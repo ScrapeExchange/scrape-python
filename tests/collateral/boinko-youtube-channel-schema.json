@@ -1,0 +1,226 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "boinko-youtube-channel-0.2.0.jsonschema",
+  "title": "YouTube Channel Metadata",
+  "description": "Schema for representing metadata about a YouTube channel, including identifiers, descriptive fields, statistics, and related media.",
+  "type": "object",
+  "properties": {
+    "channel_id": {
+      "type": ["string", "null"],
+      "format": "uuid",
+      "description": "The channel UUID or identifier"
+    },
+    "channel": {
+      "type": "string",
+      "description": "The channel vanity name (without @)"
+    },
+    "title": {
+      "type": ["string", "null"],
+      "description": "The human-readable channel title"
+    },
+    "description": {
+      "type": ["string", "null"],
+      "description": "The channel description"
+    },
+    "keywords": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "List of keywords/tags associated with the channel"
+    },
+    "categories": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Channel categories"
+    },
+    "is_family_safe": {
+      "type": "boolean",
+      "description": "Whether the channel is designated family-safe"
+    },
+    "country": {
+      "type": ["string", "null"],
+      "description": "ISO2 country code (if available)"
+    },
+    "available_country_codes": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "List of available country codes for the channel"
+    },
+    "channel_thumbnails": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/thumbnail" },
+      "description": "Thumbnails for the channel avatar"
+    },
+    "banners": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/thumbnail" },
+      "description": "Banner images for the channel"
+    },
+    "external_urls": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/external_link" },
+      "description": "External links listed on the channel (website, social)"
+    },
+    "joined_date": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "Channel joined date as an ISO-8601 datetime string"
+    },
+    "rss_url": {
+      "type": ["string", "null"],
+      "format": "uri",
+      "description": "RSS feed URL for the channel if available"
+    },
+    "verified": {
+      "type": "boolean",
+      "description": "Whether the channel is verified"
+    },
+    "subscriber_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of subscribers (defaults to 0 when unknown)"
+    },
+    "video_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of videos on the channel (defaults to 0)"
+    },
+    "view_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total view count for the channel (defaults to 0)"
+    },
+    "courses": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/course" },
+      "description": "Courses (curated playlists) published by the channel"
+    },
+    "playlists": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/playlist" },
+      "description": "Playlists published by the channel"
+    },
+    "posts": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/post" },
+      "description": "Community posts published by the channel"
+    },
+    "merch": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/product" },
+      "description": "Merchandise/products listed in the channel store"
+    },
+    "video_ids": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Video IDs belonging to the channel (only present when requested)"
+    }
+  },
+  "required": ["channel"],
+  "additionalProperties": false,
+  "$defs": {
+    "thumbnail": {
+      "type": "object",
+      "properties": {
+        "id": { "type": ["string", "null"] },
+        "url": { "type": "string", "format": "uri" },
+        "width": { "type": ["integer", "null"], "minimum": 0 },
+        "height": { "type": ["integer", "null"], "minimum": 0 },
+        "preference": { "type": "string" },
+        "display_hint": { "type": ["string", "null"], "description": "Hint for banner display (e.g. banner, tvBanner)" }
+      },
+      "required": ["url"],
+      "additionalProperties": false
+    },
+    "external_link": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "url": { "type": "string", "format": "uri" },
+        "priority": { "type": "integer" }
+      },
+      "required": ["name", "url", "priority"],
+      "additionalProperties": false
+    },
+    "course_video": {
+      "type": "object",
+      "description": "A single child video inside a YouTube course",
+      "properties": {
+        "video_id": { "type": ["string", "null"] },
+        "title": { "type": ["string", "null"] },
+        "duration_label": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "course": {
+      "type": "object",
+      "description": "A YouTube course (curated playlist)",
+      "properties": {
+        "playlist_id": { "type": ["string", "null"] },
+        "title": { "type": ["string", "null"] },
+        "video_count": { "type": "integer", "minimum": 0 },
+        "thumbnail_url": { "type": ["string", "null"], "format": "uri" },
+        "channel_id": { "type": ["string", "null"] },
+        "url": { "type": ["string", "null"], "format": "uri" },
+        "videos": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/course_video" }
+        },
+        "created_timestamp": { "type": "string", "format": "date-time" }
+      },
+      "additionalProperties": false
+    },
+    "playlist": {
+      "type": "object",
+      "description": "A YouTube playlist",
+      "properties": {
+        "playlist_id": { "type": ["string", "null"] },
+        "title": { "type": ["string", "null"] },
+        "video_count": { "type": "integer", "minimum": 0 },
+        "thumbnail_url": { "type": ["string", "null"], "format": "uri" },
+        "channel_id": { "type": ["string", "null"] },
+        "url": { "type": ["string", "null"], "format": "uri" },
+        "created_timestamp": { "type": "string", "format": "date-time" }
+      },
+      "additionalProperties": false
+    },
+    "post": {
+      "type": "object",
+      "description": "A YouTube community post",
+      "properties": {
+        "post_id": { "type": ["string", "null"] },
+        "content_text": { "type": ["string", "null"] },
+        "published_time_text": { "type": ["string", "null"] },
+        "vote_count": { "type": ["string", "null"] },
+        "attachment_type": { "type": ["string", "null"] },
+        "video_id": { "type": ["string", "null"] },
+        "image_urls": {
+          "type": "array",
+          "items": { "type": "string", "format": "uri" }
+        },
+        "poll_choices": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "channel_id": { "type": ["string", "null"] },
+        "url": { "type": ["string", "null"], "format": "uri" },
+        "created_timestamp": { "type": "string", "format": "date-time" }
+      },
+      "additionalProperties": false
+    },
+    "product": {
+      "type": "object",
+      "description": "A YouTube store product",
+      "properties": {
+        "title": { "type": ["string", "null"] },
+        "price": { "type": ["string", "null"] },
+        "merchant_name": { "type": ["string", "null"] },
+        "thumbnail_url": { "type": ["string", "null"], "format": "uri" },
+        "product_url": { "type": ["string", "null"], "format": "uri" },
+        "accessibility_title": { "type": ["string", "null"] },
+        "channel_id": { "type": ["string", "null"] },
+        "created_timestamp": { "type": "string", "format": "date-time" }
+      },
+      "additionalProperties": false
+    }
+  }
+}
