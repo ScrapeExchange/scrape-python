@@ -1,3 +1,9 @@
+.vscode/
+
+tests/collateral/youtube_videos
+
+*.swp
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
