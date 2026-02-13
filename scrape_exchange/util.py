@@ -39,7 +39,6 @@ def convert_number_string(number_text: str | int) -> int:
     return count
 
 
-
 def split_quoted_string(text: str, delimiters: str = ', ') -> set[str]:
     '''
     Split a string on delimiters (commas and spaces by default) while

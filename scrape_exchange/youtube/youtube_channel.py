@@ -6,17 +6,18 @@ Model a Youtube channel
 :license    : GPLv3
 '''
 
+import asyncio
 import re
 import logging
 
 from uuid import UUID
-
 from typing import Self
 from shutil import rmtree
 from random import random
 from tempfile import mkdtemp
 from logging import Logger
 from logging import getLogger
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import orjson
@@ -44,7 +45,6 @@ from .youtube_external_link import YouTubeExternalLink
 from ..util import split_quoted_string, convert_number_string
 
 
-
 _LOGGER: Logger = getLogger(__name__)
 
 # Limits the amount of videos imported for a channel
@@ -53,6 +53,28 @@ MAX_CHANNEL_VIDEOS_PER_RUN: int = 40
 
 HTTP_PREFIX: str = 'http://'
 HTTPS_PREFIX: str = 'https://'
+
+
+@dataclass
+class YouTubeChannelLink:
+    channel_name: str
+    subscriber_count: int
+
+    def __hash__(self) -> int:
+        return hash(self.channel_name)
+
+    def to_dict(self) -> dict[str, str | int]:
+        return {
+            'channel_name': self.channel_name,
+            'subscriber_count': self.subscriber_count
+        }
+
+    @staticmethod
+    def from_dict(data: dict[str, str | int]) -> Self:
+        return YouTubeChannelLink(
+            name=data['name'],
+            subscriber_count=data['subscriber_count']
+        )
 
 
 class YouTubeChannel:
@@ -139,6 +161,8 @@ class YouTubeChannel:
         self.subscriber_count: int | None = None
         self.video_count: int | None = None
         self.view_count: int | None = None
+
+        self.channel_links: set[YouTubeChannelLink] = set()
 
         self.videos: dict[str, YouTubeVideo] = {}
 
@@ -420,35 +444,35 @@ class YouTubeChannel:
 
         about_url: str = self.url.rstrip('/') + '/about'
 
-        log_extra: dict[str, str] = {'channel': self.name, 'url': about_url}
-
         page_contents: str | None = await self.browse_client.get(about_url)
 
         self.channel_id = YouTubeChannel.extract_channel_id(page_contents)
 
-        initial_data: dict | None = self._extract_initial_data(page_contents)
+        page_data: dict | None = self._extract_initial_data(page_contents)
 
-        if not initial_data:
-            _LOGGER.warning(
-                'Could not extract data from page', extra=log_extra
-            )
-            return {}
+        if not page_data:
+            _LOGGER.warning('Could not extract data from page')
+            return
 
         # This parses the channel metadata
-        metadata: dict[str, any] = initial_data.get(
+        metadata: dict[str, any] = page_data.get(
             'metadata', {}
         ).get('channelMetadataRenderer', {})
         if metadata:
             self._parse_channel_about_metadata(metadata)
 
-        about_renderer: dict | None = self._find_about_renderer(initial_data)
-        if not about_renderer:
+        about_data: dict[str, any] | None = self._find_about_renderer(
+            page_data
+        )
+        if not about_data:
             _LOGGER.warning('Could not find about tab renderer')
             return
 
-        self._parse_thumbnails_banners(metadata, initial_data)
+        self._parse_channel_about_data(about_data)
 
-        self._parse_channel_about_data(about_renderer)
+        self._parse_thumbnails_banners(metadata, page_data)
+
+        self.channel_links = YouTubeChannel.extract_linked_channels(page_data)
 
     def _find_about_renderer(self, initial_data: dict) -> dict | None:
         '''
@@ -517,7 +541,6 @@ class YouTubeChannel:
         self.channel_id = metadata.get(
             'externalId', self.channel_id
         )
-        self.name = self.name or metadata.get('title')
         self.title = self.title or metadata.get('title')
 
         self.description = metadata.get('description', self.description)
@@ -548,7 +571,7 @@ class YouTubeChannel:
             about_renderer.get('joinedDateText')
         )
         if joined_text:
-            joined_text = joined_text.lstrip('Joined ')
+            joined_text = joined_text[len('Joined '):]
             # YouTubeClient sets locale to en-US, so we parse accordingly
             self.joined_date = self.joined_date or datetime.strptime(
                 joined_text, '%b %d, %Y'
@@ -667,20 +690,20 @@ class YouTubeChannel:
             self.channel_thumbnail = sorted(self.channel_thumbnails)[0]
 
     def _parse_thumbnails_banners(self, metadata: dict[str, any],
-                                  initial_data: dict[str, any]) -> None:
+                                  page_data: dict[str, any]) -> None:
 
         metadata_rows: dict | None = YouTubeChannel.parse_nested_dicts(
             [
                 'header', 'pageHeaderRenderer', 'content',
                 'pageHeaderViewModel'
-            ], initial_data, dict
+            ], page_data, dict
         )
 
         self.external_urls = self.external_urls | \
-            YouTubeChannel._extract_links(initial_data)
+            YouTubeChannel._extract_links(page_data)
 
         # Thumbnails
-        header: dict[str, dict[str, any]] = initial_data.get('header', {})
+        header: dict[str, dict[str, any]] = page_data.get('header', {})
         # Try different header types
         header_renderer: dict[str, any] = (
             header.get('c4TabbedHeaderRenderer') or
@@ -720,6 +743,123 @@ class YouTubeChannel:
                 YouTubeThumbnail(data=banner)
             )
 
+    @staticmethod
+    def extract_linked_channels(page_data: dict[str, any]
+                                ) -> set[YouTubeChannelLink]:
+        '''
+        Extracts the linked channels from the channel home page data.
+        These are the channels that are linked in the "Featured Channels"
+        tab of the channel page.
+        :param page_data: the parsed data from the channel home page
+        :returns: a set of tuples containing the linked channel URL and'''
+
+        def parse_list_items(list_items: list) -> set[YouTubeChannelLink]:
+            page_links: set[YouTubeChannelLink] = set()
+            list_item: dict[str, any]
+            for list_item in list_items or []:
+                channel_renderer: dict[str, any] = list_item.get(
+                    'gridChannelRenderer', {}
+                )
+                if not channel_renderer:
+                    continue
+
+                channel_path: str | None = channel_renderer.get(
+                    'navigationEndpoint', {}
+                ).get(
+                    'commandMetadata', {}
+                ).get(
+                    'webCommandMetadata', {}
+                ).get('url')
+
+                if not channel_path:
+                    continue
+
+                channel_name: str = channel_path.lstrip('/@')
+                subs_text: str | None = channel_renderer.get(
+                    'subscriberCountText', {}
+                ).get(
+                    'simpleText'
+                )
+                if not subs_text:
+                    continue
+
+                subs: int = convert_number_string(subs_text)
+                page_links.add(
+                    YouTubeChannelLink(
+                        channel_name=channel_name, subscriber_count=subs
+                    )
+                )
+            return page_links
+
+        def parse_section_item_contents(section_item_contents: list
+                                        ) -> set[YouTubeChannelLink]:
+            page_links: set[YouTubeChannelLink] = set()
+            section_item_content: dict[str, any]
+            for section_item_content in section_item_contents or []:
+                list_items: list[dict[str, any]] = \
+                    section_item_content.get(
+                        'shelfRenderer', {}
+                    ).get(
+                        'content', {}
+                    ).get(
+                        'horizontalListRenderer', {}
+                    ).get(
+                        'items', []
+                    )
+                if list_items:
+                    page_links |= parse_list_items(list_items)
+
+            return page_links
+
+        def parse_section_items(section_items: list) -> set[YouTubeChannelLink]:
+            page_links: set[YouTubeChannelLink] = set()
+            section_item: dict[str, any]
+            for section_item in section_items or []:
+                section_item_contents: list[dict[str, any]] = section_item.get(
+                    'itemSectionRenderer', {}
+                ).get(
+                    'contents', []
+                )
+                if section_item_contents:
+                    page_links |= parse_section_item_contents(
+                        section_item_contents
+                    )
+
+            return page_links
+
+        def parse_tabs(tabs: list[dict[str, any]]) -> set[YouTubeChannelLink]:
+            page_links: set[YouTubeChannelLink] = set()
+            tab: dict[str, any]
+            for tab in tabs or []:
+                section_items: list[dict[str, any]] = tab.get(
+                    'tabRenderer', {}
+                ).get(
+                    'content', {}
+                ).get(
+                    'sectionListRenderer', {}
+                ).get(
+                    'contents', []
+                )
+                if section_items:
+                    page_links = page_links | parse_section_items(
+                        section_items
+                    )
+            return page_links
+
+        # Nested functions add to the page-links set in the parent function
+        # scope
+
+        tabs: list[dict[str, any]] = page_data.get(
+            'contents', {}
+        ).get(
+            'twoColumnBrowseResultsRenderer', {}
+        ).get(
+            'tabs', []
+        )
+        page_links: set[YouTubeChannelLink] = parse_tabs(tabs)
+
+        return page_links
+
     async def get_videos_page(self) -> str:
         '''
         Gets the videos page HTML content
@@ -745,9 +885,8 @@ class YouTubeChannel:
     async def scrape_videos(self, ingest_interval: int = 0,
                             max_videos_per_channel: int = 0) -> int:
         '''
-        Scrapes videos from the YouTube website and optionally stores them in
-        the data store
-
+        Scrapes videos from the YouTube website
+        
         :param ingest_interval: the interval in seconds between ingests
         :param max_videos_per_channel: the maximum number of videos to ingest
         :param already_ingested_videos: dictionary of ingested assets with
@@ -822,12 +961,12 @@ class YouTubeChannel:
                 if (max_videos_per_channel
                         and videos_imported >= max_videos_per_channel):
                     break
-            except ByodaRuntimeError:
+            except RuntimeError:
                 pass
-            except ByodaException:
+            except Exception:
                 raise
             except Exception as exc:
-                raise ByodaValueError(
+                raise Exception(
                     'Failed to persist video', extra=log_extra,
                     loglevel=logging.INFO
                 ) from exc
@@ -839,7 +978,7 @@ class YouTubeChannel:
                     'Sleeping between ingesting assets for a channel',
                     extra=log_extra | {'seconds': random_delay}
                 )
-                await sleep(random_delay)
+                await asyncio.sleep(random_delay)
 
             video = None
 

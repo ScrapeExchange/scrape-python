@@ -16,7 +16,10 @@ from datetime import UTC, datetime
 import orjson
 import aiofiles
 
-from scrape_exchange.youtube.youtube_channel import YouTubeChannel
+from scrape_exchange.youtube.youtube_channel import (
+    YouTubeChannel, YouTubeChannelLink
+)
+
 
 from scrape_exchange.youtube.youtube_video import DENO_PATH, PO_TOKEN_URL
 
@@ -59,6 +62,15 @@ class TestIntegration(unittest.IsolatedAsyncioTestCase):
                 channel_data
             )
             self.assertEqual(loaded_channel, channel)
+
+    async def test_channel_links(self) -> None:
+        channel: YouTubeChannel = YouTubeChannel(
+            name='ComedyCentral', deno_path=DENO_PATH,
+            po_token_url=PO_TOKEN_URL, debug=True, save_dir=OUTPUT_DIR
+        )
+        await channel.scrape()
+        self.assertGreaterEqual(len(channel.channel_links), 10)
+
 
 
 if __name__ == '__main__':
