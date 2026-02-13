@@ -7,6 +7,9 @@ Model an external link of a Youtube video
 '''
 
 
+from typing import Self
+
+
 class YouTubeExternalLink:
     def __init__(self, name: str, url: str, priority: int) -> None:
         self.name: str = name
@@ -19,6 +22,14 @@ class YouTubeExternalLink:
             'url': self.url,
             'priority': self.priority,
         }
+
+    @staticmethod
+    def from_dict(data: dict[str, str | int]) -> Self:
+        return YouTubeExternalLink(
+            name=data['name'],
+            url=data['url'],
+            priority=data['priority']
+        )
 
     def __hash__(self) -> int:
         return hash(self.url)

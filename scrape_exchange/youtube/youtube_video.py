@@ -6,6 +6,7 @@ Model a Youtube video
 :license    : GPLv3
 '''
 
+import os
 import re
 
 from typing import Self
@@ -33,12 +34,25 @@ from .youtube_client import AsyncYouTubeClient
 
 _LOGGER: Logger = getLogger(__name__)
 
+DENO_PATH: str = os.environ.get('HOME', '') + '/.deno/bin/deno'
+PO_TOKEN_URL: str = 'http://localhost:4416'
+
 
 class YouTubeVideoChapter:
     def __init__(self, chapter_info: dict[str, float | str]) -> None:
         self.start_time: float = chapter_info.get('start_time')
         self.end_time: float = chapter_info.get('end_time')
         self.title: str = chapter_info.get('title')
+
+    def __eq__(self, other: Self) -> bool:
+        if not isinstance(other, YouTubeVideoChapter):
+            return False
+
+        return (
+            self.start_time == other.start_time
+            and self.end_time == other.end_time
+            and self.title == other.title
+        )
 
     def to_dict(self) -> dict[str, str, float]:
         '''
@@ -84,6 +98,17 @@ class YouTubeCaption:
         self.url: str = caption_info.get('url')
         self.extension: str = caption_info.get('ext')
         self.protocol: str = caption_info.get('protocol')
+
+    def __eq__(self, other: Self) -> bool:
+        if not isinstance(other, YouTubeCaption):
+            return False
+
+        return (
+            self.language_code == other.language_code
+            and self.url == other.url
+            and self.extension == other.extension
+            and self.protocol == other.protocol
+        )
 
     def to_dict(self) -> dict[str, str]:
         '''
@@ -202,7 +227,7 @@ class YouTubeVideo:
         if not isinstance(other, YouTubeVideo):
             return False
 
-        return (
+        same: bool = (
             self.video_id == other.video_id
             and self.title == other.title
             and self.channel_name == other.channel_name
@@ -214,6 +239,9 @@ class YouTubeVideo:
             and self.channel_url == other.channel_url
             and self.channel_is_verified == other.channel_is_verified
             and self.channel_thumbnail_url == other.channel_thumbnail_url
+            and self.created_timestamp == other.created_timestamp
+            and self.uploaded_timestamp == other.uploaded_timestamp
+            and self.published_timestamp == other.published_timestamp
             and self.availability == other.availability
             and self.url == other.url
             and self.short_url == other.short_url
@@ -229,6 +257,29 @@ class YouTubeVideo:
             and self.default_audio_language == other.default_audio_language
             and self.privacy_status == other.privacy_status
         )
+        if not same:
+            return False
+
+        if self.thumbnails != other.thumbnails:
+            return False
+
+        if self.subtitles != other.subtitles:
+            return False
+        if self.automatic_captions != other.automatic_captions:
+            return False
+        if self.chapters != other.chapters:
+            return False
+
+        if len(self.formats) != len(other.formats):
+            return False
+
+        for key in self.formats:
+            if key not in other.formats:
+                return False
+            if self.formats[key] != other.formats[key]:
+                return False
+
+        return True
 
     def to_dict(self) -> dict[str, any]:
         '''
@@ -272,7 +323,7 @@ class YouTubeVideo:
             'keywords': list(self.keywords),
             'privacy_status': self.privacy_status
         }
-        
+
         if self.channel_thumbnail_asset:
             data['channel_thumbnail'] = self.channel_thumbnail_asset.to_dict()
 
@@ -414,9 +465,9 @@ class YouTubeVideo:
     async def scrape(
         video_id: str, channel_name: str | None,
         channel_thumbnail: YouTubeThumbnail | None,
+        deno_path: str = DENO_PATH, po_token_url: str = PO_TOKEN_URL,
         browse_client: AsyncYouTubeClient | None = None,
         download_client: YoutubeDL | None = None,
-        deno_path: str | None = None, po_token_url: str | None = None,
         debug: bool = False, save_dir: str | None = None
     ) -> Self | None:
         '''

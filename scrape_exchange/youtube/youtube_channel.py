@@ -6,12 +6,10 @@ Model a Youtube channel
 :license    : GPLv3
 '''
 
-import os
 import re
 import logging
 
 from uuid import UUID
-from uuid import uuid4
 
 from typing import Self
 from shutil import rmtree
@@ -19,8 +17,7 @@ from random import random
 from tempfile import mkdtemp
 from logging import Logger
 from logging import getLogger
-from datetime import UTC
-from datetime import datetime
+from datetime import UTC, datetime
 
 import orjson
 import country_converter
@@ -31,10 +28,22 @@ from innertube import InnerTube
 from yt_dlp import YoutubeDL
 
 
-from .youtube_client import AsyncYouTubeClient
+from .youtube_client import (
+    AsyncYouTubeClient,
+    CONSENT_COOKIES,
+    HEADERS,
+    USER_AGENT
+)
+
 from .youtube_video import YouTubeVideo
+from .youtube_video import DENO_PATH
+from .youtube_video import PO_TOKEN_URL
 from .youtube_thumbnail import YouTubeThumbnail
 from .youtube_external_link import YouTubeExternalLink
+
+from ..util import split_quoted_string, convert_number_string
+
+
 
 _LOGGER: Logger = getLogger(__name__)
 
@@ -47,8 +56,6 @@ HTTPS_PREFIX: str = 'https://'
 
 
 class YouTubeChannel:
-    DATASTORE_CLASS_NAME: str = 'channels'
-
     CHANNEL_URL: str = AsyncYouTubeClient.SCRAPE_URL + '/{channel_name}'
     CHANNEL_URL_WITH_AT: str = \
         AsyncYouTubeClient.SCRAPE_URL + '/@{channel_name}'
@@ -64,20 +71,12 @@ class YouTubeChannel:
         r'"externalId":"(.*?)"'
     )
 
-    # Path to Deno binary for yt-dlp
-    # Install Deno with from https://deno.land/#installation
-    # ie. with 'curl -fsSL https://deno.land/install.sh | sh'
-    DENO_PATH: str = os.environ.get('HOME') + '/.deno/bin/deno'
-
-    # yt-dlp requires a PO token. Install with:
-    # docker run --name bgutil-provider -d -p 4416:4416 --init brainicism/bgutil-ytdlp-pot-provider  # noqa: E501
-    PO_TOKEN_URL: str = 'http://localhost:4416'
-
     def __init__(
-        self, name: str = None, channel_id: str = None,
-        title: str | None = None, ingest: bool = False,
-        consent_cookies: dict[str, str] | None = AsyncYouTubeClient.CONSENT_COOKIES,        # noqa: E501
-        user_agent: str | None = AsyncYouTubeClient.USER_AGENT,
+        self, name: str = None,
+        deno_path: str = DENO_PATH, po_token_url: str = PO_TOKEN_URL,
+        debug: bool = False, save_dir: str = None,
+        consent_cookies: dict[str, str] | None = CONSENT_COOKIES,
+        user_agent: str = USER_AGENT, headers: dict[str, str] = HEADERS,
     ) -> None:
         '''
         Models a YouTube channel
@@ -95,32 +94,28 @@ class YouTubeChannel:
         '''
 
         self.consent_cookies: dict[str, str] = consent_cookies
-        self.user_agent: str | None = user_agent
+        self.headers: dict[str, str] = headers
         self._work_dir: str = mkdtemp(dir='/tmp')
+        self.save_dir: str | None = save_dir
 
-        self.browse_client: YoutubeDL | None = None
-        self.download_client: YoutubeDL | None = None
+        self.browse_client = AsyncYouTubeClient(
+            user_agent=user_agent, headers=headers,
+            consent_cookies=consent_cookies
+        )
+        self.download_client: YoutubeDL = YouTubeVideo._setup_download_client(
+            browse_client=self.browse_client, deno_path=deno_path,
+            po_token_url=po_token_url, debug=debug
+        )
 
-        # This is the channel UUID from byotube.json
-        self.channel_id: UUID | None = None
-
-        self.name: str | None = name
-        self.title: str | None = title
-
-        self.youtube_url: str | None = None
-        if self.name:
-            self.name = self.name.lstrip('@')
-            self.youtube_url = YouTubeChannel.CHANNEL_URL_WITH_AT.format(
+        self.url: str | None = None
+        self.title: str | None = None
+        if name:
+            self.name = name.lstrip('@')
+            self.url: str = YouTubeChannel.CHANNEL_URL_WITH_AT.format(
                 channel_name=self.name.replace(' ', '')
             )
 
-        self.web_client: AsyncYouTubeClient = AsyncYouTubeClient(
-            consent_cookies=consent_cookies, user_agent=user_agent
-        )
-
-        # This is the youtube channel ID
-        self.youtube_channel_id: str | None = channel_id
-
+        self.channel_id: UUID | None = None
         self.description: str | None = None
         self.keywords: set[str] = set()
         self.categories: set[str] = set()
@@ -145,17 +140,41 @@ class YouTubeChannel:
         self.video_count: int | None = None
         self.view_count: int | None = None
 
-        self.asset_ingest_enabled: bool = False
-        self.ingest_videos: bool = ingest
-
-        self.videos: dict[YouTubeVideo] = {}
+        self.videos: dict[str, YouTubeVideo] = {}
 
     def __del__(self) -> None:
         rmtree(self._work_dir, ignore_errors=True)
 
+    def __eq__(self, other: Self) -> bool:
+        if not isinstance(other, YouTubeChannel):
+            return False
+
+        equal: bool = (
+            self.name == other.name and
+            self.channel_id == other.channel_id and
+            self.title == other.title and
+            self.description == other.description and
+            self.joined_date == other.joined_date and
+            self.rss_url == other.rss_url and
+            self.verified == other.verified and
+            self.is_family_safe == other.is_family_safe and
+            self.video_count == other.video_count and
+            self.view_count == other.view_count and
+            self.subscriber_count == other.subscriber_count and
+            self.external_urls == other.external_urls and
+            self.categories == other.categories and
+            self.country == other.country and
+            self.keywords == other.keywords and
+            self.banners == other.banners and
+            self.available_country_codes == other.available_country_codes and
+            self.channel_thumbnails == other.channel_thumbnails and
+            self.external_urls == other.external_urls and
+            self.banners == other.banners
+        )
+        return equal
+
     def to_dict(self) -> dict[str, any]:
         data: dict[str, any] = {
-            'created_timestamp': datetime.now(tz=UTC),
             'channel_id': self.channel_id,
             'channel': self.name.lstrip('@'),
             'title': self.title,
@@ -163,6 +182,7 @@ class YouTubeChannel:
             'keywords': list(self.keywords),
             'categories': list(self.categories),
             'is_family_safe': self.is_family_safe,
+            'country': self.country,
             'available_country_codes': list(self.available_country_codes),
             'channel_thumbnails': [
                 t.to_dict() for t in self.channel_thumbnails or set()
@@ -171,155 +191,52 @@ class YouTubeChannel:
             'external_urls': [
                 el.to_dict() for el in self.external_urls or set()
             ],
-            'publisher_channel_id': self.youtube_channel_id,
-            'publisher_joined_date': self.joined_date,
-            'publisher_rss_url': self.rss_url,
-            'publisher_verified': self.verified,
-            'publisher_followers':
-                self.subscriber_count or 0,
-            'publisher_videos': self.video_count or 0,
-            'publisher_views': self.view_count or 0,
-            'claims': [],
+            'joined_date': str(self.joined_date) if self.joined_date else None,
+            'rss_url': self.rss_url,
+            'verified': self.verified,
+            'subscriber_count': self.subscriber_count or 0,
+            'video_count': self.video_count or 0,
+            'view_count': self.view_count or 0,
         }
-
-        if self.country:
-            ccode: str = country_converter.convert(
-                self.country, to='ISO2', not_found=None
-            )
-            data['country_code'] = ccode
 
         return data
 
-    def update_lock_file(self) -> None:
-        '''
-        We update the lock file every time we do something so
-        we can be more aggressive with removing stale lock files
-        '''
-
-        with open(self.lock_file, 'w') as lock_file:
-            lock_file.write('1')
-
-    def _setup_yt_dlp(self, debug: bool = False) -> YoutubeDL | None:
-        '''
-        Returns a yt-dlp YouTubeDL client
-        '''
-
-        ydl_opts: dict[str, any] = {
-            'quiet': not config.debug,
-            'verbose': config.debug,
-            'logger': _LOGGER,
-            'noprogress': True,
-            'no_color': True,
-            'format': 'all',
-            'http_headers': dict(self.web_client.headers) | {
-                'Cookie': '; '.join(
-                    f'{k}={v}' for k, v in self.consent_cookies.items()
-                )
-            },
-            'js_runtimes': {'deno': {'path': self.DENO_PATH}},
-            'extractor_args': {
-                'youtube': {
-                    'player-client': 'default,mweb',
-                    'youtubepot-bgutilhttp:base_url': self.PO_TOKEN_URL
-                }
-            }
+    @staticmethod
+    def from_dict(data: dict[str, any]) -> Self:
+        channel = YouTubeChannel(name=data.get('channel'))
+        channel.channel_id = data.get('channel_id')
+        channel.title = data.get('title')
+        channel.description = data.get('description')
+        channel.keywords = set(data.get('keywords', []))
+        channel.categories = set(data.get('categories', []))
+        channel.is_family_safe = data.get('is_family_safe', False)
+        channel.country = data.get('country')
+        channel.available_country_codes = set(
+            data.get('available_country_codes', [])
+        )
+        channel.channel_thumbnails = {
+            YouTubeThumbnail.from_dict(t) for t in data.get(
+                'channel_thumbnails', []
+            )
         }
-
-        self.download_client = YoutubeDL(ydl_opts)
-
-        return self.download_client
-
-    async def persist_channel_info_media(
-        self, member: Member, data_store: DataStore,
-        custom_domain: str | None = None
-    ) -> None:
-        '''
-        Persist the channel thumbnails and banners to storage
-
-        :param member:
-        :param data_store:
-        :param storage_driver:
-        :param custom_domain: what hostname should be used in content URLs if
-        no CDN is used
-        '''
-
-        if not self.storage_driver:
-            _LOGGER.warning(
-                'No storage driver provided, cannot persist channel media',
-            )
-            raise ValueError('No storage driver provided')
-
-        log_data: dict[str, str] = {'channel': self.name}
-
-        _LOGGER.debug('Persisting channel', extra=log_data)
-
-        table: ArraySqlTable = data_store.get_table(
-            member.member_id, YouTubeChannel.DATASTORE_CLASS_NAME
-        )
-        data_filter: DataFilterSet = DataFilterSet(
-            {'channel': {'eq': self.name}}
-        )
-
-        channel_data: dict[str, any] = self.to_dict()
-        cursor: str = table.get_cursor_hash(channel_data, member.member_id)
-
-        rows: list[QueryResult] | None = await table.query(
-            data_filters=data_filter
-        )
-        if rows:
-            await self._update_channel_stats(table, cursor, data_filter)
-            return
-
-        self.channel_id = self.channel_id or uuid4()
-
-        log_data['channel_id'] = str(self.channel_id)
-        _LOGGER.debug(
-            'Channel is not yet in the data store', extra=log_data
-        )
-
-        video_id: UUID = uuid4()
-
-        dirpath: str = mkdtemp(dir='/tmp')
-        thumbnail: YouTubeThumbnail
-        for thumbnail in self.channel_thumbnails:
-            await thumbnail.ingest(
-                video_id=video_id, storage_driver=self.storage_driver,
-                member=member, work_dir=dirpath,
-                custom_domain=custom_domain
-            )
-
-        banner: YouTubeThumbnail
-        for banner in self.banners:
-            await banner.ingest(
-                video_id=video_id, storage_driver=self.storage_driver,
-                member=member, work_dir=dirpath,
-                custom_domain=custom_domain
-            )
-
-        rmtree(dirpath, ignore_errors=True)
-
-        await table.append(
-            channel_data, cursor, origin_id=None,
-            origin_id_type=None, origin_class_name=None
-        )
-        _LOGGER.debug('Created channel in the data store', extra=log_data)
-
-    async def _update_channel_stats(self, table: ArraySqlTable, cursor: str,
-                                    data_filter: DataFilterSet) -> None:
-        data: dict[str, any] = {
-            'thirdparty_platform_followers': self.subscriber_count,
-            'thirdparty_platform_views': self.view_count,
-            'thirdparty_platform_videos': self.video_count,
+        channel.banners = {
+            YouTubeThumbnail.from_dict(b) for b in data.get('banners', [])
         }
-        await table.update(
-            data, cursor, data_filter, None, None, None,
-            placeholder_function=PostgresStorage.get_named_placeholder
-        )
+        channel.external_urls = {
+            YouTubeExternalLink.from_dict(el) for el in data.get(
+                'external_urls', []
+            )
+        }
+        joined_date_str: str | None = data.get('joined_date')
+        if joined_date_str:
+            channel.joined_date = datetime.fromisoformat(joined_date_str)
+        channel.rss_url = data.get('rss_url')
+        channel.verified = data.get('verified', False)
+        channel.subscriber_count = data.get('subscriber_count')
+        channel.video_count = data.get('video_count')
+        channel.view_count = data.get('view_count')
 
-        log_data: dict[str, str] = {'channel': self.name} | data
-        _LOGGER.info(
-            'Updated channel followers, videos, and views', extra=log_data
-        )
+        return channel
 
     def _extract_initial_data(self, html_content: str) -> dict | None:
         '''
@@ -353,19 +270,20 @@ class YouTubeChannel:
                 except orjson.JSONDecodeError:
                     continue
 
-        # If we couldn't find data, check if it's because of a consent page
-        if ('consent.youtube.com' in html_content
-                or 'consent.google.com' in html_content):
-            raise ValueError(
-                'Encountered YouTube consent page. The consent cookies may '
-                'have expired or been rejected. Try setting '
-                'use_consent_cookies=True when initializing the scraper.'
-            )
-
         return None
 
     def _extract_handle(self, url: str, metadata: dict) -> str | None:
-        '''Extract channel handle from URL or metadata'''
+        '''
+        Extract channel handle from URL or metadata
+
+        :param url:the URL of the channel page
+        :param metadata: the channel metadata extracted from the page
+        :returns: the channel handle (e.g. @HistoryMatters) or None if not
+        found
+        :raises: ValueError: If a consent page is detected (only when consent
+        cookies are not set)
+        '''
+
         # Try to extract from URL
         if '@' in url:
             parts: list[str] = url.split('@')
@@ -489,23 +407,26 @@ class YouTubeChannel:
 
         return external_links
 
-    async def scrape(self) -> dict[str, any]:
+    async def scrape(self) -> None:
         '''
         Scrape the About tab for information. This does not include data
         about the videos for the channel as multiple requests are needed
         to get that data. Use get_videos_page() and parse_channel_video_data()
         to get the videos from the channel.
+
+        :returns: dict of the scraped data
+        :raises: (none)
         '''
 
-        about_url: str = self.youtube_url.rstrip('/') + '/about'
+        about_url: str = self.url.rstrip('/') + '/about'
 
         log_extra: dict[str, str] = {'channel': self.name, 'url': about_url}
 
-        page_data: str | None = await self.web_client.get(about_url)
+        page_contents: str | None = await self.browse_client.get(about_url)
 
-        self.youtube_channel_id = YouTubeChannel.extract_channel_id(page_data)
+        self.channel_id = YouTubeChannel.extract_channel_id(page_contents)
 
-        initial_data: dict | None = self._extract_initial_data(page_data)
+        initial_data: dict | None = self._extract_initial_data(page_contents)
 
         if not initial_data:
             _LOGGER.warning(
@@ -520,12 +441,10 @@ class YouTubeChannel:
         if metadata:
             self._parse_channel_about_metadata(metadata)
 
-        about_renderer: dict | None = self._find_about_renderer(
-            initial_data
-        )
+        about_renderer: dict | None = self._find_about_renderer(initial_data)
         if not about_renderer:
             _LOGGER.warning('Could not find about tab renderer')
-            return {}
+            return
 
         self._parse_thumbnails_banners(metadata, initial_data)
 
@@ -595,8 +514,8 @@ class YouTubeChannel:
     def _parse_channel_about_metadata(self, metadata: dict) -> None:
         '''Parse channel data from ytInitialData channelMetadataRenderer'''
 
-        self.youtube_channel_id = metadata.get(
-            'externalId', self.youtube_channel_id
+        self.channel_id = metadata.get(
+            'externalId', self.channel_id
         )
         self.name = self.name or metadata.get('title')
         self.title = self.title or metadata.get('title')
@@ -618,9 +537,7 @@ class YouTubeChannel:
             metadata.get('keywords')
         )
 
-        self.is_family_safe = metadata.get(
-            'madeForKids', False
-        )
+        self.is_family_safe = metadata.get('isFamilySafe', False)
 
     def _parse_channel_about_data(self, about_renderer: dict) -> None:
         '''
@@ -635,7 +552,7 @@ class YouTubeChannel:
             # YouTubeClient sets locale to en-US, so we parse accordingly
             self.joined_date = self.joined_date or datetime.strptime(
                 joined_text, '%b %d, %Y'
-            )
+            ).replace(tzinfo=UTC)
 
         self.view_count = self.view_count or convert_number_string(
             self._extract_simple_text(about_renderer.get('viewCountText'))
@@ -664,8 +581,10 @@ class YouTubeChannel:
 
         # Redundant with metadata parsing, still kept as fallback if
         # YouTube changes metadata structure
-        self.country = self.country or self._extract_simple_text(
-            about_renderer.get('country')
+        self.country = country_converter.convert(
+            self._extract_simple_text(
+                about_renderer.get('country')
+            ), to='ISO2', not_found=None
         )
 
     def parse_channel_video_data(self, page_html: str) -> None:
@@ -684,7 +603,7 @@ class YouTubeChannel:
             )
             return None
 
-        self.youtube_channel_id = self.youtube_channel_id or \
+        self.channel_id = self.channel_id or \
             YouTubeChannel.extract_channel_id(page_html)
 
         page_data: dict[str, any] = self._extract_initial_data(page_html)
@@ -801,13 +720,6 @@ class YouTubeChannel:
                 YouTubeThumbnail(data=banner)
             )
 
-            tabs: list = YouTubeChannel.parse_nested_dicts(
-                ['contents', 'twoColumnBrowseResultsRenderer', 'tabs'],
-                initial_data, list
-            )
-            if not tabs or len(tabs) < 2 or 'tabRenderer' not in tabs[1]:
-                _LOGGER.warning('Scraped video does not have 2 tabs')
-
     async def get_videos_page(self) -> str:
         '''
         Gets the videos page HTML content
@@ -819,7 +731,7 @@ class YouTubeChannel:
 
         log_extra: dict[str, str] = {'channel': self.name, 'url': videos_url}
 
-        page_html: str | None = await self.web_client.get(videos_url)
+        page_html: str | None = await self.browse_client.get(videos_url)
 
         if not page_html:
             _LOGGER.warning(
@@ -830,30 +742,13 @@ class YouTubeChannel:
 
         return page_html
 
-    async def scrape_videos(
-        self, member: Member, data_store: DataStore,
-        video_table: Table,
-        bento4_directory: str | None = None,
-        moderate_request_url: str | None = None,
-        moderate_jwt_header: str | None = None,
-        moderate_claim_url: str | None = None, ingest_interval: int = 0,
-        custom_domain: str | None = None,
-        max_videos_per_channel: int = 0,
-    ) -> int:
+    async def scrape_videos(self, ingest_interval: int = 0,
+                            max_videos_per_channel: int = 0) -> int:
         '''
         Scrapes videos from the YouTube website and optionally stores them in
         the data store
 
-        :param member: the member to use for the data store
-        :param data_store: the data store to use for storing the video metadata
-        :param storage_driver: the storage driver to use for repackaging
-        :param beno4_directory: the directory where the Bento4 binaries are
-        :param moderate_request_url: the URL to use for moderation requests
-        :param moderate_jwt_header: the JWT header to use for moderation
-        requests
-        :param moderate_claim_url: the URL to use for moderation claims
         :param ingest_interval: the interval in seconds between ingests
-        :param custom_domain: the custom domain to use for the video URLs
         :param max_videos_per_channel: the maximum number of videos to ingest
         :param already_ingested_videos: dictionary of ingested assets with
         YouTube video IDs as keys and as values a dict with ingest_status
@@ -865,40 +760,22 @@ class YouTubeChannel:
         log_extra: dict[str, str] = {'channel': self.name}
 
         if not self.name:
-            raise ByodaValueError(
-                'No channel name provided', loglevel=logging.ERROR,
-                extra=log_extra
-            )
+            raise ValueError('No channel name provided')
 
         page_html: str = await self.get_videos_page()
 
         if not page_html:
-            raise ByodaRuntimeError(
-                'No page data found for channel', loglevel=logging.INFO,
-            )
+            raise RuntimeError(f'No page data found for channel: {self.name}')
 
         self.parse_channel_video_data(page_html)
-
-        await self.persist_channel_info_media(
-            member, data_store, custom_domain=custom_domain
-        )
 
         self.video_ids: list[str] = []
         try:
             self.video_ids = await self.get_video_ids()
             if not self.video_ids:
-                raise ByodaValueError(
-                    'No video IDs extracted', loglevel=logging.INFO,
-                    extra=log_extra
-                )
+                raise ValueError('No video IDs extracted')
         except Exception as exc:
-            raise ByodaException(
-                f'Failed to extract video IDs: {exc}', extra=log_extra,
-                loglevel=logging.INFO
-            ) from exc
-
-        self.browse_client = self._setup_yt_dlp(with_download=False)
-        self.download_client = self._setup_yt_dlp(with_download=True)
+            raise RuntimeError(f'Failed to extract video IDs: {exc}') from exc
 
         videos_imported: int = 0
         for video_id in self.video_ids:
@@ -909,12 +786,11 @@ class YouTubeChannel:
                 )
                 if not video:
                     continue
-            except ByodaRuntimeError:
+            except RuntimeError:
                 continue
             except Exception as exc:
-                raise ByodaException(
-                    f'Failed to scrape video: {exc}', extra=log_extra,
-                    loglevel=logging.INFO
+                raise Exception(
+                    f'Failed to scrape video: {exc}'
                 ) from exc
 
             log_extra['video_id'] = video.video_id

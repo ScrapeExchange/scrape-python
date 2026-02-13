@@ -88,6 +88,12 @@ class YouTubeFormat:
             ')'
         )
 
+    def __eq__(self, other: Self) -> bool:
+        if not isinstance(other, YouTubeFormat):
+            return False
+
+        return self.to_dict() == other.to_dict()
+
     def to_dict(self) -> dict[str, any]:
         '''
         Returns a dict representation of the video
@@ -116,14 +122,11 @@ class YouTubeFormat:
             'audio_channels': self.audio_channels,
             'rows': self.rows,
             'cols': self.cols,
-            'fragments': [],
+            'fragments': [fragment.to_dict() for fragment in self.fragments],
             'resolution': self.resolution,
             'aspect_ratio': self.aspect_ratio,
             'format': self.format,
         }
-
-        for fragment in self.fragments:
-            data['fragments'].append(fragment.to_dict())
 
         return data
 
@@ -138,14 +141,8 @@ class YouTubeFormat:
         yt_format.format_note = data.get('format_note')
         yt_format.ext = data.get('ext')
         yt_format.protocol = data.get('protocol')
-        yt_format.audio_codec = data.get('acodec')
-        if yt_format.audio_codec and yt_format.audio_codec.lower() == 'none':
-            yt_format.audio_codec = None
-
-        yt_format.video_codec = data.get('vcodec')
-        if yt_format.video_codec and yt_format.video_codec.lower() == 'none':
-            yt_format.video_codec = None
-
+        yt_format.audio_codec = data.get('audiocodec')
+        yt_format.video_codec = data.get('videocodec')
         yt_format.container = data.get('container')
         yt_format.audio_ext = data.get('audio_ext')
         yt_format.video_ext = data.get('video_ext')

@@ -63,6 +63,8 @@ class YouTubeThumbnail:
             or (
                 self.width == thumbnail.width
                 and self.height == thumbnail.height
+                and self.id == thumbnail.id
+                and self.preference == thumbnail.preference
             )
         )
 
