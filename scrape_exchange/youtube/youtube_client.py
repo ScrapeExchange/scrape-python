@@ -82,8 +82,8 @@ class AsyncYouTubeClient(AsyncClient):
 
         return dict(self.headers)
 
-    async def get(self, url: str, retries: int = 3, delay: float = 1.0, **kwargs
-                  ) -> str | None:
+    async def get(self, url: str, retries: int = 3, delay: float = 1.0,
+                  **kwargs) -> str | None:
         '''
         Performs a GET request to the specified URL.
 

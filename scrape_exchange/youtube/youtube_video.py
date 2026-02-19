@@ -799,7 +799,7 @@ class YouTubeVideo:
 
         # Sort by width and assign to standard sizes
         thumb_list = sorted(
-            thumb_list, key=lambda x: (int(x.preference or 0), x.width)
+            thumb_list, key=lambda x: (int(x.preference or 0), x.width or 0)
         )
 
         seen_urls: set[str] = set()
@@ -963,6 +963,9 @@ class YouTubeVideo:
 
         if self.duration and self.duration > 60:
             return False
+
+        if self.aspect_ratio < 1:
+            return True
 
         # Check for Shorts-specific markers in initial data
         try:

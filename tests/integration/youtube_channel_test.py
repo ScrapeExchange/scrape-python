@@ -99,6 +99,7 @@ class TestIntegration(unittest.IsolatedAsyncioTestCase):
                 video_count += 1
         self.assertEqual(video_count, 3)
 
+    # @unittest.skip('Shorts scraping is currently unreliable and needs fixes')
     async def test_shorts_scrape(self) -> None:
         channel: YouTubeChannel = YouTubeChannel(
             name='GMHikaru', deno_path=DENO_PATH,

@@ -891,9 +891,7 @@ class YouTubeChannel:
 
         self.video_ids: list[str] = []
         try:
-            self.video_ids = await self.get_video_page_video_ids()
-            if not self.video_ids:
-                raise ValueError('No video IDs extracted')
+            self.video_ids = await self.get_video_page_video_ids(shorts)
         except Exception as exc:
             raise RuntimeError(f'Failed to extract video IDs: {exc}') from exc
 
@@ -1216,7 +1214,7 @@ class YouTubeChannel:
     @staticmethod
     def parse_nested_dicts(keys: list[str], data: dict[str, any],
                            final_type: callable
-                           ) -> object | list[object] | None:
+                           ) -> str | int | float | list[object] | None:
         for key in keys:
             if key in data:
                 data = data[key]
@@ -1231,15 +1229,18 @@ class YouTubeChannel:
 
         return data
 
-    async def get_video_page_video_ids(self) -> list[str]:
+    async def get_video_page_video_ids(self, shorts: bool = False) -> list[str]:
         async def browse(max_retries: int = 4) -> dict:
             retries: int = 1
             delay_seconds: int = 1
-            while retries < max_retries:
+            while retries <= max_retries:
                 try:
-                    return client.browse(
-                        self.channel_id, continuation=continuation_token
-                    )
+                    if continuation_token == '':
+                        return client.browse(self.channel_id)
+                    else:
+                        return client.browse(
+                            self.channel_id, continuation=continuation_token
+                        )
                 except Exception as e:
                     retries += 1
                     _LOGGER.error(
@@ -1259,6 +1260,8 @@ class YouTubeChannel:
 
         video_ids: list[str] = []
 
+        tab_name: str = 'Shorts' if shorts else 'Videos'
+        tab_index: int = 2 if shorts else 1
         first_run: bool = True
         continuation_token: str = ''
         while first_run or continuation_token:
@@ -1278,10 +1281,8 @@ class YouTubeChannel:
                         f'Scraped video does not have 2 tabs: {self.name}'
                     )
 
-                videos_tab_renderer: dict = tabs[1]['tabRenderer']
-
-                # Make sure this tab is the 'Videos' tab
-                if videos_tab_renderer['title'] != 'Videos':
+                videos_tab_renderer: dict = tabs[tab_index]['tabRenderer']
+                if videos_tab_renderer['title'] != tab_name:
                     raise RuntimeError(
                         'Scraped channel does not have a "Videos" tab: '
                         f'{self.name}'
@@ -1291,7 +1292,7 @@ class YouTubeChannel:
                 videos_params: str = \
                     videos_tab_renderer['endpoint']['browseEndpoint']['params']
 
-                # Wait a bit so that Google doesn't suspect us of being a bot
+                # Wait a bit so that we don't overload the YT server
                 await AsyncYouTubeClient._delay()
 
                 # Fetch the browse data for the channel's videos
@@ -1306,7 +1307,7 @@ class YouTubeChannel:
                 )
                 contents: list = YouTubeChannel.parse_nested_dicts(
                     ['tabRenderer', 'content', 'richGridRenderer', 'contents'],
-                    tabs[1], list
+                    tabs[tab_index], list
                 )
             else:
                 # Fetch more videos by using the continuation token
@@ -1323,21 +1324,35 @@ class YouTubeChannel:
                 )
 
             # Extract the rich video items and the continuation item
+            rich_items: list[dict]
+            continuation_item: dict[str, any]
             *rich_items, continuation_item = contents
 
             # Loop through each video and log out its details
             for rich_item in rich_items:
-                video_renderer: dict | None = \
-                    YouTubeChannel.parse_nested_dicts(
-                        ['richItemRenderer', 'content', 'videoRenderer'],
-                        rich_item, dict
+                if shorts:
+                    video_url: str = YouTubeChannel.parse_nested_dicts(
+                        [
+                            'richItemRenderer', 'content',
+                            'shortsLockupViewModel', 'onTap',
+                            'innertubeCommand', 'commandMetadata',
+                            'webCommandMetadata', 'url'
+                        ], rich_item, str
                     )
-
-                video_id: str | None = video_renderer.get('videoId')
+                    video_id = video_url.split('/')[-1] if video_url else None
+                else:
+                    video_renderer: dict | None = \
+                        YouTubeChannel.parse_nested_dicts(
+                            ['richItemRenderer', 'content', 'videoRenderer'],
+                            rich_item, dict
+                        )
+                    video_id: str | None = video_renderer.get('videoId')
                 if video_id:
                     video_ids.append(video_id)
 
-            cont_renderer: any = continuation_item.get('continuationItemRenderer')
+            cont_renderer: any = continuation_item.get(
+                'continuationItemRenderer'
+            )
             if not cont_renderer:
                 return video_ids
 
