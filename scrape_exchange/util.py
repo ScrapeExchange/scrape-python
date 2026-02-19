@@ -2,8 +2,12 @@
 Docstring for scrape_exchange.util
 '''
 
-
+from os import path
 from enum import Enum
+from datetime import datetime
+import os
+
+from .datatypes import IngestStatus
 
 
 def convert_number_string(number_text: str | int) -> int:
@@ -37,6 +41,50 @@ def convert_number_string(number_text: str | int) -> int:
         count = int(number_text)
 
     return count
+
+
+def get_imported_assets(save_dir: str | None = None,
+                        uploaded_dir: str | None = None
+                        ) -> dict[str, tuple[Enum, datetime]]:
+    '''
+    Reads the save directory for already ingested videos and returns a mapping
+    of video IDs to their ingest status and published timestamp.
+
+    :param save_dir: The directory where scraped video data is saved
+    :param uploaded_dir: Optional directory where uploaded video data is saved.
+    If not provided, uploaded videos will be read from <save_dir>/uploaded
+    :returns: A dictionary mapping YouTube video IDs to a tuple of ingest
+              status and published timestamp
+    :raises: RuntimeError if the save directory cannot be read
+    '''
+
+    imported_assets: dict[str, tuple[IngestStatus, datetime]] = {}
+
+    def _get_assets(directory: str, ingest_status: IngestStatus) -> None:
+        try:
+            asset_id: str
+            entry: os.DirEntry
+            for entry in os.scandir(directory):
+                if entry.is_file() and entry.name.endswith('.json'):
+                    asset_id, _ = path.splitext(entry.name)[0]
+                    timestamp: datetime = entry.stat().st_mtime
+                    imported_assets[asset_id] = (
+                        ingest_status, datetime.fromtimestamp(timestamp)
+                    )
+        except Exception as exc:
+            raise RuntimeError(
+                f'Failed to read imported assets from {directory}: {exc}'
+            ) from exc
+
+    if save_dir:
+        _get_assets(save_dir, IngestStatus.SCRAPED)
+
+        if not uploaded_dir:
+            uploaded_dir = f'{save_dir}/uploaded'
+
+        _get_assets(uploaded_dir, IngestStatus.UPLOADED)
+
+    return imported_assets
 
 
 def split_quoted_string(text: str, delimiters: str = ', ') -> set[str]:
@@ -109,19 +157,3 @@ def split_quoted_string(text: str, delimiters: str = ', ') -> set[str]:
         result.add(''.join(current_token))
 
     return result
-
-class IngestStatus(Enum):
-    # flake8: noqa=E221
-    NONE            = None
-    EXTERNAL        = 'external'
-    UPLOADED        = 'uploaded'
-    ENCODING        = 'encoding'
-    DONE            = 'done'
-    PUBLISHED       = 'published'
-    STARTING        = 'starting'
-    DOWNLOADING     = 'downloading'
-    PACKAGING       = 'packaging'
-    UPLOADING       = 'uploading'
-    INGESTED        = 'ingested'
-    QUEUED_START    = 'queued_start'
-    UNAVAILABLE     = 'unavailable'

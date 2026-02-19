@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "boinko-youtube-channel-0.1.0.jsonschema",
+  "title": "YouTube Channel Metadata",
+  "description": "Schema for representing metadata about a YouTube channel, including identifiers, descriptive fields, statistics, and related media.",
+  "type": "object",
+  "properties": {
+    "channel_id": {
+      "type": ["string", "null"],
+      "format": "uuid",
+      "description": "The channel UUID or identifier"
+    },
+    "channel": {
+      "type": "string",
+      "description": "The channel vanity name (without @)"
+    },
+    "title": {
+      "type": ["string", "null"],
+      "description": "The human-readable channel title"
+    },
+    "description": {
+      "type": ["string", "null"],
+      "description": "The channel description"
+    },
+    "keywords": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "List of keywords/tags associated with the channel"
+    },
+    "categories": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Channel categories"
+    },
+    "is_family_safe": {
+      "type": "boolean",
+      "description": "Whether the channel is designated family-safe"
+    },
+    "country": {
+      "type": ["string", "null"],
+      "description": "ISO2 country code (if available)"
+    },
+    "available_country_codes": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "List of available country codes for the channel"
+    },
+    "channel_thumbnails": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/thumbnail" },
+      "description": "Thumbnails for the channel avatar"
+    },
+    "banners": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/thumbnail" },
+      "description": "Banner images for the channel"
+    },
+    "external_urls": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/external_link" },
+      "description": "External links listed on the channel (website, social)"
+    },
+    "joined_date": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "Channel joined date as an ISO-8601 datetime string"
+    },
+    "rss_url": {
+      "type": ["string", "null"],
+      "format": "uri",
+      "description": "RSS feed URL for the channel if available"
+    },
+    "verified": {
+      "type": "boolean",
+      "description": "Whether the channel is verified"
+    },
+    "subscriber_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of subscribers (defaults to 0 when unknown)"
+    },
+    "video_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of videos on the channel (defaults to 0)"
+    },
+    "view_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total view count for the channel (defaults to 0)"
+    }
+  },
+  "required": ["channel"],
+  "additionalProperties": false,
+  "$defs": {
+    "thumbnail": {
+      "type": "object",
+      "properties": {
+        "id": { "type": ["string", "null"] },
+        "url": { "type": "string", "format": "uri" },
+        "youtube_url": { "type": "string", "format": "uri" },
+        "width": { "type": ["integer", "null"], "minimum": 0 },
+        "height": { "type": ["integer", "null"], "minimum": 0 },
+        "preference": { "type": "string" },
+        "display_hint": { "type": ["string", "null"], "description": "Hint for banner display (e.g. banner, tvBanner)" }
+      },
+      "required": ["url"],
+      "additionalProperties": false
+    },
+    "external_link": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "url": { "type": "string", "format": "uri" },
+        "priority": { "type": "integer" }
+      },
+      "required": ["name", "url", "priority"],
+      "additionalProperties": false
+    }
+  }
+}

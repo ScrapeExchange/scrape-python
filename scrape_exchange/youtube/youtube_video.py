@@ -137,6 +137,40 @@ class YouTubeCaption:
             }
         )
 
+class YouTubeShort:
+    SHORTS_URL: str = 'https://www.youtube.com/shorts/{video_id}'
+
+    def __init__(self, video_id: str, title: str) -> None:
+        self.video_id: str = video_id
+        self.title: str = title
+
+    def __eq__(self, other: Self) -> bool:
+        if not isinstance(other, YouTubeShort):
+            return False
+
+        return self.video_id == other.video_id
+
+    def to_dict(self) -> dict[str, str]:
+        '''
+        Returns a dict representation of the short
+        '''
+
+        return {
+            'video_id': self.video_id,
+            'title': self.title
+        }
+
+    @staticmethod
+    def from_dict(data: dict[str, str | int]) -> Self:
+        '''
+        Factory for YouTubeShort, parses data provided by yt-dlp
+        '''
+
+        return YouTubeShort(
+            video_id=data.get('video_id'),
+            title=data.get('title')
+        )
+
 
 class YouTubeVideo:
     VIDEO_URL: str = 'https://www.youtube.com/watch?v={video_id}'
@@ -960,24 +994,3 @@ class YouTubeVideo:
             f'Video {self.video_id} transitioned to {ingest_status}',
         )
         self.ingest_status = ingest_status
-
-    async def persist(self) -> bool:
-        '''
-        Adds or updates a video in the datastore.
-
-        :returns: True if the video was added, False if it already existed
-        :raises:
-        '''
-
-        update: bool = False
-        if self.ingest_status == IngestStatus.UNAVAILABLE:
-            raise ValueError(
-                'Cannot persist video with UNAVAILABLE '
-                f'status: {self.video_id}'
-            )
-        self._transition_state(IngestStatus.EXTERNAL)
-
-        _LOGGER.info(f'Added YouTube video: {self.video_id}')
-
-        return not update
-

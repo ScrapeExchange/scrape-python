@@ -82,7 +82,7 @@ class AsyncYouTubeClient(AsyncClient):
 
         return dict(self.headers)
 
-    async def get(self, url: str, delay: int | None = None, **kwargs
+    async def get(self, url: str, retries: int = 3, delay: float = 1.0, **kwargs
                   ) -> str | None:
         '''
         Performs a GET request to the specified URL.
@@ -93,15 +93,20 @@ class AsyncYouTubeClient(AsyncClient):
         :returns: The HTTP response.
         '''
 
-        log_extra: dict = {'url': url}
-
         try:
-            _LOGGER.debug(f'HTTP GET {url}', extra=log_extra)
+            _LOGGER.debug(f'HTTP GET {url}')
             resp: Response = await super().get(url, **kwargs)
-        except ReadTimeout as exc:
-            _LOGGER.debug(
-                f'HTTP GET for {url} timed out: {exc}', extra=log_extra
-            )
+        except Exception as exc:
+            _LOGGER.debug(f'HTTP GET error for {url}: {exc}')
+            if retries > 0:
+                await asyncio.sleep(delay)
+                _LOGGER.debug(
+                    f'Retrying GET request to {url} (retries left: {retries})'
+                )
+                return await self.get(
+                    url, retries=retries - 1, delay=delay*2, **kwargs
+                )
+
             raise RuntimeError(f'Timeout fetching URL {url}')
 
         if (resp.status_code == 303
