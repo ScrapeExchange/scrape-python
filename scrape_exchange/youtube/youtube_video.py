@@ -188,7 +188,6 @@ class YouTubeVideo:
 
         self.video_id: str | None = video_id
         self.title: str | None = None
-        self.kind: str | None = None
         self.long_title: str | None = None
         self.description: str | None = None
 
@@ -265,7 +264,6 @@ class YouTubeVideo:
             self.video_id == other.video_id
             and self.title == other.title
             and self.channel_name == other.channel_name
-            and self.kind == other.kind
             and self.long_title == other.long_title
             and self.description == other.description
             and self.channel_id == other.channel_id
@@ -323,7 +321,6 @@ class YouTubeVideo:
         data: dict[str, any] = {
             'video_id': self.video_id,
             'title': self.title,
-            'kind': self.kind,
             'long_title': self.long_title,
             'description': self.description,
             'channel_id': self.channel_id,
@@ -415,7 +412,6 @@ class YouTubeVideo:
         )
 
         video.title = data.get('title')
-        video.kind = data.get('kind')
         video.long_title = data.get('long_title')
         video.description = data.get('description')
         video.channel_id = data.get('channel_id')
@@ -961,11 +957,11 @@ class YouTubeVideo:
         :returns: True if the video is a YouTube Short, False otherwise
         '''
 
-        if self.duration and self.duration > 60:
-            return False
-
         if self.aspect_ratio < 1:
             return True
+
+        if self.duration and self.duration > 60:
+            return False
 
         # Check for Shorts-specific markers in initial data
         try:

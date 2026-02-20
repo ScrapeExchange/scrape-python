@@ -913,7 +913,10 @@ class YouTubeChannel:
 
                 file_path: str = os.path.join(save_dir, f'{video_id}.json')
                 async with aiofiles.open(file_path, 'w') as f:
-                    await f.write(orjson.dumps(video.to_dict()).decode('utf-8'))
+                    await f.write(
+                        orjson.dumps(
+                            video.to_dict(), option=orjson.OPT_INDENT_2
+                        ).decode('utf-8'))
 
                 videos_imported += 1
                 already_ingested_videos[video_id] = (

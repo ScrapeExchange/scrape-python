@@ -14,8 +14,6 @@ from scrape_exchange.youtube.youtube_client import AsyncYouTubeClient
 
 
 class TestAuth(unittest.IsolatedAsyncioTestCase):
-
-
     async def test_get_headers_and_init_cookies(self) -> None:
         # Custom headers and consent cookies applied at init
         headers: dict[str, str] = {'X-Custom': 'Yes'}
@@ -99,8 +97,6 @@ class TestAuth(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(httpx.RequestError):
                 # the underlying httpx AsyncClient.get is patched to raise
                 await client.get('https://example.com')
-
-
 
 
 if __name__ == '__main__':
