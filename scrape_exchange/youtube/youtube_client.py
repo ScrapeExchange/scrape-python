@@ -16,6 +16,7 @@ from logging import getLogger
 from httpx import AsyncClient
 from httpx import Response
 from httpx import ReadTimeout
+from httpx import RequestError
 
 
 _LOGGER: Logger = getLogger(__name__)
@@ -83,7 +84,7 @@ class AsyncYouTubeClient(AsyncClient):
         return dict(self.headers)
 
     async def get(self, url: str, retries: int = 3, delay: float = 1.0,
-                  **kwargs) -> str | None:
+                  follow_redirects: bool = True, **kwargs) -> str | None:
         '''
         Performs a GET request to the specified URL.
 
@@ -96,10 +97,25 @@ class AsyncYouTubeClient(AsyncClient):
         try:
             _LOGGER.debug(f'HTTP GET {url}')
             resp: Response = await super().get(url, **kwargs)
+        except ReadTimeout as exc:
+            _LOGGER.debug(f'HTTP GET timeout for {url}: {exc}')
+            if retries > 0:
+                await asyncio.sleep(delay-1, delay)
+                _LOGGER.debug(
+                    f'Retrying GET request to {url} (retries left: {retries})'
+                )
+                return await self.get(
+                    url, retries=retries - 1, delay=delay*2, **kwargs
+                )
+
+            raise RuntimeError(f'Timeout fetching URL {url}')
+        except RequestError as exc:
+            _LOGGER.debug(f'HTTP GET request error for {url}: {exc}')
+            raise
         except Exception as exc:
             _LOGGER.debug(f'HTTP GET error for {url}: {exc}')
             if retries > 0:
-                await asyncio.sleep(delay)
+                await asyncio.sleep(delay-1, delay)
                 _LOGGER.debug(
                     f'Retrying GET request to {url} (retries left: {retries})'
                 )
@@ -112,11 +128,15 @@ class AsyncYouTubeClient(AsyncClient):
         if (resp.status_code == 303
                 and 'youtube.com' in resp.headers.get('Location', '')):
             # Follow redirect just once if it redirects to another YouTube URL
-            logging.debug(f'Following redirect to {resp.headers["Location"]}')
-            resp = await super().get(resp.headers['Location'], **kwargs)
+            if follow_redirects:
+                _LOGGER.debug(f'Following redirect to {resp.headers["Location"]}')
+                return await self.get(
+                    resp.headers['Location'], retries=retries, delay=delay,
+                    follow_redirects=False, **kwargs
+                )
 
         if resp.status_code != 200:
-            logging.warning(f'Scrape for {url} failed: {resp.status_code}')
+            _LOGGER.warning(f'Scrape for {url} failed: {resp.status_code}')
             return None
 
         if delay:
@@ -127,10 +147,6 @@ class AsyncYouTubeClient(AsyncClient):
     @staticmethod
     async def _delay(min: int = 2, max: int = 5) -> None:
         await asyncio.sleep(random() * (max - min) + min)
-
-    # get_consent_cookies removed — consent cookie management is no longer
-    # handled by this client. Use explicit cookie injection via
-    # `consent_cookies` constructor parameter or manage cookies externally.
 
     def create_cookie_header(self, cookies: dict) -> str:
         '''
