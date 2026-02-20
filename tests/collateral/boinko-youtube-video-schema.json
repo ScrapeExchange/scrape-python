@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "boinko-youtube-video-0.1.0.jsonschema",
+  "title": "YouTube Video Metadata",
+  "description": "Schema representing the output of YouTubeVideo.to_dict(), including identifiers, timestamps, thumbnails, captions, formats and statistics.",
+  "type": "object",
+  "properties": {
+    "video_id": { "type": ["string", "null"], "description": "YouTube video id" },
+    "title": { "type": ["string", "null"], "description": "Short title" },
+    "long_title": { "type": ["string", "null"], "description": "Long title" },
+    "description": { "type": ["string", "null"], "description": "Video description" },
+    "channel_id": { "type": ["string", "null"], "description": "Channel id" },
+    "channel_name": { "type": ["string", "null"], "description": "Channel vanity name" },
+    "channel_url": { "type": ["string", "null"], "format": "uri", "description": "Channel URL" },
+    "channel_is_verified": { "type": ["boolean", "null"], "description": "Channel verified flag" },
+    "channel_follower_count": { "type": ["integer", "null"], "minimum": 0 },
+    "channel_thumbnail": { "$ref": "#/$defs/thumbnail" },
+    "availability": { "type": ["string", "null"] },
+    "view_count": { "type": ["integer", "null"], "minimum": 0 },
+    "like_count": { "type": ["integer", "null"], "minimum": 0 },
+    "dislike_count": { "type": ["integer", "null"], "minimum": 0 },
+    "comment_count": { "type": ["integer", "null"], "minimum": 0 },
+    "url": { "type": ["string", "null"], "format": "uri" },
+    "embed_url": { "type": ["string", "null"], "format": "uri" },
+    "is_live": { "type": "boolean" },
+    "was_live": { "type": "boolean" },
+    "media_type": { "type": ["string", "null"], "description": "One of the YouTube media types", "enum": ["video", "short", "playlist", "channel", "live", "movie", null] },
+    "embedable": { "type": ["boolean", "null"] },
+    "age_limit": { "type": "integer", "minimum": 0 },
+    "age_restricted": { "type": "boolean" },
+    "is_family_safe": { "type": ["boolean", "null"] },
+    "aspect_ratio": { "type": ["number", "null"] },
+    "duration": { "type": ["integer", "null"], "minimum": 0, "description": "Duration in seconds" },
+    "heatmaps": { "type": "array", "items": { "type": "object", "additionalProperties": { "type": "number" } } },
+    "license": { "type": ["string", "null"] },
+    "locale": { "type": ["string", "null"] },
+    "default_audio_language": { "type": ["string", "null"] },
+    "tags": { "type": "array", "items": { "type": "string" } },
+    "annotations": { "type": "array", "items": { "type": "string" } },
+    "keywords": { "type": "array", "items": { "type": "string" } },
+    "privacy_status": { "type": "string" },
+    "created_timestamp": { "type": ["string", "null"], "format": "date-time" },
+    "uploaded_timestamp": { "type": ["string", "null"], "format": "date-time" },
+    "published_timestamp": { "type": ["string", "null"], "format": "date-time" },
+    "thumbnails": { "type": "object", "additionalProperties": { "$ref": "#/$defs/thumbnail" } },
+    "subtitles": { "type": "object", "additionalProperties": { "$ref": "#/$defs/caption" } },
+    "automatic_captions": { "type": "object", "additionalProperties": { "$ref": "#/$defs/caption" } },
+    "formats": { "type": "object", "additionalProperties": { "$ref": "#/$defs/format" } }
+  },
+  "required": ["video_id"],
+  "additionalProperties": false,
+  "$defs": {
+    "thumbnail": {
+      "type": "object",
+      "properties": {
+        "id": { "type": ["string", "null"] },
+        "url": { "type": "string", "format": "uri" },
+        "youtube_url": { "type": ["string", "null"], "format": "uri" },
+        "width": { "type": ["integer", "null"], "minimum": 0 },
+        "height": { "type": ["integer", "null"], "minimum": 0 },
+        "preference": { "type": ["string", "null"] },
+        "display_hint": { "type": ["string", "null"] }
+      },
+      "required": ["url"],
+      "additionalProperties": false
+    },
+    "caption": {
+      "type": "object",
+      "properties": {
+        "language_code": { "type": ["string", "null"] },
+        "url": { "type": ["string", "null"] , "format": "uri"},
+        "extension": { "type": ["string", "null"] },
+        "protocol": { "type": ["string", "null"] }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "fragment": {
+      "type": "object",
+      "properties": {
+        "url": { "type": ["string", "null"], "format": "uri" },
+        "duration": { "type": ["number", "null"], "minimum": 0 },
+        "path": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "format": {
+      "type": "object",
+      "properties": {
+        "format_id": { "type": ["string", "null"] },
+        "format_note": { "type": ["string", "null"] },
+        "ext": { "type": ["string", "null"] },
+        "audio_ext": { "type": ["string", "null"] },
+        "video_ext": { "type": ["string", "null"] },
+        "protocol": { "type": ["string", "null"] },
+        "audio_codec": { "type": ["string", "null"] },
+        "video_codec": { "type": ["string", "null"] },
+        "container": { "type": ["string", "null"] },
+        "url": { "type": ["string", "null"], "format": "uri" },
+        "width": { "type": ["integer", "null"], "minimum": 0 },
+        "height": { "type": ["integer", "null"], "minimum": 0 },
+        "fps": { "type": ["number", "null"], "minimum": 0 },
+        "quality": { "type": ["number", "null"] },
+        "dynamic_range": { "type": ["string", "null"] },
+        "has_drm": { "type": ["boolean", "null"] },
+        "tbr": { "type": ["number", "null"] },
+        "abr": { "type": ["number", "null"] },
+        "asr": { "type": ["integer", "null"] },
+        "audio_channels": { "type": ["integer", "null"] },
+        "rows": { "type": ["integer", "null"] },
+        "cols": { "type": ["integer", "null"] },
+        "fragments": { "type": "array", "items": { "$ref": "#/$defs/fragment" } },
+        "resolution": { "type": ["string", "null"] },
+        "aspect_ratio": { "type": ["number", "null"] },
+        "format": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    }
+  }
+}

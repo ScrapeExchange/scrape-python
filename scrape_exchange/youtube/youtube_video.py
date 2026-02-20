@@ -9,6 +9,7 @@ Model a Youtube video
 import os
 import re
 
+from enum import Enum
 from typing import Self
 from random import randrange
 from logging import Logger
@@ -36,6 +37,15 @@ _LOGGER: Logger = getLogger(__name__)
 
 DENO_PATH: str = os.environ.get('HOME', '') + '/.deno/bin/deno'
 PO_TOKEN_URL: str = 'http://localhost:4416'
+
+
+class YouTubeMediaType(str, Enum):
+    VIDEO = 'video'
+    SHORT = 'short'
+    PLAYLIST = 'playlist'
+    CHANNEL = 'channel'
+    LIVE = 'live'
+    MOVIE = 'movie'
 
 
 class YouTubeVideoChapter:
@@ -137,40 +147,6 @@ class YouTubeCaption:
             }
         )
 
-class YouTubeShort:
-    SHORTS_URL: str = 'https://www.youtube.com/shorts/{video_id}'
-
-    def __init__(self, video_id: str, title: str) -> None:
-        self.video_id: str = video_id
-        self.title: str = title
-
-    def __eq__(self, other: Self) -> bool:
-        if not isinstance(other, YouTubeShort):
-            return False
-
-        return self.video_id == other.video_id
-
-    def to_dict(self) -> dict[str, str]:
-        '''
-        Returns a dict representation of the short
-        '''
-
-        return {
-            'video_id': self.video_id,
-            'title': self.title
-        }
-
-    @staticmethod
-    def from_dict(data: dict[str, str | int]) -> Self:
-        '''
-        Factory for YouTubeShort, parses data provided by yt-dlp
-        '''
-
-        return YouTubeShort(
-            video_id=data.get('video_id'),
-            title=data.get('title')
-        )
-
 
 class YouTubeVideo:
     VIDEO_URL: str = 'https://www.youtube.com/watch?v={video_id}'
@@ -213,19 +189,18 @@ class YouTubeVideo:
         self.comment_count: int | None = None
 
         self.url: str | None = None
-        self.short_url: str | None = None
         self.embed_url: str | None = None
         self.thumbnails: dict[YouTubeThumbnail] = {}
 
         self.is_live: bool = False
         self.was_live: bool = False
-        self.is_short: bool = False
+        self.media_type: YouTubeMediaType | None = None
         self.embedable: bool | None = None
 
         self.age_limit: int = 0
         self.age_restricted: bool = False
         self.is_family_safe: bool | None = None
-        self.aspect_ratio: str | None = None
+        self.aspect_ratio: float = 0.0
 
         # Duration of the video in seconds
         self.duration: int | None = None
@@ -276,9 +251,8 @@ class YouTubeVideo:
             and self.published_timestamp == other.published_timestamp
             and self.availability == other.availability
             and self.url == other.url
-            and self.short_url == other.short_url
             and self.embed_url == other.embed_url
-            and self.is_short == other.is_short
+            and self.media_type == other.media_type
             and self.embedable == other.embedable
             and self.age_limit == other.age_limit
             and self.age_restricted == other.age_restricted
@@ -334,11 +308,10 @@ class YouTubeVideo:
             'dislike_count': self.dislike_count,
             'comment_count': self.comment_count,
             'url': self.url,
-            'short_url': self.short_url,
             'embed_url': self.embed_url,
             'is_live': self.is_live,
             'was_live': self.was_live,
-            'is_short': self.is_short,
+            'media_type': self.media_type.value if self.media_type else None,
             'embedable': self.embedable,
             'age_limit': self.age_limit,
             'age_restricted': self.age_restricted,
@@ -424,16 +397,16 @@ class YouTubeVideo:
         video.dislike_count = data.get('dislike_count')
         video.comment_count = data.get('comment_count')
         video.url = data.get('url')
-        video.short_url = data.get('short_url')
         video.embed_url = data.get('embed_url')
         video.is_live = data.get('is_live', False)
         video.was_live = data.get('was_live', False)
-        video.is_short = data.get('is_short', False)
+        media_type: str | None = data.get('media_type')
+        video.media_type = YouTubeMediaType(media_type) if media_type else None
         video.embedable = data.get('embedable')
         video.age_limit = data.get('age_limit', 0)
         video.age_restricted = data.get('age_restricted', False)
         video.is_family_safe = data.get('is_family_safe')
-        video.aspect_ratio = data.get('aspect_ratio')
+        video.aspect_ratio = float(data.get('aspect_ratio', 0))
         video.duration = data.get('duration')
         video.heatmaps = data.get('heatmaps', [])
         video.license = data.get('license')
@@ -443,6 +416,8 @@ class YouTubeVideo:
         video.annotations = set(data.get('annotations', []))
         video.keywords = set(data.get('keywords', []))
         video.privacy_status = data.get('privacy_status', 'public')
+        if isinstance(video.privacy_status, bool):
+            video.privacy_status = 'public' if video.privacy_status else 'private'
 
         if 'created_timestamp' in data:
             try:
@@ -538,8 +513,6 @@ class YouTubeVideo:
         self._parse_video_html(initial_data, player_response)
 
         await self._scrape_video()
-
-        self.is_short = self._is_short(initial_data)
 
         if save_dir:
             await self.to_file(save_dir)
@@ -696,9 +669,9 @@ class YouTubeVideo:
             )
             raise ValueError('Missing microformat data for video')
 
-        # Video ID and URLs
+        # Video ID and URLs. These will be changed later if the video is a
+        # short
         self.url = f'https://www.youtube.com/watch?v={self.video_id}'
-        self.short_url = f'https://youtu.be/{self.video_id}'
         self.embed_url = f'https://www.youtube.com/embed/{self.video_id}'
 
         self.title = video_details.get('title')
@@ -737,19 +710,16 @@ class YouTubeVideo:
 
         self.is_family_safe = microformat.get('isFamilySafe', False)
 
-        self.privacy_status = microformat.get(
-            'isUnlisted', self.privacy_status or 'public')
+        if not self.privacy_status:
+            self.privacy_status = microformat.get('privacyStatus', 'public')
+            if isinstance(self.privacy_status, bool) and self.privacy_status:
+                self.privacy_status = 'private'
+            else:
+                self.privacy_status = 'public'
 
         self.is_live = video_details.get(
             'isLive', video_details.get('isLiveContent', False)
         )
-
-        results: str = initial_data.get('contents', {}).get(
-                'twoColumnWatchNextResults', {}).get('secondaryResults', '')
-        if (self.duration and self.duration < 60
-                and microformat.get('isShortsEligible', False)
-                and 'reelShelfRenderer' in results):
-            self.is_short = True
 
         self.keywords = self.keywords | set(video_details.get('keywords', []))
 
@@ -887,6 +857,12 @@ class YouTubeVideo:
             'channel_follower_count'
         )
         self.embedable = video_info.get('playable_in_embed', True)
+        try:
+            self.media_type = YouTubeMediaType(
+                video_info.get('media_type').lower()
+            )
+        except (KeyError, ValueError):
+            self.media_type = None
 
         self.description = video_info.get('description')
         self.title = video_info.get('title')
@@ -905,7 +881,7 @@ class YouTubeVideo:
         self.default_audio_language = video_info.get('language')
         self.age_limit = self.age_limit or video_info.get('age_limit', 0)
         self.heatmaps = video_info.get('heatmaps', [])
-        self.aspect_ratio: str = video_info.get('aspect_ratio')
+        self.aspect_ratio: float = float(video_info.get('aspect_ratio', 0))
 
         for language_code, captions in video_info.get(
                 'automatic_captions', {}).items():
@@ -947,37 +923,6 @@ class YouTubeVideo:
             formats[yt_format.format_id] = yt_format
 
         return formats
-
-    def _is_short(self, initial_data: dict) -> bool:
-        '''
-        Determine if the video is a YouTube Short
-
-        :param video_details: videoDetails section from the player response
-        :param initial_data: ytInitialData extracted from the HTML page
-        :returns: True if the video is a YouTube Short, False otherwise
-        '''
-
-        if self.aspect_ratio < 1:
-            return True
-
-        if self.duration and self.duration > 60:
-            return False
-
-        # Check for Shorts-specific markers in initial data
-        try:
-            # Look for reelWatchEndpoint or shorts indicators
-            renderer: str = initial_data.get(
-                'contents', {}
-            ).get(
-                'twoColumnWatchNextResults', {}
-            ).get(
-                'secondaryResults', {}
-            ).get(
-                'reelShelfRenderer'
-            )
-            return bool(renderer)
-        except (KeyError, TypeError):
-            return False
 
     def _transition_state(self, ingest_status: IngestStatus | str) -> None:
         '''

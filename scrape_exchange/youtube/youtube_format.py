@@ -72,10 +72,10 @@ class YouTubeFormat:
         self.audio_channels: int | None = None
         self.rows: int | None = None
         self.cols: int | None = None
-        self.fragments: list[YouTubeFragment] = []
         self.resolution: str | None = None
         self.aspect_ratio: str | None = None
         self.format: str | None = None
+        self.fragments: list[YouTubeFragment] = []
 
     def __str__(self) -> str:
         return (
@@ -122,10 +122,10 @@ class YouTubeFormat:
             'audio_channels': self.audio_channels,
             'rows': self.rows,
             'cols': self.cols,
-            'fragments': [fragment.to_dict() for fragment in self.fragments],
             'resolution': self.resolution,
             'aspect_ratio': self.aspect_ratio,
             'format': self.format,
+            'fragments': [fragment.to_dict() for fragment in self.fragments],
         }
 
         return data
@@ -140,28 +140,27 @@ class YouTubeFormat:
         yt_format.format_id = data['format_id']
         yt_format.format_note = data.get('format_note')
         yt_format.ext = data.get('ext')
-        yt_format.protocol = data.get('protocol')
-        yt_format.audio_codec = data.get('audiocodec')
-        yt_format.video_codec = data.get('videocodec')
-        yt_format.container = data.get('container')
         yt_format.audio_ext = data.get('audio_ext')
         yt_format.video_ext = data.get('video_ext')
+        yt_format.protocol = data.get('protocol')
+        yt_format.audio_codec = data.get('audio_codec', data.get('audiocodec'))
+        yt_format.video_codec = data.get('video_codec', data.get('videocodec'))
+        yt_format.container = data.get('container')
         yt_format.url = data.get('url')
         yt_format.width = data.get('width')
         yt_format.height = data.get('height')
         yt_format.fps = data.get('fps')
+        yt_format.quality = data.get('quality')
+        yt_format.dynamic_range = data.get('dynamic_range')
+        yt_format.has_drm = data.get('has_drm')
         yt_format.tbr = data.get('tbr')
         yt_format.asr = data.get('asr')
         yt_format.abr = data.get('abr')
+        yt_format.audio_channels = data.get('audio_channels')
         yt_format.rows = data.get('rows')
         yt_format.cols = data.get('cols')
-        yt_format.audio_channels = data.get('audio_channels')
-        yt_format.dynamic_range = data.get('dynamic_range')
-
         yt_format.resolution = data.get('resolution')
         yt_format.aspect_ratio = data.get('aspect_ratio')
-        yt_format.audio_ext = data.get('audio_ext')
-        yt_format.video_ext = data.get('video_ext')
         yt_format.format = data.get('format')
 
         for fragment_data in data.get('fragments', []):
