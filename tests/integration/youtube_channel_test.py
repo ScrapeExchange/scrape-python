@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 
 import orjson
 import aiofiles
-from scrape_exchange.youtube.youtube_channel import YouTubeChannel
+from scrape_exchange.youtube.youtube_channel import YouTubeChannel, YouTubeChannelTabs
 from scrape_exchange.youtube.youtube_channel import YouTubeChannelPageType
 
 from scrape_exchange.youtube.youtube_video import DENO_PATH, PO_TOKEN_URL
@@ -150,6 +150,21 @@ class TestIntegration(unittest.IsolatedAsyncioTestCase):
         )
         self.assertGreaterEqual(len(channel.podcast_ids), 1)
 
+    async def test_youtube_channel_tabs_scrape(self) -> None:
+        channel_tabs: YouTubeChannelTabs = YouTubeChannelTabs(
+            channel_id='UC22BdTgxefuvUivrjesETjg'
+        )
+
+        video_ids: set[str]
+        podcast_ids: set[str]
+        playlist_ids: set[str]
+        video_ids, podcast_ids, playlist_ids = \
+            await channel_tabs.scrape_content_ids(
+                channel_id='UC22BdTgxefuvUivrjesETjg'
+            )
+        self.assertGreaterEqual(len(video_ids), 3)
+        self.assertGreaterEqual(len(podcast_ids), 3)
+        self.assertGreaterEqual(len(playlist_ids), 3)
 
 if __name__ == '__main__':
     unittest.main()

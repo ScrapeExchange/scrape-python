@@ -145,7 +145,7 @@ class AsyncYouTubeClient(AsyncClient):
         return resp.text
 
     @staticmethod
-    async def _delay(min: int = 2, max: int = 5) -> None:
+    async def _delay(min: float = 2, max: float = 5) -> None:
         await asyncio.sleep(random() * (max - min) + min)
 
     def create_cookie_header(self, cookies: dict) -> str:

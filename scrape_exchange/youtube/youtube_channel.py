@@ -1230,6 +1230,18 @@ class YouTubeChannel:
     def parse_nested_dicts(keys: list[str], data: dict[str, any],
                            final_type: callable
                            ) -> str | int | float | list[object] | None:
+        '''
+        Traverses the nested dictionaries in the scraped data to find the value
+        at the end of the path defined by the keys list. If the value is not
+        found or is not of the expected type, returns None.
+        :param keys: the list of keys to traverse the nested dictionaries
+        :param data: the data to traverse
+        :param final_type: the expected type of the value at the end of the
+        path
+        :returns: the value at the end of the path or None if not found or not
+        of the expected type
+        '''
+
         for key in keys:
             if key in data:
                 data = data[key]
@@ -1483,13 +1495,220 @@ class YouTubeChannel:
 
         return video
 
+
 class YouTubeChannelTabs:
     def __init__(self, channel_id: str) -> None:
-        self.channel_id = channel_id
+        self.channel_id: str = channel_id
+        self.client: InnerTube = InnerTube('WEB', '2.20230728.00.00')
 
     @staticmethod
     async def scrape_content_ids(channel_id: str
                                  ) -> tuple[set[str], set[str], set[str]]:
         self = YouTubeChannelTabs(channel_id)
-        self.channel_id = channel_id
+        tabs: dict[str, dict[str, any]] = await self.get_first_page()
+
+        tab: dict[str, any]
+        for tab in tabs:
+            continuation_token: str = ''
+            tab_renderer: dict[str, any] = tab.get('tabRenderer')
+
+            if not tab_renderer:
+                _LOGGER.debug(
+                    f'Channel {channel_id} a tab without a tabRenderer, '
+                    f'skipping tab: {tab.get("title", "")}'
+                )
+                continue
+
+            title: str = tab_renderer.get('title', '').lower()
+            if title == 'home':
+                continue
+
+            # Extract the browse params for the tab
+            params: str = tab_renderer['endpoint']['browseEndpoint']['params']
+
+            # Wait a bit so that we don't overload the YT server
+            await AsyncYouTubeClient._delay(0.1, 0.5)
+
+            podcast_ids: set[str] = set()
+            video_ids: set[str] = set()
+            first_run: bool = True
+            while first_run or continuation_token:
+                # Fetch the browse data for the channel's Videos/Shorts/Live
+                page_data: dict = await self._browse(
+                    params=params, continuation_token=continuation_token
+                )
+                # no need to send params when fetching subsequent pages using
+                # the continuation token
+
+                page_tab: dict[str, any] = self.get_tab(page_data, title)
+                if first_run:
+                    params = None
+                    first_run = False
+
+                contents: list = page_tab.get(
+                    'content', {}
+                ).get(
+                    'richGridRenderer', {}
+                ).get('contents', [])
+
+                if not contents:
+                    _LOGGER.debug(
+                        f'No contents found for channel {channel_id} '
+                        f'tab {title}'
+                    )
+                    break
+
+                if title == 'podcasts':
+                    # Podcasts page doesn't have a continuation token, so we
+                    # can exit after the first page
+                    podcast_ids = self.get_podcast_ids(contents)
+                    break
+
+                continuation_token = self.get_continuation_token(
+                    contents.pop()
+                )
+                for content in contents:
+                    video_id = content.get(
+                        'richItemRenderer', {}
+                    ).get(
+                        'content', {}
+                    ).get(
+                        'videoRenderer', {}
+
+                    ).get('videoId')
+                    if video_id:
+                        video_ids.add(video_id)
+
+        return video_ids, podcast_ids, set()
+
+    def get_podcast_ids(self, contents: list) -> set[str]:
+        '''
+        Gets the podcast IDs from the podcasts tab content
+        '''
+        podcast_ids: set[str] = set()
+        for content in contents:
+            podcast_id: str | None = content.get(
+                'richItemRenderer', {}
+            ).get(
+                'content', {}
+            ).get(
+                'lockupViewModel', {}
+            ).get(
+                'contentId'
+            )
+
+            podcast_ids.add(podcast_id) if podcast_id else None
+
+        return podcast_ids
+
+    async def _browse(self, params: str = '', continuation_token: str = '',
+                      max_retries: int = 4) -> dict:
+        retries: int = 1
+        delay_seconds: int = 1
+        while retries <= max_retries:
+            try:
+                if not params:
+                    if not continuation_token:
+                        return self.client.browse(self.channel_id)
+                    else:
+                        return self.client.browse(
+                            self.channel_id, continuation=continuation_token
+                        )
+                else:
+                    # No need to sent continuation token and params
+                    return self.client.browse(
+                        self.channel_id, params=params
+                    )
+            except Exception as e:
+                retries += 1
+                _LOGGER.error(
+                    f'Error fetching videos data (attempt {retries}): {e}'
+                )
+                await AsyncYouTubeClient._delay(
+                    delay_seconds-1, delay_seconds
+                )
+                delay_seconds *= 2
+
+        raise RuntimeError(
+            f'Failed to fetch tabbed data after {max_retries} attempts'
+        )
+
+    async def get_first_page(self) -> list[dict[str, any]]:
+        '''
+        Gets the first page of videos data for the channel by browsing
+        to the channel's Videos/Shorts/Live/Podcasts tab
+
+        :returns: a list containing the data of the tabs.
+        :raises: RuntimeError if the tabs cannot be extracted from the page
+        '''
+
+        # Fetch the browse data for the channel
+        channel_data: dict = await self._browse()
+
+        await AsyncYouTubeClient._delay(0.1, 0.5)
+
+        # Extract the tabs of the channel
+        page_tabs: list[dict[str, any]] = YouTubeChannel.parse_nested_dicts(
+            ['contents', 'twoColumnBrowseResultsRenderer', 'tabs'],
+            channel_data, list
+        )
+
+        if not page_tabs:
+            raise RuntimeError(
+                f'Failed to extract tabs for channel: {self.channel_id}'
+            )
+
+        return page_tabs
+
+    def get_continuation_token(self, last_item: dict) -> str:
+        '''
+        Gets the continuation token from the last_item of the data collected
+        by the Innertube client
+
+        :param last_item: the last item of the data collected by the Innertube
+        client
+        :returns: the continuation token or an empty string if there are no
+        more pages
+        '''
+
+        token: str = last_item.get(
+            'continuationItemRenderer', {}
+        ).get(
+            'continuationEndpoint', {}
+        ).get(
+            'continuationCommand', {}
+        ).get(
+            'token', ''
+        )
+        return token
+
+    def get_tab(self, page_data: dict[str, any], title: str
+                ) -> dict[str, any]:
+        '''
+        Gets the tab renderer for the given page type (Videos, Shorts,
+        Live, Podcasts)
+
+        :param page_tabs: the list of tabs to search through
+        :param title: the title of the tab to find (case-insensitive)
+        :returns: the tab renderer for the given page type
+        :raises: RuntimeError if the tab with the given title cannot be found
+        '''
+
+        page_tabs: list[dict[str, any]] = page_data.get(
+            'contents', {}
+        ).get('twoColumnBrowseResultsRenderer', {}).get('tabs')
+
+        if not page_tabs:
+            raise RuntimeError(
+                f'Failed to extract tabs for channel: {self.channel_id}'
+            )
+
+        for tab in page_tabs or []:
+            tab_renderer: dict[str, any] = tab.get('tabRenderer', {})
+            if tab_renderer.get('title', '').lower() == title:
+                return tab_renderer
+
+        raise RuntimeError(
+            f'Channel {self.channel_id} does not have a {title} tab'
+        )
 
