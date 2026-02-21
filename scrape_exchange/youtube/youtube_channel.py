@@ -1505,11 +1505,13 @@ class YouTubeChannelTabs:
     async def scrape_content_ids(channel_id: str
                                  ) -> tuple[set[str], set[str], set[str]]:
         self = YouTubeChannelTabs(channel_id)
-        tabs: dict[str, dict[str, any]] = await self.get_first_page()
+        tabs: dict[str, dict[str, any]] = await self.get_page_tab()
+
+        podcast_ids: set[str] = set()
+        video_ids: set[str] = set()
 
         tab: dict[str, any]
         for tab in tabs:
-            continuation_token: str = ''
             tab_renderer: dict[str, any] = tab.get('tabRenderer')
 
             if not tab_renderer:
@@ -1529,59 +1531,107 @@ class YouTubeChannelTabs:
             # Wait a bit so that we don't overload the YT server
             await AsyncYouTubeClient._delay(0.1, 0.5)
 
-            podcast_ids: set[str] = set()
-            video_ids: set[str] = set()
-            first_run: bool = True
-            while first_run or continuation_token:
-                # Fetch the browse data for the channel's Videos/Shorts/Live
-                page_data: dict = await self._browse(
-                    params=params, continuation_token=continuation_token
+            # First page: use params to navigate to the tab
+            page_data: dict = await self._browse(params=params)
+            page_tab: dict[str, any] = self.get_tab(page_data, title)
+
+            contents: list = page_tab.get(
+                'content', {}
+            ).get(
+                'richGridRenderer', {}
+            ).get('contents', [])
+
+            if not contents:
+                _LOGGER.debug(
+                    f'No contents found for channel {channel_id} '
+                    f'tab {title}'
                 )
-                # no need to send params when fetching subsequent pages using
-                # the continuation token
+                continue
 
-                page_tab: dict[str, any] = self.get_tab(page_data, title)
-                if first_run:
-                    params = None
-                    first_run = False
+            if title == 'podcasts':
+                # Podcasts page doesn't have a continuation token, so we
+                # can exit after the first page
+                podcast_ids = self._get_podcast_ids(contents)
+                continue
 
-                contents: list = page_tab.get(
-                    'content', {}
-                ).get(
-                    'richGridRenderer', {}
-                ).get('contents', [])
+            continuation_token: str = self.get_continuation_token(contents[-1])
+            if 'continuationItemRenderer' in contents[-1]:
+                contents = contents[:-1]
 
-                if not contents:
-                    _LOGGER.debug(
-                        f'No contents found for channel {channel_id} '
-                        f'tab {title}'
-                    )
+            for content in contents:
+                video_id = self._extract_video_id(content, title)
+                if video_id:
+                    video_ids.add(video_id)
+
+            # Subsequent pages: use continuation token
+            while continuation_token:
+                await AsyncYouTubeClient._delay(0.1, 0.5)
+
+                continued_data: dict = await self._browse(
+                    continuation_token=continuation_token
+                )
+
+                actions: list = continued_data.get(
+                    'onResponseReceivedActions'
+                )
+                if not actions:
                     break
 
-                if title == 'podcasts':
-                    # Podcasts page doesn't have a continuation token, so we
-                    # can exit after the first page
-                    podcast_ids = self.get_podcast_ids(contents)
+                continuation_items: list = actions[0].get(
+                    'appendContinuationItemsAction', {}
+                ).get('continuationItems')
+
+                if not continuation_items:
                     break
 
                 continuation_token = self.get_continuation_token(
-                    contents.pop()
+                    continuation_items[-1]
                 )
-                for content in contents:
-                    video_id = content.get(
-                        'richItemRenderer', {}
-                    ).get(
-                        'content', {}
-                    ).get(
-                        'videoRenderer', {}
+                if 'continuationItemRenderer' in continuation_items[-1]:
+                    continuation_items = continuation_items[:-1]
 
-                    ).get('videoId')
+                for item in continuation_items:
+                    video_id: str | None = self._extract_video_id(item, title)
                     if video_id:
                         video_ids.add(video_id)
 
         return video_ids, podcast_ids, set()
 
-    def get_podcast_ids(self, contents: list) -> set[str]:
+    def _extract_video_id(self, item: dict[str, any], tab_title: str
+                          ) -> str | None:
+        '''
+        Extract a video ID from a rich item renderer, handling both
+        regular videos/live and shorts layouts.
+
+        :param item: a single item from the contents list
+        :param tab_title: the lowercase tab title (videos, shorts, live, etc.)
+        :returns: the video ID or None
+        '''
+
+        if tab_title == 'shorts':
+            video_url: str | None = YouTubeChannel.parse_nested_dicts(
+                [
+                    'richItemRenderer', 'content',
+                    'shortsLockupViewModel', 'onTap',
+                    'innertubeCommand', 'commandMetadata',
+                    'webCommandMetadata', 'url'
+                ], item, str
+            )
+            if video_url and video_url.startswith('/shorts/'):
+                return video_url.split('/')[-1] or None
+            return None
+
+        video_renderer: dict | None = item.get(
+            'richItemRenderer', {}
+        ).get(
+            'content', {}
+        ).get(
+            'videoRenderer', {}
+        )
+
+        return video_renderer.get('videoId') if video_renderer else None
+
+    def _get_podcast_ids(self, contents: list) -> set[str]:
         '''
         Gets the podcast IDs from the podcasts tab content
         '''
@@ -1633,10 +1683,9 @@ class YouTubeChannelTabs:
             f'Failed to fetch tabbed data after {max_retries} attempts'
         )
 
-    async def get_first_page(self) -> list[dict[str, any]]:
+    async def get_page_tab(self) -> list[dict[str, any]]:
         '''
-        Gets the first page of videos data for the channel by browsing
-        to the channel's Videos/Shorts/Live/Podcasts tab
+        Gets the first page of videos data for the channel
 
         :returns: a list containing the data of the tabs.
         :raises: RuntimeError if the tabs cannot be extracted from the page
