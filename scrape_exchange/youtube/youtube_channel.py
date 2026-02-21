@@ -10,6 +10,7 @@ import os
 import re
 
 
+from enum import Enum
 from uuid import UUID
 from typing import Self
 from shutil import rmtree
@@ -75,6 +76,15 @@ class YouTubeChannelLink:
             name=data['name'],
             subscriber_count=data['subscriber_count']
         )
+
+
+class YouTubeChannelPageType(Enum):
+    VIDEOS = 'videos'
+    SHORTS = 'shorts'
+    LIVE = 'live'
+    PODCASTS = 'podcasts'
+    PLAYLISTS = 'playlists'
+    POSTS = 'posts'
 
 
 class YouTubeChannel:
@@ -164,8 +174,7 @@ class YouTubeChannel:
 
         self.channel_links: set[YouTubeChannelLink] = set()
 
-        self.videos: dict[str, YouTubeVideo] = {}
-        self.shorts: dict[str, YouTubeVideo] = {}
+        self.video_ids: set[str] = set()
 
     def __del__(self) -> None:
         rmtree(self._work_dir, ignore_errors=True)
@@ -274,8 +283,10 @@ class YouTubeChannel:
         '''
 
         # Verified badge is hard to find otherwise
-        self.verified = YouTubeChannel.extract_verified_status(
-            page_data=html_content
+        self.verified = (
+            self.verified or YouTubeChannel.extract_verified_status(
+                page_data=html_content
+            )
         )
 
         # YouTube embeds data in a script tag as ytInitialData
@@ -447,7 +458,9 @@ class YouTubeChannel:
 
         page_contents: str | None = await self.browse_client.get(about_url)
 
-        self.channel_id = YouTubeChannel.extract_channel_id(page_contents)
+        self.channel_id = (
+            self.channel_id or YouTubeChannel.extract_channel_id(page_contents)
+        )
 
         page_data: dict[str, any] = self._extract_initial_data(page_contents)
 
@@ -835,17 +848,36 @@ class YouTubeChannel:
 
         return page_links
 
-    async def get_videos_page(self, shorts: bool = False) -> str | None:
+    async def get_channel_page_tab(self, page_type: YouTubeChannelPageType) -> str | None:
         '''
         Gets the videos page HTML content
 
         :returns: HTML content of the videos page
         '''
 
-        if shorts:
-            videos_url: str = self.url.rstrip('/') + '/shorts'
+        videos_url: str
+        if page_type == YouTubeChannelPageType.VIDEOS:
+            videos_url = self.url.rstrip('/') + '/videos'
+        elif page_type == YouTubeChannelPageType.SHORTS:
+            videos_url = self.url.rstrip('/') + '/shorts'
+        elif page_type == YouTubeChannelPageType.LIVE:
+            videos_url = self.url.rstrip('/') + '/live'
+        elif page_type == YouTubeChannelPageType.PODCASTS:
+            videos_url = self.url.rstrip('/') + '/podcasts'
+            raise NotImplementedError(
+                f'Podcast scraping not implemented yet: {videos_url}')
+        elif page_type == YouTubeChannelPageType.PLAYLISTS:
+            videos_url = self.url.rstrip('/') + '/playlists'
+            raise NotImplementedError(
+                f'Playlist scraping not implemented yet: {videos_url}'
+            )
+        elif page_type == YouTubeChannelPageType.POSTS:
+            videos_url = self.url.rstrip('/') + '/posts'
+            raise NotImplementedError(
+                f'Post scraping not implemented yet: {videos_url}'
+            )
         else:
-            videos_url: str = self.url.rstrip('/') + '/videos'
+            raise NotImplementedError(f'Unsupported page type: {page_type}')
 
         page_html: str | None = await self.browse_client.get(videos_url)
 
@@ -854,16 +886,14 @@ class YouTubeChannel:
                 f'No page data found for videos page of channel: {self.name}'
             )
 
-        self.channel_id = self.channel_id or \
-            YouTubeChannel.extract_channel_id(page_html)
-
         page_data: dict[str, any] = self._extract_initial_data(page_html)
 
         return page_data
 
     async def scrape_videos(
         self, save_dir: str, max_videos_per_channel: int = 0,
-        uploaded_dir: str | None = None, shorts: bool = False
+        uploaded_dir: str | None = None,
+        page_type: YouTubeChannelPageType = YouTubeChannelPageType.VIDEOS
     ) -> int:
         '''
         Scrapes videos from the YouTube website
@@ -882,16 +912,15 @@ class YouTubeChannel:
         if not save_dir or not os.path.isdir(save_dir):
             raise ValueError(f'Invalid save directory: {save_dir}')
 
-        page_data: dict[str, any] = await self.get_videos_page(shorts)
+        page_data: dict[str, any] = await self.get_channel_page_tab(page_type)
 
         self.parse_channel_video_data(page_data)
 
         already_ingested_videos: dict[str, tuple[IngestStatus, datetime]] = \
             get_imported_assets(save_dir, uploaded_dir)
 
-        self.video_ids: list[str] = []
         try:
-            self.video_ids = await self.get_video_page_video_ids(shorts)
+            self.video_ids = await self.get_channel_page_video_ids(page_type)
         except Exception as exc:
             raise RuntimeError(f'Failed to extract video IDs: {exc}') from exc
 
@@ -931,7 +960,7 @@ class YouTubeChannel:
                 raise RuntimeError(f'Failed to scrape video: {exc}') from exc
 
         _LOGGER.debug(
-            f'Scraped {len(self.videos)} videos '
+            f'Scraped {videos_imported} videos '
             f'from YouTube channel: {self.name}'
         )
 
@@ -1232,7 +1261,9 @@ class YouTubeChannel:
 
         return data
 
-    async def get_video_page_video_ids(self, shorts: bool = False) -> list[str]:
+    async def get_channel_page_video_ids(
+        self, page_type: YouTubeChannelPageType
+    ) -> list[str]:
         async def browse(max_retries: int = 4) -> dict:
             retries: int = 1
             delay_seconds: int = 1
@@ -1263,8 +1294,21 @@ class YouTubeChannel:
 
         video_ids: list[str] = []
 
-        tab_name: str = 'Shorts' if shorts else 'Videos'
-        tab_index: int = 2 if shorts else 1
+        tab_name: str
+        tab_index: int
+        if page_type == YouTubeChannelPageType.VIDEOS:
+            tab_name = 'Videos'
+            tab_index = 1
+        elif page_type == YouTubeChannelPageType.SHORTS:
+            tab_name = 'Shorts'
+            tab_index = 2
+        elif page_type == YouTubeChannelPageType.LIVE:
+            tab_name = 'Live'
+            tab_index = 3
+        else:
+            raise NotImplementedError(
+                f'Scraping not supported for page type: {page_type}'
+            )
         first_run: bool = True
         continuation_token: str = ''
         while first_run or continuation_token:
@@ -1333,7 +1377,7 @@ class YouTubeChannel:
 
             # Loop through each video and log out its details
             for rich_item in rich_items:
-                if shorts:
+                if page_type == YouTubeChannelPageType.SHORTS:
                     video_url: str = YouTubeChannel.parse_nested_dicts(
                         [
                             'richItemRenderer', 'content',
@@ -1343,7 +1387,8 @@ class YouTubeChannel:
                         ], rich_item, str
                     )
                     video_id = video_url.split('/')[-1] if video_url else None
-                else:
+                elif page_type in (YouTubeChannelPageType.VIDEOS,
+                                   YouTubeChannelPageType.LIVE):
                     video_renderer: dict | None = \
                         YouTubeChannel.parse_nested_dicts(
                             ['richItemRenderer', 'content', 'videoRenderer'],
