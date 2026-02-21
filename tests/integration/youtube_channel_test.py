@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 import orjson
 import aiofiles
 from scrape_exchange.youtube.youtube_channel import YouTubeChannel
+from scrape_exchange.youtube.youtube_channel import YouTubeChannelPageType
 
 from scrape_exchange.youtube.youtube_video import DENO_PATH, PO_TOKEN_URL
 
@@ -59,7 +60,7 @@ class TestIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(channel.video_count, 384)
         self.assertGreaterEqual(channel.view_count, 755841320)
 
-        output_file: str = f'{OUTPUT_DIR}/{YOUTUBE_CHANNEL}.json'
+        output_file: str = f'{self.temp_dir}/{YOUTUBE_CHANNEL}.json'
         async with aiofiles.open(output_file, 'w') as f:
             await f.write(
                 orjson.dumps(
@@ -88,8 +89,10 @@ class TestIntegration(unittest.IsolatedAsyncioTestCase):
             name=YOUTUBE_CHANNEL, deno_path=DENO_PATH,
             po_token_url=PO_TOKEN_URL, debug=True, save_dir=OUTPUT_DIR
         )
-        await channel.scrape_videos(
-            max_videos_per_channel=3, save_dir=self.temp_dir
+        await channel.scrape_channel_content(
+            save_dir=self.temp_dir,
+            page_type=YouTubeChannelPageType.VIDEOS,
+            max_videos_per_channel=3,
         )
         self.assertGreaterEqual(len(channel.video_ids), 3)
         video_count: int = 0
@@ -99,15 +102,15 @@ class TestIntegration(unittest.IsolatedAsyncioTestCase):
                 video_count += 1
         self.assertEqual(video_count, 3)
 
-    # @unittest.skip('Shorts scraping is currently unreliable and needs fixes')
     async def test_shorts_scrape(self) -> None:
         channel: YouTubeChannel = YouTubeChannel(
             name='GMHikaru', deno_path=DENO_PATH,
             po_token_url=PO_TOKEN_URL, debug=True, save_dir=OUTPUT_DIR
         )
-        await channel.scrape_videos(
-            max_videos_per_channel=3, save_dir=self.temp_dir,
-            shorts=True
+        await channel.scrape_channel_content(
+            save_dir=self.temp_dir,
+            page_type=YouTubeChannelPageType.SHORTS,
+            max_videos_per_channel=3
         )
         self.assertGreaterEqual(len(channel.video_ids), 3)
         video_count: int = 0
@@ -116,6 +119,36 @@ class TestIntegration(unittest.IsolatedAsyncioTestCase):
             if os.path.exists(file_path):
                 video_count += 1
         self.assertEqual(video_count, 3)
+
+    async def test_live_scrape(self) -> None:
+        channel: YouTubeChannel = YouTubeChannel(
+            name='NASA', deno_path=DENO_PATH,
+            po_token_url=PO_TOKEN_URL, debug=True, save_dir=OUTPUT_DIR
+        )
+        await channel.scrape_channel_content(
+            save_dir=self.temp_dir,
+            page_type=YouTubeChannelPageType.LIVE,
+            max_videos_per_channel=3
+        )
+        self.assertGreaterEqual(len(channel.video_ids), 3)
+        video_count: int = 0
+        for video_id in channel.video_ids:
+            file_path: str = os.path.join(self.temp_dir, f'{video_id}.json')
+            if os.path.exists(file_path):
+                video_count += 1
+        self.assertEqual(video_count, 3)
+
+    async def test_podcast_scrape(self) -> None:
+        channel: YouTubeChannel = YouTubeChannel(
+            name='DoctorMike', deno_path=DENO_PATH,
+            po_token_url=PO_TOKEN_URL, debug=True, save_dir=OUTPUT_DIR
+        )
+        await channel.scrape_channel_content(
+            save_dir=self.temp_dir,
+            page_type=YouTubeChannelPageType.PODCASTS,
+            max_videos_per_channel=3
+        )
+        self.assertGreaterEqual(len(channel.podcast_ids), 1)
 
 
 if __name__ == '__main__':
