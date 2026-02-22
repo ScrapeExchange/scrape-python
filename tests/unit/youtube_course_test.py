@@ -170,7 +170,7 @@ class TestYouTubeCourse(unittest.TestCase):
             ],
         )
         data: dict = course.to_dict()
-        restored = YouTubeCourse.from_dict(data)
+        restored: YouTubeCourse = YouTubeCourse.from_dict(data)
         self.assertEqual(course, restored)
 
     def test_to_dict_fields(self) -> None:
