@@ -43,6 +43,7 @@ from .youtube_video import PO_TOKEN_URL
 from .youtube_thumbnail import YouTubeThumbnail
 from .youtube_playlist import YouTubePlaylist
 from .youtube_course import YouTubeCourse
+from .youtube_post import YouTubePost
 from .youtube_external_link import YouTubeExternalLink
 
 from ..util import split_quoted_string, convert_number_string
@@ -1508,7 +1509,8 @@ class YouTubeChannelTabs:
     async def scrape_content_ids(
         channel_id: str
     ) -> tuple[
-        set[str], set[str], set[YouTubePlaylist], set[YouTubeCourse]
+        set[str], set[str], set[YouTubePlaylist], set[YouTubeCourse],
+        set[YouTubePost]
     ]:
         self = YouTubeChannelTabs(channel_id)
         tabs: dict[str, dict[str, any]] = await self.get_page_tab()
@@ -1517,6 +1519,7 @@ class YouTubeChannelTabs:
         video_ids: set[str] = set()
         playlists: set[YouTubePlaylist] = set()
         courses: set[YouTubeCourse] = set()
+        posts: set[YouTubePost] = set()
 
         tab: dict[str, any]
         for tab in tabs:
@@ -1550,6 +1553,11 @@ class YouTubeChannelTabs:
                 continue
             elif title == 'courses':
                 courses = self._get_course_items(
+                    page_tab, channel_id
+                )
+                continue
+            elif title == 'posts':
+                posts = self._get_post_items(
                     page_tab, channel_id
                 )
                 continue
@@ -1614,7 +1622,7 @@ class YouTubeChannelTabs:
                     if video_id:
                         video_ids.add(video_id)
 
-        return video_ids, podcast_ids, playlists, courses
+        return video_ids, podcast_ids, playlists, courses, posts
 
     def _extract_video_id(self, item: dict[str, any], tab_title: str
                           ) -> str | None:
@@ -1732,6 +1740,40 @@ class YouTubeChannelTabs:
                 courses.add(course)
 
         return courses
+
+    def _get_post_items(self, tab_renderer: dict[str, any],
+                        channel_id: str) -> set[YouTubePost]:
+        '''
+        Parses posts from the posts/community tab.  The posts tab uses
+        ``sectionListRenderer`` → ``itemSectionRenderer`` with
+        ``backstagePostThreadRenderer`` items.
+
+        :param tab_renderer: the tabRenderer dict for the posts tab
+        :param channel_id: the channel ID owning the posts
+        :returns: a set of YouTubePost instances
+        '''
+
+        posts: set[YouTubePost] = set()
+
+        sections: list = tab_renderer.get(
+            'content', {}
+        ).get(
+            'sectionListRenderer', {}
+        ).get('contents', [])
+
+        for section in sections:
+            items: list = section.get(
+                'itemSectionRenderer', {}
+            ).get('contents', [])
+
+            for item in items:
+                post: YouTubePost | None = YouTubePost.from_innertube(
+                    item, channel_id
+                )
+                if post:
+                    posts.add(post)
+
+        return posts
 
     async def _browse(self, params: str = '', continuation_token: str = '',
                       max_retries: int = 4) -> dict:

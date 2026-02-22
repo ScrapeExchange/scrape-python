@@ -20,6 +20,7 @@ import orjson
 import aiofiles
 
 from scrape_exchange.youtube.youtube_course import YouTubeCourse
+from scrape_exchange.youtube.youtube_post import YouTubePost
 from scrape_exchange.youtube.youtube_channel import YouTubeChannel
 from scrape_exchange.youtube.youtube_playlist import YouTubePlaylist
 from scrape_exchange.youtube.youtube_channel import YouTubeChannelTabs
@@ -163,7 +164,8 @@ class TestIntegration(unittest.IsolatedAsyncioTestCase):
         podcast_ids: set[str]
         playlists: set[YouTubePlaylist]
         courses: set[YouTubeCourse]
-        video_ids, podcast_ids, playlists, courses = \
+        posts: set[YouTubePost]
+        video_ids, podcast_ids, playlists, courses, posts = \
             await channel_tabs.scrape_content_ids(
                 channel_id='UC22BdTgxefuvUivrjesETjg'
             )
@@ -196,7 +198,8 @@ class TestIntegration(unittest.IsolatedAsyncioTestCase):
         podcast_ids: set[str]
         playlists: set[YouTubePlaylist]
         courses: set[YouTubeCourse]
-        video_ids, podcast_ids, playlists, courses = \
+        posts: set[YouTubePost]
+        video_ids, podcast_ids, playlists, courses, posts = \
             await channel_tabs.scrape_content_ids(
                 channel_id='UCW6TXMZ5Pq6yL6_k5NZ2e0Q'
             )
@@ -219,6 +222,39 @@ class TestIntegration(unittest.IsolatedAsyncioTestCase):
         data: dict = course.to_dict()
         restored: YouTubeCourse = YouTubeCourse.from_dict(data)
         self.assertEqual(course, restored)
+
+    async def test_youtube_channel_posts_scrape(self) -> None:
+        '''Scrape posts from the HistoryMatters channel.'''
+        channel_tabs: YouTubeChannelTabs = YouTubeChannelTabs(
+            channel_id='UC22BdTgxefuvUivrjesETjg'
+        )
+
+        video_ids: set[str]
+        podcast_ids: set[str]
+        playlists: set[YouTubePlaylist]
+        courses: set[YouTubeCourse]
+        posts: set[YouTubePost]
+        video_ids, podcast_ids, playlists, courses, posts = \
+            await channel_tabs.scrape_content_ids(
+                channel_id='UC22BdTgxefuvUivrjesETjg'
+            )
+        self.assertGreaterEqual(len(posts), 1)
+
+        # Validate post objects have required fields
+        post: YouTubePost = next(iter(posts))
+        self.assertIsNotNone(post.post_id)
+        self.assertIsNotNone(post.content_text)
+        self.assertIsNotNone(post.published_time_text)
+        self.assertIsNotNone(post.vote_count)
+        self.assertIsNotNone(post.url)
+        self.assertEqual(
+            post.channel_id, 'UC22BdTgxefuvUivrjesETjg'
+        )
+
+        # Validate round-trip serialisation
+        data: dict = post.to_dict()
+        restored: YouTubePost = YouTubePost.from_dict(data)
+        self.assertEqual(post, restored)
 
 
 if __name__ == '__main__':
