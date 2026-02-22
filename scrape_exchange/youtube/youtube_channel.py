@@ -42,6 +42,7 @@ from .youtube_video import DENO_PATH
 from .youtube_video import PO_TOKEN_URL
 from .youtube_thumbnail import YouTubeThumbnail
 from .youtube_playlist import YouTubePlaylist
+from .youtube_course import YouTubeCourse
 from .youtube_external_link import YouTubeExternalLink
 
 from ..util import split_quoted_string, convert_number_string
@@ -83,6 +84,7 @@ class YouTubeChannelPageType(Enum):
     VIDEOS = 'Videos'
     SHORTS = 'Shorts'
     LIVE = 'Live'
+    COURSES = 'Courses'
     PODCASTS = 'Podcasts'
     PLAYLISTS = 'Playlists'
     POSTS = 'Posts'
@@ -1505,13 +1507,16 @@ class YouTubeChannelTabs:
     @staticmethod
     async def scrape_content_ids(
         channel_id: str
-    ) -> tuple[set[str], set[str], set[YouTubePlaylist]]:
+    ) -> tuple[
+        set[str], set[str], set[YouTubePlaylist], set[YouTubeCourse]
+    ]:
         self = YouTubeChannelTabs(channel_id)
         tabs: dict[str, dict[str, any]] = await self.get_page_tab()
 
         podcast_ids: set[str] = set()
         video_ids: set[str] = set()
         playlists: set[YouTubePlaylist] = set()
+        courses: set[YouTubeCourse] = set()
 
         tab: dict[str, any]
         for tab in tabs:
@@ -1540,6 +1545,11 @@ class YouTubeChannelTabs:
 
             if title == 'playlists':
                 playlists = self._get_playlist_items(
+                    page_tab, channel_id
+                )
+                continue
+            elif title == 'courses':
+                courses = self._get_course_items(
                     page_tab, channel_id
                 )
                 continue
@@ -1604,7 +1614,7 @@ class YouTubeChannelTabs:
                     if video_id:
                         video_ids.add(video_id)
 
-        return video_ids, podcast_ids, playlists
+        return video_ids, podcast_ids, playlists, courses
 
     def _extract_video_id(self, item: dict[str, any], tab_title: str
                           ) -> str | None:
@@ -1694,6 +1704,34 @@ class YouTubeChannelTabs:
                     playlists.add(playlist)
 
         return playlists
+
+    def _get_course_items(
+        self, tab_renderer: dict[str, any], channel_id: str
+    ) -> set[YouTubeCourse]:
+        '''
+        Parses courses from the courses tab.  The courses tab uses
+        ``richGridRenderer`` → ``richItemRenderer`` → ``playlistRenderer``.
+
+        :param tab_renderer: the tabRenderer dict for the courses tab
+        :param channel_id: the channel ID owning the courses
+        :returns: a set of YouTubeCourse instances
+        '''
+
+        courses: set[YouTubeCourse] = set()
+
+        contents: list = tab_renderer.get(
+            'content', {}
+        ).get(
+            'richGridRenderer', {}
+        ).get('contents', [])
+
+        for item in contents:
+            course: YouTubeCourse | None = \
+                YouTubeCourse.from_innertube(item, channel_id)
+            if course:
+                courses.add(course)
+
+        return courses
 
     async def _browse(self, params: str = '', continuation_token: str = '',
                       max_retries: int = 4) -> dict:

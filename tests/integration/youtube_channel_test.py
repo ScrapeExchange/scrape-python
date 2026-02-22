@@ -18,9 +18,12 @@ from datetime import UTC, datetime
 
 import orjson
 import aiofiles
-from scrape_exchange.youtube.youtube_channel import YouTubeChannel, YouTubeChannelTabs
-from scrape_exchange.youtube.youtube_channel import YouTubeChannelPageType
+
+from scrape_exchange.youtube.youtube_course import YouTubeCourse
+from scrape_exchange.youtube.youtube_channel import YouTubeChannel
 from scrape_exchange.youtube.youtube_playlist import YouTubePlaylist
+from scrape_exchange.youtube.youtube_channel import YouTubeChannelTabs
+from scrape_exchange.youtube.youtube_channel import YouTubeChannelPageType
 
 from scrape_exchange.youtube.youtube_video import DENO_PATH, PO_TOKEN_URL
 
@@ -159,7 +162,8 @@ class TestIntegration(unittest.IsolatedAsyncioTestCase):
         video_ids: set[str]
         podcast_ids: set[str]
         playlists: set[YouTubePlaylist]
-        video_ids, podcast_ids, playlists = \
+        courses: set[YouTubeCourse]
+        video_ids, podcast_ids, playlists, courses = \
             await channel_tabs.scrape_content_ids(
                 channel_id='UC22BdTgxefuvUivrjesETjg'
             )
@@ -181,6 +185,40 @@ class TestIntegration(unittest.IsolatedAsyncioTestCase):
         data: dict = playlist.to_dict()
         restored: YouTubePlaylist = YouTubePlaylist.from_dict(data)
         self.assertEqual(playlist, restored)
+
+    async def test_youtube_channel_courses_scrape(self) -> None:
+        '''Scrape courses from the Socratica channel.'''
+        channel_tabs: YouTubeChannelTabs = YouTubeChannelTabs(
+            channel_id='UCW6TXMZ5Pq6yL6_k5NZ2e0Q'
+        )
+
+        video_ids: set[str]
+        podcast_ids: set[str]
+        playlists: set[YouTubePlaylist]
+        courses: set[YouTubeCourse]
+        video_ids, podcast_ids, playlists, courses = \
+            await channel_tabs.scrape_content_ids(
+                channel_id='UCW6TXMZ5Pq6yL6_k5NZ2e0Q'
+            )
+        self.assertGreaterEqual(len(courses), 1)
+
+        # Validate course objects have required fields
+        course: YouTubeCourse = next(iter(courses))
+        self.assertIsNotNone(course.playlist_id)
+        self.assertIsNotNone(course.title)
+        self.assertGreaterEqual(course.video_count, 1)
+        self.assertIsNotNone(course.url)
+        self.assertEqual(
+            course.channel_id, 'UCW6TXMZ5Pq6yL6_k5NZ2e0Q'
+        )
+        self.assertGreater(len(course.videos), 0)
+        self.assertIsNotNone(course.videos[0].video_id)
+        self.assertIsNotNone(course.videos[0].title)
+
+        # Validate round-trip serialisation
+        data: dict = course.to_dict()
+        restored: YouTubeCourse = YouTubeCourse.from_dict(data)
+        self.assertEqual(course, restored)
 
 
 if __name__ == '__main__':
