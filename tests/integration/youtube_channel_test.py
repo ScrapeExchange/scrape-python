@@ -20,6 +20,7 @@ import orjson
 import aiofiles
 from scrape_exchange.youtube.youtube_channel import YouTubeChannel, YouTubeChannelTabs
 from scrape_exchange.youtube.youtube_channel import YouTubeChannelPageType
+from scrape_exchange.youtube.youtube_playlist import YouTubePlaylist
 
 from scrape_exchange.youtube.youtube_video import DENO_PATH, PO_TOKEN_URL
 
@@ -157,14 +158,29 @@ class TestIntegration(unittest.IsolatedAsyncioTestCase):
 
         video_ids: set[str]
         podcast_ids: set[str]
-        playlist_ids: set[str]
-        video_ids, podcast_ids, playlist_ids = \
+        playlists: set[YouTubePlaylist]
+        video_ids, podcast_ids, playlists = \
             await channel_tabs.scrape_content_ids(
                 channel_id='UC22BdTgxefuvUivrjesETjg'
             )
         self.assertGreaterEqual(len(video_ids), 3)
         self.assertGreaterEqual(len(podcast_ids), 1)
-        self.assertGreaterEqual(len(playlist_ids), 0)
+        self.assertGreaterEqual(len(playlists), 1)
+
+        # Validate playlist objects have required fields
+        playlist: YouTubePlaylist = next(iter(playlists))
+        self.assertIsNotNone(playlist.playlist_id)
+        self.assertIsNotNone(playlist.title)
+        self.assertGreaterEqual(playlist.video_count, 1)
+        self.assertIsNotNone(playlist.url)
+        self.assertEqual(
+            playlist.channel_id, 'UC22BdTgxefuvUivrjesETjg'
+        )
+
+        # Validate round-trip serialisation
+        data: dict = playlist.to_dict()
+        restored: YouTubePlaylist = YouTubePlaylist.from_dict(data)
+        self.assertEqual(playlist, restored)
 
 
 if __name__ == '__main__':

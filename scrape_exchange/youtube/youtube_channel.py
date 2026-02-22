@@ -41,6 +41,7 @@ from .youtube_video import YouTubeVideo
 from .youtube_video import DENO_PATH
 from .youtube_video import PO_TOKEN_URL
 from .youtube_thumbnail import YouTubeThumbnail
+from .youtube_playlist import YouTubePlaylist
 from .youtube_external_link import YouTubeExternalLink
 
 from ..util import split_quoted_string, convert_number_string
@@ -1502,13 +1503,15 @@ class YouTubeChannelTabs:
         self.client: InnerTube = InnerTube('WEB', '2.20230728.00.00')
 
     @staticmethod
-    async def scrape_content_ids(channel_id: str
-                                 ) -> tuple[set[str], set[str], set[str]]:
+    async def scrape_content_ids(
+        channel_id: str
+    ) -> tuple[set[str], set[str], set[YouTubePlaylist]]:
         self = YouTubeChannelTabs(channel_id)
         tabs: dict[str, dict[str, any]] = await self.get_page_tab()
 
         podcast_ids: set[str] = set()
         video_ids: set[str] = set()
+        playlists: set[YouTubePlaylist] = set()
 
         tab: dict[str, any]
         for tab in tabs:
@@ -1534,6 +1537,12 @@ class YouTubeChannelTabs:
             # First page: use params to navigate to the tab
             page_data: dict = await self._browse(params=params)
             page_tab: dict[str, any] = self.get_tab(page_data, title)
+
+            if title == 'playlists':
+                playlists = self._get_playlist_items(
+                    page_tab, channel_id
+                )
+                continue
 
             contents: list = page_tab.get(
                 'content', {}
@@ -1595,7 +1604,7 @@ class YouTubeChannelTabs:
                     if video_id:
                         video_ids.add(video_id)
 
-        return video_ids, podcast_ids, set()
+        return video_ids, podcast_ids, playlists
 
     def _extract_video_id(self, item: dict[str, any], tab_title: str
                           ) -> str | None:
@@ -1650,6 +1659,41 @@ class YouTubeChannelTabs:
             podcast_ids.add(podcast_id) if podcast_id else None
 
         return podcast_ids
+
+    def _get_playlist_items(self, tab_renderer: dict[str, any],
+                            channel_id: str) -> set[YouTubePlaylist]:
+        '''
+        Parses playlists from the playlists tab.  The playlists tab uses a
+        ``sectionListRenderer`` → ``gridRenderer`` layout instead of the
+        ``richGridRenderer`` used by the videos / shorts / live tabs.
+
+        :param tab_renderer: the tabRenderer dict for the playlists tab
+        :param channel_id: the channel ID owning the playlists
+        :returns: a set of YouTubePlaylist instances
+        '''
+
+        playlists: set[YouTubePlaylist] = set()
+
+        sections: list = tab_renderer.get(
+            'content', {}
+        ).get(
+            'sectionListRenderer', {}
+        ).get('contents', [])
+
+        for section in sections:
+            items: list = section.get(
+                'itemSectionRenderer', {}
+            ).get('contents', [{}])[0].get(
+                'gridRenderer', {}
+            ).get('items', [])
+
+            for item in items:
+                playlist: YouTubePlaylist | None = \
+                    YouTubePlaylist.from_innertube(item, channel_id)
+                if playlist:
+                    playlists.add(playlist)
+
+        return playlists
 
     async def _browse(self, params: str = '', continuation_token: str = '',
                       max_retries: int = 4) -> dict:
