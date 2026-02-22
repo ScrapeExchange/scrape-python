@@ -103,7 +103,9 @@ class TestYouTubeCourseVideo(unittest.TestCase):
             title='Test',
             duration_label='5 minutes',
         )
-        restored = YouTubeCourseVideo.from_dict(video.to_dict())
+        restored: YouTubeCourseVideo = YouTubeCourseVideo.from_dict(
+            video.to_dict()
+        )
         self.assertEqual(video, restored)
 
     def test_hash(self) -> None:
