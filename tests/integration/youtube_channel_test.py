@@ -10,6 +10,7 @@ network conditions. They are intended to run separately from unit tests.
 
 
 import os
+import json
 import shutil
 import unittest
 import tempfile
@@ -18,6 +19,7 @@ from datetime import UTC, datetime
 
 import orjson
 import aiofiles
+from jsonschema import Draft202012Validator
 
 from scrape_exchange.youtube.youtube_course import YouTubeCourse
 from scrape_exchange.youtube.youtube_post import YouTubePost
@@ -25,7 +27,6 @@ from scrape_exchange.youtube.youtube_product import YouTubeProduct
 from scrape_exchange.youtube.youtube_channel import YouTubeChannel
 from scrape_exchange.youtube.youtube_playlist import YouTubePlaylist
 from scrape_exchange.youtube.youtube_channel_tabs import YouTubeChannelTabs
-from scrape_exchange.youtube.youtube_types import YouTubeChannelPageType
 from scrape_exchange.youtube.youtube_types import YouTubeChannelLink
 
 from scrape_exchange.youtube.youtube_video import DENO_PATH, PO_TOKEN_URL
@@ -35,11 +36,18 @@ YOUTUBE_HISTORYMATTERS_CHANNEL_ID: str = 'UC22BdTgxefuvUivrjesETjg'
 YOUTUBE_SOCRATICA_CHANNEL: str = 'Socratica'
 YOUTUBE_SOCRATICA_CHANNEL_ID: str = 'UCW6TXMZ5Pq6yL6_k5NZ2e0Q'
 
-OUTPUT_DIR: str = 'tests/collateral/youtube_channels'
+SCHEMA_PATH: str = 'tests/collateral/boinko-youtube-channel-schema.json'
 
 
 class TestIntegration(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        with open(SCHEMA_PATH) as f:
+            cls.schema: dict[str, any] = json.load(f)
+        cls.validator = Draft202012Validator(cls.schema)
+
     async def asyncSetUp(self) -> None:
+        self.temp_dir: str = tempfile.mkdtemp()
         self.api_key_id: str = os.environ.get('API_KEY_ID', '')
         self.api_key_secret: str = os.environ.get('API_KEY_SECRET', '')
         self.api_base_url: str = os.environ.get(
@@ -52,10 +60,16 @@ class TestIntegration(unittest.IsolatedAsyncioTestCase):
         if self.temp_dir and os.path.exists(self.temp_dir):
             shutil.rmtree(self.temp_dir)
 
+    def _validate_schema(self, data: dict) -> None:
+        errors: list[any] = list(self.validator.iter_errors(data))
+        if errors:
+            messages: str = '\n'.join(e.message for e in errors)
+            self.fail(f'Schema validation failed:\n{messages}')
+
     async def test_youtube_channel(self) -> None:
         channel: YouTubeChannel = YouTubeChannel(
             name=YOUTUBE_HISTORYMATTERS_CHANNEL, deno_path=DENO_PATH,
-            po_token_url=PO_TOKEN_URL, debug=True, save_dir=OUTPUT_DIR
+            po_token_url=PO_TOKEN_URL, debug=True, save_dir=self.temp_dir
         )
         await channel.scrape_about_page()
         self.assertEqual(channel.name, YOUTUBE_HISTORYMATTERS_CHANNEL)
@@ -70,6 +84,9 @@ class TestIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(channel.subscriber_count, 1880000)
         self.assertGreaterEqual(channel.video_count, 384)
         self.assertGreaterEqual(channel.view_count, 755841320)
+
+        # Validate to_dict() output against JSON schema
+        self._validate_schema(channel.to_dict())
 
         output_file: str = f'{self.temp_dir}/{YOUTUBE_HISTORYMATTERS_CHANNEL}.json'
         async with aiofiles.open(output_file, 'w') as f:
@@ -86,6 +103,9 @@ class TestIntegration(unittest.IsolatedAsyncioTestCase):
                 channel_data
             )
             self.assertEqual(loaded_channel, channel)
+
+        # Validate saved-then-loaded round-trip against schema
+        self._validate_schema(channel_data)
 
     async def test_scrape_channel(self) -> None:
         channel: YouTubeChannel = YouTubeChannel(
@@ -106,10 +126,13 @@ class TestIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(channel.video_count, 384)
         self.assertGreaterEqual(channel.view_count, 755841320)
 
+        # Validate to_dict() output against JSON schema
+        self._validate_schema(channel.to_dict())
+
     async def test_channel_links(self) -> None:
         channel: YouTubeChannel = YouTubeChannel(
             name='ComedyCentral', deno_path=DENO_PATH,
-            po_token_url=PO_TOKEN_URL, debug=True, save_dir=OUTPUT_DIR
+            po_token_url=PO_TOKEN_URL, debug=True, save_dir=self.temp_dir
         )
         await channel.scrape_about_page()
         self.assertGreaterEqual(len(channel.channel_links), 10)

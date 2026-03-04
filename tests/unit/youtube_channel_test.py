@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import orjson
 import jsonschema
+from jsonschema import Draft202012Validator
 
 from scrape_exchange.youtube.youtube_channel import (
     YouTubeChannel,
@@ -22,6 +23,10 @@ from scrape_exchange.youtube.youtube_channel import (
     YouTubeExternalLink,
     YouTubeChannelLink,
 )
+from scrape_exchange.youtube.youtube_course import YouTubeCourse, YouTubeCourseVideo
+from scrape_exchange.youtube.youtube_playlist import YouTubePlaylist
+from scrape_exchange.youtube.youtube_post import YouTubePost
+from scrape_exchange.youtube.youtube_product import YouTubeProduct
 
 
 # ---------------------------------------------------------------------------
@@ -59,12 +64,14 @@ def _make_metadata_rows(content_text: str) -> dict:
 
 class TestYouTubeChannel(unittest.TestCase):
 
-    def test_extract_channel_id_success_and_failure(self):
+    def test_extract_channel_id_success_and_failure(self) -> None:
         html = 'some preface "externalId":"UCABC123" and more'
         self.assertEqual(YouTubeChannel.extract_channel_id(html), 'UCABC123')
 
+        self.assertIsNone(YouTubeChannel.extract_channel_id(''))
+
         with self.assertRaises(ValueError):
-            YouTubeChannel.extract_channel_id('')
+            YouTubeChannel.extract_channel_id('blah')
 
     def test_extract_verified_status(self) -> None:
         self.assertTrue(
@@ -292,11 +299,6 @@ class TestYouTubeChannelEquality(unittest.TestCase):
     def test_not_equal_different_type(self) -> None:
         ch = YouTubeChannel(name='X')
         self.assertNotEqual(ch, 'not_a_channel')
-
-    def test_del_does_not_raise(self) -> None:
-        ch = YouTubeChannel(name='X')
-        ch.__del__()
-
 
 class TestYouTubeChannelToFromDict(unittest.TestCase):
     def test_to_dict_basic_fields(self) -> None:
@@ -656,7 +658,7 @@ class TestFindAboutRenderer(unittest.TestCase):
 
     def test_returns_none_when_missing(self) -> None:
         ch = YouTubeChannel(name='Test')
-        ch.youtube_url = 'https://www.youtube.com/@Test'
+        ch.url = 'https://www.youtube.com/@Test'
         self.assertIsNone(
             ch._find_about_renderer(
                 {'onResponseReceivedEndpoints': []}
@@ -665,7 +667,7 @@ class TestFindAboutRenderer(unittest.TestCase):
 
     def test_returns_none_when_no_endpoints(self) -> None:
         ch = YouTubeChannel(name='Test')
-        ch.youtube_url = 'https://www.youtube.com/@Test'
+        ch.url = 'https://www.youtube.com/@Test'
         self.assertIsNone(ch._find_about_renderer({}))
 
 
@@ -1444,6 +1446,163 @@ class TestScrapeVideo(unittest.IsolatedAsyncioTestCase):
             result = await ch.scrape_video('abc123', None)
             self.assertEqual(result, mock_video)
             MockYTVideo.scrape.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# to_dict() JSON-schema compliance
+# ---------------------------------------------------------------------------
+
+SCHEMA_PATH: str = 'tests/collateral/boinko-youtube-channel-schema.json'
+
+
+class TestToDictSchemaValidation(unittest.TestCase):
+    '''Validate that YouTubeChannel.to_dict() output complies with the
+    boinko-youtube-channel JSON schema.
+    '''
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        with open(SCHEMA_PATH) as f:
+            cls.schema: dict[str, any] = orjson.loads(f.read())
+        cls.validator = Draft202012Validator(cls.schema)
+
+    def _validate(self, data: dict) -> None:
+        errors: list[any] = list(self.validator.iter_errors(data))
+        if errors:
+            messages: str = '\n'.join(e.message for e in errors)
+            self.fail(f'Schema validation failed:\n{messages}')
+
+    # -- minimal channel (defaults only) -----------------------------------
+
+    def test_minimal_channel_validates(self) -> None:
+        '''A freshly-constructed channel with only a name should pass.'''
+        ch = YouTubeChannel(name='TestChannel')
+        self._validate(ch.to_dict())
+
+    # -- channel with video_ids --------------------------------------------
+
+    def test_to_dict_with_video_ids_validates(self) -> None:
+        ch = YouTubeChannel(name='TestChannel')
+        ch.video_ids = {'abc123', 'def456'}
+        self._validate(ch.to_dict(with_video_ids=True))
+
+    # -- fully-populated channel -------------------------------------------
+
+    def test_fully_populated_channel_validates(self) -> None:
+        '''A channel with every field populated should still pass.'''
+        ch = YouTubeChannel(name='FullChannel')
+        ch.channel_id = 'UC_FAKE_ID_1234'
+        ch.title = 'Full Channel Title'
+        ch.description = 'A test description.'
+        ch.keywords = {'keyword1', 'keyword2'}
+        ch.categories = {'Education', 'Science'}
+        ch.is_family_safe = True
+        ch.country = 'US'
+        ch.available_country_codes = {'US', 'GB', 'DE'}
+        ch.joined_date = datetime(2020, 1, 15, tzinfo=UTC)
+        ch.rss_url = 'https://www.youtube.com/feeds/videos.xml?channel_id=UC_FAKE'
+        ch.verified = True
+        ch.subscriber_count = 500000
+        ch.video_count = 200
+        ch.view_count = 100000000
+
+        ch.channel_thumbnails = {
+            YouTubeThumbnail({
+                'id': 'thumb1',
+                'url': 'https://yt3.example.com/thumb.jpg',
+                'width': 900,
+                'height': 900,
+            }),
+        }
+        ch.banners = {
+            YouTubeThumbnail({
+                'id': 'banner1',
+                'url': 'https://yt3.example.com/banner.jpg',
+                'width': 2560,
+                'height': 424,
+            }, display_hint='banner'),
+        }
+        ch.external_urls = {
+            YouTubeExternalLink(
+                name='Twitter', url='https://twitter.com/test', priority=0
+            ),
+        }
+
+        ch.playlists = {
+            YouTubePlaylist(
+                playlist_id='PL123',
+                title='Test Playlist',
+                video_count=5,
+                thumbnail_url='https://i.ytimg.com/vi/abc/hqdefault.jpg',
+                channel_id='UC_FAKE_ID_1234',
+            ),
+        }
+        ch.courses = {
+            YouTubeCourse(
+                playlist_id='PLC123',
+                title='Test Course',
+                video_count=3,
+                thumbnail_url='https://i.ytimg.com/vi/xyz/hqdefault.jpg',
+                channel_id='UC_FAKE_ID_1234',
+                videos=[
+                    YouTubeCourseVideo(
+                        video_id='v1', title='Lecture 1',
+                        duration_label='10:30',
+                    ),
+                ],
+            ),
+        }
+        ch.posts = {
+            YouTubePost(
+                post_id='Ugkx_test123',
+                content_text='Hello community!',
+                published_time_text='2 days ago',
+                vote_count='42',
+                channel_id='UC_FAKE_ID_1234',
+            ),
+        }
+        ch.merch = {
+            YouTubeProduct(
+                title='T-Shirt',
+                price='$25.00',
+                merchant_name='Merch Store',
+                thumbnail_url='https://example.com/shirt.jpg',
+                product_url='https://example.com/buy',
+                accessibility_title='Cool T-Shirt',
+                channel_id='UC_FAKE_ID_1234',
+            ),
+        }
+        ch.video_ids = {'vid1', 'vid2', 'vid3'}
+
+        # Without video_ids
+        self._validate(ch.to_dict())
+        # With video_ids
+        self._validate(ch.to_dict(with_video_ids=True))
+
+    # -- round-trip: to_dict -> from_dict -> to_dict validates -------------
+
+    def test_round_trip_validates(self) -> None:
+        '''from_dict(to_dict(ch)).to_dict() should still validate.'''
+        ch = YouTubeChannel(name='RoundTrip')
+        ch.channel_id = 'UC_RT'
+        ch.title = 'Round Trip Channel'
+        ch.subscriber_count = 100
+        ch.video_count = 10
+        ch.view_count = 5000
+
+        original: dict = ch.to_dict()
+        restored: YouTubeChannel = YouTubeChannel.from_dict(original)
+        self._validate(restored.to_dict())
+
+    # -- collateral file validates -----------------------------------------
+
+    def test_historymatters_collateral_validates(self) -> None:
+        '''The saved HistoryMatters.json collateral should validate.'''
+        sample_path = Path(
+            'tests/collateral/youtube_channels/HistoryMatters.json'
+        )
+        sample: dict[str, any] = orjson.loads(sample_path.read_text())
+        self._validate(sample)
 
 
 if __name__ == '__main__':

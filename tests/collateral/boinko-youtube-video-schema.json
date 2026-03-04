@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "boinko-youtube-video-0.1.0.jsonschema",
+  "$id": "boinko-youtube-video-0.0.1.jsonschema",
   "title": "YouTube Video Metadata",
   "description": "Schema representing the output of YouTubeVideo.to_dict(), including identifiers, timestamps, thumbnails, captions, formats and statistics.",
   "type": "object",
@@ -36,6 +36,7 @@
     "locale": { "type": ["string", "null"] },
     "default_audio_language": { "type": ["string", "null"] },
     "tags": { "type": "array", "items": { "type": "string" } },
+    "categories": { "type": "array", "items": { "type": "string" }, "description": "Channel categories"},
     "annotations": { "type": "array", "items": { "type": "string" } },
     "keywords": { "type": "array", "items": { "type": "string" } },
     "privacy_status": { "type": "string" },

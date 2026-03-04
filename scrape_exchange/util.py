@@ -10,6 +10,10 @@ import os
 from .datatypes import IngestStatus
 
 
+VIDEO_FILE_PREFIX: str = 'video-'
+CHANNEL_FILE_PREFIX: str = 'channel-'
+
+
 def convert_number_string(number_text: str | int) -> int:
     '''
     Converts a number with optional appendix of m, k, to an integer
@@ -65,7 +69,8 @@ def get_imported_assets(save_dir: str | None = None,
             asset_id: str
             entry: os.DirEntry
             for entry in os.scandir(directory):
-                if entry.is_file() and entry.name.endswith('.json'):
+                if (entry.is_file() and entry.name.startswith('video-')
+                        and entry.name.endswith('.json')):
                     asset_id = path.splitext(entry.name)[0]
                     timestamp: datetime = entry.stat().st_mtime
                     imported_assets[asset_id] = (

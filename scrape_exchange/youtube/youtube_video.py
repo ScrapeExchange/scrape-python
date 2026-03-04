@@ -19,9 +19,12 @@ from datetime import timezone
 import aiofiles
 from dateutil import parser as dateutil_parser
 
-import orjson
-
 from asyncio import sleep
+
+import orjson
+import brotli
+import untangle
+from innertube import InnerTube
 
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
@@ -30,8 +33,11 @@ from ..util import IngestStatus
 from ..util import convert_number_string
 
 from .youtube_format import YouTubeFormat
-from .youtube_thumbnail import YouTubeThumbnail
+from .youtube_caption import YouTubeCaption
 from .youtube_client import AsyncYouTubeClient
+from .youtube_thumbnail import YouTubeThumbnail
+from .youtube_videochapter import YouTubeVideoChapter
+from .youtube_video_innertube import InnerTubeVideoParser
 
 _LOGGER: Logger = getLogger(__name__)
 
@@ -48,108 +54,9 @@ class YouTubeMediaType(str, Enum):
     MOVIE = 'movie'
 
 
-class YouTubeVideoChapter:
-    def __init__(self, chapter_info: dict[str, float | str]) -> None:
-        self.start_time: float = chapter_info.get('start_time')
-        self.end_time: float = chapter_info.get('end_time')
-        self.title: str = chapter_info.get('title')
-
-    def __eq__(self, other: Self) -> bool:
-        if not isinstance(other, YouTubeVideoChapter):
-            return False
-
-        return (
-            self.start_time == other.start_time
-            and self.end_time == other.end_time
-            and self.title == other.title
-        )
-
-    def to_dict(self) -> dict[str, str, float]:
-        '''
-        Returns a dict representation of the chapter
-        '''
-
-        return {
-            'start': self.start_time,
-            'end': self.end_time,
-            'title': self.title
-        }
-
-    @staticmethod
-    def from_dict(data: dict[str, str | int | float]) -> Self:
-        '''
-        Factory for YouTubeVideoChapter, parses data are provided
-        by yt-dlp
-        '''
-
-        return YouTubeVideoChapter(
-            {
-                'start_time': data.get('start_time'),
-                'end_time': data.get('end_time'),
-                'title': data.get('title')
-            }
-        )
-
-
-class YouTubeCaption:
-    def __init__(self, language_code: str, caption_info: dict[str, str]
-                 ) -> None:
-        '''
-        Describes a caption / subtitle track for a YouTube video
-
-        :param language_code: BCP-47 language code for the caption
-        :param is_auto_generated: whether the caption track is auto-generated
-        :param caption_info: information about the caption track
-        :returns: (none)
-        :raises: (none)
-        '''
-
-        self.language_code: str = language_code
-        self.url: str = caption_info.get('url')
-        self.extension: str = caption_info.get('ext')
-        self.protocol: str = caption_info.get('protocol')
-
-    def __eq__(self, other: Self) -> bool:
-        if not isinstance(other, YouTubeCaption):
-            return False
-
-        return (
-            self.language_code == other.language_code
-            and self.url == other.url
-            and self.extension == other.extension
-            and self.protocol == other.protocol
-        )
-
-    def to_dict(self) -> dict[str, str]:
-        '''
-        Returns a dict representation of the caption
-        '''
-
-        return {
-            'language_code': self.language_code,
-            'url': self.url,
-            'extension': self.extension,
-            'protocol': self.protocol
-        }
-
-    @staticmethod
-    def from_dict(data: dict[str, str | int | bool]) -> Self:
-        '''
-        Factory for YouTubeCaption, parses data provided by yt-dlp
-        '''
-
-        return YouTubeCaption(
-            language_code=data.get('language_code'),
-            caption_info={
-                'url': data.get('url'),
-                'ext': data.get('extension'),
-                'protocol': data.get('protocol')
-            }
-        )
-
-
 class YouTubeVideo:
     VIDEO_URL: str = 'https://www.youtube.com/watch?v={video_id}'
+    EMBED_URL: str = 'https://www.youtube.com/embed/{video_id}'
 
     def __init__(self,
                  video_id: str | None = None,
@@ -190,7 +97,7 @@ class YouTubeVideo:
 
         self.url: str | None = None
         self.embed_url: str | None = None
-        self.thumbnails: dict[YouTubeThumbnail] = {}
+        self.thumbnails: dict[str, YouTubeThumbnail] = {}
 
         self.is_live: bool = False
         self.was_live: bool = False
@@ -219,7 +126,7 @@ class YouTubeVideo:
         self.formats: dict[str, YouTubeFormat] = {}
 
         self.locale: str | None = None
-        self.default_audio_language: str | None = 'en'
+        self.default_audio_language: str | None = None
 
         self.tags: set[str] = set()
         self.annotations: set[str] = set()
@@ -238,7 +145,6 @@ class YouTubeVideo:
         same: bool = (
             self.video_id == other.video_id
             and self.title == other.title
-            and self.channel_name == other.channel_name
             and self.long_title == other.long_title
             and self.description == other.description
             and self.channel_id == other.channel_id
@@ -260,6 +166,7 @@ class YouTubeVideo:
             and self.aspect_ratio == other.aspect_ratio
             and self.duration == other.duration
             and self.license == other.license
+            and self.categories == other.categories
             and self.default_audio_language == other.default_audio_language
             and self.privacy_status == other.privacy_status
         )
@@ -325,6 +232,7 @@ class YouTubeVideo:
             'tags': list(self.tags),
             'annotations': list(self.annotations),
             'keywords': list(self.keywords),
+            'categories': list(self.categories),
             'privacy_status': self.privacy_status
         }
 
@@ -346,11 +254,6 @@ class YouTubeVideo:
                 for label, thumb in self.thumbnails.items()
             }
 
-        if self.thumbnails:
-            data['thumbnails'] = {
-                label: thumb.to_dict()
-                for label, thumb in self.thumbnails.items()
-            }
         if self.subtitles:
             data['subtitles'] = {
                 lang: subtitle.to_dict()
@@ -412,6 +315,7 @@ class YouTubeVideo:
         video.license = data.get('license')
         video.locale = data.get('locale')
         video.default_audio_language = data.get('default_audio_language')
+        video.categories = set(data.get('categories', []))
         video.tags = set(data.get('tags', []))
         video.annotations = set(data.get('annotations', []))
         video.keywords = set(data.get('keywords', []))
@@ -467,13 +371,128 @@ class YouTubeVideo:
         return video
 
     @staticmethod
+    def from_rss_entry(entry: untangle.Element) -> 'YouTubeVideo':
+        '''
+        Factory for YouTubeVideo, populates the subset of fields available
+        from a YouTube channel RSS feed entry.  Fields not present in the
+        RSS feed are left at their __init__ defaults.
+
+        :param entry: An untangle Element for a single <entry> in a YouTube
+        channel RSS feed (https://www.youtube.com/feeds/videos.xml).
+        :returns: A YouTubeVideo instance with RSS-available fields set.
+        :raises: AttributeError if the entry is missing the mandatory
+        yt:videoId or title elements.
+        '''
+
+        video = YouTubeVideo(video_id=entry.yt_videoId.cdata)
+        video.title = entry.title.cdata
+        video.url = YouTubeVideo.VIDEO_URL.format(video_id=video.video_id)
+
+        try:
+            video.channel_id = entry.yt_channelId.cdata
+        except AttributeError:
+            pass
+
+        try:
+            video.channel_name = entry.author.name.cdata
+            video.channel_url = entry.author.uri.cdata
+        except AttributeError:
+            pass
+
+        try:
+            video.published_timestamp = dateutil_parser.parse(
+                entry.published.cdata
+            )
+        except (ValueError, AttributeError):
+            pass
+
+        try:
+            video.uploaded_timestamp = dateutil_parser.parse(
+                entry.updated.cdata
+            )
+        except (ValueError, AttributeError):
+            pass
+
+        try:
+            video.description = entry.media_group.media_description.cdata
+        except AttributeError:
+            pass
+
+        try:
+            view_str: str = (
+                entry.media_group.media_community.media_statistics['views']
+            )
+            video.view_count = int(view_str)
+        except (AttributeError, KeyError, ValueError):
+            pass
+
+        try:
+            thumb_data: dict = {
+                'url': entry.media_group.media_thumbnail['url']
+            }
+            try:
+                thumb_data['width'] = int(
+                    entry.media_group.media_thumbnail['width']
+                )
+                thumb_data['height'] = int(
+                    entry.media_group.media_thumbnail['height']
+                )
+            except (KeyError, ValueError):
+                pass
+            video.thumbnails = YouTubeVideo._parse_thumbnails(
+                None, [thumb_data]
+            )
+        except (AttributeError, KeyError):
+            pass
+
+        return video
+
+    async def update(self, browse_client: AsyncYouTubeClient | None = None,
+                     delay: float = 1.0) -> None:
+        '''
+        Update the video metadata by scraping the video page. This can
+        be used to update fields that may have changed since the initial
+        scrape, such as view count, like count or thumbnails. This method does
+        not update the formats, chapters, or captions - for that you would
+        need to call scrape() again.
+
+        :returns: (none)
+        :raises: ValueError
+        '''
+
+        if not self.video_id:
+            raise ValueError('Cannot update video without video_id')
+
+        if not browse_client:
+            if not self.browse_client:
+                raise ValueError('No browse client available')
+            browse_client = self.browse_client
+
+        if not self.url:
+            self.url: str = self.VIDEO_URL.format(video_id=self.video_id)
+
+        if not self.embed_url:
+            self.embed_url = self.EMBED_URL.format(video_id=self.video_id)
+
+        html_content: str | None = await browse_client.get(
+            self.url, delay=delay
+        )
+
+        player_response: dict[str, any] = self._extract_player_response(
+            html_content
+        )
+
+        self._parse_video_html(player_response)
+
+    @staticmethod
     async def scrape(
         video_id: str, channel_name: str | None,
         channel_thumbnail: YouTubeThumbnail | None,
         deno_path: str = DENO_PATH, po_token_url: str = PO_TOKEN_URL,
         browse_client: AsyncYouTubeClient | None = None,
         download_client: YoutubeDL | None = None,
-        debug: bool = False, save_dir: str | None = None
+        debug: bool = False, save_dir: str | None = None,
+        filename_prefix: str = '', with_formats: bool = True
     ) -> Self | None:
         '''
         Collects data about a video by scraping the webpage for the video
@@ -501,25 +520,18 @@ class YouTubeVideo:
             download_client=download_client,
         )
 
-        canonical_url: str = self.VIDEO_URL.format(video_id=video_id)
-        html_content: str | None = await self.client.get(canonical_url)
+        await self.update(browse_client)
 
-        # Extract initial data
-        initial_data: dict[str, any] = self._extract_initial_data(html_content)
-        player_response: dict[str, any] = self._extract_player_response(
-            html_content
-        )
-
-        self._parse_video_html(initial_data, player_response)
-
-        await self._scrape_video()
+        if with_formats:
+            await self._scrape_video()
 
         if save_dir:
-            await self.to_file(save_dir)
+            await self.to_file(save_dir, filename_prefix)
 
         return self
 
-    async def to_file(self, save_dir: str) -> None:
+    async def to_file(self, save_dir: str, filename_prefix: str = '',
+                      overwrite: bool = True, compressed: bool = True) -> str:
         '''
         Saves the video metadata to a JSON file in the specified directory.
 
@@ -531,13 +543,18 @@ class YouTubeVideo:
         if not self.video_id:
             raise ValueError('Cannot save video without video_id')
 
-        filename: str = f'{save_dir}/{self.video_id}.json'
-        async with aiofiles.open(filename, 'w') as f:
-            await f.write(
-                orjson.dumps(
-                    self.to_dict(), option=orjson.OPT_INDENT_2
-                ).decode('utf-8')
-            )
+        filename: str = f'{save_dir}/{filename_prefix}{self.video_id}.json'
+        data: bytes = orjson.dumps(self.to_dict(), option=orjson.OPT_INDENT_2)
+        if compressed:
+            filename += '.br'
+            data = brotli.compress(data, quality=11, mode=brotli.MODE_TEXT)
+        if not overwrite and os.path.exists(filename):
+            raise FileExistsError(f'File {filename} already exists')
+
+        async with aiofiles.open(filename, 'wb') as f:
+            await f.write(data)
+
+        return filename
 
     @staticmethod
     def _setup_download_client(browse_client: AsyncYouTubeClient,
@@ -644,8 +661,7 @@ class YouTubeVideo:
             f'Could not extract player response data from {self.url}'
         )
 
-    def _parse_video_html(self, initial_data: dict,
-                          player_response: dict) -> None:
+    def _parse_video_html(self, player_response: dict) -> None:
         '''
         Parse the metadata scraped from a YouTube video page
 
@@ -663,16 +679,23 @@ class YouTubeVideo:
             'playerMicroformatRenderer'
         )
         if not video_details or not microformat:
-            _LOGGER.info(
+            _LOGGER.debug(
                 'Missing microformat data for video',
                 extra={'video_id': self.video_id}
             )
+
+            status: str = player_response.get(
+                'playabilityStatus', {}
+            ).get('status')
+            if status == 'LOGIN_REQUIRED':
+                raise RuntimeError('YouTube blocked the client')
+
             raise ValueError('Missing microformat data for video')
 
         # Video ID and URLs. These will be changed later if the video is a
         # short
-        self.url = f'https://www.youtube.com/watch?v={self.video_id}'
-        self.embed_url = f'https://www.youtube.com/embed/{self.video_id}'
+        self.url = self.VIDEO_URL.format(video_id=self.video_id)
+        self.embed_url = self.EMBED_URL.format(video_id=self.video_id)
 
         self.title = video_details.get('title')
         self.description = video_details.get('shortDescription')
@@ -701,7 +724,7 @@ class YouTubeVideo:
             )
 
         if microformat.get('category'):
-            self.categories | set(microformat.get('category', []))
+            self.categories |= set(microformat.get('category', []))
 
         # TODO: does this ever get a value?
         self.default_audio_language = microformat.get(
@@ -859,7 +882,7 @@ class YouTubeVideo:
         self.embedable = video_info.get('playable_in_embed', True)
         try:
             self.media_type = YouTubeMediaType(
-                video_info.get('media_type').lower()
+                video_info.get('media_type', '').lower()
             )
         except (KeyError, ValueError):
             self.media_type = None
@@ -938,3 +961,7 @@ class YouTubeVideo:
             f'Video {self.video_id} transitioned to {ingest_status}',
         )
         self.ingest_status = ingest_status
+
+    async def from_innertube(self, innertube: InnerTube | None = None) -> None:
+        await InnerTubeVideoParser.scrape(self, innertube)
+        self.embed_url = YouTubeVideo.EMBED_URL.format(video_id=self.video_id)

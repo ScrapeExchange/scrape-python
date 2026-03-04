@@ -11,8 +11,6 @@ import re
 
 from uuid import UUID
 from typing import Self
-from shutil import rmtree
-from tempfile import mkdtemp
 from logging import Logger
 from logging import getLogger
 from datetime import UTC, datetime
@@ -47,6 +45,9 @@ from .youtube_channel_tabs import YouTubeChannelTabs
 
 from ..util import split_quoted_string, convert_number_string
 from ..util import get_imported_assets
+from ..util import VIDEO_FILE_PREFIX
+
+from scrape_exchange.datatypes import MAX_KEEPALIVE_REQUESTS
 
 _LOGGER: Logger = getLogger(__name__)
 
@@ -98,12 +99,13 @@ class YouTubeChannel:
 
         self.consent_cookies: dict[str, str] = consent_cookies
         self.headers: dict[str, str] = headers
+        self.user_agent: str = user_agent
         self.save_dir: str | None = save_dir
 
-        self.browse_client = AsyncYouTubeClient(
-            user_agent=user_agent, headers=headers,
-            consent_cookies=consent_cookies
-        )
+        self.browse_client: AsyncYouTubeClient | None = None
+        self.browse_request_count: int = 0
+        self._create_browse_client()
+
         self.download_client: YoutubeDL = YouTubeVideo._setup_download_client(
             browse_client=self.browse_client, deno_path=deno_path,
             po_token_url=po_token_url, debug=debug
@@ -152,8 +154,21 @@ class YouTubeChannel:
         self.posts: set[YouTubePost] = set()
         self.products: set[YouTubeProduct] = set()
 
-    def __del__(self) -> None:
-        pass
+        self.videos: set[YouTubeVideo] = set()
+
+    def _create_browse_client(self) -> None:
+        '''
+        Get the YouTube client for browsing/scraping data. This is separate
+        from the download client used for downloading media assets.
+
+        :returns: the YouTube client for browsing/scraping data
+        '''
+
+        self.browse_client = AsyncYouTubeClient(
+            user_agent=self.user_agent, headers=self.headers,
+            consent_cookies=self.consent_cookies
+        )
+        self.browse_request_count: int = 0
 
     def __eq__(self, other: Self) -> bool:
         if not isinstance(other, YouTubeChannel):
@@ -171,6 +186,7 @@ class YouTubeChannel:
             self.video_count == other.video_count and
             self.view_count == other.view_count and
             self.subscriber_count == other.subscriber_count and
+            self.channel_links == other.channel_links and
             self.external_urls == other.external_urls and
             self.categories == other.categories and
             self.country == other.country and
@@ -178,7 +194,6 @@ class YouTubeChannel:
             self.banners == other.banners and
             self.available_country_codes == other.available_country_codes and
             self.channel_thumbnails == other.channel_thumbnails and
-            self.external_urls == other.external_urls and
             self.banners == other.banners
         )
         return equal
@@ -207,6 +222,9 @@ class YouTubeChannel:
             'subscriber_count': self.subscriber_count or 0,
             'video_count': self.video_count or 0,
             'view_count': self.view_count or 0,
+            'channel_links': [
+                cl.to_dict() for cl in self.channel_links or set()
+            ],
             'courses': [c.to_dict() for c in self.courses or set()],
             'playlists': [p.to_dict() for p in self.playlists or set()],
             'posts': [p.to_dict() for p in self.posts or set()],
@@ -252,6 +270,13 @@ class YouTubeChannel:
         channel.subscriber_count = data.get('subscriber_count')
         channel.video_count = data.get('video_count')
         channel.view_count = data.get('view_count')
+
+        for cl in data.get('channel_links', []):
+            try:
+                channel.channel_links.add(YouTubeChannelLink.from_dict(cl))
+            except Exception:
+                continue
+
         channel.courses = {
             YouTubeCourse.from_dict(c) for c in data.get('courses', [])
         }
@@ -441,7 +466,8 @@ class YouTubeChannel:
 
         return external_links
 
-    async def scrape(self, save_dir: str | None = None) -> None:
+    async def scrape(self, save_dir: str | None = None,
+                     max_videos_per_channel: int = 0) -> None:
         '''
         Scrapes the channel page for information. This does not include data
         about the videos for the channel as multiple requests are needed
@@ -457,11 +483,20 @@ class YouTubeChannel:
                 raise ValueError('Save directory must be provided')
             save_dir = self.save_dir
 
-        await self.scrape_about_page()
-        await self.scrape_channel_content(
-            save_dir=save_dir,
-            max_videos_per_channel=MAX_CHANNEL_VIDEOS_PER_RUN
-        )
+        if self.browse_request_count > MAX_KEEPALIVE_REQUESTS:
+            _LOGGER.debug('Refreshing YouTube client to avoid stale session')
+            await self.browse_client.aclose()
+            self._create_browse_client()
+
+        self.browse_request_count += 1
+        try:
+            await self.scrape_about_page()
+            await self.scrape_channel_content(
+                save_dir=save_dir,
+                max_videos_per_channel=max_videos_per_channel
+            )
+        except (ValueError, RuntimeError):
+            pass
 
     async def scrape_about_page(self) -> None:
         '''
@@ -471,12 +506,19 @@ class YouTubeChannel:
         to get the videos from the channel.
 
         :returns: dict of the scraped data
-        :raises: ValueError if no data could be scraped or parsed
+        :raises: RuntimeError if no data could be scraped or parsed
         '''
 
+        if not self.url:
+            raise ValueError('Channel URL is not set')
+        
         about_url: str = self.url.rstrip('/') + '/about'
 
         page_contents: str | None = await self.browse_client.get(about_url)
+        if not page_contents:
+            raise RuntimeError(
+                f'Could not retrieve about page for channel {self.name}'
+            )
 
         self.channel_id = (
             self.channel_id or YouTubeChannel.extract_channel_id(page_contents)
@@ -496,7 +538,9 @@ class YouTubeChannel:
         )
         if not about_data:
             _LOGGER.warning('Could not find about tab renderer')
-            return
+            raise RuntimeError(
+                f'Could not find about tab renderer for channel {self.name}'
+            )
 
         self._parse_channel_about_data(about_data)
 
@@ -552,7 +596,7 @@ class YouTubeChannel:
 
         _LOGGER.warning(
             'Could not find about tab renderer',
-            extra={'channel': self.name, 'url': self.youtube_url}
+            extra={'channel': self.name, 'url': self.url}
         )
         return None
 
@@ -908,15 +952,17 @@ class YouTubeChannel:
         return page_data
 
     async def scrape_channel_content(
-        self, save_dir: str, max_videos_per_channel: int = 0,
-        uploaded_dir: str | None = None,
+        self, save_dir: str, uploaded_dir: str | None = None,
+        max_videos_per_channel: int = 0,
     ) -> int:
         '''
-        Scrapes videos from the YouTube website
+        Scrapes video_id's and videos from the YouTube website
 
-        :param max_videos_per_channel: the maximum number of videos to ingest
         :param save_dir: the directory to save the scraped video metadata to
         as JSON (if None, videos will not be saved to disk)
+        :param max_videos_per_channel: the maximum number of videos to ingest.
+        If set to 0, no videos will be scraped, only the video IDs will be
+        scraped.
         :param uploaded_dir: the directory to where already uploaded video
         is stored. The directory must already exist. If this parameter is
         None, uploaded videos read from the save_dir/{channel_name}/uploaded
@@ -932,9 +978,6 @@ class YouTubeChannel:
 
         self.parse_channel_video_data(page_data)
 
-        already_ingested_videos: dict[str, tuple[IngestStatus, datetime]] = \
-            get_imported_assets(save_dir, uploaded_dir)
-
         try:
             self.video_ids, self.podcast_ids, self.playlists, self.courses, \
                 self.posts, self.products = \
@@ -945,7 +988,37 @@ class YouTubeChannel:
             ) from exc
 
         videos_imported: int = 0
-        for video_id in self.video_ids:
+        if max_videos_per_channel:
+            videos_imported = await self.scrape_videos(
+                save_dir, uploaded_dir, max_videos_per_channel, self.video_ids
+            )
+
+        _LOGGER.debug(
+            f'Scraped {videos_imported} videos '
+            f'from YouTube channel: {self.name}'
+        )
+
+        return videos_imported
+
+    async def scrape_videos(
+        self, save_dir: str, uploaded_dir: str, max_videos_per_channel: int,
+        video_ids: set[str]
+    ) -> int:
+        '''
+        Scrapes video data for a set of video IDs
+
+        :param video_ids: the video IDs to scrape
+        :returns: a set of YouTubeVideo objects
+        '''
+
+        if not max_videos_per_channel:
+            return 0
+
+        already_ingested_videos: dict[str, tuple[IngestStatus, datetime]] = \
+            get_imported_assets(save_dir, uploaded_dir)
+
+        videos_imported: int = 0
+        for video_id in video_ids:
             if video_id in already_ingested_videos:
                 _LOGGER.debug(
                     f'Skipping already ingested video: {video_id} '
@@ -960,7 +1033,9 @@ class YouTubeChannel:
                 if not video:
                     continue
 
-                file_path: str = os.path.join(save_dir, f'{video_id}.json')
+                file_path: str = os.path.join(
+                    save_dir, f'{VIDEO_FILE_PREFIX}-{video_id}.json'
+                )
                 async with aiofiles.open(file_path, 'w') as f:
                     await f.write(
                         orjson.dumps(
@@ -972,22 +1047,22 @@ class YouTubeChannel:
                     IngestStatus.SCRAPED, video.published_timestamp
                 )
 
-                if videos_imported >= max_videos_per_channel > 0:
+                _LOGGER.debug(
+                    f'Scraped video: {video_id} for channel: {self.name}'
+                )
+                self.videos.add(video)
+
+                if videos_imported >= max_videos_per_channel:
                     break
             except RuntimeError:
                 continue
             except Exception as exc:
                 raise RuntimeError(f'Failed to scrape video: {exc}') from exc
 
-        _LOGGER.debug(
-            f'Scraped {videos_imported} videos '
-            f'from YouTube channel: {self.name}'
-        )
-
         return videos_imported
 
     @staticmethod
-    def extract_channel_id(page_data: str) -> str:
+    def extract_channel_id(page_data: str) -> str | None:
         '''
         Extracts the YouTube channel ID (ie. 'gxefuvUivrjesETjg') from the
         channel page data
@@ -995,8 +1070,10 @@ class YouTubeChannel:
         :param page_data: channel description
         :returns: the YouTube channel ID
         '''
+
         if not page_data:
             _LOGGER.warning('No page data to extract channel ID from')
+            return
 
         match: re.Match[str] | None = \
             YouTubeChannel.CHANNEL_ID_REGEX.search(page_data)
