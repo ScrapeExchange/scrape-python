@@ -8,8 +8,7 @@ Manages connections to YouTube for data import.
 
 import asyncio
 
-import logging
-from random import random
+import random
 from logging import Logger
 from logging import getLogger
 
@@ -17,7 +16,8 @@ from httpx import AsyncClient
 from httpx import Response
 from httpx import ReadTimeout
 from httpx import RequestError
-
+from httpx import ConnectError
+from httpx import ConnectTimeout
 
 _LOGGER: Logger = getLogger(__name__)
 
@@ -64,8 +64,8 @@ class AsyncYouTubeClient(AsyncClient):
         super().__init__(**kwargs)
 
         self.headers = headers.copy()
-
         self.consent_cookies: dict[str, str] = CONSENT_COOKIES
+
         if user_agent:
             self.headers['User-Agent'] = user_agent
 
@@ -97,10 +97,11 @@ class AsyncYouTubeClient(AsyncClient):
         try:
             _LOGGER.debug(f'HTTP GET {url}')
             resp: Response = await super().get(url, **kwargs)
-        except ReadTimeout as exc:
+        except (ConnectTimeout, ConnectError, ReadTimeout,
+                ConnectionResetError, ConnectionRefusedError) as exc:
             _LOGGER.debug(f'HTTP GET timeout for {url}: {exc}')
             if retries > 0:
-                await asyncio.sleep(delay-1, delay)
+                await asyncio.sleep(random.uniform(delay-1, delay))
                 _LOGGER.debug(
                     f'Retrying GET request to {url} (retries left: {retries})'
                 )
@@ -115,7 +116,7 @@ class AsyncYouTubeClient(AsyncClient):
         except Exception as exc:
             _LOGGER.debug(f'HTTP GET error for {url}: {exc}')
             if retries > 0:
-                await asyncio.sleep(delay-1, delay)
+                await asyncio.sleep(random.uniform(delay-1, delay))
                 _LOGGER.debug(
                     f'Retrying GET request to {url} (retries left: {retries})'
                 )
@@ -123,7 +124,7 @@ class AsyncYouTubeClient(AsyncClient):
                     url, retries=retries - 1, delay=delay*2, **kwargs
                 )
 
-            raise RuntimeError(f'Timeout fetching URL {url}')
+            raise RuntimeError(f'Timeout fetching URL {url}') from exc
 
         if (resp.status_code == 303
                 and 'youtube.com' in resp.headers.get('Location', '')):
@@ -146,7 +147,7 @@ class AsyncYouTubeClient(AsyncClient):
 
     @staticmethod
     async def _delay(min: float = 0.3, max: float = 0.8) -> None:
-        await asyncio.sleep(random() * (max - min) + min)
+        await asyncio.sleep(random.uniform(min, max))
 
     def create_cookie_header(self, cookies: dict) -> str:
         '''

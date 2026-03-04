@@ -10,9 +10,11 @@ the video IDs, playlist data, course data, post data, and product data.
 
 from logging import Logger
 from logging import getLogger
+from datetime import datetime, UTC
 
 from innertube import InnerTube
 
+from scrape_exchange.datatypes import MAX_KEEPALIVE_REQUESTS
 from scrape_exchange.youtube.youtube_types import YouTubeChannelPageType
 
 from .youtube_client import AsyncYouTubeClient
@@ -27,8 +29,26 @@ _LOGGER: Logger = getLogger(__name__)
 class YouTubeChannelTabs:
     def __init__(self, channel_id: str) -> None:
         self.channel_id: str = channel_id
-        self.client: InnerTube = InnerTube('WEB', '2.20230728.00.00')
+        self.client: InnerTube = self.get_innertube_client()
+        self.client_request_count: int = 0
         self.tabs: list[dict[str, any]] = []
+
+    def get_innertube_client(self) -> InnerTube:
+        '''
+        Gets the Innertube client for browsing/scraping data.  The client is
+        created lazily on the first call to this method.
+        '''
+
+        _LOGGER.debug('Creating new Innertube client')
+        try:
+            if self.client:
+                self.client.adaptor.session.close()
+        except AttributeError:
+            # this happens when we are called by the constructor
+            pass
+
+        self.client_request_count = 0
+        return InnerTube('WEB', '2.20230728.00.00')
 
     @staticmethod
     async def scrape_content(
@@ -76,21 +96,25 @@ class YouTubeChannelTabs:
                 playlists = self._get_playlist_items(
                     page_tab, channel_id
                 )
+                _LOGGER.debug(f'Parsed {len(playlists)} playlists')
                 continue
             elif title == 'courses':
                 courses = self._get_course_items(
                     page_tab, channel_id
                 )
+                _LOGGER.debug(f'Parsed {len(playlists)} courses')
                 continue
             elif title == 'posts':
                 posts = self._get_post_items(
                     page_tab, channel_id
                 )
+                _LOGGER.debug(f'Parsed {len(playlists)} posts')
                 continue
             elif title == 'store':
                 products = self._get_product_items(
                     page_tab, channel_id
                 )
+                _LOGGER.debug(f'Parsed {len(playlists)} merch products')
                 continue
 
             contents: list = page_tab.get(
@@ -110,12 +134,14 @@ class YouTubeChannelTabs:
                 # Podcasts page doesn't have a continuation token, so we
                 # can exit after the first page
                 podcast_ids = self._get_podcast_ids(contents)
+                _LOGGER.debug(f'Parsed {len(playlists)} podcasts')
                 continue
 
             continuation_token: str = self.get_continuation_token(contents[-1])
             if 'continuationItemRenderer' in contents[-1]:
                 contents = contents[:-1]
 
+            _LOGGER.debug(f'Parsed {len(contents)} videos or shorts')
             for content in contents:
                 video_id = self._extract_video_id(content, title)
                 if video_id:
@@ -148,6 +174,9 @@ class YouTubeChannelTabs:
                 if 'continuationItemRenderer' in continuation_items[-1]:
                     continuation_items = continuation_items[:-1]
 
+                _LOGGER.debug(
+                    f'Parsed {len(continuation_items)} videos or shorts'
+                )
                 for item in continuation_items:
                     video_id: str | None = self._extract_video_id(item, title)
                     if video_id:
@@ -364,23 +393,54 @@ class YouTubeChannelTabs:
         retries: int = 1
         delay_seconds: int = 1
         while retries <= max_retries:
+            self.client_request_count += 1
+            if self.client_request_count > MAX_KEEPALIVE_REQUESTS:
+                _LOGGER.debug(
+                    f'Client request count {self.client_request_count} '
+                    f'exceeded threshold, creating new client'
+                )
+                self.client = self.get_innertube_client()
             try:
+                start: datetime = datetime.now(UTC)
+                duration: float = (datetime.now(UTC) - start).total_seconds()
                 if not params:
                     if not continuation_token:
-                        return self.client.browse(self.channel_id)
+                        result: dict = self.client.browse(self.channel_id)
+                        duration: float = (
+                            datetime.now(UTC) - start
+                        ).total_seconds()
+                        _LOGGER.debug(
+                            f'Innertube completed in {duration:.2f} seconds'
+                        )
+                        return result
                     else:
-                        return self.client.browse(
+                        result: dict = self.client.browse(
                             self.channel_id, continuation=continuation_token
                         )
+                        duration: float = (
+                            datetime.now(UTC) - start
+                        ).total_seconds()
+                        _LOGGER.debug(
+                            f'Innertube completed in {duration:.2f} seconds'
+                        )
+                        return result
                 else:
                     # No need to sent continuation token and params
-                    return self.client.browse(
+                    result: dict = self.client.browse(
                         self.channel_id, params=params
                     )
+                    duration: float = (
+                        datetime.now(UTC) - start
+                    ).total_seconds()
+                    _LOGGER.debug(
+                        f'Innertube completed in {duration:.2f} seconds'
+                    )
+                    return result
             except Exception as e:
                 retries += 1
                 _LOGGER.error(
-                    f'Error fetching videos data (attempt {retries}): {e}'
+                    f'Error fetching videos data (attempt {retries}, '
+                    f'delay: {delay_seconds}): {e}'
                 )
                 await AsyncYouTubeClient._delay(
                     delay_seconds-1, delay_seconds

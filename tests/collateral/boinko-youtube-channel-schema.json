@@ -109,6 +109,11 @@
       "items": { "$ref": "#/$defs/product" },
       "description": "Merchandise/products listed in the channel store"
     },
+    "channel_links": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/channel_link" },
+      "description": "Featured/related channels linked from the channel page"
+    },
     "video_ids": {
       "type": "array",
       "items": { "type": "string" },
@@ -220,6 +225,16 @@
         "channel_id": { "type": ["string", "null"] },
         "created_timestamp": { "type": "string", "format": "date-time" }
       },
+      "additionalProperties": false
+    },
+    "channel_link": {
+      "type": "object",
+      "description": "A featured/related channel linked from the channel page",
+      "properties": {
+        "channel_name": { "type": "string" },
+        "subscriber_count": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["channel_name", "subscriber_count"],
       "additionalProperties": false
     }
   }

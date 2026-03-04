@@ -45,7 +45,10 @@ class YouTubeThumbnail:
         else:
             size = self.size
 
-        return f'{size}_{self.width}_{self.height}_{self.url.rstrip("-mo")}'
+        if self.url:
+            return f'{size}_{self.width}_{self.height}_{self.url.rstrip("-mo")}'
+        else:
+            return f'{size}_{self.width}_{self.height}'
 
     def __hash__(self) -> int:
         value: int = hash(

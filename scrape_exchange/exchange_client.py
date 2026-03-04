@@ -8,6 +8,7 @@ Scrape.Exchange client used for uploading content
 
 
 import asyncio
+from datetime import UTC, datetime
 import logging
 
 from typing import Self
@@ -64,9 +65,16 @@ class ExchangeClient(AsyncClient):
         '''
 
         self = ExchangeClient(exchange_url)
-        self.jwt_header = await ExchangeClient.get_jwt_token(
-            api_key_id, api_key_secret, self.exchange_url
-        )
+        try:
+            self.jwt_header = await ExchangeClient.get_jwt_token(
+                api_key_id, api_key_secret, self.exchange_url
+            )
+        except Exception as exc:
+            _LOGGER.warning(
+                f'Failed to set up ExchangeClient for {self.exchange_url}: '
+                f'{exc}'
+            )
+            raise
         self.headers['Authorization'] = self.jwt_header
         return self
 
@@ -88,6 +96,10 @@ class ExchangeClient(AsyncClient):
                     'api_key_id': api_key_id,
                     'api_key_secret': api_key_secret
                 }
+            )
+            _LOGGER.debug(
+                f'Token endpoint response: {response.status_code} '
+                f'- {response.text}'
             )
             if response.status_code != 200:
                 _LOGGER.warning(
@@ -118,7 +130,13 @@ class ExchangeClient(AsyncClient):
 
         try:
             _LOGGER.debug(f'HTTP GET {url}')
+            start: datetime = datetime.now(UTC)
             result: Response = await super().get(url, **kwargs)
+            duration: float = (datetime.now(UTC) - start).total_seconds()
+            _LOGGER.debug(
+                f'HTTP GET {url} completed with status {result.status_code} '
+                f'in {duration:.2f} seconds'
+            )
             return result
         except Exception as exc:
             if retries > 0:

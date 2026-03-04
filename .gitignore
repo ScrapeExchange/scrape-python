@@ -2,7 +2,11 @@
 
 tests/collateral/youtube_videos
 
+.env*
 *.swp
+
+.claude/
+CLAUDE.md
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

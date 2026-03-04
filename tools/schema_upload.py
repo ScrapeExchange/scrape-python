@@ -33,7 +33,7 @@ async def main(argv: list[str]) -> None:
     response: Response = await client.post(
         url=f'{args.exchange_url}{ExchangeClient.POST_SCHEMA_API}',
         json={
-            'platform': 'YouTube',
+            'platform': args.platform,
             'version': args.version,
             'entity': args.entity,
             'json_schema': schema
@@ -48,7 +48,7 @@ async def main(argv: list[str]) -> None:
         )
     else:
         print(f'Failed to upload schema: {response.status_code}')
-        print(f'Response: {await response.text}')
+        print(f'Response: {response.text}')
         sys.exit(1)
 
 
@@ -75,7 +75,8 @@ def process_arguments(args: argparse.Namespace) -> argparse.Namespace:
         )
     )
     parser.add_argument(
-        '--platform', '-p', type=str, default=os.environ.get('SCHEMA_PLATFORM'),
+        '--platform', '-p', type=str,
+        default=os.environ.get('SCHEMA_PLATFORM'),
         help=(
             'Name of the platform the schema describes (default: '
             'SCHEMA_PLATFORM environment variable)'

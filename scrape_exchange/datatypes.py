@@ -5,6 +5,10 @@ Datatypes and Enums used across the scrape exchange package.
 from enum import Enum
 from typing import Self
 
+
+MAX_KEEPALIVE_REQUESTS: int = 80
+
+
 class IngestStatus(str, Enum):
     # flake8: noqa: E201
     NONE =          'none'
