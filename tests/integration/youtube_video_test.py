@@ -58,6 +58,7 @@ class TestIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(video.video_id, YOUTUBE_VIDEO_ID)
         self.assertEqual(video.media_type, YouTubeMediaType.VIDEO)
         self._validate_schema(video.to_dict())
+
         async with aiofiles.open(
                 f'{self.temp_dir}/{YOUTUBE_VIDEO_ID}.json.br', 'rb') as f:
             video_data: str = orjson.loads(brotli.decompress(await f.read()))
@@ -68,24 +69,20 @@ class TestIntegration(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(video, loaded_video)
 
     async def test_youtube_short(self) -> None:
-        with self.assertRaises(RuntimeError):
-            short: YouTubeVideo = await YouTubeVideo.scrape(
-                video_id=YOUTUBE_SHORT_ID,
-                channel_name='byjacobward', channel_thumbnail=None,
-                deno_path=DENO_PATH, po_token_url=PO_TOKEN_URL, debug=True,
-                save_dir=self.temp_dir
-            )
-            self.assertEqual(short.video_id, YOUTUBE_SHORT_ID)
-            self.assertEqual(short.media_type, YouTubeMediaType.SHORT)
-            self._validate_schema(short.to_dict())
-            async with aiofiles.open(
-                    f'{self.temp_dir}/{YOUTUBE_SHORT_ID}.json', 'rb') as f:
-                short_data: str = orjson.loads(await f.read())
-                self._validate_schema(short_data)
-                loaded_short: YouTubeVideo = YouTubeVideo.from_dict(
-                    short_data['data']
-                )
-                self.assertEqual(short, loaded_short)
+        short: YouTubeVideo = await YouTubeVideo.scrape(
+            video_id=YOUTUBE_SHORT_ID,
+            channel_name='byjacobward', channel_thumbnail=None,
+            deno_path=DENO_PATH, po_token_url=PO_TOKEN_URL, debug=True,
+            save_dir=self.temp_dir
+        )
+        self.assertEqual(short.video_id, YOUTUBE_SHORT_ID)
+        self.assertEqual(short.media_type, YouTubeMediaType.SHORT)
+        self._validate_schema(short.to_dict())
+
+        short_from_file: YouTubeVideo = await YouTubeVideo.from_file(
+            video_id=YOUTUBE_SHORT_ID, load_dir=self.temp_dir
+        )
+        self.assertEqual(short, short_from_file)
 
     async def test_innertube(self) -> None:
         video = YouTubeVideo('N3jdUSEYzdk')

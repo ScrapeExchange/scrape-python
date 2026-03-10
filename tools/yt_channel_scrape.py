@@ -13,6 +13,7 @@ to Scrape Exchange and moves the file to an "uploaded" sub-directory.
 '''
 
 import os
+from random import shuffle
 import sys
 import asyncio
 import logging
@@ -57,15 +58,10 @@ class Settings(BaseSettings):
         ),
         description='Base URL for the Scrape.Exchange API',
     )
-    username: str = Field(
+    schema_owner: str = Field(
         default='boinko',
-        validation_alias=AliasChoices('USERNAME', 'username'),
-        description='Username for the Scrape.Exchange upload',
-    )
-    schema_username: str = Field(
-        default=None,
-        validation_alias=AliasChoices('SCHEMA_USERNAME', 'schema_username'),
-        description='Username for the Scrape.Exchange schema upload',
+        validation_alias=AliasChoices('SCHEMA_OWNER', 'schema_owner'),
+        description='Username of the owner of the YouTube channel schema'
     )
     schema_version: str = Field(
         default='0.0.1',
@@ -82,20 +78,16 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices('NO_UPLOAD', 'no_upload'),
         description='Only perform the scraping step, skipping data upload',
     )
-    directory: str | None = Field(
-        default=None,
+    channel_list: str = Field(
+        default='channels.lst',
         validation_alias=AliasChoices(
-            'YOUTUBE_SCRAPE_DIR', 'directory'
-        ),
-        description=(
-            'Directory containing YouTube channel data in .lst files '
-            'with one channel name per line'
-        ),
+            'YOUTUBE_CHANNEL_LIST', 'channel_list'
+        )
     )
-    save_directory: str | None = Field(
+    channel_data_directory: str | None = Field(
         default=None,
         validation_alias=AliasChoices(
-            'YOUTUBE_SAVE_DIR', 'save_directory'
+            'YOUTUBE_CHANNEL_DATA_DIR', 'channel_data_directory'
         ),
         description='Directory to save the scraped data',
     )
@@ -115,7 +107,7 @@ class Settings(BaseSettings):
         description='Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)',
     )
     log_file: str = Field(
-        default='/tmp/yt-scrape.log',
+        default='/dev/stdout',
         validation_alias=AliasChoices('LOG_FILE', 'log_file'),
         description='Log file path',
     )
@@ -141,6 +133,16 @@ async def main() -> None:
     '''
 
     settings: Settings = Settings()
+    logging.basicConfig(
+        level=settings.log_level,
+        filename=settings.log_file,
+        format='%(levelname)s:'
+               '%(asctime)s:'
+               '%(filename)s:'
+               '%(funcName)s():'
+               '%(lineno)d:'
+               '%(message)s'
+    )
 
     if not settings.api_key_id or not settings.api_key_secret:
         print(
@@ -149,24 +151,31 @@ async def main() -> None:
             'API_KEY_ID/API_KEY_SECRET, or a .env file'
         )
         sys.exit(1)
-    if not settings.directory:
+    if not settings.channel_list:
         print(
-            'Error: Directory containing .lst files must be provided via '
-            '--directory or environment variable YOUTUBE_CHANNEL_SCRAPE_DIR'
+            'Error: file containing channels to scrapemust be provided via '
+            '--channel-list or environment variable YOUTUBE_CHANNEL_LIST'
         )
         sys.exit(1)
-    if not settings.save_directory:
+    if not settings.channel_data_directory:
         print(
-            'Error: Save directory must be provided via '
-            '--save-directory or environment variable YOUTUBE_CHANNEL_SAVE_DIR'
+            'Error: Directory for scraped channel data must be provided via '
+            '--channel-data-directory or environment variable '
+            'YOUTUBE_CHANNEL_DATA_DIR'
         )
         sys.exit(1)
-    if not os.path.isdir(settings.directory):
-        print(f'Error: Directory {settings.directory} does not exist')
-        sys.exit(1)
-    if not os.path.isdir(settings.save_directory):
+    if not os.path.isdir(settings.channel_data_directory):
         print(
-            f'Error: Save directory {settings.save_directory} does not exist'
+            f'Directory {settings.channel_data_directory} does not exist. '
+            'It will be created.'
+        )
+        os.makedirs(
+            os.path.join(settings.channel_data_directory, 'uploaded'),
+            exist_ok=True
+        )
+    if not os.path.isfile(settings.channel_list):
+        print(
+            f'Error: Channel list file {settings.channel_list} does not exist'
         )
         sys.exit(1)
 
@@ -180,10 +189,6 @@ async def main() -> None:
     )
     client: ExchangeClient | None = None
 
-    os.makedirs(
-        os.path.join(settings.save_directory, 'uploaded'), exist_ok=True
-    )
-
     if not settings.no_upload:
         client = await ExchangeClient.setup(
             api_key_id=settings.api_key_id,
@@ -196,13 +201,36 @@ async def main() -> None:
         await scrape_channels(settings, client)
 
 
+async def scrape_channels(settings: Settings, client: ExchangeClient
+                          ) -> None:
+    channel_names: set[str] = await read_channels(settings.channel_list)
+    channel_names.discard('')  # Remove empty channel names if any
+    logging.debug(
+        f'Read {len(channel_names)} unique channel names from .lst files'
+    )
+    name: str
+    errors: int = 0
+    channel_list: list[str] = list(channel_names)
+    shuffle(channel_list)
+    for name in channel_list:
+        channel_name: str = normalize_channel_name(name)
+        failed: bool = await scrape_channel(settings, client, channel_name)
+        if failed:
+            errors += 1
+            if errors > 5:
+                logging.critical('Too many errors encountered, aborting')
+                raise RuntimeError(
+                    'Too many errors encountered during scraping'
+                )
+
+
 async def upload_channels(settings: Settings, client: ExchangeClient
                           ) -> None:
     saved_filepath: str
     uploaded_filepath: str
 
     files: list[str] = [
-        f for f in os.listdir(settings.save_directory)
+        f for f in os.listdir(settings.channel_data_directory)
         if f.startswith(CHANNEL_FILE_PREFIX)
     ]
     logging.debug(
@@ -210,14 +238,21 @@ async def upload_channels(settings: Settings, client: ExchangeClient
     )
     for filename in files:
         if filename.endswith('failed'):
+            logging.debug(
+                f'Skipping previously failed upload file: {filename}'
+            )
             continue
         channel_name: str = normalize_channel_name(
             filename[len(CHANNEL_FILE_PREFIX):-1*len('.json.br')]
         )
         saved_filepath, uploaded_filepath = get_file_paths(
-            channel_name, settings.save_directory
+            channel_name, settings.channel_data_directory
         )
         if await aiofiles.os.path.exists(uploaded_filepath):
+            logging.debug(
+                f'Found existing uploaded file for channel {channel_name}, '
+                'checking timestamps'
+            )
             upload_timestamp: float = await aiofiles.os.stat(
                 uploaded_filepath
             )
@@ -242,13 +277,6 @@ async def upload_channels(settings: Settings, client: ExchangeClient
             channel: YouTubeChannel = YouTubeChannel.from_dict(
                 channel_data
             )
-            if len(channel.video_ids or []) <= 3:
-                logging.warning(
-                    f'Channel {channel_name} has only '
-                    f'{len(channel.video_ids or [])} videos, '
-                    'skipping upload'
-                )
-                continue
             success: bool = await upload_channel(settings, client, channel)
             if success:
                 await aiofiles.os.rename(saved_filepath, uploaded_filepath)
@@ -278,43 +306,26 @@ def normalize_channel_name(channel_name: str) -> str:
     name: str = channel_name.strip().lstrip('@')
     if name.startswith('https://'):
         name = name.split('/')[-1]
-
+        logging.debug(
+            f'Extracted channel name from URL: {channel_name} -> {name}'
+        )
     # If the name is an email address
     if '@' in name:
         name = name.split('@')[0]
+        logging.debug(
+            f'Extracted channel name from email: {channel_name} -> {name}')
 
-    logging.debug(f'Normalized channel name: {channel_name} -> {name}')
     return name
 
 
-async def scrape_channels(settings: Settings, client: ExchangeClient
-                          ) -> None:
-    channel_names: set[str] = await read_channels(settings.directory)
-    channel_names.discard('')  # Remove empty channel names if any
-    logging.debug(
-        f'Read {len(channel_names)} unique channel names from .lst files'
-    )
-    name: str
-    errors: int = 0
-    for name in channel_names:
-        channel_name: str = normalize_channel_name(name)
-        failed: bool = await scrape_channel(settings, client, channel_name)
-        if failed:
-            errors += 1
-            if errors > 5:
-                logging.critical('Too many errors encountered, aborting')
-                raise RuntimeError(
-                    'Too many errors encountered during scraping'
-                )
-
-
-def get_file_paths(channel_name: str, save_directory: str) -> tuple[str, str]:
+def get_file_paths(channel_name: str, channel_data_directory: str
+                   ) -> tuple[str, str]:
     filename: str = get_channel_filename(channel_name)
     saved_filepath: str = os.path.join(
-        save_directory, filename
+        channel_data_directory, filename
     )
     uploaded_filepath: str = os.path.join(
-        save_directory, 'uploaded', filename
+        channel_data_directory, 'uploaded', filename
     )
     return saved_filepath, uploaded_filepath
 
@@ -339,7 +350,7 @@ async def scrape_channel(settings: Settings, client: ExchangeClient,
     saved_filepath: str
     uploaded_filepath: str
     saved_filepath, uploaded_filepath = get_file_paths(
-        channel_name, settings.save_directory
+        channel_name, settings.channel_data_directory
     )
     upload_timestamp: float = 0
     if await aiofiles.os.path.exists(uploaded_filepath):
@@ -356,6 +367,13 @@ async def scrape_channel(settings: Settings, client: ExchangeClient,
         logging.debug(
             f'Found {saved_filepath} for channel {channel_name}'
         )
+    if await aiofiles.os.path.exists(saved_filepath + '.failed'):
+        logging.debug(
+            f'Found previously failed upload file for channel {channel_name}, '
+            'skipping'
+        )
+        saved_filepath += '.failed'
+        saved_timestamp = await aiofiles.os.stat(saved_filepath)
 
     if upload_timestamp:
         if (saved_timestamp
@@ -376,7 +394,7 @@ async def scrape_channel(settings: Settings, client: ExchangeClient,
         channel: YouTubeChannel = YouTubeChannel(
             name=channel_name, deno_path=DENO_PATH,
             po_token_url=PO_TOKEN_URL, debug=True,
-            save_dir=settings.save_directory
+            save_dir=settings.channel_data_directory
         )
         try:
             await channel.scrape(max_videos_per_channel=0)
@@ -387,7 +405,7 @@ async def scrape_channel(settings: Settings, client: ExchangeClient,
                 channel.to_dict(with_video_ids=True),
                 option=orjson.OPT_INDENT_2
             )
-            compressed = brotli.compress(
+            compressed: bytes = brotli.compress(
                 data,
                 mode=brotli.MODE_TEXT,
                 quality=11,
@@ -437,7 +455,7 @@ async def upload_channel(settings: Settings, client: ExchangeClient,
                          channel: YouTubeChannel) -> bool:
     resp: httpx.Response = await client.post(
         f'{settings.exchange_url}{client.POST_DATA_API}', json={
-            'username': settings.schema_username,
+            'username': settings.schema_owner,
             'platform': 'youtube',
             'entity': 'channel',
             'version': settings.schema_version,
@@ -461,7 +479,7 @@ async def upload_channel(settings: Settings, client: ExchangeClient,
         return False
 
 
-async def read_channels(directory: str) -> set[str]:
+async def read_channels(file_path: str) -> set[str]:
     '''
     Reads .lst files from the specified directory and extracts YouTube channel
     names.
@@ -471,16 +489,13 @@ async def read_channels(directory: str) -> set[str]:
     :raises: (none)
     '''
 
-    logging.debug(f'Reading channel names from directory: {directory}')
+    logging.debug(f'Reading channel names from: {file_path}')
 
     channels: set[str] = set()
-    for entry in os.listdir(directory):
-        if entry.endswith('.lst'):
-            logging.debug(f'Found .lst file: {entry}')
-            async with aiofiles.open(os.path.join(directory, entry), 'r') as f:
-                async for line in f:
-                    channel_name: str = line.split(' ')[0].strip()
-                    channels.add(channel_name)
+    async with aiofiles.open(file_path, 'r') as file_desc:
+        async for line in file_desc:
+            channel_name: str = line.split(' ')[0].strip()
+            channels.add(channel_name)
     return channels
 
 
