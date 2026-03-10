@@ -13,7 +13,7 @@ import json
 import logging
 import sys
 import uuid
-from urllib.parse import urlparse
+from urllib.parse import ParseResult, urlparse
 
 import orjson
 import websockets
@@ -121,7 +121,7 @@ def _parse_data_url(data_url: str) -> dict[str, str]:
     Expected URL path format:
     /api/data/v1/param/{schema_username}/{platform}/{entity}/{version}/...
     '''
-    parsed = urlparse(data_url)
+    parsed: ParseResult = urlparse(data_url)
     path: str = parsed.path
     if not path.startswith(_DATA_URL_PARAM_PREFIX):
         return {}

@@ -26,6 +26,7 @@ from datetime import datetime
 from datetime import timedelta
 
 import httpx
+import brotli
 import orjson
 import untangle
 import aiofiles
@@ -38,8 +39,6 @@ from innertube import InnerTube
 from scrape_exchange.exchange_client import ExchangeClient
 from scrape_exchange.youtube.youtube_video import YouTubeVideo
 from scrape_exchange.youtube.youtube_client import AsyncYouTubeClient
-
-_LOGGER: logging.Logger = logging.getLogger(__name__)
 
 VIDEO_FILENAME_PREFIX: str = 'video-min-'
 CHANNEL_FILENAME_PREFIX: str = 'channel-'
@@ -83,11 +82,7 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices('EXCHANGE_URL', 'exchange_url'),
         description='Base URL for the Scrape.Exchange API',
     )
-    username: str = Field(
-        default='boinko',
-        validation_alias=AliasChoices('USERNAME', 'username'),
-        description='Username for Scrape.Exchange uploads',
-    )
+
     schema_version: str = Field(
         default='0.0.1',
         validation_alias=AliasChoices(
@@ -95,10 +90,10 @@ class Settings(BaseSettings):
         ),
         description='Schema version to use for uploads',
     )
-    schema_username: str = Field(
+    schema_owner: str = Field(
         default='boinko',
         validation_alias=AliasChoices(
-            'SCHEMA_USERNAME', 'schema_username'
+            'SCHEMA_USERNAME', 'schema_owner'
         ),
         description='Username of the schema owner used for data API calls',
     )
@@ -116,18 +111,17 @@ class Settings(BaseSettings):
         ),
         description='API key secret for Scrape.Exchange authentication',
     )
-    directory: str = Field(
-        default='/tmp/yt_rss_reader',
+    channel_data_directory: str = Field(
+        default='channels',
         validation_alias=AliasChoices(
-            'YOUTUBE_SAVE_DIR', 'youtube_save_dir'
+            'YOUTUBE_CHANNEL_DATA_DIR', 'channel_data_directory'
         ),
     )
-    channel_db_file: str = Field(
-        default='channels.csv',
+    video_data_directory: str = Field(
+        default='videos',
         validation_alias=AliasChoices(
-            'YOUTUBE_CHANNEL_DB_FILE', 'channel_db_file'
+            'YOUTUBE_VIDEO_DATA_DIR', 'video_data_directory'
         ),
-        description='CSV file mapping channel IDs to channel names for video uploads',  # noqa: E501
     )
     queue_file: str = Field(
         default='/tmp/yt-rss-reader-queue.json',
@@ -137,16 +131,19 @@ class Settings(BaseSettings):
         description='Path to JSON file for persisting the channel queue',
     )
     with_innertube: bool = Field(
-        default=False,
+        default=True,
         validation_alias=AliasChoices(
             'WITH_INNERTUBE', 'with_innertube'
         ),
         description=(
-            'Whether to fetch additional video data from YouTube Innertube API '
-            '(default: False). If enabled, the worker will attempt to fetch '
-            'additional metadata for each video using the YouTube Innertube API. '
-            'If an Innertube request fails, the worker will log the error and '
-            'continue processing with the data obtained from the RSS feed.'
+            'Whether to fetch additional video data from YouTube Innertube '
+            'API (default: True). If enabled, the worker will attempt to '
+            'fetch additional metadata for each video using the YouTube '
+            'Innertube API. If an Innertube request fails, the worker will '
+            'log the error and continue processing with the data obtained '
+            'from the RSS feed. Disable this feature if you want to retrieve '
+            'RSS feeds from many channels as it may get you rate-limited by '
+            'YouTube.'
         ),
     )
     min_interval: int = Field(
@@ -213,13 +210,13 @@ async def fetch_rss(channel_id: str) -> list[YouTubeVideo]:
     '''
 
     url: str = YOUTUBE_RSS_URL.format(channel_id=channel_id)
-    _LOGGER.debug(f'Fetching RSS feed: {url}')
+    logging.debug(f'Fetching RSS feed: {url}')
 
     async with AsyncYouTubeClient() as yt_client:
         try:
             data: str | None = await yt_client.get(url, timeout=1)
         except Exception:
-            _LOGGER.debug(
+            logging.debug(
                 'Getting RSS data failed, sleeping {FAILURE_DELAY} seconds'
             )
             await asyncio.sleep(FAILURE_DELAY)
@@ -241,7 +238,7 @@ async def fetch_rss(channel_id: str) -> list[YouTubeVideo]:
             video: YouTubeVideo = YouTubeVideo.from_rss_entry(entry)
             videos.append(video)
         except AttributeError as exc:
-            _LOGGER.warning(f'Skipping malformed RSS entry: {exc}')
+            logging.warning(f'Skipping malformed RSS entry: {exc}')
 
     return videos
 
@@ -261,7 +258,7 @@ async def check_video_exists(
 
     url: str = (
         f'{settings.exchange_url}{ExchangeClient.POST_DATA_API}'
-        f'/param/{settings.schema_username}/youtube/video'
+        f'/param/{settings.schema_owner}/youtube/video'
         f'/{settings.schema_version}/{video_id}'
     )
     response: httpx.Response = await client.get(url)
@@ -276,7 +273,7 @@ async def check_video_exists(
     )
 
 
-async def store_video(
+async def upload_video(
     client: ExchangeClient, settings: Settings,
     channel_name: str, video: YouTubeVideo
 ) -> bool:
@@ -294,7 +291,7 @@ async def store_video(
         response: httpx.Response = await client.post(
             f'{settings.exchange_url}{ExchangeClient.POST_DATA_API}',
             json={
-                'username': settings.schema_username,
+                'username': settings.schema_owner,
                 'platform': 'youtube',
                 'entity': 'video',
                 'version': settings.schema_version,
@@ -306,14 +303,14 @@ async def store_video(
             }
         )
     except Exception as exc:
-        _LOGGER.info(f'Failed to upload data: {exc}')
+        logging.info(f'Failed to upload data: {exc}')
         return False
 
     if response.status_code == 201 or response.status_code == 500:
         # Status 500 is bug in server when video already exists
         return True
 
-    _LOGGER.warning(
+    logging.warning(
         f'Failed to store video {video.video_id}: '
         f'HTTP {response.status_code} - {response.text}'
     )
@@ -338,16 +335,16 @@ async def process_channel(
     :raises: RuntimeError if one or more videos could not be stored.
     '''
 
-    _LOGGER.info(f'Processing channel {channel_name!r} ({channel_id})')
+    logging.info(f'Processing channel {channel_name!r} ({channel_id})')
 
     innertube: InnerTube = InnerTube('WEB')
     videos: list[YouTubeVideo] = await fetch_rss(channel_id)
     if not videos:
         await asyncio.sleep(random.uniform(0.2, 0.5))
-        _LOGGER.info(f'No videos found in RSS feed for channel {channel_name!r}')
+        logging.info(f'No videos found in RSS feed for channel {channel_name!r}')
         return
 
-    _LOGGER.debug(
+    logging.debug(
         f'[{channel_name}] {len(videos)} video(s) in RSS feed'
     )
 
@@ -355,65 +352,79 @@ async def process_channel(
     videos_existing: int = 0
     global INNERTUBE_BLOCKED_TIMER
     for video in videos:
+        if os.path.exists(
+            YouTubeVideo.get_filepath(
+                video.video_id, settings.video_data_directory,
+                VIDEO_FILENAME_PREFIX
+            )
+        ):
+            logging.debug(
+                f'Found existing file for video {video.video_id}, skipping'
+            )
+            continue
+
         try:
+            exists: bool = await check_video_exists(
+                client, settings, video.video_id
+            )
+            if exists:
+                logging.info(
+                    f'[{channel_name}] {video.video_id} ({video.title!r}): '
+                    f'already on scrape.exchange'
+                )
+                videos_existing += 1
+                continue
+
             if settings.with_innertube:
                 if INNERTUBE_BLOCKED_TIMER < datetime.now(UTC):
                     await video.from_innertube(innertube=innertube)
-                    _LOGGER.debug('Updated video with data from YouTube')
+                    logging.debug('Updated video with data from YouTube')
                 else:
-                    _LOGGER.debug(
+                    logging.debug(
                         f'Innertube blocked until {INNERTUBE_BLOCKED_TIMER}'
                     )
         except Exception as exc:
             INNERTUBE_BLOCKED_TIMER = \
                 datetime.now(UTC) + timedelta(seconds=3600)
-            _LOGGER.debug(
+            logging.debug(
                 'Failed to update video data, will continue with '
                 f'what we have: {exc}'
             )
 
         try:
             filename: str = await video.to_file(
-                settings.directory, filename_prefix=VIDEO_FILENAME_PREFIX,
+                settings.video_data_directory,
+                filename_prefix=VIDEO_FILENAME_PREFIX,
                 overwrite=True
             )
-            _LOGGER.debug(f'Stored the file in {filename}')
+            logging.debug(f'Stored the file in {filename}')
 
-            exists: bool = await check_video_exists(
-                client, settings, video.video_id
+
+            logging.debug(
+                f'[{channel_name}] {video.video_id} ({video.title!r}): '
+                f'not yet on scrape.exchange, storing'
             )
-            if exists:
-                _LOGGER.info(
-                    f'[{channel_name}] {video.video_id} ({video.title!r}): '
-                    f'already on scrape.exchange'
+            stored: bool = await upload_video(
+                client, settings, channel_name, video
+            )
+            if stored:
+                logging.debug(
+                    f'[{channel_name}] {video.video_id} '
+                    f'({video.title!r}): uploaded'
                 )
-                videos_existing += 1
+                videos_uploaded += 1
             else:
-                _LOGGER.debug(
-                    f'[{channel_name}] {video.video_id} ({video.title!r}): '
-                    f'not yet on scrape.exchange, storing'
+                logging.warning(
+                    f'[{channel_name}] {video.video_id} '
+                    f'({video.title!r}): upload failed'
                 )
-                stored: bool = await store_video(
-                    client, settings, channel_name, video
-                )
-                if stored:
-                    _LOGGER.debug(
-                        f'[{channel_name}] {video.video_id} '
-                        f'({video.title!r}): stored'
-                    )
-                    videos_uploaded += 1
-                else:
-                    _LOGGER.warning(
-                        f'[{channel_name}] {video.video_id} '
-                        f'({video.title!r}): store failed'
-                    )
         except RuntimeError as exc:
-            _LOGGER.warning(
+            logging.warning(
                 f'[{channel_name}] {video.video_id}: API error - {exc}'
             )
 
     missed: int = len(videos) - videos_uploaded - videos_existing
-    _LOGGER.debug(
+    logging.debug(
         f'{channel_name}: uploaded {videos_uploaded} videos, '
         f'{videos_existing} were already on the server'
     )
@@ -424,36 +435,59 @@ async def process_channel(
         )
 
 
-def get_channels(channel_db_file: str) -> dict[str, str]:
+def get_channelmap(channel_data_dir: str) -> dict[str, str]:
     '''
-    Loads the wanted channels from the hardcoded wanted_channels dict.
+    Loads the wanted channels from the channel db file
 
-    In a more advanced implementation, this could read from a config file or
-    an API instead.
-
-    :param directory: (not used in this implementation) Directory path for
-                      potential future channel config files.
-    :returns: A dict mapping channel names to YouTube channel IDs.
+    :param channel_data_dir: Path to the channel data directory.
+    :returns: A dict mapping channel IDs to channel names.
     '''
+
+    if not channel_data_dir.endswith(UPLOADED_DIR):
+        channel_data_dir += UPLOADED_DIR
 
     channel_map: dict[str, str] = {}
-    with open(channel_db_file) as f:
-        for line in f:
-            channel_id: str
-            channel_name: str
-            channel_id, channel_name = line.strip().split(',')
-            if not channel_id or not channel_name:
-                logging.warning(
-                    f'Invalid channel mapping line: {line.strip()}')
-                continue
-            if channel_id in channel_map:
-                logging.warning(
-                    f'Duplicate channel ID {channel_id} in mapping file, '
-                    f'overwriting previous name {channel_map[channel_id]}'
-                )
+    files: list[str] = os.listdir(channel_data_dir)
+    filename: str
+    for filename in files:
+        if (not filename.startswith(CHANNEL_FILENAME_PREFIX)
+                or not filename.endswith('.json.br')):
+            continue
 
-            channel_map[channel_id] = channel_name
+        channel_name: str = filename[
+            len(CHANNEL_FILENAME_PREFIX):-1*len('.json.br')
+        ]
+
+        file_path: str = os.path.join(channel_data_dir, filename)
+        try:
+            data: dict[str, any] = read_channel_file(file_path)
+            channel_map[data['channel_id']] = channel_name
+        except Exception as exc:
+            os.remove(file_path)
+            logging.debug(f'Removed invalid channel file {file_path!r}: {exc}')
+
     return channel_map
+
+
+def read_channel_file(filepath: str) -> dict[str, any]:
+    '''
+    Reads a channel data file, which may be compressed with Brotli.
+
+    :param filepath: Path to the channel data file.
+    :returns: The parsed channel data as a dictionary.
+    :raises: OSError if there is an error reading the file.
+             orjson.JSONDecodeError if the file contents cannot be parsed as
+             JSON.
+    '''
+
+    logging.debug(f'Reading channel file {filepath!r}')
+    if filepath.endswith('.json.br'):
+        with open(filepath, 'rb') as f:
+            decompressed_data: bytes = brotli.decompress(f.read())
+            return orjson.loads(decompressed_data)
+    else:
+        with open(filepath, 'r') as f:
+            return orjson.loads(f.read())
 
 
 def get_queue(settings, channels: dict[str, str] = {}
@@ -477,18 +511,18 @@ def get_queue(settings, channels: dict[str, str] = {}
     try:
         temp_queue = load_queue(queue_file)
     except Exception as exc:
-        _LOGGER.warning(
+        logging.warning(
             f'Failed to load queue file {queue_file!r}: {exc}'
         )
 
     if temp_queue:
         try:
             shutil.copyfile(queue_file, f'{queue_file}.{BACKUP_SUFFIX}')
-            _LOGGER.debug(
+            logging.debug(
                 f'Backed up queue file to {queue_file!r}.{BACKUP_SUFFIX}'
             )
         except OSError as exc:
-            _LOGGER.warning(
+            logging.warning(
                 f'Failed to back up queue file {queue_file!r}: {exc}'
             )
     else:
@@ -497,12 +531,12 @@ def get_queue(settings, channels: dict[str, str] = {}
             shutil.copyfile(backup_queue_file, queue_file)
             temp_queue = load_queue(queue_file)
         except Exception as exc:
-            _LOGGER.warning(
+            logging.warning(
                 f'Failed to load backup queue file {backup_queue_file!r}: {exc}'
             )
 
     if not temp_queue:
-        _LOGGER.info('Starting with an empty queue')
+        logging.info('Starting with an empty queue')
 
     # Now create the actual queue with a list of tuples
     # ugh, (or)json does not support tuples but converts each tuple to a
@@ -514,7 +548,7 @@ def get_queue(settings, channels: dict[str, str] = {}
 
     channel_name: str
     channel_id: str
-    channel_items = list(channels.items())
+    channel_items: list[tuple[str, str]] = list(channels.items())
     random.shuffle(channel_items)
     for channel_id, channel_name in channel_items:
         if channel_name not in channels_seen:
@@ -544,7 +578,7 @@ def load_queue(filepath: str) -> list[tuple[float, str, str]]:
 
         # (next_check_timestamp, channel_name, channel_id)
         queue: list[list[float, str, str]] = orjson.loads(content)
-        _LOGGER.info(
+        logging.info(
             f'Loaded queue from file {filepath!r}: '
             f'{len(queue)} channel(s)'
         )
@@ -566,12 +600,14 @@ async def worker_loop(
     :param client: The authenticated Scrape Exchange API client.
     '''
 
-    channel_map: dict[str, str] = get_channels(settings.channel_db_file)
+    channel_map: dict[str, str] = get_channelmap(
+        settings.channel_data_directory
+    )
     queue: list[tuple[float, str, str]] = get_queue(
         settings, channel_map
     )
 
-    _LOGGER.info(
+    logging.info(
         f'Worker started: {len(queue)} channel(s), '
         f'min_interval={settings.min_interval}s, '
         f'retry_interval={settings.retry_interval}s, '
@@ -585,9 +621,8 @@ async def worker_loop(
         next_time: float = queue[0][0]
         if next_time > now:
             sleep_secs: float = next_time - now
-            _LOGGER.debug(f'Sleeping {sleep_secs:.1f}s until next batch')
+            logging.debug(f'Sleeping {sleep_secs:.1f}s until next batch')
             await asyncio.sleep(sleep_secs)
-            continue
 
         # Collect up to max_concurrent channels that are ready
         batch: list[tuple[float, str, str]] = []
@@ -595,7 +630,7 @@ async def worker_loop(
                and len(batch) < settings.max_concurrent):
             batch.append(heapq.heappop(queue))
 
-        _LOGGER.info(
+        logging.info(
             'Batch: ' + ', '.join(name for _, name, _ in batch)
         )
 
@@ -610,11 +645,9 @@ async def worker_loop(
             result = results[i]
             if (isinstance(result, BaseException)
                     and not isinstance(result, FileExistsError)):
-                _LOGGER.warning(f'Channel {name!r} failed ({result})')
-                # next_check: float = now + settings.retry_interval
-                next_check: float = now + settings.min_interval
-            else:
-                next_check: float = now + settings.min_interval
+                logging.warning(f'Channel {name!r} failed ({result})')
+
+            next_check: float = now + settings.min_interval
             heapq.heappush(queue, (next_check, name, channel_id))
 
         try:
@@ -623,7 +656,7 @@ async def worker_loop(
                     orjson.dumps(queue, option=orjson.OPT_INDENT_2)
                 )
         except OSError as exc:
-            _LOGGER.warning(
+            logging.warning(
                 f'Failed to write queue file {settings.queue_file!r}: {exc}'
             )
 
@@ -654,12 +687,14 @@ async def main() -> None:
         level=settings.log_level,
         filename=settings.log_file,
         format='%(levelname)s:'
+               '%(asctime)s:'
                '%(filename)s:'
                '%(funcName)s():'
                '%(lineno)d:'
                '%(message)s'
     )
-    os.makedirs(settings.directory, exist_ok=True)
+    os.makedirs(settings.channel_data_directory, exist_ok=True)
+    os.makedirs(settings.video_data_directory, exist_ok=True)
 
     client: ExchangeClient = await ExchangeClient.setup(
         api_key_id=settings.api_key_id,

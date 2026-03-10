@@ -14,7 +14,9 @@ dependencies = [
     "orjson>=3.11.7",
     "pydantic-settings>=2.3.0",
     "untangle>=1.2.1",
-    "yt-dlp[default]>=2026.2.21",
+    "websockets>=16.0",
+    "yt-dlp>=2026.3.3",
+    "yt-dlp-ejs>=0.5.0",
 ]
 
 [dependency-groups]

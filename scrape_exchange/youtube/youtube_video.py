@@ -134,8 +134,6 @@ class YouTubeVideo:
         self.keywords: set[str] = set()
         self.privacy_status: str = 'public'
 
-        self.client: AsyncYouTubeClient = AsyncYouTubeClient()
-
         self.ingest_status: IngestStatus = IngestStatus.NONE
 
     def __eq__(self, other: Self) -> bool:
@@ -543,16 +541,65 @@ class YouTubeVideo:
         if not self.video_id:
             raise ValueError('Cannot save video without video_id')
 
-        filename: str = f'{save_dir}/{filename_prefix}{self.video_id}.json'
+        filename: str = YouTubeVideo.get_filepath(
+            self.video_id, save_dir, filename_prefix, compressed
+        )
+
         data: bytes = orjson.dumps(self.to_dict(), option=orjson.OPT_INDENT_2)
+
         if compressed:
-            filename += '.br'
             data = brotli.compress(data, quality=11, mode=brotli.MODE_TEXT)
         if not overwrite and os.path.exists(filename):
             raise FileExistsError(f'File {filename} already exists')
 
         async with aiofiles.open(filename, 'wb') as f:
             await f.write(data)
+
+        return filename
+
+    @staticmethod
+    async def from_file(video_id: str, load_dir: str,
+                        filename_prefix: str = '',
+                        compressed: bool = True) -> Self:
+        '''
+        Loads video metadata from a JSON file in the specified directory.
+
+        :param load_dir: Directory to load the JSON file from
+        :returns: A YouTubeVideo instance with data loaded from the file
+        :raises: FileNotFoundError if the file does not exist
+        '''
+
+        filename: str = YouTubeVideo.get_filepath(
+            video_id, load_dir, filename_prefix, compressed
+        )
+
+        async with aiofiles.open(filename, 'rb') as f:
+            data: bytes = await f.read()
+
+        if compressed:
+            data = brotli.decompress(data)
+
+        video_data: dict[str, any] = orjson.loads(data)
+        return YouTubeVideo.from_dict(video_data)
+
+    @staticmethod
+    def get_filepath(video_id: str, save_dir: str, filename_prefix: str = '',
+                     compressed: bool = True) -> str:
+        '''
+        Get the file path for the video metadata JSON file in the specified
+        directory.
+
+        :param save_dir: Directory to save the JSON file in
+        :returns: File path for the JSON file
+        :raises: ValueError if video_id is not set
+        '''
+
+        if not video_id:
+            raise ValueError('Cannot get file path for video without video_id')
+
+        filename: str = f'{save_dir}/{filename_prefix}{video_id}.json'
+        if compressed:
+            filename += '.br'
 
         return filename
 
@@ -578,6 +625,7 @@ class YouTubeVideo:
         if not po_token_url:
             raise ValueError('po_token_url is required if no download_client')
 
+        _LOGGER.debug(f'Using deno: {deno_path}, po-token-url: {po_token_url}')
         ytdlp_opts: dict = {
             'quiet': not debug,
             'verbose': debug,
@@ -597,7 +645,8 @@ class YouTubeVideo:
                     'player-client': 'default,mweb',
                     'youtubepot-bgutilhttp:base_url': po_token_url
                 }
-            }
+            },
+            'remote_components': ['ejs:github']
         }
         download_client = YoutubeDL(ytdlp_opts)
 
@@ -723,8 +772,12 @@ class YouTubeVideo:
                 microformat['uploadDate']
             )
 
-        if microformat.get('category'):
-            self.categories |= set(microformat.get('category', []))
+        category: str | None = video_details.get('category')
+        if category:
+            if isinstance(category, str):
+                self.categories.add(category)
+            elif isinstance(category, list):
+                self.categories |= set(category)
 
         # TODO: does this ever get a value?
         self.default_audio_language = microformat.get(
@@ -862,14 +915,16 @@ class YouTubeVideo:
             self._transition_state(IngestStatus.UNAVAILABLE)
             await sleep(sleepy_time)
             raise RuntimeError(
-                f'Failed to extract info for video: {self.video_id}, sleeping'
+                f'Failed to extract info for video: {self.video_id}: '
+                f'{exc}, sleeping'
             ) from exc
         except Exception as exc:
             sleepy_time: int = randrange(10, 30)
             self._transition_state(IngestStatus.UNAVAILABLE)
             await sleep(sleepy_time)
             raise RuntimeError(
-                f'Failed to extract info for video: {self.video_id}, sleeping'
+                f'Failed to extract info for video: {self.video_id}: '
+                f'{exc}, sleeping'
             ) from exc
 
         self.channel_id = video_info.get('channel_id')
@@ -900,11 +955,12 @@ class YouTubeVideo:
         self.availability = video_info.get('availability')
         self.duration = self.duration or video_info.get('duration')
         self.tags = self.tags | set(video_info.get('tags', []))
-        self.categories = self.categories | set(video_info.get('categories', []))
+        self.categories = \
+            self.categories | set(video_info.get('categories', []))
         self.default_audio_language = video_info.get('language')
         self.age_limit = self.age_limit or video_info.get('age_limit', 0)
         self.heatmaps = video_info.get('heatmaps', [])
-        self.aspect_ratio: float = float(video_info.get('aspect_ratio', 0))
+        self.aspect_ratio: float = float(video_info.get('aspect_ratio') or 0)
 
         for language_code, captions in video_info.get(
                 'automatic_captions', {}).items():
