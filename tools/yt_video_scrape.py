@@ -304,10 +304,10 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
                 extension: str = '.failed'
                 error_val: str = str(exc).lower()
                 if ('uploader has not made this video available in your country' in error_val           # noqa: E501
-                        or 'this video is not available in your country' in error_val                   # noqa: E501
                         or 'this live event will begin in' in error_val
                         or 'this live event has ended' in error_val
                         or 'video unavailable' in error_val
+                        or 'video is not available' in error_val
                         or 'this video is private' in error_val
                         or 'this video has been removed' in error_val
                         or 'this video is age restricted and only available on youtube' in error_val):  # noqa: E501
