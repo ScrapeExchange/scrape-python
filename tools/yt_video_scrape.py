@@ -312,6 +312,7 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
                         or 'this video is private' in error_val
                         or 'this video has been removed' in error_val
                         or 'this video is age restricted and only available on youtube' in error_val    # noqa: E501
+                        or "available to this channel's members on level" in error_val                  # noqa: E501
                         or 'offline' in error_val):
                     sleep = randint(SLEEP_MIN_INTERVAL, SLEEP_MAX_INTERVAL)
                     extension = '.unavailable'
