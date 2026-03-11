@@ -280,7 +280,10 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
         else:
             continue
 
-        if video_uploaded(settings, video_id):
+        # If the entry was parsed by yt-dlp then we always want to upload, even
+        # if it means updating an existing upload.
+        if (not entry.startswith(VIDEO_YTDLP_PREFIX)
+                and video_uploaded(settings, video_id)):
             logging.debug(
                 f'Video {video_id} already uploaded, skipping'
             )
