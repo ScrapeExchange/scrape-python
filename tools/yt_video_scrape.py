@@ -306,6 +306,7 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
                 if ('uploader has not made this video available in your country' in error_val           # noqa: E501
                         or 'this live event will begin in' in error_val
                         or 'this live event has ended' in error_val
+                        or 'live stream recording is not available' in error_val
                         or 'video unavailable' in error_val
                         or 'video is not available' in error_val
                         or 'this video is private' in error_val
