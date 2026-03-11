@@ -33,8 +33,8 @@ from scrape_exchange.youtube.youtube_video import DENO_PATH, PO_TOKEN_URL
 VIDEO_MIN_PREFIX = 'video-min-'
 VIDEO_YTDLP_PREFIX = 'video-dlp-'
 UPLOADED_DIRNAME: str = '/uploaded'
-SLEEP_MIN_INTERVAL: int = 5
-SLEEP_MAX_INTERVAL: int = 10
+SLEEP_MIN_INTERVAL: int = 8
+SLEEP_MAX_INTERVAL: int = 15
 FAILURE_SLEEP_INTERVAL: int = 3600
 
 
@@ -306,13 +306,13 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
                 if ('uploader has not made this video available in your country' in error_val           # noqa: E501
                         or 'this live event will begin in' in error_val
                         or 'this live event has ended' in error_val
-                        or 'live stream recording is not available' in error_val
+                        or 'live stream recording is not available' in error_val                        # noqa: E501
                         or 'video unavailable' in error_val
                         or 'video is not available' in error_val
                         or 'this video is private' in error_val
                         or 'this video has been removed' in error_val
                         or 'this video is age restricted and only available on youtube' in error_val):  # noqa: E501
-                    sleep = 5
+                    sleep = randint(SLEEP_MIN_INTERVAL, SLEEP_MAX_INTERVAL)
                     extension = '.unavailable'
                 else:
                     logging.info(f'Failed to scrape video {video_id}: {exc}')
