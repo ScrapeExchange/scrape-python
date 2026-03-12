@@ -8,6 +8,7 @@ Model a Youtube video
 
 import os
 import re
+import tempfile
 
 from enum import Enum
 from typing import Self
@@ -626,6 +627,17 @@ class YouTubeVideo:
             raise ValueError('po_token_url is required if no download_client')
 
         _LOGGER.debug(f'Using deno: {deno_path}, po-token-url: {po_token_url}')
+
+        cookie_file = tempfile.NamedTemporaryFile(
+            mode='w', suffix='.txt', delete=False
+        )
+        cookie_file.write('# Netscape HTTP Cookie File\n')
+        for name, value in browse_client.consent_cookies.items():
+            cookie_file.write(
+                f'.youtube.com\tTRUE\t/\tFALSE\t0\t{name}\t{value}\n'
+            )
+        cookie_file.close()
+
         ytdlp_opts: dict = {
             'quiet': not debug,
             'verbose': debug,
@@ -633,12 +645,8 @@ class YouTubeVideo:
             'noprogress': True,
             'no_color': True,
             'format': 'all',
-            'http_headers': dict(browse_client.headers) | {
-                'Cookie': '; '.join(
-                    f'{k}={v}' for k, v
-                    in browse_client.consent_cookies.items()
-                )
-            },
+            'http_headers': dict(browse_client.headers),
+            'cookiefile': cookie_file.name,
             'js_runtimes': {'deno': {'path': deno_path}},
             'extractor_args': {
                 'youtube': {
@@ -649,6 +657,7 @@ class YouTubeVideo:
             'remote_components': ['ejs:github']
         }
         download_client = YoutubeDL(ytdlp_opts)
+        os.unlink(cookie_file.name)
 
         return download_client
 
