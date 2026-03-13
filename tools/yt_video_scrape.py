@@ -162,6 +162,7 @@ async def main() -> None:
         'Starting YouTube video upload tool with settings: '
         f'{settings.model_dump_json(indent=2)}'
     )
+
     if not settings.upload_only:
         logging.info('Starting video scraping process')
         await scrape_and_upload_videos(settings)
@@ -240,6 +241,7 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
     Scrapes YouTube video data and uploads it to Scrape Exchange.
 
     :param settings: Configuration settings for the tool
+    :param upload_only: Flag indicating whether to only upload videos without scraping
     :returns: (none)
     :raises: (none)
     '''
@@ -269,6 +271,9 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
 
         video: YouTubeVideo
         if entry.startswith(VIDEO_MIN_PREFIX):
+            if settings.upload_only:
+                continue
+
             video_needs_scraping = True
             video_id: str = entry[len(VIDEO_MIN_PREFIX):-len('.json.br')]
             video = await YouTubeVideo.from_file(
@@ -289,6 +294,7 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
             logging.debug(
                 f'Video {video_id} already uploaded, skipping'
             )
+            os.remove(os.path.join(settings.video_data_directory, entry))
             continue
 
         if video_needs_scraping:
