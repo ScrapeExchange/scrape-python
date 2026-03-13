@@ -33,8 +33,8 @@ from scrape_exchange.youtube.youtube_video import DENO_PATH, PO_TOKEN_URL
 VIDEO_MIN_PREFIX = 'video-min-'
 VIDEO_YTDLP_PREFIX = 'video-dlp-'
 UPLOADED_DIRNAME: str = '/uploaded'
-SLEEP_MIN_INTERVAL: int = 8
-SLEEP_MAX_INTERVAL: int = 15
+SLEEP_MIN_INTERVAL: int = 12
+SLEEP_MAX_INTERVAL: int = 18
 FAILURE_SLEEP_INTERVAL: int = 3600
 
 
@@ -261,6 +261,8 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
             or entry.startswith(VIDEO_YTDLP_PREFIX)
         )
     ]
+    files_scraped: int = 0
+    files_uploaded: int = 0
     shuffle(files)
     for entry in files:
         video_needs_scraping: bool = False
@@ -299,6 +301,7 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
                     filename_prefix=VIDEO_YTDLP_PREFIX,
                     debug=settings.log_level == 'DEBUG'
                 )
+                files_scraped += 1
                 await asyncio.sleep(
                     randint(SLEEP_MIN_INTERVAL, SLEEP_MAX_INTERVAL)
                 )
@@ -344,6 +347,7 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
             if not settings.no_upload and await upload_video(
                 exchange_client, settings, video.channel_name, video
             ):
+                files_uploaded += 1
                 await video.to_file(
                     settings.video_data_directory + UPLOADED_DIRNAME,
                     VIDEO_YTDLP_PREFIX
@@ -358,6 +362,9 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
         except Exception as exc:
             logging.info(f'Failed to upload video {video.video_id}: {exc}')
 
+        logging.info(
+            f'Files scraped: {files_scraped}, files uploaded: {files_uploaded}'
+        )
 
 async def upload_video(
     client: ExchangeClient, settings: Settings,

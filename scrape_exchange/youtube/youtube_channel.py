@@ -511,7 +511,7 @@ class YouTubeChannel:
 
         if not self.url:
             raise ValueError('Channel URL is not set')
-        
+
         about_url: str = self.url.rstrip('/') + '/about'
 
         page_contents: str | None = await self.browse_client.get(about_url)
@@ -1171,7 +1171,7 @@ class YouTubeChannel:
                 if isinstance(metadata_part.get('text'), dict):
                     content: str = metadata_part['text'].get('content', '')
                     if content and 'videos' in content:
-                        youtube_video_count: int | None = \
+                        youtube_v: int | None = \
                             convert_number_string(content)
                         return youtube_video_count
 
