@@ -320,6 +320,7 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
                         or 'this live event has ended' in error_val
                         or 'live stream recording is not available' in error_val                        # noqa: E501
                         or 'video unavailable' in error_val
+                        or 'inappropriate' in error_val
                         or 'video is not available' in error_val
                         or 'this video is private' in error_val
                         or 'this video has been removed' in error_val
