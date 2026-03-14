@@ -230,7 +230,7 @@ async def upload_videos(settings: Settings) -> None:
             video_id, settings.video_data_directory, VIDEO_YTDLP_PREFIX
         )
         try:
-            if not settings.no_upload and upload_video(
+            if not settings.no_upload and await upload_video(
                 exchange_client, settings, video.channel_name, video
             ):
                 os.remove(
