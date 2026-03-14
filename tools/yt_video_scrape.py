@@ -294,7 +294,10 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
             logging.debug(
                 f'Video {video_id} already uploaded, skipping'
             )
-            os.remove(os.path.join(settings.video_data_directory, entry))
+            try:
+                os.remove(os.path.join(settings.video_data_directory, entry))
+            except OSError:
+                pass
             continue
 
         if video_needs_scraping:
@@ -372,6 +375,7 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
         logging.info(
             f'Files scraped: {files_scraped}, files uploaded: {files_uploaded}'
         )
+
 
 async def upload_video(
     client: ExchangeClient, settings: Settings,
