@@ -233,10 +233,15 @@ async def upload_videos(settings: Settings) -> None:
             if not settings.no_upload and await upload_video(
                 exchange_client, settings, video.channel_name, video
             ):
-                os.remove(
+                logging.debug(f'Uploaded video {video.video_id}, moving file to uploaded directory')
+                os.rename(
                     os.path.join(
                         settings.video_data_directory, VIDEO_YTDLP_PREFIX,
                         video_id + FILE_EXTENSION
+                    ),
+                    os.path.join(
+                        settings.video_data_directory, UPLOADED_DIRNAME,
+                        VIDEO_YTDLP_PREFIX + video_id + FILE_EXTENSION
                     )
                 )
                 logging.info(f'Uploaded video {video.video_id}')
