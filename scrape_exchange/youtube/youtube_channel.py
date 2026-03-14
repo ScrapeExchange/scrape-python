@@ -1171,7 +1171,7 @@ class YouTubeChannel:
                 if isinstance(metadata_part.get('text'), dict):
                     content: str = metadata_part['text'].get('content', '')
                     if content and 'videos' in content:
-                        youtube_v: int | None = \
+                        youtube_video_count: int | None = \
                             convert_number_string(content)
                         return youtube_video_count
 
