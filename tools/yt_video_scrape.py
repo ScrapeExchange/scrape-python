@@ -189,18 +189,28 @@ async def upload_videos(settings: Settings) -> None:
 
     files: list[str] = [
         entry for entry in os.listdir(settings.video_data_directory)
-        if entry.endswith(FILE_EXTENSION) and entry.startswith(VIDEO_YTDLP_PREFIX)
+        if entry.endswith(FILE_EXTENSION)
+        and entry.startswith(VIDEO_YTDLP_PREFIX)
     ]
     for entry in files:
         uploaded_file_path: str = os.path.join(
             settings.video_data_directory, UPLOADED_DIRNAME, entry
         )
-        if os.path.exists(uploaded_file_path):
+        if (os.path.exists(uploaded_file_path)
+                and os.path.getmtime(uploaded_file_path) >= os.path.getmtime(
+                   os.path.join(settings.video_data_directory, entry)
+                )):
+            logging.debug(
+                f'Video file {entry} already uploaded and newer, skipping'
+            )
             try:
-                os.remove(os.path.join(settings.video_data_directory, entry))
+                os.remove(
+                    os.path.join(settings.video_data_directory, entry)
+                )
             except OSError:
                 pass
             continue
+
         video_id: str = entry[len(VIDEO_YTDLP_PREFIX):-len(FILE_EXTENSION)]
         video = await YouTubeVideo.from_file(
             video_id, settings.video_data_directory, VIDEO_YTDLP_PREFIX
@@ -210,8 +220,10 @@ async def upload_videos(settings: Settings) -> None:
                 exchange_client, settings, video.channel_name, video
             ):
                 os.remove(
-                    settings.video_data_directory + '/' + VIDEO_YTDLP_PREFIX +
-                    video_id + FILE_EXTENSION
+                    os.path.join(
+                        settings.video_data_directory, VIDEO_YTDLP_PREFIX,
+                        video_id + FILE_EXTENSION
+                    )
                 )
                 logging.info(f'Uploaded video {video.video_id}')
         except OSError:
