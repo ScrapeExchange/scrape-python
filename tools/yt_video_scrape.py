@@ -108,14 +108,14 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices('API_KEY_ID', 'api_key_id'),
         description=(
-            'API key ID for authenticating with the Scrape.Exchange API',
+            'API key ID for authenticating with the Scrape.Exchange API'
         )
     )
     api_key_secret: str | None = Field(
         default=None,
         validation_alias=AliasChoices('API_KEY_SECRET', 'api_key_secret'),
         description=(
-            'API key secret for authenticating with the Scrape.Exchange API',
+            'API key secret for authenticating with the Scrape.Exchange API'
         )
     )
 
