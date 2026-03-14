@@ -115,6 +115,10 @@ class Settings(BaseSettings):
         description='API key secret for authenticating with the Scrape.Exchange API',
     )
 
+    max_files: int | None = Field(
+        default=None,
+        description='Maximum number of files to process in one run'
+    )
     log_level: str = Field(
         default='INFO',
         validation_alias=AliasChoices('LOG_LEVEL', 'log_level'),
@@ -192,7 +196,12 @@ async def upload_videos(settings: Settings) -> None:
         if entry.endswith(FILE_EXTENSION)
         and entry.startswith(VIDEO_YTDLP_PREFIX)
     ]
+    entries: int = 0
     for entry in files:
+        if settings.max_files and entries >= settings.max_files:
+            return
+        entries += 1
+
         uploaded_file_path: str = os.path.join(
             settings.video_data_directory, UPLOADED_DIRNAME, entry
         )
