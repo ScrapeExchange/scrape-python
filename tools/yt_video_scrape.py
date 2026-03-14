@@ -37,6 +37,8 @@ SLEEP_MIN_INTERVAL: int = 12
 SLEEP_MAX_INTERVAL: int = 18
 FAILURE_SLEEP_INTERVAL: int = 3600
 
+FILE_EXTENSION: str = '.json.br'
+
 
 class Settings(BaseSettings):
     '''
@@ -166,6 +168,56 @@ async def main() -> None:
     if not settings.upload_only:
         logging.info('Starting video scraping process')
         await scrape_and_upload_videos(settings)
+    else:
+        await upload_videos(settings)
+
+
+async def upload_videos(settings: Settings) -> None:
+    '''
+    Uploads videos to Scrape Exchange without scraping.
+
+    :param settings: Configuration settings for the tool
+    :returns: (none)
+    :raises: (none)
+    '''
+
+    exchange_client = ExchangeClient(
+        api_key_id=settings.api_key_id,
+        api_key_secret=settings.api_key_secret,
+        exchange_url=settings.exchange_url,
+    )
+
+    files: list[str] = [
+        entry for entry in os.listdir(settings.video_data_directory)
+        if entry.endswith(FILE_EXTENSION) and entry.startswith(VIDEO_YTDLP_PREFIX)
+    ]
+    for entry in files:
+        uploaded_file_path: str = os.path.join(
+            settings.video_data_directory, UPLOADED_DIRNAME, entry
+        )
+        if os.path.exists(uploaded_file_path):
+            try:
+                os.remove(os.path.join(settings.video_data_directory, entry))
+            except OSError:
+                pass
+            continue
+        video_id: str = entry[len(VIDEO_YTDLP_PREFIX):-len(FILE_EXTENSION)]
+        video = await YouTubeVideo.from_file(
+            video_id, settings.video_data_directory, VIDEO_YTDLP_PREFIX
+        )
+        try:
+            if not settings.no_upload and upload_video(
+                exchange_client, settings, video.channel_name, video
+            ):
+                os.remove(
+                    settings.video_data_directory + '/' + VIDEO_YTDLP_PREFIX +
+                    video_id + FILE_EXTENSION
+                )
+                logging.info(f'Uploaded video {video.video_id}')
+        except OSError:
+            pass
+        except Exception as exc:
+            logging.info(f'Failed to upload video {video.video_id}: {exc}')
 
 
 def video_uploaded(settings: Settings, video_id: str) -> str | None:
@@ -258,7 +310,7 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
     )
     files: list[str] = [
         entry for entry in os.listdir(settings.video_data_directory)
-        if entry.endswith('.json.br') and (
+        if entry.endswith(FILE_EXTENSION) and (
             entry.startswith(VIDEO_MIN_PREFIX)
             or entry.startswith(VIDEO_YTDLP_PREFIX)
         )
@@ -275,12 +327,12 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
                 continue
 
             video_needs_scraping = True
-            video_id: str = entry[len(VIDEO_MIN_PREFIX):-len('.json.br')]
+            video_id: str = entry[len(VIDEO_MIN_PREFIX):-len(FILE_EXTENSION)]
             video = await YouTubeVideo.from_file(
                 video_id, settings.video_data_directory, VIDEO_MIN_PREFIX
             )
         elif entry.startswith(VIDEO_YTDLP_PREFIX):
-            video_id: str = entry[len(VIDEO_YTDLP_PREFIX):-len('.json.br')]
+            video_id: str = entry[len(VIDEO_YTDLP_PREFIX):-len(FILE_EXTENSION)]
             video = await YouTubeVideo.from_file(
                 video_id, settings.video_data_directory, VIDEO_YTDLP_PREFIX
             )
@@ -364,7 +416,7 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
                 )
                 os.remove(
                     settings.video_data_directory + '/' + VIDEO_YTDLP_PREFIX +
-                    video_id + '.json.br'
+                    video_id + FILE_EXTENSION
                 )
                 logging.info(f'Uploaded video {video.video_id}')
         except OSError:
