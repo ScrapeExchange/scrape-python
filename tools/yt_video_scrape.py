@@ -107,18 +107,23 @@ class Settings(BaseSettings):
     api_key_id: str | None = Field(
         default=None,
         validation_alias=AliasChoices('API_KEY_ID', 'api_key_id'),
-        description='API key ID for authenticating with the Scrape.Exchange API',
+        description=(
+            'API key ID for authenticating with the Scrape.Exchange API',
+        )
     )
     api_key_secret: str | None = Field(
         default=None,
         validation_alias=AliasChoices('API_KEY_SECRET', 'api_key_secret'),
-        description='API key secret for authenticating with the Scrape.Exchange API',
+        description=(
+            'API key secret for authenticating with the Scrape.Exchange API',
+        )
     )
 
     max_files: int | None = Field(
         default=None,
         description='Maximum number of files to process in one run'
     )
+
     log_level: str = Field(
         default='INFO',
         validation_alias=AliasChoices('LOG_LEVEL', 'log_level'),
@@ -185,7 +190,7 @@ async def upload_videos(settings: Settings) -> None:
     :raises: (none)
     '''
 
-    exchange_client = ExchangeClient(
+    exchange_client: ExchangeClient = await ExchangeClient.setup(
         api_key_id=settings.api_key_id,
         api_key_secret=settings.api_key_secret,
         exchange_url=settings.exchange_url,
@@ -221,7 +226,7 @@ async def upload_videos(settings: Settings) -> None:
             continue
 
         video_id: str = entry[len(VIDEO_YTDLP_PREFIX):-len(FILE_EXTENSION)]
-        video = await YouTubeVideo.from_file(
+        video: YouTubeVideo = await YouTubeVideo.from_file(
             video_id, settings.video_data_directory, VIDEO_YTDLP_PREFIX
         )
         try:
