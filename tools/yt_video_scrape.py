@@ -201,6 +201,7 @@ async def upload_videos(settings: Settings) -> None:
         if entry.endswith(FILE_EXTENSION)
         and entry.startswith(VIDEO_YTDLP_PREFIX)
     ]
+    shuffle(files)
     entries: int = 0
     for entry in files:
         if settings.max_files and entries >= settings.max_files:
@@ -233,7 +234,10 @@ async def upload_videos(settings: Settings) -> None:
             if not settings.no_upload and await upload_video(
                 exchange_client, settings, video.channel_name, video
             ):
-                logging.debug(f'Uploaded video {video.video_id}, moving file to uploaded directory')
+                logging.debug(
+                    f'Uploaded video {video.video_id}, moving file '
+                    'to uploaded directory'
+                )
                 os.rename(
                     os.path.join(
                         settings.video_data_directory, VIDEO_YTDLP_PREFIX,
@@ -412,6 +416,7 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
                         or 'this video has been removed' in error_val
                         or 'this video is age restricted and only available on youtube' in error_val    # noqa: E501
                         or "available to this channel's members on level" in error_val                  # noqa: E501
+                        or "members-only content" in error_val
                         or 'offline' in error_val):
                     sleep = randint(SLEEP_MIN_INTERVAL, SLEEP_MAX_INTERVAL)
                     extension = '.unavailable'
