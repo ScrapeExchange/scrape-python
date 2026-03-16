@@ -19,22 +19,12 @@ from httpx import RequestError
 from httpx import ConnectError
 from httpx import ConnectTimeout
 
+from httpx_curl_cffi import AsyncCurlTransport, CurlOpt
+
 _LOGGER: Logger = getLogger(__name__)
 
 YOUTUBE_DOMAIN: str = '.youtube.com'
 
-
-HEADERS: dict[str, str] = {
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Accept': (
-        'text/html,application/xhtml+xml,'
-        'application/xml;q=0.9,*/*;q=0.8'
-    ),
-}
-USER_AGENT: str = (
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-    '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-)
 
 CONSENT_COOKIES: dict[str, str] = {
     'CONSENT': 'YES+cb.20210328-17-p0.en+FX+100',
@@ -51,9 +41,8 @@ class AsyncYouTubeClient(AsyncClient):
     '''
     SCRAPE_URL: str = 'https://www.youtube.com'
 
-    def __init__(self, user_agent: str = USER_AGENT,
-                 headers: dict[str, str] = HEADERS,
-                 consent_cookies: dict[str, str] = CONSENT_COOKIES,
+    def __init__(self, consent_cookies: dict[str, str] = CONSENT_COOKIES,
+                 proxies: list[str] = [],
                  **kwargs) -> None:
         '''
         Initializes the YouTube client.
@@ -61,13 +50,16 @@ class AsyncYouTubeClient(AsyncClient):
         :param kwargs: Additional arguments to pass to the HTTP client.
         '''
 
-        super().__init__(**kwargs)
+        super().__init__(
+            transport=AsyncCurlTransport(
+                impersonate='chrome',
+                default_headers=True,
+                curl_options={CurlOpt.FRESH_CONNECT: True},
+                proxy=random.choice(proxies) if proxies else None,
+            ), **kwargs
+        )
 
-        self.headers = headers.copy()
         self.consent_cookies: dict[str, str] = CONSENT_COOKIES
-
-        if user_agent:
-            self.headers['User-Agent'] = user_agent
 
         for name, value in consent_cookies.items():
             self.cookies.set(

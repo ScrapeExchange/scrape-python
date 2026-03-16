@@ -19,12 +19,12 @@ import asyncio
 import logging
 
 from pathlib import Path
-
-import httpx
 import orjson
 import brotli
 import aiofiles
 import aiofiles.os
+
+from httpx import Response
 
 from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -453,7 +453,7 @@ async def scrape_channel(settings: Settings, client: ExchangeClient,
 
 async def upload_channel(settings: Settings, client: ExchangeClient,
                          channel: YouTubeChannel) -> bool:
-    resp: httpx.Response = await client.post(
+    resp: Response = await client.post(
         f'{settings.exchange_url}{client.POST_DATA_API}', json={
             'username': settings.schema_owner,
             'platform': 'youtube',

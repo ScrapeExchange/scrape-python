@@ -33,9 +33,11 @@ from scrape_exchange.youtube.youtube_video import DENO_PATH, PO_TOKEN_URL
 VIDEO_MIN_PREFIX = 'video-min-'
 VIDEO_YTDLP_PREFIX = 'video-dlp-'
 UPLOADED_DIRNAME: str = '/uploaded'
-SLEEP_MIN_INTERVAL: int = 8
-SLEEP_MAX_INTERVAL: int = 15
+SLEEP_MIN_INTERVAL: int = 12
+SLEEP_MAX_INTERVAL: int = 18
 FAILURE_SLEEP_INTERVAL: int = 3600
+
+FILE_EXTENSION: str = '.json.br'
 
 
 class Settings(BaseSettings):
@@ -105,12 +107,30 @@ class Settings(BaseSettings):
     api_key_id: str | None = Field(
         default=None,
         validation_alias=AliasChoices('API_KEY_ID', 'api_key_id'),
-        description='API key ID for authenticating with the Scrape.Exchange API',
+        description=(
+            'API key ID for authenticating with the Scrape.Exchange API'
+        )
     )
     api_key_secret: str | None = Field(
         default=None,
         validation_alias=AliasChoices('API_KEY_SECRET', 'api_key_secret'),
-        description='API key secret for authenticating with the Scrape.Exchange API',
+        description=(
+            'API key secret for authenticating with the Scrape.Exchange API'
+        )
+    )
+    proxies: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices('PROXIES', 'proxies'),
+        description=(
+            'Optional proxy URL to use for HTTP requests (e.g. '
+            '"http://user:pass@host:port"). Multiple proxies can be specified '
+            'separated by commas, in which case they will be used in a '
+            'round-robin fashion.'
+        )
+    )
+    max_files: int | None = Field(
+        default=None,
+        description='Maximum number of files to process in one run'
     )
 
     log_level: str = Field(
@@ -162,9 +182,86 @@ async def main() -> None:
         'Starting YouTube video upload tool with settings: '
         f'{settings.model_dump_json(indent=2)}'
     )
+
     if not settings.upload_only:
         logging.info('Starting video scraping process')
         await scrape_and_upload_videos(settings)
+    else:
+        await upload_videos(settings)
+
+
+async def upload_videos(settings: Settings) -> None:
+    '''
+    Uploads videos to Scrape Exchange without scraping.
+
+    :param settings: Configuration settings for the tool
+    :returns: (none)
+    :raises: (none)
+    '''
+
+    exchange_client: ExchangeClient = await ExchangeClient.setup(
+        api_key_id=settings.api_key_id,
+        api_key_secret=settings.api_key_secret,
+        exchange_url=settings.exchange_url,
+    )
+
+    files: list[str] = [
+        entry for entry in os.listdir(settings.video_data_directory)
+        if entry.endswith(FILE_EXTENSION)
+        and entry.startswith(VIDEO_YTDLP_PREFIX)
+    ]
+    shuffle(files)
+    entries: int = 0
+    for entry in files:
+        if settings.max_files and entries >= settings.max_files:
+            return
+        entries += 1
+
+        uploaded_file_path: str = os.path.join(
+            settings.video_data_directory, UPLOADED_DIRNAME, entry
+        )
+        if (os.path.exists(uploaded_file_path)
+                and os.path.getmtime(uploaded_file_path) >= os.path.getmtime(
+                   os.path.join(settings.video_data_directory, entry)
+                )):
+            logging.debug(
+                f'Video file {entry} already uploaded and newer, skipping'
+            )
+            try:
+                os.remove(
+                    os.path.join(settings.video_data_directory, entry)
+                )
+            except OSError:
+                pass
+            continue
+
+        video_id: str = entry[len(VIDEO_YTDLP_PREFIX):-len(FILE_EXTENSION)]
+        video: YouTubeVideo = await YouTubeVideo.from_file(
+            video_id, settings.video_data_directory, VIDEO_YTDLP_PREFIX
+        )
+        try:
+            if not settings.no_upload and await upload_video(
+                exchange_client, settings, video.channel_name, video
+            ):
+                logging.debug(
+                    f'Uploaded video {video.video_id}, moving file '
+                    'to uploaded directory'
+                )
+                os.rename(
+                    os.path.join(
+                        settings.video_data_directory, VIDEO_YTDLP_PREFIX,
+                        video_id + FILE_EXTENSION
+                    ),
+                    os.path.join(
+                        settings.video_data_directory, UPLOADED_DIRNAME,
+                        VIDEO_YTDLP_PREFIX + video_id + FILE_EXTENSION
+                    )
+                )
+                logging.info(f'Uploaded video {video.video_id}')
+        except OSError:
+            pass
+        except Exception as exc:
+            logging.info(f'Failed to upload video {video.video_id}: {exc}')
 
 
 def video_uploaded(settings: Settings, video_id: str) -> str | None:
@@ -240,6 +337,7 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
     Scrapes YouTube video data and uploads it to Scrape Exchange.
 
     :param settings: Configuration settings for the tool
+    :param upload_only: Flag indicating whether to only upload videos without scraping
     :returns: (none)
     :raises: (none)
     '''
@@ -256,24 +354,29 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
     )
     files: list[str] = [
         entry for entry in os.listdir(settings.video_data_directory)
-        if entry.endswith('.json.br') and (
+        if entry.endswith(FILE_EXTENSION) and (
             entry.startswith(VIDEO_MIN_PREFIX)
             or entry.startswith(VIDEO_YTDLP_PREFIX)
         )
     ]
+    files_scraped: int = 0
+    files_uploaded: int = 0
     shuffle(files)
     for entry in files:
         video_needs_scraping: bool = False
 
         video: YouTubeVideo
         if entry.startswith(VIDEO_MIN_PREFIX):
+            if settings.upload_only:
+                continue
+
             video_needs_scraping = True
-            video_id: str = entry[len(VIDEO_MIN_PREFIX):-len('.json.br')]
+            video_id: str = entry[len(VIDEO_MIN_PREFIX):-len(FILE_EXTENSION)]
             video = await YouTubeVideo.from_file(
                 video_id, settings.video_data_directory, VIDEO_MIN_PREFIX
             )
         elif entry.startswith(VIDEO_YTDLP_PREFIX):
-            video_id: str = entry[len(VIDEO_YTDLP_PREFIX):-len('.json.br')]
+            video_id: str = entry[len(VIDEO_YTDLP_PREFIX):-len(FILE_EXTENSION)]
             video = await YouTubeVideo.from_file(
                 video_id, settings.video_data_directory, VIDEO_YTDLP_PREFIX
             )
@@ -287,9 +390,17 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
             logging.debug(
                 f'Video {video_id} already uploaded, skipping'
             )
+            try:
+                os.remove(os.path.join(settings.video_data_directory, entry))
+            except OSError:
+                pass
             continue
 
         if video_needs_scraping:
+            proxies: list[str] = []
+            if settings.proxies:
+                proxies = settings.proxies.split(',')
+
             try:
                 video = await YouTubeVideo.scrape(
                     video_id, channel_name=video.channel_name,
@@ -297,8 +408,10 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
                     download_client=download_client,
                     save_dir=settings.video_data_directory,
                     filename_prefix=VIDEO_YTDLP_PREFIX,
-                    debug=settings.log_level == 'DEBUG'
+                    debug=settings.log_level == 'DEBUG',
+                    proxies=proxies
                 )
+                files_scraped += 1
                 await asyncio.sleep(
                     randint(SLEEP_MIN_INTERVAL, SLEEP_MAX_INTERVAL)
                 )
@@ -311,11 +424,13 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
                         or 'this live event has ended' in error_val
                         or 'live stream recording is not available' in error_val                        # noqa: E501
                         or 'video unavailable' in error_val
+                        or 'inappropriate' in error_val
                         or 'video is not available' in error_val
                         or 'this video is private' in error_val
                         or 'this video has been removed' in error_val
                         or 'this video is age restricted and only available on youtube' in error_val    # noqa: E501
                         or "available to this channel's members on level" in error_val                  # noqa: E501
+                        or "members-only content" in error_val
                         or 'offline' in error_val):
                     sleep = randint(SLEEP_MIN_INTERVAL, SLEEP_MAX_INTERVAL)
                     extension = '.unavailable'
@@ -344,19 +459,24 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
             if not settings.no_upload and await upload_video(
                 exchange_client, settings, video.channel_name, video
             ):
+                files_uploaded += 1
                 await video.to_file(
                     settings.video_data_directory + UPLOADED_DIRNAME,
                     VIDEO_YTDLP_PREFIX
                 )
                 os.remove(
                     settings.video_data_directory + '/' + VIDEO_YTDLP_PREFIX +
-                    video_id + '.json.br'
+                    video_id + FILE_EXTENSION
                 )
                 logging.info(f'Uploaded video {video.video_id}')
         except OSError:
             pass
         except Exception as exc:
             logging.info(f'Failed to upload video {video.video_id}: {exc}')
+
+        logging.info(
+            f'Files scraped: {files_scraped}, files uploaded: {files_uploaded}'
+        )
 
 
 async def upload_video(

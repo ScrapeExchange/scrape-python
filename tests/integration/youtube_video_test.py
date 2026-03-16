@@ -30,6 +30,7 @@ SCHEMA_PATH: str = 'tests/collateral/boinko-youtube-video-schema.json'
 
 DENO_PATH: str = os.environ.get('HOME', '') + '/.deno/bin/deno'
 PO_TOKEN_URL: str = 'http://localhost:4416'
+PROXIES_FILE: str = 'tests/collateral/local/proxies.lst'
 
 
 class TestIntegration(unittest.IsolatedAsyncioTestCase):
@@ -38,6 +39,13 @@ class TestIntegration(unittest.IsolatedAsyncioTestCase):
         with open(SCHEMA_PATH) as f:
             self.schema: dict[str, any] = json.load(f)
         self.validator = Draft202012Validator(self.schema)
+
+        self.proxies: list[str] = []
+        if os.path.exists(PROXIES_FILE):
+            with open(PROXIES_FILE) as f:
+                self.proxies: list[str] = [
+                    line.strip() for line in f if line.strip()
+                ]
 
     async def asyncTearDown(self) -> None:
         shutil.rmtree(self.temp_dir)
@@ -53,7 +61,7 @@ class TestIntegration(unittest.IsolatedAsyncioTestCase):
             video_id=YOUTUBE_VIDEO_ID,
             channel_name='Rick Astley', channel_thumbnail=None,
             deno_path=DENO_PATH, po_token_url=PO_TOKEN_URL, debug=True,
-            save_dir=self.temp_dir,
+            save_dir=self.temp_dir, proxies=self.proxies
         )
         self.assertEqual(video.video_id, YOUTUBE_VIDEO_ID)
         self.assertEqual(video.media_type, YouTubeMediaType.VIDEO)
