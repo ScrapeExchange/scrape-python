@@ -1,6 +1,7 @@
 .vscode/
 
 tests/collateral/youtube_videos
+tests/collateral/local
 
 .env*
 *.swp

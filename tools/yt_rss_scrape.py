@@ -25,11 +25,12 @@ from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
 
-import httpx
 import brotli
 import orjson
 import untangle
 import aiofiles
+
+from httpx import Response
 
 from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -261,7 +262,7 @@ async def check_video_exists(
         f'/param/{settings.schema_owner}/youtube/video'
         f'/{settings.schema_version}/{video_id}'
     )
-    response: httpx.Response = await client.get(url)
+    response: Response = await client.get(url)
 
     if response.status_code == 200:
         return True
@@ -288,7 +289,7 @@ async def upload_video(
     '''
 
     try:
-        response: httpx.Response = await client.post(
+        response: Response = await client.post(
             f'{settings.exchange_url}{ExchangeClient.POST_DATA_API}',
             json={
                 'username': settings.schema_owner,
@@ -398,7 +399,6 @@ async def process_channel(
                 overwrite=True
             )
             logging.debug(f'Stored the file in {filename}')
-
 
             logging.debug(
                 f'[{channel_name}] {video.video_id} ({video.title!r}): '

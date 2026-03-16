@@ -8,6 +8,8 @@ Model a Youtube video
 
 import os
 import re
+import random
+import tempfile
 
 from enum import Enum
 from typing import Self
@@ -490,7 +492,8 @@ class YouTubeVideo:
         browse_client: AsyncYouTubeClient | None = None,
         download_client: YoutubeDL | None = None,
         debug: bool = False, save_dir: str | None = None,
-        filename_prefix: str = '', with_formats: bool = True
+        filename_prefix: str = '', with_formats: bool = True,
+        proxies: list[str] = []
     ) -> Self | None:
         '''
         Collects data about a video by scraping the webpage for the video
@@ -503,11 +506,11 @@ class YouTubeVideo:
         '''
 
         if not browse_client:
-            browse_client = AsyncYouTubeClient()
+            browse_client = AsyncYouTubeClient(proxies=proxies)
 
         if not download_client:
             download_client = YouTubeVideo._setup_download_client(
-                browse_client, deno_path, po_token_url, debug
+                browse_client, deno_path, po_token_url, debug, proxies=proxies
             )
 
         self: YouTubeVideo = YouTubeVideo(
@@ -604,9 +607,10 @@ class YouTubeVideo:
         return filename
 
     @staticmethod
-    def _setup_download_client(browse_client: AsyncYouTubeClient,
-                               deno_path: str, po_token_url: str,
-                               debug: bool = False) -> YoutubeDL:
+    def _setup_download_client(
+        browse_client: AsyncYouTubeClient, deno_path: str, po_token_url: str,
+        debug: bool = False, proxies: list[str] = []
+    ) -> YoutubeDL:
         '''
         Set up the yt-dlp download client with appropriate options for
         scraping YouTube videos, including consent cookies and Deno for
@@ -626,6 +630,16 @@ class YouTubeVideo:
             raise ValueError('po_token_url is required if no download_client')
 
         _LOGGER.debug(f'Using deno: {deno_path}, po-token-url: {po_token_url}')
+
+        cookie_file: tempfile._TemporaryFileWrapper[str] = \
+            tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
+        cookie_file.write('# Netscape HTTP Cookie File\n')
+        for name, value in browse_client.consent_cookies.items():
+            cookie_file.write(
+                f'.youtube.com\tTRUE\t/\tFALSE\t0\t{name}\t{value}\n'
+            )
+        cookie_file.close()
+
         ytdlp_opts: dict = {
             'quiet': not debug,
             'verbose': debug,
@@ -633,12 +647,9 @@ class YouTubeVideo:
             'noprogress': True,
             'no_color': True,
             'format': 'all',
-            'http_headers': dict(browse_client.headers) | {
-                'Cookie': '; '.join(
-                    f'{k}={v}' for k, v
-                    in browse_client.consent_cookies.items()
-                )
-            },
+            'proxy': random.choice(proxies) if proxies else None,
+            'http_headers': dict(browse_client.headers),
+            'cookiefile': cookie_file.name,
             'js_runtimes': {'deno': {'path': deno_path}},
             'extractor_args': {
                 'youtube': {
@@ -649,6 +660,7 @@ class YouTubeVideo:
             'remote_components': ['ejs:github']
         }
         download_client = YoutubeDL(ytdlp_opts)
+        os.unlink(cookie_file.name)
 
         return download_client
 
@@ -959,7 +971,7 @@ class YouTubeVideo:
             self.categories | set(video_info.get('categories', []))
         self.default_audio_language = video_info.get('language')
         self.age_limit = self.age_limit or video_info.get('age_limit', 0)
-        self.heatmaps = video_info.get('heatmaps', [])
+        self.heatmaps = video_info.get('heatmap', [])
         self.aspect_ratio: float = float(video_info.get('aspect_ratio') or 0)
 
         for language_code, captions in video_info.get(

@@ -44,6 +44,8 @@ class ExchangeClient(AsyncClient):
 
         self.exchange_url: str = exchange_url
         self.jwt_header: str | None = None
+        self.headers: dict[str, str] = {}
+        
         super().__init__(
             headers={
                 'Content-Type': 'application/json',

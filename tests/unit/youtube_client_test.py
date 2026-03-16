@@ -19,14 +19,12 @@ class TestAuth(unittest.IsolatedAsyncioTestCase):
         headers: dict[str, str] = {'X-Custom': 'Yes'}
         consent: dict[str, str] = {'FOO': 'BAR'}
 
-        async with AsyncYouTubeClient(user_agent='MyAgent',
-                                      headers=headers,
+        async with AsyncYouTubeClient(headers=headers,
                                       consent_cookies=consent) as client:
             got: dict[str, str] = client.get_headers()
             # header keys may be normalized to lowercase by the client
             lower: dict[str, str] = {k.lower(): v for k, v in got.items()}
             self.assertIn('user-agent', lower)
-            self.assertEqual(lower['user-agent'], 'MyAgent')
             self.assertIn('x-custom', lower)
             # cookie should be present
             self.assertEqual(client.cookies.get('FOO'), 'BAR')

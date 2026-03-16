@@ -24,12 +24,7 @@ from yt_dlp import YoutubeDL
 from ..datatypes import IngestStatus
 from ..datatypes import SocialNetworks
 
-from .youtube_client import (
-    AsyncYouTubeClient,
-    CONSENT_COOKIES,
-    HEADERS,
-    USER_AGENT
-)
+from .youtube_client import AsyncYouTubeClient, CONSENT_COOKIES
 
 from .youtube_video import YouTubeVideo
 from .youtube_video import DENO_PATH
@@ -80,7 +75,6 @@ class YouTubeChannel:
         deno_path: str = DENO_PATH, po_token_url: str = PO_TOKEN_URL,
         debug: bool = False, save_dir: str = None,
         consent_cookies: dict[str, str] | None = CONSENT_COOKIES,
-        user_agent: str = USER_AGENT, headers: dict[str, str] = HEADERS,
     ) -> None:
         '''
         Models a YouTube channel
@@ -98,8 +92,6 @@ class YouTubeChannel:
         '''
 
         self.consent_cookies: dict[str, str] = consent_cookies
-        self.headers: dict[str, str] = headers
-        self.user_agent: str = user_agent
         self.save_dir: str | None = save_dir
 
         self.browse_client: AsyncYouTubeClient | None = None
@@ -156,7 +148,7 @@ class YouTubeChannel:
 
         self.videos: set[YouTubeVideo] = set()
 
-    def _create_browse_client(self) -> None:
+    def _create_browse_client(self, proxies: list[str] = []) -> None:
         '''
         Get the YouTube client for browsing/scraping data. This is separate
         from the download client used for downloading media assets.
@@ -165,8 +157,7 @@ class YouTubeChannel:
         '''
 
         self.browse_client = AsyncYouTubeClient(
-            user_agent=self.user_agent, headers=self.headers,
-            consent_cookies=self.consent_cookies
+            consent_cookies=self.consent_cookies, proxies=proxies,
         )
         self.browse_request_count: int = 0
 
@@ -511,7 +502,7 @@ class YouTubeChannel:
 
         if not self.url:
             raise ValueError('Channel URL is not set')
-        
+
         about_url: str = self.url.rstrip('/') + '/about'
 
         page_contents: str | None = await self.browse_client.get(about_url)
