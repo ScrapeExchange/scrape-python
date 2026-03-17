@@ -362,6 +362,7 @@ async def process_channel(
             logging.debug(
                 f'Found existing file for video {video.video_id}, skipping'
             )
+            videos_existing += 1
             continue
 
         try:
