@@ -225,7 +225,7 @@ class YouTubeVideo:
             'is_family_safe': self.is_family_safe,
             'aspect_ratio': self.aspect_ratio,
             'duration': self.duration,
-            'heatmaps': self.heatmaps,
+            'heatmaps': self.heatmaps or [],
             'license': self.license,
             'locale': self.locale,
             'default_audio_language': self.default_audio_language,

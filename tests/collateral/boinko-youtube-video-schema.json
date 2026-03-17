@@ -106,7 +106,7 @@
         "tbr": { "type": ["number", "null"] },
         "abr": { "type": ["number", "null"] },
         "asr": { "type": ["integer", "null"] },
-        "audio_channels": { "type": ["integer", "null"] },
+        "audio_channels": { "type": ["number", "null"] },
         "rows": { "type": ["integer", "null"] },
         "cols": { "type": ["integer", "null"] },
         "fragments": { "type": "array", "items": { "$ref": "#/$defs/fragment" } },
