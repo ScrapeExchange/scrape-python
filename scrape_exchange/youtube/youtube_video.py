@@ -508,10 +508,12 @@ class YouTubeVideo:
         if not browse_client:
             browse_client = AsyncYouTubeClient(proxies=proxies)
 
+        instantiated_download_client: bool = False
         if not download_client:
             download_client = YouTubeVideo._setup_download_client(
                 browse_client, deno_path, po_token_url, debug, proxies=proxies
             )
+            instantiated_download_client = True
 
         self: YouTubeVideo = YouTubeVideo(
             video_id=video_id,
@@ -528,6 +530,9 @@ class YouTubeVideo:
 
         if save_dir:
             await self.to_file(save_dir, filename_prefix)
+
+        if instantiated_download_client:
+            download_client.close()
 
         return self
 
