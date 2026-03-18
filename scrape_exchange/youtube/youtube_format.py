@@ -69,7 +69,7 @@ class YouTubeFormat:
         self.tbr: float | None = None
         self.abr: float | None = None
         self.asr: int | None = None
-        self.audio_channels: int | None = None
+        self.audio_channels: float | None = None
         self.rows: int | None = None
         self.cols: int | None = None
         self.resolution: str | None = None
@@ -156,12 +156,14 @@ class YouTubeFormat:
         yt_format.tbr = data.get('tbr')
         yt_format.asr = data.get('asr')
         yt_format.abr = data.get('abr')
-        yt_format.audio_channels = data.get('audio_channels')
         yt_format.rows = data.get('rows')
         yt_format.cols = data.get('cols')
         yt_format.resolution = data.get('resolution')
         yt_format.aspect_ratio = data.get('aspect_ratio')
         yt_format.format = data.get('format')
+
+        if data.get('audio_channels') is not None:
+            yt_format.audio_channels = float(data.get('audio_channels'))
 
         for fragment_data in data.get('fragments', []):
             fragment: YouTubeFragment = YouTubeFragment.from_dict(

@@ -259,8 +259,7 @@ async def check_video_exists(
 
     url: str = (
         f'{settings.exchange_url}{ExchangeClient.POST_DATA_API}'
-        f'/param/{settings.schema_owner}/youtube/video'
-        f'/{settings.schema_version}/{video_id}'
+        f'/content/youtube/video/{video_id}'
     )
     response: Response = await client.get(url)
 

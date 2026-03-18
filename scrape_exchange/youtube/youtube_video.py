@@ -136,8 +136,6 @@ class YouTubeVideo:
         self.keywords: set[str] = set()
         self.privacy_status: str = 'public'
 
-        self.ingest_status: IngestStatus = IngestStatus.NONE
-
     def __eq__(self, other: Self) -> bool:
         if not isinstance(other, YouTubeVideo):
             return False
@@ -374,8 +372,14 @@ class YouTubeVideo:
     def from_rss_entry(entry: untangle.Element) -> 'YouTubeVideo':
         '''
         Factory for YouTubeVideo, populates the subset of fields available
-        from a YouTube channel RSS feed entry.  Fields not present in the
-        RSS feed are left at their __init__ defaults.
+        from a YouTube channel RSS feed entry. Fields not present in the
+        RSS feed are left at their constructor defaults.
+
+        We currently do not try to detect shorts from the RSS feed:
+        'entry.link._attributes=
+            {'rel': 'alternate', 'href': 'https://www.youtube.com/shorts/QrAZfXiuF9E'}
+        We're not using that because we don't have an is_short property in
+        YouTubeVideo
 
         :param entry: An untangle Element for a single <entry> in a YouTube
         channel RSS feed (https://www.youtube.com/feeds/videos.xml).
@@ -387,6 +391,9 @@ class YouTubeVideo:
         video = YouTubeVideo(video_id=entry.yt_videoId.cdata)
         video.title = entry.title.cdata
         video.url = YouTubeVideo.VIDEO_URL.format(video_id=video.video_id)
+        video.embed_url = YouTubeVideo.EMBED_URL.format(
+            video_id=video.video_id
+        )
 
         try:
             video.channel_id = entry.yt_channelId.cdata
@@ -1019,21 +1026,6 @@ class YouTubeVideo:
             formats[yt_format.format_id] = yt_format
 
         return formats
-
-    def _transition_state(self, ingest_status: IngestStatus | str) -> None:
-        '''
-        Transition the ingest state of the video
-
-        :param ingest_status: the new ingest state
-        '''
-
-        if isinstance(ingest_status, str):
-            ingest_status = IngestStatus(ingest_status)
-
-        _LOGGER.debug(
-            f'Video {self.video_id} transitioned to {ingest_status}',
-        )
-        self.ingest_status = ingest_status
 
     async def from_innertube(self, innertube: InnerTube | None = None) -> None:
         await InnerTubeVideoParser.scrape(self, innertube)
