@@ -643,7 +643,7 @@ class YouTubeVideo:
 
         _LOGGER.debug(f'Using deno: {deno_path}, po-token-url: {po_token_url}')
 
-        with tempfile.TemporaryFile(mode='w') as temp_file:
+        with tempfile.NamedTemporaryFile(mode='w') as temp_file:
             temp_file.write('# Netscape HTTP Cookie File\n')
             for name, value in browse_client.consent_cookies.items():
                 temp_file.write(
