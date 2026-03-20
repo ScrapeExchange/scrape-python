@@ -936,7 +936,6 @@ class YouTubeVideo:
                 )
         except DownloadError as exc:
             sleepy_time: int = randrange(2, 5)
-            self._transition_state(IngestStatus.UNAVAILABLE)
             await sleep(sleepy_time)
             raise RuntimeError(
                 f'Failed to extract info for video: {self.video_id}: '
@@ -944,7 +943,6 @@ class YouTubeVideo:
             ) from exc
         except Exception as exc:
             sleepy_time: int = randrange(10, 30)
-            self._transition_state(IngestStatus.UNAVAILABLE)
             await sleep(sleepy_time)
             raise RuntimeError(
                 f'Failed to extract info for video: {self.video_id}: '
