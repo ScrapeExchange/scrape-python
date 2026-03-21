@@ -643,36 +643,35 @@ class YouTubeVideo:
 
         _LOGGER.debug(f'Using deno: {deno_path}, po-token-url: {po_token_url}')
 
-        cookie_file: tempfile._TemporaryFileWrapper[str] = \
-            tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
-        cookie_file.write('# Netscape HTTP Cookie File\n')
-        for name, value in browse_client.consent_cookies.items():
-            cookie_file.write(
-                f'.youtube.com\tTRUE\t/\tFALSE\t0\t{name}\t{value}\n'
-            )
-        cookie_file.close()
+        with tempfile.NamedTemporaryFile(mode='w') as temp_file:
+            temp_file.write('# Netscape HTTP Cookie File\n')
+            for name, value in browse_client.consent_cookies.items():
+                temp_file.write(
+                    f'.youtube.com\tTRUE\t/\tFALSE\t0\t{name}\t{value}\n'
+                )
+            temp_file.flush()
+            cookie_file_path: str = temp_file.name
 
-        ytdlp_opts: dict = {
-            'quiet': not debug,
-            'verbose': debug,
-            'logger': _LOGGER,
-            'noprogress': True,
-            'no_color': True,
-            'format': 'all',
-            'proxy': random.choice(proxies) if proxies else None,
-            'http_headers': dict(browse_client.headers),
-            'cookiefile': cookie_file.name,
-            'js_runtimes': {'deno': {'path': deno_path}},
-            'extractor_args': {
-                'youtube': {
-                    'player-client': 'default,mweb',
-                    'youtubepot-bgutilhttp:base_url': po_token_url
-                }
-            },
-            'remote_components': ['ejs:github']
-        }
-        download_client = YoutubeDL(ytdlp_opts)
-        os.unlink(cookie_file.name)
+            ytdlp_opts: dict = {
+                'quiet': not debug,
+                'verbose': debug,
+                'logger': _LOGGER,
+                'noprogress': True,
+                'no_color': True,
+                'format': 'all',
+                'proxy': random.choice(proxies) if proxies else None,
+                'http_headers': dict(browse_client.headers),
+                'cookiefile': cookie_file_path,
+                'js_runtimes': {'deno': {'path': deno_path}},
+                'extractor_args': {
+                    'youtube': {
+                        'player-client': 'default,mweb',
+                        'youtubepot-bgutilhttp:base_url': po_token_url
+                    }
+                },
+                'remote_components': ['ejs:github']
+            }
+            download_client = YoutubeDL(ytdlp_opts)
 
         return download_client
 
