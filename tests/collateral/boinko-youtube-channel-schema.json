@@ -7,8 +7,7 @@
   "properties": {
     "channel_id": {
       "type": ["string", "null"],
-      "format": "uuid",
-      "description": "The channel UUID or identifier"
+      "description": "The channel identifier"
     },
     "channel": {
       "type": "string",

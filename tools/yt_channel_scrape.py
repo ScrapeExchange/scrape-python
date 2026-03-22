@@ -32,7 +32,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from scrape_exchange.exchange_client import ExchangeClient
 from scrape_exchange.util import CHANNEL_FILE_PREFIX
 from scrape_exchange.youtube.youtube_channel import YouTubeChannel
-
+from scrape_exchange.youtube.youtube_client import AsyncYouTubeClient
 from scrape_exchange.youtube.youtube_video import DENO_PATH, PO_TOKEN_URL
 
 
@@ -75,7 +75,7 @@ class Settings(BaseSettings):
     )
     no_upload: bool = Field(
         default=False,
-        validation_alias=AliasChoices('NO_UPLOAD', 'no_upload'),
+        validation_alias=AliasChoices('#NO_UPLOAD', '#no_upload'),
         description='Only perform the scraping step, skipping data upload',
     )
     channel_list: str = Field(
@@ -94,12 +94,12 @@ class Settings(BaseSettings):
     api_key_id: str | None = Field(
         default=None,
         validation_alias=AliasChoices('API_KEY_ID', 'api_key_id'),
-        description='API key ID for authenticating with the Scrape.Exchange API',
+        description='API key ID for authenticating with the Scrape.Exchange API',       # noqa: E501
     )
     api_key_secret: str | None = Field(
         default=None,
         validation_alias=AliasChoices('API_KEY_SECRET', 'api_key_secret'),
-        description='API key secret for authenticating with the Scrape.Exchange API',
+        description='API key secret for authenticating with the Scrape.Exchange API',   # noqa: E501
     )
     log_level: str = Field(
         default='INFO',
@@ -179,30 +179,57 @@ async def main() -> None:
         )
         sys.exit(1)
 
-    logging.basicConfig(
-        level=settings.log_level,
-        filename=settings.log_file
-    )
     logging.info(
         'Starting YouTube channel upload tool with settings: '
         f'{settings.model_dump()}'
     )
-    client: ExchangeClient | None = None
+
+    client: ExchangeClient | None = await ExchangeClient.setup(
+        api_key_id=settings.api_key_id,
+        api_key_secret=settings.api_key_secret,
+        exchange_url=settings.exchange_url
+    )
+
+    yt_client = AsyncYouTubeClient()
 
     if not settings.no_upload:
-        client = await ExchangeClient.setup(
-            api_key_id=settings.api_key_id,
-            api_key_secret=settings.api_key_secret,
-            exchange_url=settings.exchange_url
-        )
         await upload_channels(settings, client)
 
     if not settings.upload_only:
-        await scrape_channels(settings, client)
+        await scrape_channels(settings, client, yt_client)
 
 
-async def scrape_channels(settings: Settings, client: ExchangeClient
-                          ) -> None:
+async def channel_exists(client: ExchangeClient, channel_name: str) -> bool:
+    '''
+    Checks if a channel with the given name already exists on Scrape Exchange.
+
+    :param client: The Scrape Exchange client instance.
+    :param channel_name: The name of the YouTube channel to check.
+    :returns: True if the channel exists, False otherwise.
+    :raises: (none)
+    '''
+
+    resp: Response = await client.get(
+        f'{client.exchange_url}{ExchangeClient.GET_CONTENT_API}'
+        f'/youtube/channel/{channel_name}'
+    )
+
+    if resp.status_code == 200:
+        data: dict = resp.json()
+        return data.get('exists', False)
+    elif resp.status_code == 404:
+        return False
+    else:
+        logging.warning(
+            f'Failed to check existence of channel {channel_name}: '
+            f'Status code {resp.status_code}, response: {resp.text}'
+        )
+        # Assume the channel does not exist if there was an error checking
+        return False
+
+
+async def scrape_channels(settings: Settings, client: ExchangeClient,
+                          yt_client: AsyncYouTubeClient) -> None:
     channel_names: set[str] = await read_channels(settings.channel_list)
     channel_names.discard('')  # Remove empty channel names if any
     logging.debug(
@@ -214,7 +241,9 @@ async def scrape_channels(settings: Settings, client: ExchangeClient
     shuffle(channel_list)
     for name in channel_list:
         channel_name: str = normalize_channel_name(name)
-        failed: bool = await scrape_channel(settings, client, channel_name)
+        failed: bool = await scrape_channel(
+            settings, client, channel_name, yt_client
+        )
         if failed:
             errors += 1
             if errors > 5:
@@ -277,6 +306,16 @@ async def upload_channels(settings: Settings, client: ExchangeClient
             channel: YouTubeChannel = YouTubeChannel.from_dict(
                 channel_data
             )
+            if await channel_exists(client, channel.name):
+                logging.debug(
+                    f'Channel {channel_name} already exists on Scrape '
+                    'Exchange, skipping upload'
+                )
+                try:
+                    await aiofiles.os.remove(saved_filepath)
+                except OSError:
+                    pass
+                continue
             success: bool = await upload_channel(settings, client, channel)
             if success:
                 await aiofiles.os.rename(saved_filepath, uploaded_filepath)
@@ -335,7 +374,8 @@ def get_channel_filename(channel_name: str) -> str:
 
 
 async def scrape_channel(settings: Settings, client: ExchangeClient,
-                         channel_name: str) -> bool:
+                         channel_name: str, yt_client: AsyncYouTubeClient
+                         ) -> bool:
     '''
     Scrapes a single YouTube channel and uploads it to the Scrape Exchange.
 
@@ -389,12 +429,24 @@ async def scrape_channel(settings: Settings, client: ExchangeClient,
         # If the channel was already uploaded then there is nothing to do
         return False
 
+    if await channel_exists(client, channel_name):
+        logging.debug(
+            f'Channel {channel_name} already exists on Scrape '
+            'Exchange, skipping upload'
+        )
+        try:
+            await aiofiles.os.remove(saved_filepath)
+        except OSError:
+            pass
+        return False
+
     if not saved_timestamp:
         logging.debug(f'Channel {channel_name} not scraped, scraping now')
         channel: YouTubeChannel = YouTubeChannel(
             name=channel_name, deno_path=DENO_PATH,
             po_token_url=PO_TOKEN_URL, debug=True,
-            save_dir=settings.channel_data_directory
+            save_dir=settings.channel_data_directory,
+            browse_client=yt_client
         )
         try:
             await channel.scrape(max_videos_per_channel=0)

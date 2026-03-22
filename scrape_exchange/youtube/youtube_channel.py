@@ -75,6 +75,8 @@ class YouTubeChannel:
         deno_path: str = DENO_PATH, po_token_url: str = PO_TOKEN_URL,
         debug: bool = False, save_dir: str = None,
         consent_cookies: dict[str, str] | None = CONSENT_COOKIES,
+        browse_client: AsyncYouTubeClient | None = None,
+        with_download_client: bool = True,
     ) -> None:
         '''
         Models a YouTube channel
@@ -82,26 +84,31 @@ class YouTubeChannel:
         :param name: the name of the channel as it appears in the vanity URL,
         i.e., for https://www.youtube.com/@HistoryMatters, name is
         'HistoryMatters'
-        :param channel_id: The YouTube channel ID, i.e. the last part of:
-        https://www.youtube.com/channel/UC22BdTgxefuvUivrjesETjg
-        :param ingest: whether to ingest the A/V streams of the scraped assets
+        :param deno_path: path to the Deno executable for running the
+        download client
+        :param po_token_url: URL to get the PO token for the download client
+        :debug: whether to enable debug logging for the download client
+        :param save_dir: directory to save downloaded media assets to
         :param consent_cookies: cookies to use to bypass consent pages
-        :param user_agent: User-Agent string to use for HTTP requests
-        :param lock_file: path to lock file to prevent concurrent runs
-        :param storage_driver: storage driver to use for persisting media
+        :param browse_client: an existing AsyncYouTubeClient instance to use
+        for browsing/scraping data
         '''
 
         self.consent_cookies: dict[str, str] = consent_cookies
         self.save_dir: str | None = save_dir
 
-        self.browse_client: AsyncYouTubeClient | None = None
-        self.browse_request_count: int = 0
-        self._create_browse_client()
+        self.browse_client: AsyncYouTubeClient | None = browse_client
+        if not self.browse_client:
+            self._create_browse_client()
 
-        self.download_client: YoutubeDL = YouTubeVideo._setup_download_client(
-            browse_client=self.browse_client, deno_path=deno_path,
-            po_token_url=po_token_url, debug=debug
-        )
+        self.browse_request_count: int = 0
+
+        if with_download_client:
+            self.download_client: YoutubeDL = \
+                YouTubeVideo._setup_download_client(
+                    browse_client=self.browse_client, deno_path=deno_path,
+                    po_token_url=po_token_url, debug=debug
+                )
 
         self.url: str | None = None
         self.title: str | None = None
@@ -207,7 +214,7 @@ class YouTubeChannel:
             'external_urls': [
                 el.to_dict() for el in self.external_urls or set()
             ],
-            'joined_date': str(self.joined_date) if self.joined_date else None,
+            'joined_date': self.joined_date.isoformat() if self.joined_date else None,
             'rss_url': self.rss_url,
             'verified': self.verified,
             'subscriber_count': self.subscriber_count or 0,
@@ -505,7 +512,22 @@ class YouTubeChannel:
 
         about_url: str = self.url.rstrip('/') + '/about'
 
-        page_contents: str | None = await self.browse_client.get(about_url)
+        try:
+            page_contents: str | None = await self.browse_client.get(about_url)
+        except ValueError:
+            _LOGGER.warning(
+                f'About page not found for channel {self.name} at '
+                f'URL {about_url}'
+            )
+            raise
+        except Exception as exc:
+            _LOGGER.warning(
+                f'Error fetching about page for channel {self.name}: {exc}'
+            )
+            raise RuntimeError(
+                f'Could not retrieve about page for channel {self.name}'
+            ) from exc
+
         if not page_contents:
             raise RuntimeError(
                 f'Could not retrieve about page for channel {self.name}'
@@ -926,9 +948,18 @@ class YouTubeChannel:
         Gets the videos page HTML content
 
         :returns: HTML content of the videos page
+        :raises RuntimeError if the page cannot be retrieved or parsed
+        :raises ValueError if the channel does not exist
         '''
 
-        page_html: str | None = await self.browse_client.get(self.url)
+        try:
+            page_html: str | None = await self.browse_client.get(self.url)
+        except ValueError:
+            _LOGGER.warning(
+                f'Channel page not found for channel {self.name} '
+                f'at URL {self.url}'
+            )
+            raise
 
         if not page_html:
             raise RuntimeError(

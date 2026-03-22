@@ -38,6 +38,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from innertube import InnerTube
 
 from scrape_exchange.exchange_client import ExchangeClient
+from scrape_exchange.youtube.youtube_channel import YouTubeChannel
 from scrape_exchange.youtube.youtube_video import YouTubeVideo
 from scrape_exchange.youtube.youtube_client import AsyncYouTubeClient
 
@@ -57,6 +58,14 @@ YOUTUBE_RSS_URL: str = (
 
 INNERTUBE_BLOCKED_TIMER: datetime = datetime.now(UTC) - timedelta(seconds=60)
 FAILURE_DELAY: int = 60
+
+CHANNEL_SCHEMA_OWNER: str = 'boinko'
+CHANNEL_SCHEMA_VERSION: str = '0.0.1'
+CHANNEL_SCHEMA_PLATFORM: str = 'youtube'
+CHANNEL_SCHEMA_ENTITY: str = 'channel'
+
+MIN_SLEEP_SECONDS: int = 0.2
+MAX_SLEEP_SECONDS: int = 0.5
 
 
 class Settings(BaseSettings):
@@ -200,7 +209,7 @@ class Settings(BaseSettings):
         return upper
 
 
-async def fetch_rss(channel_id: str) -> list[YouTubeVideo]:
+async def fetch_rss(channel_id: str) -> list[YouTubeVideo] | None:
     '''
     Fetches and parses the YouTube RSS feed for a channel.
 
@@ -216,14 +225,23 @@ async def fetch_rss(channel_id: str) -> list[YouTubeVideo]:
     async with AsyncYouTubeClient() as yt_client:
         try:
             data: str | None = await yt_client.get(url, timeout=1)
+        except ValueError as exc:
+            logging.warning(
+                f'RSS feed not found for channel {channel_id}, '
+                f'sleeping 1 second: {exc}'
+            )
+            await asyncio.sleep(1)
+            raise
         except Exception:
             logging.debug(
-                'Getting RSS data failed, sleeping {FAILURE_DELAY} seconds'
+                f'Getting RSS data failed, sleeping {FAILURE_DELAY} seconds'
             )
             await asyncio.sleep(FAILURE_DELAY)
             raise
 
-        await asyncio.sleep(random.uniform(0.2, 0.5))
+        await asyncio.sleep(
+            random.uniform(MIN_SLEEP_SECONDS, MAX_SLEEP_SECONDS)
+        )
 
     if not data:
         raise RuntimeError(f'No data received from RSS feed {url}')
@@ -318,9 +336,9 @@ async def upload_video(
 
 
 async def process_channel(
-    channel_name: str, channel_id: str,
-    client: ExchangeClient, settings: Settings
-) -> None:
+    channel_name: str, channel_id: str, client: ExchangeClient,
+    yt_client: AsyncYouTubeClient, settings: Settings
+) -> bool:
     '''
     Fetches the RSS feed for one channel and checks or stores each video.
 
@@ -331,18 +349,33 @@ async def process_channel(
     :param channel_id: YouTube channel ID.
     :param client: The authenticated Scrape Exchange API client.
     :param settings: Worker settings.
+    :returns: bool if the channel should be scheduled again
     :raises: httpx.HTTPError if the RSS feed cannot be retrieved.
     :raises: RuntimeError if one or more videos could not be stored.
     '''
 
     logging.info(f'Processing channel {channel_name!r} ({channel_id})')
 
+    channel = YouTubeChannel(
+        name=channel_name, browse_client=yt_client, with_download_client=False
+    )
+    channel.channel_id = channel_id
+    await update_channel(client, channel)
+
     innertube: InnerTube = InnerTube('WEB')
-    videos: list[YouTubeVideo] = await fetch_rss(channel_id)
+    videos: list[YouTubeVideo] | None = await fetch_rss(channel_id)
+    if videos is None:
+        logging.warning(f'RSS feed not found for channel {channel_name!r}')
+        return False
+
     if not videos:
-        await asyncio.sleep(random.uniform(0.2, 0.5))
-        logging.info(f'No videos found in RSS feed for channel {channel_name!r}')
-        return
+        await asyncio.sleep(
+            random.uniform(MIN_SLEEP_SECONDS, MAX_SLEEP_SECONDS)
+        )
+        logging.info(
+            f'No videos found in RSS feed for channel {channel_name!r}'
+        )
+        return True
 
     logging.debug(
         f'[{channel_name}] {len(videos)} video(s) in RSS feed'
@@ -398,11 +431,10 @@ async def process_channel(
                 filename_prefix=VIDEO_FILENAME_PREFIX,
                 overwrite=True
             )
-            logging.debug(f'Stored the file in {filename}')
-
             logging.debug(
+                f'Stored the file in {filename}'
                 f'[{channel_name}] {video.video_id} ({video.title!r}): '
-                f'not yet on scrape.exchange, storing'
+                f'not yet on scrape.exchange, uploading'
             )
             stored: bool = await upload_video(
                 client, settings, channel_name, video
@@ -433,6 +465,46 @@ async def process_channel(
             f'{missed} out of {len(videos)} videos '
             f'for channel {channel_name!r} could not be processed'
         )
+
+    return True
+
+
+async def update_channel(client: ExchangeClient, channel: YouTubeChannel
+                         ) -> None:
+    try:
+        await channel.scrape_about_page()
+
+        channel_id: str = channel.channel_id
+        response: Response = await client.post(
+            f'{client.exchange_url}{ExchangeClient.POST_DATA_API}',
+            json={
+                'username': CHANNEL_SCHEMA_OWNER,
+                'platform': CHANNEL_SCHEMA_PLATFORM,
+                'entity': CHANNEL_SCHEMA_ENTITY,
+                'version': CHANNEL_SCHEMA_VERSION,
+                'source_url': f'https://www.youtube.com/channel/{channel_id}',
+                'data': {
+                    'channel': channel.name.lstrip('@'),
+                    'title': channel.title,
+                    'subscriber_count': channel.subscriber_count or 0,
+                    'view_count': channel.view_count or 0,
+                    'video_count': channel.video_count or 0,
+                    'description': channel.description,
+                },
+                'platform_content_id': channel.channel_id,
+                'platform_creator_id': None,
+                'platform_topic_id': None,
+            }
+        )
+        if response.status_code == 201:
+            logging.info(f'Channel {channel.name!r} updated successfully')
+        else:
+            logging.warning(
+                f'Failed to store channel {channel.name!r}: '
+                f'HTTP {response.status_code} - {response.text}'
+            )
+    except Exception as exc:
+        logging.info(f'Failed to update channel data: {exc}')
 
 
 def get_channelmap(channel_data_dir: str) -> dict[str, str]:
@@ -532,7 +604,8 @@ def get_queue(settings, channels: dict[str, str] = {}
             temp_queue = load_queue(queue_file)
         except Exception as exc:
             logging.warning(
-                f'Failed to load backup queue file {backup_queue_file!r}: {exc}'
+                f'Failed to load backup queue file {backup_queue_file!r}: '
+                f'{exc}'
             )
 
     if not temp_queue:
@@ -615,6 +688,7 @@ async def worker_loop(
         f'discovered_channels={len(channel_map)}'
     )
 
+    yt_client = AsyncYouTubeClient()
     while True:
         now: float = datetime.now(UTC).timestamp()
 
@@ -635,7 +709,7 @@ async def worker_loop(
         )
 
         tasks: list[asyncio.Task] = [
-            process_channel(name, channel_id, client, settings)
+            process_channel(name, channel_id, client, yt_client, settings)
             for _, name, channel_id in batch
         ]
         results: list = await asyncio.gather(*tasks, return_exceptions=True)
@@ -643,6 +717,9 @@ async def worker_loop(
         now = datetime.now(UTC).timestamp()
         for i, (_, name, channel_id) in enumerate(batch):
             result = results[i]
+            if isinstance(result, bool) and result is False:
+                # don't schedule the channel again if the RSS feed got a 404
+                continue
             if (isinstance(result, BaseException)
                     and not isinstance(result, FileExistsError)):
                 logging.warning(f'Channel {name!r} failed ({result})')

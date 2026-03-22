@@ -84,6 +84,8 @@ class AsyncYouTubeClient(AsyncClient):
         :param kwargs: Additional arguments to pass to the GET request.
 
         :returns: The HTTP response.
+        :raises: RuntimeError if the request fails after all retries.
+        :raises: ValueError if the URL is not found (404).
         '''
 
         try:
@@ -122,11 +124,16 @@ class AsyncYouTubeClient(AsyncClient):
                 and 'youtube.com' in resp.headers.get('Location', '')):
             # Follow redirect just once if it redirects to another YouTube URL
             if follow_redirects:
-                _LOGGER.debug(f'Following redirect to {resp.headers["Location"]}')
+                _LOGGER.debug(
+                    f'Following redirect to {resp.headers["Location"]}'
+                )
                 return await self.get(
                     resp.headers['Location'], retries=retries, delay=delay,
                     follow_redirects=False, **kwargs
                 )
+
+        if resp.status_code == 404:
+            raise ValueError(f'URL not found: {url}')
 
         if resp.status_code != 200:
             _LOGGER.warning(f'Scrape for {url} failed: {resp.status_code}')

@@ -14,7 +14,7 @@ VIDEO_FILE_PREFIX: str = 'video-'
 CHANNEL_FILE_PREFIX: str = 'channel-'
 
 
-def convert_number_string(number_text: str | int) -> int:
+def convert_number_string(number_text: str | int) -> int | None:
     '''
     Converts a number with optional appendix of m, k, to an integer
 
@@ -22,6 +22,9 @@ def convert_number_string(number_text: str | int) -> int:
     :returns: The number as an integer, e.g. 1200000, 3000, 500
     :raises ValueError: If the input string is not in a valid format
     '''
+
+    if isinstance(number_text, bool):
+        return None
 
     if not number_text or isinstance(number_text, int):
         return number_text

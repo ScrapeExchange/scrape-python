@@ -31,7 +31,6 @@ from innertube import InnerTube
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
 
-from ..util import IngestStatus
 from ..util import convert_number_string
 
 from .youtube_format import YouTubeFormat
@@ -369,7 +368,7 @@ class YouTubeVideo:
         return video
 
     @staticmethod
-    def from_rss_entry(entry: untangle.Element) -> 'YouTubeVideo':
+    def from_rss_entry(entry: untangle.Element) -> Self:
         '''
         Factory for YouTubeVideo, populates the subset of fields available
         from a YouTube channel RSS feed entry. Fields not present in the
@@ -377,7 +376,10 @@ class YouTubeVideo:
 
         We currently do not try to detect shorts from the RSS feed:
         'entry.link._attributes=
-            {'rel': 'alternate', 'href': 'https://www.youtube.com/shorts/QrAZfXiuF9E'}
+            {
+                'rel': 'alternate',
+                'href': 'https://www.youtube.com/shorts/QrAZfXiuF9E'
+            }
         We're not using that because we don't have an is_short property in
         YouTubeVideo
 
@@ -464,7 +466,7 @@ class YouTubeVideo:
         need to call scrape() again.
 
         :returns: (none)
-        :raises: ValueError
+        :raises: ValueError, RuntimeError
         '''
 
         if not self.video_id:
@@ -481,9 +483,19 @@ class YouTubeVideo:
         if not self.embed_url:
             self.embed_url = self.EMBED_URL.format(video_id=self.video_id)
 
-        html_content: str | None = await browse_client.get(
-            self.url, delay=delay
-        )
+        try:
+            html_content: str | None = await browse_client.get(
+                self.url, delay=delay
+            )
+        except ValueError:
+            _LOGGER.warning(
+                f'Video page not found for video {self.video_id} '
+                f'at URL {self.url}'
+            )
+            raise
+
+        if html_content is None:
+            raise RuntimeError(f'Failed to retrieve video page for {self.url}')
 
         player_response: dict[str, any] = self._extract_player_response(
             html_content
