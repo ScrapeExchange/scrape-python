@@ -27,8 +27,16 @@ class ExchangeClient(AsyncClient):
     ME_API: str = '/me'
     POST_REGISTER_API: str = '/api/account/v1/register'
     POST_TOKEN_API: str = '/api/account/v1/token'
+    GET_NEWEST_SCHEMA_API: str = '/api/schema/v1/newest'
+    GET_ALL_SCHEMAS_API: str = '/api/schema/v1'
+    GET_SCHEMA_COUNTERS_API: str = '/api/schema/v1/counters'
+    GET_DATA_PARAM: str = '/api/data/v1/param'
     POST_SCHEMA_API: str = '/api/schema/v1'
     POST_DATA_API: str = '/api/data/v1'
+    GET_CONTENT_API: str = '/api/data/v1/content'
+    GET_FILTER_API: str = '/api/filter/v1'
+    GET_STATS_API: str = '/api/stats/v1'
+    GET_METRICS_API: str = '/api/metrics/v1'
     GET_STATUS_API: str = '/api/status/v1'
 
     def __init__(self, exchange_url: str = SCRAPE_EXCHANGE_URL) -> None:
@@ -45,7 +53,7 @@ class ExchangeClient(AsyncClient):
         self.exchange_url: str = exchange_url
         self.jwt_header: str | None = None
         self.headers: dict[str, str] = {}
-        
+
         super().__init__(
             headers={
                 'Content-Type': 'application/json',

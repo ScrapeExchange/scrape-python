@@ -80,8 +80,8 @@ YOUTUBE_CHANNEL_DATA_DIR -> yt_rss_scrape.py -> YOUTUBE_VIDEO_DATA_DIR
 YOUTUBE_VIDEO_DATA_DIR -> yt_video_scrape.py -> YOUTUBE_VIDEO_DATA_DIR
 
 These scripts share a set of command line arguments, which can also be set using environment variables. They also support `.env` files, which is easiest to use. A sample .env file is included in the repository as `.env.example`.
-- yt_channel_upload.py: Scrapes channels, saves the scraped metadata as JSON files in the 'YOUTUBE_CHANNEL_DATA_DIR' directory.
-- yt_rss_reader.py: reads the channels from the YOUTUBE_CHANNEL_DATA_DIR directory and calls the YouTube RSS feed for each channel to get the latest videos. It then uploads the video metadata to the API and saves a copy of the scraped metadata as JSON files in the 'YOUTUBE_VIDEO_DATA_DIR' directory.
+- yt_channel_upload.py: Scrapes channels, their videos, shorts, playlists, merch etc. using the Innertube library, saves the scraped metadata as JSON files in the 'YOUTUBE_CHANNEL_DATA_DIR' directory.
+- yt_rss_reader.py: reads the channels from the YOUTUBE_CHANNEL_DATA_DIR directory. For each channel, it does a quick scrape of the About page of the channel to get latest counters for subscribers, views, and videos, and calls the YouTube RSS feed to get the latest videos. It then uploads the channel- and video metadata to the API and saves a copy of the scraped video metadata as JSON files in the 'YOUTUBE_VIDEO_DATA_DIR' directory.
 - yt_video_upload.py: reads the video metadata from the YOUTUBE_VIDEO_DATA_DIR directory, augments it with data scraped using yt-dlp, and uploads it to the API.
 
 ## Websocket listener
