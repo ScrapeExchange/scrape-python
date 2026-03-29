@@ -6,7 +6,7 @@ Python tools to scrape content from various platforms and upload it to the ![Scr
 
 These instructions assume you have access to a Linux computer. It needs to have Python3, the 'uv' tool, and docker installed. The instructions for installing 'uv' are available at [uv documentation](https://docs.astral.sh/uv/getting-started/installation/). Instructions for installing docker can bbe found on the [docker website](https://docs.docker.com/desktop/setup/install/linux/).
 
-The YouTube scrapers can be used to scrape metadata about videos and channels from YouTube. The code leverages the `InnerTube` and `yt-dlp` libraries to scrape the metadata from YouTube. The `yt-dlp` library needs some bits installed and configured to work properly with YouTube.
+The YouTube scrapers can be used to scrape metadata about videos and channels from YouTube. The code leverages the `InnerTube` and `yt-dlp` packages to scrape the metadata from YouTube. The `yt-dlp` package needs some bits installed and configured to work properly with YouTube.
 - [deno](https://docs.deno.com/runtime/getting_started/installation/): ```curl -fsSL https://deno.land/install.sh | sh```
 - [po-token-provider](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide): ```docker run --name bgutil-provider -d -p 4416:4416 --init brainicism/bgutil-ytdlp-pot-provider```
 
@@ -17,6 +17,7 @@ To avoid more stringent bot checking to access content, you can use a proxy. To 
 ```bash
 export HTTP_PROXY=http://your-proxy-server:port
 export HTTPS_PROXY=http://your-proxy-server:port
+export NO_PROXY=https://scrape.exchange
 ```
 
 If you don't have a proxy server, but you do have a VPN service, you can use the VPN's proxy server. Check your VPN provider's documentation for the proxy server details.
@@ -65,10 +66,14 @@ You may have to change the `VPN_SERVICE_PROVIDER`, `VPN_TYPE`, and `SERVER_COUNT
 
 # The tools
 
-The tools described below should be run from the root of the repository using the `uv` tool. For example, to run the YouTube channel scraper, you would run for example:
+The tools described below should be run from the root of the repository using the `uv` tool. We'll need to set the PYTHONPATH environment variable because scrape-python is not installed as a package. 
 
 ```bash
-uv run tools/yt_channel_scrape.py -h
+# For the YouTube channel scraper:
+PYTHONPATH=. uv run tools/yt_channel_scrape.py -h
+
+# For the websocket listener:
+PYTHONPATH=. uv run tools/listen_messages.py
 ```
 
 The first time you run one of the tools, or after you pull new changes from the repository, `uv` will automatically install any new dependencies specified in the `pyproject.toml` file. After that, it will run the tool using the installed dependencies.
@@ -88,4 +93,4 @@ These scripts share a set of command line arguments, which can also be set using
 With tools/listen_messages.py, you can listen to the websocket for new channels and videos being uploaded to the [scrape.exchange](https://scrape.exchange). This is useful for testing and debugging, as well as for getting real-time updates on new content being uploaded to the exchange. Depending on your filtering criteria, this can be a very high volume of messages, so use it with caution.
 
 ## Schema upload
-If you want to upload new JSONSchemas to the exchange, you can use the tools/upload_schema.py script. This is useful for updating the schemas used by the exchange, or for adding new schemas for new types of content.
+If you want to upload new JSONSchemas to the exchange, you can use the [scrape.exchange](https://scrape.exchange) website.  The `tools/upload_schema.py` script is also available for this purpose. This is useful for updating the schemas used by the exchange, or for adding new schemas for new types of content.
