@@ -2,7 +2,8 @@
 
 '''
 YouTube Video Upload Tool. Reads YouTube video files from a
-specified directory. For each channel, checks whether it was already scraped; if not, scrapes it and saves to disk.
+specified directory. For each channel, checks whether it was already scraped;
+if not, scrapes it and saves to disk.
 Then checks whether the scraped data was already uploaded; if not, uploads it
 to Scrape Exchange and moves the file to an "uploaded" sub-directory.
 
@@ -12,6 +13,7 @@ to Scrape Exchange and moves the file to an "uploaded" sub-directory.
 '''
 
 import os
+import random
 import asyncio
 import logging
 
@@ -37,7 +39,7 @@ VIDEO_YTDLP_PREFIX = 'video-dlp-'
 UPLOADED_DIRNAME: str = 'uploaded'
 SLEEP_MIN_INTERVAL: int = 12
 SLEEP_MAX_INTERVAL: int = 18
-FAILURE_SLEEP_INTERVAL_MIN: int = 300
+FAILURE_SLEEP_INTERVAL_MIN: int = 60
 FAILURE_SLEEP_INTERVAL_MAX: int = 3600
 
 FILE_EXTENSION: str = '.json.br'
@@ -277,7 +279,7 @@ async def upload_videos(settings: Settings) -> None:
             logging.info(f'Failed to upload video {video.video_id}: {exc}')
 
 
-def video_uploaded(settings: Settings, video_id: str) -> str | None:
+def video_uploaded_file(settings: Settings, video_id: str) -> str | None:
     '''
     Checks whether a video with the given ID has already been uploaded.
 
@@ -350,7 +352,8 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
     Scrapes YouTube video data and uploads it to Scrape Exchange.
 
     :param settings: Configuration settings for the tool
-    :param upload_only: Flag indicating whether to only upload videos without scraping
+    :param upload_only: Flag indicating whether to only upload videos without
+    scraping
     :returns: (none)
     :raises: (none)
     '''
@@ -375,49 +378,43 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
     files_scraped: int = 0
     files_uploaded: int = 0
     shuffle(files)
-    sleep: int = SLEEP_MIN_INTERVAL
+    logging.info(f'Found {len(files)} video files to process')
     for entry in files:
         video_needs_scraping: bool = False
 
         video: YouTubeVideo
+        prefix: str
         if entry.startswith(VIDEO_MIN_PREFIX):
             if settings.upload_only:
                 continue
-
+            prefix = VIDEO_MIN_PREFIX
             video_needs_scraping = True
-            video_id: str = entry[len(VIDEO_MIN_PREFIX):-len(FILE_EXTENSION)]
-            try:
-                video = await YouTubeVideo.from_file(
-                    video_id, settings.video_data_directory, VIDEO_MIN_PREFIX
-                )
-            except FileNotFoundError:
-                logging.warning(
-                    f'Minimal video file {entry} not found, skipping'
-                )
-                continue
         elif entry.startswith(VIDEO_YTDLP_PREFIX):
-            video_id: str = entry[len(VIDEO_YTDLP_PREFIX):-len(FILE_EXTENSION)]
-            try:
-                video = await YouTubeVideo.from_file(
-                    video_id, settings.video_data_directory, VIDEO_YTDLP_PREFIX
-                )
-            except FileNotFoundError:
-                logging.warning(
-                    f'YT-DLP video file {entry} not found, skipping'
-                )
-                continue
-            except brotli.error as exc:
-                logging.warning(
-                    f'Failed to load YT-DLP video file {entry}, skipping: {exc}'
-                )
-                continue
+            prefix = VIDEO_YTDLP_PREFIX
         else:
+            continue
+
+        video_id: str = entry[len(prefix):-len(FILE_EXTENSION)]
+
+        try:
+            video = await YouTubeVideo.from_file(
+                video_id, settings.video_data_directory, prefix
+            )
+        except FileNotFoundError:
+            logging.warning(
+                f'Video file {entry} not found, skipping'
+            )
+            continue
+        except brotli.error as exc:
+            logging.warning(
+                f'Failed to decompress video file {entry}, skipping: {exc}'
+            )
             continue
 
         # If the entry was parsed by yt-dlp then we always want to upload, even
         # if it means updating an existing upload.
-        if (not entry.startswith(VIDEO_YTDLP_PREFIX)
-                and video_uploaded(settings, video_id)):
+        if (prefix == VIDEO_YTDLP_PREFIX
+                and video_uploaded_file(settings, video_id)):
             logging.debug(
                 f'Video {video_id} already uploaded, skipping'
             )
@@ -431,69 +428,21 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
             proxies: list[str] = []
             if settings.proxies:
                 proxies = settings.proxies.split(',')
+            video = await _scrape(
+                entry, video_id, video.channel_name,
+                browse_client, download_client, settings, proxies
+            )
 
-            try:
-                video = await YouTubeVideo.scrape(
-                    video_id, channel_name=video.channel_name,
-                    channel_thumbnail=None, browse_client=browse_client,
-                    download_client=download_client,
-                    save_dir=settings.video_data_directory,
-                    filename_prefix=VIDEO_YTDLP_PREFIX,
-                    debug=settings.log_level == 'DEBUG',
-                    proxies=proxies
-                )
+            if video:
                 files_scraped += 1
-                sleep: int = randint(SLEEP_MIN_INTERVAL, SLEEP_MAX_INTERVAL)
-            except Exception as exc:
-                extension: str = '.failed'
-                error_val: str = str(exc).lower()
-                if ('uploader has not made this video available in your country' in error_val           # noqa: E501
-                        or 'this live event will begin in' in error_val
-                        or 'this live event has ended' in error_val
-                        or 'live stream recording is not available' in error_val                        # noqa: E501
-                        or 'video unavailable' in error_val
-                        or 'inappropriate' in error_val
-                        or 'video is not available' in error_val
-                        or 'this video is private' in error_val
-                        or 'this video has been removed' in error_val
-                        or 'this video is age restricted and only available on youtube' in error_val    # noqa: E501
-                        or "available to this channel's members on level" in error_val                  # noqa: E501
-                        or "members-only content" in error_val
-                        or 'The page needs to be reloaded' in error_val
-                        or 'offline' in error_val
-                        or 'sslerror' in error_val
-                        or 'ssl:' in error_val
-                        or 'unable to connect to proxy' in error_val):
-                    pass
-                else:
-                    if sleep < FAILURE_SLEEP_INTERVAL_MIN:
-                        sleep = FAILURE_SLEEP_INTERVAL_MIN
-                    else:
-                        sleep *= 2
-                        if sleep > FAILURE_SLEEP_INTERVAL_MAX:
-                            sleep = FAILURE_SLEEP_INTERVAL_MAX
-
-                    extension = '.unavailable'
-                    logging.info(f'Failed to scrape video {video_id}: {exc}')
-                    try:
-                        os.rename(
-                            os.path.join(settings.video_data_directory, entry),
-                            os.path.join(
-                                settings.video_data_directory,
-                                entry + extension
-                            )
+                video.to_file(
+                    settings.video_data_directory, VIDEO_YTDLP_PREFIX)
+                try:
+                    os.remove(
+                        os.path.join(settings.video_data_directory, entry)
                         )
-                    except OSError:
-                        pass
-
-                logging.info(f'Sleeping for {sleep} seconds before continuing')
-                await asyncio.sleep(sleep)
-                continue
-
-            try:
-                os.remove(os.path.join(settings.video_data_directory, entry))
-            except OSError:
-                pass
+                except OSError:
+                    pass
 
         try:
             if not settings.no_upload and await upload_video(
@@ -522,6 +471,71 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
             f'Files scraped: {files_scraped}, files uploaded: {files_uploaded}'
         )
 
+
+async def _scrape(entry, video_id: str, channel_name: str,
+                  browse_client: AsyncYouTubeClient,
+                  download_client: YoutubeDL, settings: Settings,
+                  proxies: list[str]) -> YouTubeVideo | None:
+    ''''''
+    sleep: int = randint(SLEEP_MIN_INTERVAL, SLEEP_MAX_INTERVAL)
+    video: YouTubeVideo | None = None
+    try:
+        video: YouTubeVideo = await YouTubeVideo.scrape(
+            video_id, channel_name=channel_name,
+            channel_thumbnail=None, browse_client=browse_client,
+            download_client=download_client,
+            save_dir=settings.video_data_directory,
+            filename_prefix=VIDEO_YTDLP_PREFIX,
+            debug=settings.log_level == 'DEBUG',
+            proxies=proxies
+        )
+
+    except Exception as exc:
+        error_val: str = str(exc).lower()
+        if ('video available in your country' in error_val
+                or 'this live event will begin in' in error_val
+                or 'this live event has ended' in error_val
+                or 'live stream recording is not available' in error_val                        # noqa: E501
+                or 'video unavailable' in error_val
+                or 'inappropriate' in error_val
+                or 'video is not available' in error_val
+                or 'this video is private' in error_val
+                or 'this video has been removed' in error_val
+                or 'video is age restricted' in error_val
+                or "available to this channel's members on level" in error_val                  # noqa: E501
+                or "members-only content" in error_val):
+            extension = '.unavailable'
+            logging.info(f'Video {video_id} not available for scraping: {exc}')
+            try:
+                os.rename(
+                    os.path.join(settings.video_data_directory, entry),
+                    os.path.join(
+                        settings.video_data_directory,
+                        entry + extension
+                    )
+                )
+            except OSError:
+                pass
+            logging.debug(f'Sleeping for {sleep} seconds before continuing')
+            await asyncio.sleep(randint(SLEEP_MIN_INTERVAL, SLEEP_MAX_INTERVAL))
+        elif ('the page needs to be reloaded' in error_val
+                or 'offline' in error_val
+                or 'sslerror' in error_val
+                or 'ssl:' in error_val
+                or 'unable to connect to proxy' in error_val):
+            logging.info(f'Transient failure during scraping: {exc}')
+        else:
+            if sleep < FAILURE_SLEEP_INTERVAL_MIN:
+                sleep = FAILURE_SLEEP_INTERVAL_MIN
+            else:
+                sleep *= 2
+                if sleep > FAILURE_SLEEP_INTERVAL_MAX:
+                    sleep = FAILURE_SLEEP_INTERVAL_MAX
+
+    logging.info(f'Sleeping for {sleep} seconds before continuing')
+    await asyncio.sleep(sleep)
+
+    return video
 
 async def upload_video(
     client: ExchangeClient, settings: Settings,
