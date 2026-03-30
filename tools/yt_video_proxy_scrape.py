@@ -290,6 +290,9 @@ async def prepare_workload(settings: Settings) -> Queue:
     for file in files:
         await queue.put(file)
 
+    logging.debug(
+        f'Prepared workload with {len(files)} video files to process'
+    )
     return queue
 
 
