@@ -471,7 +471,7 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
         except OSError:
             pass
         except Exception as exc:
-            logging.info(f'Failed to upload video {video.video_id}: {exc}')
+            logging.info(f'Failed to upload video {video_id}: {exc}')
 
         logging.info(
             f'Files scraped: {files_scraped}, files uploaded: {files_uploaded}'
