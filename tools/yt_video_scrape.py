@@ -610,6 +610,10 @@ async def upload_video(
 
     if response.status_code == 201 or response.status_code == 500:
         # Status 500 is bug in server when video already exists
+        logging.debug(
+            f'Video {video.video_id} upload response: '
+            f'HTTP {response.status_code}'
+        )
         return True
 
     logging.warning(
