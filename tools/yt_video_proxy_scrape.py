@@ -309,11 +309,13 @@ async def worker_loop(settings: Settings) -> None:
     queue: Queue = await prepare_workload(settings)
 
     tasks: list[Task] = []
+    count: int = 0
     for proxy in proxies:
         task: Task = asyncio.create_task(
-            worker(proxy, queue, settings)
+            worker(proxy, queue, settings, count)
         )
         tasks.append(task)
+        count += 1
     started_at = time.monotonic()
     await queue.join()
     total_slept_for = time.monotonic() - started_at
@@ -329,7 +331,8 @@ async def worker_loop(settings: Settings) -> None:
     )
 
 
-async def worker(proxy: str, queue: Queue, settings: Settings) -> None:
+async def worker(proxy: str, queue: Queue, settings: Settings, instance: int
+                 ) -> None:
     '''
     Worker function to process video files from the queue using a specific
     proxy.
@@ -353,14 +356,16 @@ async def worker(proxy: str, queue: Queue, settings: Settings) -> None:
         exchange_url=settings.exchange_url,
     )
 
-    logging.debug(f'Worker started with proxy: {proxy}')
+    logging.debug(f'{instance}: Worker started with proxy: {proxy}')
     sleep: int | None = None
     files_scraped: int = 0
     files_uploaded: int = 0
     while True:
         entry: str = await queue.get()
 
-        logging.debug(f'Worker with proxy {proxy} processing file: {entry}')
+        logging.debug(
+            f'{instance}: Worker with proxy {proxy} processing file: {entry}'
+        )
         video_id: str
         video_needs_scraping: bool
         prefix: str
@@ -387,14 +392,15 @@ async def worker(proxy: str, queue: Queue, settings: Settings) -> None:
             continue
         except brotli.error as exc:
             logging.warning(
-                f'Failed to decompress video file {entry}, skipping: {exc}'
+                f'{instance}: Failed to decompress video file {entry}, '
+                f'skipping: {exc}'
             )
             os.remove(os.path.join(settings.video_data_directory, entry))
             continue
 
         if not video_needs_uploading(settings, video_id):
             logging.debug(
-                f'Video {video_id} already uploaded, skipping'
+                f'{instance}:Video {video_id} already uploaded, skipping'
             )
             try:
                 os.remove(os.path.join(settings.video_data_directory, entry))
@@ -443,11 +449,9 @@ async def worker(proxy: str, queue: Queue, settings: Settings) -> None:
         except Exception as exc:
             logging.info(f'Failed to upload video {video_id}: {exc}')
 
-        logging.info(f'Sleeping for {sleep} seconds before continuing')
-        await asyncio.sleep(sleep)
-
         logging.info(
-            f'Files scraped: {files_scraped}, files uploaded: {files_uploaded}'
+            f'{instance}: Files scraped: {files_scraped}, '
+            f'files uploaded: {files_uploaded}'
         )
         queue.task_done()
 
