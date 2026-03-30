@@ -212,7 +212,6 @@ class YouTubeVideo:
             'dislike_count': self.dislike_count,
             'comment_count': self.comment_count,
             'url': self.url,
-            'embed_url': self.embed_url,
             'is_live': self.is_live,
             'was_live': self.was_live,
             'media_type': self.media_type.value if self.media_type else None,
@@ -232,6 +231,11 @@ class YouTubeVideo:
             'categories': list(self.categories),
             'privacy_status': self.privacy_status
         }
+
+        if self.embed_url:
+            data['embed_url'] = self.embed_url
+        else:
+            data['embed_url'] = self.EMBED_URL.format(video_id=self.video_id)
 
         if self.channel_thumbnail_asset:
             data['channel_thumbnail'] = self.channel_thumbnail_asset.to_dict()
@@ -663,7 +667,7 @@ class YouTubeVideo:
                 )
             temp_file.flush()
             cookie_file_path: str = temp_file.name
-
+            proxy: str | None = random.choice(proxies) if proxies else None
             ytdlp_opts: dict = {
                 'quiet': not debug,
                 'verbose': debug,
@@ -671,7 +675,7 @@ class YouTubeVideo:
                 'noprogress': True,
                 'no_color': True,
                 'format': 'all',
-                'proxy': random.choice(proxies) if proxies else None,
+                'proxy': proxy,
                 'http_headers': dict(browse_client.headers),
                 'cookiefile': cookie_file_path,
                 'js_runtimes': {'deno': {'path': deno_path}},
@@ -684,7 +688,6 @@ class YouTubeVideo:
                 'remote_components': ['ejs:github']
             }
             download_client = YoutubeDL(ytdlp_opts)
-
         return download_client
 
     def _extract_initial_data(self, html_content: str) -> dict:

@@ -50,6 +50,8 @@ MIN_CHANNEL_INTERVAL_SECONDS: int = 60 * 240  # 4 hours
 RETRY_INTERVAL_SECONDS: int = 60 * 2          # 2 minutes
 MAX_CONCURRENT_CHANNELS: int = 3
 
+FILE_EXTENSION: str = '.json.br'
+
 BACKUP_SUFFIX: str = 'bak'
 
 YOUTUBE_RSS_URL: str = (
@@ -64,8 +66,8 @@ CHANNEL_SCHEMA_VERSION: str = '0.0.1'
 CHANNEL_SCHEMA_PLATFORM: str = 'youtube'
 CHANNEL_SCHEMA_ENTITY: str = 'channel'
 
-MIN_SLEEP_SECONDS: int = 0.2
-MAX_SLEEP_SECONDS: int = 0.5
+MIN_SLEEP_SECONDS: float = 0.2
+MAX_SLEEP_SECONDS: float = 0.5
 
 
 class Settings(BaseSettings):
@@ -140,6 +142,16 @@ class Settings(BaseSettings):
         ),
         description='Path to JSON file for persisting the channel queue',
     )
+    no_feeds_file: str = Field(
+        default='/var/tmp/yt-rss-reader-no-feeds.txt',
+        validation_alias=AliasChoices(
+            'NO_FEEDS_FILE', 'no_feeds_file'
+        ),
+        description=(
+            'Path to text file where channel names with missing RSS feeds are '
+            'logged (one channel name per line)'
+        ),
+    )
     with_innertube: bool = Field(
         default=True,
         validation_alias=AliasChoices(
@@ -209,11 +221,14 @@ class Settings(BaseSettings):
         return upper
 
 
-async def fetch_rss(channel_id: str) -> list[YouTubeVideo] | None:
+async def fetch_rss(channel_id: str, channel_name: str,
+                    no_feeds_file: str) -> list[YouTubeVideo] | None:
     '''
     Fetches and parses the YouTube RSS feed for a channel.
 
     :param channel_id: The YouTube channel ID.
+    :param channel_name: The YouTube channel name.
+    :param no_feeds_file: Path to the file where channels with missing RSS feeds are logged.
     :returns: A list of YouTubeVideo instances populated from the RSS feed.
     :raises: httpx.HTTPStatusError on non-2xx HTTP responses.
     :raises: httpx.RequestError on network-level failures.
@@ -225,10 +240,13 @@ async def fetch_rss(channel_id: str) -> list[YouTubeVideo] | None:
     async with AsyncYouTubeClient() as yt_client:
         try:
             data: str | None = await yt_client.get(url, timeout=1)
-        except ValueError as exc:
+        except ValueError:
+            async with aiofiles.open(no_feeds_file, 'a') as fd:
+                await fd.write(f'{channel_id}\t{url}\t{channel_name}\n')
+
             logging.warning(
                 f'RSS feed not found for channel {channel_id}, '
-                f'sleeping 1 second: {exc}'
+                f'wrote channel_id to {no_feeds_file}, sleeping 1 second'
             )
             await asyncio.sleep(1)
             raise
@@ -363,7 +381,9 @@ async def process_channel(
     await update_channel(client, channel)
 
     innertube: InnerTube = InnerTube('WEB')
-    videos: list[YouTubeVideo] | None = await fetch_rss(channel_id)
+    videos: list[YouTubeVideo] | None = await fetch_rss(
+        channel_id, channel_name, settings.no_feeds_file
+    )
     if videos is None:
         logging.warning(f'RSS feed not found for channel {channel_name!r}')
         return False
@@ -491,8 +511,8 @@ async def update_channel(client: ExchangeClient, channel: YouTubeChannel
                     'video_count': channel.video_count or 0,
                     'description': channel.description,
                 },
-                'platform_content_id': channel.channel_id,
-                'platform_creator_id': None,
+                'platform_content_id': channel.name,
+                'platform_creator_id': channel.name,
                 'platform_topic_id': None,
             }
         )
@@ -523,11 +543,11 @@ def get_channelmap(channel_data_dir: str) -> dict[str, str]:
     filename: str
     for filename in files:
         if (not filename.startswith(CHANNEL_FILENAME_PREFIX)
-                or not filename.endswith('.json.br')):
+                or not filename.endswith('FILE_EXTENSION')):
             continue
 
         channel_name: str = filename[
-            len(CHANNEL_FILENAME_PREFIX):-1*len('.json.br')
+            len(CHANNEL_FILENAME_PREFIX):-1*len('FILE_EXTENSION')
         ]
 
         file_path: str = os.path.join(channel_data_dir, filename)
@@ -553,7 +573,7 @@ def read_channel_file(filepath: str) -> dict[str, any]:
     '''
 
     logging.debug(f'Reading channel file {filepath!r}')
-    if filepath.endswith('.json.br'):
+    if filepath.endswith('FILE_EXTENSION'):
         with open(filepath, 'rb') as f:
             decompressed_data: bytes = brotli.decompress(f.read())
             return orjson.loads(decompressed_data)
@@ -717,9 +737,13 @@ async def worker_loop(
         now = datetime.now(UTC).timestamp()
         for i, (_, name, channel_id) in enumerate(batch):
             result = results[i]
-            if isinstance(result, bool) and result is False:
+            if (isinstance(result, ValueError)
+                    or (isinstance(result, bool) and result is False)):
                 # don't schedule the channel again if the RSS feed got a 404
-                continue
+                logging.info(
+                    f'RSS feed not found for channel {name!r} - {channel_id}'
+                )
+                # continue
             if (isinstance(result, BaseException)
                     and not isinstance(result, FileExistsError)):
                 logging.warning(f'Channel {name!r} failed ({result})')
