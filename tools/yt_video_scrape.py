@@ -552,6 +552,7 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
             except OSError:
                 pass
         elif ('offline' in error_val
+                or 'timed out' in error_val
                 or 'sslerror' in error_val
                 or 'ssl:' in error_val
                 or 'unable to connect to proxy' in error_val):
