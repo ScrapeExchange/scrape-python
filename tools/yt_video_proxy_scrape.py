@@ -403,13 +403,11 @@ async def worker(proxy: str, queue: Queue, settings: Settings) -> None:
             continue
 
         if video_needs_scraping:
-            result: YouTubeVideo | int = await _scrape(
+            video, sleep = await _scrape(
                 entry, video_id, video.channel_name,
                 browse_client, download_client,
                 settings, proxy, sleep
             )
-            if isinstance(result, int):
-                sleep = result
 
             files_scraped += 1
             try:
@@ -445,6 +443,9 @@ async def worker(proxy: str, queue: Queue, settings: Settings) -> None:
         except Exception as exc:
             logging.info(f'Failed to upload video {video_id}: {exc}')
 
+        logging.info(f'Sleeping for {sleep} seconds before continuing')
+        await asyncio.sleep(sleep)
+
         logging.info(
             f'Files scraped: {files_scraped}, files uploaded: {files_uploaded}'
         )
@@ -455,7 +456,7 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
                   browse_client: AsyncYouTubeClient,
                   download_client: YoutubeDL, settings: Settings,
                   proxy: str, sleep: int | None = None
-                  ) -> YouTubeVideo | int:
+                  ) -> tuple[YouTubeVideo | None, int]:
     '''
     Scrapes video data for a given video ID using yt-dlp. If video scraping
     fails due to rate limiting or transient errors, returns an integer
@@ -469,8 +470,8 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
     :param settings: Configuration settings for the tool
     :param proxy: Proxy URL to use for scraping
     :param sleep: Optional integer indicating how long to sleep before scraping
-    :returns: YouTubeVideo instance if scraping is successful, or integer sleep
-    duration if scraping fails due to rate limiting or transient errors.
+    :returns: YouTubeVideo instance if scraping is successful, sleep duration
+    in seconds if scraping fails due to rate limiting or transient errors.
     The value of the sleep duration should be used the next time this function
     is called.
     '''
@@ -539,13 +540,8 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
             if sleep > FAILURE_SLEEP_INTERVAL_MAX:
                 sleep = FAILURE_SLEEP_INTERVAL_MAX
 
-    logging.info(f'Sleeping for {sleep} seconds before continuing')
-    await asyncio.sleep(sleep)
+    return video, sleep
 
-    if video:
-        return video
-
-    return sleep
 
 
 async def upload_video(
