@@ -355,8 +355,9 @@ async def worker(proxy: str, queue: Queue, settings: Settings) -> None:
     files_scraped: int = 0
     files_uploaded: int = 0
     while True:
-        entry: str = queue.get()
+        entry: str = await queue.get()
 
+        logging.debug(f'Worker with proxy {proxy} processing file: {entry}')
         video_id: str
         video_needs_scraping: bool
         prefix: str
