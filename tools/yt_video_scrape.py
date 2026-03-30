@@ -569,7 +569,10 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
     logging.info(f'Sleeping for {sleep} seconds before continuing')
     await asyncio.sleep(sleep)
 
-    return video | sleep
+    if video:
+        return video
+
+    return sleep
 
 
 async def upload_video(
