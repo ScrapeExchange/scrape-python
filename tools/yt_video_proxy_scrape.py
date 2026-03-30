@@ -338,7 +338,7 @@ async def worker(proxy: str, queue: Queue, settings: Settings) -> None:
     :raises: (none)
     '''
 
-    browse_client = AsyncYouTubeClient(proxy=proxy)
+    browse_client = AsyncYouTubeClient(proxies=[proxy])
     download_client: YoutubeDL = YouTubeVideo._setup_download_client(
         browse_client=browse_client, deno_path=settings.deno_path,
         po_token_url=settings.po_token_url, proxies=[proxy]
