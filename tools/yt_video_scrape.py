@@ -379,6 +379,7 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
     files_uploaded: int = 0
     shuffle(files)
     logging.info(f'Found {len(files)} video files to process')
+    sleep: int | None = None
     for entry in files:
         video_needs_scraping: bool = False
 
@@ -430,19 +431,24 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
                 proxies = settings.proxies.split(',')
             video = await _scrape(
                 entry, video_id, video.channel_name,
-                browse_client, download_client, settings, proxies
+                browse_client, download_client,
+                settings, proxies, sleep
             )
 
-            if video:
-                files_scraped += 1
-                video.to_file(
-                    settings.video_data_directory, VIDEO_YTDLP_PREFIX)
-                try:
-                    os.remove(
-                        os.path.join(settings.video_data_directory, entry)
-                        )
-                except OSError:
-                    pass
+            if isinstance(video, int):
+                sleep = video
+                continue
+
+            sleep = None
+            files_scraped += 1
+            video.to_file(
+                settings.video_data_directory, VIDEO_YTDLP_PREFIX)
+            try:
+                os.remove(
+                    os.path.join(settings.video_data_directory, entry)
+                    )
+            except OSError:
+                pass
 
         try:
             if not settings.no_upload and await upload_video(
@@ -472,12 +478,33 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
         )
 
 
-async def _scrape(entry, video_id: str, channel_name: str,
+async def _scrape(entry: str, video_id: str, channel_name: str,
                   browse_client: AsyncYouTubeClient,
                   download_client: YoutubeDL, settings: Settings,
-                  proxies: list[str]) -> YouTubeVideo | None:
-    ''''''
-    sleep: int = randint(SLEEP_MIN_INTERVAL, SLEEP_MAX_INTERVAL)
+                  proxies: list[str], sleep: int | None = None
+                  ) -> YouTubeVideo | int:
+    '''
+    Scrapes video data for a given video ID using yt-dlp. If video scraping
+    fails due to rate limiting or transient errors, returns an integer
+    indicating how long to sleep before the next attempt.
+
+    :param entry: Filename of the video data file to scrape
+    :param video_id: YouTube video ID to scrape
+    :param channel_name: YouTube channel name associated with the video
+    :param browse_client: AsyncYouTubeClient instance for browsing YouTube
+    :param download_client: YoutubeDL instance for downloading video data
+    :param settings: Configuration settings for the tool
+    :param proxies: List of proxy URLs to use for scraping
+    :param sleep: Optional integer indicating how long to sleep before scraping
+    :returns: YouTubeVideo instance if scraping is successful, or integer sleep
+    duration if scraping fails due to rate limiting or transient errors.
+    The value of the sleep duration should be used the next time this function
+    is called.
+    '''
+
+    if not sleep:
+        sleep: int = randint(SLEEP_MIN_INTERVAL, SLEEP_MAX_INTERVAL)
+
     video: YouTubeVideo | None = None
     try:
         video: YouTubeVideo = await YouTubeVideo.scrape(
@@ -489,20 +516,28 @@ async def _scrape(entry, video_id: str, channel_name: str,
             debug=settings.log_level == 'DEBUG',
             proxies=proxies
         )
-
     except Exception as exc:
         error_val: str = str(exc).lower()
-        if ('video available in your country' in error_val
+        if ('rate-limited by youtube' in error_val
+                or 'VPN/Proxy Detected' in error_val
+                or 'captcha' in error_val
+                or 'try again later' in error_val
+                or 'the page needs to be reloaded' in error_val
+                or 'Missing microformat data' in error_val
+                or '429' in error_val):
+            sleep = max(sleep, FAILURE_SLEEP_INTERVAL_MIN)
+            logging.info(f'Rate limited during scraping: {exc}')
+        elif ('video available in your country' in error_val
                 or 'this live event will begin in' in error_val
                 or 'this live event has ended' in error_val
-                or 'live stream recording is not available' in error_val                        # noqa: E501
+                or 'live stream recording is not available' in error_val
                 or 'video unavailable' in error_val
                 or 'inappropriate' in error_val
                 or 'video is not available' in error_val
                 or 'this video is private' in error_val
                 or 'this video has been removed' in error_val
                 or 'video is age restricted' in error_val
-                or "available to this channel's members on level" in error_val                  # noqa: E501
+                or "available to this channel's members on level" in error_val
                 or "members-only content" in error_val):
             extension = '.unavailable'
             logging.info(f'Video {video_id} not available for scraping: {exc}')
@@ -516,26 +551,25 @@ async def _scrape(entry, video_id: str, channel_name: str,
                 )
             except OSError:
                 pass
-            logging.debug(f'Sleeping for {sleep} seconds before continuing')
-            await asyncio.sleep(randint(SLEEP_MIN_INTERVAL, SLEEP_MAX_INTERVAL))
-        elif ('the page needs to be reloaded' in error_val
-                or 'offline' in error_val
+        elif ('offline' in error_val
                 or 'sslerror' in error_val
                 or 'ssl:' in error_val
                 or 'unable to connect to proxy' in error_val):
             logging.info(f'Transient failure during scraping: {exc}')
+
+    if sleep > SLEEP_MAX_INTERVAL:
+        if sleep < FAILURE_SLEEP_INTERVAL_MIN:
+            sleep = max(sleep, FAILURE_SLEEP_INTERVAL_MIN)
         else:
-            if sleep < FAILURE_SLEEP_INTERVAL_MIN:
-                sleep = FAILURE_SLEEP_INTERVAL_MIN
-            else:
-                sleep *= 2
-                if sleep > FAILURE_SLEEP_INTERVAL_MAX:
-                    sleep = FAILURE_SLEEP_INTERVAL_MAX
+            sleep *= 2
+            if sleep > FAILURE_SLEEP_INTERVAL_MAX:
+                sleep = FAILURE_SLEEP_INTERVAL_MAX
 
     logging.info(f'Sleeping for {sleep} seconds before continuing')
     await asyncio.sleep(sleep)
 
-    return video
+    return video | sleep
+
 
 async def upload_video(
     client: ExchangeClient, settings: Settings,
