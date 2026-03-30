@@ -441,7 +441,7 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
 
             sleep = None
             files_scraped += 1
-            video.to_file(
+            await video.to_file(
                 settings.video_data_directory, VIDEO_YTDLP_PREFIX)
             try:
                 os.remove(
