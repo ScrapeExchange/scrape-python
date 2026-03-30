@@ -66,7 +66,7 @@ You may have to change the `VPN_SERVICE_PROVIDER`, `VPN_TYPE`, and `SERVER_COUNT
 
 # The tools
 
-The tools described below should be run from the root of the repository using the `uv` tool. We'll need to set the PYTHONPATH environment variable because scrape-python is not installed as a package. 
+The tools described below should be run from the root of the repository using the `uv` tool. We'll need to set the PYTHONPATH environment variable because scrape-python is not installed as a package.
 
 ```bash
 # For the YouTube channel scraper:
@@ -80,17 +80,23 @@ The first time you run one of the tools, or after you pull new changes from the 
 
 ## YouTube Scrapers
 There are three tools available in this repository for scraping YouTube content and uploading it to the [scrape.exchange](https://scrape.exchange). They share a directory structure:
+
+```
 YOUTUBE_CHANNEL_LIST -> yt_channel_scrape.py -> YOUTUBE_CHANNEL_DATA_DIR
 YOUTUBE_CHANNEL_DATA_DIR -> yt_rss_scrape.py -> YOUTUBE_VIDEO_DATA_DIR
 YOUTUBE_VIDEO_DATA_DIR -> yt_video_scrape.py -> YOUTUBE_VIDEO_DATA_DIR
+```
 
 These scripts share a set of command line arguments, which can also be set using environment variables. They also support `.env` files, which is easiest to use. A sample .env file is included in the repository as `.env.example`.
-- yt_channel_upload.py: Scrapes channels, their videos, shorts, playlists, merch etc. using the Innertube library, saves the scraped metadata as JSON files in the 'YOUTUBE_CHANNEL_DATA_DIR' directory.
+- yt_channel_upload.py: Scrapes channels and the information about their videos, shorts, playlists, merch etc. using the Innertube library, saves the scraped metadata as JSON files in the 'YOUTUBE_CHANNEL_DATA_DIR' directory.
 - yt_rss_reader.py: reads the channels from the YOUTUBE_CHANNEL_DATA_DIR directory. For each channel, it does a quick scrape of the About page of the channel to get latest counters for subscribers, views, and videos, and calls the YouTube RSS feed to get the latest videos. It then uploads the channel- and video metadata to the API and saves a copy of the scraped video metadata as JSON files in the 'YOUTUBE_VIDEO_DATA_DIR' directory.
 - yt_video_upload.py: reads the video metadata from the YOUTUBE_VIDEO_DATA_DIR directory, augments it with data scraped using yt-dlp, and uploads it to the API.
 
 ## Websocket listener
 With tools/listen_messages.py, you can listen to the websocket for new channels and videos being uploaded to the [scrape.exchange](https://scrape.exchange). This is useful for testing and debugging, as well as for getting real-time updates on new content being uploaded to the exchange. Depending on your filtering criteria, this can be a very high volume of messages, so use it with caution.
+```bash
+PYTHONPATH=. uv run tools/listen_messages.py --platform youtube
+```
 
 ## Schema upload
-If you want to upload new JSONSchemas to the exchange, you can use the [scrape.exchange](https://scrape.exchange) website.  The `tools/upload_schema.py` script is also available for this purpose. This is useful for updating the schemas used by the exchange, or for adding new schemas for new types of content.
+If you want to upload new JSONSchemas to the exchange, you can use the [schema page](https://scrape.exchange/schema) on the website.  The `tools/upload_schema.py` script is also available for this purpose. This is useful for updating the schemas used by the exchange, or for adding new schemas for new types of content.
