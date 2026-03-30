@@ -452,7 +452,7 @@ async def worker(proxy: str, queue: Queue, settings: Settings, instance: int
         logging.info(f'{instance}: sleeping for {sleep} seconds')
         await asyncio.sleep(sleep)
         logging.info(
-            f'{instance}: Files scraped: {files_scraped}, '
+            f'{instance}: {proxy} files scraped: {files_scraped}, '
             f'files uploaded: {files_uploaded}'
         )
         queue.task_done()
