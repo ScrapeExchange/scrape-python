@@ -18,6 +18,8 @@ import logging
 from pathlib import Path
 from random import randint, shuffle
 
+import brotli
+
 from httpx import Response
 
 from pydantic import AliasChoices, Field, field_validator
@@ -32,10 +34,11 @@ from scrape_exchange.youtube.youtube_video import DENO_PATH, PO_TOKEN_URL
 
 VIDEO_MIN_PREFIX = 'video-min-'
 VIDEO_YTDLP_PREFIX = 'video-dlp-'
-UPLOADED_DIRNAME: str = '/uploaded'
+UPLOADED_DIRNAME: str = 'uploaded'
 SLEEP_MIN_INTERVAL: int = 12
 SLEEP_MAX_INTERVAL: int = 18
-FAILURE_SLEEP_INTERVAL: int = 3600
+FAILURE_SLEEP_INTERVAL_MIN: int = 300
+FAILURE_SLEEP_INTERVAL_MAX: int = 3600
 
 FILE_EXTENSION: str = '.json.br'
 
@@ -176,7 +179,8 @@ async def main() -> None:
                '%(message)s'
     )
     os.makedirs(
-        settings.video_data_directory + UPLOADED_DIRNAME, exist_ok=True
+        os.path.join(settings.video_data_directory, UPLOADED_DIRNAME),
+        exist_ok=True
     )
     logging.info(
         'Starting YouTube video upload tool with settings: '
@@ -211,55 +215,64 @@ async def upload_videos(settings: Settings) -> None:
         and entry.startswith(VIDEO_YTDLP_PREFIX)
     ]
     shuffle(files)
+    logging.info(f'Found {len(files)} video files to upload')
     entries: int = 0
     for entry in files:
         if settings.max_files and entries >= settings.max_files:
+            logging.info(f'Processed {entries} files')
             return
         entries += 1
 
         uploaded_file_path: str = os.path.join(
             settings.video_data_directory, UPLOADED_DIRNAME, entry
         )
-        if (os.path.exists(uploaded_file_path)
-                and os.path.getmtime(uploaded_file_path) >= os.path.getmtime(
-                   os.path.join(settings.video_data_directory, entry)
-                )):
-            logging.debug(
-                f'Video file {entry} already uploaded and newer, skipping'
-            )
-            try:
+        try:
+            if (os.path.exists(uploaded_file_path)
+                    and os.path.getmtime(uploaded_file_path) >= os.path.getmtime(
+                    os.path.join(settings.video_data_directory, entry)
+                    )):
+                logging.debug(
+                    f'Video file {entry} already uploaded and newer, skipping'
+                )
                 os.remove(
                     os.path.join(settings.video_data_directory, entry)
                 )
-            except OSError:
-                pass
+                continue
+        except OSError:
             continue
 
         video_id: str = entry[len(VIDEO_YTDLP_PREFIX):-len(FILE_EXTENSION)]
-        video: YouTubeVideo = await YouTubeVideo.from_file(
-            video_id, settings.video_data_directory, VIDEO_YTDLP_PREFIX
-        )
+        try:
+            video: YouTubeVideo = await YouTubeVideo.from_file(
+                video_id, settings.video_data_directory, VIDEO_YTDLP_PREFIX
+            )
+        except Exception as exc:
+            logging.info(
+                f'Failed to load video data from file {entry}, skipping: {exc}'
+            )
+            continue
+
         try:
             if not settings.no_upload and await upload_video(
                 exchange_client, settings, video.channel_name, video
             ):
-                logging.debug(
-                    f'Uploaded video {video.video_id}, moving file '
-                    'to uploaded directory'
+                filename: str = (
+                    f'{VIDEO_YTDLP_PREFIX}{video_id}{FILE_EXTENSION}'
                 )
-                os.rename(
-                    os.path.join(
-                        settings.video_data_directory, VIDEO_YTDLP_PREFIX,
-                        video_id + FILE_EXTENSION
-                    ),
-                    os.path.join(
-                        settings.video_data_directory, UPLOADED_DIRNAME,
-                        VIDEO_YTDLP_PREFIX + video_id + FILE_EXTENSION
-                    )
+                source_file: str = os.path.join(
+                    settings.video_data_directory, filename
                 )
+                dest_file: str = os.path.join(
+                    settings.video_data_directory,
+                    UPLOADED_DIRNAME, filename
+                )
+                os.rename(source_file, dest_file)
                 logging.info(f'Uploaded video {video.video_id}')
-        except OSError:
-            pass
+        except OSError as exc:
+            logging.warning(
+                'Failed to move uploaded video file '
+                f'for {video.video_id} to {dest_file}: {exc}'
+            )
         except Exception as exc:
             logging.info(f'Failed to upload video {video.video_id}: {exc}')
 
@@ -274,8 +287,8 @@ def video_uploaded(settings: Settings, video_id: str) -> str | None:
     :raises: (none)
     '''
 
-    uploaded_filepath: str = (
-        f'{settings.video_data_directory}{UPLOADED_DIRNAME}/'
+    uploaded_filepath: str = os.path.join(
+        settings.video_data_directory, UPLOADED_DIRNAME,
         f'{VIDEO_YTDLP_PREFIX}{video_id}.json.br'
     )
     if os.path.isfile(uploaded_filepath):
@@ -362,6 +375,7 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
     files_scraped: int = 0
     files_uploaded: int = 0
     shuffle(files)
+    sleep: int = SLEEP_MIN_INTERVAL
     for entry in files:
         video_needs_scraping: bool = False
 
@@ -372,14 +386,31 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
 
             video_needs_scraping = True
             video_id: str = entry[len(VIDEO_MIN_PREFIX):-len(FILE_EXTENSION)]
-            video = await YouTubeVideo.from_file(
-                video_id, settings.video_data_directory, VIDEO_MIN_PREFIX
-            )
+            try:
+                video = await YouTubeVideo.from_file(
+                    video_id, settings.video_data_directory, VIDEO_MIN_PREFIX
+                )
+            except FileNotFoundError:
+                logging.warning(
+                    f'Minimal video file {entry} not found, skipping'
+                )
+                continue
         elif entry.startswith(VIDEO_YTDLP_PREFIX):
             video_id: str = entry[len(VIDEO_YTDLP_PREFIX):-len(FILE_EXTENSION)]
-            video = await YouTubeVideo.from_file(
-                video_id, settings.video_data_directory, VIDEO_YTDLP_PREFIX
-            )
+            try:
+                video = await YouTubeVideo.from_file(
+                    video_id, settings.video_data_directory, VIDEO_YTDLP_PREFIX
+                )
+            except FileNotFoundError:
+                logging.warning(
+                    f'YT-DLP video file {entry} not found, skipping'
+                )
+                continue
+            except brotli.error as exc:
+                logging.warning(
+                    f'Failed to load YT-DLP video file {entry}, skipping: {exc}'
+                )
+                continue
         else:
             continue
 
@@ -412,11 +443,8 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
                     proxies=proxies
                 )
                 files_scraped += 1
-                await asyncio.sleep(
-                    randint(SLEEP_MIN_INTERVAL, SLEEP_MAX_INTERVAL)
-                )
+                sleep: int = randint(SLEEP_MIN_INTERVAL, SLEEP_MAX_INTERVAL)
             except Exception as exc:
-                sleep: int = FAILURE_SLEEP_INTERVAL + randint(0, 60)
                 extension: str = '.failed'
                 error_val: str = str(exc).lower()
                 if ('uploader has not made this video available in your country' in error_val           # noqa: E501
@@ -431,10 +459,21 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
                         or 'this video is age restricted and only available on youtube' in error_val    # noqa: E501
                         or "available to this channel's members on level" in error_val                  # noqa: E501
                         or "members-only content" in error_val
-                        or 'offline' in error_val):
-                    sleep = randint(SLEEP_MIN_INTERVAL, SLEEP_MAX_INTERVAL)
-                    extension = '.unavailable'
+                        or 'The page needs to be reloaded' in error_val
+                        or 'offline' in error_val
+                        or 'sslerror' in error_val
+                        or 'ssl:' in error_val
+                        or 'unable to connect to proxy' in error_val):
+                    pass
                 else:
+                    if sleep < FAILURE_SLEEP_INTERVAL_MIN:
+                        sleep = FAILURE_SLEEP_INTERVAL_MIN
+                    else:
+                        sleep *= 2
+                        if sleep > FAILURE_SLEEP_INTERVAL_MAX:
+                            sleep = FAILURE_SLEEP_INTERVAL_MAX
+
+                    extension = '.unavailable'
                     logging.info(f'Failed to scrape video {video_id}: {exc}')
                     try:
                         os.rename(
@@ -447,6 +486,7 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
                     except OSError:
                         pass
 
+                logging.info(f'Sleeping for {sleep} seconds before continuing')
                 await asyncio.sleep(sleep)
                 continue
 
@@ -461,12 +501,16 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
             ):
                 files_uploaded += 1
                 await video.to_file(
-                    settings.video_data_directory + UPLOADED_DIRNAME,
+                    os.path.join(
+                        settings.video_data_directory, UPLOADED_DIRNAME
+                    ),
                     VIDEO_YTDLP_PREFIX
                 )
                 os.remove(
-                    settings.video_data_directory + '/' + VIDEO_YTDLP_PREFIX +
-                    video_id + FILE_EXTENSION
+                    os.path.join(
+                        settings.video_data_directory,
+                        f'{VIDEO_YTDLP_PREFIX}{video_id}{FILE_EXTENSION}'
+                    )
                 )
                 logging.info(f'Uploaded video {video.video_id}')
         except OSError:
