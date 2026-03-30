@@ -357,7 +357,7 @@ async def worker(proxy: str, queue: Queue, settings: Settings, instance: int
     )
 
     logging.debug(f'{instance}: Worker started with proxy: {proxy}')
-    sleep: int | None = None
+    sleep: int = SLEEP_MIN_INTERVAL
     files_scraped: int = 0
     files_uploaded: int = 0
     while True:
@@ -449,6 +449,8 @@ async def worker(proxy: str, queue: Queue, settings: Settings, instance: int
         except Exception as exc:
             logging.info(f'Failed to upload video {video_id}: {exc}')
 
+        logging.info(f'{instance}: sleeping for {sleep} seconds')
+        await asyncio.sleep(sleep)
         logging.info(
             f'{instance}: Files scraped: {files_scraped}, '
             f'files uploaded: {files_uploaded}'
