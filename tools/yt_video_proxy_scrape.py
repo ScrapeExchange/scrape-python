@@ -549,6 +549,7 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
             debug=settings.log_level == 'DEBUG',
             proxies=[proxy]
         )
+        sleep: int = randint(SLEEP_MIN_INTERVAL, SLEEP_MAX_INTERVAL)
     except Exception as exc:
         error_val: str = str(exc).lower()
         if ('rate-limited by youtube' in error_val
@@ -573,6 +574,7 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
                 or "available to this channel's members on level" in error_val
                 or "members-only content" in error_val):
             extension = '.unavailable'
+            sleep: int = randint(SLEEP_MIN_INTERVAL, SLEEP_MAX_INTERVAL)
             logging.info(f'Video {video_id} not available for scraping: {exc}')
             try:
                 os.rename(
@@ -590,6 +592,8 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
                 or 'ssl:' in error_val
                 or 'unable to connect to proxy' in error_val):
             logging.info(f'Transient failure during scraping: {exc}')
+            # We keep sleep to the same value here as this issue is caused by
+            # a proxy failure, not because of YouTube rate limiting.
 
     if sleep > SLEEP_MAX_INTERVAL:
         if sleep < FAILURE_SLEEP_INTERVAL_MIN:
@@ -600,7 +604,6 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
                 sleep = FAILURE_SLEEP_INTERVAL_MAX
 
     return video, sleep
-
 
 
 async def upload_video(
