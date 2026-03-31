@@ -382,8 +382,9 @@ async def worker(proxy: str, queue: Queue, settings: Settings, instance: int
         async with aiofiles.open(settings.status_file, 'a') as f:
             await f.write(
                 f'{int(time.monotonic() - START_TIME)}: {instance}: '
-                f'{proxy_count}, scraped: {files_scraped}, '
-                f'uploaded: {files_uploaded}\n'
+                f'{proxy_count}, '
+                f'scraped: {files_scraped}, uploaded: {files_uploaded}, '
+                f'min {settings.min_sleep}, max {settings.max_sleep}\n'
             )
         entry: str = await queue.get()
 
