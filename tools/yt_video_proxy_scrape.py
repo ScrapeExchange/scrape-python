@@ -22,6 +22,7 @@ from asyncio import Task, Queue
 from pathlib import Path
 from random import randint, shuffle
 
+import aiofiles
 import brotli
 
 from httpx import Response
@@ -45,6 +46,8 @@ FAILURE_SLEEP_INTERVAL_MIN: int = 300
 FAILURE_SLEEP_INTERVAL_MAX: int = 3600
 
 FILE_EXTENSION: str = '.json.br'
+
+START_TIME: float = time.monotonic()
 
 
 class Settings(BaseSettings):
@@ -147,6 +150,11 @@ class Settings(BaseSettings):
         default='/dev/stdout',
         validation_alias=AliasChoices('LOG_FILE', 'log_file'),
         description='Log file path',
+    )
+    status_file: str | None = Field(
+        default='/tmp/proxy_status.log',
+        validation_alias=AliasChoices('STATUS_FILE', 'status_file'),
+        description='File to write status updates to',
     )
 
     @field_validator('log_level', mode='before')
@@ -353,6 +361,7 @@ async def worker(proxy: str, queue: Queue, settings: Settings, instance: int
     :raises: (none)
     '''
 
+    proxy_count: int = len(settings.proxies.split(','))
     browse_client = AsyncYouTubeClient(proxies=[proxy])
     download_client: YoutubeDL = YouTubeVideo._setup_download_client(
         browse_client=browse_client, deno_path=settings.deno_path,
@@ -370,6 +379,12 @@ async def worker(proxy: str, queue: Queue, settings: Settings, instance: int
     files_scraped: int = 0
     files_uploaded: int = 0
     while True:
+        async with aiofiles.open(settings.status_file, 'a') as f:
+            await f.write(
+                f'{int(time.monotonic() - START_TIME)}: {instance}: '
+                f'{proxy_count}, scraped: {files_scraped}, '
+                f'uploaded: {files_uploaded}\n'
+            )
         entry: str = await queue.get()
 
         logging.debug(
