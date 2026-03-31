@@ -406,7 +406,10 @@ async def worker(proxy: str, queue: Queue, settings: Settings, instance: int
                 f'{instance}: Failed to decompress video file {entry}, '
                 f'skipping: {exc}'
             )
-            os.remove(os.path.join(settings.video_data_directory, entry))
+            try:
+                os.remove(os.path.join(settings.video_data_directory, entry))
+            except OSError:
+                pass
             queue.task_done()
             continue
         except Exception as exc:
@@ -415,6 +418,7 @@ async def worker(proxy: str, queue: Queue, settings: Settings, instance: int
             )
             queue.task_done()
             continue
+
         if not video_needs_uploading(settings, video_id):
             logging.debug(
                 f'{instance}:Video {video_id} already uploaded, skipping'
@@ -446,13 +450,16 @@ async def worker(proxy: str, queue: Queue, settings: Settings, instance: int
                     continue
             except Exception as exc:
                 logging.info(f'Failed to scrape video {video_id}: {exc}')
-                os.rename(
-                    os.path.join(settings.video_data_directory, entry),
-                    os.path.join(
-                        settings.video_data_directory,
-                        entry + '.failed'
+                try:
+                    os.rename(
+                        os.path.join(settings.video_data_directory, entry),
+                        os.path.join(
+                            settings.video_data_directory,
+                            entry + '.failed'
+                        )
                     )
-                )
+                except OSError:
+                    pass
                 video = None
                 queue.task_done()
                 continue
