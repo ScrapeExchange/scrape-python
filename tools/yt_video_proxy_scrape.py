@@ -434,8 +434,25 @@ async def worker(proxy: str, queue: Queue, settings: Settings, instance: int
                     browse_client, download_client,
                     settings, proxy, sleep
                 )
+                if not video:
+                    os.rename(
+                        os.path.join(settings.video_data_directory, entry),
+                        os.path.join(
+                            settings.video_data_directory,
+                            entry + '.unavailable'
+                        )
+                    )
+                    queue.task_done()
+                    continue
             except Exception as exc:
                 logging.info(f'Failed to scrape video {video_id}: {exc}')
+                os.rename(
+                    os.path.join(settings.video_data_directory, entry),
+                    os.path.join(
+                        settings.video_data_directory,
+                        entry + '.failed'
+                    )
+                )
                 video = None
                 queue.task_done()
                 continue
