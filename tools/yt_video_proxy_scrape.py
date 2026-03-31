@@ -128,7 +128,16 @@ class Settings(BaseSettings):
         default=None,
         description='Maximum number of files to process in one run'
     )
-
+    min_sleep: int = Field(
+        default=SLEEP_MIN_INTERVAL,
+        validation_alias=AliasChoices('MIN_SLEEP', 'min_sleep'),
+        description='Minimum number of seconds to sleep between scrapes'
+    )
+    max_sleep: int = Field(
+        default=SLEEP_MAX_INTERVAL,
+        validation_alias=AliasChoices('MAX_SLEEP', 'max_sleep'),
+        description='Maximum number of seconds to sleep between scrapes'
+    )
     log_level: str = Field(
         default='INFO',
         validation_alias=AliasChoices('LOG_LEVEL', 'log_level'),
@@ -357,7 +366,7 @@ async def worker(proxy: str, queue: Queue, settings: Settings, instance: int
     )
 
     logging.debug(f'{instance}: Worker started with proxy: {proxy}')
-    sleep: int = SLEEP_MIN_INTERVAL
+    sleep: int = settings.min_sleep
     files_scraped: int = 0
     files_uploaded: int = 0
     while True:
@@ -450,6 +459,8 @@ async def worker(proxy: str, queue: Queue, settings: Settings, instance: int
             logging.info(f'Failed to upload video {video_id}: {exc}')
 
         logging.info(f'{instance}: sleeping for {sleep} seconds')
+        if sleep <= settings.max_sleep:
+            sleep = randint(settings.min_sleep, settings.max_sleep)
         await asyncio.sleep(sleep)
         logging.info(
             f'{instance}: {proxy} files scraped: {files_scraped}, '
@@ -482,7 +493,7 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
     is called.
     '''
 
-    if not sleep:
+    if sleep is None:
         sleep: int = randint(SLEEP_MIN_INTERVAL, SLEEP_MAX_INTERVAL)
 
     video: YouTubeVideo | None = None
