@@ -388,6 +388,7 @@ async def worker(proxy: str, queue: Queue, settings: Settings, instance: int
             video_id = entry[len(VIDEO_YTDLP_PREFIX):-len(FILE_EXTENSION)]
             video_needs_scraping = False
         else:
+            queue.task_done()
             continue
 
         try:
@@ -398,6 +399,7 @@ async def worker(proxy: str, queue: Queue, settings: Settings, instance: int
             logging.warning(
                 f'Video file {entry} not found, skipping'
             )
+            queue.task_done()
             continue
         except brotli.error as exc:
             logging.warning(
@@ -405,8 +407,14 @@ async def worker(proxy: str, queue: Queue, settings: Settings, instance: int
                 f'skipping: {exc}'
             )
             os.remove(os.path.join(settings.video_data_directory, entry))
+            queue.task_done()
             continue
-
+        except Exception as exc:
+            logging.warning(
+                f'{instance}: Failed to read video file {entry}, skipping: {exc}'
+            )
+            queue.task_done()
+            continue
         if not video_needs_uploading(settings, video_id):
             logging.debug(
                 f'{instance}:Video {video_id} already uploaded, skipping'
@@ -415,48 +423,58 @@ async def worker(proxy: str, queue: Queue, settings: Settings, instance: int
                 os.remove(os.path.join(settings.video_data_directory, entry))
             except OSError:
                 pass
+
+            queue.task_done()
             continue
 
         if video_needs_scraping:
-            video, sleep = await _scrape(
-                entry, video_id, video.channel_name,
-                browse_client, download_client,
-                settings, proxy, sleep
-            )
+            try:
+                video, sleep = await _scrape(
+                    entry, video_id, video.channel_name,
+                    browse_client, download_client,
+                    settings, proxy, sleep
+                )
+            except Exception as exc:
+                logging.info(f'Failed to scrape video {video_id}: {exc}')
+                video = None
+                queue.task_done()
+                continue
 
             files_scraped += 1
-            try:
-                await video.to_file(
-                    settings.video_data_directory, VIDEO_YTDLP_PREFIX
-                )
-                os.remove(
-                    os.path.join(settings.video_data_directory, entry)
+            if video is not None:
+                try:
+                    await video.to_file(
+                        settings.video_data_directory, VIDEO_YTDLP_PREFIX
                     )
+                    os.remove(
+                        os.path.join(settings.video_data_directory, entry)
+                    )
+                except OSError:
+                    pass
+
+        if video is not None:
+            try:
+                if await upload_video(
+                    exchange_client, settings, video.channel_name, video
+                ):
+                    files_uploaded += 1
+                    await video.to_file(
+                        os.path.join(
+                            settings.video_data_directory, UPLOADED_DIRNAME
+                        ),
+                        VIDEO_YTDLP_PREFIX
+                    )
+                    os.remove(
+                        os.path.join(
+                            settings.video_data_directory,
+                            f'{VIDEO_YTDLP_PREFIX}{video_id}{FILE_EXTENSION}'
+                        )
+                    )
+                    logging.info(f'Uploaded video {video.video_id}')
             except OSError:
                 pass
-
-        try:
-            if await upload_video(
-                exchange_client, settings, video.channel_name, video
-            ):
-                files_uploaded += 1
-                await video.to_file(
-                    os.path.join(
-                        settings.video_data_directory, UPLOADED_DIRNAME
-                    ),
-                    VIDEO_YTDLP_PREFIX
-                )
-                os.remove(
-                    os.path.join(
-                        settings.video_data_directory,
-                        f'{VIDEO_YTDLP_PREFIX}{video_id}{FILE_EXTENSION}'
-                    )
-                )
-                logging.info(f'Uploaded video {video.video_id}')
-        except OSError:
-            pass
-        except Exception as exc:
-            logging.info(f'Failed to upload video {video_id}: {exc}')
+            except Exception as exc:
+                logging.info(f'Failed to upload video {video_id}: {exc}')
 
         logging.info(f'{instance}: sleeping for {sleep} seconds')
         if sleep <= settings.max_sleep:
