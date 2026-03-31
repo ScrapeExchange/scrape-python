@@ -21,6 +21,7 @@ from datetime import timezone
 import aiofiles
 from dateutil import parser as dateutil_parser
 
+import asyncio
 from asyncio import sleep
 
 import orjson
@@ -936,10 +937,13 @@ class YouTubeVideo:
 
         try:
             _LOGGER.debug(f'Scraping YouTube video: {self.video_id}')
-            video_info: dict[str, any] = \
-                self.download_client.extract_info(
+            loop = asyncio.get_event_loop()
+            video_info: dict[str, any] = await loop.run_in_executor(
+                None,
+                lambda: self.download_client.extract_info(
                     self.url, download=False
                 )
+            )
             if video_info:
                 _LOGGER.debug(f'Collected info for video: {self.video_id}')
             else:
