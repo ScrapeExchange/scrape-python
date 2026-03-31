@@ -446,6 +446,8 @@ async def worker(proxy: str, queue: Queue, settings: Settings, instance: int
                             entry + '.unavailable'
                         )
                     )
+                    logging.info(f'{instance}: sleeping for {sleep} seconds')
+                    await asyncio.sleep(sleep)
                     queue.task_done()
                     continue
             except Exception as exc:
@@ -460,6 +462,8 @@ async def worker(proxy: str, queue: Queue, settings: Settings, instance: int
                     )
                 except OSError:
                     pass
+                logging.info(f'{instance}: sleeping for {sleep} seconds')
+                await asyncio.sleep(sleep)
                 video = None
                 queue.task_done()
                 continue
@@ -554,6 +558,7 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
         error_val: str = str(exc).lower()
         if ('rate-limited by youtube' in error_val
                 or 'VPN/Proxy Detected' in error_val
+                or 'YouTube blocked' in error_val
                 or 'captcha' in error_val
                 or 'try again later' in error_val
                 or 'the page needs to be reloaded' in error_val
@@ -594,6 +599,9 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
             logging.info(f'Transient failure during scraping: {exc}')
             # We keep sleep to the same value here as this issue is caused by
             # a proxy failure, not because of YouTube rate limiting.
+        else:
+            logging.info(f'Failed to scrape video {video_id}: {exc}')
+            sleep = max(sleep, FAILURE_SLEEP_INTERVAL_MIN)
 
     if sleep > SLEEP_MAX_INTERVAL:
         if sleep < FAILURE_SLEEP_INTERVAL_MIN:
