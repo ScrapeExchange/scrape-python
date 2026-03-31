@@ -37,8 +37,8 @@ from scrape_exchange.youtube.youtube_video import DENO_PATH, PO_TOKEN_URL
 VIDEO_MIN_PREFIX = 'video-min-'
 VIDEO_YTDLP_PREFIX = 'video-dlp-'
 UPLOADED_DIRNAME: str = 'uploaded'
-SLEEP_MIN_INTERVAL: int = 12
-SLEEP_MAX_INTERVAL: int = 18
+SLEEP_MIN_INTERVAL: int = 6
+SLEEP_MAX_INTERVAL: int = 10
 FAILURE_SLEEP_INTERVAL_MIN: int = 300
 FAILURE_SLEEP_INTERVAL_MAX: int = 3600
 
@@ -137,7 +137,16 @@ class Settings(BaseSettings):
         default=None,
         description='Maximum number of files to process in one run'
     )
-
+    min_sleep: int = Field(
+        default=SLEEP_MIN_INTERVAL,
+        validation_alias=AliasChoices('MIN_SLEEP', 'min_sleep'),
+        description='Minimum number of seconds to sleep between scrapes'
+    )
+    max_sleep: int = Field(
+        default=SLEEP_MAX_INTERVAL,
+        validation_alias=AliasChoices('MAX_SLEEP', 'max_sleep'),
+        description='Maximum number of seconds to sleep between scrapes'
+    )
     log_level: str = Field(
         default='INFO',
         validation_alias=AliasChoices('LOG_LEVEL', 'log_level'),
@@ -503,7 +512,7 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
     '''
 
     if not sleep:
-        sleep: int = randint(SLEEP_MIN_INTERVAL, SLEEP_MAX_INTERVAL)
+        sleep: int = randint(settings.min_sleep, settings.max_sleep)
 
     video: YouTubeVideo | None = None
     try:
