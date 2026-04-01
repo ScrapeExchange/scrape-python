@@ -471,7 +471,7 @@ async def process_channel(
                 overwrite=True
             )
             logging.debug(
-                f'Stored the file in {filename}'
+                f'Stored the file in {filename} -'
                 f'[{channel_name}] {video.video_id} ({video.title!r}): '
                 f'not yet on scrape.exchange, uploading'
             )
