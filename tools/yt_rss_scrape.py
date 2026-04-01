@@ -78,7 +78,7 @@ RSS_FEED_NOT_FOUND: dict[str, int] = {}
 CHANNEL_LAST_CHECKED: dict[str, float] = {}
 
 CHANNEL_CHECKS: dict[str, int] = {}
-
+CHANNEL_VIDEOS: dict[str, int] = {}
 
 class Settings(BaseSettings):
     '''
@@ -353,6 +353,11 @@ async def upload_video(
         return False
 
     if response.status_code == 201:
+        CHANNEL_VIDEOS[channel_name] = CHANNEL_VIDEOS.get(channel_name, 0) + 1
+        logging.debug(
+            f'Videos uploaded for channel {channel_name!r}: '
+            f'{CHANNEL_VIDEOS[channel_name]}'
+        )
         return True
 
     logging.warning(
