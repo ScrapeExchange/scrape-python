@@ -529,6 +529,7 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
         error_val: str = str(exc).lower()
         if ('rate-limited by youtube' in error_val
                 or 'VPN/Proxy Detected' in error_val
+                or 'YouTube blocked' in error_val
                 or 'captcha' in error_val
                 or 'try again later' in error_val
                 or 'the page needs to be reloaded' in error_val
@@ -540,7 +541,11 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
                 or 'this live event will begin in' in error_val
                 or 'this live event has ended' in error_val
                 or 'live stream recording is not available' in error_val
+                or 'Premieres' in error_val
                 or 'video unavailable' in error_val
+                or 'copyright' in error_val
+                or 'Offline.' in error_val
+                or 'uploader' in error_val
                 or 'inappropriate' in error_val
                 or 'video is not available' in error_val
                 or 'this video is private' in error_val
@@ -566,6 +571,9 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
                 or 'ssl:' in error_val
                 or 'unable to connect to proxy' in error_val):
             logging.info(f'Transient failure during scraping: {exc}')
+        else:
+            logging.info(f'Failed to scrape video {video_id}: {exc}')
+            sleep = max(sleep, FAILURE_SLEEP_INTERVAL_MIN)
 
     if sleep > SLEEP_MAX_INTERVAL:
         if sleep < FAILURE_SLEEP_INTERVAL_MIN:
