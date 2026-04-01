@@ -13,7 +13,6 @@ to Scrape Exchange and moves the file to an "uploaded" sub-directory.
 '''
 
 import os
-import random
 import asyncio
 import logging
 
@@ -39,7 +38,7 @@ VIDEO_YTDLP_PREFIX = 'video-dlp-'
 UPLOADED_DIRNAME: str = 'uploaded'
 SLEEP_MIN_INTERVAL: int = 6
 SLEEP_MAX_INTERVAL: int = 10
-FAILURE_SLEEP_INTERVAL_MIN: int = 300
+FAILURE_SLEEP_INTERVAL_MIN: int = 60
 FAILURE_SLEEP_INTERVAL_MAX: int = 3600
 
 FILE_EXTENSION: str = '.json.br'
