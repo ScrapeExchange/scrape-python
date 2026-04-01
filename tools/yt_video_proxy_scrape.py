@@ -590,6 +590,7 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
                 or 'video unavailable' in error_val
                 or 'copyright' in error_val
                 or 'Offline.' in error_val
+                or 'uploader' in error_val
                 or 'inappropriate' in error_val
                 or 'video is not available' in error_val
                 or 'this video is private' in error_val
