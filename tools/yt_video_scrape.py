@@ -435,29 +435,44 @@ async def scrape_and_upload_videos(settings: Settings) -> None:
             continue
 
         if video_needs_scraping:
-            proxies: list[str] = []
-            if settings.proxies:
-                proxies = settings.proxies.split(',')
-            video = await _scrape(
-                entry, video_id, video.channel_name,
-                browse_client, download_client,
-                settings, proxies, sleep
-            )
-
-            if isinstance(video, int):
-                sleep = video
-                continue
-
-            sleep = None
-            files_scraped += 1
-            await video.to_file(
-                settings.video_data_directory, VIDEO_YTDLP_PREFIX)
             try:
-                os.remove(
-                    os.path.join(settings.video_data_directory, entry)
+                proxies: list[str] = []
+                if settings.proxies:
+                    proxies = settings.proxies.split(',')
+                video = await _scrape(
+                    entry, video_id, video.channel_name,
+                    browse_client, download_client,
+                    settings, proxies, sleep
+                )
+
+                if isinstance(video, int):
+                    sleep = video
+                    continue
+
+                sleep = None
+                files_scraped += 1
+                await video.to_file(
+                    settings.video_data_directory, VIDEO_YTDLP_PREFIX)
+                try:
+                    os.remove(
+                        os.path.join(settings.video_data_directory, entry)
+                        )
+                except OSError:
+                    pass
+            except Exception as exc:
+                logging.info(
+                    f'Failed to scrape video {video_id}, skipping upload: {exc}'
                     )
-            except OSError:
-                pass
+                try:
+                    os.rename(
+                        os.path.join(settings.video_data_directory, entry),
+                        os.path.join(
+                            settings.video_data_directory,
+                            entry + '.failed'
+                        )
+                    )
+                except OSError:
+                    pass
 
         try:
             if not settings.no_upload and await upload_video(
@@ -525,6 +540,7 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
             debug=settings.log_level == 'DEBUG',
             proxies=proxies
         )
+        logging.info(f'Successfully scraped video {video_id}')
     except Exception as exc:
         error_val: str = str(exc).lower()
         if ('rate-limited by youtube' in error_val
