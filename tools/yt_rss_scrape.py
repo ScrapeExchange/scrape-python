@@ -47,8 +47,8 @@ VIDEO_FILENAME_PREFIX: str = 'video-min-'
 CHANNEL_FILENAME_PREFIX: str = 'channel-'
 UPLOADED_DIR: str = '/uploaded'
 
-MIN_CHANNEL_INTERVAL_SECONDS: int = 60 * 240  # 4 hours
-RETRY_INTERVAL_SECONDS: int = 60 * 2          # 2 minutes
+MIN_CHANNEL_INTERVAL_SECONDS: int = 60 * 60 * 1     # 1 hour
+RETRY_INTERVAL_SECONDS: int = 60 * 2                # 2 minutes
 MAX_CONCURRENT_CHANNELS: int = 3
 
 FILE_EXTENSION: str = '.json.br'
@@ -562,11 +562,11 @@ def get_channelmap(channel_data_dir: str) -> dict[str, str]:
     filename: str
     for filename in files:
         if (not filename.startswith(CHANNEL_FILENAME_PREFIX)
-                or not filename.endswith('FILE_EXTENSION')):
+                or not filename.endswith(FILE_EXTENSION)):
             continue
 
         channel_name: str = filename[
-            len(CHANNEL_FILENAME_PREFIX):-1*len('FILE_EXTENSION')
+            len(CHANNEL_FILENAME_PREFIX):-1*len(FILE_EXTENSION)
         ]
 
         file_path: str = os.path.join(channel_data_dir, filename)
