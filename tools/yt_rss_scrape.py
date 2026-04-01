@@ -47,7 +47,7 @@ VIDEO_FILENAME_PREFIX: str = 'video-min-'
 CHANNEL_FILENAME_PREFIX: str = 'channel-'
 UPLOADED_DIR: str = '/uploaded'
 
-MIN_CHANNEL_INTERVAL_SECONDS: int = 60 * 60 * 1     # 1 hour
+MIN_CHANNEL_INTERVAL_SECONDS: int = 60 * 60 * 4     # 1 hour
 RETRY_INTERVAL_SECONDS: int = 60 * 2                # 2 minutes
 MAX_CONCURRENT_CHANNELS: int = 3
 
@@ -621,7 +621,6 @@ def get_queue(settings, channels: dict[str, str] = {}
     :raises: (none)
     '''
     now: float = datetime.now(UTC).timestamp()
-    channels_seen: set[str] = set()
     queue_file: str = settings.queue_file
     temp_queue: list[list[float, str, str]] = []
     try:
@@ -660,7 +659,13 @@ def get_queue(settings, channels: dict[str, str] = {}
     # list. Hopefully orjson keeps the list in the same order as the
     # original tuple, so we can just convert it back.
     queue: list[tuple[float, str, str]] = []
+    seen_names: set[str] = set()
+    seen_ids: set[str] = set()
     for timestamp, name, channel_id in temp_queue:
+        if name.lower() in seen_names or channel_id.lower() in seen_ids:
+            continue
+        seen_names.add(name.lower())
+        seen_ids.add(channel_id.lower())
         queue.append((timestamp, name, channel_id))
 
     channel_name: str
@@ -668,9 +673,11 @@ def get_queue(settings, channels: dict[str, str] = {}
     channel_items: list[tuple[str, str]] = list(channels.items())
     random.shuffle(channel_items)
     for channel_id, channel_name in channel_items:
-        if channel_name not in channels_seen:
+        if (channel_name.lower() not in seen_names
+                and channel_id.lower() not in seen_ids):
             queue.append((now, channel_name, channel_id))
-            channels_seen.add(channel_name)
+            seen_names.add(channel_name.lower())
+            seen_ids.add(channel_id.lower())
 
     heapq.heapify(queue)
 
@@ -706,7 +713,7 @@ def load_queue(filepath: str) -> list[tuple[float, str, str]]:
         _, channel_name, channel_id = entry
         if (channel_name.lower() in seen_names
                 or channel_id.lower() in seen_ids):
-            logging.warning(
+            logging.debug(
                 f'Skipping duplicate queue entry: {channel_name!r} '
                 f'({channel_id})'
             )
@@ -769,7 +776,8 @@ async def worker_loop(
             batch.append(heapq.heappop(queue))
 
         logging.info(
-            'Batch: ' + ', '.join(name for _, name, _ in batch)
+            f'Batch size {len(batch)}: '
+            f'{", ".join(name for _, name, _ in batch)}'
         )
 
         tasks: list[asyncio.Task] = [
