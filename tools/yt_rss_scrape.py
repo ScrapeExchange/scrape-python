@@ -21,6 +21,7 @@ import asyncio
 import logging
 
 from pathlib import Path
+from time import monotonic
 from datetime import UTC, time
 from datetime import datetime
 from datetime import timedelta
@@ -381,7 +382,7 @@ async def process_channel(
     '''
 
     if channel_id in CHANNEL_LAST_CHECKED:
-        elapsed: float = time.monotonic() - CHANNEL_LAST_CHECKED[channel_id]
+        elapsed: float = monotonic() - CHANNEL_LAST_CHECKED[channel_id]
         logging.debug(
             f'Processing channel {channel_name!r} last checked '
             f'{elapsed:.1f}s ago'
@@ -389,7 +390,7 @@ async def process_channel(
     else:
         logging.info(f'First time processing channel {channel_name!r} ({channel_id})')
 
-    CHANNEL_LAST_CHECKED[channel_id] = time.monotonic()
+    CHANNEL_LAST_CHECKED[channel_id] = monotonic()
     CHANNEL_CHECKS[channel_id] = CHANNEL_CHECKS.get(channel_id, 0) + 1
 
     channel = YouTubeChannel(
