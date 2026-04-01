@@ -539,6 +539,7 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
             debug=settings.log_level == 'DEBUG',
             proxies=proxies
         )
+        sleep: int = randint(SLEEP_MIN_INTERVAL, SLEEP_MAX_INTERVAL)
         logging.info(f'Successfully scraped video {video_id}')
     except Exception as exc:
         error_val: str = str(exc).lower()
