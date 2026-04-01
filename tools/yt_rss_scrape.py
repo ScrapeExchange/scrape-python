@@ -162,7 +162,7 @@ class Settings(BaseSettings):
         ),
     )
     with_innertube: bool = Field(
-        default=False,
+        default=True,
         validation_alias=AliasChoices(
             'WITH_INNERTUBE', 'with_innertube'
         ),
