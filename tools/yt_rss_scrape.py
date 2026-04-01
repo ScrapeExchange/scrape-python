@@ -21,7 +21,7 @@ import asyncio
 import logging
 
 from pathlib import Path
-from datetime import UTC
+from datetime import UTC, time
 from datetime import datetime
 from datetime import timedelta
 
@@ -68,6 +68,15 @@ CHANNEL_SCHEMA_ENTITY: str = 'channel'
 
 MIN_SLEEP_SECONDS: float = 0.2
 MAX_SLEEP_SECONDS: float = 0.5
+
+# Track 404s for RSS feeds
+RSS_FEED_FOUND: dict[str, int] = {}
+RSS_FEED_NOT_FOUND: dict[str, int] = {}
+
+# Track interval between RSS feed checks per channel
+CHANNEL_LAST_CHECKED: dict[str, float] = {}
+
+CHANNEL_CHECKS: dict[str, int] = {}
 
 
 class Settings(BaseSettings):
@@ -153,7 +162,7 @@ class Settings(BaseSettings):
         ),
     )
     with_innertube: bool = Field(
-        default=True,
+        default=False,
         validation_alias=AliasChoices(
             'WITH_INNERTUBE', 'with_innertube'
         ),
@@ -342,8 +351,7 @@ async def upload_video(
         logging.info(f'Failed to upload data: {exc}')
         return False
 
-    if response.status_code == 201 or response.status_code == 500:
-        # Status 500 is bug in server when video already exists
+    if response.status_code == 201:
         return True
 
     logging.warning(
@@ -372,7 +380,17 @@ async def process_channel(
     :raises: RuntimeError if one or more videos could not be stored.
     '''
 
-    logging.info(f'Processing channel {channel_name!r} ({channel_id})')
+    if channel_id in CHANNEL_LAST_CHECKED:
+        elapsed: float = time.monotonic() - CHANNEL_LAST_CHECKED[channel_id]
+        logging.debug(
+            f'Processing channel {channel_name!r} last checked '
+            f'{elapsed:.1f}s ago'
+        )
+    else:
+        logging.info(f'First time processing channel {channel_name!r} ({channel_id})')
+
+    CHANNEL_LAST_CHECKED[channel_id] = time.monotonic()
+    CHANNEL_CHECKS[channel_id] = CHANNEL_CHECKS.get(channel_id, 0) + 1
 
     channel = YouTubeChannel(
         name=channel_name, browse_client=yt_client, with_download_client=False
@@ -529,7 +547,7 @@ async def update_channel(client: ExchangeClient, channel: YouTubeChannel
 
 def get_channelmap(channel_data_dir: str) -> dict[str, str]:
     '''
-    Loads the wanted channels from the channel db file
+    Loads the wanted channels from the directory with known channel data files.
 
     :param channel_data_dir: Path to the channel data directory.
     :returns: A dict mapping channel IDs to channel names.
@@ -739,15 +757,26 @@ async def worker_loop(
             result = results[i]
             if (isinstance(result, ValueError)
                     or (isinstance(result, bool) and result is False)):
-                # don't schedule the channel again if the RSS feed got a 404
                 logging.info(
                     f'RSS feed not found for channel {name!r} - {channel_id}'
                 )
+                RSS_FEED_NOT_FOUND[channel_id] = RSS_FEED_NOT_FOUND.get(
+                    channel_id, 0
+                ) + 1
                 # continue
-            if (isinstance(result, BaseException)
+            elif (isinstance(result, BaseException)
                     and not isinstance(result, FileExistsError)):
                 logging.warning(f'Channel {name!r} failed ({result})')
-
+            else:
+                RSS_FEED_FOUND[channel_id] = RSS_FEED_FOUND.get(
+                    channel_id, 0
+                ) + 1
+                found: int = RSS_FEED_FOUND.get(channel_id, 0)
+                not_found: int = RSS_FEED_NOT_FOUND.get(channel_id, 0)
+                logging.info(
+                    f'Channel {name!r} processed successfully ({found} found, '
+                    f'{not_found} not found)'
+                )
             next_check: float = now + settings.min_interval
             heapq.heappush(queue, (next_check, name, channel_id))
 
