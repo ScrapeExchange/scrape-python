@@ -694,11 +694,30 @@ def load_queue(filepath: str) -> list[tuple[float, str, str]]:
         content: bytes = fd.read()
 
         # (next_check_timestamp, channel_name, channel_id)
-        queue: list[list[float, str, str]] = orjson.loads(content)
-        logging.info(
-            f'Loaded queue from file {filepath!r}: '
-            f'{len(queue)} channel(s)'
-        )
+        raw: list[list[float, str, str]] = orjson.loads(content)
+
+    seen_names: set[str] = set()
+    seen_ids: set[str] = set()
+    queue: list[list[float, str, str]] = []
+    _: float
+    channel_name: str
+    channel_id: str
+    for entry in raw:
+        _, channel_name, channel_id = entry
+        if channel_name in seen_names or channel_id in seen_ids:
+            logging.warning(
+                f'Skipping duplicate queue entry: {channel_name!r} '
+                f'({channel_id})'
+            )
+            continue
+        seen_names.add(channel_name)
+        seen_ids.add(channel_id)
+        queue.append(entry)
+
+    logging.info(
+        f'Loaded queue from file {filepath!r}: '
+        f'{len(queue)} channel(s)'
+    )
     return queue
 
 
