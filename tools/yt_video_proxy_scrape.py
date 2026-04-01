@@ -455,13 +455,6 @@ async def worker(proxy: str, queue: Queue, settings: Settings, instance: int
                     settings, proxy, sleep
                 )
                 if not video:
-                    os.rename(
-                        os.path.join(settings.video_data_directory, entry),
-                        os.path.join(
-                            settings.video_data_directory,
-                            entry + '.unavailable'
-                        )
-                    )
                     logging.info(f'{instance}: sleeping for {sleep} seconds')
                     await asyncio.sleep(sleep)
                     queue.task_done()
