@@ -704,14 +704,15 @@ def load_queue(filepath: str) -> list[tuple[float, str, str]]:
     channel_id: str
     for entry in raw:
         _, channel_name, channel_id = entry
-        if channel_name in seen_names or channel_id in seen_ids:
+        if (channel_name.lower() in seen_names
+                or channel_id.lower() in seen_ids):
             logging.warning(
                 f'Skipping duplicate queue entry: {channel_name!r} '
                 f'({channel_id})'
             )
             continue
-        seen_names.add(channel_name)
-        seen_ids.add(channel_id)
+        seen_names.add(channel_name.lower())
+        seen_ids.add(channel_id.lower())
         queue.append(entry)
 
     logging.info(
