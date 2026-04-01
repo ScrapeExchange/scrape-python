@@ -586,7 +586,10 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
                 or 'this live event will begin in' in error_val
                 or 'this live event has ended' in error_val
                 or 'live stream recording is not available' in error_val
+                or 'Premieres' in error_val
                 or 'video unavailable' in error_val
+                or 'copyright' in error_val
+                or 'Offline.' in error_val
                 or 'inappropriate' in error_val
                 or 'video is not available' in error_val
                 or 'this video is private' in error_val
