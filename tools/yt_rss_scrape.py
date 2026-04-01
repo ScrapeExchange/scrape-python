@@ -592,7 +592,7 @@ def read_channel_file(filepath: str) -> dict[str, any]:
     '''
 
     logging.debug(f'Reading channel file {filepath!r}')
-    if filepath.endswith('FILE_EXTENSION'):
+    if filepath.endswith(FILE_EXTENSION):
         with open(filepath, 'rb') as f:
             decompressed_data: bytes = brotli.decompress(f.read())
             return orjson.loads(decompressed_data)
