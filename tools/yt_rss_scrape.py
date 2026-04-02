@@ -22,7 +22,7 @@ import logging
 
 from pathlib import Path
 from time import monotonic
-from datetime import UTC, time
+from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
 
@@ -512,6 +512,8 @@ async def process_channel(
             f'for channel {channel_name!r} could not be processed'
         )
 
+    videos = []
+    channel = None
     return True
 
 
