@@ -13,12 +13,13 @@ to Scrape Exchange and moves the file to an "uploaded" sub-directory.
 '''
 
 import os
-from random import shuffle
 import sys
 import asyncio
 import logging
 
+from random import shuffle
 from pathlib import Path
+
 import orjson
 import brotli
 import aiofiles
@@ -82,6 +83,16 @@ class Settings(BaseSettings):
         default='channels.lst',
         validation_alias=AliasChoices(
             'YOUTUBE_CHANNEL_LIST', 'channel_list'
+        )
+    )
+    existing_channels_list: str = Field(
+        default='existing_channels.csv',
+        validation_alias=AliasChoices(
+            'YOUTUBE_EXISTING_CHANNEL_LIST', 'existing_channels_list'
+        ),
+        description=(
+            'CSV file containing existing channel IDs and names '
+            'to skip scraping (format: channel_id,channel_name).'
         )
     )
     channel_data_directory: str | None = Field(
@@ -153,7 +164,7 @@ async def main() -> None:
         sys.exit(1)
     if not settings.channel_list:
         print(
-            'Error: file containing channels to scrapemust be provided via '
+            'Error: file containing channels to scrape must be provided via '
             '--channel-list or environment variable YOUTUBE_CHANNEL_LIST'
         )
         sys.exit(1)
@@ -230,17 +241,23 @@ async def channel_exists(client: ExchangeClient, channel_name: str) -> bool:
 
 async def scrape_channels(settings: Settings, client: ExchangeClient,
                           yt_client: AsyncYouTubeClient) -> None:
-    channel_names: set[str] = await read_channels(settings.channel_list)
-    channel_names.discard('')  # Remove empty channel names if any
-    logging.debug(
-        f'Read {len(channel_names)} unique channel names from .lst files'
+    existing_channels: dict[str, str] = await read_existing_channels(
+        settings.existing_channels_list
     )
-    name: str
+    new_channels: set[str] = await read_channels(
+        settings.channel_list, existing_channels, yt_client
+    )
+    new_channels.discard('')  # Remove empty channel names if any
+    logging.debug(
+        f'Read {len(new_channels)} unique channel names from .lst files'
+    )
+    channel_name: str
     errors: int = 0
-    channel_list: list[str] = list(channel_names)
+    channel_list: list[str] = list(new_channels)
     shuffle(channel_list)
-    for name in channel_list:
-        channel_name: str = normalize_channel_name(name)
+    for channel_name in channel_list:
+        channel_name: str = normalize_channel_name(channel_name)
+
         failed: bool = await scrape_channel(
             settings, client, channel_name, yt_client
         )
@@ -531,10 +548,52 @@ async def upload_channel(settings: Settings, client: ExchangeClient,
         return False
 
 
-async def read_channels(file_path: str) -> set[str]:
+async def read_existing_channels(file_path: str) -> dict[str, str]:
+    '''
+    Reads existing channel files from the specified directory and extracts
+    channel names.
+
+    :param directory: The directory containing existing channel files.
+    :returns: A dict with existing YouTube channel IDs as keys and names as
+    values  .
+    :raises: (none)
+    '''
+
+    logging.debug(f'Reading existing channel names from: {file_path}')
+
+    channels: dict[str, str] = {}
+    if not os.path.isfile(file_path):
+        logging.debug(f'File {file_path} does not exist, returning empty set')
+        return channels
+
+    line: str
+    async with aiofiles.open(file_path, 'r') as file_desc:
+        async for line in file_desc:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+
+            if ',' in line:
+                channel_id: str
+                channel_name: str
+                channel_id, channel_name = line.split(',', 1)
+                channels[channel_id] = channel_name
+            else:
+                channels[line] = line
+
+    return channels
+
+
+async def read_channels(file_path: str, existing_channels: dict[str, str],
+                        yt_client: AsyncYouTubeClient) -> set[str]:
     '''
     Reads .lst files from the specified directory and extracts YouTube channel
-    names.
+    names. This function accepts:
+    - Lines that start with 'UC' and are 24 characters long, which are treated
+      as channel IDs (these will be resolved to channel names later).
+    - Lines that contain a tab character, where the channel name is expected to
+      be the second word (after the tab).
+    - Lines that start with youtube URL
 
     :param directory: The directory containing .lst files with channel names.
     :returns: A list of YouTube channel names.
@@ -543,12 +602,45 @@ async def read_channels(file_path: str) -> set[str]:
 
     logging.debug(f'Reading channel names from: {file_path}')
 
-    channels: set[str] = set()
+    existing_channel_names: set[str] = set(existing_channels.values())
+    new_channel_names: set[str] = set()
+    channel_name: str
+    line: str
     async with aiofiles.open(file_path, 'r') as file_desc:
         async for line in file_desc:
-            channel_name: str = line.split(' ')[0].strip()
-            channels.add(channel_name)
-    return channels
+            line = line.strip()
+            if not line:
+                continue
+
+            if YouTubeChannel.is_channel_id(line):
+                if line in existing_channels or line in existing_channel_names:
+                    logging.debug(
+                        f'Channel ID {line} already exists as '
+                        f'{existing_channels[line]}, skipping'
+                    )
+                    continue
+                channel_name = await YouTubeChannel.resolve_channel_id(
+                    line, yt_client
+                )
+            elif line.startswith('https://www.youtube.com/@'):
+                channel_name = line[len('https://www.youtube.com/@'):].strip()
+            elif (line.startswith('handle') or line.startswith('custom')
+                    or line.startswith('user')):
+                parts: list[str] = line.split('\\')
+                if len(parts) >= 2:
+                    channel_name = parts[1].strip()
+            elif '\t' in line:
+                channel_name = line.split('\t')[1].strip()
+            else:
+                channel_name = line
+
+            if channel_name not in existing_channel_names:
+                new_channel_names.add(channel_name)
+
+    logging.info(
+        f'Read {len(new_channel_names)} unique channel names from {file_path}'
+    )
+    return new_channel_names
 
 
 if __name__ == '__main__':

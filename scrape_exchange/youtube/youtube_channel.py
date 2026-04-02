@@ -58,8 +58,14 @@ class YouTubeChannel:
     CHANNEL_URL: str = AsyncYouTubeClient.SCRAPE_URL + '/{channel_name}'
     CHANNEL_URL_WITH_AT: str = \
         AsyncYouTubeClient.SCRAPE_URL + '/@{channel_name}'
+    CHANNEL_URL_WITH_ID: str = \
+        AsyncYouTubeClient.SCRAPE_URL + '/channel/{channel_id}'
 
-    CHANNEL_ID_REGEX: re.Pattern[str] = re.compile(r'"externalId":"(.*?)"')
+    CHANNEL_NAME_REGEX: re.Pattern[str] = re.compile(
+        r'"canonicalBaseUrl":"/@([^"]+)"'
+    )
+    CHANNEL_ID_REGEX_SCRAPE: re.Pattern[str] = \
+        re.compile(r'"externalId":"(.*?)"')
     CHANNEL_SCRAPE_REGEX_SHORT: re.Pattern[str] = re.compile(
         r'var ytInitialData = (.*?);'
     )
@@ -69,6 +75,8 @@ class YouTubeChannel:
     RX_SCRAPE_CHANNEL_ID: re.Pattern[str] = re.compile(
         r'"externalId":"(.*?)"'
     )
+    CHANNEL_ID_REGEX_MATCH: re.Pattern[str] = \
+        re.compile(r'^UC[a-zA-Z0-9_-]{22}$')
 
     def __init__(
         self, name: str = None,
@@ -943,6 +951,47 @@ class YouTubeChannel:
 
         return page_links
 
+    @staticmethod
+    def is_channel_id(name: str) -> bool:
+        return bool(YouTubeChannel.CHANNEL_ID_REGEX_MATCH.match(name))
+
+    @staticmethod
+    async def resolve_channel_id(channel_id: str,
+                                 yt_client: AsyncYouTubeClient) -> str | None:
+        '''
+        Resolves a YouTube channel ID to its handle/name by fetching the
+        channel page and extracting the canonicalBaseUrl.
+
+        :param channel_id: YouTube channel ID (e.g. UCxxxxxxxxxxxxxxxxxxxxxx)
+        :param yt_client: AsyncYouTubeClient instance to use for the request
+        :returns: channel handle without leading '@', or None if not resolved
+        '''
+
+        url: str = YouTubeChannel.CHANNEL_URL_WITH_ID.format(
+            channel_id=channel_id
+        )
+        try:
+            page_html: str | None = await yt_client.get(url)
+        except (ValueError, RuntimeError) as exc:
+            _LOGGER.debug(
+                f'Failed to fetch channel page for ID {channel_id}: {exc}'
+            )
+            return None
+
+        if not page_html:
+            return None
+
+        match: re.Match[str] | None = YouTubeChannel.CHANNEL_NAME_REGEX.search(
+            page_html
+        )
+        if match:
+            return match.group(1)
+
+        _LOGGER.debug(
+            f'Could not extract channel handle from page for ID {channel_id}'
+        )
+        return None
+
     async def get_channel_page(self) -> str | None:
         '''
         Gets the videos page HTML content
@@ -953,11 +1002,19 @@ class YouTubeChannel:
         '''
 
         try:
+            if not self.url and self.name:
+                self.url = YouTubeChannel.CHANNEL_URL_WITH_AT.format(
+                    channel_name=self.name.replace(' ', '')
+                )
+            elif not self.name and self.channel_id:
+                self.url = YouTubeChannel.CHANNEL_URL_WITH_ID.format(
+                    channel_id=self.channel_id
+                )
             page_html: str | None = await self.browse_client.get(self.url)
         except ValueError:
             _LOGGER.warning(
-                f'Channel page not found for channel {self.name} '
-                f'at URL {self.url}'
+                'Channel page not found for channel '
+                f'{self.name or self.channel_id} at URL {self.url}'
             )
             raise
 
@@ -1098,7 +1155,7 @@ class YouTubeChannel:
             return
 
         match: re.Match[str] | None = \
-            YouTubeChannel.CHANNEL_ID_REGEX.search(page_data)
+            YouTubeChannel.CHANNEL_ID_REGEX_SCRAPE.search(page_data)
 
         if match is None:
             raise ValueError('Channel ID not found')

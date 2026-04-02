@@ -393,7 +393,9 @@ async def process_channel(
             f'{elapsed:.1f}s ago'
         )
     else:
-        logging.info(f'First time processing channel {channel_name!r} ({channel_id})')
+        logging.info(
+            f'First time processing channel {channel_name!r} ({channel_id})'
+        )
 
     CHANNEL_LAST_CHECKED[channel_id] = monotonic()
     CHANNEL_CHECKS[channel_id] = CHANNEL_CHECKS.get(channel_id, 0) + 1
@@ -769,6 +771,7 @@ async def worker_loop(
             logging.debug(f'Sleeping {sleep_secs:.1f}s until next batch')
             await asyncio.sleep(sleep_secs)
 
+        now: float = datetime.now(UTC).timestamp()
         # Collect up to max_concurrent channels that are ready
         batch: list[tuple[float, str, str]] = []
         while (queue and queue[0][0] <= now
