@@ -102,6 +102,16 @@ class Settings(BaseSettings):
         ),
         description='Directory to save the scraped data',
     )
+    channel_map_file: str = Field(
+        default='channel_map.csv',
+        validation_alias=AliasChoices(
+            'YOUTUBE_CHANNEL_MAP_FILE', 'channel_map_file'
+        ),
+        description=(
+            'CSV file to save mapping of channel IDs to names for channels '
+            'scraped during this run (format: channel_id,channel_name).'
+        )
+    )
     api_key_id: str | None = Field(
         default=None,
         validation_alias=AliasChoices('API_KEY_ID', 'api_key_id'),
@@ -243,7 +253,8 @@ async def scrape_channels(settings: Settings, client: ExchangeClient,
                           yt_client: AsyncYouTubeClient) -> None:
 
     new_channels: set[str] = await read_channels(
-        settings.channel_list, settings.existing_channels_list, yt_client
+        settings.channel_list, settings.existing_channels_list,
+        settings.channel_map_file, yt_client
     )
     new_channels.discard('')  # Remove empty channel names if any
     logging.debug(
@@ -583,6 +594,7 @@ async def read_existing_channels(file_path: str) -> dict[str, str]:
 
 
 async def read_channels(file_path: str, existing_channel_file: str,
+                        channel_map_file: str,
                         yt_client: AsyncYouTubeClient) -> set[str]:
     '''
     Reads .lst files from the specified directory and extracts YouTube channel
@@ -603,6 +615,9 @@ async def read_channels(file_path: str, existing_channel_file: str,
     existing_channels: dict[str, str] = await read_existing_channels(
         existing_channel_file
     )
+    channel_map: dict[str, str] = await read_existing_channels(
+        channel_map_file
+    )
     existing_channel_names: set[str] = set(existing_channels.values())
     new_channel_names: set[str] = set()
     channel_name: str
@@ -620,16 +635,23 @@ async def read_channels(file_path: str, existing_channel_file: str,
                         f'{existing_channels[line]}, skipping'
                     )
                     continue
-                try:
-                    channel_name = await YouTubeChannel.resolve_channel_id(
-                        line, yt_client
-                    )
-                    async with aiofiles.open(
-                            existing_channel_file, 'a') as file_desc_append:
-                        await file_desc_append.write(f'{line},{channel_name}\n')
-                except Exception as e:
-                    logging.error(f'Failed to resolve channel ID {line}: {e}')
-                    continue
+                if line in channel_map:
+                    channel_name = channel_map[line]
+                else:
+                    try:
+                        channel_name = await YouTubeChannel.resolve_channel_id(
+                            line, yt_client
+                        )
+                        async with aiofiles.open(
+                                channel_map_file, 'a') as file_desc_append:
+                            await file_desc_append.write(
+                                f'{line},{channel_name}\n'
+                            )
+                    except Exception as e:
+                        logging.debug(
+                            f'Failed to resolve channel ID {line}: {e}'
+                        )
+                        continue
             elif line.startswith('https://www.youtube.com/@'):
                 channel_name = line[len('https://www.youtube.com/@'):].strip()
             elif (line.startswith('handle') or line.startswith('custom')
