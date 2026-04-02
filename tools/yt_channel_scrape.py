@@ -17,7 +17,7 @@ import sys
 import asyncio
 import logging
 
-from random import random, shuffle, choice
+from random import shuffle, choice
 from pathlib import Path
 
 import orjson
@@ -292,7 +292,7 @@ async def scrape_channels(settings: Settings, client: ExchangeClient,
     async def worker(name: str) -> bool:
         channel_name: str = normalize_channel_name(name)
         async with semaphore:
-            yt_client: AsyncYouTubeClient = random.choice(yt_clients)
+            yt_client: AsyncYouTubeClient = choice(yt_clients)
             return await scrape_channel(
                 settings, client, channel_name, yt_client
             )
