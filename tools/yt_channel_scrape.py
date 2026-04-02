@@ -261,9 +261,10 @@ async def scrape_channels(settings: Settings, client: ExchangeClient,
 
     new_channels: set[str] = await read_channels(
         settings.channel_list, settings.existing_channels_list,
-        settings.channel_map_file, yt_client
+        settings.channel_map_file, yt_client, settings.concurrency
     )
     new_channels.discard('')  # Remove empty channel names if any
+    new_channels.discard(None)
     logging.debug(
         f'Read {len(new_channels)} unique channel names from .lst files'
     )
@@ -280,7 +281,7 @@ async def scrape_channels(settings: Settings, client: ExchangeClient,
             )
 
     tasks: list[asyncio.Task] = [
-        asyncio.create_task(worker(name)) for name in channel_list
+        asyncio.create_task(worker(name)) for name in channel_list if name
     ]
     errors: int = 0
     for coro in asyncio.as_completed(tasks):
@@ -610,7 +611,8 @@ async def read_existing_channels(file_path: str) -> dict[str, str]:
 
 async def read_channels(file_path: str, existing_channel_file: str,
                         channel_map_file: str,
-                        yt_client: AsyncYouTubeClient) -> set[str]:
+                        yt_client: AsyncYouTubeClient,
+                        concurrency: int = 3) -> set[str]:
     '''
     Reads .lst files from the specified directory and extracts YouTube channel
     names. This function accepts:
@@ -621,6 +623,7 @@ async def read_channels(file_path: str, existing_channel_file: str,
     - Lines that start with youtube URL
 
     :param directory: The directory containing .lst files with channel names.
+    :param concurrency: Number of channel ID resolutions to run concurrently.
     :returns: A list of YouTube channel names.
     :raises: (none)
     '''
@@ -635,7 +638,8 @@ async def read_channels(file_path: str, existing_channel_file: str,
     )
     existing_channel_names: set[str] = set(existing_channels.values())
     new_channel_names: set[str] = set()
-    channel_name: str
+    # Channel IDs that need to be resolved to names
+    unresolved_ids: list[str] = []
     line: str
     async with aiofiles.open(file_path, 'r') as file_desc:
         async for line in file_desc:
@@ -643,30 +647,19 @@ async def read_channels(file_path: str, existing_channel_file: str,
             if not line:
                 continue
 
+            channel_name: str | None = None
             if YouTubeChannel.is_channel_id(line):
                 if line in existing_channels or line in existing_channel_names:
                     logging.debug(
                         f'Channel ID {line} already exists as '
-                        f'{existing_channels[line]}, skipping'
+                        f'{existing_channels.get(line, line)}, skipping'
                     )
                     continue
                 if line in channel_map:
                     channel_name = channel_map[line]
                 else:
-                    try:
-                        channel_name = await YouTubeChannel.resolve_channel_id(
-                            line, yt_client
-                        )
-                        async with aiofiles.open(
-                                channel_map_file, 'a') as file_desc_append:
-                            await file_desc_append.write(
-                                f'{line},{channel_name}\n'
-                            )
-                    except Exception as e:
-                        logging.debug(
-                            f'Failed to resolve channel ID {line}: {e}'
-                        )
-                        continue
+                    unresolved_ids.append(line)
+                    continue
             elif line.startswith('https://www.youtube.com/@'):
                 channel_name = line[len('https://www.youtube.com/@'):].strip()
             elif (line.startswith('handle') or line.startswith('custom')
@@ -679,8 +672,36 @@ async def read_channels(file_path: str, existing_channel_file: str,
             else:
                 channel_name = line
 
-            if channel_name not in existing_channel_names:
+            if channel_name and channel_name not in existing_channel_names:
                 new_channel_names.add(channel_name)
+
+    if unresolved_ids:
+        semaphore: asyncio.Semaphore = asyncio.Semaphore(concurrency)
+        map_lock: asyncio.Lock = asyncio.Lock()
+
+        async def resolve(channel_id: str) -> str | None:
+            async with semaphore:
+                try:
+                    name: str = await YouTubeChannel.resolve_channel_id(
+                        channel_id, yt_client
+                    )
+                    async with map_lock:
+                        async with aiofiles.open(
+                                channel_map_file, 'a') as f:
+                            await f.write(f'{channel_id},{name}\n')
+                    return name
+                except Exception as e:
+                    logging.debug(
+                        f'Failed to resolve channel ID {channel_id}: {e}'
+                    )
+                    return None
+
+        results: list[str | None] = await asyncio.gather(
+            *(resolve(cid) for cid in unresolved_ids)
+        )
+        for name in results:
+            if name and name not in existing_channel_names:
+                new_channel_names.add(name)
 
     logging.info(
         f'Read {len(new_channel_names)} unique channel names from {file_path}'
