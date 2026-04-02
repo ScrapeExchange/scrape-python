@@ -619,9 +619,13 @@ async def read_channels(file_path: str, existing_channels: dict[str, str],
                         f'{existing_channels[line]}, skipping'
                     )
                     continue
-                channel_name = await YouTubeChannel.resolve_channel_id(
-                    line, yt_client
-                )
+                try:
+                    channel_name = await YouTubeChannel.resolve_channel_id(
+                        line, yt_client
+                    )
+                except Exception as e:
+                    logging.error(f'Failed to resolve channel ID {line}: {e}')
+                    continue
             elif line.startswith('https://www.youtube.com/@'):
                 channel_name = line[len('https://www.youtube.com/@'):].strip()
             elif (line.startswith('handle') or line.startswith('custom')
