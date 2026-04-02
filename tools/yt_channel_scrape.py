@@ -17,7 +17,7 @@ import sys
 import asyncio
 import logging
 
-from random import shuffle
+from random import random, shuffle, choice
 from pathlib import Path
 
 import orjson
@@ -139,6 +139,15 @@ class Settings(BaseSettings):
         ),
         description='Number of channels to scrape concurrently',
     )
+    proxies: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices('PROXIES', 'proxies'),
+        description=(
+            'Comma-separated list of proxy URLs to use for scraping (e.g. '
+            '"http://proxy1:port,http://proxy2:port"). If not set, no '
+            'proxy will be used.'
+        )
+    )
 
     @field_validator('log_level', mode='before')
     @classmethod
@@ -218,13 +227,20 @@ async def main() -> None:
         exchange_url=settings.exchange_url
     )
 
-    yt_client = AsyncYouTubeClient()
+    yt_clients: list[AsyncYouTubeClient] = []
+    if settings.proxies:
+        for proxy in set(settings.proxies.split(',')):
+            yt_clients.append(
+                AsyncYouTubeClient(proxies=[proxy.strip()], debug=True)
+            )
+    else:
+        yt_clients.append(AsyncYouTubeClient(debug=True))
 
     if not settings.no_upload:
         await upload_channels(settings, client)
 
     if not settings.upload_only:
-        await scrape_channels(settings, client, yt_client)
+        await scrape_channels(settings, client, yt_clients)
 
 
 async def channel_exists(client: ExchangeClient, channel_name: str) -> bool:
@@ -257,11 +273,11 @@ async def channel_exists(client: ExchangeClient, channel_name: str) -> bool:
 
 
 async def scrape_channels(settings: Settings, client: ExchangeClient,
-                          yt_client: AsyncYouTubeClient) -> None:
+                          yt_clients: list[AsyncYouTubeClient]) -> None:
 
     new_channels: set[str] = await read_channels(
         settings.channel_list, settings.existing_channels_list,
-        settings.channel_map_file, yt_client, settings.concurrency
+        settings.channel_map_file, yt_clients, settings.concurrency
     )
     new_channels.discard('')  # Remove empty channel names if any
     new_channels.discard(None)
@@ -276,6 +292,7 @@ async def scrape_channels(settings: Settings, client: ExchangeClient,
     async def worker(name: str) -> bool:
         channel_name: str = normalize_channel_name(name)
         async with semaphore:
+            yt_client: AsyncYouTubeClient = random.choice(yt_clients)
             return await scrape_channel(
                 settings, client, channel_name, yt_client
             )
@@ -611,7 +628,7 @@ async def read_existing_channels(file_path: str) -> dict[str, str]:
 
 async def read_channels(file_path: str, existing_channel_file: str,
                         channel_map_file: str,
-                        yt_client: AsyncYouTubeClient,
+                        yt_clients: list[AsyncYouTubeClient],
                         concurrency: int = 3) -> set[str]:
     '''
     Reads .lst files from the specified directory and extracts YouTube channel
@@ -683,7 +700,7 @@ async def read_channels(file_path: str, existing_channel_file: str,
             async with semaphore:
                 try:
                     name: str = await YouTubeChannel.resolve_channel_id(
-                        channel_id, yt_client
+                        channel_id, choice(yt_clients)
                     )
                     async with map_lock:
                         async with aiofiles.open(
