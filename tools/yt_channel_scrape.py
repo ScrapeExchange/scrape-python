@@ -241,11 +241,9 @@ async def channel_exists(client: ExchangeClient, channel_name: str) -> bool:
 
 async def scrape_channels(settings: Settings, client: ExchangeClient,
                           yt_client: AsyncYouTubeClient) -> None:
-    existing_channels: dict[str, str] = await read_existing_channels(
-        settings.existing_channels_list
-    )
+
     new_channels: set[str] = await read_channels(
-        settings.channel_list, existing_channels, yt_client
+        settings.channel_list, settings.existing_channels_list, yt_client
     )
     new_channels.discard('')  # Remove empty channel names if any
     logging.debug(
@@ -584,8 +582,7 @@ async def read_existing_channels(file_path: str) -> dict[str, str]:
     return channels
 
 
-async def read_channels(file_path: str, existing_channels: dict[str, str],
-                        existing_channel_file: str,
+async def read_channels(file_path: str, existing_channel_file: str,
                         yt_client: AsyncYouTubeClient) -> set[str]:
     '''
     Reads .lst files from the specified directory and extracts YouTube channel
@@ -603,6 +600,9 @@ async def read_channels(file_path: str, existing_channels: dict[str, str],
 
     logging.debug(f'Reading channel names from: {file_path}')
 
+    existing_channels: dict[str, str] = await read_existing_channels(
+        existing_channel_file
+    )
     existing_channel_names: set[str] = set(existing_channels.values())
     new_channel_names: set[str] = set()
     channel_name: str
