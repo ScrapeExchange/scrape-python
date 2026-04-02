@@ -302,7 +302,7 @@ async def scrape_channels(settings: Settings, client: ExchangeClient,
     ]
     errors: int = 0
     for coro in asyncio.as_completed(tasks):
-        if errors > 5:
+        if errors > 10000:
             for task in tasks:
                 task.cancel()
             logging.critical('Too many errors encountered, aborting')
@@ -667,10 +667,6 @@ async def read_channels(file_path: str, existing_channel_file: str,
             channel_name: str | None = None
             if YouTubeChannel.is_channel_id(line):
                 if line in existing_channels or line in existing_channel_names:
-                    logging.debug(
-                        f'Channel ID {line} already exists as '
-                        f'{existing_channels.get(line, line)}, skipping'
-                    )
                     continue
                 if line in channel_map:
                     channel_name = channel_map[line]
