@@ -231,7 +231,7 @@ async def main() -> None:
     if settings.proxies:
         for proxy in set(settings.proxies.split(',')):
             yt_clients.append(
-                AsyncYouTubeClient(proxies=[proxy.strip()], debug=True)
+                AsyncYouTubeClient(proxies=[proxy.strip()])
             )
     else:
         yt_clients.append(AsyncYouTubeClient(debug=True))
