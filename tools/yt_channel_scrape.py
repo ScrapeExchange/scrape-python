@@ -134,7 +134,9 @@ class Settings(BaseSettings):
     )
     concurrency: int = Field(
         default=3,
-        validation_alias=AliasChoices('CONCURRENCY', 'concurrency'),
+        validation_alias=AliasChoices(
+            'MAX_CONCURRENT_CHANNELS', 'max_concurrent_channels'
+        ),
         description='Number of channels to scrape concurrently',
     )
 
