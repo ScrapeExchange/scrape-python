@@ -585,6 +585,7 @@ async def read_existing_channels(file_path: str) -> dict[str, str]:
 
 
 async def read_channels(file_path: str, existing_channels: dict[str, str],
+                        existing_channel_file: str,
                         yt_client: AsyncYouTubeClient) -> set[str]:
     '''
     Reads .lst files from the specified directory and extracts YouTube channel
@@ -623,6 +624,9 @@ async def read_channels(file_path: str, existing_channels: dict[str, str],
                     channel_name = await YouTubeChannel.resolve_channel_id(
                         line, yt_client
                     )
+                    async with aiofiles.open(
+                            existing_channel_file, 'a') as file_desc_append:
+                        await file_desc_append.write(f'{line},{channel_name}\n')
                 except Exception as e:
                     logging.error(f'Failed to resolve channel ID {line}: {e}')
                     continue
