@@ -132,6 +132,11 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices('LOG_FILE', 'log_file'),
         description='Log file path',
     )
+    concurrency: int = Field(
+        default=3,
+        validation_alias=AliasChoices('CONCURRENCY', 'concurrency'),
+        description='Number of channels to scrape concurrently',
+    )
 
     @field_validator('log_level', mode='before')
     @classmethod
@@ -260,23 +265,31 @@ async def scrape_channels(settings: Settings, client: ExchangeClient,
     logging.debug(
         f'Read {len(new_channels)} unique channel names from .lst files'
     )
-    channel_name: str
-    errors: int = 0
     channel_list: list[str] = list(new_channels)
     shuffle(channel_list)
-    for channel_name in channel_list:
-        channel_name: str = normalize_channel_name(channel_name)
 
-        failed: bool = await scrape_channel(
-            settings, client, channel_name, yt_client
-        )
+    semaphore: asyncio.Semaphore = asyncio.Semaphore(settings.concurrency)
+
+    async def worker(name: str) -> bool:
+        channel_name: str = normalize_channel_name(name)
+        async with semaphore:
+            return await scrape_channel(
+                settings, client, channel_name, yt_client
+            )
+
+    tasks: list[asyncio.Task] = [
+        asyncio.create_task(worker(name)) for name in channel_list
+    ]
+    errors: int = 0
+    for coro in asyncio.as_completed(tasks):
+        if errors > 5:
+            for task in tasks:
+                task.cancel()
+            logging.critical('Too many errors encountered, aborting')
+            raise RuntimeError('Too many errors encountered during scraping')
+        failed: bool = await coro
         if failed:
             errors += 1
-            if errors > 5:
-                logging.critical('Too many errors encountered, aborting')
-                raise RuntimeError(
-                    'Too many errors encountered during scraping'
-                )
 
 
 async def upload_channels(settings: Settings, client: ExchangeClient
