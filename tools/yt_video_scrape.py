@@ -549,10 +549,12 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
                 or 'captcha' in error_val
                 or 'try again later' in error_val
                 or 'the page needs to be reloaded' in error_val
-                or 'Missing microformat data' in error_val
                 or '429' in error_val):
             sleep = max(sleep, FAILURE_SLEEP_INTERVAL_MIN)
             logging.info(f'Rate limited during scraping: {exc}')
+        elif 'Missing microformat data' in error_val:
+            sleep = max(sleep, 60)
+            logging.info(str(exc))
         elif ('video available in your country' in error_val
                 or 'this live event will begin in' in error_val
                 or 'this live event has ended' in error_val
