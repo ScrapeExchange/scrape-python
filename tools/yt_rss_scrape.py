@@ -265,6 +265,16 @@ class Settings(BaseSettings):
             f'(default: {MAX_CONCURRENT_CHANNELS})'
         ),
     )
+    proxies: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices('PROXIES', 'proxies'),
+        description=(
+            'Optional proxy URL to use for HTTP requests (e.g. '
+            '"http://user:pass@host:port"). Multiple proxies can be specified '
+            'separated by commas, in which case they will be used in a '
+            'round-robin fashion.'
+        )
+    )
     log_level: str = Field(
         default='INFO',
         description='Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)',
@@ -301,7 +311,8 @@ async def fetch_rss(channel_id: str, channel_name: str,
 
     :param channel_id: The YouTube channel ID.
     :param channel_name: The YouTube channel name.
-    :param no_feeds_file: Path to the file where channels with missing RSS feeds are logged.
+    :param no_feeds_file: Path to the file where channels with missing RSS
+    feeds are logged.
     :returns: A list of YouTubeVideo instances populated from the RSS feed.
     :raises: httpx.HTTPStatusError on non-2xx HTTP responses.
     :raises: httpx.RequestError on network-level failures.
