@@ -33,6 +33,8 @@ import aiofiles
 
 from httpx import Response
 
+from prometheus_client import Counter, Gauge, start_http_server
+
 from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -69,6 +71,61 @@ CHANNEL_SCHEMA_ENTITY: str = 'channel'
 
 MIN_SLEEP_SECONDS: float = 0.2
 MAX_SLEEP_SECONDS: float = 0.5
+
+# Prometheus metrics
+METRIC_CHANNEL_MAP_SIZE = Gauge(
+    'yt_rss_channel_map_size',
+    'Number of channels in the channel map',
+)
+METRIC_QUEUE_SIZE = Gauge(
+    'yt_rss_queue_size',
+    'Number of channels in the processing queue',
+)
+METRIC_VIDEOS_UPLOADED = Counter(
+    'yt_rss_videos_uploaded_total',
+    'Total number of videos successfully uploaded to the data API',
+)
+METRIC_API_CHANNEL_CALLS = Counter(
+    'yt_rss_post_data_api_channel_calls_total',
+    'Number of times the POST data API was called for a channel',
+)
+METRIC_API_VIDEO_CALLS = Counter(
+    'yt_rss_post_data_api_video_calls_total',
+    'Number of times the POST data API was called for a video',
+)
+METRIC_RSS_FAILURES = Counter(
+    'yt_rss_feed_download_failures_total',
+    'Number of times an RSS feed could not be downloaded',
+)
+METRIC_RSS_DOWNLOADED = Counter(
+    'yt_rss_feeds_downloaded_total',
+    'Number of RSS feeds successfully downloaded',
+)
+METRIC_SLEEP_SECONDS = Gauge(
+    'yt_rss_sleep_seconds_before_next_channel',
+    'Seconds the worker will sleep before processing the next channel batch',
+)
+METRIC_CONCURRENCY = Gauge(
+    'yt_rss_concurrency_level',
+    'Number of channels being processed concurrently in the current batch',
+)
+METRIC_CHANNEL_UPDATE_FAILURES = Counter(
+    'yt_rss_channel_update_failures_total',
+    'Number of times a channel update to the data API failed',
+)
+METRIC_VIDEO_UPLOAD_FAILURES = Counter(
+    'yt_rss_video_upload_failures_total',
+    'Number of times a video upload to the data API failed',
+)
+METRIC_INNERTUBE_FAILURES = Counter(
+    'yt_rss_innertube_call_failures_total',
+    'Number of times an Innertube API call failed',
+)
+METRIC_CHANNEL_SECONDS_SINCE_LAST_PROCESSED = Gauge(
+    'yt_rss_channel_seconds_since_last_processed',
+    'Seconds elapsed since the channel was last processed (only set for channels that have been processed before)',
+    ['channel'],
+)
 
 # Track 404s for RSS feeds
 RSS_FEED_FOUND: dict[str, int] = {}
@@ -219,6 +276,12 @@ class Settings(BaseSettings):
         description='Log file path',
     )
 
+    metrics_port: int = Field(
+        default=9800,
+        validation_alias=AliasChoices('METRICS_PORT', 'metrics_port'),
+        description='Port for the Prometheus metrics HTTP server',
+    )
+
     @field_validator('log_level', mode='before')
     @classmethod
     def uppercase_log_level(cls, v: str) -> str:
@@ -251,16 +314,18 @@ async def fetch_rss(channel_id: str, channel_name: str,
         try:
             data: str | None = await yt_client.get(url, timeout=1)
         except ValueError:
+            METRIC_RSS_FAILURES.inc()
             async with aiofiles.open(no_feeds_file, 'a') as fd:
                 await fd.write(f'{channel_id}\t{url}\t{channel_name}\n')
 
-            logging.warning(
+            logging.info(
                 f'RSS feed not found for channel {channel_id}, '
                 f'wrote channel_id to {no_feeds_file}, sleeping 1 second'
             )
             await asyncio.sleep(1)
             raise
         except Exception:
+            METRIC_RSS_FAILURES.inc()
             logging.debug(
                 f'Getting RSS data failed, sleeping {FAILURE_DELAY} seconds'
             )
@@ -270,6 +335,7 @@ async def fetch_rss(channel_id: str, channel_name: str,
         await asyncio.sleep(
             random.uniform(MIN_SLEEP_SECONDS, MAX_SLEEP_SECONDS)
         )
+        METRIC_RSS_DOWNLOADED.inc()
 
     if not data:
         raise RuntimeError(f'No data received from RSS feed {url}')
@@ -334,6 +400,7 @@ async def upload_video(
     '''
 
     try:
+        METRIC_API_VIDEO_CALLS.inc()
         response: Response = await client.post(
             f'{settings.exchange_url}{ExchangeClient.POST_DATA_API}',
             json={
@@ -349,10 +416,12 @@ async def upload_video(
             }
         )
     except Exception as exc:
-        logging.info(f'Failed to upload data: {exc}')
+        METRIC_VIDEO_UPLOAD_FAILURES.inc()
+        logging.info(f'Failed to upload video {video.video_id}: {exc}')
         return False
 
     if response.status_code == 201:
+        METRIC_VIDEOS_UPLOADED.inc()
         CHANNEL_VIDEOS[channel_name] = CHANNEL_VIDEOS.get(channel_name, 0) + 1
         logging.debug(
             f'Videos uploaded for channel {channel_name!r}: '
@@ -360,6 +429,7 @@ async def upload_video(
         )
         return True
 
+    METRIC_VIDEO_UPLOAD_FAILURES.inc()
     logging.warning(
         f'Failed to store video {video.video_id}: '
         f'HTTP {response.status_code} - {response.text}'
@@ -388,7 +458,10 @@ async def process_channel(
 
     if channel_id in CHANNEL_LAST_CHECKED:
         elapsed: float = monotonic() - CHANNEL_LAST_CHECKED[channel_id]
-        logging.debug(
+        METRIC_CHANNEL_SECONDS_SINCE_LAST_PROCESSED.labels(
+            channel=channel_name
+        ).set(elapsed)
+        logging.info(
             f'Processing channel {channel_name!r} last checked '
             f'{elapsed:.1f}s ago'
         )
@@ -418,7 +491,7 @@ async def process_channel(
         await asyncio.sleep(
             random.uniform(MIN_SLEEP_SECONDS, MAX_SLEEP_SECONDS)
         )
-        logging.info(
+        logging.debug(
             f'No videos found in RSS feed for channel {channel_name!r}'
         )
         return True
@@ -448,7 +521,7 @@ async def process_channel(
                 client, settings, video.video_id
             )
             if exists:
-                logging.info(
+                logging.debug(
                     f'[{channel_name}] {video.video_id} ({video.title!r}): '
                     f'already on scrape.exchange'
                 )
@@ -464,6 +537,7 @@ async def process_channel(
                         f'Innertube blocked until {INNERTUBE_BLOCKED_TIMER}'
                     )
         except Exception as exc:
+            METRIC_INNERTUBE_FAILURES.inc()
             INNERTUBE_BLOCKED_TIMER = \
                 datetime.now(UTC) + timedelta(seconds=3600)
             logging.debug(
@@ -523,6 +597,7 @@ async def update_channel(client: ExchangeClient, channel: YouTubeChannel
         await channel.scrape_about_page()
 
         channel_id: str = channel.channel_id
+        METRIC_API_CHANNEL_CALLS.inc()
         response: Response = await client.post(
             f'{client.exchange_url}{ExchangeClient.POST_DATA_API}',
             json={
@@ -545,13 +620,15 @@ async def update_channel(client: ExchangeClient, channel: YouTubeChannel
             }
         )
         if response.status_code == 201:
-            logging.info(f'Channel {channel.name!r} updated successfully')
+            logging.debug(f'Channel {channel.name!r} updated successfully')
         else:
+            METRIC_CHANNEL_UPDATE_FAILURES.inc()
             logging.warning(
                 f'Failed to store channel {channel.name!r}: '
                 f'HTTP {response.status_code} - {response.text}'
             )
     except Exception as exc:
+        METRIC_CHANNEL_UPDATE_FAILURES.inc()
         logging.info(f'Failed to update channel data: {exc}')
 
 
@@ -754,6 +831,8 @@ async def worker_loop(
     queue: list[tuple[float, str, str]] = get_queue(
         settings, channel_map
     )
+    METRIC_CHANNEL_MAP_SIZE.set(len(channel_map))
+    METRIC_QUEUE_SIZE.set(len(queue))
 
     logging.info(
         f'Worker started: {len(queue)} channel(s), '
@@ -770,8 +849,10 @@ async def worker_loop(
         next_time: float = queue[0][0]
         if next_time > now:
             sleep_secs: float = next_time - now
+            METRIC_SLEEP_SECONDS.set(sleep_secs)
             logging.debug(f'Sleeping {sleep_secs:.1f}s until next batch')
             await asyncio.sleep(sleep_secs)
+        METRIC_SLEEP_SECONDS.set(0)
 
         now: float = datetime.now(UTC).timestamp()
         # Collect up to max_concurrent channels that are ready
@@ -780,7 +861,9 @@ async def worker_loop(
                and len(batch) < settings.max_concurrent):
             batch.append(heapq.heappop(queue))
 
-        logging.info(
+        METRIC_QUEUE_SIZE.set(len(queue))
+        METRIC_CONCURRENCY.set(len(batch))
+        logging.debug(
             f'Batch size {len(batch)}: '
             f'{", ".join(name for _, name, _ in batch)}'
         )
@@ -812,12 +895,15 @@ async def worker_loop(
                 ) + 1
                 found: int = RSS_FEED_FOUND.get(channel_id, 0)
                 not_found: int = RSS_FEED_NOT_FOUND.get(channel_id, 0)
-                logging.info(
+                logging.debug(
                     f'Channel {name!r} processed successfully ({found} found, '
                     f'{not_found} not found)'
                 )
             next_check: float = now + settings.min_interval
             heapq.heappush(queue, (next_check, name, channel_id))
+
+        METRIC_QUEUE_SIZE.set(len(queue))
+        METRIC_CONCURRENCY.set(0)
 
         try:
             async with aiofiles.open(settings.queue_file, 'wb') as fd:
@@ -861,6 +947,10 @@ async def main() -> None:
                '%(funcName)s():'
                '%(lineno)d:'
                '%(message)s'
+    )
+    start_http_server(settings.metrics_port)
+    logging.info(
+        f'Prometheus metrics available on port {settings.metrics_port}'
     )
     os.makedirs(settings.channel_data_directory, exist_ok=True)
     os.makedirs(settings.video_data_directory, exist_ok=True)
