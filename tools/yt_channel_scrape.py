@@ -234,7 +234,7 @@ async def main() -> None:
                 AsyncYouTubeClient(proxies=[proxy.strip()])
             )
     else:
-        yt_clients.append(AsyncYouTubeClient(debug=True))
+        yt_clients.append(AsyncYouTubeClient())
 
     if not settings.no_upload:
         await upload_channels(settings, client)
