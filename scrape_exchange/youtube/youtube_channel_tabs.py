@@ -57,7 +57,9 @@ class YouTubeChannelTabs:
 
         self.client_request_count = 0
         if not proxies and not self.proxies:
-            logging.warning('No proxies configured, proceeding without proxies')
+            logging.warning(
+                'No proxies configured, proceeding without proxies'
+            )
 
         return InnerTube(
             'WEB', '2.20230728.00.00', proxies=proxies or self.proxies
