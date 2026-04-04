@@ -345,8 +345,7 @@ async def scrape_channels(settings: Settings, client: ExchangeClient,
         settings.channel_list, settings.existing_channels_list,
         settings.channel_map_file, yt_clients, settings.concurrency
     )
-    new_channels.discard('')  # Remove empty channel names if any
-    new_channels.discard(None)
+
     logging.debug(
         f'Read {len(new_channels)} unique channel names from .lst files'
     )
@@ -795,6 +794,8 @@ async def read_channels(file_path: str, existing_channel_file: str,
     logging.info(
         f'Read {len(new_channel_names)} unique channel names from {file_path}'
     )
+    new_channel_names.discard('')  # Remove empty channel names if any
+    new_channel_names.discard(None)
     return new_channel_names
 
 

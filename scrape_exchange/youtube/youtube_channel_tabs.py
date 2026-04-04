@@ -27,16 +27,23 @@ _LOGGER: Logger = getLogger(__name__)
 
 
 class YouTubeChannelTabs:
-    def __init__(self, channel_id: str) -> None:
+    def __init__(self, channel_id: str, proxies: list[str] | None = None
+                 ) -> None:
         self.channel_id: str = channel_id
-        self.client: InnerTube = self.get_innertube_client()
+        self.proxies: list[str] | None = proxies
+        self.client: InnerTube = self.get_innertube_client(proxies)
         self.client_request_count: int = 0
         self.tabs: list[dict[str, any]] = []
 
-    def get_innertube_client(self) -> InnerTube:
+    def get_innertube_client(self, proxies: list[str] | None = None
+                             ) -> InnerTube:
         '''
         Gets the Innertube client for browsing/scraping data.  The client is
         created lazily on the first call to this method.
+        ---
+        :param proxies: Optional list of proxy URLs to use for the Innertube
+        client.
+        :returns: An instance of the Innertube client.
         '''
 
         _LOGGER.debug('Creating new Innertube client')
@@ -48,16 +55,18 @@ class YouTubeChannelTabs:
             pass
 
         self.client_request_count = 0
-        return InnerTube('WEB', '2.20230728.00.00')
+        return InnerTube(
+            'WEB', '2.20230728.00.00', proxies=proxies or self.proxies
+        )
 
     @staticmethod
     async def scrape_content(
-        channel_id: str
+        channel_id: str, proxies: list[str] | None = None
     ) -> tuple[
         set[str], set[str], set[YouTubePlaylist], set[YouTubeCourse],
         set[YouTubePost], set[YouTubeProduct]
     ]:
-        self = YouTubeChannelTabs(channel_id)
+        self = YouTubeChannelTabs(channel_id, proxies)
         tabs: dict[str, dict[str, any]] = await self.get_page_tabs()
 
         podcast_ids: set[str] = set()

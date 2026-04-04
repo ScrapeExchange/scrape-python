@@ -42,8 +42,7 @@ class AsyncYouTubeClient(AsyncClient):
     SCRAPE_URL: str = 'https://www.youtube.com'
 
     def __init__(self, consent_cookies: dict[str, str] = CONSENT_COOKIES,
-                 proxies: list[str] | str = [],
-                 **kwargs) -> None:
+                 proxies: list[str] | str = [], **kwargs) -> None:
         '''
         Initializes the YouTube client.
 
@@ -51,18 +50,18 @@ class AsyncYouTubeClient(AsyncClient):
         '''
 
         if isinstance(proxies, str):
-            proxies = proxies.split(',') if proxies else []
-    
-        proxy: str = random.choice(proxies) if proxies else None
+            proxies = proxies.split(',') if proxies else None
+
+        self.proxy: str = random.choice(proxies) if proxies else None
         _LOGGER.debug(
-            f'Initializing AsyncYouTubeClient with proxy: {proxy}'
+            f'Initializing AsyncYouTubeClient with proxy: {self.proxy}'
         )
         super().__init__(
             transport=AsyncCurlTransport(
                 impersonate='chrome',
                 default_headers=True,
                 curl_options={CurlOpt.FRESH_CONNECT: True},
-                proxy=proxy,
+                proxy=self.proxy,
             ), **kwargs
         )
 

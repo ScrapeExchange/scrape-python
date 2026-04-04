@@ -107,19 +107,22 @@ def _extract_comment_count(next_data: dict) -> int | None:
 
 
 class InnerTubeVideoParser:
-    def __init__(self, video: YouTubeVideo, innertube: InnerTube | None = None) -> None:
+    def __init__(self, video: YouTubeVideo, innertube: InnerTube | None = None,
+                 proxy: str | None = None) -> None:
         self.video: YouTubeVideo | None = video
 
         self.innertube: InnerTube
         if innertube:
             self.innertube = innertube
         else:
-            self.innertube = InnerTube('WEB')
+            self.innertube = InnerTube(
+                'WEB', proxies=[proxy] if proxy else None
+            )
 
     @staticmethod
-    async def scrape(video: YouTubeVideo, innertube: InnerTube | None = None
-                     ) -> None:
-        self = InnerTubeVideoParser(video, innertube)
+    async def scrape(video: YouTubeVideo, innertube: InnerTube | None = None,
+                     proxy: str | None = None) -> None:
+        self = InnerTubeVideoParser(video, innertube, proxy)
 
         try:
             player_data: dict = self.innertube.player(video.video_id)
@@ -127,7 +130,7 @@ class InnerTubeVideoParser:
             raise RuntimeError(f'Innertube API call failed: {exc}')
 
         video_details: dict = player_data.get('videoDetails', {})
-        streaming_data: dict = player_data.get('streamingData', {})
+        # streaming_data: dict = player_data.get('streamingData', {})
         captions_data: dict = player_data.get('captions', {})
         microformat: dict = player_data.get(
             'microformat', {}

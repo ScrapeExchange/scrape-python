@@ -1043,6 +1043,9 @@ class YouTubeVideo:
 
         return formats
 
-    async def from_innertube(self, innertube: InnerTube | None = None) -> None:
-        await InnerTubeVideoParser.scrape(self, innertube)
+    async def from_innertube(self, innertube: InnerTube | None = None,
+                             ) -> None:
+        await InnerTubeVideoParser.scrape(
+            self, innertube, self.browse_client.proxy
+        )
         self.embed_url = YouTubeVideo.EMBED_URL.format(video_id=self.video_id)

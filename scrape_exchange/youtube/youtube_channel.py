@@ -163,7 +163,7 @@ class YouTubeChannel:
 
         self.videos: set[YouTubeVideo] = set()
 
-    def _create_browse_client(self, proxies: list[str] = []) -> None:
+    def _create_browse_client(self, proxies: list[str] | None = None) -> None:
         '''
         Get the YouTube client for browsing/scraping data. This is separate
         from the download client used for downloading media assets.
@@ -174,6 +174,7 @@ class YouTubeChannel:
         self.browse_client = AsyncYouTubeClient(
             consent_cookies=self.consent_cookies, proxies=proxies,
         )
+        self.proxies: list[str] | None = proxies
         self.browse_request_count: int = 0
 
     def __eq__(self, other: Self) -> bool:
@@ -1032,7 +1033,7 @@ class YouTubeChannel:
 
     async def scrape_channel_content(
         self, save_dir: str, uploaded_dir: str | None = None,
-        max_videos_per_channel: int = 0,
+        max_videos_per_channel: int = 0
     ) -> int:
         '''
         Scrapes video_id's and videos from the YouTube website
@@ -1060,7 +1061,9 @@ class YouTubeChannel:
         try:
             self.video_ids, self.podcast_ids, self.playlists, self.courses, \
                 self.posts, self.products = \
-                await YouTubeChannelTabs.scrape_content(self.channel_id)
+                await YouTubeChannelTabs.scrape_content(
+                    self.channel_id, proxies=self.proxies
+                )
         except Exception as exc:
             raise RuntimeError(
                 f'Failed to scrape channel content: {exc}'
@@ -1107,7 +1110,7 @@ class YouTubeChannel:
 
             try:
                 video: YouTubeVideo | None = await self.scrape_video(
-                    video_id, self.channel_thumbnail
+                    video_id, self.channel_thumbnail, self.proxies
                 )
                 if not video:
                     continue
