@@ -18,6 +18,7 @@ from httpx import ReadTimeout
 from httpx import RequestError
 from httpx import ConnectError
 from httpx import ConnectTimeout
+from httpx import TimeoutException
 
 from httpx_curl_cffi import AsyncCurlTransport, CurlOpt
 
@@ -97,7 +98,7 @@ class AsyncYouTubeClient(AsyncClient):
         try:
             _LOGGER.debug(f'HTTP GET {url}')
             resp: Response = await super().get(url, **kwargs)
-        except (ConnectTimeout, ConnectError, ReadTimeout,
+        except (TimeoutException, ConnectError, ReadTimeout,
                 ConnectionResetError, ConnectionRefusedError) as exc:
             _LOGGER.debug(f'HTTP GET timeout for {url}: {exc}')
             if retries > 0:
