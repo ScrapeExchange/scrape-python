@@ -7,6 +7,7 @@ to keep the source files to a managable length
 :license    : GPLv3
 '''
 
+import logging
 import re
 
 from datetime import datetime
@@ -115,6 +116,10 @@ class InnerTubeVideoParser:
         if innertube:
             self.innertube = innertube
         else:
+            if not proxy:
+                logging.warning(
+                    'No proxies configured, proceeding without proxy'
+                )
             self.innertube = InnerTube(
                 'WEB', proxies=[proxy] if proxy else None
             )

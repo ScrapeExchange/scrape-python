@@ -11,6 +11,7 @@ the video IDs, playlist data, course data, post data, and product data.
 from logging import Logger
 from logging import getLogger
 from datetime import datetime, UTC
+import logging
 
 from innertube import InnerTube
 
@@ -55,6 +56,9 @@ class YouTubeChannelTabs:
             pass
 
         self.client_request_count = 0
+        if not proxies and not self.proxies:
+            logging.warning('No proxies configured, proceeding without proxies')
+
         return InnerTube(
             'WEB', '2.20230728.00.00', proxies=proxies or self.proxies
         )
