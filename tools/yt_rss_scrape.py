@@ -902,7 +902,10 @@ async def worker_loop(
                 # continue
             elif (isinstance(result, BaseException)
                     and not isinstance(result, FileExistsError)):
-                logging.warning(f'Channel {name!r} failed ({result})')
+                logging.warning(
+                    f'Channel {name!r} failed: {type(result).__name__}: '
+                    f'{result}', exc_info=result,
+                )
             else:
                 RSS_FEED_FOUND[channel_id] = RSS_FEED_FOUND.get(
                     channel_id, 0
