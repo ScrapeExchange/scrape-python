@@ -28,15 +28,14 @@ _LOGGER: Logger = getLogger(__name__)
 
 
 class YouTubeChannelTabs:
-    def __init__(self, channel_id: str, proxies: list[str] | None = None
+    def __init__(self, channel_id: str, proxy: str | None = None
                  ) -> None:
         self.channel_id: str = channel_id
-        self.proxies: list[str] | None = proxies
-        self.client: InnerTube = self.get_innertube_client(proxies)
+        self.client: InnerTube = self.get_innertube_client(proxy)
         self.client_request_count: int = 0
         self.tabs: list[dict[str, any]] = []
 
-    def get_innertube_client(self, proxies: list[str] | None = None
+    def get_innertube_client(self, proxy: str | None = None
                              ) -> InnerTube:
         '''
         Gets the Innertube client for browsing/scraping data.  The client is
@@ -56,14 +55,12 @@ class YouTubeChannelTabs:
             pass
 
         self.client_request_count = 0
-        if not proxies and not self.proxies:
+        if not proxy:
             logging.warning(
                 'No proxies configured, proceeding without proxies'
             )
 
-        return InnerTube(
-            'WEB', '2.20230728.00.00', proxies=proxies or self.proxies
-        )
+        return InnerTube('WEB', '2.20230728.00.00', proxies=proxy)
 
     @staticmethod
     async def scrape_content(

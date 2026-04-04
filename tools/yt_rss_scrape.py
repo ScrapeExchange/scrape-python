@@ -490,11 +490,7 @@ async def process_channel(
     channel.channel_id = channel_id
     await update_channel(client, channel)
 
-    proxies: list[str] | None = \
-        settings.proxies.split(',') if settings.proxies else None
-    if not proxies:
-        logging.warning('No proxies configured, proceeding without proxies')
-    innertube: InnerTube = InnerTube('WEB', proxies=proxies)
+    innertube: InnerTube = InnerTube('WEB', proxies=yt_client.proxy)
     videos: list[YouTubeVideo] | None = await fetch_rss(
         channel_id, channel_name, settings.no_feeds_file
     )

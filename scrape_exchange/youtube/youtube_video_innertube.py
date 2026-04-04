@@ -118,11 +118,9 @@ class InnerTubeVideoParser:
         else:
             if not proxy:
                 logging.warning(
-                    'No proxies configured, proceeding without proxy'
+                    'No proxy configured, proceeding without proxy'
                 )
-            self.innertube = InnerTube(
-                'WEB', proxies=[proxy] if proxy else None
-            )
+            self.innertube = InnerTube('WEB', proxies=proxy)
 
     @staticmethod
     async def scrape(video: YouTubeVideo, innertube: InnerTube | None = None,
