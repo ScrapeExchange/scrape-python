@@ -852,7 +852,9 @@ async def worker_loop(
         f'discovered_channels={len(channel_map)}'
     )
 
-    yt_client = AsyncYouTubeClient()
+    yt_client = AsyncYouTubeClient(
+        proxies=settings.proxies.split(',') if settings.proxies else None
+    )
     while True:
         now: float = datetime.now(UTC).timestamp()
 
