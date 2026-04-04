@@ -27,6 +27,8 @@ import aiofiles.os
 
 from httpx import Response
 
+from prometheus_client import Counter, Gauge, start_http_server
+
 from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -149,6 +151,12 @@ class Settings(BaseSettings):
         )
     )
 
+    metrics_port: int = Field(
+        default=9801,
+        validation_alias=AliasChoices('METRICS_PORT', 'metrics_port'),
+        description='Port for the Prometheus metrics HTTP server',
+    )
+
     @field_validator('log_level', mode='before')
     @classmethod
     def uppercase_log_level(cls, v: str) -> str:
@@ -159,6 +167,53 @@ class Settings(BaseSettings):
                 f'log_level must be one of {sorted(valid)}, got {v!r}'
             )
         return upper
+
+
+# Prometheus metrics
+METRIC_CHANNEL_EXISTS_FOUND = Counter(
+    'yt_channel_exists_found_total',
+    'Number of times a channel was found to already exist on Scrape Exchange',
+)
+METRIC_CHANNEL_EXISTS_NOT_FOUND = Counter(
+    'yt_channel_exists_not_found_total',
+    'Number of times a channel was found to not exist on Scrape Exchange',
+)
+METRIC_CHANNEL_EXISTS_FAILURES = Counter(
+    'yt_channel_exists_check_failures_total',
+    'Number of times the channel existence check call failed',
+)
+METRIC_UNIQUE_CHANNELS_READ = Gauge(
+    'yt_channel_unique_channels_read',
+    'Number of unique channel names read from the channel list',
+)
+METRIC_FILES_PENDING_UPLOAD = Gauge(
+    'yt_channel_files_pending_upload',
+    'Number of channel files found that may need to be uploaded',
+)
+METRIC_UPLOADED_FILE_EXISTS = Counter(
+    'yt_channel_uploaded_file_exists_total',
+    'Number of channels skipped because an uploaded file already exists',
+)
+METRIC_CHANNELS_SCRAPED = Counter(
+    'yt_channel_scraped_total',
+    'Number of channels successfully scraped',
+)
+METRIC_SCRAPE_FAILURES = Counter(
+    'yt_channel_scrape_failures_total',
+    'Number of times channel scraping failed',
+)
+METRIC_CHANNEL_IDS_TO_RESOLVE = Gauge(
+    'yt_channel_ids_to_resolve',
+    'Number of channel IDs that needed to be resolved to channel names',
+)
+METRIC_CHANNEL_IDS_RESOLVED = Counter(
+    'yt_channel_ids_resolved_total',
+    'Number of channel IDs successfully resolved to channel names',
+)
+METRIC_CHANNEL_ID_RESOLUTION_FAILURES = Counter(
+    'yt_channel_id_resolution_failures_total',
+    'Number of channel IDs that failed to resolve to channel names',
+)
 
 
 async def main() -> None:
@@ -179,6 +234,10 @@ async def main() -> None:
                '%(funcName)s():'
                '%(lineno)d:'
                '%(message)s'
+    )
+    start_http_server(settings.metrics_port)
+    logging.info(
+        f'Prometheus metrics available on port {settings.metrics_port}'
     )
 
     if not settings.api_key_id or not settings.api_key_secret:
@@ -260,10 +319,17 @@ async def channel_exists(client: ExchangeClient, channel_name: str) -> bool:
 
     if resp.status_code == 200:
         data: dict = resp.json()
-        return data.get('exists', False)
+        exists: bool = data.get('exists', False)
+        if exists:
+            METRIC_CHANNEL_EXISTS_FOUND.inc()
+        else:
+            METRIC_CHANNEL_EXISTS_NOT_FOUND.inc()
+        return exists
     elif resp.status_code == 404:
+        METRIC_CHANNEL_EXISTS_NOT_FOUND.inc()
         return False
     else:
+        METRIC_CHANNEL_EXISTS_FAILURES.inc()
         logging.warning(
             f'Failed to check existence of channel {channel_name}: '
             f'Status code {resp.status_code}, response: {resp.text}'
@@ -321,6 +387,7 @@ async def upload_channels(settings: Settings, client: ExchangeClient
         f for f in os.listdir(settings.channel_data_directory)
         if f.startswith(CHANNEL_FILE_PREFIX)
     ]
+    METRIC_FILES_PENDING_UPLOAD.set(len(files))
     logging.debug(
         f'Found {len(files)} channel files that may need to be uploaded'
     )
@@ -337,6 +404,7 @@ async def upload_channels(settings: Settings, client: ExchangeClient
             channel_name, settings.channel_data_directory
         )
         if await aiofiles.os.path.exists(uploaded_filepath):
+            METRIC_UPLOADED_FILE_EXISTS.inc()
             logging.debug(
                 f'Found existing uploaded file for channel {channel_name}, '
                 'checking timestamps'
@@ -524,8 +592,10 @@ async def scrape_channel(settings: Settings, client: ExchangeClient,
             )
             async with aiofiles.open(saved_filepath, 'wb') as fd:
                 await fd.write(compressed)
+            METRIC_CHANNELS_SCRAPED.inc()
             logging.debug(f'Downloaded channel {channel_name}')
         except RuntimeError as exc:
+            METRIC_SCRAPE_FAILURES.inc()
             logging.warning(
                 f'Failed to scrape channel {channel_name}: {exc}'
             )
@@ -533,6 +603,7 @@ async def scrape_channel(settings: Settings, client: ExchangeClient,
             # keep downloading channels
             return False
         except Exception as exc:
+            METRIC_SCRAPE_FAILURES.inc()
             logging.error(
                 f'Unexpected error while scraping channel {channel_name}: '
                 f'{exc}'
@@ -689,6 +760,7 @@ async def read_channels(file_path: str, existing_channel_file: str,
                 new_channel_names.add(channel_name)
 
     if unresolved_ids:
+        METRIC_CHANNEL_IDS_TO_RESOLVE.set(len(unresolved_ids))
         semaphore: asyncio.Semaphore = asyncio.Semaphore(concurrency)
         map_lock: asyncio.Lock = asyncio.Lock()
 
@@ -702,8 +774,10 @@ async def read_channels(file_path: str, existing_channel_file: str,
                         async with aiofiles.open(
                                 channel_map_file, 'a') as f:
                             await f.write(f'{channel_id},{name}\n')
+                    METRIC_CHANNEL_IDS_RESOLVED.inc()
                     return name
                 except Exception as e:
+                    METRIC_CHANNEL_ID_RESOLUTION_FAILURES.inc()
                     logging.debug(
                         f'Failed to resolve channel ID {channel_id}: {e}'
                     )
@@ -716,6 +790,7 @@ async def read_channels(file_path: str, existing_channel_file: str,
             if name and name not in existing_channel_names:
                 new_channel_names.add(name)
 
+    METRIC_UNIQUE_CHANNELS_READ.set(len(new_channel_names))
     logging.info(
         f'Read {len(new_channel_names)} unique channel names from {file_path}'
     )
