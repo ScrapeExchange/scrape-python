@@ -625,6 +625,7 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
             logging.info(f'Failed to scrape video {video_id}: {exc}')
             sleep = max(sleep, FAILURE_SLEEP_INTERVAL_MIN)
 
+    logging.debug(f'{video_id}: sleep review input sleep={sleep}')
     if sleep > settings.max_sleep:
         if sleep < FAILURE_SLEEP_INTERVAL_MIN:
             sleep = max(sleep, FAILURE_SLEEP_INTERVAL_MIN)
@@ -632,6 +633,7 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
             sleep *= 2
             if sleep > FAILURE_SLEEP_INTERVAL_MAX:
                 sleep = FAILURE_SLEEP_INTERVAL_MAX
+    logging.debug(f'{video_id}: sleep review output sleep={sleep}')
 
     return video, sleep
 
