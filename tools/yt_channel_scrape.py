@@ -777,6 +777,10 @@ async def read_channels(file_path: str, existing_channel_file: str,
                     name: str = await YouTubeChannel.resolve_channel_id(
                         channel_id, choice(yt_clients)
                     )
+                    if not name:
+                        logging.warning(
+                            f'Failed to resolve channel ID {channel_id}'
+                        )
                     async with map_lock:
                         async with aiofiles.open(
                                 channel_map_file, 'a') as f:
