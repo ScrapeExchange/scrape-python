@@ -1,35 +1,34 @@
 #!/usr/bin/env python3
 
 import os
-
+import sys
+DATA_DIR = '../../byoda/data/scraped-channels'
 UNRESOLVED_CHANNEL_ID_FILE = '../../byoda/data/unresolved_channel_ids.txt'
-
-
-unresolved_channel_ids: set[str] = set()
 if os.path.exists(UNRESOLVED_CHANNEL_ID_FILE):
     with open(UNRESOLVED_CHANNEL_ID_FILE, 'r') as file_desc:
-        line: str
         for line in file_desc:
             line = line.strip()
             if line:
-                unresolved_channel_ids.add(line)
+                open(
+                    os.path.join(DATA_DIR, f'channel-{line}.unresolved'), 'w'
+                ).close()
 
-    print(
-        f'Loaded {len(unresolved_channel_ids)} unresolved channel IDs '
-        f'from file {UNRESOLVED_CHANNEL_ID_FILE}.'
-    )
-
+line: str
 with open('/tmp/yt-channel.log', 'r') as file_desc:
-    with open('../../byoda/data/unresolved_channel_ids.txt', 'a') as output_desc:   # noqa: E501
-        for line in file_desc:
-            line = line.strip()
-            if 'Failed to resolve channel ID' in line:
-                channel_id: str = line.split(' ')[-1].strip()
-                if channel_id in unresolved_channel_ids:
-                    continue
-                print('Unresolved channel ID:', channel_id)
-                unresolved_channel_ids.add(channel_id)
-                output_desc.write(f'{channel_id}\n')
+    unresolved_channel_ids: set[str] = set()
+    for line in file_desc:
+        line = line.strip()
+        if 'Failed to resolve channel ID' in line:
+            channel_id: str = line.split(' ')[-1].strip()
+            unresolved_file_path: str = os.path.join(
+                DATA_DIR, f'channel-{channel_id}.unresolved'
+            )
+            if os.path.exists(unresolved_file_path):
+                continue
+            print('New unresolved channel ID:', channel_id)
+            unresolved_channel_ids.add(channel_id)
+            with open(unresolved_file_path, 'w') as unresolved_file:
+                unresolved_file.write(f'{channel_id}\n')
 
 print(f'Found {len(unresolved_channel_ids)} unique unresolved channel IDs.')
 
