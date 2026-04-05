@@ -790,8 +790,8 @@ async def read_channels(file_path: str, existing_channel_file: str,
                         )
                         if os.path.exists(unresolved_file_path):
                             logging.debug(
-                                f'Channel ID {channel_id} previously failed to'
-                                ' resolve, skipping'
+                                'Channel ID previously failed to'
+                                f' resolve, skipping: {channel_id}'
                             )
                         else:
                             logging.warning(
