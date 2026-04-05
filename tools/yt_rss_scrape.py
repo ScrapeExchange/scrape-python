@@ -61,7 +61,7 @@ YOUTUBE_RSS_URL: str = (
     'https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}'
 )
 
-INNERTUBE_BLOCKED_TIMER: datetime = datetime.now(UTC) - timedelta(seconds=60)
+INNERTUBE_BLOCKED_TIMER: datetime = datetime.now(UTC) - timedelta(years=1)
 FAILURE_DELAY: int = 60
 
 CHANNEL_SCHEMA_OWNER: str = 'boinko'
@@ -547,12 +547,17 @@ async def process_channel(
                     logging.info(
                         f'Innertube blocked until {INNERTUBE_BLOCKED_TIMER}'
                     )
-        except Exception as exc:
+        except RuntimeError as exc:
             METRIC_INNERTUBE_FAILURES.inc()
             INNERTUBE_BLOCKED_TIMER = \
                 datetime.now(UTC) + timedelta(seconds=3600)
             logging.debug(
-                'Failed to update video data, will continue with '
+                'Failed to get InnerTube video data, will continue with '
+                f'what we have: {exc}'
+            )
+        except Exception as exc:
+            logging.debug(
+                'Failed to get InnerTube data, will continue with '
                 f'what we have: {exc}'
             )
 
