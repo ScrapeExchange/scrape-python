@@ -781,6 +781,9 @@ async def read_channels(file_path: str, existing_channel_file: str,
                         async with aiofiles.open(
                                 channel_map_file, 'a') as f:
                             await f.write(f'{channel_id},{name}\n')
+                    logging.debug(
+                        f'Resolved channel ID {channel_id} to name {name}'
+                    )
                     METRIC_CHANNEL_IDS_RESOLVED.inc()
                     await asyncio.sleep(random())
                     return name
