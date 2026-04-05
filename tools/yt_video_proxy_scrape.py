@@ -554,7 +554,7 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
     '''
 
     if sleep is None:
-        sleep: int = randint(SLEEP_MIN_INTERVAL, SLEEP_MAX_INTERVAL)
+        sleep: int = randint(settings.min_sleep, settings.max_sleep)
 
     video: YouTubeVideo | None = None
     try:
@@ -567,7 +567,7 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
             debug=settings.log_level == 'DEBUG',
             proxies=[proxy]
         )
-        sleep: int = randint(SLEEP_MIN_INTERVAL, SLEEP_MAX_INTERVAL)
+        sleep: int = randint(settings.min_sleep, settings.max_sleep)
         logging.info(f'Successfully scraped video {video_id}')
     except Exception as exc:
         error_val: str = str(exc).lower()
