@@ -22,7 +22,6 @@ from asyncio import Task, Queue
 from pathlib import Path
 from random import randint, shuffle
 
-import aiofiles
 import brotli
 
 from httpx import Response
@@ -151,11 +150,6 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices('LOG_FILE', 'log_file'),
         description='Log file path',
     )
-    status_file: str | None = Field(
-        default='/tmp/proxy_status.log',
-        validation_alias=AliasChoices('STATUS_FILE', 'status_file'),
-        description='File to write status updates to',
-    )
 
     @field_validator('log_level', mode='before')
     @classmethod
@@ -201,11 +195,10 @@ async def main() -> None:
         exist_ok=True
     )
     logging.info(
-        'Starting YouTube video upload tool with settings: '
+        'Starting YouTube video scrape tool with settings: '
         f'{settings.model_dump_json(indent=2)}'
     )
 
-    logging.info('Starting video scraping process')
     await worker_loop(settings)
 
 
@@ -326,16 +319,15 @@ async def worker_loop(settings: Settings) -> None:
     queue: Queue = await prepare_workload(settings)
 
     tasks: list[Task] = []
-    count: int = 0
     for proxy in proxies:
         task: Task = asyncio.create_task(
-            worker(proxy, queue, settings, count)
+            worker(proxy, queue, settings)
         )
         tasks.append(task)
-        count += 1
-    started_at = time.monotonic()
+
+    started_at: float = time.monotonic()
     await queue.join()
-    total_slept_for = time.monotonic() - started_at
+    total_slept_for: float = time.monotonic() - started_at
 
     for task in tasks:
         task.cancel()
@@ -348,8 +340,7 @@ async def worker_loop(settings: Settings) -> None:
     )
 
 
-async def worker(proxy: str, queue: Queue, settings: Settings, instance: int
-                 ) -> None:
+async def worker(proxy: str, queue: Queue, settings: Settings) -> None:
     '''
     Worker function to process video files from the queue using a specific
     proxy.
@@ -361,7 +352,6 @@ async def worker(proxy: str, queue: Queue, settings: Settings, instance: int
     :raises: (none)
     '''
 
-    proxy_count: int = len(settings.proxies.split(','))
     browse_client = AsyncYouTubeClient(proxies=[proxy])
     download_client: YoutubeDL = YouTubeVideo._setup_download_client(
         browse_client=browse_client, deno_path=settings.deno_path,
@@ -374,23 +364,13 @@ async def worker(proxy: str, queue: Queue, settings: Settings, instance: int
         exchange_url=settings.exchange_url,
     )
 
-    logging.debug(f'{instance}: Worker started with proxy: {proxy}')
     sleep: int = settings.min_sleep
     files_scraped: int = 0
     files_uploaded: int = 0
     while True:
-        async with aiofiles.open(settings.status_file, 'a') as f:
-            await f.write(
-                f'{int(time.monotonic() - START_TIME)}: {instance}: '
-                f'{proxy_count}, '
-                f'scraped: {files_scraped}, uploaded: {files_uploaded}, '
-                f'min {settings.min_sleep}, max {settings.max_sleep}\n'
-            )
         entry: str = await queue.get()
 
-        logging.debug(
-            f'{instance}: Worker with proxy {proxy} processing file: {entry}'
-        )
+        logging.debug(f'Worker with proxy {proxy} processing file: {entry}')
         video_id: str
         video_needs_scraping: bool
         prefix: str
@@ -412,15 +392,12 @@ async def worker(proxy: str, queue: Queue, settings: Settings, instance: int
                 video_id, settings.video_data_directory, prefix
             )
         except FileNotFoundError:
-            logging.warning(
-                f'Video file {entry} not found, skipping'
-            )
+            logging.warning(f'Video file {entry} not found, skipping')
             queue.task_done()
             continue
         except brotli.error as exc:
             logging.warning(
-                f'{instance}: Failed to decompress video file {entry}, '
-                f'skipping: {exc}'
+                f'Failed to decompress video file {entry}, skipping: {exc}'
             )
             try:
                 os.remove(os.path.join(settings.video_data_directory, entry))
@@ -430,16 +407,13 @@ async def worker(proxy: str, queue: Queue, settings: Settings, instance: int
             continue
         except Exception as exc:
             logging.warning(
-                f'{instance}: Failed to read video file {entry}, '
-                f'skipping: {exc}'
+                f'Failed to read video file {entry}, skipping: {exc}'
             )
             queue.task_done()
             continue
 
         if not video_needs_uploading(settings, video_id):
-            logging.debug(
-                f'{instance}:Video {video_id} already uploaded, skipping'
-            )
+            logging.debug(f'Video {video_id} was already uploaded, skipping')
             try:
                 os.remove(os.path.join(settings.video_data_directory, entry))
             except OSError:
@@ -456,9 +430,7 @@ async def worker(proxy: str, queue: Queue, settings: Settings, instance: int
                     settings, proxy, sleep
                 )
                 if not video:
-                    logging.info(
-                        f'{instance}: {video_id} sleeping for {sleep} seconds'
-                    )
+                    logging.debug(f'{video_id} sleeping for {sleep} seconds')
                     await asyncio.sleep(sleep)
                     queue.task_done()
                     continue
@@ -474,9 +446,7 @@ async def worker(proxy: str, queue: Queue, settings: Settings, instance: int
                     )
                 except OSError:
                     pass
-                logging.info(
-                    f'{instance} {video_id}: sleeping for {sleep} seconds'
-                )
+                logging.debug(f'{video_id}: sleeping for {sleep} seconds')
                 await asyncio.sleep(sleep)
                 video = None
                 queue.task_done()
@@ -520,10 +490,10 @@ async def worker(proxy: str, queue: Queue, settings: Settings, instance: int
 
         if sleep <= settings.max_sleep:
             sleep = randint(settings.min_sleep, settings.max_sleep)
-        logging.info(f'{instance} {video_id}: sleeping for {sleep} seconds')
+        logging.debug(f'{video_id}: sleeping for {sleep} seconds')
         await asyncio.sleep(sleep)
-        logging.info(
-            f'{instance}: {proxy} files scraped: {files_scraped}, '
+        logging.debug(
+            f'Worker with proxy {proxy} files scraped: {files_scraped}, '
             f'files uploaded: {files_uploaded}'
         )
         queue.task_done()
@@ -579,10 +549,14 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
                 or 'the page needs to be reloaded' in error_val
                 or '429' in error_val):
             sleep = max(sleep, FAILURE_SLEEP_INTERVAL_MIN)
-            logging.info(f'Rate limited during scraping: {exc}')
+            logging.warning(
+                f'Rate limited during scraping video {video_id}: {exc}'
+            )
         elif 'Missing microformat data' in error_val:
             sleep = max(sleep, 60)
-            logging.info(str(exc))
+            logging.notice(
+                f'Missing microformat data for video {video_id}: {exc}'
+            )
         elif ('video available in your country' in error_val
                 or 'this live event will begin in' in error_val
                 or 'this live event has ended' in error_val
@@ -602,7 +576,7 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
                 or "members-only content" in error_val):
             extension = '.unavailable'
             sleep: int = randint(settings.min_sleep, settings.max_sleep)
-            logging.info(f'Video {video_id} not available for scraping: {exc}')
+            logging.notice(f'Video {video_id} not available for scraping: {exc}')
             try:
                 os.rename(
                     os.path.join(settings.video_data_directory, entry),
@@ -618,14 +592,15 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
                 or 'sslerror' in error_val
                 or 'ssl:' in error_val
                 or 'unable to connect to proxy' in error_val):
-            logging.info(f'Transient failure during scraping: {exc}')
+            logging.info(
+                f'Transient failure during scraping {video_id}: {exc}'
+            )
             # We keep sleep to the same value here as this issue is caused by
             # a proxy failure, not because of YouTube rate limiting.
         else:
             logging.info(f'Failed to scrape video {video_id}: {exc}')
             sleep = max(sleep, FAILURE_SLEEP_INTERVAL_MIN)
 
-    logging.debug(f'{video_id}: sleep review input sleep={sleep}')
     if sleep > settings.max_sleep:
         if sleep < FAILURE_SLEEP_INTERVAL_MIN:
             sleep = max(sleep, FAILURE_SLEEP_INTERVAL_MIN)
@@ -633,7 +608,6 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
             sleep *= 2
             if sleep > FAILURE_SLEEP_INTERVAL_MAX:
                 sleep = FAILURE_SLEEP_INTERVAL_MAX
-    logging.debug(f'{video_id}: sleep review output sleep={sleep}')
 
     return video, sleep
 
@@ -668,11 +642,11 @@ async def upload_video(
             }
         )
     except Exception as exc:
-        logging.info(f'Failed to upload data: {exc}')
+        logging.warning(f'Failed to upload data: {exc}')
         return False
 
     if response.status_code == 201:
-        logging.debug(
+        logging.info(
             f'Video {video.video_id} upload response: '
             f'HTTP {response.status_code}'
         )
