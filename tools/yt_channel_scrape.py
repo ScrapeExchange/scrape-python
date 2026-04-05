@@ -784,6 +784,9 @@ async def read_channels(file_path: str, existing_channel_file: str,
                             f'Failed to resolve channel ID {channel_id}'
                         )
                         await asyncio.sleep(random())
+                        METRIC_CHANNEL_ID_RESOLUTION_FAILURES.inc()
+                        return None
+
                     async with map_lock:
                         async with aiofiles.open(
                                 channel_map_file, 'a') as f:
