@@ -554,7 +554,7 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
             )
         elif 'Missing microformat data' in error_val:
             sleep = max(sleep, 60)
-            logging.notice(
+            logging.info(
                 f'Missing microformat data for video {video_id}: {exc}'
             )
         elif ('video available in your country' in error_val
