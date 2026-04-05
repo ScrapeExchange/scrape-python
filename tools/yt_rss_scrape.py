@@ -124,7 +124,6 @@ METRIC_INNERTUBE_FAILURES = Counter(
 METRIC_CHANNEL_SECONDS_SINCE_LAST_PROCESSED = Gauge(
     'yt_rss_channel_seconds_since_last_processed',
     'Seconds elapsed since the channel was last processed (only set for channels that have been processed before)',     # noqa: E501
-    ['channel'],
 )
 
 # Track 404s for RSS feeds
@@ -469,9 +468,7 @@ async def process_channel(
 
     if channel_id in CHANNEL_LAST_CHECKED:
         elapsed: float = monotonic() - CHANNEL_LAST_CHECKED[channel_id]
-        METRIC_CHANNEL_SECONDS_SINCE_LAST_PROCESSED.labels(
-            channel=channel_name
-        ).set(elapsed)
+        METRIC_CHANNEL_SECONDS_SINCE_LAST_PROCESSED.set(elapsed)
         logging.info(
             f'Processing channel {channel_name!r} last checked '
             f'{elapsed:.1f}s ago'
