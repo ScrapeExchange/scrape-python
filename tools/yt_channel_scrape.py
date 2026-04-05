@@ -17,7 +17,7 @@ import sys
 import asyncio
 import logging
 
-from random import shuffle, choice
+from random import random, shuffle, choice
 from pathlib import Path
 
 import orjson
@@ -294,6 +294,10 @@ async def main() -> None:
             )
     else:
         yt_clients.append(AsyncYouTubeClient())
+        logging.info(
+            'No proxies configured, using direct connection for scraping'
+        )
+        settings.concurrency = 1
 
     if not settings.no_upload:
         await upload_channels(settings, client)
@@ -578,6 +582,7 @@ async def scrape_channel(settings: Settings, client: ExchangeClient,
             await channel.scrape(max_videos_per_channel=0)
             if not channel.video_ids:
                 logging.warning(f'No videos found for channel {channel_name}')
+                await asyncio.sleep(random(1, 5))
                 return False
             data: bytes = orjson.dumps(
                 channel.to_dict(with_video_ids=True),
@@ -600,6 +605,7 @@ async def scrape_channel(settings: Settings, client: ExchangeClient,
             )
             # No need to fail because of network errors, we can just
             # keep downloading channels
+            await asyncio.sleep(random(1, 5))
             return False
         except Exception as exc:
             METRIC_SCRAPE_FAILURES.inc()
@@ -607,6 +613,7 @@ async def scrape_channel(settings: Settings, client: ExchangeClient,
                 f'Unexpected error while scraping channel {channel_name}: '
                 f'{exc}'
             )
+            await asyncio.sleep(random(1, 5))
             return True
 
     if settings.no_upload:
@@ -775,12 +782,14 @@ async def read_channels(file_path: str, existing_channel_file: str,
                                 channel_map_file, 'a') as f:
                             await f.write(f'{channel_id},{name}\n')
                     METRIC_CHANNEL_IDS_RESOLVED.inc()
+                    await asyncio.sleep(random(0.1, 0.5))
                     return name
                 except Exception as e:
                     METRIC_CHANNEL_ID_RESOLUTION_FAILURES.inc()
                     logging.debug(
                         f'Failed to resolve channel ID {channel_id}: {e}'
                     )
+                    await asyncio.sleep(random(1, 5))
                     return None
 
         results: list[str | None] = await asyncio.gather(
