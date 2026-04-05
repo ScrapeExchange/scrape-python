@@ -22,7 +22,8 @@ with open('/tmp/yt-channel.log', 'r') as file_desc:
         line = line.strip()
         if ('Failed to resolve channel ID' in line
                 or 'previously failed to resolve' in line):
-            channel_id: str = line.split(' ')[-1].strip()
+            channel_id: str = os.path.basename(line.split(' ')[-1].strip())
+            channel_id = channel_id.lstrip('channel-').rstrip('.unresolved')
             if channel_id in unresolved_channel_ids:
                 continue
             unresolved_file_path: str = os.path.join(
