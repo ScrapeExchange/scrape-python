@@ -1,17 +1,8 @@
 #!/usr/bin/env python3
 
 import os
-import sys
+
 DATA_DIR = '../../byoda/data/scraped-channels'
-UNRESOLVED_CHANNEL_ID_FILE = '../../byoda/data/unresolved_channel_ids.txt'
-if os.path.exists(UNRESOLVED_CHANNEL_ID_FILE):
-    with open(UNRESOLVED_CHANNEL_ID_FILE, 'r') as file_desc:
-        for line in file_desc:
-            line = line.strip()
-            if line:
-                open(
-                    os.path.join(DATA_DIR, f'channel-{line}.unresolved'), 'w'
-                ).close()
 
 line: str
 with open('/tmp/yt-channel.log', 'r') as file_desc:

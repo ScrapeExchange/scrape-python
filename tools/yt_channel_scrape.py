@@ -792,7 +792,8 @@ async def read_channels(file_path: str, existing_channel_file: str,
                             )
                         else:
                             logging.warning(
-                                f'Failed to resolve channel ID {channel_id}'
+                                f'Failed to resolve channel ID {channel_id}, '
+                                f'touching {unresolved_file_path}'
                             )
                             async with aiofiles.open(unresolved_file_path, 'w'
                                                      ) as f:
