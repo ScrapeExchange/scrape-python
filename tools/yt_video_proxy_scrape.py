@@ -576,7 +576,7 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
                 or "members-only content" in error_val):
             extension = '.unavailable'
             sleep: int = randint(settings.min_sleep, settings.max_sleep)
-            logging.notice(f'Video {video_id} not available for scraping: {exc}')
+            logging.info(f'Video {video_id} not available for scraping: {exc}')
             try:
                 os.rename(
                     os.path.join(settings.video_data_directory, entry),
