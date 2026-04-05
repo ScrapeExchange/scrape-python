@@ -7,8 +7,10 @@ with open('/tmp/yt-channel.log', 'r') as file_desc:
         line = line.strip()
         if 'Failed to resolve channel ID' in line:
             channel_id: str = line.split(' ')[-1].strip()
+            print('Unresolved channel ID:', channel_id)
             channel_ids.add(channel_id)
 
+print(f'Found {len(channel_ids)} unique unresolved channel IDs.')
 
 with open('../../byoda/data/channels.lst', 'r') as file_desc:
     existing_channels: set[str] = set()
