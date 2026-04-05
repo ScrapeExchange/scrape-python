@@ -38,6 +38,8 @@ from scrape_exchange.youtube.youtube_channel import YouTubeChannel
 from scrape_exchange.youtube.youtube_client import AsyncYouTubeClient
 from scrape_exchange.youtube.youtube_video import DENO_PATH, PO_TOKEN_URL
 
+CHANNEL_FILE_POSTFIX = '.json.br'
+
 
 class Settings(BaseSettings):
     '''
@@ -390,6 +392,7 @@ async def upload_channels(settings: Settings, client: ExchangeClient
     files: list[str] = [
         f for f in os.listdir(settings.channel_data_directory)
         if f.startswith(CHANNEL_FILE_PREFIX)
+        and f.endswith(CHANNEL_FILE_POSTFIX)
     ]
     METRIC_FILES_PENDING_UPLOAD.set(len(files))
     logging.info(
@@ -403,7 +406,7 @@ async def upload_channels(settings: Settings, client: ExchangeClient
             )
             continue
         channel_name: str = normalize_channel_name(
-            filename[len(CHANNEL_FILE_PREFIX):-1*len('.json.br')]
+            filename[len(CHANNEL_FILE_PREFIX):-1*len(CHANNEL_FILE_POSTFIX)]
         )
         saved_filepath, uploaded_filepath = get_file_paths(
             channel_name, settings.channel_data_directory
@@ -502,7 +505,7 @@ def get_file_paths(channel_name: str, channel_data_directory: str
 
 
 def get_channel_filename(channel_name: str) -> str:
-    return f'{CHANNEL_FILE_PREFIX}{channel_name}.json.br'
+    return f'{CHANNEL_FILE_PREFIX}{channel_name}{CHANNEL_FILE_POSTFIX}'
 
 
 async def scrape_channel(settings: Settings, client: ExchangeClient,
