@@ -392,7 +392,8 @@ async def upload_channels(settings: Settings, client: ExchangeClient
     ]
     METRIC_FILES_PENDING_UPLOAD.set(len(files))
     logging.info(
-        f'Found {len(files)} channel files that may need to be uploaded'
+        f'Found {len(files)} already scraped channel files that may need to be '
+        'uploaded'
     )
     for filename in files:
         if filename.endswith('failed'):
@@ -783,7 +784,7 @@ async def read_channels(file_path: str, existing_channel_file: str,
                         logging.warning(
                             f'Failed to resolve channel ID {channel_id}'
                         )
-                        await asyncio.sleep(random())
+                        await asyncio.sleep(random() * 5)
                         METRIC_CHANNEL_ID_RESOLUTION_FAILURES.inc()
                         return None
 
@@ -800,7 +801,7 @@ async def read_channels(file_path: str, existing_channel_file: str,
                 except Exception as e:
                     METRIC_CHANNEL_ID_RESOLUTION_FAILURES.inc()
                     logging.debug(
-                        f'Failed to resolve channel ID {channel_id}: {e}'
+                        f'Error while resolving channel ID {channel_id}: {e}'
                     )
                     await asyncio.sleep(random() * 5)
                     return None
