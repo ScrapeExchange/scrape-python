@@ -61,7 +61,7 @@ YOUTUBE_RSS_URL: str = (
     'https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}'
 )
 
-INNERTUBE_BLOCKED_TIMER: datetime = datetime.now(UTC) - timedelta(years=1)
+INNERTUBE_BLOCKED_TIMER: datetime = datetime.now(UTC) - timedelta(days=365)
 FAILURE_DELAY: int = 60
 
 CHANNEL_SCHEMA_OWNER: str = 'boinko'
