@@ -5,7 +5,8 @@ import os
 DATA_DIR = '../../byoda/data/scraped-channels'
 
 unresolved_files: list[str] = [
-    f for f in os.listdir(DATA_DIR) if f.endswith('.unresolved')
+    os.path.basename(f) for f in os.listdir(DATA_DIR)
+    if f.endswith('.unresolved')
 ]
 
 unresolved_channel_ids: set[str] = set()
@@ -17,14 +18,15 @@ print(f'Found {len(unresolved_files)} existing unresolved channel ID files.')
 
 line: str
 with open('/tmp/yt-channel.log', 'r') as file_desc:
-
     for line in file_desc:
         line = line.strip()
         if ('Failed to resolve channel ID' in line
                 or 'previously failed to resolve' in line):
             channel_id: str = line.split(' ')[-1].strip()
+            if channel_id in unresolved_channel_ids:
+                continue
             unresolved_file_path: str = os.path.join(
-                DATA_DIR, f'channel-{channel_id}.unresolved'
+                DATA_DIR, f'channel-{os.path.basename(channel_id)}.unresolved'
             )
             if os.path.exists(unresolved_file_path):
                 continue
