@@ -596,7 +596,7 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
                 or "available to this channel's members on level" in error_val
                 or "members-only content" in error_val):
             extension = '.unavailable'
-            sleep: int = randint(SLEEP_MIN_INTERVAL, SLEEP_MAX_INTERVAL)
+            sleep: int = randint(settings.min_sleep, settings.max_sleep)
             logging.info(f'Video {video_id} not available for scraping: {exc}')
             try:
                 os.rename(
@@ -620,7 +620,7 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
             logging.info(f'Failed to scrape video {video_id}: {exc}')
             sleep = max(sleep, FAILURE_SLEEP_INTERVAL_MIN)
 
-    if sleep > SLEEP_MAX_INTERVAL:
+    if sleep > settings.max_sleep:
         if sleep < FAILURE_SLEEP_INTERVAL_MIN:
             sleep = max(sleep, FAILURE_SLEEP_INTERVAL_MIN)
         else:
