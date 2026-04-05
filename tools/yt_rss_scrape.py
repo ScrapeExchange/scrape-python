@@ -123,7 +123,7 @@ METRIC_INNERTUBE_FAILURES = Counter(
 )
 METRIC_CHANNEL_SECONDS_SINCE_LAST_PROCESSED = Gauge(
     'yt_rss_channel_seconds_since_last_processed',
-    'Seconds elapsed since the channel was last processed (only set for channels that have been processed before)',
+    'Seconds elapsed since the channel was last processed (only set for channels that have been processed before)',     # noqa: E501
     ['channel'],
 )
 
