@@ -8,7 +8,7 @@ unresolved_files: list[str] = [
     f for f in os.listdir(DATA_DIR) if f.endswith('.unresolved')
 ]
 
-unresolved_channel_ids: set[str] = []
+unresolved_channel_ids: set[str] = set()
 for file_name in unresolved_files:
     channel_id: str = file_name[len('channel-'):-len('.unresolved')]
     unresolved_channel_ids.add(channel_id)
