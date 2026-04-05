@@ -26,6 +26,8 @@ import brotli
 
 from httpx import Response
 
+from prometheus_client import Counter, Gauge, start_http_server
+
 from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from yt_dlp.YoutubeDL import YoutubeDL
@@ -47,6 +49,41 @@ FAILURE_SLEEP_INTERVAL_MAX: int = 3600
 FILE_EXTENSION: str = '.json.br'
 
 START_TIME: float = time.monotonic()
+
+# Prometheus metrics
+METRIC_VIDEOS_SCRAPED = Counter(
+    'yt_video_proxy_videos_scraped_total',
+    'Number of videos successfully scraped with yt-dlp',
+)
+METRIC_SCRAPE_FAILURES = Counter(
+    'yt_video_proxy_scrape_failures_total',
+    'Number of times video scraping failed',
+)
+METRIC_RATE_LIMIT_HITS = Counter(
+    'yt_video_proxy_rate_limit_hits_total',
+    'Number of times a proxy was rate-limited by YouTube',
+)
+METRIC_VIDEOS_UPLOADED = Counter(
+    'yt_video_proxy_videos_uploaded_total',
+    'Number of videos successfully uploaded to the data API',
+)
+METRIC_UPLOAD_FAILURES = Counter(
+    'yt_video_proxy_upload_failures_total',
+    'Number of times a video upload to the data API failed',
+)
+METRIC_VIDEOS_ALREADY_UPLOADED = Counter(
+    'yt_video_proxy_videos_already_uploaded_total',
+    'Number of videos skipped because they were already uploaded',
+)
+METRIC_QUEUE_SIZE = Gauge(
+    'yt_video_proxy_queue_size',
+    'Number of video files pending processing in the queue',
+)
+METRIC_SLEEP_SECONDS = Gauge(
+    'yt_video_proxy_sleep_seconds',
+    'Seconds the worker will sleep before processing the next video',
+    ['proxy'],
+)
 
 
 class Settings(BaseSettings):
@@ -140,6 +177,12 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices('MAX_SLEEP', 'max_sleep'),
         description='Maximum number of seconds to sleep between scrapes'
     )
+    metrics_port: int = Field(
+        default=9802,
+        validation_alias=AliasChoices('METRICS_PORT', 'metrics_port'),
+        description='Port for the Prometheus metrics HTTP server',
+    )
+
     log_level: str = Field(
         default='INFO',
         validation_alias=AliasChoices('LOG_LEVEL', 'log_level'),
@@ -189,6 +232,10 @@ async def main() -> None:
                '%(funcName)s():'
                '%(lineno)d:'
                '%(message)s'
+    )
+    start_http_server(settings.metrics_port)
+    logging.info(
+        f'Prometheus metrics available on port {settings.metrics_port}'
     )
     os.makedirs(
         os.path.join(settings.video_data_directory, UPLOADED_DIRNAME),
@@ -300,6 +347,7 @@ async def prepare_workload(settings: Settings) -> Queue:
     for file in files:
         await queue.put(file)
 
+    METRIC_QUEUE_SIZE.set(len(files))
     logging.debug(
         f'Prepared workload with {len(files)} video files to process'
     )
@@ -414,6 +462,7 @@ async def worker(proxy: str, queue: Queue, settings: Settings) -> None:
 
         if not video_needs_uploading(settings, video_id):
             logging.debug(f'Video {video_id} was already uploaded, skipping')
+            METRIC_VIDEOS_ALREADY_UPLOADED.inc()
             try:
                 os.remove(os.path.join(settings.video_data_directory, entry))
             except OSError:
@@ -436,6 +485,7 @@ async def worker(proxy: str, queue: Queue, settings: Settings) -> None:
                     continue
             except Exception as exc:
                 logging.info(f'Failed to scrape video {video_id}: {exc}')
+                METRIC_SCRAPE_FAILURES.inc()
                 try:
                     os.rename(
                         os.path.join(settings.video_data_directory, entry),
@@ -447,12 +497,14 @@ async def worker(proxy: str, queue: Queue, settings: Settings) -> None:
                 except OSError:
                     pass
                 logging.debug(f'{video_id}: sleeping for {sleep} seconds')
+                METRIC_SLEEP_SECONDS.labels(proxy=proxy).set(sleep)
                 await asyncio.sleep(sleep)
                 video = None
                 queue.task_done()
                 continue
 
             files_scraped += 1
+            METRIC_VIDEOS_SCRAPED.inc()
             if video is not None:
                 try:
                     await video.to_file(
@@ -470,6 +522,7 @@ async def worker(proxy: str, queue: Queue, settings: Settings) -> None:
                     exchange_client, settings, video.channel_name, video
                 ):
                     files_uploaded += 1
+                    METRIC_VIDEOS_UPLOADED.inc()
                     await video.to_file(
                         os.path.join(
                             settings.video_data_directory, UPLOADED_DIRNAME
@@ -483,14 +536,18 @@ async def worker(proxy: str, queue: Queue, settings: Settings) -> None:
                         )
                     )
                     logging.info(f'Uploaded video {video.video_id}')
+                else:
+                    METRIC_UPLOAD_FAILURES.inc()
             except OSError:
                 pass
             except Exception as exc:
                 logging.info(f'Failed to upload video {video_id}: {exc}')
+                METRIC_UPLOAD_FAILURES.inc()
 
         if sleep <= settings.max_sleep:
             sleep = randint(settings.min_sleep, settings.max_sleep)
         logging.debug(f'{video_id}: sleeping for {sleep} seconds')
+        METRIC_SLEEP_SECONDS.labels(proxy=proxy).set(sleep)
         await asyncio.sleep(sleep)
         logging.debug(
             f'Worker with proxy {proxy} files scraped: {files_scraped}, '
@@ -549,11 +606,13 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
                 or 'the page needs to be reloaded' in error_val
                 or '429' in error_val):
             sleep = max(sleep, FAILURE_SLEEP_INTERVAL_MIN)
+            METRIC_RATE_LIMIT_HITS.inc()
             logging.warning(
                 f'Rate limited during scraping video {video_id}: {exc}'
             )
         elif 'Missing microformat data' in error_val:
             sleep = max(sleep, 60)
+            METRIC_SCRAPE_FAILURES.inc()
             logging.info(
                 f'Missing microformat data for video {video_id}: {exc}'
             )
@@ -576,6 +635,7 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
                 or "members-only content" in error_val):
             extension = '.unavailable'
             sleep: int = randint(settings.min_sleep, settings.max_sleep)
+            METRIC_SCRAPE_FAILURES.inc()
             logging.info(f'Video {video_id} not available for scraping: {exc}')
             try:
                 os.rename(
@@ -599,6 +659,7 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
             # a proxy failure, not because of YouTube rate limiting.
         else:
             logging.info(f'Failed to scrape video {video_id}: {exc}')
+            METRIC_SCRAPE_FAILURES.inc()
             sleep = max(sleep, FAILURE_SLEEP_INTERVAL_MIN)
 
     if sleep > settings.max_sleep:
