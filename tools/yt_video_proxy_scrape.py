@@ -430,7 +430,8 @@ async def worker(proxy: str, queue: Queue, settings: Settings, instance: int
             continue
         except Exception as exc:
             logging.warning(
-                f'{instance}: Failed to read video file {entry}, skipping: {exc}'
+                f'{instance}: Failed to read video file {entry}, '
+                f'skipping: {exc}'
             )
             queue.task_done()
             continue
@@ -455,7 +456,9 @@ async def worker(proxy: str, queue: Queue, settings: Settings, instance: int
                     settings, proxy, sleep
                 )
                 if not video:
-                    logging.info(f'{instance}: sleeping for {sleep} seconds')
+                    logging.info(
+                        f'{instance}: {video_id} sleeping for {sleep} seconds'
+                    )
                     await asyncio.sleep(sleep)
                     queue.task_done()
                     continue
@@ -471,7 +474,9 @@ async def worker(proxy: str, queue: Queue, settings: Settings, instance: int
                     )
                 except OSError:
                     pass
-                logging.info(f'{instance}: sleeping for {sleep} seconds')
+                logging.info(
+                    f'{instance} {video_id}: sleeping for {sleep} seconds'
+                )
                 await asyncio.sleep(sleep)
                 video = None
                 queue.task_done()
@@ -515,7 +520,7 @@ async def worker(proxy: str, queue: Queue, settings: Settings, instance: int
 
         if sleep <= settings.max_sleep:
             sleep = randint(settings.min_sleep, settings.max_sleep)
-        logging.info(f'{instance}: sleeping for {sleep} seconds')
+        logging.info(f'{instance} {video_id}: sleeping for {sleep} seconds')
         await asyncio.sleep(sleep)
         logging.info(
             f'{instance}: {proxy} files scraped: {files_scraped}, '
