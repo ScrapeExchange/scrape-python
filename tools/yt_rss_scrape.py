@@ -69,8 +69,8 @@ CHANNEL_SCHEMA_VERSION: str = '0.0.1'
 CHANNEL_SCHEMA_PLATFORM: str = 'youtube'
 CHANNEL_SCHEMA_ENTITY: str = 'channel'
 
-MIN_SLEEP_SECONDS: float = 0.2
-MAX_SLEEP_SECONDS: float = 0.5
+MIN_SLEEP_SECONDS: float = 0.8
+MAX_SLEEP_SECONDS: float = 1.5
 
 # Prometheus metrics
 METRIC_CHANNEL_MAP_SIZE = Gauge(
@@ -333,7 +333,7 @@ async def fetch_rss(channel_id: str, channel_name: str,
                 f'RSS feed not found for channel {channel_id}, '
                 f'wrote channel_id to {no_feeds_file}, sleeping 1 second'
             )
-            await asyncio.sleep(1)
+            await asyncio.sleep(random.random() + 1)
             raise
         except Exception:
             METRIC_RSS_FAILURES.inc()
@@ -477,7 +477,7 @@ async def process_channel(
             f'{elapsed:.1f}s ago'
         )
     else:
-        logging.info(
+        logging.debug(
             f'First time processing channel {channel_name!r} ({channel_id})'
         )
 
@@ -495,7 +495,7 @@ async def process_channel(
         channel_id, channel_name, settings.no_feeds_file
     )
     if videos is None:
-        logging.warning(f'RSS feed not found for channel {channel_name!r}')
+        logging.debug(f'RSS feed not found for channel {channel_name!r}')
         return False
 
     if not videos:
@@ -544,7 +544,7 @@ async def process_channel(
                     await video.from_innertube(innertube=innertube)
                     logging.debug('Updated video with data from YouTube')
                 else:
-                    logging.debug(
+                    logging.info(
                         f'Innertube blocked until {INNERTUBE_BLOCKED_TIMER}'
                     )
         except Exception as exc:
@@ -736,6 +736,7 @@ def get_queue(settings, channels: dict[str, str] = {}
             backup_queue_file: str = f'{queue_file}.{BACKUP_SUFFIX}'
             shutil.copyfile(backup_queue_file, queue_file)
             temp_queue = load_queue(queue_file)
+            logging.info(f'Using backup queue file {backup_queue_file!r}')
         except Exception as exc:
             logging.warning(
                 f'Failed to load backup queue file {backup_queue_file!r}: '
@@ -743,7 +744,7 @@ def get_queue(settings, channels: dict[str, str] = {}
             )
 
     if not temp_queue:
-        logging.info('Starting with an empty queue')
+        logging.warning('Starting with an empty queue')
 
     # Now create the actual queue with a list of tuples
     # ugh, (or)json does not support tuples but converts each tuple to a
