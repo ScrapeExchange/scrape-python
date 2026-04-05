@@ -20,19 +20,18 @@ if os.path.exists(UNRESOLVED_CHANNEL_ID_FILE):
     )
 
 with open('/tmp/yt-channel.log', 'r') as file_desc:
-    for line in file_desc:
-        line = line.strip()
-        if 'Failed to resolve channel ID' in line:
-            channel_id: str = line.split(' ')[-1].strip()
-            if channel_id in unresolved_channel_ids:
-                continue
-            print('Unresolved channel ID:', channel_id)
-            unresolved_channel_ids.add(channel_id)
+    with open('../../byoda/data/unresolved_channel_ids.txt', 'a') as output_desc:   # noqa: E501
+        for line in file_desc:
+            line = line.strip()
+            if 'Failed to resolve channel ID' in line:
+                channel_id: str = line.split(' ')[-1].strip()
+                if channel_id in unresolved_channel_ids:
+                    continue
+                print('Unresolved channel ID:', channel_id)
+                unresolved_channel_ids.add(channel_id)
+                output_desc.write(f'{channel_id}\n')
 
 print(f'Found {len(unresolved_channel_ids)} unique unresolved channel IDs.')
-with open('../../byoda/data/unresolved_channel_ids.txt', 'a') as output_desc:
-    for channel_id in unresolved_channel_ids:
-        output_desc.write(f'{channel_id}\n')
 
 with open('../../byoda/data/channels.lst', 'r') as file_desc:
     existing_channels: set[str] = set()
