@@ -824,7 +824,7 @@ async def read_channels(file_path: str, existing_channel_file: str,
                     return None
 
         results: list[str | None] = await asyncio.gather(
-            *(resolve(cid) for cid in unresolved_ids)
+            *(resolve(cid) for cid in shuffle(list(unresolved_ids)))
         )
         for name in results:
             if name and name not in existing_channel_names:
