@@ -126,15 +126,10 @@ METRIC_CHANNEL_SECONDS_SINCE_LAST_PROCESSED = Gauge(
     'Seconds elapsed since the channel was last processed (only set for channels that have been processed before)',     # noqa: E501
 )
 
-# Track 404s for RSS feeds
-RSS_FEED_FOUND: dict[str, int] = {}
-RSS_FEED_NOT_FOUND: dict[str, int] = {}
 
 # Track interval between RSS feed checks per channel
 CHANNEL_LAST_CHECKED: dict[str, float] = {}
 
-CHANNEL_CHECKS: dict[str, int] = {}
-CHANNEL_VIDEOS: dict[str, int] = {}
 
 class Settings(BaseSettings):
     '''
@@ -432,11 +427,6 @@ async def upload_video(
 
     if response.status_code == 201:
         METRIC_VIDEOS_UPLOADED.inc()
-        CHANNEL_VIDEOS[channel_name] = CHANNEL_VIDEOS.get(channel_name, 0) + 1
-        logging.debug(
-            f'Videos uploaded for channel {channel_name!r}: '
-            f'{CHANNEL_VIDEOS[channel_name]}'
-        )
         return True
 
     METRIC_VIDEO_UPLOAD_FAILURES.inc()
@@ -479,7 +469,6 @@ async def process_channel(
         )
 
     CHANNEL_LAST_CHECKED[channel_id] = monotonic()
-    CHANNEL_CHECKS[channel_id] = CHANNEL_CHECKS.get(channel_id, 0) + 1
 
     channel = YouTubeChannel(
         name=channel_name, browse_client=yt_client, with_download_client=False
@@ -897,25 +886,11 @@ async def worker_loop(
                 logging.info(
                     f'RSS feed not found for channel {name!r} - {channel_id}'
                 )
-                RSS_FEED_NOT_FOUND[channel_id] = RSS_FEED_NOT_FOUND.get(
-                    channel_id, 0
-                ) + 1
-                # continue
             elif (isinstance(result, BaseException)
                     and not isinstance(result, FileExistsError)):
                 logging.warning(
                     f'Channel {name!r} failed: {type(result).__name__}: '
                     f'{result}', exc_info=result,
-                )
-            else:
-                RSS_FEED_FOUND[channel_id] = RSS_FEED_FOUND.get(
-                    channel_id, 0
-                ) + 1
-                found: int = RSS_FEED_FOUND.get(channel_id, 0)
-                not_found: int = RSS_FEED_NOT_FOUND.get(channel_id, 0)
-                logging.debug(
-                    f'Channel {name!r} processed successfully ({found} found, '
-                    f'{not_found} not found)'
                 )
             next_check: float = now + settings.min_interval
             heapq.heappush(queue, (next_check, name, channel_id))
