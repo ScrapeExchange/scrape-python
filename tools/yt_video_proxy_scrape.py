@@ -411,7 +411,7 @@ async def worker(proxy: str, queue: Queue, settings: Settings) -> None:
         api_key_secret=settings.api_key_secret,
         exchange_url=settings.exchange_url,
     )
-
+    await asyncio.sleep(randint(1, settings.min_sleep))
     sleep: int = settings.min_sleep
     files_scraped: int = 0
     files_uploaded: int = 0
