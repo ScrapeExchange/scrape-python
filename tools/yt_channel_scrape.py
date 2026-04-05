@@ -783,6 +783,7 @@ async def read_channels(file_path: str, existing_channel_file: str,
                         logging.warning(
                             f'Failed to resolve channel ID {channel_id}'
                         )
+                        await asyncio.sleep(random())
                     async with map_lock:
                         async with aiofiles.open(
                                 channel_map_file, 'a') as f:
