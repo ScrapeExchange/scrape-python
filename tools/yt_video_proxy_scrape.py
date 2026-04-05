@@ -513,9 +513,9 @@ async def worker(proxy: str, queue: Queue, settings: Settings, instance: int
             except Exception as exc:
                 logging.info(f'Failed to upload video {video_id}: {exc}')
 
-        logging.info(f'{instance}: sleeping for {sleep} seconds')
         if sleep <= settings.max_sleep:
             sleep = randint(settings.min_sleep, settings.max_sleep)
+        logging.info(f'{instance}: sleeping for {sleep} seconds')
         await asyncio.sleep(sleep)
         logging.info(
             f'{instance}: {proxy} files scraped: {files_scraped}, '
