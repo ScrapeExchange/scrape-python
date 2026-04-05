@@ -347,7 +347,8 @@ async def scrape_channels(settings: Settings, client: ExchangeClient,
 
     new_channels: set[str] = await read_channels(
         settings.channel_list, settings.existing_channels_list,
-        settings.channel_map_file, yt_clients, settings.concurrency
+        settings.channel_map_file, settings.channel_data_directory,
+        yt_clients, settings.concurrency,
     )
 
     logging.info(
@@ -705,7 +706,7 @@ async def read_existing_channels(file_path: str) -> dict[str, str]:
 
 
 async def read_channels(file_path: str, existing_channel_file: str,
-                        channel_map_file: str,
+                        channel_map_file: str, data_dir: str,
                         yt_clients: list[AsyncYouTubeClient],
                         concurrency: int = 3) -> set[str]:
     '''
@@ -781,9 +782,21 @@ async def read_channels(file_path: str, existing_channel_file: str,
                         channel_id, choice(yt_clients)
                     )
                     if not name:
-                        logging.warning(
-                            f'Failed to resolve channel ID {channel_id}'
+                        unresolved_file_path: str = os.path.join(
+                            data_dir, f'channel-{channel_id}.unresolved'
                         )
+                        if os.path.exists(unresolved_file_path):
+                            logging.debug(
+                                f'Channel ID {channel_id} previously failed to'
+                                ' resolve, skipping'
+                            )
+                        else:
+                            logging.warning(
+                                f'Failed to resolve channel ID {channel_id}'
+                            )
+                            async with aiofiles.open(unresolved_file_path, 'w'
+                                                     ) as f:
+                                await f.write(f'{channel_id}\n')
                         await asyncio.sleep(random() * 5)
                         METRIC_CHANNEL_ID_RESOLUTION_FAILURES.inc()
                         return None
