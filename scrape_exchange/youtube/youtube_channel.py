@@ -76,7 +76,7 @@ class YouTubeChannel:
         r'"externalId":"(.*?)"'
     )
     CHANNEL_ID_REGEX_MATCH: re.Pattern[str] = \
-        re.compile(r'^UC[a-zA-Z0-9_-]{22}$')
+        re.compile(r'^UC[A-Z0-9_-]{22}$', re.IGNORECASE)
 
     def __init__(
         self, name: str = None,

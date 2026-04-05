@@ -350,7 +350,7 @@ async def scrape_channels(settings: Settings, client: ExchangeClient,
         settings.channel_map_file, yt_clients, settings.concurrency
     )
 
-    logging.debug(
+    logging.info(
         f'Read {len(new_channels)} unique channel names from .lst files'
     )
     channel_list: list[str] = list(new_channels)
@@ -371,7 +371,7 @@ async def scrape_channels(settings: Settings, client: ExchangeClient,
     ]
     errors: int = 0
     for coro in asyncio.as_completed(tasks):
-        if errors > 10000:
+        if errors > 100:
             for task in tasks:
                 task.cancel()
             logging.critical('Too many errors encountered, aborting')
@@ -391,7 +391,7 @@ async def upload_channels(settings: Settings, client: ExchangeClient
         if f.startswith(CHANNEL_FILE_PREFIX)
     ]
     METRIC_FILES_PENDING_UPLOAD.set(len(files))
-    logging.debug(
+    logging.info(
         f'Found {len(files)} channel files that may need to be uploaded'
     )
     for filename in files:
@@ -581,7 +581,7 @@ async def scrape_channel(settings: Settings, client: ExchangeClient,
         try:
             await channel.scrape(max_videos_per_channel=0)
             if not channel.video_ids:
-                logging.warning(f'No videos found for channel {channel_name}')
+                logging.debug(f'No videos found for channel {channel_name}')
                 await asyncio.sleep(random(1, 5))
                 return False
             data: bytes = orjson.dumps(
@@ -609,7 +609,7 @@ async def scrape_channel(settings: Settings, client: ExchangeClient,
             return False
         except Exception as exc:
             METRIC_SCRAPE_FAILURES.inc()
-            logging.error(
+            logging.warning(
                 f'Unexpected error while scraping channel {channel_name}: '
                 f'{exc}'
             )
@@ -617,7 +617,7 @@ async def scrape_channel(settings: Settings, client: ExchangeClient,
             return True
 
     if settings.no_upload:
-        logging.debug(f'No upload flag set, skipping upload for channel '
+        logging.debug(f'No-upload flag set, skipping upload for channel '
                       f'{channel_name}')
         return False
 
@@ -678,11 +678,11 @@ async def read_existing_channels(file_path: str) -> dict[str, str]:
     :raises: (none)
     '''
 
-    logging.debug(f'Reading existing channel names from: {file_path}')
+    logging.info(f'Reading existing channel names from: {file_path}')
 
     channels: dict[str, str] = {}
     if not os.path.isfile(file_path):
-        logging.debug(f'File {file_path} does not exist, returning empty set')
+        logging.warning(f'File {file_path} does not exist, returning empty set')
         return channels
 
     line: str
@@ -722,7 +722,7 @@ async def read_channels(file_path: str, existing_channel_file: str,
     :raises: (none)
     '''
 
-    logging.debug(f'Reading channel names from: {file_path}')
+    logging.info(f'Reading channel names from: {file_path}')
 
     existing_channels: dict[str, str] = await read_existing_channels(
         existing_channel_file
