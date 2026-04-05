@@ -751,6 +751,8 @@ async def read_channels(file_path: str, existing_channel_file: str,
                 _, channel_name = line.split(',', 1)
                 channel_name = channel_name.strip()
             if not channel_name and YouTubeChannel.is_channel_id(line):
+                if line in channel_map:
+                    channel_name = channel_map[line]
                 if line in existing_channels or line in existing_channel_names:
                     continue
                 if line in channel_map:
