@@ -822,7 +822,8 @@ async def read_channels(file_path: str, existing_channel_file: str,
                     )
                     await asyncio.sleep(random() * 5)
                     return None
-        ids: list[str] = shuffle(list(unresolved_ids))
+        ids: list[str] = list(unresolved_ids)
+        shuffle(ids)
 
         results: list[str | None] = await asyncio.gather(
             *(resolve(cid) for cid in ids)
