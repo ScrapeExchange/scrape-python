@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 
+import os
+
 UNRESOLVED_CHANNEL_ID_FILE = '../../byoda/data/unresolved_channel_ids.txt'
 
 
 unresolved_channel_ids: set[str] = set()
-with open(UNRESOLVED_CHANNEL_ID_FILE, 'r') as file_desc:
-    line: str
-    for line in file_desc:
-        line = line.strip()
-        if line:
-            unresolved_channel_ids.add(line)
+if os.path.exists(UNRESOLVED_CHANNEL_ID_FILE):
+    with open(UNRESOLVED_CHANNEL_ID_FILE, 'r') as file_desc:
+        line: str
+        for line in file_desc:
+            line = line.strip()
+            if line:
+                unresolved_channel_ids.add(line)
 
-print(
-    f'Loaded {len(unresolved_channel_ids)} unresolved channel IDs '
-    f'from file {UNRESOLVED_CHANNEL_ID_FILE}.'
-)
+    print(
+        f'Loaded {len(unresolved_channel_ids)} unresolved channel IDs '
+        f'from file {UNRESOLVED_CHANNEL_ID_FILE}.'
+    )
 
 with open('/tmp/yt-channel.log', 'r') as file_desc:
     for line in file_desc:
