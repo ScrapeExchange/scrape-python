@@ -1,16 +1,35 @@
 #!/usr/bin/env python3
 
-line: str
+UNRESOLVED_CHANNEL_ID_FILE = '../../byoda/data/unresolved_channel_ids.txt'
+
+
+unresolved_channel_ids: set[str] = set()
+with open(UNRESOLVED_CHANNEL_ID_FILE, 'r') as file_desc:
+    line: str
+    for line in file_desc:
+        line = line.strip()
+        if line:
+            unresolved_channel_ids.add(line)
+
+print(
+    f'Loaded {len(unresolved_channel_ids)} unresolved channel IDs '
+    f'from file {UNRESOLVED_CHANNEL_ID_FILE}.'
+)
+
 with open('/tmp/yt-channel.log', 'r') as file_desc:
-    channel_ids: set[str] = set()
     for line in file_desc:
         line = line.strip()
         if 'Failed to resolve channel ID' in line:
             channel_id: str = line.split(' ')[-1].strip()
+            if channel_id in unresolved_channel_ids:
+                continue
             print('Unresolved channel ID:', channel_id)
-            channel_ids.add(channel_id)
+            unresolved_channel_ids.add(channel_id)
 
-print(f'Found {len(channel_ids)} unique unresolved channel IDs.')
+print(f'Found {len(unresolved_channel_ids)} unique unresolved channel IDs.')
+with open('../../byoda/data/unresolved_channel_ids.txt', 'a') as output_desc:
+    for channel_id in unresolved_channel_ids:
+        output_desc.write(f'{channel_id}\n')
 
 with open('../../byoda/data/channels.lst', 'r') as file_desc:
     existing_channels: set[str] = set()
@@ -26,7 +45,7 @@ with open('../../byoda/data/channels.lst', 'r') as file_desc:
         elif channel_name.startswith('uc') and len(channel_name) == 24:
             channel_name = 'UC' + channel_name[2:]
 
-        if channel_name in channel_ids:
+        if channel_name in unresolved_channel_ids:
             duplicate_channel_ids += 1
             continue
         if channel_name in existing_channels:
