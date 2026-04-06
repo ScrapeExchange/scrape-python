@@ -673,7 +673,7 @@ async def process_channel(
             )
 
     missed: int = len(videos) - videos_uploaded - videos_existing
-    logging.debug(
+    logging.info(
         f'{channel_name}: uploaded {videos_uploaded} videos, '
         f'{videos_existing} were already on the server'
     )
