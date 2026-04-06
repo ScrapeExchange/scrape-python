@@ -447,7 +447,7 @@ async def read_no_feeds_file(filepath: str) -> dict[str, tuple[str, str, int]]:
                 continue
             channel_id: str = parts[0]
             url: str = parts[1]
-            name: str = ' '.join(parts[2:])
+            name: str = parts[2]
             count: int = 1
             if len(parts) >= 4:
                 try:
@@ -1020,6 +1020,10 @@ async def worker_loop(
 
         try:
             # Now write the updated feeds info back to the file
+            logging.debug(
+                f'Updating no-feeds file: {settings.no_feeds_file!r} '
+                f'with {len(no_feeds)} entries'
+            )
             async with aiofiles.open(settings.no_feeds_file, 'w') as f:
                 for cid, (url, name, count) in no_feeds.items():
                     await f.write(f'{cid}\t{url}\t{name}\t{count}\n')
