@@ -479,7 +479,7 @@ async def worker(proxy: str, queue: Queue, settings: Settings) -> None:
                     settings, proxy, sleep
                 )
                 if not video:
-                    logging.debug(f'{video_id} sleeping for {sleep} seconds')
+                    logging.info(f'{video_id}: sleeping for {sleep} seconds')
                     await asyncio.sleep(sleep)
                     queue.task_done()
                     continue
