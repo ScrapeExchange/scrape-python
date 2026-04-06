@@ -477,11 +477,17 @@ async def process_channel(
     await update_channel(client, channel)
 
     innertube: InnerTube = InnerTube('WEB', proxies=yt_client.proxy)
-    videos: list[YouTubeVideo] | None = await fetch_rss(
-        channel_id, channel_name, settings.no_feeds_file
-    )
-    if videos is None:
-        logging.debug(f'RSS feed not found for channel {channel_name!r}')
+    try:
+        videos: list[YouTubeVideo] | None = await fetch_rss(
+            channel_id, channel_name, settings.no_feeds_file
+        )
+        if videos is None:
+            logging.debug(f'RSS feed not found for channel {channel_name!r}')
+            return False
+    except Exception as exc:
+        logging.debug(
+            f'Failed to fetch RSS feed for channel {channel_name!r}: {exc}'
+        )
         return False
 
     if not videos:
