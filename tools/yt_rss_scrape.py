@@ -298,52 +298,40 @@ class Settings(BaseSettings):
         return upper
 
 
-async def fetch_rss(channel_id: str, channel_name: str,
-                    no_feeds_file: str) -> list[YouTubeVideo] | None:
+async def fetch_rss(rss_url: str, yt_client: AsyncYouTubeClient
+                    ) -> list[YouTubeVideo] | None:
     '''
     Fetches and parses the YouTube RSS feed for a channel.
 
-    :param channel_id: The YouTube channel ID.
-    :param channel_name: The YouTube channel name.
-    :param no_feeds_file: Path to the file where channels with missing RSS
-    feeds are logged.
+    :param rss_url: The URL of the YouTube RSS feed.
     :returns: A list of YouTubeVideo instances populated from the RSS feed.
     :raises: httpx.HTTPStatusError on non-2xx HTTP responses.
     :raises: httpx.RequestError on network-level failures.
     '''
 
-    url: str = YOUTUBE_RSS_URL.format(channel_id=channel_id)
-    logging.debug(f'Fetching RSS feed: {url}')
+    logging.debug(f'Fetching RSS feed: {rss_url}')
 
-    async with AsyncYouTubeClient() as yt_client:
-        try:
-            data: str | None = await yt_client.get(url, timeout=1)
-        except ValueError:
-            METRIC_RSS_FAILURES.inc()
-            async with aiofiles.open(no_feeds_file, 'a') as fd:
-                await fd.write(f'{channel_id}\t{url}\t{channel_name}\n')
-
-            logging.info(
-                f'RSS feed not found for channel {channel_id}, '
-                f'wrote channel_id to {no_feeds_file}, sleeping 1 second'
-            )
-            await asyncio.sleep(random.random() + 1)
-            raise
-        except Exception:
-            METRIC_RSS_FAILURES.inc()
-            logging.debug(
-                f'Getting RSS data failed, sleeping {FAILURE_DELAY} seconds'
-            )
-            await asyncio.sleep(FAILURE_DELAY)
-            raise
-
-        await asyncio.sleep(
-            random.uniform(MIN_SLEEP_SECONDS, MAX_SLEEP_SECONDS)
+    try:
+        data: str | None = await yt_client.get(rss_url, timeout=1)
+    except ValueError:
+        METRIC_RSS_FAILURES.inc()
+        await asyncio.sleep(random.random() + 1)
+        raise
+    except Exception:
+        METRIC_RSS_FAILURES.inc()
+        logging.debug(
+            f'Getting RSS data failed, sleeping {FAILURE_DELAY} seconds'
         )
-        METRIC_RSS_DOWNLOADED.inc()
+        await asyncio.sleep(FAILURE_DELAY)
+        raise
+
+    sleep: float = random.uniform(MIN_SLEEP_SECONDS, MAX_SLEEP_SECONDS)
+    logging.debug('Sleeping for %.2f seconds after fetching RSS feed', sleep)
+    await asyncio.sleep(sleep)
+    METRIC_RSS_DOWNLOADED.inc()
 
     if not data:
-        raise RuntimeError(f'No data received from RSS feed {url}')
+        raise RuntimeError(f'No data received from RSS feed {rss_url}')
 
     feed: untangle.Element = untangle.parse(data)
     raw_entries: list | object = getattr(feed.feed, 'entry', [])
@@ -437,6 +425,79 @@ async def upload_video(
     return False
 
 
+async def read_no_feeds_file(filepath: str) -> dict[str, tuple[str, str, int]]:
+    '''
+    Reads the no-feeds file and returns a dict of channel_id -> (url,
+    channel_name, count).
+
+    :param filepath: Path to the no-feeds file.
+    :returns: A dict mapping channel IDs to tuples of (url, channel_name,
+    count).
+    :raises: OSError if there is an error reading the file.
+    '''
+
+    no_feeds: dict[str, tuple[str, str, int]] = {}
+    if not os.path.exists(filepath):
+        return no_feeds
+
+    async with aiofiles.open(filepath, 'r') as f:
+        async for line in f:
+            parts: list[str] = line.strip().split()
+            if len(parts) < 3:
+                continue
+            channel_id: str = parts[0]
+            url: str = parts[1]
+            name: str = ' '.join(parts[2:])
+            count: int = 1
+            if len(parts) == 4:
+                try:
+                    count = int(parts[3])
+                except ValueError:
+                    pass
+            if channel_id in no_feeds:
+                existing_count: int = no_feeds[channel_id][2]
+                no_feeds[channel_id] = (url, name, existing_count + count)
+            else:
+                no_feeds[channel_id] = (url, name, count)
+
+    return no_feeds
+
+
+async def update_no_feeds_file(
+    channel_id: str, rss_url: str, channel_name: str,
+    no_feeds: dict[str, tuple[str, str, int]], no_feeds_file: str,
+    count: int = 0
+) -> None:
+    '''
+    Updates the no-feeds file with a new entry or increments the count for an
+    existing entry.
+
+    :param channel_id: The YouTube channel ID.
+    :param url: The URL of the RSS feed that was attempted to be fetched.
+    :param channel_name: The human-readable name of the channel.
+    :param no_feeds: The current dict of channel_id -> (url, channel_name,
+    count) loaded from the no-feeds file.
+    :param no_feeds_file: Path to the no-feeds file to update.
+    :raises: OSError if there is an error writing to the file.
+    '''
+
+    if channel_id in no_feeds:
+        if count == 0:
+            no_feeds.pop(channel_id)
+        else:
+            fail_count: int
+            rss_url, channel_name, fail_count = no_feeds[channel_id]
+            fail_count += count
+            no_feeds[channel_id] = (rss_url, channel_name, fail_count)
+    else:
+        no_feeds[channel_id] = (rss_url, channel_name, count)
+
+    # Now write the updated data back to the file
+    async with aiofiles.open(no_feeds_file, 'w') as f:
+        for cid, (url, name, count) in no_feeds.items():
+            await f.write(f'{cid}\t{url}\t{name}\t{count}\n')
+
+
 async def process_channel(
     channel_name: str, channel_id: str, client: ExchangeClient,
     yt_client: AsyncYouTubeClient, settings: Settings
@@ -468,27 +529,65 @@ async def process_channel(
             f'First time processing channel {channel_name!r} ({channel_id})'
         )
 
+    no_feeds: dict[str, tuple[str, str, int]] = await read_no_feeds_file(
+        settings.no_feeds_file
+    )
+
+    rss_url: str = YOUTUBE_RSS_URL.format(channel_id=channel_id)
+    fail_count: int = 0
+    if channel_id in no_feeds:
+        _: str
+        rss_url, _, fail_count = no_feeds[channel_id]
+        if fail_count >= 3:
+            logging.info(
+                f'Channel {channel_name!r} has failed to fetch RSS feed '
+                f'{fail_count} times, skipping'
+            )
+            return False
+        logging.info(
+            f'Channel {channel_name!r} had missing RSS feed (attempted URL: '
+            f'{rss_url}), failure count: {fail_count}'
+        )
+
     CHANNEL_LAST_CHECKED[channel_id] = monotonic()
 
     channel = YouTubeChannel(
         name=channel_name, browse_client=yt_client, with_download_client=False
     )
     channel.channel_id = channel_id
-    await update_channel(client, channel)
+    if not await update_channel(client, channel):
+        await update_no_feeds_file(
+            channel_id, rss_url, channel_name, no_feeds,
+            settings.no_feeds_file, 1
+        )
+        return False
 
     innertube: InnerTube = InnerTube('WEB', proxies=yt_client.proxy)
     try:
-        videos: list[YouTubeVideo] | None = await fetch_rss(
-            channel_id, channel_name, settings.no_feeds_file
-        )
+        videos: list[YouTubeVideo] | None = await fetch_rss(rss_url, yt_client)
         if videos is None:
             logging.debug(f'RSS feed not found for channel {channel_name!r}')
+            await update_no_feeds_file(
+                channel_id, YOUTUBE_RSS_URL.format(channel_id=channel_id),
+                channel_name, no_feeds, settings.no_feeds_file, 1
+            )
             return False
     except Exception as exc:
         logging.debug(
             f'Failed to fetch RSS feed for channel {channel_name!r}: {exc}'
         )
+        await update_no_feeds_file(
+            channel_id, YOUTUBE_RSS_URL.format(channel_id=channel_id),
+            channel_name, no_feeds, settings.no_feeds_file, 1
+        )
         return False
+
+    # Scraping was succesfull, reset the fail counter
+    if channel_id in no_feeds:
+        await update_no_feeds_file(
+                channel_id, YOUTUBE_RSS_URL.format(channel_id=channel_id),
+                channel_name, no_feeds, settings.no_feeds_file, 0
+        )
 
     if not videos:
         await asyncio.sleep(
@@ -600,10 +699,27 @@ async def process_channel(
 
 
 async def update_channel(client: ExchangeClient, channel: YouTubeChannel
-                         ) -> None:
+                         ) -> bool:
+    '''
+    Scrapes the about page of the channel for metadata and updates the channel
+    data on Scrape Exchange via the data API.
+
+    :param client: The authenticated Scrape Exchange API client.
+    :param channel: The YouTubeChannel instance to update.
+    :returns: True if the channel data was scraped successfully, False on
+    failure to scrape.
+    :raises: (none)
+    '''
+
     try:
         await channel.scrape_about_page()
+    except Exception as exc:
+        logging.debug(
+            f'Failed to scrape about page for channel {channel.name!r}: {exc}'
+        )
+        return False
 
+    try:
         channel_id: str = channel.channel_id
         METRIC_API_CHANNEL_CALLS.inc()
         response: Response = await client.post(
@@ -638,6 +754,8 @@ async def update_channel(client: ExchangeClient, channel: YouTubeChannel
     except Exception as exc:
         METRIC_CHANNEL_UPDATE_FAILURES.inc()
         logging.info(f'Failed to update channel data: {exc}')
+
+    return True
 
 
 def get_channelmap(channel_data_dir: str) -> dict[str, str]:
