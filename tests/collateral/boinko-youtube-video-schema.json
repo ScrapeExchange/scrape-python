@@ -46,7 +46,9 @@
     "thumbnails": { "type": "object", "additionalProperties": { "$ref": "#/$defs/thumbnail" } },
     "subtitles": { "type": "object", "additionalProperties": { "$ref": "#/$defs/caption" } },
     "automatic_captions": { "type": "object", "additionalProperties": { "$ref": "#/$defs/caption" } },
-    "formats": { "type": "object", "additionalProperties": { "$ref": "#/$defs/format" } }
+    "formats": { "type": "object", "additionalProperties": { "$ref": "#/$defs/format" } },
+    "available_country_codes": { "type": "array", "items": { "type": "string" }, "description": "List of ISO 3166-1 alpha-2 country codes where the video is available" },
+    "is_tv_film_video": { "type": "boolean", "description": "Whether the video is classified as a TV film or video by YouTube" }
   },
   "required": ["video_id"],
   "additionalProperties": false,

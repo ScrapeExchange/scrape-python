@@ -133,7 +133,6 @@ class InnerTubeVideoParser:
             raise RuntimeError(f'Innertube API call failed: {exc}')
 
         video_details: dict = player_data.get('videoDetails', {})
-        # streaming_data: dict = player_data.get('streamingData', {})
         captions_data: dict = player_data.get('captions', {})
         microformat: dict = player_data.get(
             'microformat', {}
@@ -145,6 +144,10 @@ class InnerTubeVideoParser:
         video.description = video_details.get(
             'shortDescription', video.description
         )
+        video.url = microformat.get('canonicalUrl', video.url)
+        video.embed_url = microformat.get(
+            'embed', {}
+        ).get('iframeUrl', video.embed_url)
 
         video.duration = _safe_int(video_details.get('lengthSeconds'))
 
@@ -160,24 +163,37 @@ class InnerTubeVideoParser:
 
         video.channel_id = video_details.get('channelId', video.channel_id)
         video.channel_name = video_details.get('author', video.channel_name)
-
-        video.is_live = bool(video_details.get('isLive', video.is_live))
+        video.channel_url = microformat.get(
+            'ownerProfileUrl', video.channel_url
+        )
+        video.is_live = bool(video_details.get('isLiveContent', video.is_live))
         video.was_live = bool(video_details.get(
             'isLiveContent', video.was_live)
-                            )
+        )
+        if microformat.get('isUnlisted', False):
+            video.privacy_status = 'private'
+        else:
+            video.privacy_status = 'public'
+
         video.keywords |= set(video_details.get('keywords', {}))
         video.tags |= set(video_details.get('tags', {}))
-
+        video.available_country_codes |= set(
+            microformat.get('availableCountries', [])
+        )
         video.is_family_safe = microformat.get(
             'isFamilySafe', video.is_family_safe
         )
 
         video.view_count = _safe_int(video_details.get('viewCount'))
-
+        video.like_count = _safe_int(microformat.get('likeCount'))
         playability: dict = player_data.get('playabilityStatus', {})
         video.age_restricted = playability.get('status') == 'LOGIN_REQUIRED'
-
-        thumbnails_data = microformat.get('thumbnail', {}).get('thumbnails', [])
+        video.is_tv_film_video = video_details.get(
+            'isTvFilmVideo', video.is_tv_film_video
+        )
+        thumbnails_data = video_details.get(
+            'thumbnail', {}
+        ).get('thumbnails', [])
         for thumbnail_data in thumbnails_data:
             thumbnail = YouTubeThumbnail(thumbnail_data)
             label: str = thumbnail.id or f'{thumbnail.width}x{thumbnail.height}'

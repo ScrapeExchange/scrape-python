@@ -606,12 +606,12 @@ async def process_channel(
     videos_existing: int = 0
     global INNERTUBE_BLOCKED_TIMER
     for video in videos:
-        if os.path.exists(
-            YouTubeVideo.get_filepath(
-                video.video_id, settings.video_data_directory,
-                VIDEO_FILENAME_PREFIX
-            )
-        ):
+        file_path: str = YouTubeVideo.get_filepath(
+            video.video_id, settings.video_data_directory,
+            VIDEO_FILENAME_PREFIX
+        )
+
+        if os.path.exists(file_path):
             logging.debug(
                 f'Found existing file for video {video.video_id}, skipping'
             )

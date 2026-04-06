@@ -99,7 +99,8 @@ class AsyncYouTubeClient(AsyncClient):
             _LOGGER.debug(f'HTTP GET {url}')
             resp: Response = await super().get(url, **kwargs)
         except (TimeoutException, ConnectError, ReadTimeout,
-                ConnectionResetError, ConnectionRefusedError) as exc:
+                ConnectTimeout, ConnectionResetError,
+                ConnectionRefusedError) as exc:
             _LOGGER.debug(f'HTTP GET timeout for {url}: {exc}')
             if retries > 0:
                 await asyncio.sleep(random.uniform(delay-1, delay))

@@ -13,6 +13,9 @@ import json
 import shutil
 import unittest
 import tempfile
+import datetime
+
+from datetime import UTC
 
 import orjson
 import aiofiles
@@ -20,6 +23,7 @@ from jsonschema import Draft202012Validator
 
 import brotli
 
+from scrape_exchange.youtube.youtube_client import AsyncYouTubeClient
 from scrape_exchange.youtube.youtube_video import YouTubeVideo
 from scrape_exchange.youtube.youtube_video import YouTubeMediaType
 
@@ -56,6 +60,40 @@ class TestIntegration(unittest.IsolatedAsyncioTestCase):
             messages: str = '\n'.join(e.message for e in errors)
             self.fail(f'Schema validation failed:\n{messages}')
 
+    async def test_innertube_video_scrape(self) -> None:
+        video: YouTubeVideo = YouTubeVideo(YOUTUBE_VIDEO_ID)
+        video.browse_client = AsyncYouTubeClient()
+        await video.from_innertube()
+        self.assertEqual(video.video_id, YOUTUBE_VIDEO_ID)
+        self.assertIsNone(video.media_type, None)
+        self.assertEqual(video.duration, 213)
+        self.assertGreaterEqual(video.view_count, 1759729070)
+        self.assertGreaterEqual(video.like_count, 18917330)
+        self.assertGreaterEqual(video.comment_count, 2400000)
+        self.assertFalse(video.age_restricted)
+        self.assertTrue(video.is_family_safe)
+        self.assertFalse(video.is_tv_film_video)
+        self.assertEqual(video.age_limit, 0)
+        self.assertEqual(video.categories, set(['Music']))
+        self.assertGreaterEqual(len(video.available_country_codes), 40)
+        self.assertEqual(video.privacy_status, 'public')
+        self.assertIn('rick astley', video.keywords)
+        self.assertIn('never gonna give you up', video.keywords)
+        self.assertFalse(video.is_live)
+        self.assertFalse(video.is_tv_film_video)
+        self.assertGreater(len(video.thumbnails), 2)
+        self.assertGreater(
+            video.published_timestamp,
+            datetime.datetime(2009, 10, 25, tzinfo=UTC)
+        )
+        self.assertEqual(
+            video.channel_url, 'http://www.youtube.com/@RickAstleyYT'
+        )
+        self.assertEqual(video.channel_name, 'Rick Astley')
+        self.assertEqual(video.privacy_status, 'public')
+
+        self._validate_schema(video.to_dict())
+
     async def test_youtube_video(self) -> None:
         video: YouTubeVideo = await YouTubeVideo.scrape(
             video_id=YOUTUBE_VIDEO_ID,
@@ -91,11 +129,6 @@ class TestIntegration(unittest.IsolatedAsyncioTestCase):
             video_id=YOUTUBE_SHORT_ID, load_dir=self.temp_dir
         )
         self.assertEqual(short, short_from_file)
-
-    async def test_innertube(self) -> None:
-        video = YouTubeVideo('N3jdUSEYzdk')
-        await video.from_innertube()
-        self.assertEqual(video.video_id, 'N3jdUSEYzdk')
 
 
 if __name__ == '__main__':

@@ -91,6 +91,7 @@ class YouTubeVideo:
         self.uploaded_timestamp: datetime | None = None
         self.published_timestamp: datetime | None = None
         self.availability: str | None = None
+        self.available_country_codes: set[str] = set()
 
         self.view_count: int | None = None
         self.like_count: int | None = None
@@ -109,6 +110,7 @@ class YouTubeVideo:
         self.age_limit: int = 0
         self.age_restricted: bool = False
         self.is_family_safe: bool | None = None
+        self.is_tv_film_video: bool = False
         self.aspect_ratio: float = 0.0
 
         # Duration of the video in seconds
@@ -154,6 +156,7 @@ class YouTubeVideo:
             and self.uploaded_timestamp == other.uploaded_timestamp
             and self.published_timestamp == other.published_timestamp
             and self.availability == other.availability
+            and self.available_country_codes == other.available_country_codes
             and self.url == other.url
             and self.embed_url == other.embed_url
             and self.media_type == other.media_type
@@ -161,6 +164,7 @@ class YouTubeVideo:
             and self.age_limit == other.age_limit
             and self.age_restricted == other.age_restricted
             and self.is_family_safe == other.is_family_safe
+            and self.is_tv_film_video == other.is_tv_film_video
             and self.aspect_ratio == other.aspect_ratio
             and self.duration == other.duration
             and self.license == other.license
@@ -212,6 +216,7 @@ class YouTubeVideo:
             'like_count': self.like_count,
             'dislike_count': self.dislike_count,
             'comment_count': self.comment_count,
+            'available_country_codes': list(self.available_country_codes),
             'url': self.url,
             'is_live': self.is_live,
             'was_live': self.was_live,
@@ -220,6 +225,7 @@ class YouTubeVideo:
             'age_limit': self.age_limit,
             'age_restricted': self.age_restricted,
             'is_family_safe': self.is_family_safe,
+            'is_tv_film_video': self.is_tv_film_video,
             'aspect_ratio': self.aspect_ratio,
             'duration': self.duration,
             'heatmaps': self.heatmaps or [],
@@ -297,6 +303,9 @@ class YouTubeVideo:
         video.channel_is_verified = data.get('channel_is_verified')
         video.channel_follower_count = data.get('channel_follower_count')
         video.availability = data.get('availability')
+        video.available_country_codes = set(
+            data.get('available_country_codes', [])
+        )
         video.view_count = data.get('view_count')
         video.like_count = data.get('like_count')
         video.dislike_count = data.get('dislike_count')
@@ -1045,7 +1054,10 @@ class YouTubeVideo:
 
     async def from_innertube(self, innertube: InnerTube | None = None,
                              ) -> None:
+        if not self.browse_client:
+            raise RuntimeError(
+                'No browse client available for scraping video with InnerTube'
+            )
         await InnerTubeVideoParser.scrape(
             self, innertube, self.browse_client.proxy
         )
-        self.embed_url = YouTubeVideo.EMBED_URL.format(video_id=self.video_id)
