@@ -411,6 +411,8 @@ async def worker(proxy: str, queue: Queue, settings: Settings) -> None:
         api_key_secret=settings.api_key_secret,
         exchange_url=settings.exchange_url,
     )
+    # Create some random initial sleep to avoid all workers hitting YouTube at
+    # startup
     await asyncio.sleep(randint(1, settings.min_sleep))
     sleep: int = settings.min_sleep
     files_scraped: int = 0
@@ -496,7 +498,7 @@ async def worker(proxy: str, queue: Queue, settings: Settings) -> None:
                     )
                 except OSError:
                     pass
-                logging.debug(f'{video_id}: sleeping for {sleep} seconds')
+                logging.info(f'{video_id}: sleeping for {sleep} seconds')
                 METRIC_SLEEP_SECONDS.labels(proxy=proxy).set(sleep)
                 await asyncio.sleep(sleep)
                 video = None
@@ -546,7 +548,7 @@ async def worker(proxy: str, queue: Queue, settings: Settings) -> None:
 
         if sleep <= settings.max_sleep:
             sleep = randint(settings.min_sleep, settings.max_sleep)
-        logging.debug(f'{video_id}: sleeping for {sleep} seconds')
+        logging.info(f'{video_id}: sleeping for {sleep} seconds')
         METRIC_SLEEP_SECONDS.labels(proxy=proxy).set(sleep)
         await asyncio.sleep(sleep)
         logging.debug(
