@@ -89,16 +89,6 @@ class Settings(BaseSettings):
             'YOUTUBE_CHANNEL_LIST', 'channel_list'
         )
     )
-    existing_channels_list: str = Field(
-        default='existing_channels.csv',
-        validation_alias=AliasChoices(
-            'YOUTUBE_EXISTING_CHANNEL_LIST', 'existing_channels_list'
-        ),
-        description=(
-            'CSV file containing existing channel IDs and names '
-            'to skip scraping (format: channel_id,channel_name).'
-        )
-    )
     channel_data_directory: str | None = Field(
         default=None,
         validation_alias=AliasChoices(
@@ -348,9 +338,8 @@ async def scrape_channels(settings: Settings, client: ExchangeClient,
                           yt_clients: list[AsyncYouTubeClient]) -> None:
 
     new_channels: set[str] = await read_channels(
-        settings.channel_list, settings.existing_channels_list,
-        settings.channel_map_file, settings.channel_data_directory,
-        yt_clients, settings.concurrency,
+        settings.channel_list, settings.channel_map_file,
+        settings.channel_data_directory, yt_clients, settings.concurrency,
     )
 
     logging.info(
@@ -708,8 +697,7 @@ async def read_existing_channels(file_path: str) -> dict[str, str]:
     return channels
 
 
-async def read_channels(file_path: str, existing_channel_file: str,
-                        channel_map_file: str, data_dir: str,
+async def read_channels(file_path: str, channel_map_file: str, data_dir: str,
                         yt_clients: list[AsyncYouTubeClient],
                         concurrency: int = 3) -> set[str]:
     '''
@@ -729,13 +717,10 @@ async def read_channels(file_path: str, existing_channel_file: str,
 
     logging.info(f'Reading channel names from: {file_path}')
 
-    existing_channels: dict[str, str] = await read_existing_channels(
-        existing_channel_file
-    )
     channel_map: dict[str, str] = await read_existing_channels(
         channel_map_file
     )
-    existing_channel_names: set[str] = set(existing_channels.values())
+    existing_channel_names: set[str] = set(channel_map.values())
     new_channel_names: set[str] = set()
     # Channel IDs that need to be resolved to names
     unresolved_ids: list[str] = []
@@ -743,7 +728,7 @@ async def read_channels(file_path: str, existing_channel_file: str,
     async with aiofiles.open(file_path, 'r') as file_desc:
         async for line in file_desc:
             line = line.strip()
-            if not line:
+            if not line or line.startswith('#'):
                 continue
             channel_name: str | None = None
             if ',' in line:
@@ -753,7 +738,7 @@ async def read_channels(file_path: str, existing_channel_file: str,
             if not channel_name and YouTubeChannel.is_channel_id(line):
                 if line in channel_map:
                     channel_name = channel_map[line]
-                if line in existing_channels or line in existing_channel_names:
+                if line in existing_channel_names:
                     continue
                 if line in channel_map:
                     channel_name = channel_map[line]
