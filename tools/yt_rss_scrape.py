@@ -184,6 +184,16 @@ class Settings(BaseSettings):
         ),
         description='API key secret for Scrape.Exchange authentication',
     )
+    channel_map_file: str = Field(
+        default='channel_map.csv',
+        validation_alias=AliasChoices(
+            'YOUTUBE_CHANNEL_MAP_FILE', 'channel_map_file'
+        ),
+        description=(
+            'CSV file to save mapping of channel IDs to names for channels '
+            'scraped during this run (format: channel_id,channel_name).'
+        )
+    )
     channel_data_directory: str = Field(
         default='channels',
         validation_alias=AliasChoices(
@@ -197,14 +207,14 @@ class Settings(BaseSettings):
         ),
     )
     queue_file: str = Field(
-        default='/tmp/yt-rss-reader-queue.json',
+        default='yt-rss-reader-queue.json',
         validation_alias=AliasChoices(
             'RSS_QUEUE_FILE', 'rss_queue_file'
         ),
         description='Path to JSON file for persisting the channel queue',
     )
     no_feeds_file: str = Field(
-        default='/var/tmp/yt-rss-reader-no-feeds.txt',
+        default='yt-rss-reader-no-feeds.txt',
         validation_alias=AliasChoices(
             'NO_FEEDS_FILE', 'no_feeds_file'
         ),
@@ -748,7 +758,43 @@ async def update_channel(client: ExchangeClient, channel: YouTubeChannel
     return True
 
 
-def get_channelmap(channel_data_dir: str) -> dict[str, str]:
+def read_channel_map_file(filepath: str) -> dict[str, str]:
+    '''
+    Reads the channel map CSV file and returns a dict of channel_id ->
+    channel_name.
+
+    :param filepath: Path to the channel map CSV file.
+    :returns: A dict mapping channel IDs to channel names.
+    :raises: OSError if there is an error reading the file.
+    '''
+
+    channel_map: dict[str, str] = {}
+    if not os.path.exists(filepath):
+        return channel_map
+
+    with open(filepath, 'r') as file_desc:
+        line: str
+        for line in file_desc:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts: list[str] = line.split(',')
+            if len(parts) < 2:
+                logging.warning(
+                    f'Skipping malformed line in channel map file: {line!r}'
+                )
+                continue
+            channel_id: str
+            channel_name: str
+            channel_id, channel_name = parts[0].strip(), parts[1].strip()
+            if channel_id and channel_name:
+                channel_map[channel_id] = channel_name
+
+    return channel_map
+
+
+def get_channelmap(channel_map_file: str, channel_data_dir: str
+                   ) -> dict[str, str]:
     '''
     Loads the wanted channels from the directory with known channel data files.
 
@@ -756,28 +802,36 @@ def get_channelmap(channel_data_dir: str) -> dict[str, str]:
     :returns: A dict mapping channel IDs to channel names.
     '''
 
-    if not channel_data_dir.endswith(UPLOADED_DIR):
-        channel_data_dir += UPLOADED_DIR
-
-    channel_map: dict[str, str] = {}
-    files: list[str] = os.listdir(channel_data_dir)
-    filename: str
-    for filename in files:
-        if (not filename.startswith(CHANNEL_FILENAME_PREFIX)
-                or not filename.endswith(FILE_EXTENSION)):
-            continue
-
-        channel_name: str = filename[
-            len(CHANNEL_FILENAME_PREFIX):-1*len(FILE_EXTENSION)
+    channel_map: dict[str, str] = read_channel_map_file(channel_map_file)
+    known_channels: list[str] = list(channel_map.values())
+    for directory in [channel_data_dir, channel_data_dir + UPLOADED_DIR]:
+        os.makedirs(directory, exist_ok=True)
+        files: list[str] = [
+            filename for filename in os.listdir(directory)
+            if filename.startswith(CHANNEL_FILENAME_PREFIX)
+            and filename.endswith(FILE_EXTENSION)
         ]
+        filename: str
+        for filename in files:
+            channel_name: str = filename[
+                len(CHANNEL_FILENAME_PREFIX):-1*len(FILE_EXTENSION)
+            ]
+            if channel_name in known_channels:
+                continue
 
-        file_path: str = os.path.join(channel_data_dir, filename)
-        try:
-            data: dict[str, any] = read_channel_file(file_path)
-            channel_map[data['channel_id']] = channel_name
-        except Exception as exc:
-            os.remove(file_path)
-            logging.debug(f'Removed invalid channel file {file_path!r}: {exc}')
+            file_path: str = os.path.join(directory, filename)
+            try:
+                data: dict[str, any] = read_channel_file(file_path)
+                channel_map[data['channel_id']] = channel_name
+            except Exception as exc:
+                os.remove(file_path)
+                logging.debug(
+                    f'Removed invalid channel file {file_path!r}: {exc}'
+                )
+
+    with open(channel_map_file, 'w') as f:
+        for channel_id, channel_name in channel_map.items():
+            f.write(f'{channel_id},{channel_name}\n')
 
     return channel_map
 
@@ -942,7 +996,7 @@ async def worker_loop(
     '''
 
     channel_map: dict[str, str] = get_channelmap(
-        settings.channel_data_directory
+        settings.channel_map_file, settings.channel_data_directory
     )
     queue: list[tuple[float, str, str]] = get_queue(
         settings, channel_map
