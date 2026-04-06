@@ -1025,7 +1025,9 @@ async def worker_loop(
                 f'with {len(no_feeds)} entries'
             )
             async with aiofiles.open(settings.no_feeds_file, 'w') as f:
-                for cid, (url, name, count) in no_feeds.items():
+                for cid, (url, name, count) in sorted(
+                    no_feeds.items(), key=lambda x: x[1][2], reverse=True
+                ):
                     await f.write(f'{cid}\t{url}\t{name}\t{count}\n')
         except OSError as exc:
             logging.warning(
