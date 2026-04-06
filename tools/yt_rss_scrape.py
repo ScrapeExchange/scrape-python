@@ -463,10 +463,9 @@ async def read_no_feeds_file(filepath: str) -> dict[str, tuple[str, str, int]]:
     return no_feeds
 
 
-async def update_no_feeds_file(
+async def update_no_feeds(
     channel_id: str, rss_url: str, channel_name: str,
-    no_feeds: dict[str, tuple[str, str, int]], no_feeds_file: str,
-    count: int = 0
+    no_feeds: dict[str, tuple[str, str, int]], count: int = 0
 ) -> None:
     '''
     Updates the no-feeds file with a new entry or increments the count for an
@@ -492,15 +491,11 @@ async def update_no_feeds_file(
     else:
         no_feeds[channel_id] = (rss_url, channel_name, count)
 
-    # Now write the updated data back to the file
-    async with aiofiles.open(no_feeds_file, 'w') as f:
-        for cid, (url, name, count) in no_feeds.items():
-            await f.write(f'{cid}\t{url}\t{name}\t{count}\n')
-
 
 async def process_channel(
     channel_name: str, channel_id: str, client: ExchangeClient,
-    yt_client: AsyncYouTubeClient, settings: Settings
+    yt_client: AsyncYouTubeClient,
+    no_feeds: dict[str, tuple[str, str, int]], settings: Settings
 ) -> bool:
     '''
     Fetches the RSS feed for one channel and checks or stores each video.
@@ -529,10 +524,6 @@ async def process_channel(
             f'First time processing channel {channel_name!r} ({channel_id})'
         )
 
-    no_feeds: dict[str, tuple[str, str, int]] = await read_no_feeds_file(
-        settings.no_feeds_file
-    )
-
     rss_url: str = YOUTUBE_RSS_URL.format(channel_id=channel_id)
     fail_count: int = 0
     if channel_id in no_feeds:
@@ -556,9 +547,8 @@ async def process_channel(
     )
     channel.channel_id = channel_id
     if not await update_channel(client, channel):
-        await update_no_feeds_file(
-            channel_id, rss_url, channel_name, no_feeds,
-            settings.no_feeds_file, 1
+        await update_no_feeds(
+            channel_id, rss_url, channel_name, no_feeds, 1
         )
         return False
 
@@ -567,26 +557,26 @@ async def process_channel(
         videos: list[YouTubeVideo] | None = await fetch_rss(rss_url, yt_client)
         if videos is None:
             logging.debug(f'RSS feed not found for channel {channel_name!r}')
-            await update_no_feeds_file(
+            await update_no_feeds(
                 channel_id, YOUTUBE_RSS_URL.format(channel_id=channel_id),
-                channel_name, no_feeds, settings.no_feeds_file, 1
+                channel_name, no_feeds, 1
             )
             return False
     except Exception as exc:
         logging.debug(
             f'Failed to fetch RSS feed for channel {channel_name!r}: {exc}'
         )
-        await update_no_feeds_file(
+        await update_no_feeds(
             channel_id, YOUTUBE_RSS_URL.format(channel_id=channel_id),
-            channel_name, no_feeds, settings.no_feeds_file, 1
+            channel_name, no_feeds, 1
         )
         return False
 
     # Scraping was succesfull, reset the fail counter
     if channel_id in no_feeds:
-        await update_no_feeds_file(
+        await update_no_feeds(
                 channel_id, YOUTUBE_RSS_URL.format(channel_id=channel_id),
-                channel_name, no_feeds, settings.no_feeds_file, 0
+                channel_name, no_feeds, 0
         )
 
     if not videos:
@@ -971,6 +961,11 @@ async def worker_loop(
     yt_client = AsyncYouTubeClient(
         proxies=settings.proxies.split(',') if settings.proxies else None
     )
+
+    no_feeds: dict[str, tuple[str, str, int]] = await read_no_feeds_file(
+        settings.no_feeds_file
+    )
+
     while True:
         now: float = datetime.now(UTC).timestamp()
 
@@ -997,8 +992,9 @@ async def worker_loop(
         )
 
         tasks: list[asyncio.Task] = [
-            process_channel(name, channel_id, client, yt_client, settings)
-            for _, name, channel_id in batch
+            process_channel(
+                name, channel_id, client, yt_client, no_feeds, settings
+            ) for _, name, channel_id in batch
         ]
         results: list = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -1021,6 +1017,17 @@ async def worker_loop(
 
         METRIC_QUEUE_SIZE.set(len(queue))
         METRIC_CONCURRENCY.set(0)
+
+        try:
+            # Now write the updated feeds info back to the file
+            async with aiofiles.open(settings.no_feeds_file, 'w') as f:
+                for cid, (url, name, count) in no_feeds.items():
+                    await f.write(f'{cid}\t{url}\t{name}\t{count}\n')
+        except OSError as exc:
+            logging.warning(
+                f'Failed to write no-feeds file {settings.no_feeds_file!r}: '
+                f'{exc}'
+            )
 
         try:
             async with aiofiles.open(settings.queue_file, 'wb') as fd:
