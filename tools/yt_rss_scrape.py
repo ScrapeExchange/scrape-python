@@ -772,6 +772,7 @@ def read_channel_map_file(filepath: str) -> dict[str, str]:
     if not os.path.exists(filepath):
         return channel_map
 
+    logging.info(f'Reading channel map from {filepath!r}')
     with open(filepath, 'r') as file_desc:
         line: str
         for line in file_desc:
@@ -829,6 +830,10 @@ def get_channelmap(channel_map_file: str, channel_data_dir: str
                     f'Removed invalid channel file {file_path!r}: {exc}'
                 )
 
+    logging.info(
+        f'Writing channel map with {len(channel_map)} entries '
+        f'to {channel_map_file!r}'
+    )
     with open(channel_map_file, 'w') as f:
         for channel_id, channel_name in channel_map.items():
             f.write(f'{channel_id},{channel_name}\n')
