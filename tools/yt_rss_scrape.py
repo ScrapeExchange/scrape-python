@@ -449,14 +449,14 @@ async def read_no_feeds_file(filepath: str) -> dict[str, tuple[str, str, int]]:
             url: str = parts[1]
             name: str = ' '.join(parts[2:])
             count: int = 1
-            if len(parts) == 4:
+            if len(parts) >= 4:
                 try:
                     count = int(parts[3])
                 except ValueError:
                     pass
             if channel_id in no_feeds:
                 existing_count: int = no_feeds[channel_id][2]
-                no_feeds[channel_id] = (url, name, existing_count + count)
+                no_feeds[channel_id] = (url, name, int(existing_count + count))
             else:
                 no_feeds[channel_id] = (url, name, count)
 
