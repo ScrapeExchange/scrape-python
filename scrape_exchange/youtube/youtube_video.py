@@ -21,12 +21,15 @@ from datetime import timezone
 import aiofiles
 from dateutil import parser as dateutil_parser
 
+import asyncio
 from asyncio import sleep
 
 import orjson
 import brotli
 import untangle
 from innertube import InnerTube
+
+from prometheus_client import Gauge
 
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
@@ -38,12 +41,27 @@ from .youtube_caption import YouTubeCaption
 from .youtube_client import AsyncYouTubeClient
 from .youtube_thumbnail import YouTubeThumbnail
 from .youtube_videochapter import YouTubeVideoChapter
+from .youtube_rate_limiter import YouTubeRateLimiter, YouTubeCallType
 from .youtube_video_innertube import InnerTubeVideoParser
 
 _LOGGER: Logger = getLogger(__name__)
 
 DENO_PATH: str = os.environ.get('HOME', '') + '/.deno/bin/deno'
 PO_TOKEN_URL: str = 'http://localhost:4416'
+YTDLP_CACHE_DIR: str = '/var/tmp/yt_dlp_cache'
+
+# Number of yt-dlp ``extract_info`` calls currently running in the
+# default ThreadPoolExecutor, labelled by proxy.  Used to detect
+# thread-pool starvation: if this gauge stays pinned at the executor
+# size while ``yt_video_proxy_videos_scraped_total`` rate is low, the
+# scraper is bottlenecked by the executor (or the GIL) rather than by
+# the rate limiter or YouTube.
+METRIC_EXTRACT_INFO_ACTIVE: Gauge = Gauge(
+    'youtube_extract_info_active',
+    'Number of yt-dlp extract_info calls currently running in the '
+    'thread pool, labelled by proxy.',
+    ['proxy'],
+)
 
 
 class YouTubeMediaType(str, Enum):
@@ -90,6 +108,7 @@ class YouTubeVideo:
         self.uploaded_timestamp: datetime | None = None
         self.published_timestamp: datetime | None = None
         self.availability: str | None = None
+        self.available_country_codes: set[str] = set()
 
         self.view_count: int | None = None
         self.like_count: int | None = None
@@ -108,6 +127,7 @@ class YouTubeVideo:
         self.age_limit: int = 0
         self.age_restricted: bool = False
         self.is_family_safe: bool | None = None
+        self.is_tv_film_video: bool = False
         self.aspect_ratio: float = 0.0
 
         # Duration of the video in seconds
@@ -153,6 +173,7 @@ class YouTubeVideo:
             and self.uploaded_timestamp == other.uploaded_timestamp
             and self.published_timestamp == other.published_timestamp
             and self.availability == other.availability
+            and self.available_country_codes == other.available_country_codes
             and self.url == other.url
             and self.embed_url == other.embed_url
             and self.media_type == other.media_type
@@ -160,6 +181,7 @@ class YouTubeVideo:
             and self.age_limit == other.age_limit
             and self.age_restricted == other.age_restricted
             and self.is_family_safe == other.is_family_safe
+            and self.is_tv_film_video == other.is_tv_film_video
             and self.aspect_ratio == other.aspect_ratio
             and self.duration == other.duration
             and self.license == other.license
@@ -211,6 +233,7 @@ class YouTubeVideo:
             'like_count': self.like_count,
             'dislike_count': self.dislike_count,
             'comment_count': self.comment_count,
+            'available_country_codes': list(self.available_country_codes),
             'url': self.url,
             'is_live': self.is_live,
             'was_live': self.was_live,
@@ -219,6 +242,7 @@ class YouTubeVideo:
             'age_limit': self.age_limit,
             'age_restricted': self.age_restricted,
             'is_family_safe': self.is_family_safe,
+            'is_tv_film_video': self.is_tv_film_video,
             'aspect_ratio': self.aspect_ratio,
             'duration': self.duration,
             'heatmaps': self.heatmaps or [],
@@ -296,6 +320,9 @@ class YouTubeVideo:
         video.channel_is_verified = data.get('channel_is_verified')
         video.channel_follower_count = data.get('channel_follower_count')
         video.availability = data.get('availability')
+        video.available_country_codes = set(
+            data.get('available_country_codes', [])
+        )
         video.view_count = data.get('view_count')
         video.like_count = data.get('like_count')
         video.dislike_count = data.get('dislike_count')
@@ -469,6 +496,11 @@ class YouTubeVideo:
         not update the formats, chapters, or captions - for that you would
         need to call scrape() again.
 
+        Calling this function too frequently may lead to rate limiting or
+        CAPTCHAs, so a delay is included between the request and the scrape.
+        The default delay is 1 second, but it can be increased if you are
+        making frequent calls to update() on many videos.
+
         :returns: (none)
         :raises: ValueError, RuntimeError
         '''
@@ -493,8 +525,8 @@ class YouTubeVideo:
             )
         except ValueError:
             _LOGGER.warning(
-                f'Video page not found for video {self.video_id} '
-                f'at URL {self.url}'
+                'Video page not found for video',
+                extra={'video_id': self.video_id, 'url': self.url}
             )
             raise
 
@@ -512,14 +544,14 @@ class YouTubeVideo:
         video_id: str, channel_name: str | None,
         channel_thumbnail: YouTubeThumbnail | None,
         deno_path: str = DENO_PATH, po_token_url: str = PO_TOKEN_URL,
-        browse_client: AsyncYouTubeClient | None = None,
-        download_client: YoutubeDL | None = None,
+        ytdlp_cache_dir: str = YTDLP_CACHE_DIR, download_client: YoutubeDL | None = None,
         debug: bool = False, save_dir: str | None = None,
         filename_prefix: str = '', with_formats: bool = True,
         proxies: list[str] = []
     ) -> Self | None:
         '''
-        Collects data about a video by scraping the webpage for the video
+        Collects data about a video using InnerTube API and optionally yt-dlp
+        for format extraction.
 
         :param video_id: YouTube video ID
         :param channel_name: Name of the channel that we are scraping the
@@ -528,13 +560,17 @@ class YouTubeVideo:
         page
         '''
 
-        if not browse_client:
-            browse_client = AsyncYouTubeClient(proxies=proxies)
+        if not proxies:
+            proxy: str | None = YouTubeRateLimiter.get().select_proxy(
+                YouTubeCallType.PLAYER
+            )
+        else:
+            proxy = random.choice(proxies)
 
         instantiated_download_client: bool = False
         if not download_client:
             download_client = YouTubeVideo._setup_download_client(
-                browse_client, deno_path, po_token_url, debug, proxies=proxies
+                deno_path, po_token_url, ytdlp_cache_dir, debug, proxy=proxy,
             )
             instantiated_download_client = True
 
@@ -542,14 +578,13 @@ class YouTubeVideo:
             video_id=video_id,
             channel_name=channel_name,
             channel_thumbnail=channel_thumbnail,
-            browse_client=browse_client,
             download_client=download_client,
         )
 
-        await self.update(browse_client)
+        await self.from_innertube(proxy=proxy)
 
         if with_formats:
-            await self._scrape_video()
+            await self._scrape_video(proxy=proxy)
 
         if save_dir:
             await self.to_file(save_dir, filename_prefix)
@@ -636,8 +671,10 @@ class YouTubeVideo:
 
     @staticmethod
     def _setup_download_client(
-        browse_client: AsyncYouTubeClient, deno_path: str, po_token_url: str,
-        debug: bool = False, proxies: list[str] = []
+        deno_path: str, po_token_url: str,
+        ytdlp_cache_dir: str = YTDLP_CACHE_DIR,
+        debug: bool = False, proxy: str | None = None,
+        cookie_file: str | None = None
     ) -> YoutubeDL:
         '''
         Set up the yt-dlp download client with appropriate options for
@@ -648,6 +685,7 @@ class YouTubeVideo:
         execution
         :param po_token_url: the URL to fetch PO tokens for YouTube scraping
         :param debug: whether to enable debug logging
+        :param proxy: optional proxy URL for yt-dlp requests
         :returns: configured YoutubeDL instance
         :raises: ValueError if required parameters are missing
         '''
@@ -657,17 +695,23 @@ class YouTubeVideo:
         if not po_token_url:
             raise ValueError('po_token_url is required if no download_client')
 
-        _LOGGER.debug(f'Using deno: {deno_path}, po-token-url: {po_token_url}')
+        _LOGGER.debug(
+            'Using deno and po-token-url',
+            extra={
+                'deno_path': deno_path,
+                'po_token_url': po_token_url,
+            }
+        )
 
+        from .youtube_client import CONSENT_COOKIES
         with tempfile.NamedTemporaryFile(mode='w') as temp_file:
             temp_file.write('# Netscape HTTP Cookie File\n')
-            for name, value in browse_client.consent_cookies.items():
+            for name, value in CONSENT_COOKIES.items():
                 temp_file.write(
                     f'.youtube.com\tTRUE\t/\tFALSE\t0\t{name}\t{value}\n'
                 )
             temp_file.flush()
             cookie_file_path: str = temp_file.name
-            proxy: str | None = random.choice(proxies) if proxies else None
             ytdlp_opts: dict = {
                 'quiet': not debug,
                 'verbose': debug,
@@ -676,17 +720,20 @@ class YouTubeVideo:
                 'no_color': True,
                 'format': 'all',
                 'proxy': proxy,
-                'http_headers': dict(browse_client.headers),
                 'cookiefile': cookie_file_path,
+                'cachedir': ytdlp_cache_dir,
                 'js_runtimes': {'deno': {'path': deno_path}},
                 'extractor_args': {
                     'youtube': {
-                        'player-client': 'default,mweb',
+                        'player-client': 'tv,mweb',
                         'youtubepot-bgutilhttp:base_url': po_token_url
                     }
                 },
                 'remote_components': ['ejs:github']
             }
+            if cookie_file:
+                ytdlp_opts['cookiefile'] = cookie_file
+
             download_client = YoutubeDL(ytdlp_opts)
         return download_client
 
@@ -870,8 +917,11 @@ class YouTubeVideo:
                 thumb_list.append(thumbnail)
             else:
                 _LOGGER.debug(
-                    f'Not importing thumbnail without size '
-                    f'({thumbnail.size}) or URL ({thumbnail.url})'
+                    'Not importing thumbnail without size or URL',
+                    extra={
+                        'size': thumbnail.size,
+                        'url': thumbnail.url,
+                    }
                 )
 
         if not thumb_list:
@@ -921,10 +971,12 @@ class YouTubeVideo:
 
         return False
 
-    async def _scrape_video(self) -> None:
+    async def _scrape_video(self, proxy: str | None = None) -> None:
         '''
         Collects data about a video by scraping the webpage for the video.
 
+        :param proxy: proxy to acquire the rate-limit token for; when None
+            the limiter auto-selects from the registered pool.
         :returns: (none)
         :raises: (none)
         '''
@@ -934,14 +986,37 @@ class YouTubeVideo:
                 'No download_client available for scraping video'
             )
 
+        proxy, cookie_file = await YouTubeRateLimiter.get().acquire(
+            YouTubeCallType.PLAYER, proxy=proxy,
+        )
+        self.download_client.params['proxy'] = proxy
+        if cookie_file:
+            self.download_client.params['cookiefile'] = cookie_file
+
         try:
-            _LOGGER.debug(f'Scraping YouTube video: {self.video_id}')
-            video_info: dict[str, any] = \
-                self.download_client.extract_info(
-                    self.url, download=False
+            _LOGGER.debug(
+                'Scraping YouTube video',
+                extra={'video_id': self.video_id}
+            )
+            loop = asyncio.get_event_loop()
+            proxy_label: str = proxy or 'none'
+            METRIC_EXTRACT_INFO_ACTIVE.labels(proxy=proxy_label).inc()
+            try:
+                video_info: dict[str, any] = await loop.run_in_executor(
+                    None,
+                    lambda: self.download_client.extract_info(
+                        self.url, download=False
+                    )
                 )
+            finally:
+                METRIC_EXTRACT_INFO_ACTIVE.labels(
+                    proxy=proxy_label
+                ).dec()
             if video_info:
-                _LOGGER.debug(f'Collected info for video: {self.video_id}')
+                _LOGGER.debug(
+                    'Collected info for video',
+                    extra={'video_id': self.video_id}
+                )
             else:
                 sleepy_time: int = randrange(10, 30)
                 await sleep(sleepy_time)
@@ -1025,7 +1100,8 @@ class YouTubeVideo:
         self.formats = self._parse_formats(video_info['formats'])
 
         _LOGGER.debug(
-            f'Parsed all available data for video: {self.video_id}'
+            'Parsed all available data for video',
+            extra={'video_id': self.video_id}
         )
 
     @staticmethod
@@ -1039,6 +1115,9 @@ class YouTubeVideo:
 
         return formats
 
-    async def from_innertube(self, innertube: InnerTube | None = None) -> None:
-        await InnerTubeVideoParser.scrape(self, innertube)
-        self.embed_url = YouTubeVideo.EMBED_URL.format(video_id=self.video_id)
+    async def from_innertube(self, innertube: InnerTube | None = None,
+                             proxy: str | None = None,
+                             ) -> None:
+        await InnerTubeVideoParser.scrape(
+            self, innertube, proxy=proxy
+        )

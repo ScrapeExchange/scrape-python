@@ -1,0 +1,226 @@
+# Prometheus alerting rules for the YouTube scraper fleet.
+#
+# Load from prometheus.yml via:
+#   rule_files:
+#     - /etc/prometheus/rules/prometheus-alerts-youtube.yml
+#
+# Thresholds are tuned for the current production layout:
+#   video:   num_processes=6, concurrency=12  (72 async tasks)
+#   rss:     num_processes=4, concurrency=20  (80 async tasks)
+#   channel: num_processes=4, concurrency=14  (56 async tasks)
+#   proxies: 58
+# Re-tune if you scale the fleet significantly.
+#
+# All alerts route through the existing Alertmanager receivers via
+# the `severity` label. `scraper` label is preserved so dashboards
+# and notifications can group by tool.
+
+groups:
+
+  - name: youtube_scraper_failures
+    interval: 30s
+    rules:
+
+      # --- VIDEO -----------------------------------------------------
+
+      - alert: YtVideoSuccessFractionLow
+        expr: |
+          sum(rate(yt_video_proxy_videos_scraped_total[15m]))
+          /
+          (
+            sum(rate(yt_video_proxy_videos_scraped_total[15m]))
+            +
+            sum(rate(yt_video_proxy_scrape_failures_total[15m]))
+          ) < 0.60
+        for: 15m
+        labels:
+          severity: warning
+          scraper: video
+        annotations:
+          summary: "Video scraper success fraction below 60%"
+          description: |
+            Only {{ $value | humanizePercentage }} of video scrape
+            attempts are succeeding over the last 15m. Check the
+            failure breakdown panel and consider scaling
+            video_num_processes *down* if rate_limit is dominant.
+
+      - alert: YtVideoSuccessFractionCritical
+        expr: |
+          sum(rate(yt_video_proxy_videos_scraped_total[15m]))
+          /
+          (
+            sum(rate(yt_video_proxy_videos_scraped_total[15m]))
+            +
+            sum(rate(yt_video_proxy_scrape_failures_total[15m]))
+          ) < 0.30
+        for: 15m
+        labels:
+          severity: critical
+          scraper: video
+        annotations:
+          summary: "Video scraper success fraction below 30%"
+          description: |
+            Video scraper is failing {{ $value | humanizePercentage }}
+            of attempts. Strong signal of YouTube blocking or proxy
+            pool exhaustion.
+
+      - alert: YtVideoRateLimitFailuresHigh
+        expr: |
+          sum(rate(yt_video_proxy_scrape_failures_total{
+            reason="rate_limit"
+          }[10m])) > 0.10
+        for: 10m
+        labels:
+          severity: warning
+          scraper: video
+        annotations:
+          summary: "Video scraper sustained rate_limit failures"
+          description: |
+            {{ $value | humanize }} rate_limit failures/s sustained
+            for 10m. Per-IP ceiling likely hit; scale
+            video_num_processes down rather than up.
+
+      - alert: YtVideoRateLimiterHitsHigh
+        expr: |
+          sum(rate(yt_video_proxy_rate_limit_hits_total[10m])) > 0.50
+        for: 10m
+        labels:
+          severity: warning
+          scraper: video
+        annotations:
+          summary: "Video rate limiter acquiring slowly"
+          description: |
+            {{ $value | humanize }} rate-limit hits/s over 10m —
+            workers are spending significant time waiting on the
+            token bucket.
+
+      - alert: YtVideoThroughputCollapsed
+        expr: |
+          sum(rate(yt_video_proxy_videos_scraped_total[15m])) < 0.05
+          and
+          sum(yt_video_proxy_queue_size) > 1000
+        for: 15m
+        labels:
+          severity: critical
+          scraper: video
+        annotations:
+          summary: "Video scraper throughput near zero with backlog"
+          description: |
+            Scrape rate is {{ $value | humanize }} videos/s while
+            the queue still has pending work. Workers are stuck
+            (rate limiter, backoff, or upstream block).
+
+      # --- RSS -------------------------------------------------------
+
+      - alert: YtRssFeedFailureRateHigh
+        expr: |
+          sum(rate(yt_rss_feed_download_failures_total[15m]))
+          /
+          (
+            sum(rate(yt_rss_feeds_downloaded_total[15m]))
+            +
+            sum(rate(yt_rss_feed_download_failures_total[15m]))
+          ) > 0.20
+        for: 15m
+        labels:
+          severity: warning
+          scraper: rss
+        annotations:
+          summary: "RSS feed download failure rate above 20%"
+          description: |
+            {{ $value | humanizePercentage }} of RSS feed fetches
+            are failing over the last 15m.
+
+      - alert: YtRssFeedFailureRateCritical
+        expr: |
+          sum(rate(yt_rss_feed_download_failures_total[15m]))
+          /
+          (
+            sum(rate(yt_rss_feeds_downloaded_total[15m]))
+            +
+            sum(rate(yt_rss_feed_download_failures_total[15m]))
+          ) > 0.50
+        for: 15m
+        labels:
+          severity: critical
+          scraper: rss
+        annotations:
+          summary: "RSS feed download failure rate above 50%"
+          description: |
+            {{ $value | humanizePercentage }} of RSS feed fetches
+            are failing. YouTube likely blocking or proxies broken.
+
+      - alert: YtRssInnertubeFailuresHigh
+        expr: |
+          sum(rate(yt_rss_innertube_call_failures_total[10m])) > 0.20
+        for: 10m
+        labels:
+          severity: warning
+          scraper: rss
+        annotations:
+          summary: "RSS innertube call failures sustained"
+          description: |
+            {{ $value | humanize }} innertube failures/s over 10m —
+            often the first signal of YouTube bot detection on
+            the RSS path.
+
+      # --- CHANNEL ---------------------------------------------------
+
+      # no_content_found is subtracted because it's a legitimate
+      # "this channel has no uploads" outcome, not a failure.
+      - alert: YtChannelRealFailureRateHigh
+        expr: |
+          (
+            sum(rate(yt_channel_scrape_failures_total[15m]))
+            -
+            sum(rate(yt_channel_no_content_found_total[15m]))
+          )
+          /
+          sum(rate(yt_channel_scraped_total[15m])) > 0.20
+        for: 15m
+        labels:
+          severity: warning
+          scraper: channel
+        annotations:
+          summary: "Channel scraper real failure rate above 20%"
+          description: |
+            {{ $value | humanizePercentage }} of channel scrapes
+            are failing for reasons other than empty channels.
+
+      - alert: YtChannelIdResolutionFailing
+        expr: |
+          sum(rate(yt_channel_id_resolution_failures_total[15m]))
+          /
+          (
+            sum(rate(yt_channel_ids_resolved_total[15m]))
+            +
+            sum(rate(yt_channel_id_resolution_failures_total[15m]))
+          ) > 0.30
+        for: 15m
+        labels:
+          severity: warning
+          scraper: channel
+        annotations:
+          summary: "Channel ID resolution failing above 30%"
+          description: |
+            {{ $value | humanizePercentage }} of channel handle →
+            ID lookups are failing. Upstream or innertube issue.
+
+      # --- FLEET-WIDE ------------------------------------------------
+
+      - alert: YtScraperSupervisorMissing
+        expr: |
+          absent(scraper_num_processes{role="supervisor",scraper="video"})
+          or
+          absent(scraper_num_processes{role="supervisor",scraper="rss"})
+          or
+          absent(scraper_num_processes{role="supervisor",scraper="channel"})
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "One or more YouTube scraper supervisors is missing"
+          description: |
+            No supervisor metrics seen for at least one scraper
+            (video, rss, or channel) in the last 5m. Process
+            died or Prometheus scrape target is unreachable.

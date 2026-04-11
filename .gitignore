@@ -3,7 +3,10 @@
 tests/collateral/youtube_videos
 tests/collateral/local
 
-.env*
+.env
+.env-dev
+.env-prod
+
 *.swp
 
 .claude/

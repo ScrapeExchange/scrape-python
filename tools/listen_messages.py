@@ -173,8 +173,11 @@ def _matches_client_filters(
 async def _listen(args: argparse.Namespace) -> None:
     subscription: dict = _build_subscription(args)
 
-    _LOGGER.info(f'Connecting to {args.url}')
-    _LOGGER.debug(f'Subscription request: {subscription}')
+    _LOGGER.info('Connecting', extra={'url': args.url})
+    _LOGGER.debug(
+        'Subscription request',
+        extra={'subscription': subscription},
+    )
 
     try:
         async with websockets.connect(args.url) as ws:
@@ -208,8 +211,12 @@ async def _listen(args: argparse.Namespace) -> None:
 
                 if not _matches_client_filters(data, args):
                     _LOGGER.debug(
-                        'Message filtered out: '
-                        f'{data.get("platform_content_id")}'
+                        'Message filtered out',
+                        extra={
+                            'platform_content_id': data.get(
+                                'platform_content_id'
+                            ),
+                        },
                     )
                     continue
 
