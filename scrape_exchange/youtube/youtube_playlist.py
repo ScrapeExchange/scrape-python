@@ -128,7 +128,8 @@ class YouTubePlaylist:
         content_type: str = lvm.get('contentType', '')
         if content_type != 'LOCKUP_CONTENT_TYPE_PLAYLIST':
             _LOGGER.debug(
-                f'Skipping non-playlist lockup: {content_type}'
+                'Skipping non-playlist lockup',
+                extra={'content_type': content_type}
             )
             return None
 

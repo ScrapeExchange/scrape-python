@@ -7,14 +7,22 @@ to keep the source files to a managable length
 :license    : GPLv3
 '''
 
+import asyncio
+import logging
 import re
+import time
 
 from datetime import datetime
 from innertube import InnerTube
+from innertube.errors import RequestError as InnerTubeRequestError
 
 from dateutil import parser as dateutil_parser
 
+from .youtube_caption import YouTubeCaption
+from .youtube_client import METRIC_YT_REQUEST_DURATION
 from .youtube_format import YouTubeFormat
+from .youtube_cookiejar import YouTubeCookieJar
+from .youtube_rate_limiter import YouTubeRateLimiter, YouTubeCallType
 from .youtube_thumbnail import YouTubeThumbnail
 from .youtube_videochapter import YouTubeVideoChapter
 
@@ -107,27 +115,83 @@ def _extract_comment_count(next_data: dict) -> int | None:
 
 
 class InnerTubeVideoParser:
-    def __init__(self, video: YouTubeVideo, innertube: InnerTube | None = None) -> None:
+    def __init__(self, video: YouTubeVideo, innertube: InnerTube | None = None,
+                 proxy: str | None = None) -> None:
         self.video: YouTubeVideo | None = video
 
         self.innertube: InnerTube
         if innertube:
             self.innertube = innertube
         else:
-            self.innertube = InnerTube('WEB')
+            if not proxy:
+                logging.warning(
+                    'No proxy configured, proceeding without proxy'
+                )
+            self.innertube = InnerTube('WEB', proxies=proxy)
+            YouTubeCookieJar.get().load_into_session(
+                self.innertube.adaptor.session, proxy
+            )
 
     @staticmethod
-    async def scrape(video: YouTubeVideo, innertube: InnerTube | None = None
-                     ) -> None:
-        self = InnerTubeVideoParser(video, innertube)
+    async def scrape(video: YouTubeVideo, innertube: InnerTube | None = None,
+                     proxy: str | None = None,
+                     max_retries: int = 4) -> None:
+        self = InnerTubeVideoParser(video, innertube, proxy)
+        limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
 
-        try:
-            player_data: dict = self.innertube.player(video.video_id)
-        except Exception as exc:
-            raise RuntimeError(f'Innertube API call failed: {exc}')
+        _PLAYER_PENALTY_INITIAL: float = 4.0
+        _PLAYER_PENALTY_MAX: float = 300.0
+        penalty: float = _PLAYER_PENALTY_INITIAL
+
+        player_data: dict | None = None
+        for attempt in range(1, max_retries + 1):
+            proxy, _ = await limiter.acquire(
+                YouTubeCallType.PLAYER, proxy=proxy
+            )
+            start: float = time.monotonic()
+            try:
+                player_data = self.innertube.player(video.video_id)
+                METRIC_YT_REQUEST_DURATION.labels(
+                    kind='innertube', status_class='2xx'
+                ).observe(time.monotonic() - start)
+                break
+            except InnerTubeRequestError as exc:
+                METRIC_YT_REQUEST_DURATION.labels(
+                    kind='innertube',
+                    status_class=(
+                        '4xx' if exc.error.code == 429 else 'error'
+                    ),
+                ).observe(time.monotonic() - start)
+                if exc.error.code == 429:
+                    await limiter.penalise(
+                        YouTubeCallType.PLAYER, proxy, penalty
+                    )
+                    await limiter.penalise(
+                        YouTubeCallType.NEXT, proxy, penalty
+                    )
+                    logging.warning(
+                        'InnerTube PLAYER 429 for %s (attempt %d/%d), '
+                        'penalty %.1fs',
+                        video.video_id, attempt, max_retries, penalty,
+                    )
+                    penalty = min(penalty * 2, _PLAYER_PENALTY_MAX)
+                    if attempt == max_retries:
+                        raise RuntimeError(
+                            f'InnerTube PLAYER rate-limited after '
+                            f'{max_retries} attempts: {exc}'
+                        )
+                    await asyncio.sleep(penalty)
+                else:
+                    raise RuntimeError(
+                        f'InnerTube API call failed: {exc}'
+                    )
+            except Exception as exc:
+                METRIC_YT_REQUEST_DURATION.labels(
+                    kind='innertube', status_class='error'
+                ).observe(time.monotonic() - start)
+                raise RuntimeError(f'InnerTube API call failed: {exc}')
 
         video_details: dict = player_data.get('videoDetails', {})
-        streaming_data: dict = player_data.get('streamingData', {})
         captions_data: dict = player_data.get('captions', {})
         microformat: dict = player_data.get(
             'microformat', {}
@@ -139,6 +203,10 @@ class InnerTubeVideoParser:
         video.description = video_details.get(
             'shortDescription', video.description
         )
+        video.url = microformat.get('canonicalUrl', video.url)
+        video.embed_url = microformat.get(
+            'embed', {}
+        ).get('iframeUrl', video.embed_url)
 
         video.duration = _safe_int(video_details.get('lengthSeconds'))
 
@@ -154,27 +222,46 @@ class InnerTubeVideoParser:
 
         video.channel_id = video_details.get('channelId', video.channel_id)
         video.channel_name = video_details.get('author', video.channel_name)
+        video.channel_url = microformat.get(
+            'ownerProfileUrl', video.channel_url
+        )
+        video.is_live = bool(
+            video_details.get('isLiveContent', video.is_live)
+        )
+        video.was_live = bool(
+            video_details.get('isLiveContent', video.was_live)
+        )
+        if microformat.get('isUnlisted', False):
+            video.privacy_status = 'private'
+        else:
+            video.privacy_status = 'public'
 
-        video.is_live = bool(video_details.get('isLive', video.is_live))
-        video.was_live = bool(video_details.get(
-            'isLiveContent', video.was_live)
-                            )
         video.keywords |= set(video_details.get('keywords', {}))
         video.tags |= set(video_details.get('tags', {}))
-
+        video.available_country_codes |= set(
+            microformat.get('availableCountries', [])
+        )
         video.is_family_safe = microformat.get(
             'isFamilySafe', video.is_family_safe
         )
 
         video.view_count = _safe_int(video_details.get('viewCount'))
-
+        video.like_count = _safe_int(microformat.get('likeCount'))
         playability: dict = player_data.get('playabilityStatus', {})
-        video.age_restricted = playability.get('status') == 'LOGIN_REQUIRED'
-
-        thumbnails_data = microformat.get('thumbnail', {}).get('thumbnails', [])
+        video.age_restricted = (
+            playability.get('status') == 'LOGIN_REQUIRED'
+        )
+        video.is_tv_film_video = video_details.get(
+            'isTvFilmVideo', video.is_tv_film_video
+        )
+        thumbnails_data = video_details.get(
+            'thumbnail', {}
+        ).get('thumbnails', [])
         for thumbnail_data in thumbnails_data:
             thumbnail = YouTubeThumbnail(thumbnail_data)
-            label: str = thumbnail.id or f'{thumbnail.width}x{thumbnail.height}'
+            label: str = (
+                thumbnail.id or f'{thumbnail.width}x{thumbnail.height}'
+            )
             if label and label not in video.thumbnails:
                 video.thumbnails[label] = thumbnail
 
@@ -188,17 +275,61 @@ class InnerTubeVideoParser:
         for format_data in video_details.get('formats') or []:
             video.formats.add(YouTubeFormat(format_data))
 
-        # Have not seen captions in InnerTube output. This is untested
         if captions_data:
-            video.subtitles |= InnerTubeVideoParser.parse_captions(
+            parsed_captions: dict = InnerTubeVideoParser.parse_captions(
                 captions_data
             )
+            for entry in parsed_captions.get('subtitles', []):
+                lang: str = entry.get('language_code', 'unknown')
+                video.subtitles[lang] = YouTubeCaption(lang, entry)
+            for entry in parsed_captions.get('automatic_captions', []):
+                lang: str = entry.get('language_code', 'unknown')
+                video.automatic_captions[lang] = YouTubeCaption(lang, entry)
 
-        try:
-            next_data: dict[str, any] = self.innertube.next(video.video_id)
-            self._parse_next_data(next_data)
-        except Exception:
-            pass
+        _next_penalty: float = _PLAYER_PENALTY_INITIAL
+        for attempt in range(1, max_retries + 1):
+            await limiter.acquire(YouTubeCallType.NEXT, proxy=proxy)
+            next_start: float = time.monotonic()
+            try:
+                next_data: dict[str, any] = self.innertube.next(
+                    video.video_id
+                )
+                METRIC_YT_REQUEST_DURATION.labels(
+                    kind='innertube', status_class='2xx'
+                ).observe(time.monotonic() - next_start)
+                self._parse_next_data(next_data)
+                break
+            except InnerTubeRequestError as exc:
+                METRIC_YT_REQUEST_DURATION.labels(
+                    kind='innertube',
+                    status_class=(
+                        '4xx' if exc.error.code == 429 else 'error'
+                    ),
+                ).observe(time.monotonic() - next_start)
+                if exc.error.code == 429:
+                    await limiter.penalise(
+                        YouTubeCallType.NEXT, proxy, _next_penalty
+                    )
+                    await limiter.penalise(
+                        YouTubeCallType.PLAYER, proxy, _next_penalty
+                    )
+                    logging.warning(
+                        'InnerTube NEXT 429 for %s (attempt %d/%d), '
+                        'penalty %.1fs',
+                        video.video_id, attempt, max_retries, _next_penalty,
+                    )
+                    _next_penalty = min(
+                        _next_penalty * 2, _PLAYER_PENALTY_MAX
+                    )
+                    if attempt < max_retries:
+                        await asyncio.sleep(_next_penalty)
+                else:
+                    break  # non-429 error on NEXT: skip silently
+            except Exception:
+                METRIC_YT_REQUEST_DURATION.labels(
+                    kind='innertube', status_class='error'
+                ).observe(time.monotonic() - next_start)
+                break  # NEXT is best-effort; never fail the whole scrape
 
         return video
 

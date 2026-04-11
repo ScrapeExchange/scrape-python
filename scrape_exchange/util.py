@@ -2,16 +2,10 @@
 Docstring for scrape_exchange.util
 '''
 
-from os import path
-from enum import Enum
 from datetime import datetime
-import os
 
 from .datatypes import IngestStatus
-
-
-VIDEO_FILE_PREFIX: str = 'video-'
-CHANNEL_FILE_PREFIX: str = 'channel-'
+from .file_management import AssetFileManagement
 
 
 def convert_number_string(number_text: str | int) -> int | None:
@@ -50,49 +44,72 @@ def convert_number_string(number_text: str | int) -> int | None:
     return count
 
 
-def get_imported_assets(save_dir: str | None = None,
-                        uploaded_dir: str | None = None
-                        ) -> dict[str, tuple[Enum, datetime]]:
+def get_imported_assets(
+    save_dir: str | None = None,
+) -> dict[str, tuple[IngestStatus, datetime]]:
     '''
-    Reads the save directory for already ingested videos and returns a mapping
-    of video IDs to their ingest status and published timestamp.
+    Read *save_dir* (and its ``uploaded/`` subdirectory) for already-ingested
+    YouTube videos and return a mapping of bare video IDs to their ingest
+    status and modification timestamp.
 
-    :param save_dir: The directory where scraped video data is saved
-    :param uploaded_dir: Optional directory where uploaded video data is saved.
-    If not provided, uploaded videos will be read from <save_dir>/uploaded
-    :returns: A dictionary mapping YouTube video IDs to a tuple of ingest
-              status and published timestamp
-    :raises: RuntimeError if the save directory cannot be read
+    Asset discovery is delegated to
+    :class:`scrape_exchange.file_management.AssetFileManagement`, which
+    enumerates ``video-*-{id}.json.br`` files across both the base and
+    uploaded directories.  When the same video ID appears in multiple
+    locations the ``UPLOADED`` status takes precedence over ``SCRAPED``;
+    within the same status, the most recent modification time wins.
+
+    :param save_dir: The directory where scraped video data is saved.
+    :returns: Dict mapping bare video IDs (no prefix, no suffix) to a
+        ``(IngestStatus, datetime)`` tuple.
+    :raises RuntimeError: If *save_dir* cannot be read.
     '''
+    if not save_dir:
+        return {}
+
+    try:
+        afm = AssetFileManagement(save_dir)
+    except OSError as exc:
+        raise RuntimeError(
+            f'Failed to access asset directory {save_dir}: {exc}'
+        ) from exc
 
     imported_assets: dict[str, tuple[IngestStatus, datetime]] = {}
-
-    def _get_assets(directory: str, ingest_status: IngestStatus) -> None:
-        try:
-            asset_id: str
-            entry: os.DirEntry
-            for entry in os.scandir(directory):
-                if (entry.is_file() and entry.name.startswith('video-')
-                        and entry.name.endswith('.json')):
-                    asset_id = path.splitext(entry.name)[0]
-                    timestamp: datetime = entry.stat().st_mtime
-                    imported_assets[asset_id] = (
-                        ingest_status, datetime.fromtimestamp(timestamp)
-                    )
-        except Exception as exc:
-            raise RuntimeError(
-                f'Failed to read imported assets from {directory}: {exc}'
-            ) from exc
-
-    if save_dir:
-        _get_assets(save_dir, IngestStatus.SCRAPED)
-
-        if not uploaded_dir:
-            uploaded_dir = f'{save_dir}/uploaded'
-
-        _get_assets(uploaded_dir, IngestStatus.UPLOADED)
+    try:
+        for video_id, is_uploaded, mtime in afm.iter_assets('video'):
+            new_status: IngestStatus = (
+                IngestStatus.UPLOADED if is_uploaded else IngestStatus.SCRAPED
+            )
+            new_ts: datetime = datetime.fromtimestamp(mtime)
+            existing = imported_assets.get(video_id)
+            if (existing is None
+                    or _should_replace(existing, new_status, new_ts)):
+                imported_assets[video_id] = (new_status, new_ts)
+    except OSError as exc:
+        raise RuntimeError(
+            f'Failed to read imported assets from {save_dir}: {exc}'
+        ) from exc
 
     return imported_assets
+
+
+def _should_replace(
+    existing: tuple[IngestStatus, datetime],
+    new_status: IngestStatus,
+    new_ts: datetime,
+) -> bool:
+    '''
+    Decide whether *new_status*/*new_ts* should overwrite *existing* in the
+    imported-assets map: ``UPLOADED`` always wins over ``SCRAPED``; within the
+    same status the newer timestamp wins.
+    '''
+    old_status, old_ts = existing
+    if (new_status == IngestStatus.UPLOADED
+            and old_status != IngestStatus.UPLOADED):
+        return True
+    if new_status == old_status and new_ts > old_ts:
+        return True
+    return False
 
 
 def split_quoted_string(text: str, delimiters: str = ', ') -> set[str]:
