@@ -379,17 +379,17 @@ async def _run_worker(settings: VideoSettings) -> None:
 
     try:
         start_http_server(settings.metrics_port)
+        logging.info(
+            'Prometheus metrics available',
+            extra={'metrics_port': settings.metrics_port},
+        )
     except OSError as exc:
-        logging.critical(
-            'Failed to bind Prometheus metrics port',
+        logging.warning(
+            'Failed to bind Prometheus metrics port; '
+            'worker will run without metrics',
             exc=exc,
             extra={'metrics_port': settings.metrics_port},
         )
-        sys.exit(1)
-    logging.info(
-        'Prometheus metrics available',
-        extra={'metrics_port': settings.metrics_port},
-    )
     publish_config_metrics(
         role='worker', scraper_label='video',
         num_processes=1,
