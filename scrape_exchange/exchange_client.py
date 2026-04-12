@@ -8,6 +8,7 @@ Scrape.Exchange client used for uploading content
 
 
 import asyncio
+import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import logging
@@ -16,6 +17,12 @@ from typing import Any, Self, TYPE_CHECKING
 
 from httpx import AsyncClient, Response
 from prometheus_client import Counter, Gauge, Histogram
+
+from scrape_exchange.scrape_exchange_rate_limiter import (
+    ScrapeExchangeCallType,
+    ScrapeExchangeRateLimiter,
+    DEFAULT_429_PENALTY_SECONDS,
+)
 
 if TYPE_CHECKING:
     from scrape_exchange.file_management import AssetFileManagement
@@ -56,8 +63,16 @@ METRIC_UPLOAD_QUEUE_DROPPED: Counter = Counter(
 METRIC_BACKGROUND_UPLOADS: Counter = Counter(
     'exchange_client_background_uploads_total',
     'Background upload jobs processed, labelled by outcome '
-    '(success/failure).',
-    ['outcome'],
+    '(created/updated/failure) and entity type '
+    '(video/channel). "created" = HTTP 201 (new data), '
+    '"updated" = HTTP 200 (existing data refreshed).',
+    ['outcome', 'entity'],
+)
+METRIC_429_RECEIVED: Counter = Counter(
+    'exchange_client_429_received_total',
+    'Number of HTTP 429 responses received from the '
+    'Scrape.Exchange API, by method.',
+    ['method'],
 )
 
 
@@ -67,6 +82,24 @@ def _status_class(status_code: int | None) -> str:
     if status_code is None:
         return 'error'
     return f'{status_code // 100}xx'
+
+
+def _parse_retry_after(
+    response: Response, default: float,
+) -> float:
+    '''
+    Extract the ``Retry-After`` header value (seconds) from an
+    HTTP 429 response.  Falls back to *default* when the header
+    is absent or unparseable.
+    '''
+    header: str | None = response.headers.get('retry-after')
+    if header is None:
+        return default
+    try:
+        value: float = float(header)
+        return max(1.0, value)
+    except (ValueError, TypeError):
+        return default
 
 
 @dataclass
@@ -85,6 +118,7 @@ class _UploadJob:
     json: dict[str, Any]
     file_manager: 'AssetFileManagement | None' = None
     filename: str | None = None
+    entity: str = 'unknown'
     log_extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -141,29 +175,52 @@ class ExchangeClient(AsyncClient):
         )
 
     @staticmethod
-    async def setup(api_key_id: str, api_key_secret: str,
-                    exchange_url: str = SCRAPE_EXCHANGE_URL,
-                    retries: int = 3, delay: float = 1.0) -> Self:
+    async def setup(
+        api_key_id: str, api_key_secret: str,
+        exchange_url: str = SCRAPE_EXCHANGE_URL,
+        retries: int = 3, delay: float = 1.0,
+    ) -> Self:
         '''
-        Factory to create an instance of ExchangeClient and the JWT token for
-        later us.
+        Factory to create an instance of ExchangeClient and
+        the JWT token for later use.
+
+        When the ``EXCHANGE_JWT`` environment variable is set
+        (written by the supervisor), the pre-fetched JWT is
+        used directly and the token endpoint is not contacted.
+        This avoids N redundant auth calls when N child
+        processes start simultaneously.
 
         :param api_key_id: The API key ID for authentication.
-        :param api_key_secret: The API key secret for authentication.
-        :param api_url: The base URL of the Scrape.Exchange API.
+        :param api_key_secret: The API key secret.
+        :param exchange_url: The base URL of the API.
         :param retries: Number of retries on failure.
-        :param delay: Initial delay in seconds between retries (doubles each
-        retry).
+        :param delay: Initial delay in seconds between retries
+                      (doubles each retry).
         :returns: An initialized instance of ExchangeClient.
-        :raises: (none)
+        :raises: Exception if the JWT cannot be obtained after
+                 retries.
         '''
 
         self = ExchangeClient(exchange_url)
+
+        # If the supervisor already fetched a JWT, use it.
+        env_jwt: str | None = os.environ.get('EXCHANGE_JWT')
+        if env_jwt:
+            _LOGGER.info(
+                'Using pre-fetched JWT from supervisor',
+            )
+            self.jwt_header = env_jwt
+            self.headers['Authorization'] = self.jwt_header
+            return self
+
         attempt: int = 0
         while True:
             try:
-                self.jwt_header = await ExchangeClient.get_jwt_token(
-                    api_key_id, api_key_secret, self.exchange_url
+                self.jwt_header = (
+                    await ExchangeClient.get_jwt_token(
+                        api_key_id, api_key_secret,
+                        self.exchange_url,
+                    )
                 )
                 break
             except Exception as exc:
@@ -173,21 +230,32 @@ class ExchangeClient(AsyncClient):
                         'Retrying ExchangeClient setup',
                         exc=exc,
                         extra={
-                            'exchange_url': self.exchange_url,
-                            'exc_type': type(exc).__name__,
-                            'retries_left': retries - attempt,
+                            'exchange_url': (
+                                self.exchange_url
+                            ),
+                            'exc_type': (
+                                type(exc).__name__
+                            ),
+                            'retries_left': (
+                                retries - attempt
+                            ),
                         },
                     )
                     await asyncio.sleep(sleep_for)
                     attempt += 1
                     continue
                 _LOGGER.warning(
-                    'Failed to set up ExchangeClient after attempts',
+                    'Failed to set up ExchangeClient '
+                    'after attempts',
                     exc=exc,
                     extra={
-                        'exchange_url': self.exchange_url,
+                        'exchange_url': (
+                            self.exchange_url
+                        ),
                         'attempts': retries + 1,
-                        'exc_type': type(exc).__name__,
+                        'exc_type': (
+                            type(exc).__name__
+                        ),
                     },
                 )
                 raise
@@ -205,13 +273,15 @@ class ExchangeClient(AsyncClient):
         :raises: RuntimeError if the token retrieval fails.
         '''
 
-        async with AsyncClient(trust_env=False) as client:
+        async with AsyncClient(
+            trust_env=False, timeout=30.0,
+        ) as client:
             response: Response = await client.post(
                 f'{api_url}{TOKEN_ENDPOINT}',
                 data={
                     'api_key_id': api_key_id,
-                    'api_key_secret': api_key_secret
-                }
+                    'api_key_secret': api_key_secret,
+                },
             )
             _LOGGER.debug(
                 'Token endpoint response',
@@ -236,24 +306,37 @@ class ExchangeClient(AsyncClient):
 
             return jwt_header
 
-    async def get(self, url: str, retries: int = 3, delay: float = 1.0,
-                  **kwargs) -> Response:
+    async def get(
+        self, url: str, retries: int = 3,
+        delay: float = 1.0, **kwargs,
+    ) -> Response:
         '''
-        Overrides the AsyncClient get method to include the JWT token in the
-        headers.
+        Overrides the AsyncClient get method to include the JWT
+        token in the headers, rate-limit via
+        :class:`ScrapeExchangeRateLimiter`, and retry on HTTP 429.
 
         :param url: The URL to send the GET request to.
         :returns: The response from the GET request.
-        :raises: Exception if the GET request fails after the specified
-        number of retries.
+        :raises: Exception if the GET request fails after the
+                 specified number of retries.
         '''
+
+        limiter: ScrapeExchangeRateLimiter | None = (
+            ScrapeExchangeRateLimiter._instance
+        )
+        if limiter is not None:
+            await limiter.acquire(ScrapeExchangeCallType.GET)
 
         _LOGGER.debug('HTTP GET', extra={'url': url})
         start: datetime = datetime.now(UTC)
         try:
-            result: Response = await super().get(url, **kwargs)
+            result: Response = await super().get(
+                url, **kwargs,
+            )
         except Exception as exc:
-            duration: float = (datetime.now(UTC) - start).total_seconds()
+            duration: float = (
+                (datetime.now(UTC) - start).total_seconds()
+            )
             METRIC_REQUEST_DURATION.labels(
                 method='get', status_class='error'
             ).observe(duration)
@@ -269,7 +352,8 @@ class ExchangeClient(AsyncClient):
                     },
                 )
                 return await self.get(
-                    url, retries=retries - 1, delay=delay*2, **kwargs
+                    url, retries=retries - 1,
+                    delay=delay * 2, **kwargs,
                 )
             _LOGGER.warning(
                 'GET request failed after retries',
@@ -281,10 +365,40 @@ class ExchangeClient(AsyncClient):
             )
             raise exc
 
-        duration = (datetime.now(UTC) - start).total_seconds()
+        duration = (
+            (datetime.now(UTC) - start).total_seconds()
+        )
         METRIC_REQUEST_DURATION.labels(
-            method='get', status_class=_status_class(result.status_code)
+            method='get',
+            status_class=_status_class(result.status_code),
         ).observe(duration)
+
+        if result.status_code == 429:
+            METRIC_429_RECEIVED.labels(method='get').inc()
+            penalty: float = _parse_retry_after(
+                result, DEFAULT_429_PENALTY_SECONDS,
+            )
+            _LOGGER.warning(
+                'HTTP 429 from Scrape.Exchange on GET',
+                extra={
+                    'url': url,
+                    'penalty': penalty,
+                    'retries_left': retries,
+                },
+            )
+            if limiter is not None:
+                await limiter.penalise(
+                    ScrapeExchangeCallType.GET,
+                    None, penalty,
+                )
+            if retries > 0:
+                await asyncio.sleep(penalty)
+                return await self.get(
+                    url, retries=retries - 1,
+                    delay=delay, **kwargs,
+                )
+            return result
+
         _LOGGER.debug(
             'HTTP GET completed',
             extra={
@@ -295,27 +409,40 @@ class ExchangeClient(AsyncClient):
         )
         return result
 
-    async def post(self, url: str, retries: int = 3, delay: float = 1.0,
-                   **kwargs) -> Response:
+    async def post(
+        self, url: str, retries: int = 3,
+        delay: float = 1.0, **kwargs,
+    ) -> Response:
         '''
-        Overrides the AsyncClient post method to include retry logic with
-        exponential backoff.
+        Overrides the AsyncClient post method to include retry
+        logic with exponential backoff, rate-limit via
+        :class:`ScrapeExchangeRateLimiter`, and retry on HTTP 429.
 
         :param url: The URL to send the POST request to.
         :param retries: Number of retries on failure.
-        :param delay: Initial delay in seconds between retries (doubles each
-        retry).
+        :param delay: Initial delay in seconds between retries
+                      (doubles each retry).
         :returns: The response from the POST request.
-        :raises: Exception if the POST request fails after the specified
-        number of retries.
+        :raises: Exception if the POST request fails after the
+                 specified number of retries.
         '''
+
+        limiter: ScrapeExchangeRateLimiter | None = (
+            ScrapeExchangeRateLimiter._instance
+        )
+        if limiter is not None:
+            await limiter.acquire(ScrapeExchangeCallType.POST)
 
         _LOGGER.debug('HTTP POST', extra={'url': url})
         start: datetime = datetime.now(UTC)
         try:
-            result: Response = await super().post(url, **kwargs)
+            result: Response = await super().post(
+                url, **kwargs,
+            )
         except Exception as exc:
-            duration: float = (datetime.now(UTC) - start).total_seconds()
+            duration: float = (
+                (datetime.now(UTC) - start).total_seconds()
+            )
             METRIC_REQUEST_DURATION.labels(
                 method='post', status_class='error'
             ).observe(duration)
@@ -331,7 +458,8 @@ class ExchangeClient(AsyncClient):
                     },
                 )
                 return await self.post(
-                    url, retries=retries - 1, delay=delay*2, **kwargs
+                    url, retries=retries - 1,
+                    delay=delay * 2, **kwargs,
                 )
             _LOGGER.warning(
                 'POST request failed after retries',
@@ -343,10 +471,40 @@ class ExchangeClient(AsyncClient):
             )
             raise exc
 
-        duration = (datetime.now(UTC) - start).total_seconds()
+        duration = (
+            (datetime.now(UTC) - start).total_seconds()
+        )
         METRIC_REQUEST_DURATION.labels(
-            method='post', status_class=_status_class(result.status_code)
+            method='post',
+            status_class=_status_class(result.status_code),
         ).observe(duration)
+
+        if result.status_code == 429:
+            METRIC_429_RECEIVED.labels(method='post').inc()
+            penalty: float = _parse_retry_after(
+                result, DEFAULT_429_PENALTY_SECONDS,
+            )
+            _LOGGER.warning(
+                'HTTP 429 from Scrape.Exchange on POST',
+                extra={
+                    'url': url,
+                    'penalty': penalty,
+                    'retries_left': retries,
+                },
+            )
+            if limiter is not None:
+                await limiter.penalise(
+                    ScrapeExchangeCallType.POST,
+                    None, penalty,
+                )
+            if retries > 0:
+                await asyncio.sleep(penalty)
+                return await self.post(
+                    url, retries=retries - 1,
+                    delay=delay, **kwargs,
+                )
+            return result
+
         _LOGGER.debug(
             'HTTP POST completed',
             extra={
@@ -372,6 +530,7 @@ class ExchangeClient(AsyncClient):
         json: dict[str, Any],
         file_manager: 'AssetFileManagement | None' = None,
         filename: str | None = None,
+        entity: str = 'unknown',
         log_extra: dict[str, Any] | None = None,
     ) -> bool:
         '''
@@ -413,6 +572,7 @@ class ExchangeClient(AsyncClient):
             json=json,
             file_manager=file_manager,
             filename=filename,
+            entity=entity,
             log_extra=dict(log_extra or {}),
         )
         try:
@@ -476,7 +636,8 @@ class ExchangeClient(AsyncClient):
                     },
                 )
                 METRIC_BACKGROUND_UPLOADS.labels(
-                    outcome='failure'
+                    outcome='failure',
+                    entity=job.entity,
                 ).inc()
             finally:
                 self._upload_queue.task_done()
@@ -484,34 +645,64 @@ class ExchangeClient(AsyncClient):
                     self._upload_queue.qsize()
                 )
 
-    async def _perform_background_upload(self, job: _UploadJob) -> None:
+    async def _perform_background_upload(
+        self, job: _UploadJob,
+    ) -> None:
         '''
         Execute a single upload job: POST the payload (reusing
-        :meth:`post`'s retry loop), and on HTTP 201 mark the file as
-        uploaded via :meth:`AssetFileManagement.mark_uploaded`.
+        :meth:`post`'s retry loop), and on HTTP 200/201 mark
+        the file as uploaded via
+        :meth:`AssetFileManagement.mark_uploaded`.
+
+        The API returns 201 for newly created data and 200 for
+        existing data that was updated. Both are success and
+        are tracked separately via the ``outcome`` label
+        (``created`` vs ``updated``).
+
+        If the POST ultimately returns 429 (i.e. retries inside
+        :meth:`post` were also exhausted), the job is re-enqueued
+        so it will be retried after the rate-limiter penalty has
+        drained and other queued jobs have been processed.
         '''
 
         try:
-            resp: Response = await self.post(job.url, json=job.json)
+            resp: Response = await self.post(
+                job.url, json=job.json,
+            )
         except Exception as exc:
-            METRIC_BACKGROUND_UPLOADS.labels(outcome='failure').inc()
+            METRIC_BACKGROUND_UPLOADS.labels(
+                outcome='failure',
+                entity=job.entity,
+            ).inc()
             _LOGGER.warning(
                 'Background upload POST failed after retries',
                 exc=exc,
-                extra={'filename': job.filename, **job.log_extra},
+                extra={
+                    'filename': job.filename,
+                    **job.log_extra,
+                },
             )
             return
 
-        if resp.status_code == 201:
-            if job.file_manager is not None and job.filename is not None:
+        if resp.status_code in (200, 201):
+            outcome: str = (
+                'created' if resp.status_code == 201
+                else 'updated'
+            )
+            if (job.file_manager is not None
+                    and job.filename is not None):
                 try:
-                    await job.file_manager.mark_uploaded(job.filename)
+                    await job.file_manager.mark_uploaded(
+                        job.filename,
+                    )
                 except OSError as exc:
                     METRIC_BACKGROUND_UPLOADS.labels(
-                        outcome='failure'
+                        outcome='failure',
+                        entity=job.entity,
                     ).inc()
                     _LOGGER.warning(
-                        'Upload succeeded but mark_uploaded failed',
+                        'Upload succeeded but '
+                        'mark_uploaded failed',
                         exc=exc,
                         extra={
                             'filename': job.filename,
@@ -519,14 +710,52 @@ class ExchangeClient(AsyncClient):
                         },
                     )
                     return
-            METRIC_BACKGROUND_UPLOADS.labels(outcome='success').inc()
+            METRIC_BACKGROUND_UPLOADS.labels(
+                outcome=outcome,
+                entity=job.entity,
+            ).inc()
             _LOGGER.debug(
                 'Background upload succeeded',
-                extra={'filename': job.filename, **job.log_extra},
+                extra={
+                    'filename': job.filename,
+                    'outcome': outcome,
+                    **job.log_extra,
+                },
             )
             return
 
-        METRIC_BACKGROUND_UPLOADS.labels(outcome='failure').inc()
+        if resp.status_code == 429:
+            # post() already penalised the rate limiter and
+            # retried; if we still got 429 the server is under
+            # sustained pressure.  Re-enqueue so the job is
+            # retried after the penalty has elapsed and other
+            # queued work has drained.
+            _LOGGER.warning(
+                'Background upload got 429 after retries, '
+                're-enqueueing',
+                extra={
+                    'filename': job.filename,
+                    **job.log_extra,
+                },
+            )
+            try:
+                self._upload_queue.put_nowait(job)
+            except asyncio.QueueFull:
+                METRIC_UPLOAD_QUEUE_DROPPED.inc()
+                _LOGGER.warning(
+                    'Re-enqueue after 429 failed: '
+                    'queue full',
+                    extra={
+                        'filename': job.filename,
+                        **job.log_extra,
+                    },
+                )
+            return
+
+        METRIC_BACKGROUND_UPLOADS.labels(
+            outcome='failure',
+            entity=job.entity,
+        ).inc()
         _LOGGER.warning(
             'Background upload rejected by API',
             extra={

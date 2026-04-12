@@ -50,6 +50,9 @@ from scrape_exchange.scraper_supervisor import (
 )
 from scrape_exchange.settings import normalize_log_level
 from scrape_exchange.youtube.youtube_channel_tabs import YouTubeChannelTabs
+from scrape_exchange.scrape_exchange_rate_limiter import (
+    ScrapeExchangeRateLimiter,
+)
 from scrape_exchange.youtube.youtube_rate_limiter import (
     YouTubeRateLimiter, YouTubeCallType
 )
@@ -95,9 +98,11 @@ METRIC_QUEUE_SIZE = Gauge(
     'yt_rss_queue_size',
     'Number of channels in the processing queue',
 )
-METRIC_VIDEOS_UPLOADED = Counter(
-    'yt_rss_videos_uploaded_total',
-    'Total number of videos successfully uploaded to the data API',
+METRIC_VIDEOS_ENQUEUED = Counter(
+    'yt_rss_videos_enqueued_total',
+    'Total number of videos successfully enqueued for background '
+    'upload. Actual delivery is tracked by '
+    'exchange_client_background_uploads_total{entity="video"}.',
 )
 METRIC_API_CHANNEL_CALLS = Counter(
     'yt_rss_post_data_api_channel_calls_total',
@@ -216,7 +221,7 @@ class RssSettings(YouTubeScraperSettings):
     )
     metrics_port: int = Field(
         default=9500,
-        validation_alias=AliasChoices('METRICS_PORT', 'metrics_port'),
+        validation_alias=AliasChoices('RSS_METRICS_PORT', 'rss_metrics_port'),
         description='Port for the Prometheus metrics HTTP server',
     )
     rss_concurrency: int = Field(
@@ -397,8 +402,7 @@ def enqueue_upload_video(
     :returns: ``True`` if the job was enqueued, ``False`` if dropped.
     '''
 
-    METRIC_API_VIDEO_CALLS.inc()
-    return client.enqueue_upload(
+    enqueued: bool = client.enqueue_upload(
         f'{settings.exchange_url}{ExchangeClient.POST_DATA_API}',
         json={
             'username': settings.schema_owner,
@@ -411,11 +415,15 @@ def enqueue_upload_video(
             'platform_creator_id': channel_name,
             'platform_topic_id': None,
         },
+        entity='video',
         log_extra={
             'platform_content_id': video.video_id,
             'platform_creator_id': channel_name,
         },
     )
+    if enqueued:
+        METRIC_API_VIDEO_CALLS.inc()
+    return enqueued
 
 
 async def read_no_feeds_file(filepath: str) -> dict[str, tuple[str, str, int]]:
@@ -487,7 +495,7 @@ async def update_no_feeds(
 
 async def process_channel(
     channel_name: str, channel_id: str, client: ExchangeClient,
-    no_feeds: dict[str, tuple[str, str, int]], settings: RssSettings
+    no_feeds: dict[str, tuple[str, str, int]], settings: RssSettings,
 ) -> bool:
     '''
     Fetches the RSS feed for one channel and checks or stores each video.
@@ -557,7 +565,9 @@ async def process_channel(
 
     CHANNEL_LAST_CHECKED[channel_id] = monotonic()
 
-    if not await update_channel(client, channel_name, channel_id, proxy):
+    if not await update_channel(
+        client, channel_name, channel_id, proxy,
+    ):
         await update_no_feeds(
             channel_id, rss_url, channel_name, no_feeds, 1
         )
@@ -614,6 +624,7 @@ async def process_channel(
 
     videos_uploaded: int = 0
     videos_existing: int = 0
+    videos_failed: int = 0
     for video in videos:
         file_path: str = YouTubeVideo.get_filepath(
             video.video_id, settings.video_data_directory,
@@ -643,92 +654,114 @@ async def process_channel(
                 )
                 videos_existing += 1
                 continue
+        except Exception as exc:
+            logging.warning(
+                'Failed to check video existence on '
+                'scrape.exchange, will upload anyway',
+                exc=exc,
+                extra={'video_id': video.video_id},
+            )
 
-            await video.from_innertube(innertube=innertube, proxy=proxy)
+        try:
+            await video.from_innertube(
+                innertube=innertube, proxy=proxy,
+            )
             logging.debug('Updated video using InnerTube data')
         except Exception as exc:
             METRIC_INNERTUBE_FAILURES.inc()
             logging.warning(
-                'Failed to get InnerTube video data after retries, '
-                'will continue with what we have',
+                'Failed to get InnerTube video data, '
+                'will continue with RSS data',
                 exc=exc,
+                extra={'video_id': video.video_id},
             )
 
         try:
             filename: str = await video.to_file(
                 settings.video_data_directory,
                 filename_prefix=VIDEO_FILENAME_PREFIX,
-                overwrite=True
+                overwrite=True,
             )
-            logging.debug(
-                'Stored the file, video not yet on scrape.exchange, '
-                'uploading',
+        except Exception as exc:
+            logging.warning(
+                'Failed to write video file to disk, '
+                'skipping video',
+                exc=exc,
                 extra={
-                    'filename': filename,
+                    'video_id': video.video_id,
+                    'channel_name': channel_name,
+                },
+            )
+            videos_failed += 1
+            continue
+
+        logging.debug(
+            'Stored the file, video not yet on '
+            'scrape.exchange, uploading',
+            extra={
+                'filename': filename,
+                'channel_name': channel_name,
+                'video_id': video.video_id,
+                'title': video.title,
+            },
+        )
+        # Fire-and-forget: background worker handles the POST
+        # with retries. videos_uploaded counts successful
+        # enqueues; true delivery status is tracked by
+        # exchange_client_background_uploads_total.
+        if enqueue_upload_video(
+            client, settings, channel_name, video
+        ):
+            METRIC_VIDEOS_ENQUEUED.inc()
+            videos_uploaded += 1
+            logging.debug(
+                'Video enqueued for upload',
+                extra={
                     'channel_name': channel_name,
                     'video_id': video.video_id,
                     'title': video.title,
                 },
             )
-            # Fire-and-forget: background worker handles the POST
-            # with retries. videos_uploaded counts successful enqueues;
-            # true delivery status is tracked by
-            # exchange_client_background_uploads_total.
-            if enqueue_upload_video(
-                client, settings, channel_name, video
-            ):
-                METRIC_VIDEOS_UPLOADED.inc()
-                videos_uploaded += 1
-                logging.debug(
-                    'Video enqueued for upload',
-                    extra={
-                        'channel_name': channel_name,
-                        'video_id': video.video_id,
-                        'title': video.title,
-                    },
-                )
-        except RuntimeError as exc:
-            logging.warning(
-                'API error',
-                exc=exc,
-                extra={
-                    'channel_name': channel_name,
-                    'video_id': video.video_id,
-                },
-            )
 
-    missed: int = len(videos) - videos_uploaded - videos_existing
+    missed: int = (
+        len(videos) - videos_uploaded
+        - videos_existing - videos_failed
+    )
     logging.info(
-        'Uploaded videos for channel',
+        'Processed videos for channel',
         extra={
             'channel_name': channel_name,
             'videos_uploaded': videos_uploaded,
+            'videos_existing': videos_existing,
+            'videos_failed': videos_failed,
             'video_count': len(videos),
         },
     )
     if missed > 0:
         raise RuntimeError(
             f'{missed} out of {len(videos)} videos '
-            f'for channel {channel_name!r} could not be processed'
+            f'for channel {channel_name!r} could not '
+            f'be processed'
         )
 
     videos = []
     return True
 
 
-async def update_channel(client: ExchangeClient, channel_name: str,
-                         channel_id: str, proxy: str | None = None
-                         ) -> bool:
+async def update_channel(
+    client: ExchangeClient, channel_name: str,
+    channel_id: str, proxy: str | None = None,
+) -> bool:
     '''
-    Fetches channel metadata via InnerTube and updates the channel data on
-    Scrape Exchange via the data API.
+    Fetches channel metadata via InnerTube and updates the channel
+    data on Scrape Exchange via the data API.
 
     :param client: The authenticated Scrape Exchange API client.
     :param channel_name: The channel handle / vanity name.
     :param channel_id: The YouTube channel ID.
     :param proxy: Optional proxy URL for the InnerTube request.
-    :returns: True if the channel data was fetched successfully, False on
-    failure.
+    :returns: True if the channel data was fetched successfully,
+              False on failure.
     :raises: (none)
     '''
 
@@ -768,15 +801,17 @@ async def update_channel(client: ExchangeClient, channel_name: str,
     # the POST with retries. No file_manager is passed because an RSS
     # channel update has no on-disk asset backing it; success is
     # tracked via exchange_client_background_uploads_total.
-    METRIC_API_CHANNEL_CALLS.inc()
-    client.enqueue_upload(
+    enqueued: bool = client.enqueue_upload(
         f'{client.exchange_url}{ExchangeClient.POST_DATA_API}',
         json={
             'username': CHANNEL_SCHEMA_OWNER,
             'platform': CHANNEL_SCHEMA_PLATFORM,
             'entity': CHANNEL_SCHEMA_ENTITY,
             'version': CHANNEL_SCHEMA_VERSION,
-            'source_url': f'https://www.youtube.com/channel/{channel_id}',
+            'source_url': (
+                'https://www.youtube.com/channel/'
+                f'{channel_id}'
+            ),
             'data': {
                 'channel': channel_name.lstrip('@'),
                 'title': title,
@@ -788,8 +823,11 @@ async def update_channel(client: ExchangeClient, channel_name: str,
             'platform_creator_id': channel_name,
             'platform_topic_id': None,
         },
+        entity='channel',
         log_extra={'channel_name': channel_name},
     )
+    if enqueued:
+        METRIC_API_CHANNEL_CALLS.inc()
 
     return True
 
@@ -1143,9 +1181,18 @@ async def worker_loop(
         },
     )
 
-    no_feeds: dict[str, tuple[str, str, int]] = await read_no_feeds_file(
-        settings.no_feeds_file
-    )
+    try:
+        no_feeds: dict[str, tuple[str, str, int]] = (
+            await read_no_feeds_file(settings.no_feeds_file)
+        )
+    except OSError as exc:
+        logging.warning(
+            'Failed to read no-feeds file, starting with '
+            'empty set',
+            exc=exc,
+            extra={'no_feeds_file': settings.no_feeds_file},
+        )
+        no_feeds = {}
 
     while True:
         now: float = datetime.now(UTC).timestamp()
@@ -1182,7 +1229,7 @@ async def worker_loop(
 
         tasks: list[asyncio.Task] = [
             process_channel(
-                name, channel_id, client, no_feeds, settings
+                name, channel_id, client, no_feeds, settings,
             ) for _, name, channel_id in batch
         ]
         results: list = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1277,7 +1324,15 @@ async def _run_worker(settings: RssSettings) -> None:
         },
     )
 
-    start_http_server(settings.metrics_port)
+    try:
+        start_http_server(settings.metrics_port)
+    except OSError as exc:
+        logging.critical(
+            'Failed to bind Prometheus metrics port',
+            exc=exc,
+            extra={'metrics_port': settings.metrics_port},
+        )
+        sys.exit(1)
     logging.info(
         'Prometheus metrics available',
         extra={'metrics_port': settings.metrics_port},
@@ -1296,15 +1351,36 @@ async def _run_worker(settings: RssSettings) -> None:
     )
     os.makedirs(settings.video_data_directory, exist_ok=True)
 
-    client: ExchangeClient = await ExchangeClient.setup(
-        api_key_id=settings.api_key_id,
-        api_key_secret=settings.api_key_secret,
-        exchange_url=settings.exchange_url,
-    )
+    try:
+        client: ExchangeClient = await ExchangeClient.setup(
+            api_key_id=settings.api_key_id,
+            api_key_secret=settings.api_key_secret,
+            exchange_url=settings.exchange_url,
+        )
+    except Exception as exc:
+        logging.critical(
+            'Failed to connect to Scrape Exchange API',
+            exc=exc,
+            extra={
+                'exchange_url': settings.exchange_url,
+            },
+        )
+        sys.exit(1)
 
     YouTubeRateLimiter.get(
         state_dir=settings.rate_limiter_state_dir,
+        redis_dsn=settings.redis_dsn,
     ).set_proxies(settings.proxies)
+
+    post_rate: float = float(max(
+        1,
+        settings.rss_num_processes * settings.rss_concurrency,
+    ))
+    ScrapeExchangeRateLimiter.get(
+        state_dir=settings.rate_limiter_state_dir,
+        post_rate=post_rate,
+        redis_dsn=settings.redis_dsn,
+    )
 
     # Wire SIGINT/SIGTERM so they cancel the main task;
     # ExchangeClient's overridden aclose() (invoked by
@@ -1360,6 +1436,9 @@ def main() -> None:
             proxies=settings.proxies,
             metrics_port=settings.metrics_port,
             log_file=settings.rss_log_file or None,
+            api_key_id=settings.api_key_id,
+            api_key_secret=settings.api_key_secret,
+            exchange_url=settings.exchange_url,
         )))
 
     asyncio.run(_run_worker(settings))

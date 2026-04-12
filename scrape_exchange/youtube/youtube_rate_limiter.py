@@ -114,8 +114,15 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
 
     _instance: ClassVar['YouTubeRateLimiter | None'] = None
 
-    def __init__(self, state_dir: str | None = None) -> None:
-        super().__init__('YouTube', state_dir=state_dir)
+    def __init__(
+        self, state_dir: str | None = None,
+        redis_dsn: str | None = None,
+    ) -> None:
+        super().__init__(
+            'YouTube',
+            state_dir=state_dir,
+            redis_dsn=redis_dsn,
+        )
         self._renewal_task: asyncio.Task | None = None
 
     def set_proxies(self, proxies: list[str] | str | None) -> None:

@@ -645,6 +645,356 @@ class _SharedFileBackend(_Backend[CallTypeT]):
         self._update_cache(proxy, buckets, global_bucket)
 
 
+# ------------------------------------------------------------------
+# Redis backend
+# ------------------------------------------------------------------
+
+METRIC_REDIS_OPS: Counter = Counter(
+    'rate_limiter_redis_ops_total',
+    'Redis operations executed by the rate limiter backend.',
+    ['operation', 'result', 'platform'],
+)
+
+# Lua script: atomic refill + conditional consume.
+# Uses redis TIME for server-side clock (avoids cross-host skew).
+# Returns {wait_seconds, bucket_tokens, global_tokens} as strings.
+_LUA_TRY_ACQUIRE: str = '''\
+local key = KEYS[1]
+local ct = ARGV[1]
+local b_burst = tonumber(ARGV[2])
+local b_rate = tonumber(ARGV[3])
+local g_burst = tonumber(ARGV[4])
+local g_rate = tonumber(ARGV[5])
+local ttl = tonumber(ARGV[6])
+
+local t = redis.call('TIME')
+local now = tonumber(t[1]) + tonumber(t[2]) / 1e6
+
+local function read_field(f)
+    local raw = redis.call('HGET', key, f)
+    if raw then
+        local sep = string.find(raw, ':')
+        return tonumber(string.sub(raw, 1, sep - 1)),
+               tonumber(string.sub(raw, sep + 1))
+    end
+    return nil, nil
+end
+
+local function refill(tokens, lr, burst, rate)
+    if tokens == nil then
+        return burst, now
+    end
+    local elapsed = math.max(0, now - lr)
+    return math.min(burst, tokens + elapsed * rate), now
+end
+
+local b_tok, b_lr = read_field(ct)
+b_tok, b_lr = refill(b_tok, b_lr, b_burst, b_rate)
+
+local g_tok, g_lr = read_field('__global__')
+g_tok, g_lr = refill(g_tok, g_lr, g_burst, g_rate)
+
+local b_wait = 0
+if b_tok < 1.0 then
+    b_wait = (1.0 - b_tok) / b_rate
+end
+local g_wait = 0
+if g_tok < 1.0 then
+    g_wait = (1.0 - g_tok) / g_rate
+end
+local wait = math.max(b_wait, g_wait)
+
+if wait <= 0 then
+    b_tok = b_tok - 1.0
+    g_tok = g_tok - 1.0
+end
+
+redis.call('HSET', key, ct,
+    string.format('%.6f:%.6f', b_tok, b_lr))
+redis.call('HSET', key, '__global__',
+    string.format('%.6f:%.6f', g_tok, g_lr))
+redis.call('EXPIRE', key, ttl)
+
+return {tostring(wait), tostring(b_tok), tostring(g_tok)}
+'''
+
+# Lua script: drain tokens from a per-type bucket.
+_LUA_PENALISE: str = '''\
+local key = KEYS[1]
+local ct = ARGV[1]
+local b_burst = tonumber(ARGV[2])
+local b_rate = tonumber(ARGV[3])
+local penalty = tonumber(ARGV[4])
+local ttl = tonumber(ARGV[5])
+
+local t = redis.call('TIME')
+local now = tonumber(t[1]) + tonumber(t[2]) / 1e6
+
+local raw = redis.call('HGET', key, ct)
+local b_tok, b_lr
+if raw then
+    local sep = string.find(raw, ':')
+    b_tok = tonumber(string.sub(raw, 1, sep - 1))
+    b_lr = tonumber(string.sub(raw, sep + 1))
+else
+    b_tok = b_burst
+    b_lr = now
+end
+
+local elapsed = math.max(0, now - b_lr)
+b_tok = math.min(b_burst, b_tok + elapsed * b_rate)
+b_lr = now
+
+b_tok = b_tok - penalty * b_rate
+b_tok = math.max(b_tok, -b_burst)
+
+redis.call('HSET', key, ct,
+    string.format('%.6f:%.6f', b_tok, b_lr))
+redis.call('EXPIRE', key, ttl)
+
+return tostring(b_tok)
+'''
+
+
+class _RedisBackend(_Backend[CallTypeT]):
+    '''
+    Redis-backed backend. Bucket state for each proxy lives
+    in a Redis hash; every read-modify-write cycle is
+    serialised by the Redis server via Lua scripts, enabling
+    cross-host coordination.
+
+    Requires the ``redis`` package (``pip install
+    redis[hiredis]>=5.0.0``).
+    '''
+
+    _KEY_TTL: int = 3600  # 1 hour
+
+    def __init__(
+        self,
+        default_configs: dict[CallTypeT, _BucketConfig],
+        global_config: _BucketConfig,
+        redis_dsn: str,
+        platform: str,
+    ) -> None:
+        super().__init__(default_configs, global_config)
+        try:
+            import redis.asyncio as aioredis
+        except ImportError:
+            raise ImportError(
+                'redis package is required for the Redis '
+                'rate-limiter backend. Install it with: '
+                'pip install "redis[hiredis]>=5.0.0"'
+            ) from None
+        self._redis: aioredis.Redis = (
+            aioredis.from_url(
+                redis_dsn, decode_responses=True,
+            )
+        )
+        self._platform: str = platform
+        self._cache: dict[
+            str | None,
+            dict[str, tuple[float, float]],
+        ] = {}
+        self._try_acquire_sha: str | None = None
+        self._penalise_sha: str | None = None
+        self._scripts_loaded: bool = False
+
+    def _key(self, proxy: str | None) -> str:
+        h: str = _proxy_filename(proxy).removesuffix(
+            '.state'
+        )
+        return f'rl:{self._platform}:{h}'
+
+    def _metric_labels(
+        self, operation: str, result: str,
+    ) -> dict[str, str]:
+        return {
+            'operation': operation,
+            'result': result,
+            'platform': self._platform,
+        }
+
+    async def _ensure_scripts(self) -> None:
+        '''Load Lua scripts into Redis on first use.'''
+        if self._scripts_loaded:
+            return
+        self._try_acquire_sha = (
+            await self._redis.script_load(
+                _LUA_TRY_ACQUIRE
+            )
+        )
+        self._penalise_sha = (
+            await self._redis.script_load(
+                _LUA_PENALISE
+            )
+        )
+        self._scripts_loaded = True
+        METRIC_REDIS_OPS.labels(
+            **self._metric_labels(
+                'script_load', 'success',
+            )
+        ).inc()
+
+    async def _evalsha_with_reload(
+        self, sha: str, script: str,
+        num_keys: int, *args: str,
+    ) -> list[str]:
+        '''
+        Run ``EVALSHA``. On ``NOSCRIPT`` (Redis restarted),
+        reload all scripts and retry once.
+        '''
+        import redis.exceptions as rexc
+        try:
+            return await self._redis.evalsha(
+                sha, num_keys, *args,
+            )
+        except rexc.NoScriptError:
+            _LOGGER.warning(
+                'Redis NOSCRIPT — reloading Lua scripts',
+            )
+            self._scripts_loaded = False
+            await self._ensure_scripts()
+            # Re-resolve SHA after reload
+            if script is _LUA_TRY_ACQUIRE:
+                sha = self._try_acquire_sha
+            else:
+                sha = self._penalise_sha
+            return await self._redis.evalsha(
+                sha, num_keys, *args,
+            )
+
+    def peek_tokens(
+        self, call_type: CallTypeT,
+        proxy: str | None,
+    ) -> float:
+        cached: (
+            dict[str, tuple[float, float]] | None
+        ) = self._cache.get(proxy)
+        if cached is None:
+            return float(
+                self._default_configs[call_type].burst
+            )
+        entry: tuple[float, float] | None = (
+            cached.get(call_type.value)
+        )
+        if entry is None:
+            return float(
+                self._default_configs[call_type].burst
+            )
+        tokens: float = entry[0]
+        last_refill: float = entry[1]
+        cfg: _BucketConfig = (
+            self._default_configs[call_type]
+        )
+        now: float = time.time()
+        elapsed: float = max(0.0, now - last_refill)
+        return min(
+            cfg.burst,
+            tokens + elapsed * cfg.refill_rate,
+        )
+
+    async def try_acquire(
+        self, call_type: CallTypeT,
+        proxy: str | None,
+    ) -> tuple[float, float, float]:
+        await self._ensure_scripts()
+        cfg: _BucketConfig = (
+            self._default_configs[call_type]
+        )
+        gc: _BucketConfig = self._global_config
+        try:
+            result: list[str] = (
+                await self._evalsha_with_reload(
+                    self._try_acquire_sha,
+                    _LUA_TRY_ACQUIRE,
+                    1,
+                    self._key(proxy),
+                    call_type.value,
+                    str(cfg.burst),
+                    str(cfg.refill_rate),
+                    str(gc.burst),
+                    str(gc.refill_rate),
+                    str(self._KEY_TTL),
+                )
+            )
+        except Exception:
+            _LOGGER.warning(
+                'Redis unavailable; allowing request',
+                exc_info=True,
+            )
+            METRIC_REDIS_OPS.labels(
+                **self._metric_labels(
+                    'try_acquire', 'error',
+                )
+            ).inc()
+            return 0.0, 0.0, 0.0
+
+        METRIC_REDIS_OPS.labels(
+            **self._metric_labels(
+                'try_acquire', 'success',
+            )
+        ).inc()
+
+        wait: float = float(result[0])
+        bt: float = float(result[1])
+        gt: float = float(result[2])
+        now: float = time.time()
+
+        proxy_cache: dict[str, tuple[float, float]] = (
+            self._cache.setdefault(proxy, {})
+        )
+        proxy_cache[call_type.value] = (bt, now)
+        proxy_cache['__global__'] = (gt, now)
+
+        return wait, bt, gt
+
+    async def penalise(
+        self, call_type: CallTypeT,
+        proxy: str | None,
+        penalty_seconds: float,
+    ) -> None:
+        await self._ensure_scripts()
+        cfg: _BucketConfig = (
+            self._default_configs[call_type]
+        )
+        try:
+            bt_str: str = (
+                await self._evalsha_with_reload(
+                    self._penalise_sha,
+                    _LUA_PENALISE,
+                    1,
+                    self._key(proxy),
+                    call_type.value,
+                    str(cfg.burst),
+                    str(cfg.refill_rate),
+                    str(penalty_seconds),
+                    str(self._KEY_TTL),
+                )
+            )
+        except Exception:
+            _LOGGER.warning(
+                'Redis unavailable during penalise',
+                exc_info=True,
+            )
+            METRIC_REDIS_OPS.labels(
+                **self._metric_labels(
+                    'penalise', 'error',
+                )
+            ).inc()
+            return
+
+        METRIC_REDIS_OPS.labels(
+            **self._metric_labels(
+                'penalise', 'success',
+            )
+        ).inc()
+
+        now: float = time.time()
+        self._cache.setdefault(proxy, {})[
+            call_type.value
+        ] = (float(bt_str), now)
+
+
 class RateLimiter(ABC, Generic[CallTypeT]):
     '''
     Abstract async-safe, singleton rate limiter for platform HTTP
@@ -655,14 +1005,14 @@ class RateLimiter(ABC, Generic[CallTypeT]):
     and a global aggregate bucket. The singleton, proxy management,
     and acquire loop are provided here.
 
-    Backend selection: when *state_dir* is provided (or the env var
-    ``RATE_LIMITER_STATE_DIR`` is set) the limiter uses a file-backed
-    backend that shares state across every process on the host that
-    points at the same directory, so that running multiple scraper
-    tools (video / rss / channel) or multiple scraper processes
-    against the same proxy pool no longer multiplies the configured
-    per-proxy rate. Set *state_dir* to an empty string to force the
-    in-process backend explicitly (useful in tests).
+    Backend selection (first match wins):
+
+    1. ``redis_dsn`` (or env ``REDIS_DSN``) — Redis backend for
+       cross-host coordination.
+    2. ``state_dir`` (or env ``RATE_LIMITER_STATE_DIR``) — shared-
+       file backend for cross-process coordination on a single
+       host.
+    3. Neither — in-process backend (no coordination).
 
     Usage (from a concrete subclass)::
 
@@ -675,31 +1025,57 @@ class RateLimiter(ABC, Generic[CallTypeT]):
     _instance: ClassVar['RateLimiter[Any] | None'] = None
 
     def __init__(
-        self, platform: str, state_dir: str | None = None,
+        self, platform: str,
+        state_dir: str | None = None,
+        redis_dsn: str | None = None,
     ) -> None:
         self._platform: str = platform
         self._proxies: list[str] | None = None
-        self._proxy_locks: dict[str | None, asyncio.Lock] = {}
+        self._proxy_locks: dict[
+            str | None, asyncio.Lock
+        ] = {}
+
+        if redis_dsn is None:
+            redis_dsn = os.environ.get('REDIS_DSN')
+        resolved_redis_dsn: str | None = (
+            redis_dsn or None
+        )
 
         if state_dir is None:
-            state_dir = os.environ.get('RATE_LIMITER_STATE_DIR')
-        resolved_state_dir: str | None = state_dir or None
+            state_dir = os.environ.get(
+                'RATE_LIMITER_STATE_DIR'
+            )
+        resolved_state_dir: str | None = (
+            state_dir or None
+        )
 
         self._state_dir: str | None = resolved_state_dir
         backend: _Backend[CallTypeT]
-        if resolved_state_dir:
+        if resolved_redis_dsn:
+            backend = _RedisBackend(
+                self.default_configs,
+                self.global_config,
+                resolved_redis_dsn,
+                platform,
+            )
+            _LOGGER.info(
+                'Rate limiter using Redis backend',
+            )
+        elif resolved_state_dir:
             backend = _SharedFileBackend(
                 self.default_configs,
                 self.global_config,
                 resolved_state_dir,
             )
             _LOGGER.info(
-                'Rate limiter using shared-file backend at %s',
+                'Rate limiter using shared-file '
+                'backend at %s',
                 resolved_state_dir,
             )
         else:
             backend = _InProcessBackend(
-                self.default_configs, self.global_config,
+                self.default_configs,
+                self.global_config,
             )
             _LOGGER.info(
                 'Rate limiter using in-process backend',
@@ -737,15 +1113,22 @@ class RateLimiter(ABC, Generic[CallTypeT]):
         return lock
 
     @classmethod
-    def get(cls, state_dir: str | None = None) -> Self:
+    def get(
+        cls, state_dir: str | None = None,
+        redis_dsn: str | None = None,
+    ) -> Self:
         '''
-        Return the process-wide singleton, creating it on first
-        call. *state_dir* is only honoured on the very first call;
-        subsequent calls ignore it and return the existing instance.
+        Return the process-wide singleton, creating it on
+        first call.  *state_dir* and *redis_dsn* are only
+        honoured on the very first call; subsequent calls
+        ignore them and return the existing instance.
         Call :meth:`reset` first to rebind a backend in tests.
         '''
         if cls._instance is None:
-            cls._instance = cls(state_dir=state_dir)
+            cls._instance = cls(
+                state_dir=state_dir,
+                redis_dsn=redis_dsn,
+            )
         return cls._instance
 
     @classmethod
