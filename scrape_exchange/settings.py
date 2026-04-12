@@ -109,6 +109,20 @@ class ScraperSettings(BaseSettings):
         ),
     )
 
+    redis_dsn: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            'REDIS_DSN', 'redis_dsn'
+        ),
+        description=(
+            'Redis connection string for cross-host '
+            'rate-limiter coordination. When set, the '
+            'Redis backend is preferred over the shared-'
+            'file backend. Example: '
+            'redis://localhost:6379/0'
+        ),
+    )
+
     @field_validator('log_level', mode='before')
     @classmethod
     def uppercase_log_level(cls, v: str) -> str:

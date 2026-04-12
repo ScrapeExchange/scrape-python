@@ -39,6 +39,9 @@ from scrape_exchange.scraper_supervisor import (
 )
 from scrape_exchange.settings import normalize_log_level
 
+from scrape_exchange.scrape_exchange_rate_limiter import (
+    ScrapeExchangeRateLimiter,
+)
 from scrape_exchange.youtube.youtube_rate_limiter import YouTubeRateLimiter
 from scrape_exchange.youtube.youtube_video import YouTubeVideo
 from scrape_exchange.youtube.youtube_video import (
@@ -173,11 +176,11 @@ METRIC_RATE_LIMIT_HITS = Counter(
     'Number of times a proxy was rate-limited by YouTube',
     ['proxy'],
 )
-METRIC_VIDEOS_UPLOADED = Counter(
-    'yt_video_proxy_videos_uploaded_total',
+METRIC_VIDEOS_ENQUEUED = Counter(
+    'yt_video_proxy_videos_enqueued_total',
     'Number of videos successfully enqueued for background upload. '
-    'Actual completion is tracked by '
-    'exchange_client_background_uploads_total{outcome="success"}.',
+    'Actual delivery is tracked by '
+    'exchange_client_background_uploads_total{entity="video"}.',
 )
 METRIC_VIDEOS_ALREADY_UPLOADED = Counter(
     'yt_video_proxy_videos_already_uploaded_total',
@@ -238,7 +241,8 @@ class VideoSettings(YouTubeScraperSettings):
     )
     metrics_port: int = Field(
         default=9400,
-        validation_alias=AliasChoices('METRICS_PORT', 'metrics_port'),
+        validation_alias=AliasChoices(
+            'VIDEO_METRICS_PORT', 'video_metrics_port'),
         description='Port for the Prometheus metrics HTTP server',
     )
     video_concurrency: int = Field(
@@ -332,6 +336,9 @@ def main() -> None:
             proxies=settings.proxies,
             metrics_port=settings.metrics_port,
             log_file=settings.video_log_file or None,
+            api_key_id=settings.api_key_id,
+            api_key_secret=settings.api_key_secret,
+            exchange_url=settings.exchange_url,
         )))
 
     asyncio.run(_run_worker(settings))
@@ -370,7 +377,15 @@ async def _run_worker(settings: VideoSettings) -> None:
         },
     )
 
-    start_http_server(settings.metrics_port)
+    try:
+        start_http_server(settings.metrics_port)
+    except OSError as exc:
+        logging.critical(
+            'Failed to bind Prometheus metrics port',
+            exc=exc,
+            extra={'metrics_port': settings.metrics_port},
+        )
+        sys.exit(1)
     logging.info(
         'Prometheus metrics available',
         extra={'metrics_port': settings.metrics_port},
@@ -383,7 +398,19 @@ async def _run_worker(settings: VideoSettings) -> None:
 
     YouTubeRateLimiter.get(
         state_dir=settings.rate_limiter_state_dir,
+        redis_dsn=settings.redis_dsn,
     ).set_proxies(settings.proxies)
+
+    post_rate: float = float(max(
+        1,
+        settings.video_num_processes
+        * settings.video_concurrency,
+    ))
+    ScrapeExchangeRateLimiter.get(
+        state_dir=settings.rate_limiter_state_dir,
+        post_rate=post_rate,
+        redis_dsn=settings.redis_dsn,
+    )
 
     # Wire SIGINT/SIGTERM to cancel the worker loop so the finally
     # block gets a chance to drain the ExchangeClient upload queue.
@@ -583,13 +610,24 @@ async def worker(proxy: str, queue: Queue, settings: VideoSettings,
             'cookie_file': cookie_file,
         },
     )
-    download_client: YoutubeDL = YouTubeVideo._setup_download_client(
-        deno_path=settings.deno_path,
-        po_token_url=settings.po_token_url,
-        ytdlp_cache_dir=settings.ytdlp_cache_dir,
-        proxy=proxy,
-        cookie_file=cookie_file,
-    )
+    try:
+        download_client: YoutubeDL = (
+            YouTubeVideo._setup_download_client(
+                deno_path=settings.deno_path,
+                po_token_url=settings.po_token_url,
+                ytdlp_cache_dir=settings.ytdlp_cache_dir,
+                proxy=proxy,
+                cookie_file=cookie_file,
+            )
+        )
+    except Exception as exc:
+        logging.critical(
+            'Failed to set up yt-dlp download client; '
+            'worker cannot proceed',
+            exc=exc,
+            extra={'proxy': proxy},
+        )
+        return
 
     sleep: int = 0
     files_scraped: int = 0
@@ -708,14 +746,24 @@ async def worker(proxy: str, queue: Queue, settings: VideoSettings,
             if video is not None:
                 try:
                     await video.to_file(
-                        settings.video_data_directory, VIDEO_YTDLP_PREFIX
+                        settings.video_data_directory,
+                        VIDEO_YTDLP_PREFIX,
                     )
-                    # to_file uses model I/O so it bypasses FM cleanup;
-                    # explicitly remove the original entry (e.g. the
-                    # video-min-{id} file we just upgraded to video-dlp-).
-                    await video_fm.delete(entry, fail_ok=False)
-                except OSError:
-                    pass
+                    # to_file uses model I/O so it bypasses FM
+                    # cleanup; explicitly remove the original
+                    # entry (e.g. the video-min-{id} file we
+                    # just upgraded to video-dlp-).
+                    await video_fm.delete(
+                        entry, fail_ok=False,
+                    )
+                except OSError as exc:
+                    logging.warning(
+                        'Failed to write scraped video '
+                        'file to disk',
+                        exc=exc,
+                        extra={'video_id': video_id},
+                    )
+                    video = None
 
         if video is not None and exchange_client is not None:
             # Fire-and-forget: the background worker inside
@@ -729,7 +777,7 @@ async def worker(proxy: str, queue: Queue, settings: VideoSettings,
             )
             if enqueued:
                 files_uploaded += 1
-                METRIC_VIDEOS_UPLOADED.inc()
+                METRIC_VIDEOS_ENQUEUED.inc()
 
         logging.debug(
             'Worker progress',
@@ -937,6 +985,7 @@ def enqueue_upload_video(
         },
         file_manager=video_fm,
         filename=filename,
+        entity='video',
         log_extra={'video_id': video.video_id},
     )
 

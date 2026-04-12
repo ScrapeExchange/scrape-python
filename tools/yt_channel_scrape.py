@@ -43,6 +43,9 @@ from scrape_exchange.scraper_supervisor import (
 from scrape_exchange.settings import normalize_log_level
 
 from scrape_exchange.youtube.youtube_channel import YouTubeChannel
+from scrape_exchange.scrape_exchange_rate_limiter import (
+    ScrapeExchangeRateLimiter,
+)
 from scrape_exchange.youtube.youtube_rate_limiter import YouTubeRateLimiter
 from scrape_exchange.youtube.youtube_video import DENO_PATH, PO_TOKEN_URL
 from scrape_exchange.youtube.settings import YouTubeScraperSettings
@@ -93,7 +96,9 @@ class ChannelSettings(YouTubeScraperSettings):
     )
     metrics_port: int = Field(
         default=9600,
-        validation_alias=AliasChoices('METRICS_PORT', 'metrics_port'),
+        validation_alias=AliasChoices(
+            'CHANNEL_METRICS_PORT', 'channel_metrics_port'
+        ),
         description='Port for the Prometheus metrics HTTP server',
     )
     channel_concurrency: int = Field(
@@ -189,6 +194,12 @@ METRIC_UPLOADED_FILE_EXISTS = Counter(
 METRIC_CHANNELS_SCRAPED = Counter(
     'yt_channel_scraped_total',
     'Number of channels successfully scraped',
+)
+METRIC_CHANNELS_ENQUEUED = Counter(
+    'yt_channel_enqueued_total',
+    'Number of channels successfully enqueued for background '
+    'upload. Actual delivery is tracked by '
+    'exchange_client_background_uploads_total{entity="channel"}.',
 )
 METRIC_SCRAPE_FAILURES = Counter(
     'yt_channel_scrape_failures_total',
@@ -288,7 +299,15 @@ async def _run_worker(settings: ChannelSettings) -> None:
         },
     )
 
-    start_http_server(settings.metrics_port)
+    try:
+        start_http_server(settings.metrics_port)
+    except OSError as exc:
+        logging.critical(
+            'Failed to bind Prometheus metrics port',
+            exc=exc,
+            extra={'metrics_port': settings.metrics_port},
+        )
+        sys.exit(1)
     logging.info(
         'Prometheus metrics available',
         extra={'metrics_port': settings.metrics_port},
@@ -306,15 +325,39 @@ async def _run_worker(settings: ChannelSettings) -> None:
         settings.channel_data_directory
     )
 
-    client: ExchangeClient | None = await ExchangeClient.setup(
-        api_key_id=settings.api_key_id,
-        api_key_secret=settings.api_key_secret,
-        exchange_url=settings.exchange_url
-    )
+    try:
+        client: ExchangeClient | None = (
+            await ExchangeClient.setup(
+                api_key_id=settings.api_key_id,
+                api_key_secret=settings.api_key_secret,
+                exchange_url=settings.exchange_url,
+            )
+        )
+    except Exception as exc:
+        logging.critical(
+            'Failed to connect to Scrape Exchange API',
+            exc=exc,
+            extra={
+                'exchange_url': settings.exchange_url,
+            },
+        )
+        sys.exit(1)
 
     YouTubeRateLimiter.get(
         state_dir=settings.rate_limiter_state_dir,
+        redis_dsn=settings.redis_dsn,
     ).set_proxies(settings.proxies)
+
+    post_rate: float = float(max(
+        1,
+        settings.channel_num_processes
+        * settings.channel_concurrency,
+    ))
+    ScrapeExchangeRateLimiter.get(
+        state_dir=settings.rate_limiter_state_dir,
+        post_rate=post_rate,
+        redis_dsn=settings.redis_dsn,
+    )
 
     if not settings.proxies:
         logging.info(
@@ -380,9 +423,15 @@ def main() -> None:
             proxies=settings.proxies,
             metrics_port=settings.metrics_port,
             log_file=settings.channel_log_file or None,
+            api_key_id=settings.api_key_id,
+            api_key_secret=settings.api_key_secret,
+            exchange_url=settings.exchange_url,
         )))
 
-    asyncio.run(_run_worker(settings))
+    try:
+        asyncio.run(_run_worker(settings))
+    except asyncio.CancelledError:
+        logging.info('Channel scraper shutdown complete')
 
 
 async def channel_exists(client: ExchangeClient, channel_name: str) -> bool:
@@ -395,10 +444,19 @@ async def channel_exists(client: ExchangeClient, channel_name: str) -> bool:
     :raises: (none)
     '''
 
-    resp: Response = await client.get(
-        f'{client.exchange_url}{ExchangeClient.GET_CONTENT_API}'
-        f'/youtube/channel/{channel_name}'
-    )
+    try:
+        resp: Response = await client.get(
+            f'{client.exchange_url}{ExchangeClient.GET_CONTENT_API}'
+            f'/youtube/channel/{channel_name}'
+        )
+    except Exception as exc:
+        METRIC_CHANNEL_EXISTS_FAILURES.inc()
+        logging.warning(
+            'Network error checking channel existence',
+            exc=exc,
+            extra={'channel_name': channel_name},
+        )
+        return False
 
     if resp.status_code == 200:
         data: dict = resp.json()
@@ -421,7 +479,8 @@ async def channel_exists(client: ExchangeClient, channel_name: str) -> bool:
                 'response_text': resp.text,
             },
         )
-        # Assume the channel does not exist if there was an error checking
+        # Assume the channel does not exist if there was
+        # an error checking
         return False
 
 
@@ -492,25 +551,44 @@ async def upload_channels(settings: ChannelSettings, client: ExchangeClient,
             )
             continue
         channel_name: str = normalize_channel_name(
-            filename[len(CHANNEL_FILE_PREFIX):-1 * len(CHANNEL_FILE_POSTFIX)]
+            filename[len(CHANNEL_FILE_PREFIX):-1 * len(
+                CHANNEL_FILE_POSTFIX
+            )]
         )
         base_path: Path = fm.base_dir / filename
         uploaded_path: Path = fm.uploaded_dir / filename
+
+        if not base_path.exists():
+            logging.debug(
+                'Channel file disappeared before '
+                'processing, skipping',
+                extra={'filename': filename},
+            )
+            continue
+
         if uploaded_path.exists():
             METRIC_UPLOADED_FILE_EXISTS.inc()
             logging.debug(
-                'Found existing uploaded file for channel, '
-                'checking timestamps',
+                'Found existing uploaded file for '
+                'channel, checking timestamps',
                 extra={'channel_name': channel_name},
             )
-            upload_mtime: float = uploaded_path.stat().st_mtime
-            save_mtime: float = base_path.stat().st_mtime
+            upload_mtime: float = (
+                uploaded_path.stat().st_mtime
+            )
+            save_mtime: float = (
+                base_path.stat().st_mtime
+            )
             if upload_mtime >= save_mtime:
                 logging.debug(
                     'Channel already uploaded, skipping',
-                    extra={'channel_name': channel_name},
+                    extra={
+                        'channel_name': channel_name,
+                    },
                 )
-                await fm.delete(filename, fail_ok=False)
+                await fm.delete(
+                    filename, fail_ok=False,
+                )
                 continue
 
         try:
@@ -526,11 +604,14 @@ async def upload_channels(settings: ChannelSettings, client: ExchangeClient,
                 )
                 await fm.delete(filename, fail_ok=False)
                 continue
-            # Fire-and-forget: background worker moves the file on
-            # success; on queue full the file stays in base_dir.
-            enqueue_upload_channel(
+
+            # Fire-and-forget: background worker moves the file
+            # on success; on queue full the file stays in
+            # base_dir.
+            if enqueue_upload_channel(
                 settings, client, fm, filename, channel
-            )
+            ):
+                METRIC_CHANNELS_ENQUEUED.inc()
         except Exception as exc:
             logging.error(
                 'Error processing channel file',
@@ -592,6 +673,7 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
     logging.debug(
         'Processing channel', extra={'channel_name': channel_name}
     )
+    channel: YouTubeChannel | None = None
     filename: str = get_channel_filename(channel_name)
     base_path: Path = fm.base_dir / filename
     uploaded_path: Path = fm.uploaded_dir / filename
@@ -644,7 +726,7 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
             'Channel not scraped, scraping now',
             extra={'channel_name': channel_name},
         )
-        channel: YouTubeChannel = YouTubeChannel(
+        channel = YouTubeChannel(
             name=channel_name, deno_path=DENO_PATH,
             po_token_url=PO_TOKEN_URL, debug=True,
             save_dir=settings.channel_data_directory,
@@ -657,36 +739,8 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
             )
             await channel.scrape(
                 with_about_page=True,
-                max_videos_per_channel=0, proxies=settings.proxies
-            )
-            if (not channel.video_ids and not channel.playlists
-                    and not channel.courses and not channel.podcast_ids
-                    and not channel.products):
-                if channel.description:
-                    logging.info(
-                        'Channel has description but no other '
-                        'content, skipping upload',
-                        extra={'channel_name': channel_name},
-                    )
-                METRIC_CHANNEL_NO_CONTENT_FOUND.inc()
-                logging.info(
-                    'YouTube channel content counts',
-                    extra={
-                        'channel_name': channel_name,
-                        'playlists_length': len(channel.playlists),
-                        'courses_length': len(channel.courses),
-                        'podcast_ids_length': len(channel.podcast_ids),
-                        'products_length': len(channel.products),
-                    },
-                )
-                return False
-            await fm.write_file(
-                filename, channel.to_dict(with_video_ids=True)
-            )
-            METRIC_CHANNELS_SCRAPED.inc()
-            logging.info(
-                'Downloaded channel',
-                extra={'channel_name': channel_name},
+                max_videos_per_channel=0,
+                proxies=settings.proxies,
             )
         except ValueError:
             logging.debug(
@@ -700,8 +754,11 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
                 )
             except OSError:
                 logging.warning(
-                    'Failed to write not_found marker for channel',
-                    extra={'channel_name': channel_name},
+                    'Failed to write not_found marker '
+                    'for channel',
+                    extra={
+                        'channel_name': channel_name,
+                    },
                 )
             return False
         except asyncio.CancelledError:
@@ -713,8 +770,6 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
                 exc=exc,
                 extra={'channel_name': channel_name},
             )
-            # No need to fail because of network errors, we can just
-            # keep downloading channels
             return False
         except Exception as exc:
             METRIC_SCRAPE_FAILURES.inc()
@@ -724,6 +779,58 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
                 extra={'channel_name': channel_name},
             )
             return False
+
+        if (not channel.video_ids and not channel.playlists
+                and not channel.courses
+                and not channel.podcast_ids
+                and not channel.products):
+            if channel.description:
+                logging.info(
+                    'Channel has description but no other '
+                    'content, skipping upload',
+                    extra={'channel_name': channel_name},
+                )
+            METRIC_CHANNEL_NO_CONTENT_FOUND.inc()
+            logging.info(
+                'YouTube channel content counts',
+                extra={
+                    'channel_name': channel_name,
+                    'playlists_length': (
+                        len(channel.playlists)
+                    ),
+                    'courses_length': (
+                        len(channel.courses)
+                    ),
+                    'podcast_ids_length': (
+                        len(channel.podcast_ids)
+                    ),
+                    'products_length': (
+                        len(channel.products)
+                    ),
+                },
+            )
+            return False
+
+        try:
+            await fm.write_file(
+                filename,
+                channel.to_dict(with_video_ids=True),
+            )
+        except Exception as exc:
+            logging.error(
+                'Failed to write channel file to disk',
+                exc=exc,
+                extra={
+                    'channel_name': channel_name,
+                    'filename': filename,
+                },
+            )
+            return True
+        METRIC_CHANNELS_SCRAPED.inc()
+        logging.info(
+            'Downloaded channel',
+            extra={'channel_name': channel_name},
+        )
 
     if settings.no_upload:
         logging.debug(
@@ -736,9 +843,29 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
         'Uploading channel to Scrape Exchange',
         extra={'channel_name': channel_name},
     )
+    # If we reached here via the saved_mtime path (file existed on
+    # disk but was never uploaded), ``channel`` was never assigned.
+    # Load it from the persisted file before enqueueing.
+    if channel is None:
+        try:
+            channel_data: dict = await fm.read_file(filename)
+            channel = YouTubeChannel.from_dict(channel_data)
+        except Exception as exc:
+            logging.error(
+                'Failed to load channel file for upload',
+                exc=exc,
+                extra={
+                    'channel_name': channel_name,
+                    'filename': filename,
+                },
+            )
+            return True
     # Fire-and-forget: background worker moves the file on success;
     # on queue full the file stays in base_dir for the next retry.
-    enqueue_upload_channel(settings, client, fm, filename, channel)
+    if enqueue_upload_channel(
+        settings, client, fm, filename, channel,
+    ):
+        METRIC_CHANNELS_ENQUEUED.inc()
     return False
 
 
@@ -774,6 +901,7 @@ def enqueue_upload_channel(
         },
         file_manager=fm,
         filename=filename,
+        entity='channel',
         log_extra={'channel_name': channel.name},
     )
 

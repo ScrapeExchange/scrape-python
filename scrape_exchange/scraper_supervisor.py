@@ -20,15 +20,24 @@ fleet is currently configured.
 :license    : GPLv3
 '''
 
+import asyncio
 import logging
 import os
 import signal
 import subprocess
 import sys
+import time
 
 from dataclasses import dataclass
 
 from prometheus_client import Gauge, start_http_server
+
+from scrape_exchange.exchange_client import ExchangeClient
+
+# Environment variable the supervisor writes the pre-fetched JWT
+# into for child processes. Workers check this before calling
+# ``ExchangeClient.get_jwt_token`` themselves.
+EXCHANGE_JWT_ENV_VAR: str = 'EXCHANGE_JWT'
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -122,6 +131,9 @@ class SupervisorConfig:
     metrics_port: int
     log_file: str | None
     log_file_env_var: str | None = None
+    api_key_id: str | None = None
+    api_key_secret: str | None = None
+    exchange_url: str = 'https://scrape.exchange'
 
 
 def publish_config_metrics(
@@ -211,11 +223,12 @@ def chunks_are_disjoint_cover(
 
 def spawn_children(
     config: SupervisorConfig, chunks: list[list[str]],
+    jwt_header: str | None = None,
 ) -> list[subprocess.Popen]:
     '''
     Spawn one child subprocess per chunk in *chunks*.
 
-    Each child inherits the parent environment with four
+    Each child inherits the parent environment with these
     overrides:
 
     * ``<config.num_processes_env_var>=1`` — prevents recursion
@@ -228,6 +241,9 @@ def spawn_children(
     * ``LOG_FILE=<root>-<worker_instance><ext>`` (only when
       *config.log_file* is non-empty) — each child writes to its
       own file so they don't tear up a shared log.
+    * ``EXCHANGE_JWT=<jwt_header>`` (only when *jwt_header* is
+      provided) — the pre-fetched JWT so children skip the
+      token endpoint call.
     '''
 
     script_path: str = os.path.abspath(sys.argv[0])
@@ -244,6 +260,8 @@ def spawn_children(
         child_env['METRICS_PORT'] = str(
             config.metrics_port + worker_instance
         )
+        if jwt_header is not None:
+            child_env[EXCHANGE_JWT_ENV_VAR] = jwt_header
         child_log_file: str | None = None
         if suffixable:
             assert config.log_file is not None
@@ -375,6 +393,55 @@ def run_supervisor(config: SupervisorConfig) -> int:
     if not chunks_are_disjoint_cover(chunks, proxies):
         return 1
 
+    # Fetch the JWT once so children don't each hit the token
+    # endpoint independently at startup.  Retry with 1s → 2s →
+    # 4s → 8s delays (4 attempts total) before giving up.
+    jwt_header: str | None = None
+    if config.api_key_id and config.api_key_secret:
+        delay: float = 1.0
+        max_delay: float = 8.0
+        while True:
+            try:
+                jwt_header = asyncio.run(
+                    ExchangeClient.get_jwt_token(
+                        config.api_key_id,
+                        config.api_key_secret,
+                        config.exchange_url,
+                    )
+                )
+                _LOGGER.info(
+                    '%s supervisor acquired JWT for children',
+                    config.scraper_label,
+                )
+                break
+            except Exception as exc:
+                if delay > max_delay:
+                    _LOGGER.critical(
+                        '%s supervisor failed to acquire '
+                        'JWT after retries; exiting',
+                        config.scraper_label,
+                        extra={
+                            'exc_type': (
+                                type(exc).__name__
+                            ),
+                            'exc': str(exc),
+                        },
+                    )
+                    return 1
+                _LOGGER.warning(
+                    '%s supervisor JWT attempt failed, '
+                    'retrying in %.0fs',
+                    config.scraper_label, delay,
+                    extra={
+                        'exc_type': (
+                            type(exc).__name__
+                        ),
+                        'exc': str(exc),
+                    },
+                )
+                time.sleep(delay)
+                delay *= 2
+
     start_http_server(config.metrics_port)
     _LOGGER.info(
         '%s supervisor metrics server started '
@@ -389,7 +456,7 @@ def run_supervisor(config: SupervisorConfig) -> int:
     )
 
     children: list[subprocess.Popen] = spawn_children(
-        config, chunks,
+        config, chunks, jwt_header=jwt_header,
     )
     install_signal_forwarders(children)
 

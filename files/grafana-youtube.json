@@ -166,7 +166,7 @@
     {
       "id": 3,
       "type": "stat",
-      "title": "Videos uploaded \u2014 video tool (1h)",
+      "title": "Videos enqueued \u2014 video tool (1h)",
       "description": "",
       "datasource": {
         "type": "prometheus",
@@ -208,7 +208,7 @@
       },
       "targets": [
         {
-          "expr": "sum(increase(yt_video_proxy_videos_uploaded_total{job=~\"$job\", instance=~\"$instance\"}[1h]))",
+          "expr": "sum(increase(yt_video_proxy_videos_enqueued_total{job=~\"$job\", instance=~\"$instance\"}[1h]))",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
@@ -220,7 +220,7 @@
     {
       "id": 4,
       "type": "stat",
-      "title": "Videos uploaded \u2014 RSS tool (1h)",
+      "title": "Videos enqueued \u2014 RSS tool (1h)",
       "description": "",
       "datasource": {
         "type": "prometheus",
@@ -262,7 +262,7 @@
       },
       "targets": [
         {
-          "expr": "sum(increase(yt_rss_videos_uploaded_total{job=~\"$job\", instance=~\"$instance\"}[1h]))",
+          "expr": "sum(increase(yt_rss_videos_enqueued_total{job=~\"$job\", instance=~\"$instance\"}[1h]))",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
@@ -542,12 +542,228 @@
       ]
     },
     {
+      "id": 56,
+      "type": "stat",
+      "title": "API \u2014 videos created (1h)",
+      "description": "New video records accepted by scrape.exchange (HTTP 201)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 9,
+        "w": 6,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(exchange_client_background_uploads_total{outcome=\"created\", entity=\"video\", job=~\"$job\", instance=~\"$instance\"}[1h]))",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 57,
+      "type": "stat",
+      "title": "API \u2014 videos updated (1h)",
+      "description": "Existing video records refreshed on scrape.exchange (HTTP 200)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 9,
+        "w": 6,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(exchange_client_background_uploads_total{outcome=\"updated\", entity=\"video\", job=~\"$job\", instance=~\"$instance\"}[1h]))",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 58,
+      "type": "stat",
+      "title": "API \u2014 channels created (1h)",
+      "description": "New channel records accepted by scrape.exchange (HTTP 201)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 9,
+        "w": 6,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(exchange_client_background_uploads_total{outcome=\"created\", entity=\"channel\", job=~\"$job\", instance=~\"$instance\"}[1h]))",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 59,
+      "type": "stat",
+      "title": "API \u2014 channels updated (1h)",
+      "description": "Existing channel records refreshed on scrape.exchange (HTTP 200)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 9,
+        "w": 6,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(exchange_client_background_uploads_total{outcome=\"updated\", entity=\"channel\", job=~\"$job\", instance=~\"$instance\"}[1h]))",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
       "id": 10,
       "type": "row",
       "title": "Throughput",
       "gridPos": {
         "x": 0,
-        "y": 9,
+        "y": 13,
         "w": 24,
         "h": 1
       },
@@ -609,8 +825,8 @@
           }
         },
         {
-          "expr": "sum(rate(yt_video_proxy_videos_uploaded_total{job=~\"$job\", instance=~\"$instance\"}[5m]))",
-          "legendFormat": "uploaded (video tool)",
+          "expr": "sum(rate(yt_video_proxy_videos_enqueued_total{job=~\"$job\", instance=~\"$instance\"}[5m]))",
+          "legendFormat": "enqueued (video tool)",
           "refId": "B",
           "datasource": {
             "type": "prometheus",
@@ -618,9 +834,27 @@
           }
         },
         {
-          "expr": "sum(rate(yt_rss_videos_uploaded_total{job=~\"$job\", instance=~\"$instance\"}[5m]))",
-          "legendFormat": "uploaded (rss tool)",
+          "expr": "sum(rate(yt_rss_videos_enqueued_total{job=~\"$job\", instance=~\"$instance\"}[5m]))",
+          "legendFormat": "enqueued (rss tool)",
           "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "sum(rate(exchange_client_background_uploads_total{outcome=\"created\", entity=\"video\", job=~\"$job\", instance=~\"$instance\"}[5m]))",
+          "legendFormat": "API created (video)",
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "sum(rate(exchange_client_background_uploads_total{outcome=\"updated\", entity=\"video\", job=~\"$job\", instance=~\"$instance\"}[5m]))",
+          "legendFormat": "API updated (video)",
+          "refId": "E",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -873,8 +1107,8 @@
       },
       "targets": [
         {
-          "expr": "sum by (job) (rate(exchange_client_background_uploads_total{outcome=\"failure\", job=~\"$job\", instance=~\"$instance\"}[5m]))",
-          "legendFormat": "{{job}} background upload failures",
+          "expr": "sum by (job, entity) (rate(exchange_client_background_uploads_total{outcome=\"failure\", job=~\"$job\", instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{job}} {{entity}} upload failures",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
