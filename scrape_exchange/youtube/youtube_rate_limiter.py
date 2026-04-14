@@ -19,12 +19,20 @@ Typical YouTube soft/hard limits (empirical, as of 2025), assuming
 unauthenticated browser cookies acquired via :class:`YouTubeCookieJar`
 (CONSENT/SOCS + real session cookies, no logged-in account):
 
-    browse   – ~150 req/min sustained, burst of 20  (50% of 300/min valid-context soft limit)
-    player   – ~100 req/min sustained, burst of 12  (33% of 300/min valid-context soft limit)
-    next     – ~150 req/min sustained, burst of 20  (50% of 300/min valid-context soft limit)
-    html     – ~90  req/min sustained, burst of 10  (50% of 180/min with-cookies soft limit)
-    rss      – ~60  req/min sustained, burst of 15  (plain XML, low risk)
-    global   – ~300 req/min aggregate across all types (valid-context IP ceiling)
+    browse – ~150 req/min, burst 20
+            (50% of 300/min valid-context soft limit)
+    player – ~30  req/min, burst 4
+            (30% of 100/min; yt-dlp extract_info
+             adds ~5 ungated sub-requests ≈160/min
+             effective load, 47% headroom)
+    next   – ~150 req/min, burst 20
+            (50% of 300/min valid-context soft limit)
+    html   – ~90  req/min, burst 10
+            (50% of 180/min with-cookies soft limit)
+    rss    – ~60  req/min, burst 15
+            (plain XML, low risk)
+    global – ~250 req/min aggregate across all types
+            (83% of 300/min valid-context IP ceiling)
 
 :maintainer : Boinko <boinko@scrape.exchange>
 :copyright  : Copyright 2026
@@ -64,9 +72,12 @@ _DEFAULT_CONFIGS: dict[YouTubeCallType, _BucketConfig] = {
         burst=20, refill_rate=150 / 60,
         jitter_min=0.3, jitter_max=1.2,
     ),
-    # ~20 req/min (yt-dlp makes ~5 sub-requests per extract_info)
+    # ~30 req/min (yt-dlp makes ~5 sub-requests per
+    # extract_info, so effective YouTube load is ~160 req/min
+    # per proxy — under the 300/min soft limit with 47%
+    # headroom)
     YouTubeCallType.PLAYER: _BucketConfig(
-        burst=3, refill_rate=20 / 60,
+        burst=4, refill_rate=30 / 60,
         jitter_min=1.0, jitter_max=3.0,
     ),
     # ~150 req/min
@@ -87,8 +98,9 @@ _DEFAULT_CONFIGS: dict[YouTubeCallType, _BucketConfig] = {
 }
 
 _GLOBAL_CONFIG: _BucketConfig = _BucketConfig(
-    # ~300 req/min aggregate (valid-context IP ceiling)
-    burst=30, refill_rate=300 / 60,
+    # ~250 req/min aggregate (83% of 300/min
+    # valid-context IP ceiling)
+    burst=20, refill_rate=250 / 60,
     # jitter applied per-type only
     jitter_min=0.0, jitter_max=0.0,
 )

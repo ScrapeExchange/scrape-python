@@ -23,6 +23,7 @@ from scrape_exchange.scrape_exchange_rate_limiter import (
     ScrapeExchangeRateLimiter,
     DEFAULT_429_PENALTY_SECONDS,
 )
+from scrape_exchange.worker_id import get_worker_id
 
 if TYPE_CHECKING:
     from scrape_exchange.file_management import AssetFileManagement
@@ -42,7 +43,7 @@ METRIC_REQUEST_DURATION: Histogram = Histogram(
     'exchange_client_request_duration_seconds',
     'Duration of HTTP requests to scrape.exchange, by method and '
     'HTTP status class.',
-    ['method', 'status_class'],
+    ['method', 'status_class', 'worker_id'],
     buckets=(0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0),
 )
 
@@ -53,12 +54,14 @@ METRIC_UPLOAD_QUEUE_DEPTH: Gauge = Gauge(
     'exchange_client_upload_queue_depth',
     'Number of background upload jobs currently waiting in the '
     'ExchangeClient fire-and-forget upload queue.',
+    ['worker_id'],
 )
 METRIC_UPLOAD_QUEUE_DROPPED: Counter = Counter(
     'exchange_client_upload_queue_dropped_total',
     'Background upload jobs dropped because the queue was full. The '
     'underlying asset file is left in the base directory and will be '
     'retried on the next scraper iteration.',
+    ['worker_id'],
 )
 METRIC_BACKGROUND_UPLOADS: Counter = Counter(
     'exchange_client_background_uploads_total',
@@ -66,13 +69,13 @@ METRIC_BACKGROUND_UPLOADS: Counter = Counter(
     '(created/updated/failure) and entity type '
     '(video/channel). "created" = HTTP 201 (new data), '
     '"updated" = HTTP 200 (existing data refreshed).',
-    ['outcome', 'entity'],
+    ['outcome', 'entity', 'worker_id'],
 )
 METRIC_429_RECEIVED: Counter = Counter(
     'exchange_client_429_received_total',
     'Number of HTTP 429 responses received from the '
     'Scrape.Exchange API, by method.',
-    ['method'],
+    ['method', 'worker_id'],
 )
 
 
@@ -164,7 +167,7 @@ class ExchangeClient(AsyncClient):
         # ``enqueue_upload`` call so tests and callers that never need
         # fire-and-forget uploads don't pay for idle worker tasks.
         self._upload_queue: asyncio.Queue[_UploadJob | None] | None = None
-        self._upload_workers: list[asyncio.Task] = []
+        self._upload_tasks: list[asyncio.Task] = []
         self._upload_shutdown: bool = False
 
         super().__init__(
@@ -338,7 +341,8 @@ class ExchangeClient(AsyncClient):
                 (datetime.now(UTC) - start).total_seconds()
             )
             METRIC_REQUEST_DURATION.labels(
-                method='get', status_class='error'
+                method='get', status_class='error',
+                worker_id=get_worker_id(),
             ).observe(duration)
             if retries > 0:
                 await asyncio.sleep(delay)
@@ -371,10 +375,14 @@ class ExchangeClient(AsyncClient):
         METRIC_REQUEST_DURATION.labels(
             method='get',
             status_class=_status_class(result.status_code),
+            worker_id=get_worker_id(),
         ).observe(duration)
 
         if result.status_code == 429:
-            METRIC_429_RECEIVED.labels(method='get').inc()
+            METRIC_429_RECEIVED.labels(
+                method='get',
+                worker_id=get_worker_id(),
+            ).inc()
             penalty: float = _parse_retry_after(
                 result, DEFAULT_429_PENALTY_SECONDS,
             )
@@ -444,7 +452,8 @@ class ExchangeClient(AsyncClient):
                 (datetime.now(UTC) - start).total_seconds()
             )
             METRIC_REQUEST_DURATION.labels(
-                method='post', status_class='error'
+                method='post', status_class='error',
+                worker_id=get_worker_id(),
             ).observe(duration)
             if retries > 0:
                 await asyncio.sleep(delay)
@@ -477,10 +486,14 @@ class ExchangeClient(AsyncClient):
         METRIC_REQUEST_DURATION.labels(
             method='post',
             status_class=_status_class(result.status_code),
+            worker_id=get_worker_id(),
         ).observe(duration)
 
         if result.status_code == 429:
-            METRIC_429_RECEIVED.labels(method='post').inc()
+            METRIC_429_RECEIVED.labels(
+                method='post',
+                worker_id=get_worker_id(),
+            ).inc()
             penalty: float = _parse_retry_after(
                 result, DEFAULT_429_PENALTY_SECONDS,
             )
@@ -565,7 +578,7 @@ class ExchangeClient(AsyncClient):
         if self._upload_shutdown:
             return False
 
-        self._ensure_upload_workers()
+        self._ensure_upload_tasks()
 
         job: _UploadJob = _UploadJob(
             url=url,
@@ -578,7 +591,9 @@ class ExchangeClient(AsyncClient):
         try:
             self._upload_queue.put_nowait(job)
         except asyncio.QueueFull:
-            METRIC_UPLOAD_QUEUE_DROPPED.inc()
+            METRIC_UPLOAD_QUEUE_DROPPED.labels(
+                worker_id=get_worker_id(),
+            ).inc()
             _LOGGER.warning(
                 'Upload queue full; dropping enqueue request',
                 extra={
@@ -589,10 +604,12 @@ class ExchangeClient(AsyncClient):
             )
             return False
 
-        METRIC_UPLOAD_QUEUE_DEPTH.set(self._upload_queue.qsize())
+        METRIC_UPLOAD_QUEUE_DEPTH.labels(
+            worker_id=get_worker_id(),
+        ).set(self._upload_queue.qsize())
         return True
 
-    def _ensure_upload_workers(self) -> None:
+    def _ensure_upload_tasks(self) -> None:
         '''
         Lazily create the background upload queue and worker tasks
         on the first ``enqueue_upload`` call. Requires a running
@@ -607,7 +624,7 @@ class ExchangeClient(AsyncClient):
                 self._upload_worker_loop(),
                 name=f'ExchangeClient.upload_worker-{i}',
             )
-            self._upload_workers.append(task)
+            self._upload_tasks.append(task)
 
     async def _upload_worker_loop(self) -> None:
         '''
@@ -638,12 +655,13 @@ class ExchangeClient(AsyncClient):
                 METRIC_BACKGROUND_UPLOADS.labels(
                     outcome='failure',
                     entity=job.entity,
+                    worker_id=get_worker_id(),
                 ).inc()
             finally:
                 self._upload_queue.task_done()
-                METRIC_UPLOAD_QUEUE_DEPTH.set(
-                    self._upload_queue.qsize()
-                )
+                METRIC_UPLOAD_QUEUE_DEPTH.labels(
+                    worker_id=get_worker_id(),
+                ).set(self._upload_queue.qsize())
 
     async def _perform_background_upload(
         self, job: _UploadJob,
@@ -673,6 +691,7 @@ class ExchangeClient(AsyncClient):
             METRIC_BACKGROUND_UPLOADS.labels(
                 outcome='failure',
                 entity=job.entity,
+                worker_id=get_worker_id(),
             ).inc()
             _LOGGER.warning(
                 'Background upload POST failed after retries',
@@ -713,6 +732,7 @@ class ExchangeClient(AsyncClient):
             METRIC_BACKGROUND_UPLOADS.labels(
                 outcome=outcome,
                 entity=job.entity,
+                worker_id=get_worker_id(),
             ).inc()
             _LOGGER.debug(
                 'Background upload succeeded',
@@ -741,7 +761,9 @@ class ExchangeClient(AsyncClient):
             try:
                 self._upload_queue.put_nowait(job)
             except asyncio.QueueFull:
-                METRIC_UPLOAD_QUEUE_DROPPED.inc()
+                METRIC_UPLOAD_QUEUE_DROPPED.labels(
+                    worker_id=get_worker_id(),
+                ).inc()
                 _LOGGER.warning(
                     'Re-enqueue after 429 failed: '
                     'queue full',
@@ -779,7 +801,7 @@ class ExchangeClient(AsyncClient):
         '''
 
         self._upload_shutdown = True
-        if self._upload_queue is None or not self._upload_workers:
+        if self._upload_queue is None or not self._upload_tasks:
             return
 
         remaining: int = self._upload_queue.qsize()
@@ -787,7 +809,7 @@ class ExchangeClient(AsyncClient):
             'Draining background upload queue',
             extra={
                 'queued': remaining,
-                'workers': len(self._upload_workers),
+                'tasks': len(self._upload_tasks),
                 'timeout': timeout,
             },
         )
@@ -811,15 +833,17 @@ class ExchangeClient(AsyncClient):
 
         # Whether we drained cleanly or timed out, cancel the worker
         # tasks so they exit out of their blocking ``queue.get()``.
-        for task in self._upload_workers:
+        for task in self._upload_tasks:
             if not task.done():
                 task.cancel()
         await asyncio.gather(
-            *self._upload_workers, return_exceptions=True
+            *self._upload_tasks, return_exceptions=True
         )
-        self._upload_workers.clear()
+        self._upload_tasks.clear()
         self._upload_queue = None
-        METRIC_UPLOAD_QUEUE_DEPTH.set(0)
+        METRIC_UPLOAD_QUEUE_DEPTH.labels(
+            worker_id=get_worker_id(),
+        ).set(0)
 
     async def aclose(self) -> None:
         '''

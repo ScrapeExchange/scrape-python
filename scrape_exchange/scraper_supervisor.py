@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from prometheus_client import Gauge, start_http_server
 
 from scrape_exchange.exchange_client import ExchangeClient
+from scrape_exchange.worker_id import get_worker_id
 
 # Environment variable the supervisor writes the pre-fetched JWT
 # into for child processes. Workers check this before calling
@@ -63,13 +64,13 @@ METRIC_NUM_PROCESSES: Gauge = Gauge(
     'scraper_num_processes',
     'Number of child scraper processes configured for this '
     'scraper tree as seen from the current process.',
-    ['role', 'scraper'],
+    ['role', 'scraper', 'worker_id'],
 )
 METRIC_CONCURRENCY: Gauge = Gauge(
     'scraper_concurrency',
     'Number of concurrent async tasks per worker process as seen '
     'from the current process.',
-    ['role', 'scraper'],
+    ['role', 'scraper', 'worker_id'],
 )
 
 
@@ -121,6 +122,9 @@ class SupervisorConfig:
         (which is higher priority) to the per-worker file. Set to
         ``None`` if the scraper doesn't use a scraper-specific
         log-file alias.
+    :param shutdown_grace_seconds: Seconds to wait after
+        forwarding SIGTERM/SIGINT to children before escalating
+        to SIGKILL. Defaults to 30.
     '''
 
     scraper_label: str
@@ -134,6 +138,7 @@ class SupervisorConfig:
     api_key_id: str | None = None
     api_key_secret: str | None = None
     exchange_url: str = 'https://scrape.exchange'
+    shutdown_grace_seconds: int = 60
 
 
 def publish_config_metrics(
@@ -155,11 +160,14 @@ def publish_config_metrics(
         the worker report the same per-child concurrency.
     '''
 
+    worker_id: str = get_worker_id()
     METRIC_NUM_PROCESSES.labels(
         role=role, scraper=scraper_label,
+        worker_id=worker_id,
     ).set(num_processes)
     METRIC_CONCURRENCY.labels(
         role=role, scraper=scraper_label,
+        worker_id=worker_id,
     ).set(concurrency)
 
 
@@ -260,6 +268,7 @@ def spawn_children(
         child_env['METRICS_PORT'] = str(
             config.metrics_port + worker_instance
         )
+        child_env['WORKER_ID'] = str(worker_instance)
         if jwt_header is not None:
             child_env[EXCHANGE_JWT_ENV_VAR] = jwt_header
         child_log_file: str | None = None
@@ -296,8 +305,69 @@ def terminate_children(
                 pass
 
 
+def _should_escalate(
+    shutdown_state: dict[str, float | None] | None,
+) -> bool:
+    '''
+    Return ``True`` when the shutdown grace period has expired
+    and children should be sent SIGKILL.
+    '''
+
+    if shutdown_state is None:
+        return False
+    deadline: float | None = shutdown_state.get('deadline')
+    return deadline is not None and time.monotonic() >= deadline
+
+
+def _kill_children(
+    scraper_label: str,
+    pending: list[subprocess.Popen],
+) -> None:
+    '''Send SIGKILL to every still-running child in *pending*.'''
+
+    _LOGGER.warning(
+        '%s supervisor grace period expired; '
+        'sending SIGKILL to %d remaining children',
+        scraper_label, len(pending),
+    )
+    for child in pending:
+        if child.poll() is None:
+            try:
+                child.kill()
+            except ProcessLookupError:
+                pass
+
+
+def _handle_child_exit(
+    scraper_label: str,
+    child: subprocess.Popen,
+    rc: int,
+    pending: list[subprocess.Popen],
+) -> int:
+    '''
+    Log a child exit and return a non-zero exit code if the
+    child failed. Terminates siblings on first failure.
+    '''
+
+    _LOGGER.info(
+        '%s scraper child exited '
+        '(pid=%d returncode=%s)',
+        scraper_label, child.pid, rc,
+    )
+    if rc == 0:
+        return 0
+    _LOGGER.error(
+        'Child failed; terminating siblings '
+        '(pid=%d returncode=%s)',
+        child.pid, rc,
+    )
+    terminate_children(pending)
+    return rc or 1
+
+
 def wait_for_children(
     scraper_label: str, children: list[subprocess.Popen],
+    shutdown_state: dict[str, float | None] | None = None,
 ) -> int:
     '''
     Block until every child has exited. Returns ``0`` when every
@@ -305,38 +375,51 @@ def wait_for_children(
     first failing child — at which point the surviving siblings
     are sent SIGTERM so the supervisor doesn't keep partial work
     running.
+
+    When *shutdown_state* is provided and contains a
+    ``'deadline'`` key set by :func:`install_signal_forwarders`,
+    any children still running after that deadline are sent
+    SIGKILL so the supervisor does not hang indefinitely on
+    stuck processes (e.g. yt-dlp threads blocking
+    ``asyncio.run()`` cleanup).
     '''
 
     exit_code: int = 0
     pending: list[subprocess.Popen] = list(children)
+    escalated: bool = False
     while pending:
+        if not escalated and _should_escalate(shutdown_state):
+            escalated = True
+            _kill_children(scraper_label, pending)
+
         for child in list(pending):
             try:
                 rc: int | None = child.wait(timeout=1.0)
             except subprocess.TimeoutExpired:
                 continue
             pending.remove(child)
-            _LOGGER.info(
-                '%s scraper child exited (pid=%d returncode=%s)',
-                scraper_label, child.pid, rc,
+            result: int = _handle_child_exit(
+                scraper_label, child, rc, pending,
             )
-            if rc != 0 and exit_code == 0:
-                exit_code = rc or 1
-                _LOGGER.error(
-                    'Child failed; terminating siblings '
-                    '(pid=%d returncode=%s)',
-                    child.pid, rc,
-                )
-                terminate_children(pending)
+            if exit_code == 0:
+                exit_code = result
     return exit_code
 
 
 def install_signal_forwarders(
     children: list[subprocess.Popen],
+    shutdown_state: dict[str, float | None] | None = None,
+    grace_seconds: int = 30,
 ) -> None:
     '''
     Install SIGINT and SIGTERM handlers that forward the received
     signal to every still-running child.
+
+    When *shutdown_state* is provided, the first signal sets
+    ``shutdown_state['deadline']`` to
+    ``time.monotonic() + grace_seconds`` so that
+    :func:`wait_for_children` can escalate to SIGKILL after the
+    grace period.
     '''
 
     def _forward_signal(signum: int, _frame: object) -> None:
@@ -345,6 +428,11 @@ def install_signal_forwarders(
             '(signum=%d children=%d)',
             signum, len(children),
         )
+        if (shutdown_state is not None
+                and shutdown_state.get('deadline') is None):
+            shutdown_state['deadline'] = (
+                time.monotonic() + grace_seconds
+            )
         for child in children:
             if child.poll() is None:
                 try:
@@ -458,10 +546,19 @@ def run_supervisor(config: SupervisorConfig) -> int:
     children: list[subprocess.Popen] = spawn_children(
         config, chunks, jwt_header=jwt_header,
     )
-    install_signal_forwarders(children)
+    shutdown_state: dict[str, float | None] = {
+        'deadline': None,
+    }
+    install_signal_forwarders(
+        children, shutdown_state,
+        grace_seconds=config.shutdown_grace_seconds,
+    )
 
     try:
-        return wait_for_children(config.scraper_label, children)
+        return wait_for_children(
+            config.scraper_label, children,
+            shutdown_state,
+        )
     finally:
         for child in children:
             if child.poll() is None:

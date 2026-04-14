@@ -109,6 +109,19 @@ class ScraperSettings(BaseSettings):
         ),
     )
 
+    worker_id: str = Field(
+        default='0',
+        validation_alias=AliasChoices(
+            'WORKER_ID', 'worker_id'
+        ),
+        description=(
+            'Unique identifier for this worker process, '
+            'used as a Prometheus metric label to '
+            'distinguish workers whose instance labels '
+            'collide. Set automatically by the supervisor.'
+        ),
+    )
+
     redis_dsn: str | None = Field(
         default=None,
         validation_alias=AliasChoices(

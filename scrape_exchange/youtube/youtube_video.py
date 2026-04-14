@@ -31,6 +31,8 @@ from innertube import InnerTube
 
 from prometheus_client import Gauge
 
+from scrape_exchange.worker_id import get_worker_id
+
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
 
@@ -58,9 +60,9 @@ YTDLP_CACHE_DIR: str = '/var/tmp/yt_dlp_cache'
 # the rate limiter or YouTube.
 METRIC_EXTRACT_INFO_ACTIVE: Gauge = Gauge(
     'youtube_extract_info_active',
-    'Number of yt-dlp extract_info calls currently running in the '
-    'thread pool, labelled by proxy.',
-    ['proxy'],
+    'Number of yt-dlp extract_info calls currently running in '
+    'the thread pool, labelled by proxy.',
+    ['proxy', 'worker_id'],
 )
 
 
@@ -1000,17 +1002,22 @@ class YouTubeVideo:
             )
             loop = asyncio.get_event_loop()
             proxy_label: str = proxy or 'none'
-            METRIC_EXTRACT_INFO_ACTIVE.labels(proxy=proxy_label).inc()
+            wid: str = get_worker_id()
+            METRIC_EXTRACT_INFO_ACTIVE.labels(
+                proxy=proxy_label, worker_id=wid,
+            ).inc()
             try:
-                video_info: dict[str, any] = await loop.run_in_executor(
-                    None,
-                    lambda: self.download_client.extract_info(
-                        self.url, download=False
+                video_info: dict[str, any] = (
+                    await loop.run_in_executor(
+                        None,
+                        lambda: self.download_client.extract_info(
+                            self.url, download=False
+                        ),
                     )
                 )
             finally:
                 METRIC_EXTRACT_INFO_ACTIVE.labels(
-                    proxy=proxy_label
+                    proxy=proxy_label, worker_id=wid,
                 ).dec()
             if video_info:
                 _LOGGER.debug(

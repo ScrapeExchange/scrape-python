@@ -8,38 +8,46 @@
   <img src="files/grafana-scrape-small.png?raw=true" alt="Scrape Dashboard"/>
 </div>
 
-Python tools to scrape content from various platforms and upload it to the [scrape.exchange](https://scrape.exchange). At this time, only YouTube is supported, but the goal is to support more platforms in the future. The tool does not download any media such as images or videos, but it does scrape metadata about the content, such as titles, descriptions, and URLs. The scraped metadata is then uploaded to the [scrape.exchange](https://scrape.exchange), where it can be accessed by other users and applications, either through the web interface, the anonymous API, or using torrents. To upload data to the exchange, you need to have a forever-free account and an API key. You can create an account on the [scrape.exchange](https://scrape.exchange) website, and you can generate an API key from your account settings.
+Python tools to scrape content from various platforms and upload it to the [scrape.exchange](https://scrape.exchange). At this time, only YouTube is supported, but the goal is to support more platforms in the future. The tool does not download any media such as images or videos, but it does scrape metadata about the content, such as titles, descriptions, and URLs. The scraped metadata is then uploaded to the [scrape.exchange](https://scrape.exchange), where it can be accessed by other users and applications, either through the web interface, the anonymous API, or using torrents. To upload data to the exchange, you need to have a (forever-free) account and an API key. You can create an account on the [scrape.exchange](https://scrape.exchange) website, and you can download the API key from your account settings page.
+While the scraping tools have a lot of capabilities, they can be used without much configuration effort. The tools are designed to be easy to use and to require minimal setup, so you can start scraping and uploading data to the exchange with just a few steps. The tools are also designed to be flexible and configurable, so you can customize them to fit your specific needs and use cases. For example, you can configure the tools to scrape specific channels or videos, to use proxies to avoid bot detection, and to adjust rate limits to avoid getting blocked by the platforms. The tools also support running multiple worker processes in parallel while sharing the rate limits, which can help to speed up the scraping process while still respecting the rate limits of the platforms.
 In addition to the scraping tools, there is also a websocket listener tool that allows you to listen for new content being uploaded to the exchange in real-time. This can be useful for testing and debugging, as well as for getting real-time updates on new content being uploaded to the exchange. You can look at the  [Firehose page on the scrape.exchange](https://scrape.exchange/firehose) website for an example to see what kind of data you can collect with the listener.
 
-# Avoiding bot detection and rate limits
-The scraping tools in this directory maximize the number of scrapes that you can do while minimizing the risk of being blocked by the platform for making too many requests. To do this, the tools use a rate limiter to limit the number of requests that can be made in a given time period. The rate limits are based on the observed behavior of YouTube's bot detection mechanisms, but they may need to be adjusted over time as YouTube changes its algorithms. The tools also support using proxies to route requests through different IP addresses, which can help to avoid triggering bot detection. They use the [InnerTube](https://github.com/yt-dlp/yt-dlp/wiki/InnerTube) to interact with YouTube's internal API. Furthermore, it sets up the [yt-dlp](https://github.com/yt-dlp/yt-dlp) package with the appropriate cookies and headers to make the requests look like they are coming from a real browser session, which can also help to avoid triggering bot detection. Finally, as per the instructions of yt-dlp, it uses deno and the po-token-provider to generate the necessary tokens for making requests to YouTube, which can also help to avoid triggering bot detection. When a scraper receives a response from YouTube that indicates that it has been rate limited or blocked, it will back off and retry the request after a certain amount of time. The backoff time is increased exponentially with each subsequent failure, up to a maximum backoff time. This way, the scraper can recover from temporary blocks and continue scraping without getting permanently blocked.
+# Quick start
+The fastest way to get started is:
+- Create an account on the [scrape.exchange](https://scrape.exchange) and get your API key from your account settings page.
+- Log in to a Linux machine and execute
+```bash
+# Install the Deno runtime, which is required for yt-dlp to work properly with YouTube
+curl -fsSL https://deno.land/install.sh | sh
+# Run the po-token-provider, which is required for yt-dlp to work properly with YouTube
+docker run --name bgutil-provider -d -p 4416:4416 --init brainicism/bgutil-ytdlp-pot-provider
+# Install uv, the package manager and task runner used to run the tools in this repository
+curl -fsSL https://install.astral.sh | sh
 
-The scrapers share a common rate limiter so you can run multiple tools at the same time without worrying about them interfering with each other and causing you to get blocked. Currently, all scrapers need to run on the same host to share the rate limiter, but in the future, the rate limiter could be extended to work across multiple hosts using a shared database or cache.
+mkdir -p scraping/{channels,videos}
+cd scraping
+# channels.lst takes one channel per line, either in the form of a channel ID (UC...) or a channel handle (@...)
+echo <channel you want to scrape> >> channels.lst
+git clone https://github.com/scrape-python/scrape-python.git
+cd scrape-python
+cp .env-example .env
+# Edit [.env-example](.env-example) to put in your Scrape.Exchange username and API key, and to set the data directories to the channels and videos directories you just created. Set YOUTUBE_VIDEO_DATA_DIR to ../videos and YOUTUBE_CHANNEL_DATA_DIR to ../channels
+uv run tools/yt_channel_scrape.py
+uv run tools/yt_rss_scrape.py
+uv run tools/yt_video_upload.py
+```
+
+As you can see from the contents of the .env file, there are many configuration options available for the scrapers, but you can get started with changing just a few of them. The most important ones to set up are the Scrape.Exchange API key and the data directories for the channels and videos. The other settings can be left at their default values for now, and you can adjust them later as you become more familiar with the scrapers and based on your specific use case.
+
+# Avoiding bot detection and rate limits
+The scraping tools in this directory maximize the number of scrapes that you can do while minimizing the risk of being blocked by the platform for making too many requests. To do this, the tools use a rate limiter to limit the number of requests that can be made in a given time period. The rate limits are based on the observed behavior of YouTube's bot detection mechanisms, but they may need to be adjusted over time as YouTube changes its algorithms. The tools also support using proxies to route requests through different IP addresses, which can help to avoid triggering bot detection. They use the [InnerTube](https://github.com/yt-dlp/yt-dlp/wiki/InnerTube) to interact with YouTube's internal API. Furthermore, it sets up the [yt-dlp](https://github.com/yt-dlp/yt-dlp) package with the appropriate cookies and headers to make the requests look like they are coming from a real browser session, which can also help to avoid triggering bot detection. Finally, as per the instructions of yt-dlp, it uses deno and the po-token-provider to generate the necessary tokens for making requests to YouTube, which can further help to avoid triggering bot detection. When a scraper receives a response from YouTube that indicates that it has been rate limited or blocked, it will back off and retry the request after a certain amount of time. The backoff time is increased exponentially with each subsequent failure, up to a maximum backoff time. This way, the scraper can recover from temporary blocks and continue scraping without getting permanently blocked.
+
+The scrapers share a common rate limiter so you can run multiple tools at the same time without worrying about them interfering with each other, exceeding the configured limits and causing you to get blocked. If you want to use the scrapers on multiple hosts, you can set up a Redis server and configure the scrapers to use Redis as a backend for the rate limiter. This way, the scrapers on different hosts can coordinate their requests and avoid exceeding the rate limits of the platforms.
 
 # Process management and observability
-Each of the scrapers in this repo can be configured to either run as a single process or with multiple worker processes managed by a supervisor process. When running with multiple worker processes, the supervisor process will automatically restart any worker processes that crash or become unresponsive. The scrapers also expose Prometheus metrics about their performance and configuration, which can be used to monitor the scrapers and alert on any issues. The metrics include information about the number of channels and videos scraped, the number of requests made to YouTube, the number of requests that were rate limited, and the current configuration of the scraper. The metrics are exposed on a configurable port, and they can be scraped by a Prometheus server for monitoring and alerting. A Grafana dashboard is included in the repository as `grafana_dashboard.json` that can be imported into Grafana to visualize the metrics. There is also a configuration file included in the repository as `prometheus-alerts-youtube.yml` that can be used to configure a Prometheus server to scrape the metrics from the scrapers. Logs are emitted by default in a structured JSON format, which can be easily ingested by log management systems such as Elasticsearch or Splunk. A command to de-jsonify the logs is provided below for users who want to read the logs in a more human-readable format.
-Configuration of the scrapers can be done through environment variables or command line arguments. A sample `.env` file is included in the repository as `.env.example`, which can be copied to `.env` and modified with the appropriate values for your setup.
+Each of the scrapers in this repo can be configured to either run as a single process or with multiple worker processes managed by a supervisor process. When running with multiple worker processes, the supervisor process will automatically restart any worker processes that crash or become unresponsive. The scrapers also expose Prometheus metrics about their performance and configuration, which can be used to monitor the scrapers and alert on any issues. The metrics include information about the number of channels and videos scraped, the number of requests made to YouTube, the number of requests that were rate limited, and the current configuration of the scraper. The metrics are exposed on a configurable port, and they can be scraped by a Prometheus server for monitoring and alerting. A Grafana dashboard is included in the repository as `grafana_dashboard.json` that can be imported into Grafana to visualize the metrics. There is also a configuration file included in the repository as `prometheus-alerts-youtube.yml` that can be used to configure a Prometheus AlertManager that can generate alerts.. Logs are emitted by default in a structured JSON format, which can be easily ingested by log management systems such as Elasticsearch or Splunk.
+For more info about observability of the scrapers, see the [OBSERVABILITY.md](OBSERVABILITY.md) doc.
 
-# Installation
-These instructions assume you have access to a Linux computer. It needs to have Python3, the 'uv' tool, docker, brotli, and jq installed. The instructions for installing 'uv' are available at [uv documentation](https://docs.astral.sh/uv/getting-started/installation/). Instructions for installing docker can be found on the [docker website](https://docs.docker.com/desktop/setup/install/linux/). Brotli and jq can be installed using `yum install brotli jq` on RHEL-based distributions, `apt install brotli jq` on Debian-based distributions.
-
-The YouTube scrapers can be used to scrape metadata about videos and channels from YouTube. The code leverages the `InnerTube` and `yt-dlp` packages to scrape the metadata from YouTube. The `yt-dlp` package needs some bits installed and configured to work properly with YouTube.
-- [deno](https://docs.deno.com/runtime/getting_started/installation/): ```curl -fsSL https://deno.land/install.sh | sh```
-- [po-token-provider](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide): ```docker run --name bgutil-provider -d -p 4416:4416 --init brainicism/bgutil-ytdlp-pot-provider``` or `docker-compose.yml`:
-
-```yaml
-version: '3'
-services:
-  po-token-provider:
-    image: brainicism/bgutil-ytdlp-pot-provider
-    container_name: bgutil-provider
-    restart: unless-stopped
-    init: true
-    networks:
-      - po-token-provider
-    ports:
-      - 4416:4416
-```
 
 # Using a proxy
 
@@ -48,8 +56,7 @@ To avoid more stringent bot checking to access content, you can use web proxies.
 PROXIES=http://your-proxy-server:port,http://your-proxy-server:port2
 ```
 
-The rate limiter will apply the rate limits per proxy server, so using multiple proxy servers can help to increase the overall rate of scraping while still avoiding triggering bot detection.
-If you don't have a proxy server provider, but you do subscribe to a VPN service, you can use the VPN's proxy server. Check your VPN provider's documentation for the proxy server details.
+The rate limiter will apply the rate limits per proxy server, so using multiple proxy servers can help to increase the overall rate of scraping while still avoiding triggering bot detection. If you don't have a proxy server provider, but you do subscribe to a VPN service, you can use the VPN's proxy server. Check your VPN provider's documentation for the proxy server details.
 
 If you have a VPN subscription (ie., NordVPN, ProtonVPN, etc.), you can also set up your own proxy server using your VPN service. For example, you can use the Gluetun Docker image to set up a VPN connection and a Squid proxy server. Here's how you can do it:
 - Install docker as described above.
@@ -94,9 +101,9 @@ services:
 You may have to change the `VPN_SERVICE_PROVIDER`, `VPN_TYPE`, and `SERVER_COUNTRIES` environment variables to match your VPN provider and preferences. You'll have to change the `WIREGUARD_PRIVATE_KEY` environment variable to your own WireGuard private key. Then run `docker-compose up -d` to start the containers. The Squid proxy server will be available on port 3128 of your host machine, and it will route traffic through the Gluetun VPN container. For more information on setting up Gluetun, see the [Gluetun Wiki](https://github.com/qdm12/gluetun/wiki).
 
 # JSONSchema
-The scrapers in this repository use JSONSchema to validate the data before it is uploaded to the [scrape.exchange](https://scrape.exchange). This helps people to use the data you shared more easily. If you want to make changes to the data that is being uploaded, such as adding new fields or changing the format of existing fields, you should create your own JSONSchema. The JSONSchemas for the YouTube channel and video metadata are included in the repository as `youtube_channel_schema.json` and `youtube_video_schema.json`, respectively. You can upload new schemas using [the website](https://scrape.exchange/schema) or you can use the `tools/upload_schema.py` script to upload the new schema to the exchange.
+The scrapers in this repository use JSONSchema to validate the data before it is uploaded to the [scrape.exchange](https://scrape.exchange). This helps people to use the data you shared more easily. If you want to make changes to the data that is being uploaded, such as adding new fields or changing the format of existing fields, you should create your own JSONSchema. You can read the [documentation on schema](docs/SCHEMA.md) for more information. The JSONSchemas for the YouTube channel and video metadata are included in the repository as `youtube_channel_schema.json` and `youtube_video_schema.json`, respectively. You can upload new schemas using [the website](https://scrape.exchange/schema) or you can use the `tools/upload_schema.py` script to upload the new schema to the exchange.
 
-# The tools
+# Running the tools
 
 The tools described below should be run from the root of the repository using the `uv` tool. We'll need to set the PYTHONPATH environment variable because scrape-python is not installed as a package.
 
@@ -111,7 +118,7 @@ PYTHONPATH=. uv run tools/listen_messages.py
 The first time you run one of the tools, or after you pull new changes from the repository, `uv` will automatically install any new dependencies specified in the `pyproject.toml` file. After that, it will run the tool using the installed dependencies.
 
 ## YouTube Scrapers
-There are three tools available in this repository for scraping YouTube content and uploading it to the [scrape.exchange](https://scrape.exchange). If you want to scrape one or more YouTube channels, you put them in the <YOUTUBE_CHANNEL_LIST> file. You can add either the channel-ID (a 24-character string starting with "UC") or the channel handle (a string starting with "@"). You can then run the `yt_channel_scrape.py` script to scrape the channel information and save it to the <YOUTUBE_CHANNEL_DATA_DIR> directory. It also writes to <CHANNEL_MAP_FILE> to store mappings from channel IDs ('UC<22 characters>') to channel handle. You then run the `yt_rss_reader.py` script to scrape the latest videos from the channels and save them to the <YOUTUBE_VIDEO_DATA_DIR> directory, while also uploading the metadata to the Scrape.Exchange API. Finally, you run the `yt_video_upload.py` script to augment the video metadata with data collected with yt-dlp and upload it to the API.
+There are three tools available in this repository for scraping YouTube content and uploading it to the [scrape.exchange](https://scrape.exchange). If you want to scrape one or more YouTube channels, you put them in the <YOUTUBE_CHANNEL_LIST> file. You can add either the channel-ID (a 24-character string starting with "UC") or the channel handle (a string starting with "@"). You can then run the `yt_channel_scrape.py` script to scrape the channel information and save it to the <YOUTUBE_CHANNEL_DATA_DIR> directory. It also writes to <CHANNEL_MAP_FILE> to store mappings from channel IDs to channel handle. You then run the `yt_rss_reader.py` script to scrape the latest videos from the channels and save them to the <YOUTUBE_VIDEO_DATA_DIR> directory, while also uploading the metadata to the Scrape.Exchange API. Finally, you run the `yt_video_upload.py` script to augment the video metadata with data collected with yt-dlp (such as available video streams, captions etc.) and upload it to the API.
 
 These tools share a directory structure:
 
@@ -180,7 +187,6 @@ The `YouTubeRateLimiter` enforces a separate token bucket per call type, plus a 
 - **with cookies** means using a valid browser cookie jar with consent cookies and optionally authenticated session cookies.
 - Datacenter IPs are penalised much more aggressively than residential IPs
   across all methods.
-
 
 ## Websocket listener
 With tools/listen_messages.py, you can listen to the websocket for new channels and videos being uploaded to the [scrape.exchange](https://scrape.exchange). This is useful for testing and debugging, as well as for getting real-time updates on new content being uploaded to the exchange. Depending on your filtering criteria, this can be a very high volume of messages, so use it with caution.

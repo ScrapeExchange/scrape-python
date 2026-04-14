@@ -31,10 +31,15 @@ from dataclasses import dataclass, field
 
 from prometheus_client import Counter, Gauge, Histogram
 
+from scrape_exchange.worker_id import get_worker_id
+
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 _SCRIPT_NAME: str = os.path.basename(sys.argv[0]) if sys.argv else 'unknown'
 
-_METRIC_LABELS: list[str] = ['call_type', 'proxy', 'script', 'platform']
+_METRIC_LABELS: list[str] = [
+    'call_type', 'proxy', 'script', 'platform',
+    'worker_id',
+]
 
 METRIC_REQUESTS_ACQUIRED: Counter = Counter(
     'rate_limiter_requests_acquired_total',
@@ -60,7 +65,7 @@ METRIC_BUCKET_TOKENS: Gauge = Gauge(
 METRIC_GLOBAL_BUCKET_TOKENS: Gauge = Gauge(
     'rate_limiter_global_bucket_tokens',
     'Current token level in the global rate-limit bucket',
-    ['proxy', 'script', 'platform'],
+    ['proxy', 'script', 'platform', 'worker_id'],
 )
 
 
@@ -652,7 +657,7 @@ class _SharedFileBackend(_Backend[CallTypeT]):
 METRIC_REDIS_OPS: Counter = Counter(
     'rate_limiter_redis_ops_total',
     'Redis operations executed by the rate limiter backend.',
-    ['operation', 'result', 'platform'],
+    ['operation', 'result', 'platform', 'worker_id'],
 )
 
 # Lua script: atomic refill + conditional consume.
@@ -812,6 +817,7 @@ class _RedisBackend(_Backend[CallTypeT]):
             'operation': operation,
             'result': result,
             'platform': self._platform,
+            'worker_id': get_worker_id(),
         }
 
     async def _ensure_scripts(self) -> None:
@@ -1166,6 +1172,7 @@ class RateLimiter(ABC, Generic[CallTypeT]):
             'proxy': proxy or 'none',
             'script': _SCRIPT_NAME,
             'platform': self._platform,
+            'worker_id': get_worker_id(),
         }
 
     def _global_labels(
@@ -1175,6 +1182,7 @@ class RateLimiter(ABC, Generic[CallTypeT]):
             'proxy': proxy or 'none',
             'script': _SCRIPT_NAME,
             'platform': self._platform,
+            'worker_id': get_worker_id(),
         }
 
     async def acquire(

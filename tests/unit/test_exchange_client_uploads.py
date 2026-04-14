@@ -47,7 +47,7 @@ def _make_client(
     client.jwt_header = None
     client.headers = {}
     client._upload_queue = None
-    client._upload_workers = []
+    client._upload_tasks = []
     client._upload_shutdown = False
     httpx.AsyncClient.__init__(
         client,
