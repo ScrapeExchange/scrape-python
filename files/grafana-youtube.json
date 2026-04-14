@@ -599,7 +599,7 @@
     {
       "id": 57,
       "type": "stat",
-      "title": "API \u2014 videos updated (1h)",
+      "title": "API \u2014 videos uploaded (1h)",
       "description": "Existing video records refreshed on scrape.exchange (HTTP 200)",
       "datasource": {
         "type": "prometheus",
@@ -641,7 +641,7 @@
       },
       "targets": [
         {
-          "expr": "sum(increase(exchange_client_background_uploads_total{outcome=\"updated\", entity=\"video\", job=~\"$job\", instance=~\"$instance\"}[1h]))",
+          "expr": "sum(increase(exchange_client_background_uploads_total{outcome=~\"created|updated\", entity=\"video\", job=~\"$job\", instance=~\"$instance\"}[1h]))",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
@@ -853,8 +853,8 @@
           }
         },
         {
-          "expr": "sum(rate(exchange_client_background_uploads_total{outcome=\"updated\", entity=\"video\", job=~\"$job\", instance=~\"$instance\"}[5m]))",
-          "legendFormat": "API updated (video)",
+          "expr": "sum(rate(exchange_client_background_uploads_total{outcome=~\"created|updated\", entity=\"video\", job=~\"$job\", instance=~\"$instance\"}[5m]))",
+          "legendFormat": "API created/updated (video)",
           "refId": "E",
           "datasource": {
             "type": "prometheus",
@@ -2268,7 +2268,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (tier) (rate(yt_rss_tier_on_time_total{job=~\"$job\", instance=~\"$instance\"}[15m])) / (sum by (tier) (rate(yt_rss_tier_on_time_total{job=~\"$job\", instance=~\"$instance\"}[15m])) + sum by (tier) (rate(yt_rss_tier_overdue_total{job=~\"$job\", instance=~\"$instance\"}[15m])))",
+          "expr": "sum by (tier) (rate(yt_rss_tier_on_time_total{job=~\"$job\", instance=~\"$instance\"}[15m])) / (sum by (tier) (rate(yt_rss_tier_on_time_total{job=~\"$job\", instance=~\"$instance\"}[15m])) + (sum by (tier) (rate(yt_rss_tier_overdue_total{job=~\"$job\", instance=~\"$instance\"}[15m])) or vector(0)))",
           "legendFormat": "tier {{tier}} SLA%",
           "refId": "A",
           "datasource": {

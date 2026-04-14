@@ -146,7 +146,7 @@ class ExchangeClient(AsyncClient):
     # attributes so tests and tools can override them before
     # instantiating the client.
     UPLOAD_QUEUE_MAX: int = 1024
-    UPLOAD_WORKER_COUNT: int = 8
+    UPLOAD_WORKER_COUNT: int = 32
 
     def __init__(self, exchange_url: str = SCRAPE_EXCHANGE_URL) -> None:
         '''
