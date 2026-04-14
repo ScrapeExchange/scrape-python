@@ -13,16 +13,6 @@ from ..settings import ScraperSettings
 
 
 class YouTubeScraperSettings(ScraperSettings):
-    upload_only: bool = Field(
-        default=False,
-        validation_alias=AliasChoices('UPLOAD_ONLY', 'upload_only'),
-        description='Only perform the upload step, skipping data scraping',
-    )
-    no_upload: bool = Field(
-        default=False,
-        validation_alias=AliasChoices('#NO_UPLOAD', '#no_upload'),
-        description='Only perform the scraping step, skipping data upload',
-    )
     channel_data_directory: str | None = Field(
         default=None,
         validation_alias=AliasChoices(

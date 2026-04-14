@@ -19,6 +19,7 @@ from innertube.errors import RequestError as InnerTubeRequestError
 from dateutil import parser as dateutil_parser
 
 from .youtube_caption import YouTubeCaption
+from scrape_exchange.worker_id import get_worker_id
 from .youtube_client import METRIC_YT_REQUEST_DURATION
 from .youtube_format import YouTubeFormat
 from .youtube_cookiejar import YouTubeCookieJar
@@ -152,15 +153,20 @@ class InnerTubeVideoParser:
             try:
                 player_data = self.innertube.player(video.video_id)
                 METRIC_YT_REQUEST_DURATION.labels(
-                    kind='innertube', status_class='2xx'
+                    kind='innertube',
+                    status_class='2xx',
+                    worker_id=get_worker_id(),
                 ).observe(time.monotonic() - start)
                 break
             except InnerTubeRequestError as exc:
                 METRIC_YT_REQUEST_DURATION.labels(
                     kind='innertube',
                     status_class=(
-                        '4xx' if exc.error.code == 429 else 'error'
+                        '4xx'
+                        if exc.error.code == 429
+                        else 'error'
                     ),
+                    worker_id=get_worker_id(),
                 ).observe(time.monotonic() - start)
                 if exc.error.code == 429:
                     await limiter.penalise(
@@ -187,7 +193,9 @@ class InnerTubeVideoParser:
                     )
             except Exception as exc:
                 METRIC_YT_REQUEST_DURATION.labels(
-                    kind='innertube', status_class='error'
+                    kind='innertube',
+                    status_class='error',
+                    worker_id=get_worker_id(),
                 ).observe(time.monotonic() - start)
                 raise RuntimeError(f'InnerTube API call failed: {exc}')
 
@@ -295,7 +303,9 @@ class InnerTubeVideoParser:
                     video.video_id
                 )
                 METRIC_YT_REQUEST_DURATION.labels(
-                    kind='innertube', status_class='2xx'
+                    kind='innertube',
+                    status_class='2xx',
+                    worker_id=get_worker_id(),
                 ).observe(time.monotonic() - next_start)
                 self._parse_next_data(next_data)
                 break
@@ -303,8 +313,11 @@ class InnerTubeVideoParser:
                 METRIC_YT_REQUEST_DURATION.labels(
                     kind='innertube',
                     status_class=(
-                        '4xx' if exc.error.code == 429 else 'error'
+                        '4xx'
+                        if exc.error.code == 429
+                        else 'error'
                     ),
+                    worker_id=get_worker_id(),
                 ).observe(time.monotonic() - next_start)
                 if exc.error.code == 429:
                     await limiter.penalise(
@@ -327,7 +340,9 @@ class InnerTubeVideoParser:
                     break  # non-429 error on NEXT: skip silently
             except Exception:
                 METRIC_YT_REQUEST_DURATION.labels(
-                    kind='innertube', status_class='error'
+                    kind='innertube',
+                    status_class='error',
+                    worker_id=get_worker_id(),
                 ).observe(time.monotonic() - next_start)
                 break  # NEXT is best-effort; never fail the whole scrape
 

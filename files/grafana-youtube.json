@@ -478,7 +478,8 @@
       },
       "targets": [
         {
-          "expr": "sum(yt_rss_queue_size{job=~\"$job\", instance=~\"$instance\"})",
+          "expr": "max(yt_rss_queue_size{job=~\"$job\", instance=~\"$instance\"}) by (tier)",
+          "legendFormat": "tier {{tier}}",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
@@ -598,7 +599,7 @@
     {
       "id": 57,
       "type": "stat",
-      "title": "API \u2014 videos updated (1h)",
+      "title": "API \u2014 videos uploaded (1h)",
       "description": "Existing video records refreshed on scrape.exchange (HTTP 200)",
       "datasource": {
         "type": "prometheus",
@@ -640,7 +641,7 @@
       },
       "targets": [
         {
-          "expr": "sum(increase(exchange_client_background_uploads_total{outcome=\"updated\", entity=\"video\", job=~\"$job\", instance=~\"$instance\"}[1h]))",
+          "expr": "sum(increase(exchange_client_background_uploads_total{outcome=~\"created|updated\", entity=\"video\", job=~\"$job\", instance=~\"$instance\"}[1h]))",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
@@ -852,8 +853,8 @@
           }
         },
         {
-          "expr": "sum(rate(exchange_client_background_uploads_total{outcome=\"updated\", entity=\"video\", job=~\"$job\", instance=~\"$instance\"}[5m]))",
-          "legendFormat": "API updated (video)",
+          "expr": "sum(rate(exchange_client_background_uploads_total{outcome=~\"created|updated\", entity=\"video\", job=~\"$job\", instance=~\"$instance\"}[5m]))",
+          "legendFormat": "API created/updated (video)",
           "refId": "E",
           "datasource": {
             "type": "prometheus",
@@ -1995,8 +1996,8 @@
           }
         },
         {
-          "expr": "sum(yt_rss_queue_size{job=~\"$job\", instance=~\"$instance\"})",
-          "legendFormat": "rss queue",
+          "expr": "max(yt_rss_queue_size{job=~\"$job\", instance=~\"$instance\"}) by (tier)",
+          "legendFormat": "rss queue tier {{tier}}",
           "refId": "B",
           "datasource": {
             "type": "prometheus",
@@ -2136,6 +2137,139 @@
         {
           "expr": "max(yt_rss_channel_seconds_since_last_processed{job=~\"$job\", instance=~\"$instance\"})",
           "legendFormat": "max age",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 60,
+      "type": "timeseries",
+      "title": "RSS queue size by tier",
+      "description": "Number of channels in each priority tier queue. Tier 1 = highest priority (most subscribers).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 103,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "normal"
+            },
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "last"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "max by (tier) (yt_rss_queue_size{job=~\"$job\", instance=~\"$instance\"})",
+          "legendFormat": "tier {{tier}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 61,
+      "type": "timeseries",
+      "title": "RSS tier SLA (on-time vs overdue)",
+      "description": "Rate of channels processed within (on-time) vs after (overdue) the tier's target interval. SLA% = on_time / (on_time + overdue).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 103,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "showPoints": "never"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.7
+              },
+              {
+                "color": "green",
+                "value": 0.9
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "min"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (tier) (rate(yt_rss_tier_on_time_total{job=~\"$job\", instance=~\"$instance\"}[15m])) / (sum by (tier) (rate(yt_rss_tier_on_time_total{job=~\"$job\", instance=~\"$instance\"}[15m])) + (sum by (tier) (rate(yt_rss_tier_overdue_total{job=~\"$job\", instance=~\"$instance\"}[15m])) or vector(0)))",
+          "legendFormat": "tier {{tier}} SLA%",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
@@ -3256,6 +3390,262 @@
           "expr": "scraper_num_processes{role=\"supervisor\"}",
           "legendFormat": "{{scraper}} (live workers)",
           "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 62,
+      "type": "row",
+      "title": "Upload-only watcher",
+      "gridPos": {
+        "x": 0,
+        "y": 152,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 63,
+      "type": "timeseries",
+      "title": "Video watcher — files detected / skipped / enqueued",
+      "description": "Upload-only watcher KPIs for the video scraper. detected − skipped should equal enqueued.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 153,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "none"
+            },
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "sum"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(yt_video_watcher_files_detected_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "detected",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "sum(rate(yt_video_watcher_files_skipped_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "skipped",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "sum(rate(yt_video_proxy_videos_enqueued_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "enqueued",
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "sum(rate(yt_video_watcher_batches_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "watcher batches",
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 64,
+      "type": "timeseries",
+      "title": "Channel watcher — files detected / skipped / enqueued",
+      "description": "Upload-only watcher KPIs for the channel scraper. detected − skipped should equal enqueued.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 153,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "none"
+            },
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "sum"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(yt_channel_watcher_files_detected_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "detected",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "sum(rate(yt_channel_watcher_files_skipped_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "skipped",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "sum(rate(yt_channel_enqueued_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "enqueued",
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "sum(rate(yt_channel_watcher_batches_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "watcher batches",
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 65,
+      "type": "stat",
+      "title": "Watcher totals (since start)",
+      "description": "Cumulative counts since the upload-only watcher started.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 161,
+        "w": 24,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 100 },
+              { "color": "red", "value": 1000 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"]
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "orientation": "horizontal"
+      },
+      "targets": [
+        {
+          "expr": "sum(yt_video_watcher_files_detected_total{job=~\"$job\", instance=~\"$instance\"})",
+          "legendFormat": "video detected",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "sum(yt_video_watcher_files_skipped_total{job=~\"$job\", instance=~\"$instance\"})",
+          "legendFormat": "video skipped",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "sum(yt_channel_watcher_files_detected_total{job=~\"$job\", instance=~\"$instance\"})",
+          "legendFormat": "channel detected",
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "sum(yt_channel_watcher_files_skipped_total{job=~\"$job\", instance=~\"$instance\"})",
+          "legendFormat": "channel skipped",
+          "refId": "D",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"

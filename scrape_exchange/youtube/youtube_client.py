@@ -26,6 +26,7 @@ from httpx import TimeoutException
 from httpx_curl_cffi import AsyncCurlTransport, CurlOpt
 from prometheus_client import Histogram
 
+from scrape_exchange.worker_id import get_worker_id
 from .youtube_rate_limiter import YouTubeRateLimiter, YouTubeCallType
 
 _LOGGER: Logger = getLogger(__name__)
@@ -39,10 +40,13 @@ _LOGGER: Logger = getLogger(__name__)
 # raised exception).
 METRIC_YT_REQUEST_DURATION: Histogram = Histogram(
     'youtube_client_request_duration_seconds',
-    'Duration of requests to YouTube, by kind (http/innertube) and '
-    'HTTP status class.',
-    ['kind', 'status_class'],
-    buckets=(0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0),
+    'Duration of requests to YouTube, by kind '
+    '(http/innertube) and HTTP status class.',
+    ['kind', 'status_class', 'worker_id'],
+    buckets=(
+        0.1, 0.25, 0.5, 1.0, 2.5,
+        5.0, 10.0, 30.0, 60.0,
+    ),
 )
 
 
@@ -174,7 +178,8 @@ class AsyncYouTubeClient(AsyncClient):
             resp: Response = await super().get(url, **kwargs)
         except asyncio.CancelledError:
             METRIC_YT_REQUEST_DURATION.labels(
-                kind='http', status_class='error'
+                kind='http', status_class='error',
+                worker_id=get_worker_id(),
             ).observe(time.monotonic() - start)
             # curl_cffi can raise CancelledError from its internal stream task
             # during cleanup even when the outer task is not being cancelled.
@@ -196,7 +201,8 @@ class AsyncYouTubeClient(AsyncClient):
                 ConnectTimeout, ConnectionResetError,
                 ConnectionRefusedError) as exc:
             METRIC_YT_REQUEST_DURATION.labels(
-                kind='http', status_class='error'
+                kind='http', status_class='error',
+                worker_id=get_worker_id(),
             ).observe(time.monotonic() - start)
             _LOGGER.debug(
                 'HTTP GET timeout',
@@ -216,7 +222,8 @@ class AsyncYouTubeClient(AsyncClient):
             raise RuntimeError(f'Timeout fetching URL {url}')
         except RequestError as exc:
             METRIC_YT_REQUEST_DURATION.labels(
-                kind='http', status_class='error'
+                kind='http', status_class='error',
+                worker_id=get_worker_id(),
             ).observe(time.monotonic() - start)
             _LOGGER.debug(
                 'HTTP GET request error',
@@ -226,7 +233,8 @@ class AsyncYouTubeClient(AsyncClient):
             raise
         except Exception as exc:
             METRIC_YT_REQUEST_DURATION.labels(
-                kind='http', status_class='error'
+                kind='http', status_class='error',
+                worker_id=get_worker_id(),
             ).observe(time.monotonic() - start)
             _LOGGER.debug(
                 'HTTP GET error',
@@ -246,7 +254,9 @@ class AsyncYouTubeClient(AsyncClient):
             raise RuntimeError(f'Timeout fetching URL {url}') from exc
 
         METRIC_YT_REQUEST_DURATION.labels(
-            kind='http', status_class=_yt_status_class(resp.status_code)
+            kind='http',
+            status_class=_yt_status_class(resp.status_code),
+            worker_id=get_worker_id(),
         ).observe(time.monotonic() - start)
 
         if (resp.status_code == 303

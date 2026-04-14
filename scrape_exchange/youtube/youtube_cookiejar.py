@@ -122,7 +122,7 @@ class YouTubeCookieJar:
                 return entry.path
             if entry is not None:
                 _LOGGER.debug(
-                    'Cookie TTL expired for proxy=%s, refreshing', proxy
+                    f'Cookie TTL expired for proxy={proxy}, refreshing'
                 )
                 entry.delete()
             entry = await self._acquire(proxy)
@@ -194,9 +194,11 @@ class YouTubeCookieJar:
                 # Snapshot cookies while the client is still open.
                 cookies = list(client.cookies.jar)
 
-            tmp = tempfile.NamedTemporaryFile(
-                mode='w', suffix='.txt', prefix='yt_cookies_', delete=False,
-            )
+            tmp: tempfile._TemporaryFileWrapper[str] = \
+                tempfile.NamedTemporaryFile(
+                    mode='w', suffix='.txt', prefix='yt_cookies_',
+                    delete=False,
+                )
             tmp.write('# Netscape HTTP Cookie File\n')
             for cookie in cookies:
                 domain: str = cookie.domain or '.youtube.com'
@@ -212,7 +214,7 @@ class YouTubeCookieJar:
             tmp.flush()
             tmp.close()
 
-            _LOGGER.info(
+            _LOGGER.debug(
                 'Acquired %d cookies for proxy=%s → %s',
                 len(cookies), proxy, tmp.name,
             )

@@ -41,39 +41,29 @@ class ScrapeExchangeCallType(str, Enum):
     POST = 'post'
 
 
-# Server-side Angie rate limits:
-#
-#   global_api  — 16 r/s, burst 8  (all /api/ endpoints)
-#   data_post   —  8 r/s, burst 4  (POST /api/data/v1 only)
-#
-# Both zones apply to POST /api/data/v1 (both must pass).
-# GET /api/ endpoints only hit global_api.
-#
-# The per-type buckets mirror data_post (POST) and
-# global_api (GET). The global bucket mirrors global_api
-# so the aggregate of GETs + POSTs stays within the
-# server's cross-endpoint ceiling.
+# Fleet-wide rate ceilings (shared across all workers via
+# the Redis or shared-file backend).
 #
 # POST burst/refill_rate can be overridden at init time
 # via the ``post_rate`` parameter.
 _DEFAULT_CONFIGS: dict[ScrapeExchangeCallType, _BucketConfig] = {
     ScrapeExchangeCallType.GET: _BucketConfig(
-        burst=8,
-        refill_rate=12.0,
+        burst=40,
+        refill_rate=400.0,
         jitter_min=0.0,
         jitter_max=0.0,
     ),
     ScrapeExchangeCallType.POST: _BucketConfig(
-        burst=4,
-        refill_rate=6.0,
+        burst=16,
+        refill_rate=80.0,
         jitter_min=0.0,
         jitter_max=0.0,
     ),
 }
 
 _GLOBAL_CONFIG: _BucketConfig = _BucketConfig(
-    burst=8,
-    refill_rate=12.0,
+    burst=50,
+    refill_rate=500.0,
     jitter_min=0.0,
     jitter_max=0.0,
 )
@@ -117,8 +107,7 @@ class ScrapeExchangeRateLimiter(RateLimiter[ScrapeExchangeCallType]):
         self._global: _BucketConfig = _GLOBAL_CONFIG
 
         if post_rate is not None and post_rate > 0:
-            # Cap at server-side data_post zone limit
-            # (8 r/s, burst 4).
+            # Cap at fleet-wide POST ceiling.
             capped_rate: float = min(
                 post_rate,
                 _DEFAULT_CONFIGS[

@@ -9,6 +9,8 @@ forking.
 '''
 
 import os
+import subprocess
+import time
 import unittest
 
 from unittest.mock import patch, MagicMock
@@ -17,10 +19,15 @@ from scrape_exchange.scraper_supervisor import (
     METRIC_CONCURRENCY,
     METRIC_NUM_PROCESSES,
     SupervisorConfig,
+    _handle_child_exit,
+    _kill_children,
+    _should_escalate,
     chunks_are_disjoint_cover,
+    install_signal_forwarders,
     publish_config_metrics,
     spawn_children,
     split_proxies,
+    wait_for_children,
 )
 
 
@@ -325,6 +332,211 @@ class TestSpawnChildrenEnv(unittest.TestCase):
         self.assertEqual(
             captured_envs[1]['PROXIES'],
             'http://b,http://d',
+        )
+
+
+class TestShouldEscalate(unittest.TestCase):
+
+    def test_none_state_returns_false(self) -> None:
+        self.assertFalse(_should_escalate(None))
+
+    def test_no_deadline_returns_false(self) -> None:
+        self.assertFalse(
+            _should_escalate({'deadline': None})
+        )
+
+    def test_future_deadline_returns_false(self) -> None:
+        future: float = time.monotonic() + 3600
+        self.assertFalse(
+            _should_escalate({'deadline': future})
+        )
+
+    def test_past_deadline_returns_true(self) -> None:
+        past: float = time.monotonic() - 1
+        self.assertTrue(
+            _should_escalate({'deadline': past})
+        )
+
+
+class TestKillChildren(unittest.TestCase):
+
+    def test_sends_kill_to_running_children(self) -> None:
+        alive: MagicMock = MagicMock()
+        alive.poll.return_value = None
+
+        dead: MagicMock = MagicMock()
+        dead.poll.return_value = 0
+
+        _kill_children('test', [alive, dead])
+
+        alive.kill.assert_called_once()
+        dead.kill.assert_not_called()
+
+    def test_ignores_process_lookup_error(self) -> None:
+        child: MagicMock = MagicMock()
+        child.poll.return_value = None
+        child.kill.side_effect = ProcessLookupError
+
+        _kill_children('test', [child])
+        child.kill.assert_called_once()
+
+
+class TestHandleChildExit(unittest.TestCase):
+
+    def test_success_returns_zero(self) -> None:
+        child: MagicMock = MagicMock()
+        child.pid = 1
+        result: int = _handle_child_exit(
+            'test', child, 0, [],
+        )
+        self.assertEqual(result, 0)
+
+    def test_failure_returns_code_and_terminates(
+        self,
+    ) -> None:
+        child: MagicMock = MagicMock()
+        child.pid = 1
+        sibling: MagicMock = MagicMock()
+        sibling.poll.return_value = None
+        pending: list[MagicMock] = [sibling]
+
+        result: int = _handle_child_exit(
+            'test', child, 2, pending,
+        )
+        self.assertEqual(result, 2)
+        sibling.terminate.assert_called_once()
+
+    def test_none_rc_treated_as_one(self) -> None:
+        '''rc=0 from kill is normalised to 1.'''
+        child: MagicMock = MagicMock()
+        child.pid = 1
+        result: int = _handle_child_exit(
+            'test', child, 0, [],
+        )
+        self.assertEqual(result, 0)
+
+
+class TestWaitForChildren(unittest.TestCase):
+
+    def test_all_exit_cleanly(self) -> None:
+        child: MagicMock = MagicMock()
+        child.wait.return_value = 0
+        child.pid = 1
+
+        rc: int = wait_for_children('test', [child])
+        self.assertEqual(rc, 0)
+
+    def test_escalates_after_deadline(self) -> None:
+        '''
+        Children that don't exit before the deadline get
+        SIGKILL.
+        '''
+        call_count: int = 0
+
+        def slow_wait(timeout: float = None) -> int:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise subprocess.TimeoutExpired(
+                    'test', timeout,
+                )
+            return -9
+
+        child: MagicMock = MagicMock()
+        child.wait.side_effect = slow_wait
+        child.poll.return_value = None
+        child.pid = 1
+
+        shutdown_state: dict[str, float | None] = {
+            'deadline': time.monotonic() - 1,
+        }
+        rc: int = wait_for_children(
+            'test', [child], shutdown_state,
+        )
+        child.kill.assert_called_once()
+
+    def test_no_escalation_without_deadline(self) -> None:
+        child: MagicMock = MagicMock()
+        child.wait.return_value = 0
+        child.pid = 1
+
+        shutdown_state: dict[str, float | None] = {
+            'deadline': None,
+        }
+        result: int = wait_for_children(
+            'test', [child], shutdown_state,
+        )
+        self.assertEqual(result, 0)
+        child.kill.assert_not_called()
+
+
+class TestInstallSignalForwarders(unittest.TestCase):
+
+    def test_sets_deadline_on_first_signal(self) -> None:
+        '''
+        Simulates a SIGTERM by capturing the handler
+        installed via signal.signal and invoking it directly.
+        '''
+        shutdown_state: dict[str, float | None] = {
+            'deadline': None,
+        }
+        handlers: dict[int, object] = {}
+
+        def fake_signal(
+            signum: int, handler: object,
+        ) -> None:
+            handlers[signum] = handler
+
+        child: MagicMock = MagicMock()
+        child.poll.return_value = None
+
+        with patch(
+            'scrape_exchange.scraper_supervisor.signal.signal',
+            side_effect=fake_signal,
+        ):
+            install_signal_forwarders(
+                [child], shutdown_state, grace_seconds=10,
+            )
+
+        import signal
+        handler = handlers[signal.SIGTERM]
+        handler(signal.SIGTERM, None)
+
+        self.assertIsNotNone(shutdown_state['deadline'])
+        child.send_signal.assert_called_once_with(
+            signal.SIGTERM,
+        )
+
+    def test_deadline_set_only_once(self) -> None:
+        shutdown_state: dict[str, float | None] = {
+            'deadline': None,
+        }
+        handlers: dict[int, object] = {}
+
+        def fake_signal(
+            signum: int, handler: object,
+        ) -> None:
+            handlers[signum] = handler
+
+        child: MagicMock = MagicMock()
+        child.poll.return_value = None
+
+        with patch(
+            'scrape_exchange.scraper_supervisor.signal.signal',
+            side_effect=fake_signal,
+        ):
+            install_signal_forwarders(
+                [child], shutdown_state, grace_seconds=10,
+            )
+
+        import signal
+        handler = handlers[signal.SIGTERM]
+        handler(signal.SIGTERM, None)
+        first_deadline: float = shutdown_state['deadline']
+
+        handler(signal.SIGTERM, None)
+        self.assertEqual(
+            shutdown_state['deadline'], first_deadline,
         )
 
 

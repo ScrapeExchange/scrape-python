@@ -26,6 +26,7 @@ from .youtube_client import (
     METRIC_YT_REQUEST_DURATION,
     generate_visitor_info,
 )
+from scrape_exchange.worker_id import get_worker_id
 from .youtube_cookiejar import YouTubeCookieJar
 from .youtube_rate_limiter import YouTubeRateLimiter, YouTubeCallType
 from .youtube_playlist import YouTubePlaylist
@@ -534,15 +535,20 @@ class YouTubeChannelTabs:
                         self.channel_id, params=params
                     )
                 METRIC_YT_REQUEST_DURATION.labels(
-                    kind='innertube', status_class='2xx'
+                    kind='innertube',
+                    status_class='2xx',
+                    worker_id=get_worker_id(),
                 ).observe(time.monotonic() - start)
                 return result
             except InnerTubeRequestError as exc:
                 METRIC_YT_REQUEST_DURATION.labels(
                     kind='innertube',
                     status_class=(
-                        '4xx' if exc.error.code == 429 else 'error'
+                        '4xx'
+                        if exc.error.code == 429
+                        else 'error'
                     ),
+                    worker_id=get_worker_id(),
                 ).observe(time.monotonic() - start)
                 if exc.error.code == 429:
                     await limiter.penalise(
@@ -569,7 +575,9 @@ class YouTubeChannelTabs:
                     penalty = min(penalty * 2, _PENALTY_MAX)
             except Exception as exc:
                 METRIC_YT_REQUEST_DURATION.labels(
-                    kind='innertube', status_class='error'
+                    kind='innertube',
+                    status_class='error',
+                    worker_id=get_worker_id(),
                 ).observe(time.monotonic() - start)
                 _LOGGER.error(
                     'InnerTube BROWSE error for channel %s '
