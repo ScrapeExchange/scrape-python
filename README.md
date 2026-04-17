@@ -77,36 +77,89 @@ docker compose logs -f video
 docker compose ps
 ```
 
-For host-specific overrides (e.g. volume mounts for data
-persistence, `NUM_PROCESSES`, `CONCURRENCY`), create a
-`docker-compose.override.yml` file. For example:
+## Mapping host directories into containers
+
+By default the containers store scraped data inside the
+container filesystem, which means data is lost when the
+container is removed. To persist data on your host, you
+need to mount host directories as volumes.
+
+The containers expect data in these paths:
+
+| Container path | Purpose |
+|---|---|
+| `/data/channels` | Scraped channel metadata |
+| `/data/videos` | Scraped video metadata |
+| `/data/channels.lst` | Channel list file |
+| `/data/channel_map.csv` | Channel ID to handle map |
+| `/data/rss-queue.json` | RSS scraper queue state |
+| `/data/rss-no-feeds.txt` | Channels with no RSS feed |
+| `/var/log/scrape/scraper` | Scraper log files |
+| `/var/tmp/yt_dlp_cache` | yt-dlp cache directory |
+
+To map your own host directories to these paths, create a
+`docker-compose.override.yml` file in the repository root.
+Docker Compose automatically picks up this file alongside
+the base `docker-compose.yml`, so you just run
+`docker compose up -d` as usual.
+
+For example, if your scraped data lives in `/srv/scrape`
+and you want logs in `/var/log/scrape`:
+
+```yaml
+x-data-volumes: &data-volumes
+  - /srv/scrape/videos:/data/videos
+  - /srv/scrape/channels:/data/channels
+  - /srv/scrape/channels.lst:/data/channels.lst:ro
+  - /srv/scrape/channel_map.csv:/data/channel_map.csv
+  - /srv/scrape/rss-queue.json:/data/rss-queue.json
+  - /srv/scrape/rss-no-feeds.txt:/data/rss-no-feeds.txt
+  - /var/log/scrape/scraper:/var/log/scrape/scraper
+
+services:
+  video:
+    volumes: *data-volumes
+  video-upload-only:
+    volumes: *data-volumes
+  channel:
+    volumes: *data-volumes
+  channel-upload-only:
+    volumes: *data-volumes
+  rss:
+    volumes: *data-volumes
+```
+
+If you just want to use the `data/` directory you created
+in the quick start steps above:
+```yaml
+x-data-volumes: &data-volumes
+  - ./data/videos:/data/videos
+  - ./data/channels:/data/channels
+  - ./data/channels.lst:/data/channels.lst:ro
+  - ./data/logs:/var/log/scrape/scraper
+
+services:
+  video:
+    volumes: *data-volumes
+  video-upload-only:
+    volumes: *data-volumes
+  channel:
+    volumes: *data-volumes
+  channel-upload-only:
+    volumes: *data-volumes
+  rss:
+    volumes: *data-volumes
+```
+
+You can also use the override file to tune parallelism
+per service:
 ```yaml
 services:
   video:
-    volumes:
-      - ./data/videos:/data/videos
-      - ./data/channels:/data/channels
-      - ./data/channels.lst:/data/channels.lst
-      - ./logs/scraper:/var/log/scrape/scraper
     environment:
       VIDEO_NUM_PROCESSES: 2
       VIDEO_CONCURRENCY: 4
-  channel:
-    volumes:
-      - ./data/channels:/data/channels
-      - ./data/channels.lst:/data/channels.lst
-      - ./logs/scraper:/var/log/scrape/scraper
-  rss:
-    volumes:
-      - ./data/videos:/data/videos
-      - ./data/channels:/data/channels
-      - ./data/channels.lst:/data/channels.lst
-      - ./logs/scraper:/var/log/scrape/scraper
 ```
-
-Docker Compose automatically picks up
-`docker-compose.override.yml` alongside the base file, so
-you just run `docker compose up -d` as usual.
 
 As you can see from the contents of the `.env` file, there
 are many configuration options available for the scrapers,
