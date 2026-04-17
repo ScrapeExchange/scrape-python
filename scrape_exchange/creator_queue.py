@@ -128,17 +128,19 @@ def tier_for_subscriber_count(
     A creator is placed in the first tier where
     ``count >= tier.min_subscribers``.
 
-    Unknown or zero subscriber counts are placed in
-    tier 1 (highest priority) so new creators are
-    scraped quickly.
+    ``None`` means the subscriber count is genuinely
+    unknown (never scraped); these go to tier 1 so new
+    creators are scraped quickly.  ``0`` is treated as a
+    known value and falls through to the normal threshold
+    comparison (landing in the lowest tier).
 
     :param tiers: Ordered list of :class:`TierConfig`.
-    :param count: Subscriber count, or ``None``/0 for
+    :param count: Subscriber count, or ``None`` for
         unknown.
     :returns: 1-based tier number.
     '''
 
-    if not count:
+    if count is None:
         return 1
     for tc in tiers:
         if count >= tc.min_subscribers:
@@ -233,15 +235,22 @@ class CreatorQueue(ABC):
         batch_size: int,
         worker_id: str,
         claim_ttl: int = DEFAULT_CLAIM_TTL,
-    ) -> list[tuple[str, str]]:
+        cutoff: float | None = None,
+    ) -> list[tuple[str, str, float]]:
         '''
         Atomically pop up to *batch_size* creators that
-        are due (score <= now) and claim them.
+        are due (score <= *cutoff*) and claim them.
+
+        :param cutoff: Unix timestamp ceiling.
+            Defaults to ``now`` when ``None``.
 
         Fills from tier 1 first, then tier 2, etc.
 
         :returns:
-            ``[(creator_id, creator_name), ...]``.
+            ``[(creator_id, creator_name,
+            scheduled_time), ...]`` where
+            *scheduled_time* is the queue score
+            (the time the channel was due).
         '''
 
     @abstractmethod
@@ -303,6 +312,21 @@ class CreatorQueue(ABC):
         creator_id: str,
     ) -> None:
         '''Remove a no-feeds entry.'''
+
+    @abstractmethod
+    async def remove(
+        self,
+        creator_id: str,
+    ) -> None:
+        '''
+        Permanently remove a creator from the queue.
+
+        Removes the creator from all tier sorted sets
+        and any active claim, but keeps the entry in
+        the creators hash, tiers hash, and names index
+        so ``populate()`` continues to skip the channel
+        and does not re-add it.
+        '''
 
     @abstractmethod
     async def queue_size(self) -> int:
@@ -702,7 +726,7 @@ class FileCreatorQueue(CreatorQueue):
                 name, cid, channel_fm,
             ):
                 continue
-            count: int = subscriber_counts.get(cid, 0)
+            count: int | None = subscriber_counts.get(cid)
             tier: int = tier_for_subscriber_count(
                 tiers, count,
             )
@@ -724,9 +748,14 @@ class FileCreatorQueue(CreatorQueue):
         batch_size: int,
         worker_id: str,
         claim_ttl: int = DEFAULT_CLAIM_TTL,
-    ) -> list[tuple[str, str]]:
-        now: float = datetime.now(UTC).timestamp()
-        batch: list[tuple[str, str]] = []
+        cutoff: float | None = None,
+    ) -> list[tuple[str, str, float]]:
+        ts: float = (
+            cutoff
+            if cutoff is not None
+            else datetime.now(UTC).timestamp()
+        )
+        batch: list[tuple[str, str, float]] = []
         for tc in sorted(
             self._tiers, key=lambda t: t.tier,
         ):
@@ -735,15 +764,16 @@ class FileCreatorQueue(CreatorQueue):
             )
             while (
                 heap
-                and heap[0][0] <= now
+                and heap[0][0] <= ts
                 and len(batch) < batch_size
             ):
+                score: float
                 name: str
                 cid: str
-                _, name, cid = heapq.heappop(heap)
+                score, name, cid = heapq.heappop(heap)
                 self._claimed.add(cid)
                 self._names[cid] = name
-                batch.append((cid, name))
+                batch.append((cid, name, score))
             if len(batch) >= batch_size:
                 break
         return batch
@@ -841,6 +871,24 @@ class FileCreatorQueue(CreatorQueue):
         self._no_feeds.pop(creator_id, None)
         await self._persist_no_feeds()
 
+    async def remove(
+        self, creator_id: str,
+    ) -> None:
+        self._claimed.discard(creator_id)
+        tier: int | None = self._creator_tiers.get(
+            creator_id,
+        )
+        # Keep creator_id in _creator_tiers and _names
+        # so populate() still sees it in existing_ids /
+        # existing_names and won't re-add the channel.
+        if tier is not None and tier in self._heaps:
+            self._heaps[tier] = [
+                entry for entry in self._heaps[tier]
+                if entry[2] != creator_id
+            ]
+            heapq.heapify(self._heaps[tier])
+        await self._persist_queue()
+
     async def queue_size(self) -> int:
         return sum(
             len(h) for h in self._heaps.values()
@@ -885,8 +933,11 @@ for q = 1, num_tiers do
     local due = redis.call(
         'ZRANGEBYSCORE', KEYS[q],
         '-inf', ARGV[1],
+        'WITHSCORES',
         'LIMIT', 0, remaining)
-    for _, cid in ipairs(due) do
+    for i = 1, #due, 2 do
+        local cid = due[i]
+        local score = due[i + 1]
         local key = ARGV[5] .. cid
         local ok = redis.call(
             'SET', key, ARGV[3],
@@ -898,6 +949,7 @@ for q = 1, num_tiers do
                 cid) or ''
             out[#out + 1] = cid
             out[#out + 1] = name
+            out[#out + 1] = score
             remaining = remaining - 1
         end
     end
@@ -974,6 +1026,8 @@ class RedisCreatorQueue(CreatorQueue):
     Tier queues: ``rss:{platform}:queue:1``, ``:queue:2``
     etc.  Tier membership: ``rss:{platform}:tiers``
     hash (``creator_id`` → tier number as string).
+    Case-insensitive name index: ``rss:{platform}:names``
+    set (lowercased channel names for dedup).
 
     Uses ``redis.asyncio`` following the pattern
     established by :class:`_RedisBackend` in
@@ -1006,6 +1060,8 @@ class RedisCreatorQueue(CreatorQueue):
         self._no_feeds_prefix: str = (
             f'rss:{p}:no_feeds:'
         )
+        self._key_names: str = f'rss:{p}:names'
+        self._names_indexed: bool = False
 
         # Populated by populate(); tier queues keys.
         self._key_queues: list[str] = []
@@ -1013,6 +1069,47 @@ class RedisCreatorQueue(CreatorQueue):
 
         self._claim_script: Any = None
         self._recover_script: Any = None
+
+    async def _ensure_names_index(self) -> None:
+        '''
+        Populate ``rss:{p}:names`` from the creators
+        hash if the set does not yet exist.  Uses
+        ``HSCAN`` to avoid loading the entire hash
+        into Python memory at once.  Idempotent:
+        ``SADD`` is a no-op for existing members,
+        so concurrent workers running this are safe.
+        '''
+
+        if self._names_indexed:
+            return
+        self._names_indexed = True
+
+        if await self._redis.exists(self._key_names):
+            return
+        if not await self._redis.exists(
+            self._key_creators,
+        ):
+            return
+
+        _LOGGER.info(
+            'Building names index from creators hash',
+        )
+        cursor: str | int = 0
+        while True:
+            cursor, data = await self._redis.hscan(
+                self._key_creators,
+                cursor,
+                count=1000,
+            )
+            if data:
+                lowered: list[str] = [
+                    v.lower() for v in data.values()
+                ]
+                await self._redis.sadd(
+                    self._key_names, *lowered,
+                )
+            if cursor == 0:
+                break
 
     def _build_queue_keys(
         self, tiers: list[TierConfig],
@@ -1200,47 +1297,81 @@ class RedisCreatorQueue(CreatorQueue):
             tiers, subscriber_counts,
         )
 
-        now: float = datetime.now(UTC).timestamp()
-        added: int = 0
-        pipe = self._redis.pipeline()
-        batch_count: int = 0
-        last_tier: int = tiers[-1].tier
+        # One-time backfill of the names index from
+        # the creators hash (uses HSCAN, not HGETALL).
+        await self._ensure_names_index()
 
+        # Pre-filter candidates that should be skipped
+        # regardless of name dedup.
+        candidates: list[tuple[str, str]] = []
         for cid, name in creators.items():
             if _should_skip_creator(
                 name, cid, channel_fm,
             ):
                 continue
-            count: int = subscriber_counts.get(cid, 0)
-            tier: int = tier_for_subscriber_count(
-                tiers, count,
-            )
-            p: str = self._platform
-            queue_key: str = (
-                f'rss:{p}:queue:{tier}'
-            )
-            pipe.zadd(
-                queue_key, {cid: now}, nx=True,
-            )
-            pipe.hset(
-                self._key_creators, cid, name,
-            )
-            pipe.hset(
-                self._key_tiers, cid, str(tier),
-            )
-            batch_count += 1
+            candidates.append((cid, name))
 
-            if batch_count >= 500:
+        now: float = datetime.now(UTC).timestamp()
+        added: int = 0
+        last_tier: int = tiers[-1].tier
+        chunk_size: int = 500
+
+        for i in range(
+            0, len(candidates), chunk_size,
+        ):
+            chunk: list[tuple[str, str]] = (
+                candidates[i:i + chunk_size]
+            )
+            lowered: list[str] = [
+                name.lower() for _, name in chunk
+            ]
+
+            # Batch membership check — one round-trip
+            # per chunk, O(1) per name in Redis.
+            exists_flags: list[int] = (
+                await self._redis.smismember(
+                    self._key_names, lowered,
+                )
+            )
+
+            pipe = self._redis.pipeline()
+            new_names: list[str] = []
+            batch_count: int = 0
+            for (cid, name), lname, exists in zip(
+                chunk, lowered, exists_flags,
+            ):
+                if exists:
+                    continue
+                count: int | None = (
+                    subscriber_counts.get(cid)
+                )
+                tier: int = tier_for_subscriber_count(
+                    tiers, count,
+                )
+                p: str = self._platform
+                queue_key: str = (
+                    f'rss:{p}:queue:{tier}'
+                )
+                pipe.zadd(
+                    queue_key, {cid: now}, nx=True,
+                )
+                pipe.hset(
+                    self._key_creators, cid, name,
+                )
+                pipe.hset(
+                    self._key_tiers, cid, str(tier),
+                )
+                new_names.append(lname)
+                batch_count += 1
+
+            if batch_count:
                 results: list[Any] = (
                     await pipe.execute()
                 )
                 added += self._count_added(results)
-                pipe = self._redis.pipeline()
-                batch_count = 0
-
-        if batch_count:
-            results = await pipe.execute()
-            added += self._count_added(results)
+                await self._redis.sadd(
+                    self._key_names, *new_names,
+                )
 
         added += await self._recover_orphans(
             last_tier,
@@ -1252,17 +1383,22 @@ class RedisCreatorQueue(CreatorQueue):
         batch_size: int,
         worker_id: str,
         claim_ttl: int = DEFAULT_CLAIM_TTL,
-    ) -> list[tuple[str, str]]:
+        cutoff: float | None = None,
+    ) -> list[tuple[str, str, float]]:
         self._ensure_scripts()
-        now: float = datetime.now(UTC).timestamp()
-        raw: list[str] = (
+        ts: float = (
+            cutoff
+            if cutoff is not None
+            else datetime.now(UTC).timestamp()
+        )
+        raw: list = (
             await self._claim_script(
                 keys=[
                     *self._key_queues,
                     self._key_creators,
                 ],
                 args=[
-                    str(now),
+                    str(ts),
                     str(batch_size),
                     worker_id,
                     str(claim_ttl),
@@ -1270,9 +1406,13 @@ class RedisCreatorQueue(CreatorQueue):
                 ],
             )
         )
-        result: list[tuple[str, str]] = []
-        for i in range(0, len(raw), 2):
-            result.append((raw[i], raw[i + 1]))
+        result: list[tuple[str, str, float]] = []
+        for i in range(0, len(raw), 3):
+            result.append((
+                raw[i],
+                raw[i + 1],
+                float(raw[i + 2]),
+            ))
         return result
 
     async def release(
@@ -1401,6 +1541,20 @@ class RedisCreatorQueue(CreatorQueue):
         await self._redis.delete(
             f'{self._no_feeds_prefix}{creator_id}',
         )
+
+    async def remove(
+        self, creator_id: str,
+    ) -> None:
+        # Keep creator in _key_creators, _key_tiers,
+        # and _key_names so populate() still sees it
+        # and won't re-add the channel.
+        pipe = self._redis.pipeline()
+        for key in self._key_queues:
+            pipe.zrem(key, creator_id)
+        pipe.delete(
+            f'{self._claim_prefix}{creator_id}',
+        )
+        await pipe.execute()
 
     async def queue_size(self) -> int:
         total: int = 0
