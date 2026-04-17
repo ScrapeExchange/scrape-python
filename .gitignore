@@ -9,6 +9,8 @@ tests/collateral/local
 
 *.swp
 
+docker-compose.override.yml
+
 .claude/
 CLAUDE.md
 
