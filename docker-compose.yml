@@ -1,0 +1,81 @@
+# Base docker-compose configuration for scrape-python scrapers.
+#
+# Usage with a per-host override:
+#   docker compose -f docker-compose.yml \
+#     -f docker-compose.<your-host>.yml up -d
+#
+# All services use the same image built from ./Dockerfile.
+# Host-specific settings (NUM_PROCESSES, CONCURRENCY, volumes)
+# go in the override file.
+
+# Container-internal paths that override the relative paths
+# from .env. Compose 'environment' takes precedence over
+# 'env_file', so these win.
+x-container-paths: &container-paths
+  YOUTUBE_VIDEO_DATA_DIR: /data/videos
+  YOUTUBE_CHANNEL_DATA_DIR: /data/channels
+  YOUTUBE_CHANNEL_LIST: /data/channels.lst
+  YOUTUBE_CHANNEL_MAP_FILE: /data/channel_map.csv
+  RSS_QUEUE_FILE: /data/rss-queue.json
+  NO_FEEDS_FILE: /data/rss-no-feeds.txt
+  DENO_PATH: /usr/local/deno/bin/deno
+
+x-scraper-common: &scraper-common
+  build: .
+  image: scrape-python:latest
+  env_file: .env
+  restart: unless-stopped
+  network_mode: host
+  stop_grace_period: 60s
+
+services:
+  po-token-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider
+    restart: unless-stopped
+    network_mode: host
+    init: true
+    environment:
+      PORT: 4416
+
+  video:
+    <<: *scraper-common
+    command: ["tools/yt_video_scrape.py"]
+    depends_on:
+      - po-token-provider
+    environment:
+      <<: *container-paths
+      VIDEO_LOG_FILE: /var/log/scrape/scraper/yt_video.log
+
+  video-upload-only:
+    <<: *scraper-common
+    command:
+      - "tools/yt_video_scrape.py"
+      - "--video-upload-only"
+    depends_on:
+      - po-token-provider
+    environment:
+      <<: *container-paths
+      VIDEO_LOG_FILE: /var/log/scrape/scraper/yt_video.log
+
+  channel:
+    <<: *scraper-common
+    command: ["tools/yt_channel_scrape.py"]
+    environment:
+      <<: *container-paths
+      CHANNEL_LOG_FILE: /var/log/scrape/scraper/yt_channel.log
+
+  channel-upload-only:
+    <<: *scraper-common
+    command:
+      - "tools/yt_channel_scrape.py"
+      - "--channel-upload-only"
+    environment:
+      <<: *container-paths
+      CHANNEL_LOG_FILE: /var/log/scrape/scraper/yt_channel.log
+
+  rss:
+    <<: *scraper-common
+    command: ["tools/yt_rss_scrape.py"]
+    environment:
+      <<: *container-paths
+      RSS_LOG_FILE: /var/log/scrape/scraper/yt_rss.log

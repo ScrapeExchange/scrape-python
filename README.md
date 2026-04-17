@@ -13,31 +13,110 @@ While the scraping tools have a lot of capabilities, they can be used without mu
 In addition to the scraping tools, there is also a websocket listener tool that allows you to listen for new content being uploaded to the exchange in real-time. This can be useful for testing and debugging, as well as for getting real-time updates on new content being uploaded to the exchange. You can look at the  [Firehose page on the scrape.exchange](https://scrape.exchange/firehose) website for an example to see what kind of data you can collect with the listener.
 
 # Quick start
-The fastest way to get started is:
-- Create an account on the [scrape.exchange](https://scrape.exchange) and get your API key from your account settings page.
-- Log in to a Linux machine and execute
-```bash
-# Install the Deno runtime, which is required for yt-dlp to work properly with YouTube
-curl -fsSL https://deno.land/install.sh | sh
-# Run the po-token-provider, which is required for yt-dlp to work properly with YouTube
-docker run --name bgutil-provider -d -p 4416:4416 --init brainicism/bgutil-ytdlp-pot-provider
-# Install uv, the package manager and task runner used to run the tools in this repository
-curl -fsSL https://install.astral.sh | sh
+The fastest way to get started is using Docker Compose,
+which runs all three scrapers and their dependencies in
+containers:
 
-mkdir -p scraping/{channels,videos}
-cd scraping
-# channels.lst takes one channel per line, either in the form of a channel ID (UC...) or a channel handle (@...)
-echo <channel you want to scrape> >> channels.lst
+1. Create an account on the
+   [scrape.exchange](https://scrape.exchange) and get your
+   API key from your account settings page.
+2. Log in to a Linux machine with Docker and Docker Compose
+   installed, then run:
+
+```bash
 git clone https://github.com/scrape-python/scrape-python.git
 cd scrape-python
+
+# Create host directories for scraped data and logs
+mkdir -p data/{channels,videos,logs}
+
+# Add channels to scrape (one per line: UC... or @...)
+echo "@channel_handle" >> data/channels.lst
+
+# Configure your credentials and settings
 cp .env-example .env
-# Edit [.env-example](.env-example) to put in your Scrape.Exchange username and API key, and to set the data directories to the channels and videos directories you just created. Set YOUTUBE_VIDEO_DATA_DIR to ../videos and YOUTUBE_CHANNEL_DATA_DIR to ../channels
-uv run tools/yt_channel_scrape.py
-uv run tools/yt_rss_scrape.py
-uv run tools/yt_video_upload.py
+# Edit .env: set USERNAME, API_KEY_ID and API_KEY_SECRET
+# to your Scrape.Exchange credentials. The data directory
+# settings in .env are overridden by the container paths
+# automatically, so you can leave them as-is.
+
+# Build the scraper image and start all services
+docker compose up -d --build
 ```
 
-As you can see from the contents of the .env file, there are many configuration options available for the scrapers, but you can get started with changing just a few of them. The most important ones to set up are the Scrape.Exchange API key and the data directories for the channels and videos. The other settings can be left at their default values for now, and you can adjust them later as you become more familiar with the scrapers and based on your specific use case.
+This starts five services defined in `docker-compose.yml`:
+- **po-token-provider** — generates tokens required by
+  yt-dlp for YouTube access
+- **channel** — scrapes channel metadata
+- **channel-upload-only** — uploads previously scraped
+  channel data
+- **rss** — scrapes RSS feeds and video metadata via
+  InnerTube
+- **video** — augments video metadata with yt-dlp and
+  uploads it
+
+You can start individual services instead of the full
+fleet:
+```bash
+# Start only the channel scraper and its dependency
+docker compose up -d po-token-provider channel
+
+# Or just the RSS scraper
+docker compose up -d rss
+```
+
+Monitor the scrapers with:
+```bash
+# View logs for all services
+docker compose logs -f
+
+# View logs for a specific service
+docker compose logs -f video
+
+# Check service status
+docker compose ps
+```
+
+For host-specific overrides (e.g. volume mounts for data
+persistence, `NUM_PROCESSES`, `CONCURRENCY`), create a
+`docker-compose.override.yml` file. For example:
+```yaml
+services:
+  video:
+    volumes:
+      - ./data/videos:/data/videos
+      - ./data/channels:/data/channels
+      - ./data/channels.lst:/data/channels.lst
+      - ./logs/scraper:/var/log/scrape/scraper
+    environment:
+      VIDEO_NUM_PROCESSES: 2
+      VIDEO_CONCURRENCY: 4
+  channel:
+    volumes:
+      - ./data/channels:/data/channels
+      - ./data/channels.lst:/data/channels.lst
+      - ./logs/scraper:/var/log/scrape/scraper
+  rss:
+    volumes:
+      - ./data/videos:/data/videos
+      - ./data/channels:/data/channels
+      - ./data/channels.lst:/data/channels.lst
+      - ./logs/scraper:/var/log/scrape/scraper
+```
+
+Docker Compose automatically picks up
+`docker-compose.override.yml` alongside the base file, so
+you just run `docker compose up -d` as usual.
+
+As you can see from the contents of the `.env` file, there
+are many configuration options available for the scrapers,
+but you can get started with changing just a few of them.
+The most important ones to set up are the Scrape.Exchange
+API key. The data directories are handled by the container
+configuration automatically. The other settings can be left
+at their default values for now, and you can adjust them
+later as you become more familiar with the scrapers and
+based on your specific use case.
 
 # Avoiding bot detection and rate limits
 The scraping tools in this directory maximize the number of scrapes that you can do while minimizing the risk of being blocked by the platform for making too many requests. To do this, the tools use a rate limiter to limit the number of requests that can be made in a given time period. The rate limits are based on the observed behavior of YouTube's bot detection mechanisms, but they may need to be adjusted over time as YouTube changes its algorithms. The tools also support using proxies to route requests through different IP addresses, which can help to avoid triggering bot detection. They use the [InnerTube](https://github.com/yt-dlp/yt-dlp/wiki/InnerTube) to interact with YouTube's internal API. Furthermore, it sets up the [yt-dlp](https://github.com/yt-dlp/yt-dlp) package with the appropriate cookies and headers to make the requests look like they are coming from a real browser session, which can also help to avoid triggering bot detection. Finally, as per the instructions of yt-dlp, it uses deno and the po-token-provider to generate the necessary tokens for making requests to YouTube, which can further help to avoid triggering bot detection. When a scraper receives a response from YouTube that indicates that it has been rate limited or blocked, it will back off and retry the request after a certain amount of time. The backoff time is increased exponentially with each subsequent failure, up to a maximum backoff time. This way, the scraper can recover from temporary blocks and continue scraping without getting permanently blocked.
