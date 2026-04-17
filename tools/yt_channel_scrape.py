@@ -30,6 +30,11 @@ from prometheus_client import Counter, Gauge, start_http_server
 
 from pydantic import AliasChoices, Field, field_validator
 
+from scrape_exchange.channel_map import (
+    ChannelMap,
+    FileChannelMap,
+    RedisChannelMap,
+)
 from scrape_exchange.exchange_client import ExchangeClient
 
 from scrape_exchange.file_management import AssetFileManagement
@@ -400,6 +405,16 @@ async def _run_worker(settings: ChannelSettings) -> None:
         logging.shutdown()
         sys.exit(1)
 
+    channel_map_backend: ChannelMap
+    if settings.redis_dsn:
+        channel_map_backend = RedisChannelMap(
+            settings.redis_dsn,
+        )
+    else:
+        channel_map_backend = FileChannelMap(
+            settings.channel_map_file,
+        )
+
     YouTubeRateLimiter.get(
         state_dir=settings.rate_limiter_state_dir,
         redis_dsn=settings.redis_dsn,
@@ -447,7 +462,9 @@ async def _run_worker(settings: ChannelSettings) -> None:
                 settings, client, fm,
             )
         else:
-            await scrape_channels(settings, client, fm)
+            await scrape_channels(
+                settings, client, fm, channel_map_backend,
+            )
     except asyncio.CancelledError:
         logging.info(
             'Shutdown signal received; '
@@ -568,11 +585,12 @@ async def scrape_channels(
     settings: ChannelSettings,
     client: ExchangeClient,
     fm: AssetFileManagement,
+    channel_map: ChannelMap,
 ) -> None:
 
     new_channels: set[str] = await read_channels(
         settings.channel_list,
-        settings.channel_map_file, fm, client,
+        channel_map, fm, client,
         settings.max_new_channels,
         settings.max_resolved_channels,
         settings.channel_concurrency,
@@ -1096,55 +1114,12 @@ def enqueue_upload_channel(
     )
 
 
-async def read_channel_map(file_path: str) -> dict[str, str]:
-    '''
-    Reads existing channel files from the specified directory and extracts
-    channel names.
-
-    :param directory: The directory containing existing channel files.
-    :returns: A dict with existing YouTube channel IDs as keys and names as
-    values  .
-    :raises: (none)
-    '''
-
-    logging.info(
-        'Reading channel map', extra={'file_path': file_path}
-    )
-
-    channels: dict[str, str] = {}
-    if not os.path.isfile(file_path):
-        logging.warning(
-            'File does not exist, returning empty set',
-            extra={'file_path': file_path},
-        )
-        return channels
-
-    line: str
-    async with aiofiles.open(file_path, 'r') as file_desc:
-        async for line in file_desc:
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-
-            if ',' in line:
-                channel_id: str
-                channel_name: str
-                channel_id, channel_name = line.split(',', 1)
-                channels[channel_id] = channel_name
-            else:
-                channels[line] = line
-
-    logging.info(
-        'Finished reading channel map',
-        extra={'file_path': file_path, 'entries': len(channels)},
-    )
-    return channels
-
-
 async def read_channels(
-    file_path: str, channel_map_file: str, fm: AssetFileManagement,
+    file_path: str, channel_map: ChannelMap,
+    fm: AssetFileManagement,
     exchange_client: ExchangeClient,
-    max_new_channels: int, max_resolved_channels: int, concurrency: int = 3,
+    max_new_channels: int, max_resolved_channels: int,
+    concurrency: int = 3,
 ) -> set[str]:
     '''
     Reads .lst files from the specified directory and extracts YouTube channel
@@ -1166,8 +1141,8 @@ async def read_channels(
     )
 
     # These are known names but not necesarily will have been scraped
-    channel_map: dict[str, str] = await read_channel_map(
-        channel_map_file
+    channel_map_data: dict[str, str] = (
+        await channel_map.get_all()
     )
     new_channel_names: set[str] = set()
 
@@ -1191,8 +1166,8 @@ async def read_channels(
                 _, channel_name = line.split(',', 1)
                 channel_name = channel_name.strip()
             if not channel_name and YouTubeChannel.is_channel_id(line):
-                if line in channel_map:
-                    channel_name = channel_map[line]
+                if line in channel_map_data:
+                    channel_name = channel_map_data[line]
                 elif (fm.base_dir
                       / f'{CHANNEL_FILE_PREFIX}{line}.unresolved').exists():
                     logging.debug(
@@ -1239,7 +1214,7 @@ async def read_channels(
             worker_id=get_worker_id()
         ).set(len(unresolved_ids))
         resolved_channels = await review_unresolved_ids(
-            unresolved_ids, channel_map_file, fm,
+            unresolved_ids, channel_map, fm,
             concurrency, max_resolved_channels
         )
         new_channel_names.update(resolved_channels)
@@ -1310,8 +1285,9 @@ async def read_channels(
 
 
 async def review_unresolved_ids(
-    unresolved_ids: set[str], channel_map_file: str, fm: AssetFileManagement,
-    concurrency: int, max_resolved_channels: int
+    unresolved_ids: set[str], channel_map: ChannelMap,
+    fm: AssetFileManagement,
+    concurrency: int, max_resolved_channels: int,
 ) -> set[str]:
     '''
     See if we can resolve a channel ID to a channel handle
@@ -1328,7 +1304,6 @@ async def review_unresolved_ids(
     '''
 
     semaphore: asyncio.Semaphore = asyncio.Semaphore(concurrency)
-    map_lock: asyncio.Lock = asyncio.Lock()
     resolved_channel_names: set[str] = set()
 
     async def resolve(channel_id: str) -> str | None:
@@ -1375,10 +1350,7 @@ async def review_unresolved_ids(
                         },
                     )
                     return None
-                async with map_lock:
-                    async with aiofiles.open(
-                            channel_map_file, 'a') as f:
-                        await f.write(f'{channel_id},{name}\n')
+                await channel_map.put(channel_id, name)
 
                 logging.debug(
                     'Resolved channel ID to name',

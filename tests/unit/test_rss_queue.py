@@ -108,11 +108,12 @@ class TestFileCreatorQueuePopulate(
                 await q.get_tier('UC_tiny'), 4,
             )
 
-    async def test_populate_unknown_subscriber_count_tier1(
+    async def test_populate_unknown_subscriber_count_lowest_tier(
         self,
     ):
-        '''Creator absent from subscriber_counts goes to
-        tier 1 (highest priority).'''
+        '''Creator absent from subscriber_counts gets
+        None from dict.get() → tier 1 (unknown, highest
+        priority).'''
         with tempfile.TemporaryDirectory() as tmp:
             q: FileCreatorQueue = _make_queue(tmp)
             fm: AssetFileManagement = _make_fm(tmp)
@@ -128,6 +129,28 @@ class TestFileCreatorQueuePopulate(
             self.assertEqual(added, 1)
             self.assertEqual(
                 await q.get_tier('UCunknown'), 1,
+            )
+
+    async def test_populate_zero_subscriber_count_lowest_tier(
+        self,
+    ):
+        '''Creator with subscriber count of 0 goes to
+        the lowest tier (not tier 1).'''
+        with tempfile.TemporaryDirectory() as tmp:
+            q: FileCreatorQueue = _make_queue(tmp)
+            fm: AssetFileManagement = _make_fm(tmp)
+            creators: dict[str, str] = {
+                'UCzero': 'zero-channel',
+            }
+            added: int = await q.populate(
+                creators,
+                fm,
+                DEFAULT_TIERS,
+                {'UCzero': 0},
+            )
+            self.assertEqual(added, 1)
+            self.assertEqual(
+                await q.get_tier('UCzero'), 4,
             )
 
     async def test_populate_skips_duplicate_channel_id(
@@ -272,7 +295,7 @@ class TestFileCreatorQueueClaimBatch(
             )
             self.assertEqual(len(batch), 1)
             cid: str
-            cid, _ = batch[0]
+            cid, _, _ = batch[0]
             self.assertEqual(cid, 'UC_t1')
 
     async def test_claim_fills_from_lower_tier_when_higher_drained(
@@ -300,7 +323,7 @@ class TestFileCreatorQueueClaimBatch(
                 await q.claim_batch(3, 'worker-1')
             )
             self.assertEqual(len(batch), 3)
-            cids: set[str] = {c for c, _ in batch}
+            cids: set[str] = {c for c, _, _ in batch}
             self.assertIn('UC_t1a', cids)
             self.assertIn('UC_t2a', cids)
             self.assertIn('UC_t2b', cids)
@@ -519,7 +542,7 @@ class TestQueueOperations(
             q: FileCreatorQueue = _make_queue(tmp)
             fm: AssetFileManagement = _make_fm(tmp)
             creators: dict[str, str] = {
-                'UCaaa': 'alpha',   # tier 1 (unknown → 1)
+                'UCaaa': 'alpha',   # tier 1 (unknown/None → 1)
                 'UCbbb': 'beta',    # tier 2
                 'UCccc': 'gamma',   # tier 3
             }

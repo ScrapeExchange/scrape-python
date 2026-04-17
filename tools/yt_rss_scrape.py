@@ -61,6 +61,11 @@ from scrape_exchange.youtube.youtube_video_innertube import (
 )
 from scrape_exchange.worker_id import get_worker_id
 from scrape_exchange.youtube.settings import YouTubeScraperSettings
+from scrape_exchange.channel_map import (
+    ChannelMap,
+    FileChannelMap,
+    RedisChannelMap,
+)
 from scrape_exchange.creator_queue import (
     CreatorQueue,
     FileCreatorQueue,
@@ -74,8 +79,9 @@ VIDEO_FILENAME_PREFIX: str = 'video-min-'
 CHANNEL_FILENAME_PREFIX: str = 'channel-'
 UPLOADED_DIR: str = '/uploaded'
 
-MIN_CHANNEL_INTERVAL_SECONDS: int = 60 * 60 * 4     # 1 hour
-RETRY_INTERVAL_SECONDS: int = 60 * 2                # 2 minutes
+MIN_CHANNEL_INTERVAL_SECONDS: int = 30 * 60         # 30 minutes
+RETRY_INTERVAL_SECONDS: int = 60 * 60 * 4           # 4 hours
+DEFAULT_PRIORITY_QUEUES: str = '1:10000000,4:1000000,12:100000,24:10000,48:0'
 MAX_CONCURRENT_CHANNELS: int = 3
 
 FILE_EXTENSION: str = '.json.br'
@@ -207,7 +213,7 @@ class RssSettings(YouTubeScraperSettings):
         description='Path to JSON file for persisting the channel queue',
     )
     rss_max_no_feed_failures: int = Field(
-        default=8,
+        default=3,
         validation_alias=AliasChoices(
             'RSS_MAX_NO_FEED_FAILURES',
             'rss_max_no_feed_failures',
@@ -582,9 +588,14 @@ async def _enrich_and_store_video(
 async def process_channel(
     channel_name: str, channel_id: str, client: ExchangeClient,
     creator_queue: CreatorQueue, settings: RssSettings,
-) -> bool:
+) -> bool | None:
     '''
     Fetches the RSS feed for one channel and checks or stores each video.
+
+    Returns ``True`` on success, ``False`` on transient failure (the
+    channel stays in the queue for retry), or ``None`` when the
+    channel should be permanently removed from the queue (e.g.
+    too many consecutive no-feed failures).
 
     Raises on RSS fetch failure or if any video could not be stored, so
     the worker loop can schedule a retry for the whole channel.
@@ -637,14 +648,14 @@ async def process_channel(
         rss_url, _, fail_count = no_feed_entry
         if fail_count >= settings.rss_max_no_feed_failures:
             logging.info(
-                'Channel has failed to fetch RSS feed too many '
-                'times, skipping',
+                'Channel has exceeded no-feed failure '
+                'threshold, removing from queue',
                 extra={
                     'channel_name': channel_name,
                     'fail_count': fail_count,
                 },
             )
-            return False
+            return None
         logging.info(
             'Channel had missing RSS feed',
             extra={
@@ -670,6 +681,9 @@ async def process_channel(
     sub_count: int = update_result[1]
 
     if not update_ok:
+        # Leave the tier unchanged — don't overwrite a
+        # known subscriber count with 0 just because
+        # InnerTube failed this time.
         await creator_queue.set_no_feeds(
             channel_id, rss_url, channel_name, 1,
         )
@@ -986,122 +1000,6 @@ async def update_channel(
     return True, subscriber_count
 
 
-def read_channel_map_file(filepath: str) -> dict[str, str]:
-    '''
-    Reads the channel map CSV file and returns a dict of channel_id ->
-    channel_name.
-
-    :param filepath: Path to the channel map CSV file.
-    :returns: A dict mapping channel IDs to channel names.
-    :raises: OSError if there is an error reading the file.
-    '''
-
-    channel_map: dict[str, str] = {}
-    if not os.path.exists(filepath):
-        return channel_map
-
-    logging.info(
-        'Reading channel map',
-        extra={'filepath': filepath},
-    )
-    with open(filepath, 'r') as file_desc:
-        line: str
-        for line in file_desc:
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-            parts: list[str] = line.split(',')
-            if len(parts) < 2:
-                logging.warning(
-                    'Skipping malformed line in channel map file',
-                    extra={'line': line},
-                )
-                continue
-            channel_id: str
-            channel_name: str
-            channel_id, channel_name = parts[0].strip(), parts[1].strip()
-            if channel_id and channel_name:
-                channel_map[channel_id] = channel_name
-
-    return channel_map
-
-
-def get_channelmap(
-    channel_map_file: str,
-    channel_data_dir: str,
-) -> tuple[dict[str, str], dict[str, int]]:
-    '''
-    Loads the wanted channels from the directory with known channel
-    data files.
-
-    :param channel_map_file: Path to the channel map CSV file.
-    :param channel_data_dir: Path to the channel data directory.
-    :returns: A tuple of (channel_map, subscriber_counts) where
-        channel_map maps channel_id to channel_name and
-        subscriber_counts maps channel_id to subscriber count.
-    '''
-
-    channel_map: dict[str, str] = read_channel_map_file(
-        channel_map_file,
-    )
-    subscriber_counts: dict[str, int] = {}
-    updated_channel_map: dict[str, str] = {}
-    known_channels: set[str] = set(channel_map.values())
-    for directory in [
-        channel_data_dir,
-        channel_data_dir + UPLOADED_DIR,
-    ]:
-        os.makedirs(directory, exist_ok=True)
-        files: list[str] = [
-            filename for filename in os.listdir(directory)
-            if filename.startswith(CHANNEL_FILENAME_PREFIX)
-            and filename.endswith(FILE_EXTENSION)
-        ]
-        filename: str
-        for filename in files:
-            channel_name: str = filename[
-                len(CHANNEL_FILENAME_PREFIX):-1*len(FILE_EXTENSION)
-            ]
-            if channel_name in known_channels:
-                continue
-
-            file_path: str = os.path.join(directory, filename)
-            try:
-                data: dict[str, any] = read_channel_file(file_path)
-                cid: str = data['channel_id']
-                channel_map[cid] = channel_name
-                updated_channel_map[cid] = channel_name
-                subscriber_counts[cid] = data.get(
-                    'subscriber_count', 0,
-                )
-            except Exception as exc:
-                try:
-                    os.remove(file_path)
-                except OSError:
-                    pass
-                logging.debug(
-                    'Removed invalid channel file',
-                    exc=exc,
-                    extra={'file_path': file_path},
-                )
-
-    logging.info(
-        'Writing channel map',
-        extra={
-            'entry_count': len(channel_map),
-            'channel_map_file': channel_map_file,
-        },
-    )
-    # We only append new entries as yt_channel_scraper.py also
-    # appends to this file, so we want to avoid rewriting it and
-    # potentially causing conflicts.
-    with open(channel_map_file, 'a') as f:
-        for channel_id, channel_name in updated_channel_map.items():
-            f.write(f'{channel_id},{channel_name}\n')
-
-    return channel_map, subscriber_counts
-
-
 def read_channel_file(filepath: str) -> dict[str, any]:
     '''
     Reads a channel data file, which may be compressed with Brotli.
@@ -1155,24 +1053,21 @@ def _log_channel_result(
 
 
 def _record_tier_sla(
-    cid: str,
     tier: int,
-    tiers: list[TierConfig],
+    scheduled_time: float,
+    now: float,
 ) -> None:
     '''
-    Increment the on-time or overdue SLA counter for *cid*
-    based on how long ago it was last checked.
+    Increment the on-time or overdue SLA counter.
+
+    Compares the current time against the queue score
+    (the time the channel was scheduled to be fetched).
+    If ``now <= scheduled_time`` the fetch is on-time;
+    otherwise it is overdue.
     '''
 
-    tier_cfg: TierConfig | None = next(
-        (t for t in tiers if t.tier == tier), None,
-    )
-    if not tier_cfg or cid not in CHANNEL_LAST_CHECKED:
-        return
-    elapsed: float = monotonic() - CHANNEL_LAST_CHECKED[cid]
-    limit: float = tier_cfg.interval_hours * 3600
     wid: str = get_worker_id()
-    if elapsed <= limit:
+    if now <= scheduled_time:
         METRIC_TIER_ON_TIME.labels(
             tier=str(tier), worker_id=wid,
         ).inc()
@@ -1228,13 +1123,14 @@ async def _enrich_subscriber_counts(
         return
 
     # Cap API lookups to avoid blocking startup
-    # for hours.  Un-enriched channels default to
-    # tier 1 and get re-tiered after first scrape.
-    _MAX_LOOKUPS: int = 1000
+    # indefinitely.  Un-enriched channels default to
+    # the lowest tier and get re-tiered after first
+    # scrape.
+    _MAX_LOOKUPS: int = 100_000
     if len(missing) > _MAX_LOOKUPS:
         logging.info(
             'Capping API enrichment to %d of %d '
-            'channels (rest default to tier 1)',
+            'channels (rest default to lowest tier)',
             _MAX_LOOKUPS, len(missing),
         )
         missing = missing[:_MAX_LOOKUPS]
@@ -1287,6 +1183,7 @@ async def worker_loop(
     channel_fm: AssetFileManagement,
     creator_queue: CreatorQueue,
     tiers: list[TierConfig],
+    channel_map: ChannelMap,
 ) -> None:
     '''
     Runs indefinitely, processing channels in priority order.
@@ -1302,28 +1199,27 @@ async def worker_loop(
         channel data directory.
     :param creator_queue: Queue backend (file or Redis).
     :param tiers: Priority tier configuration.
+    :param channel_map: Channel map backend (file or Redis).
     '''
 
-    channel_map: dict[str, str]
-    subscriber_counts: dict[str, int]
-    channel_map, subscriber_counts = get_channelmap(
-        settings.channel_map_file,
-        settings.channel_data_directory,
+    channel_map_data: dict[str, str] = (
+        await channel_map.get_all()
     )
+    subscriber_counts: dict[str, int] = {}
     known_ids: set[str] = (
         await creator_queue.known_creator_ids()
     )
     await _enrich_subscriber_counts(
-        client, channel_map, subscriber_counts,
+        client, channel_map_data, subscriber_counts,
         known_ids=known_ids,
     )
     added: int = await creator_queue.populate(
-        channel_map, channel_fm, tiers, subscriber_counts,
+        channel_map_data, channel_fm, tiers, subscriber_counts,
     )
     queue_size: int = await creator_queue.queue_size()
     METRIC_CHANNEL_MAP_SIZE.labels(
         worker_id=get_worker_id()
-    ).set(len(channel_map))
+    ).set(len(channel_map_data))
     await _publish_queue_sizes(creator_queue)
 
     logging.info(
@@ -1334,7 +1230,7 @@ async def worker_loop(
             'min_interval': settings.min_interval,
             'retry_interval': settings.retry_interval,
             'rss_concurrency': settings.rss_concurrency,
-            'discovered_channels': len(channel_map),
+            'discovered_channels': len(channel_map_data),
         },
     )
 
@@ -1355,50 +1251,69 @@ async def worker_loop(
             METRIC_SLEEP_SECONDS.labels(
                 worker_id=get_worker_id()
             ).set(0)
-            channel_map, subscriber_counts = (
-                get_channelmap(
-                    settings.channel_map_file,
-                    settings.channel_data_directory,
-                )
+            channel_map_data = (
+                await channel_map.get_all()
             )
+            subscriber_counts = {}
             known_ids = (
                 await creator_queue.known_creator_ids()
             )
             await _enrich_subscriber_counts(
-                client, channel_map,
+                client, channel_map_data,
                 subscriber_counts,
                 known_ids=known_ids,
             )
             await creator_queue.populate(
-                channel_map, channel_fm,
+                channel_map_data, channel_fm,
                 tiers, subscriber_counts,
             )
             METRIC_CHANNEL_MAP_SIZE.labels(
                 worker_id=get_worker_id()
-            ).set(len(channel_map))
+            ).set(len(channel_map_data))
             await _publish_queue_sizes(creator_queue)
             continue
 
         now: float = datetime.now(UTC).timestamp()
 
-        next_time: float | None = await creator_queue.next_due_time()
+        next_time: float | None = (
+            await creator_queue.next_due_time()
+        )
+        claim_cutoff: float | None = None
         if next_time is not None and next_time > now:
             sleep_secs: float = next_time - now
-            METRIC_SLEEP_SECONDS.labels(
-                worker_id=get_worker_id()
-            ).set(sleep_secs)
-            logging.debug(
-                'Sleeping until next batch',
-                extra={'sleep_secs': sleep_secs},
-            )
-            await asyncio.sleep(sleep_secs)
+            if sleep_secs > settings.min_interval:
+                # Nothing due within min_interval;
+                # pull the next channel early instead
+                # of idling.
+                logging.debug(
+                    'Next channel not due for longer '
+                    'than min_interval, claiming early',
+                    extra={
+                        'sleep_secs': sleep_secs,
+                        'min_interval': (
+                            settings.min_interval
+                        ),
+                    },
+                )
+                claim_cutoff = next_time
+            else:
+                METRIC_SLEEP_SECONDS.labels(
+                    worker_id=get_worker_id()
+                ).set(sleep_secs)
+                logging.debug(
+                    'Sleeping until next batch',
+                    extra={'sleep_secs': sleep_secs},
+                )
+                await asyncio.sleep(sleep_secs)
         METRIC_SLEEP_SECONDS.labels(
             worker_id=get_worker_id()
         ).set(0)
 
         batch: list[tuple[str, str]] = (
             await creator_queue.claim_batch(
-                settings.rss_concurrency, get_worker_id(),
+                settings.rss_concurrency,
+                get_worker_id(),
+                cutoff=claim_cutoff,
             )
         )
         if not batch:
@@ -1414,26 +1329,38 @@ async def worker_loop(
             extra={
                 'batch_size': len(batch),
                 'batch_names': ', '.join(
-                    name for _, name in batch
+                    name for _, name, _ in batch
                 ),
             },
         )
 
+        process_now: float = (
+            datetime.now(UTC).timestamp()
+        )
         results: list = await asyncio.gather(
             *[
                 process_channel(
-                    name, cid, client, creator_queue, settings,
+                    name, cid, client,
+                    creator_queue, settings,
                 )
-                for cid, name in batch
+                for cid, name, _ in batch
             ],
             return_exceptions=True,
         )
 
-        for i, (cid, name) in enumerate(batch):
-            _log_channel_result(results[i], name, cid)
-            tier: int = await creator_queue.get_tier(cid)
-            await creator_queue.release(cid)
-            _record_tier_sla(cid, tier, tiers)
+        for i, (cid, name, sched) in enumerate(batch):
+            result = results[i]
+            _log_channel_result(result, name, cid)
+            if result is None:
+                await creator_queue.remove(cid)
+            else:
+                tier: int = (
+                    await creator_queue.get_tier(cid)
+                )
+                await creator_queue.release(cid)
+                _record_tier_sla(
+                    tier, sched, process_now,
+                )
 
         await _publish_queue_sizes(creator_queue)
         METRIC_CONCURRENCY.labels(
@@ -1540,6 +1467,16 @@ async def _run_worker(settings: RssSettings) -> None:
             settings.no_feeds_file,
         )
 
+    channel_map_backend: ChannelMap
+    if settings.redis_dsn:
+        channel_map_backend = RedisChannelMap(
+            settings.redis_dsn,
+        )
+    else:
+        channel_map_backend = FileChannelMap(
+            settings.channel_map_file,
+        )
+
     tiers: list[TierConfig] = parse_priority_queues(
         settings.priority_queues,
     )
@@ -1559,7 +1496,8 @@ async def _run_worker(settings: RssSettings) -> None:
     try:
         async with client:
             await worker_loop(
-                settings, client, channel_fm, creator_queue, tiers,
+                settings, client, channel_fm,
+                creator_queue, tiers, channel_map_backend,
             )
     except asyncio.CancelledError:
         logging.info(

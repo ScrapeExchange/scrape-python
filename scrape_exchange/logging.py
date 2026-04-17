@@ -11,6 +11,7 @@ based on their settings.
 '''
 
 import logging
+import logging.handlers
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -192,7 +193,11 @@ def configure_logging(
         ``'text'`` for the legacy colon-separated format.
     '''
 
-    handler: logging.Handler = logging.FileHandler(filename)
+    handler: logging.Handler
+    if filename == '/dev/stdout':
+        handler = logging.FileHandler(filename)
+    else:
+        handler = logging.handlers.WatchedFileHandler(filename)
     formatter: logging.Formatter
     if log_format == 'json':
         formatter = JsonFormatter()

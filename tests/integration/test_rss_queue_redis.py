@@ -200,7 +200,7 @@ class TestRedisCreatorQueuePopulate(
     async def test_populate_unknown_sub_count_tier1(
         self,
     ) -> None:
-        # No subscriber count supplied → tier 1.
+        # No subscriber count supplied (None) → tier 1.
         creators: dict[str, str] = {
             'UCunknown': 'unknown-channel',
         }
@@ -213,6 +213,31 @@ class TestRedisCreatorQueuePopulate(
             )
         )
         self.assertIsNotNone(score)
+
+    async def test_populate_zero_sub_count_lowest_tier(
+        self,
+    ) -> None:
+        # Subscriber count of 0 → lowest tier (not tier 1).
+        creators: dict[str, str] = {
+            'UCzero': 'zero-channel',
+        }
+        await self.q.populate(
+            creators, self.fm, DEFAULT_TIERS,
+            {'UCzero': 0},
+        )
+        score: float | None = (
+            await self._redis.zscore(
+                _queue_key(4), 'UCzero',
+            )
+        )
+        self.assertIsNotNone(score)
+        # Confirm it's NOT in tier 1.
+        tier1_score: float | None = (
+            await self._redis.zscore(
+                _queue_key(1), 'UCzero',
+            )
+        )
+        self.assertIsNone(tier1_score)
 
     async def test_populate_recovers_orphaned_creators(
         self,
