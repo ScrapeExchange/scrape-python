@@ -1,0 +1,16 @@
+.git
+.github
+.claude
+.env
+*.pyc
+__pycache__
+tests/
+docs/
+*.md
+!README.md
+CLAUDE.md
+.venv
+*.egg-info
+.coverage
+htmlcov/
+files/
