@@ -51,6 +51,7 @@ services:
     command:
       - "tools/yt_video_scrape.py"
       - "--video-upload-only"
+      - "true"
     depends_on:
       - po-token-provider
     environment:
@@ -69,6 +70,7 @@ services:
     command:
       - "tools/yt_channel_scrape.py"
       - "--channel-upload-only"
+      - "true"
     environment:
       <<: *container-paths
       CHANNEL_LOG_FILE: /var/log/scrape/scraper/yt_channel.log
