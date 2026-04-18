@@ -1,17 +1,17 @@
 '''
-Channel map abstraction for channel_id to channel_handle
+Creator map abstraction for creator_id to creator_handle
 mappings.
 
 Two interchangeable backends:
 
-* :class:`FileChannelMap` — CSV file with append-only writes.
+* :class:`FileCreatorMap` — CSV file with append-only writes.
   Uses an ``asyncio.Lock`` for intra-process safety.
-* :class:`RedisChannelMap` — Redis hash. Atomic operations,
+* :class:`RedisCreatorMap` — Redis hash. Atomic operations,
   works across hosts.
-* :class:`NullChannelMap` — no-op for contexts that do not
-  need the channel map.
+* :class:`NullCreatorMap` — no-op for contexts that do not
+  need the creator map.
 
-The channel scraper is the authoritative writer. The RSS
+The creator scraper is the authoritative writer. The RSS
 scraper reads only.
 
 :maintainer : Boinko <boinko@scrape.exchange>
@@ -29,25 +29,23 @@ import aiofiles
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
-_REDIS_KEY: str = 'yt:channel_map'
 
-
-class ChannelMap(ABC):
-    '''Abstract base for channel_id to handle mappings.'''
+class CreatorMap(ABC):
+    '''Abstract base for creator_id to creator_handle mappings.'''
 
     @abstractmethod
     async def get(
-        self, channel_id: str,
+        self, creator_id: str,
     ) -> str | None:
-        '''Return the handle for *channel_id*, or None.'''
+        '''Return the creator_handle for *creator_id*, or None.'''
 
     @abstractmethod
     async def get_all(self) -> dict[str, str]:
-        '''Return all channel_id to handle mappings.'''
+        '''Return all creator_id to creator_handle mappings.'''
 
     @abstractmethod
     async def put(
-        self, channel_id: str, handle: str,
+        self, creator_id: str, creator_handle: str,
     ) -> None:
         '''Store a single mapping.'''
 
@@ -59,18 +57,18 @@ class ChannelMap(ABC):
 
     @abstractmethod
     async def contains(
-        self, channel_id: str,
+        self, creator_id: str,
     ) -> bool:
-        '''Return True if *channel_id* is in the map.'''
+        '''Return True if *creator_id* is in the map.'''
 
     @abstractmethod
     async def size(self) -> int:
         '''Return the number of entries.'''
 
 
-class FileChannelMap(ChannelMap):
+class FileCreatorMap(CreatorMap):
     '''
-    CSV-backed channel map. Reads the full file on
+    CSV-backed creator map. Reads the full file on
     :meth:`get_all` and caches in memory. Writes append
     to the file under an ``asyncio.Lock``.
     '''
@@ -81,11 +79,11 @@ class FileChannelMap(ChannelMap):
         self._cache: dict[str, str] = {}
 
     async def get(
-        self, channel_id: str,
+        self, creator_id: str,
     ) -> str | None:
         if not self._cache:
             await self.get_all()
-        return self._cache.get(channel_id)
+        return self._cache.get(creator_id)
 
     async def get_all(self) -> dict[str, str]:
         self._cache = {}
@@ -102,14 +100,14 @@ class FileChannelMap(ChannelMap):
                     continue
                 if ',' in line:
                     cid: str
-                    handle: str
-                    cid, handle = line.split(',', 1)
-                    self._cache[cid] = handle
+                    creator_handle: str
+                    cid, creator_handle = line.split(',', 1)
+                    self._cache[cid] = creator_handle
                 else:
                     self._cache[line] = line
 
         _LOGGER.info(
-            'Read channel map from file',
+            'Read creator map from file',
             extra={
                 'file_path': self._file_path,
                 'entries': len(self._cache),
@@ -118,16 +116,16 @@ class FileChannelMap(ChannelMap):
         return dict(self._cache)
 
     async def put(
-        self, channel_id: str, handle: str,
+        self, creator_id: str, creator_handle: str,
     ) -> None:
         async with self._lock:
             async with aiofiles.open(
                 self._file_path, 'a',
             ) as f:
                 await f.write(
-                    f'{channel_id},{handle}\n'
+                    f'{creator_id},{creator_handle}\n'
                 )
-        self._cache[channel_id] = handle
+        self._cache[creator_id] = creator_handle
 
     async def put_many(
         self, mapping: dict[str, str],
@@ -138,18 +136,18 @@ class FileChannelMap(ChannelMap):
             async with aiofiles.open(
                 self._file_path, 'a',
             ) as f:
-                for cid, handle in mapping.items():
+                for cid, creator_handle in mapping.items():
                     await f.write(
-                        f'{cid},{handle}\n'
+                        f'{cid},{creator_handle}\n'
                     )
         self._cache.update(mapping)
 
     async def contains(
-        self, channel_id: str,
+        self, creator_id: str,
     ) -> bool:
         if not self._cache:
             await self.get_all()
-        return channel_id in self._cache
+        return creator_id in self._cache
 
     async def size(self) -> int:
         if not self._cache:
@@ -157,26 +155,28 @@ class FileChannelMap(ChannelMap):
         return len(self._cache)
 
 
-class RedisChannelMap(ChannelMap):
+class RedisCreatorMap(CreatorMap):
     '''
-    Redis hash-backed channel map. Key ``yt:channel_map``
-    with field=channel_id, value=handle.
+    Redis hash-backed creator map. Key ``{platform}:creator_map``
+    with field=creator_id, value=creator_handle.
     '''
 
-    def __init__(self, redis_dsn: str) -> None:
+    def __init__(
+        self, redis_dsn: str, platform: str,
+    ) -> None:
         import redis.asyncio as aioredis
         self._redis: aioredis.Redis = (
             aioredis.from_url(
                 redis_dsn, decode_responses=True,
             )
         )
-        self._key: str = _REDIS_KEY
+        self._key: str = f'{platform}:creator_map'
 
     async def get(
-        self, channel_id: str,
+        self, creator_id: str,
     ) -> str | None:
         result: str | None = await self._redis.hget(
-            self._key, channel_id,
+            self._key, creator_id,
         )
         return result
 
@@ -187,10 +187,10 @@ class RedisChannelMap(ChannelMap):
         return result
 
     async def put(
-        self, channel_id: str, handle: str,
+        self, creator_id: str, creator_handle: str,
     ) -> None:
         await self._redis.hset(
-            self._key, channel_id, handle,
+            self._key, creator_id, creator_handle,
         )
 
     async def put_many(
@@ -203,21 +203,21 @@ class RedisChannelMap(ChannelMap):
         )
 
     async def contains(
-        self, channel_id: str,
+        self, creator_id: str,
     ) -> bool:
         return await self._redis.hexists(
-            self._key, channel_id,
+            self._key, creator_id,
         )
 
     async def size(self) -> int:
         return await self._redis.hlen(self._key)
 
 
-class NullChannelMap(ChannelMap):
-    '''No-op channel map. Discards writes, returns empty.'''
+class NullCreatorMap(CreatorMap):
+    '''No-op creator map. Discards writes, returns empty.'''
 
     async def get(
-        self, channel_id: str,
+        self, creator_id: str,
     ) -> str | None:
         return None
 
@@ -225,7 +225,7 @@ class NullChannelMap(ChannelMap):
         return {}
 
     async def put(
-        self, channel_id: str, handle: str,
+        self, creator_id: str, creator_handle: str,
     ) -> None:
         pass
 
@@ -235,7 +235,7 @@ class NullChannelMap(ChannelMap):
         pass
 
     async def contains(
-        self, channel_id: str,
+        self, creator_id: str,
     ) -> bool:
         return False
 

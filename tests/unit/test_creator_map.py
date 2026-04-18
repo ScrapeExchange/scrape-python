@@ -1,4 +1,4 @@
-'''Unit tests for scrape_exchange.channel_map.'''
+'''Unit tests for scrape_exchange.creator_map.'''
 
 import os
 import tempfile
@@ -6,33 +6,33 @@ import unittest
 
 import fakeredis.aioredis
 
-from scrape_exchange.channel_map import (
-    FileChannelMap,
-    NullChannelMap,
-    RedisChannelMap,
+from scrape_exchange.creator_map import (
+    FileCreatorMap,
+    NullCreatorMap,
+    RedisCreatorMap,
 )
 
 
-class TestFileChannelMap(unittest.IsolatedAsyncioTestCase):
-    '''Tests for the CSV-backed channel map.'''
+class TestFileCreatorMap(unittest.IsolatedAsyncioTestCase):
+    '''Tests for the CSV-backed creator map.'''
 
     def setUp(self) -> None:
         self.tmpdir: str = tempfile.mkdtemp()
         self.csv_path: str = os.path.join(
-            self.tmpdir, 'channel_map.csv',
+            self.tmpdir, 'creator_map.csv',
         )
 
     async def test_get_all_empty_when_file_missing(
         self,
     ) -> None:
-        cm: FileChannelMap = FileChannelMap(
+        cm: FileCreatorMap = FileCreatorMap(
             self.csv_path,
         )
         result: dict[str, str] = await cm.get_all()
         self.assertEqual(result, {})
 
     async def test_put_and_get(self) -> None:
-        cm: FileChannelMap = FileChannelMap(
+        cm: FileCreatorMap = FileCreatorMap(
             self.csv_path,
         )
         await cm.put('UC123', 'TestChannel')
@@ -40,7 +40,7 @@ class TestFileChannelMap(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, 'TestChannel')
 
     async def test_put_many_and_get_all(self) -> None:
-        cm: FileChannelMap = FileChannelMap(
+        cm: FileCreatorMap = FileCreatorMap(
             self.csv_path,
         )
         mapping: dict[str, str] = {
@@ -52,7 +52,7 @@ class TestFileChannelMap(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, mapping)
 
     async def test_contains(self) -> None:
-        cm: FileChannelMap = FileChannelMap(
+        cm: FileCreatorMap = FileCreatorMap(
             self.csv_path,
         )
         await cm.put('UC123', 'TestChannel')
@@ -60,7 +60,7 @@ class TestFileChannelMap(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await cm.contains('UC999'))
 
     async def test_size(self) -> None:
-        cm: FileChannelMap = FileChannelMap(
+        cm: FileCreatorMap = FileCreatorMap(
             self.csv_path,
         )
         self.assertEqual(await cm.size(), 0)
@@ -74,7 +74,7 @@ class TestFileChannelMap(unittest.IsolatedAsyncioTestCase):
             f.write('# comment\n')
             f.write('\n')
             f.write('UC123,TestChannel\n')
-        cm: FileChannelMap = FileChannelMap(
+        cm: FileCreatorMap = FileCreatorMap(
             self.csv_path,
         )
         result: dict[str, str] = await cm.get_all()
@@ -88,7 +88,7 @@ class TestFileChannelMap(unittest.IsolatedAsyncioTestCase):
         with open(self.csv_path, 'w') as f:
             f.write('UC123,First\n')
             f.write('UC123,Second\n')
-        cm: FileChannelMap = FileChannelMap(
+        cm: FileCreatorMap = FileCreatorMap(
             self.csv_path,
         )
         result: str | None = await cm.get('UC123')
@@ -97,7 +97,7 @@ class TestFileChannelMap(unittest.IsolatedAsyncioTestCase):
     async def test_put_appends_to_file(self) -> None:
         with open(self.csv_path, 'w') as f:
             f.write('UC111,Existing\n')
-        cm: FileChannelMap = FileChannelMap(
+        cm: FileCreatorMap = FileCreatorMap(
             self.csv_path,
         )
         await cm.put('UC222', 'New')
@@ -110,10 +110,10 @@ class TestFileChannelMap(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(lines[1], 'UC222,New')
 
 
-class TestRedisChannelMap(
+class TestRedisCreatorMap(
     unittest.IsolatedAsyncioTestCase,
 ):
-    '''Tests for the Redis-backed channel map.'''
+    '''Tests for the Redis-backed creator map.'''
 
     async def asyncSetUp(self) -> None:
         self.redis: fakeredis.aioredis.FakeRedis = (
@@ -121,11 +121,11 @@ class TestRedisChannelMap(
                 decode_responses=True,
             )
         )
-        self.cm: RedisChannelMap = (
-            RedisChannelMap.__new__(RedisChannelMap)
+        self.cm: RedisCreatorMap = (
+            RedisCreatorMap.__new__(RedisCreatorMap)
         )
         self.cm._redis = self.redis
-        self.cm._key = 'yt:channel_map'
+        self.cm._key = 'youtube:creator_map'
 
     async def asyncTearDown(self) -> None:
         await self.redis.flushall()
@@ -178,26 +178,26 @@ class TestRedisChannelMap(
         self.assertEqual(result, 'Second')
 
 
-class TestNullChannelMap(
+class TestNullCreatorMap(
     unittest.IsolatedAsyncioTestCase,
 ):
-    '''Tests for the no-op channel map.'''
+    '''Tests for the no-op creator map.'''
 
     async def test_get_returns_none(self) -> None:
-        cm: NullChannelMap = NullChannelMap()
+        cm: NullCreatorMap = NullCreatorMap()
         self.assertIsNone(await cm.get('UC123'))
 
     async def test_get_all_returns_empty(self) -> None:
-        cm: NullChannelMap = NullChannelMap()
+        cm: NullCreatorMap = NullCreatorMap()
         self.assertEqual(await cm.get_all(), {})
 
     async def test_put_is_noop(self) -> None:
-        cm: NullChannelMap = NullChannelMap()
+        cm: NullCreatorMap = NullCreatorMap()
         await cm.put('UC123', 'Test')
         self.assertIsNone(await cm.get('UC123'))
 
     async def test_size_always_zero(self) -> None:
-        cm: NullChannelMap = NullChannelMap()
+        cm: NullCreatorMap = NullCreatorMap()
         self.assertEqual(await cm.size(), 0)
 
 
@@ -219,11 +219,11 @@ class TestExportImportRoundTrip(
                 decode_responses=True,
             )
         )
-        self.redis_cm: RedisChannelMap = (
-            RedisChannelMap.__new__(RedisChannelMap)
+        self.redis_cm: RedisCreatorMap = (
+            RedisCreatorMap.__new__(RedisCreatorMap)
         )
         self.redis_cm._redis = self.redis
-        self.redis_cm._key = 'yt:channel_map'
+        self.redis_cm._key = 'youtube:creator_map'
 
     async def asyncTearDown(self) -> None:
         await self.redis.flushall()
@@ -235,7 +235,7 @@ class TestExportImportRoundTrip(
             f.write('UC222,Beta\n')
             f.write('UC333,Gamma\n')
 
-        file_cm: FileChannelMap = FileChannelMap(
+        file_cm: FileCreatorMap = FileCreatorMap(
             self.csv_in,
         )
         data: dict[str, str] = await file_cm.get_all()
@@ -245,13 +245,15 @@ class TestExportImportRoundTrip(
             await self.redis_cm.get_all()
         )
         with open(self.csv_out, 'w') as f:
-            for cid, handle in sorted(
+            for creator_id, creator_handle in sorted(
                 exported.items(),
                 key=lambda x: x[1].lower(),
             ):
-                f.write(f'{cid},{handle}\n')
+                f.write(
+                    f'{creator_id},{creator_handle}\n'
+                )
 
-        out_cm: FileChannelMap = FileChannelMap(
+        out_cm: FileCreatorMap = FileCreatorMap(
             self.csv_out,
         )
         result: dict[str, str] = await out_cm.get_all()

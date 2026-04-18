@@ -67,7 +67,7 @@ class TestAcquireTiming(unittest.IsolatedAsyncioTestCase):
         for _ in range(acquires):
             await limiter.acquire(YouTubeCallType.RSS, proxy=proxy)
 
-        pb: _ProxyBuckets = limiter._get_proxy_buckets(proxy)
+        pb: _ProxyBuckets = limiter._backend._get_or_create(proxy)
         remaining: float = pb.buckets[YouTubeCallType.RSS].tokens
         self.assertAlmostEqual(remaining, burst - acquires, delta=0.1)
 
@@ -81,7 +81,7 @@ class TestAcquireTiming(unittest.IsolatedAsyncioTestCase):
         for _ in range(burst):
             await limiter.acquire(YouTubeCallType.RSS, proxy=proxy)
 
-        pb: _ProxyBuckets = limiter._get_proxy_buckets(proxy)
+        pb: _ProxyBuckets = limiter._backend._get_or_create(proxy)
         bucket: _Bucket = pb.buckets[YouTubeCallType.RSS]
         wait_estimate: float = bucket.time_until_available()
         self.assertGreater(wait_estimate, 0.0)
@@ -118,11 +118,9 @@ class TestConcurrentProxySelection(unittest.IsolatedAsyncioTestCase):
         burst: int = _DEFAULT_CONFIGS[YouTubeCallType.RSS].burst
 
         coros = [limiter.acquire(YouTubeCallType.RSS) for _ in range(burst)]
-        results: list[tuple[str | None, str | None]] = (
-            await asyncio.gather(*coros)
-        )
+        results: list[str | None] = await asyncio.gather(*coros)
 
-        for result_proxy, _ in results:
+        for result_proxy in results:
             self.assertEqual(result_proxy, PROXIES[0])
 
     async def test_auto_select_returns_registered_proxy_after_partial_drain(
@@ -138,7 +136,7 @@ class TestConcurrentProxySelection(unittest.IsolatedAsyncioTestCase):
         for _ in range(burst // 2):
             await limiter.acquire(YouTubeCallType.BROWSE, proxy=PROXIES[0])
 
-        result_proxy, _ = await limiter.acquire(YouTubeCallType.BROWSE)
+        result_proxy = await limiter.acquire(YouTubeCallType.BROWSE)
         self.assertEqual(result_proxy, PROXIES[0])
 
 
@@ -167,13 +165,13 @@ class TestProxiesFromFile(unittest.IsolatedAsyncioTestCase):
         limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
         limiter.set_proxies(PROXIES)
 
-        result_proxy, _ = await limiter.acquire(YouTubeCallType.BROWSE)
+        result_proxy = await limiter.acquire(YouTubeCallType.BROWSE)
         self.assertIn(result_proxy, PROXIES)
 
     async def test_explicit_proxy_from_file(self) -> None:
         limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
         for proxy in PROXIES:
-            result_proxy, _ = await limiter.acquire(
+            result_proxy = await limiter.acquire(
                 YouTubeCallType.PLAYER, proxy=proxy,
             )
             self.assertEqual(result_proxy, proxy)
@@ -194,30 +192,32 @@ class TestAcquireReturnsCookieFile(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(YouTubeRateLimiter.reset)
         self.addCleanup(YouTubeCookieJar.reset)
 
-    async def test_acquire_returns_two_tuple(self) -> None:
-        '''acquire() must return a (proxy, cookie_file) two-tuple.'''
+    async def test_acquire_returns_proxy_string(self) -> None:
+        '''acquire() must return the proxy string.'''
         limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
-        result = await limiter.acquire(YouTubeCallType.RSS, proxy=PROXIES[0])
-        self.assertIsInstance(result, tuple)
-        self.assertEqual(len(result), 2)
+        result = await limiter.acquire(
+            YouTubeCallType.RSS, proxy=PROXIES[0],
+        )
+        self.assertIsInstance(result, str)
 
-    async def test_acquire_first_element_is_proxy(self) -> None:
-        '''The first element of the tuple must be the proxy that was used.'''
+    async def test_acquire_returns_correct_proxy(self) -> None:
+        '''acquire() must return the proxy that was used.'''
         limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
-        result_proxy, _ = await limiter.acquire(
+        result_proxy = await limiter.acquire(
             YouTubeCallType.RSS, proxy=PROXIES[0],
         )
         self.assertEqual(result_proxy, PROXIES[0])
 
-    async def test_acquire_after_warm_returns_cookie_file(self) -> None:
-        '''After warming the jar, acquire must return a valid file path.'''
+    async def test_get_cookie_file_cached_after_warm(self) -> None:
+        '''After warming the jar, get_cookie_file_cached returns a valid path.'''
         limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
         limiter.set_proxies(PROXIES[:1])
         await limiter.warm_cookie_jar()
 
-        _, cookie_file = await limiter.acquire(
+        proxy = await limiter.acquire(
             YouTubeCallType.RSS, proxy=PROXIES[0],
         )
+        cookie_file: str | None = limiter.get_cookie_file_cached(proxy)
         self.assertIsNotNone(cookie_file)
         self.assertTrue(
             os.path.exists(cookie_file),
@@ -230,9 +230,10 @@ class TestAcquireReturnsCookieFile(unittest.IsolatedAsyncioTestCase):
         limiter.set_proxies(PROXIES[:1])
         await limiter.warm_cookie_jar()
 
-        _, cookie_file = await limiter.acquire(
+        proxy = await limiter.acquire(
             YouTubeCallType.RSS, proxy=PROXIES[0],
         )
+        cookie_file: str | None = limiter.get_cookie_file_cached(proxy)
         self.assertIsNotNone(cookie_file)
         content: str = await asyncio.to_thread(_read_file, cookie_file)
         first_line: str = content.splitlines()[0].strip()
@@ -245,23 +246,26 @@ class TestAcquireReturnsCookieFile(unittest.IsolatedAsyncioTestCase):
         # Warm first so the cache is populated before acquire() reads it.
         await limiter.warm_cookie_jar()
 
-        _, cookie_file_1 = await limiter.acquire(
+        proxy_1 = await limiter.acquire(
             YouTubeCallType.RSS, proxy=PROXIES[0],
         )
-        _, cookie_file_2 = await limiter.acquire(
+        cookie_file_1: str | None = limiter.get_cookie_file_cached(proxy_1)
+        proxy_2 = await limiter.acquire(
             YouTubeCallType.RSS, proxy=PROXIES[0],
         )
+        cookie_file_2: str | None = limiter.get_cookie_file_cached(proxy_2)
         self.assertIsNotNone(cookie_file_1)
         self.assertEqual(cookie_file_1, cookie_file_2)
 
     async def test_auto_selected_proxy_has_matching_cookie_file(self) -> None:
-        '''When proxy is auto-selected, the cookie file matches that proxy.'''
+        '''When proxy is auto-selected, cookie file matches the proxy.'''
         limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
         limiter.set_proxies(PROXIES)
         await limiter.warm_cookie_jar()
 
-        result_proxy, cookie_file = await limiter.acquire(YouTubeCallType.RSS)
+        result_proxy = await limiter.acquire(YouTubeCallType.RSS)
         self.assertIn(result_proxy, PROXIES)
+        cookie_file: str | None = limiter.get_cookie_file_cached(result_proxy)
         # The cookie file returned must be the one for the selected proxy.
         jar: YouTubeCookieJar = YouTubeCookieJar.get()
         expected: str | None = await jar.get_cookie_file(result_proxy)

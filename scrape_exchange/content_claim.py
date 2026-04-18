@@ -1,24 +1,24 @@
 '''
-Cross-process claim lock for video scraping.
+Cross-process claim lock for content scraping.
 
-Before a worker spends a yt-dlp scrape slot on a video,
-it attempts to *claim* the video ID.  If another process
-already holds the claim the worker skips the video,
+Before a worker spends a scrape slot on a content item,
+it attempts to *claim* the content ID.  If another process
+already holds the claim the worker skips the item,
 avoiding duplicate scraping across ``NUM_PROCESSES > 1``
 child processes.
 
 Two interchangeable backends are provided:
 
-* :class:`FileVideoClaim` — atomic ``O_CREAT|O_EXCL``
+* :class:`FileContentClaim` — atomic ``O_CREAT|O_EXCL``
   lock files in a shared directory.  Zero external
   dependencies; requires all processes to share a
   filesystem.
-* :class:`RedisVideoClaim` — ``SET NX EX`` in Redis.
+* :class:`RedisContentClaim` — ``SET NX EX`` in Redis.
   Automatic TTL-based expiry; works across hosts.
 
 Both expose the same async context-manager interface via
-the abstract :class:`VideoClaim` base class so the worker
-code is backend-agnostic.
+the abstract :class:`ContentClaim` base class so the
+worker code is backend-agnostic.
 
 :maintainer : Boinko <boinko@scrape.exchange>
 :copyright  : Copyright 2026
@@ -41,34 +41,34 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 DEFAULT_CLAIM_TTL: int = 3600
 
 
-class VideoClaim(ABC):
+class ContentClaim(ABC):
     '''
-    Abstract base for cross-process video claim locks.
+    Abstract base for cross-process content claim locks.
 
     Usage::
 
-        claim: VideoClaim = FileVideoClaim(...)
-        acquired: bool = await claim.acquire(video_id)
+        claim: ContentClaim = FileContentClaim(...)
+        acquired: bool = await claim.acquire(content_id)
         if not acquired:
-            # another process owns this video
+            # another process owns this content item
             ...
         # ... scrape ...
-        await claim.release(video_id)
+        await claim.release(content_id)
     '''
 
     @abstractmethod
-    async def acquire(self, video_id: str) -> bool:
+    async def acquire(self, content_id: str) -> bool:
         '''
-        Attempt to claim *video_id*.
+        Attempt to claim *content_id*.
 
         :returns: ``True`` if the claim was acquired,
             ``False`` if another process already holds it.
         '''
 
     @abstractmethod
-    async def release(self, video_id: str) -> None:
+    async def release(self, content_id: str) -> None:
         '''
-        Release the claim on *video_id*.  Safe to call
+        Release the claim on *content_id*.  Safe to call
         even if the claim was not held (idempotent).
         '''
 
@@ -81,12 +81,12 @@ class VideoClaim(ABC):
         '''
 
 
-class FileVideoClaim(VideoClaim):
+class FileContentClaim(ContentClaim):
     '''
     Filesystem-backed claim lock using atomic file
     creation (``O_CREAT | O_EXCL``).
 
-    Claim files are named ``.claim-{video_id}`` inside
+    Claim files are named ``.claim-{content_id}`` inside
     *claim_dir*.  Each file contains the PID and a
     monotonic timestamp so :meth:`cleanup_stale` can
     detect and remove locks left by dead processes.
@@ -106,11 +106,11 @@ class FileVideoClaim(VideoClaim):
         self._dir.mkdir(parents=True, exist_ok=True)
         self._ttl: int = ttl
 
-    def _path(self, video_id: str) -> Path:
-        return self._dir / f'{self._PREFIX}{video_id}'
+    def _path(self, content_id: str) -> Path:
+        return self._dir / f'{self._PREFIX}{content_id}'
 
-    async def acquire(self, video_id: str) -> bool:
-        path: Path = self._path(video_id)
+    async def acquire(self, content_id: str) -> bool:
+        path: Path = self._path(content_id)
         try:
             fd: int = os.open(
                 str(path),
@@ -131,7 +131,7 @@ class FileVideoClaim(VideoClaim):
             _LOGGER.warning(
                 'Reclaiming expired filesystem claim',
                 extra={
-                    'video_id': video_id,
+                    'content_id': content_id,
                     'age_seconds': age,
                     'ttl': self._ttl,
                 },
@@ -159,8 +159,8 @@ class FileVideoClaim(VideoClaim):
             os.close(fd)
         return True
 
-    async def release(self, video_id: str) -> None:
-        path: Path = self._path(video_id)
+    async def release(self, content_id: str) -> None:
+        path: Path = self._path(content_id)
         try:
             path.unlink()
         except FileNotFoundError:
@@ -193,23 +193,24 @@ class FileVideoClaim(VideoClaim):
         return removed
 
 
-class RedisVideoClaim(VideoClaim):
+class RedisContentClaim(ContentClaim):
     '''
     Redis-backed claim lock using ``SET NX EX``.
 
     Claims are stored as keys
-    ``video:claim:{video_id}`` with a TTL that acts as
-    automatic stale-lock cleanup.
+    ``{platform}:claim:{content_id}`` with a TTL that
+    acts as automatic stale-lock cleanup.
 
     :param redis_dsn: Redis connection string.
+    :param platform: Platform identifier used as key
+        prefix (e.g. ``'youtube'``, ``'tiktok'``).
     :param ttl: Seconds for the claim key TTL.
     '''
-
-    _KEY_PREFIX: str = 'video:claim:'
 
     def __init__(
         self,
         redis_dsn: str,
+        platform: str,
         ttl: int = DEFAULT_CLAIM_TTL,
     ) -> None:
         try:
@@ -217,7 +218,7 @@ class RedisVideoClaim(VideoClaim):
         except ImportError:
             raise ImportError(
                 'redis package is required for '
-                'RedisVideoClaim. Install with: '
+                'RedisContentClaim. Install with: '
                 'pip install "redis[hiredis]>=5.0.0"'
             ) from None
         self._redis: aioredis.Redis = (
@@ -227,21 +228,22 @@ class RedisVideoClaim(VideoClaim):
         )
         self._ttl: int = ttl
         self._pid: str = str(os.getpid())
+        self._key_prefix: str = f'{platform}:claim:'
 
-    def _key(self, video_id: str) -> str:
-        return f'{self._KEY_PREFIX}{video_id}'
+    def _key(self, content_id: str) -> str:
+        return f'{self._key_prefix}{content_id}'
 
-    async def acquire(self, video_id: str) -> bool:
+    async def acquire(self, content_id: str) -> bool:
         result: bool | None = await self._redis.set(
-            self._key(video_id),
+            self._key(content_id),
             self._pid,
             nx=True,
             ex=self._ttl,
         )
         return result is True
 
-    async def release(self, video_id: str) -> None:
-        await self._redis.delete(self._key(video_id))
+    async def release(self, content_id: str) -> None:
+        await self._redis.delete(self._key(content_id))
 
     async def cleanup_stale(self) -> int:
         '''
@@ -256,7 +258,7 @@ class RedisVideoClaim(VideoClaim):
 
         removed: int = 0
         cursor: int = 0
-        pattern: str = f'{self._KEY_PREFIX}*'
+        pattern: str = f'{self._key_prefix}*'
         while True:
             cursor, keys = await self._redis.scan(
                 cursor=cursor, match=pattern, count=100,
@@ -274,17 +276,17 @@ class RedisVideoClaim(VideoClaim):
         return removed
 
 
-class NullVideoClaim(VideoClaim):
+class NullContentClaim(ContentClaim):
     '''
     No-op claim lock for single-process mode or when
     cross-process coordination is disabled.  Every
     :meth:`acquire` succeeds unconditionally.
     '''
 
-    async def acquire(self, video_id: str) -> bool:
+    async def acquire(self, content_id: str) -> bool:
         return True
 
-    async def release(self, video_id: str) -> None:
+    async def release(self, content_id: str) -> None:
         pass
 
     async def cleanup_stale(self) -> int:

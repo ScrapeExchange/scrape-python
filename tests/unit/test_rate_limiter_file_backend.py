@@ -325,8 +325,9 @@ class TestRateLimiterSharedBackend(unittest.IsolatedAsyncioTestCase):
             state_dir=self.state_dir,
         )
         limiter.set_proxies(['http://a:3128'])
-        proxy, _ = await limiter.acquire(
-            YouTubeCallType.BROWSE, proxy='http://a:3128',
+        proxy: str | None = await limiter.acquire(
+            YouTubeCallType.BROWSE,
+            proxy='http://a:3128',
         )
         self.assertEqual(proxy, 'http://a:3128')
 

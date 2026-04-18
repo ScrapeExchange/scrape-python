@@ -13,7 +13,6 @@ to Scrape Exchange and moves the file to an "uploaded" sub-directory.
 '''
 
 import os
-import signal
 import sys
 import asyncio
 import logging
@@ -26,31 +25,26 @@ import aiofiles
 
 from httpx import Response
 
-from prometheus_client import Counter, Gauge, start_http_server
+from prometheus_client import Counter, Gauge
 
 from pydantic import AliasChoices, Field, field_validator
 
-from scrape_exchange.channel_map import (
-    ChannelMap,
-    FileChannelMap,
-    RedisChannelMap,
+from scrape_exchange.creator_map import (
+    CreatorMap,
+    FileCreatorMap,
+    RedisCreatorMap,
 )
 from scrape_exchange.exchange_client import ExchangeClient
 
 from scrape_exchange.file_management import AssetFileManagement
 from scrape_exchange.file_management import CHANNEL_FILE_PREFIX
-from scrape_exchange.logging import configure_logging
-from scrape_exchange.scraper_supervisor import (
-    SupervisorConfig,
-    publish_config_metrics,
-    run_supervisor,
+from scrape_exchange.scraper_runner import (
+    ScraperRunContext,
+    ScraperRunner,
 )
 from scrape_exchange.settings import normalize_log_level
 
 from scrape_exchange.youtube.youtube_channel import YouTubeChannel
-from scrape_exchange.scrape_exchange_rate_limiter import (
-    ScrapeExchangeRateLimiter,
-)
 from scrape_exchange.youtube.youtube_rate_limiter import YouTubeRateLimiter
 from scrape_exchange.youtube.youtube_video import DENO_PATH, PO_TOKEN_URL
 from scrape_exchange.worker_id import get_worker_id
@@ -327,153 +321,76 @@ def _validate_settings(settings: ChannelSettings) -> None:
         sys.exit(1)
 
 
-async def _run_worker(settings: ChannelSettings) -> None:
+async def _run_worker(
+    ctx: ScraperRunContext,
+) -> None:
     '''
     Run a single in-process channel scraper worker (the leaf of
-    the supervisor tree). Binds the Prometheus HTTP server,
-    publishes the configuration gauges for this process, wires up
-    signal handlers, and runs the upload + scrape passes.
+    the supervisor tree). Runs the upload + scrape passes using
+    the context provided by ScraperRunner.
     '''
 
-    _soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    _target = _hard if _hard != resource.RLIM_INFINITY else 1048576
-    resource.setrlimit(resource.RLIMIT_NOFILE, (_target, _hard))
+    settings: ChannelSettings = ctx.settings
+
+    _soft, _hard = resource.getrlimit(
+        resource.RLIMIT_NOFILE,
+    )
+    _target: int = (
+        _hard
+        if _hard != resource.RLIM_INFINITY
+        else 1048576
+    )
+    resource.setrlimit(
+        resource.RLIMIT_NOFILE,
+        (_target, _hard),
+    )
 
     logging.info(
         'Starting YouTube channel upload tool',
-        extra={'settings': settings.model_dump()},
-    )
-    worker_proxies: list[str] = [
-        p.strip() for p in settings.proxies.split(',') if p.strip()
-    ] if settings.proxies else []
-    logging.info(
-        'Channel scraper worker started',
         extra={
-            'metrics_port': settings.metrics_port,
-            'proxies_count': len(worker_proxies),
-            'first_proxy': (
-                worker_proxies[0] if worker_proxies else None
-            ),
-            'last_proxy': (
-                worker_proxies[-1] if worker_proxies else None
-            ),
+            'settings': settings.model_dump(),
         },
-    )
-
-    try:
-        start_http_server(settings.metrics_port)
-        logging.info(
-            'Prometheus metrics available',
-            extra={'metrics_port': settings.metrics_port},
-        )
-    except OSError as exc:
-        logging.warning(
-            'Failed to bind Prometheus metrics port; '
-            'worker will run without metrics',
-            exc=exc,
-            extra={'metrics_port': settings.metrics_port},
-        )
-    publish_config_metrics(
-        role='worker', scraper_label='channel',
-        num_processes=1,
-        concurrency=settings.channel_concurrency,
     )
 
     # AssetFileManagement creates the 'uploaded' subdirectory
     # automatically and owns all read/write/marker operations
     # under channel_data_directory.
     fm: AssetFileManagement = AssetFileManagement(
-        settings.channel_data_directory
+        settings.channel_data_directory,
     )
 
-    try:
-        client: ExchangeClient | None = (
-            await ExchangeClient.setup(
-                api_key_id=settings.api_key_id,
-                api_key_secret=settings.api_key_secret,
-                exchange_url=settings.exchange_url,
-            )
-        )
-    except Exception as exc:
-        logging.critical(
-            'Failed to connect to Scrape Exchange API',
-            exc=exc,
-            extra={
-                'exchange_url': settings.exchange_url,
-            },
-        )
-        logging.shutdown()
-        sys.exit(1)
-
-    channel_map_backend: ChannelMap
+    creator_map_backend: CreatorMap
     if settings.redis_dsn:
-        channel_map_backend = RedisChannelMap(
+        creator_map_backend = RedisCreatorMap(
             settings.redis_dsn,
+            platform='youtube',
         )
     else:
-        channel_map_backend = FileChannelMap(
+        creator_map_backend = FileCreatorMap(
             settings.channel_map_file,
         )
 
-    YouTubeRateLimiter.get(
-        state_dir=settings.rate_limiter_state_dir,
-        redis_dsn=settings.redis_dsn,
-    ).set_proxies(settings.proxies)
-
-    post_rate: float = float(max(
-        1,
-        settings.channel_num_processes
-        * settings.channel_concurrency,
-    ))
-    ScrapeExchangeRateLimiter.get(
-        state_dir=settings.rate_limiter_state_dir,
-        post_rate=post_rate,
-        redis_dsn=settings.redis_dsn,
-    )
-
     if not settings.proxies:
         logging.info(
-            'No proxies configured, using direct connection '
-            'for scraping'
+            'No proxies configured, using direct '
+            'connection for scraping',
         )
         settings.channel_concurrency = 1
-        publish_config_metrics(
-            role='worker', scraper_label='channel',
-            num_processes=1,
-            concurrency=settings.channel_concurrency,
+
+    if not settings.channel_no_upload:
+        await upload_channels(
+            settings, ctx.client, fm,
         )
 
-    # Wire SIGINT/SIGTERM to cancel the current task so the finally
-    # block gets a chance to drain the ExchangeClient upload queue.
-    loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
-    main_task: asyncio.Task = asyncio.current_task()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, main_task.cancel)
-        except NotImplementedError:
-            pass
-
-    try:
-        if not settings.channel_no_upload:
-            await upload_channels(settings, client, fm)
-
-        if settings.channel_upload_only:
-            await _watch_and_upload_channels(
-                settings, client, fm,
-            )
-        else:
-            await scrape_channels(
-                settings, client, fm, channel_map_backend,
-            )
-    except asyncio.CancelledError:
-        logging.info(
-            'Shutdown signal received; '
-            'draining background uploads'
+    if settings.channel_upload_only:
+        await _watch_and_upload_channels(
+            settings, ctx.client, fm,
         )
-        raise
-    finally:
-        if client is not None:
-            await client.drain_uploads(timeout=10.0)
+    else:
+        await scrape_channels(
+            settings, ctx.client, fm,
+            creator_map_backend,
+        )
 
 
 def main() -> None:
@@ -485,40 +402,33 @@ def main() -> None:
     '''
 
     settings: ChannelSettings = ChannelSettings()
-    configure_logging(
-        level=settings.channel_log_level,
-        filename=settings.channel_log_file,
-        log_format=settings.log_format,
-    )
     _validate_settings(settings)
 
     if settings.channel_upload_only:
         settings.channel_num_processes = 1
-        settings.metrics_port = settings.metrics_port - 1
-        logging.info(
-            'Upload-only mode: forcing single process '
-            f'with metrics port {settings.metrics_port}'
+        settings.metrics_port = (
+            settings.metrics_port - 1
         )
 
-    if settings.channel_num_processes > 1:
-        sys.exit(run_supervisor(SupervisorConfig(
-            scraper_label='channel',
-            num_processes_env_var='CHANNEL_NUM_PROCESSES',
-            log_file_env_var='CHANNEL_LOG_FILE',
-            num_processes=settings.channel_num_processes,
-            concurrency=settings.channel_concurrency,
-            proxies=settings.proxies,
-            metrics_port=settings.metrics_port,
-            log_file=settings.channel_log_file or None,
-            api_key_id=settings.api_key_id,
-            api_key_secret=settings.api_key_secret,
-            exchange_url=settings.exchange_url,
-        )))
-
-    try:
-        asyncio.run(_run_worker(settings))
-    except asyncio.CancelledError:
-        logging.info('Channel scraper shutdown complete')
+    runner: ScraperRunner = ScraperRunner(
+        settings=settings,
+        scraper_label='channel',
+        platform='youtube',
+        num_processes=(
+            settings.channel_num_processes
+        ),
+        concurrency=settings.channel_concurrency,
+        metrics_port=settings.metrics_port,
+        log_file=settings.channel_log_file,
+        log_level=settings.channel_log_level,
+        rate_limiter_factory=lambda s: (
+            YouTubeRateLimiter.get(
+                state_dir=s.rate_limiter_state_dir,
+                redis_dsn=s.redis_dsn,
+            )
+        ),
+    )
+    sys.exit(runner.run_sync(_run_worker))
 
 
 async def channel_exists(client: ExchangeClient, channel_name: str) -> bool:
@@ -585,12 +495,12 @@ async def scrape_channels(
     settings: ChannelSettings,
     client: ExchangeClient,
     fm: AssetFileManagement,
-    channel_map: ChannelMap,
+    creator_map_backend: CreatorMap,
 ) -> None:
 
     new_channels: set[str] = await read_channels(
         settings.channel_list,
-        channel_map, fm, client,
+        creator_map_backend, fm, client,
         settings.max_new_channels,
         settings.max_resolved_channels,
         settings.channel_concurrency,
@@ -1115,7 +1025,7 @@ def enqueue_upload_channel(
 
 
 async def read_channels(
-    file_path: str, channel_map: ChannelMap,
+    file_path: str, creator_map_backend: CreatorMap,
     fm: AssetFileManagement,
     exchange_client: ExchangeClient,
     max_new_channels: int, max_resolved_channels: int,
@@ -1142,7 +1052,7 @@ async def read_channels(
 
     # These are known names but not necesarily will have been scraped
     channel_map_data: dict[str, str] = (
-        await channel_map.get_all()
+        await creator_map_backend.get_all()
     )
     new_channel_names: set[str] = set()
 
@@ -1214,7 +1124,7 @@ async def read_channels(
             worker_id=get_worker_id()
         ).set(len(unresolved_ids))
         resolved_channels = await review_unresolved_ids(
-            unresolved_ids, channel_map, fm,
+            unresolved_ids, creator_map_backend, fm,
             concurrency, max_resolved_channels
         )
         new_channel_names.update(resolved_channels)
@@ -1285,7 +1195,8 @@ async def read_channels(
 
 
 async def review_unresolved_ids(
-    unresolved_ids: set[str], channel_map: ChannelMap,
+    unresolved_ids: set[str],
+    creator_map_backend: CreatorMap,
     fm: AssetFileManagement,
     concurrency: int, max_resolved_channels: int,
 ) -> set[str]:
@@ -1350,7 +1261,9 @@ async def review_unresolved_ids(
                         },
                     )
                     return None
-                await channel_map.put(channel_id, name)
+                await creator_map_backend.put(
+                    channel_id, name,
+                )
 
                 logging.debug(
                     'Resolved channel ID to name',

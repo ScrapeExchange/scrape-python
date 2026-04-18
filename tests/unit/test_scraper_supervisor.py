@@ -15,6 +15,7 @@ import unittest
 
 from unittest.mock import patch, MagicMock
 
+from scrape_exchange.worker_id import get_worker_id
 from scrape_exchange.scraper_supervisor import (
     METRIC_CONCURRENCY,
     METRIC_NUM_PROCESSES,
@@ -98,11 +99,16 @@ class TestPublishConfigMetrics(unittest.TestCase):
             scraper_label=self.scraper_label,
             num_processes=4, concurrency=3,
         )
+        wid: str = get_worker_id()
         np_val: float = METRIC_NUM_PROCESSES.labels(
-            role='supervisor', scraper=self.scraper_label,
+            role='supervisor',
+            scraper=self.scraper_label,
+            worker_id=wid,
         )._value.get()
         conc_val: float = METRIC_CONCURRENCY.labels(
-            role='supervisor', scraper=self.scraper_label,
+            role='supervisor',
+            scraper=self.scraper_label,
+            worker_id=wid,
         )._value.get()
         self.assertEqual(np_val, 4.0)
         self.assertEqual(conc_val, 3.0)
@@ -118,11 +124,16 @@ class TestPublishConfigMetrics(unittest.TestCase):
             scraper_label=self.scraper_label,
             num_processes=1, concurrency=3,
         )
+        wid: str = get_worker_id()
         sup_np: float = METRIC_NUM_PROCESSES.labels(
-            role='supervisor', scraper=self.scraper_label,
+            role='supervisor',
+            scraper=self.scraper_label,
+            worker_id=wid,
         )._value.get()
         w_np: float = METRIC_NUM_PROCESSES.labels(
-            role='worker', scraper=self.scraper_label,
+            role='worker',
+            scraper=self.scraper_label,
+            worker_id=wid,
         )._value.get()
         self.assertEqual(sup_np, 4.0)
         self.assertEqual(w_np, 1.0)

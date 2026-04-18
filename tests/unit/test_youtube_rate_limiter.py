@@ -199,7 +199,7 @@ class TestAcquireWithProxy(unittest.IsolatedAsyncioTestCase):
     async def test_acquire_explicit_proxy(self) -> None:
         limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
         proxy: str = PROXIES[0]
-        result_proxy, _ = await limiter.acquire(
+        result_proxy = await limiter.acquire(
             YouTubeCallType.BROWSE, proxy=proxy,
         )
         self.assertEqual(result_proxy, proxy)
@@ -219,7 +219,7 @@ class TestAcquireWithProxy(unittest.IsolatedAsyncioTestCase):
 
     async def test_acquire_no_proxy_no_pool_returns_none(self) -> None:
         limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
-        result_proxy, _ = await limiter.acquire(YouTubeCallType.HTML)
+        result_proxy = await limiter.acquire(YouTubeCallType.HTML)
         self.assertIsNone(result_proxy)
 
     async def test_acquire_auto_selects_best_proxy(self) -> None:
@@ -231,7 +231,7 @@ class TestAcquireWithProxy(unittest.IsolatedAsyncioTestCase):
         pb_a: _ProxyBuckets = backend._get_or_create('http://a:3128')
         pb_a.buckets[YouTubeCallType.BROWSE].tokens = 0.0
 
-        result_proxy, _ = await limiter.acquire(YouTubeCallType.BROWSE)
+        result_proxy = await limiter.acquire(YouTubeCallType.BROWSE)
         self.assertEqual(result_proxy, 'http://b:3128')
 
     async def test_acquire_does_not_cross_pollinate(self) -> None:
@@ -253,7 +253,7 @@ class TestAcquireWithProxy(unittest.IsolatedAsyncioTestCase):
     async def test_acquire_returns_proxy_used(self) -> None:
         limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
         limiter.set_proxies(['http://only:3128'])
-        result_proxy, _ = await limiter.acquire(YouTubeCallType.RSS)
+        result_proxy = await limiter.acquire(YouTubeCallType.RSS)
         self.assertEqual(result_proxy, 'http://only:3128')
 
     async def test_multiple_acquires_round_robin_effect(self) -> None:
@@ -268,18 +268,21 @@ class TestAcquireWithProxy(unittest.IsolatedAsyncioTestCase):
             await limiter.acquire(YouTubeCallType.HTML, proxy='http://a:3128')
 
         # Auto-select should now prefer B
-        result_proxy, _ = await limiter.acquire(YouTubeCallType.HTML)
+        result_proxy = await limiter.acquire(YouTubeCallType.HTML)
         self.assertEqual(result_proxy, 'http://b:3128')
 
-    async def test_acquire_returns_tuple(self) -> None:
-        '''acquire() must return a (proxy, cookie_file) two-tuple.'''
+    async def test_acquire_returns_proxy_string(self) -> None:
+        '''acquire() must return the proxy string.'''
         limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
-        result = await limiter.acquire(YouTubeCallType.RSS, proxy=PROXIES[0])
-        self.assertIsInstance(result, tuple)
-        self.assertEqual(len(result), 2)
+        result = await limiter.acquire(
+            YouTubeCallType.RSS, proxy=PROXIES[0],
+        )
+        self.assertIsInstance(result, str)
 
-    async def test_acquire_returns_cached_cookie_file(self) -> None:
-        '''acquire() reads cookie file from jar cache; no network I/O.'''
+    async def test_get_cookie_file_cached_returns_cached_entry(
+        self,
+    ) -> None:
+        '''get_cookie_file_cached() reads cookie from jar; no network I/O.'''
         from scrape_exchange.youtube.youtube_cookiejar import (
             YouTubeCookieJar, _CookieEntry,
         )
@@ -288,17 +291,21 @@ class TestAcquireWithProxy(unittest.IsolatedAsyncioTestCase):
         jar._entries[PROXIES[0]] = _CookieEntry(path='/tmp/yt_test.txt')
         self.addCleanup(YouTubeCookieJar.reset)
 
-        _, cookie_file = await limiter.acquire(
+        await limiter.acquire(
             YouTubeCallType.RSS, proxy=PROXIES[0],
         )
+        cookie_file: str | None = limiter.get_cookie_file_cached(PROXIES[0])
         self.assertEqual(cookie_file, '/tmp/yt_test.txt')
 
-    async def test_acquire_returns_none_cookie_when_cache_empty(self) -> None:
-        '''acquire() returns None cookie_file when jar cache has no entry.'''
+    async def test_get_cookie_file_cached_none_when_cache_empty(
+        self,
+    ) -> None:
+        '''get_cookie_file_cached() returns None when jar cache has no entry.'''
         limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
-        _, cookie_file = await limiter.acquire(
+        await limiter.acquire(
             YouTubeCallType.RSS, proxy=PROXIES[0],
         )
+        cookie_file: str | None = limiter.get_cookie_file_cached(PROXIES[0])
         self.assertIsNone(cookie_file)
 
 

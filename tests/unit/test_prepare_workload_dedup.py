@@ -74,6 +74,7 @@ def _make_mocks(
     '''
     settings: MagicMock = MagicMock()
     settings.video_data_directory = '/tmp/test'
+    settings.video_upload_only = False
 
     video_fm: MagicMock = MagicMock()
     video_fm.delete = AsyncMock()
