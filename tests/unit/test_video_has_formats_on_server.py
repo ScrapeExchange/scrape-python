@@ -61,7 +61,7 @@ _video_has_formats_on_server = (
 )
 
 # Constants mirrored from ExchangeClient so tests are self-contained.
-_GET_DATA_PARAM: str = '/api/data/v1/param'
+_GET_DATA_PARAM: str = '/api/v1/data/param'
 _EXCHANGE_URL: str = 'https://scrape.exchange'
 _SCHEMA_OWNER: str = 'testuser'
 _SCHEMA_VERSION: str = '0.0.1'

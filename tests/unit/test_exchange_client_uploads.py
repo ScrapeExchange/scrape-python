@@ -72,7 +72,7 @@ class EnqueueUploadTests(unittest.IsolatedAsyncioTestCase):
         try:
             fm: _FakeFileManager = _FakeFileManager()
             enqueued: bool = client.enqueue_upload(
-                'https://fake.scrape.exchange/api/data/v1',
+                'https://fake.scrape.exchange/api/v1/data',
                 json={'entity': 'video', 'id': 'abc'},
                 file_manager=fm,
                 filename='video-dlp-abc.json.br',
@@ -95,7 +95,7 @@ class EnqueueUploadTests(unittest.IsolatedAsyncioTestCase):
         try:
             fm: _FakeFileManager = _FakeFileManager()
             client.enqueue_upload(
-                'https://fake.scrape.exchange/api/data/v1',
+                'https://fake.scrape.exchange/api/v1/data',
                 json={'entity': 'video'},
                 file_manager=fm,
                 filename='video-dlp-xyz.json.br',
@@ -118,7 +118,7 @@ class EnqueueUploadTests(unittest.IsolatedAsyncioTestCase):
         client: ExchangeClient = _make_client(handler)
         try:
             client.enqueue_upload(
-                'https://fake.scrape.exchange/api/data/v1',
+                'https://fake.scrape.exchange/api/v1/data',
                 json={'entity': 'video'},
             )
             await client.drain_uploads(timeout=2.0)
@@ -146,7 +146,7 @@ class EnqueueUploadTests(unittest.IsolatedAsyncioTestCase):
             fm: _FakeFileManager = _FakeFileManager()
             # This must return without waiting for release.
             enqueued: bool = client.enqueue_upload(
-                'https://fake.scrape.exchange/api/data/v1',
+                'https://fake.scrape.exchange/api/v1/data',
                 json={'entity': 'video'},
                 file_manager=fm,
                 filename='video-dlp-abc.json.br',
