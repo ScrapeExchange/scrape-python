@@ -1,0 +1,932 @@
+#!/usr/bin/env python3
+
+'''
+Discover new YouTube channels via BFS from a set of seed pages.
+
+Reads known channels from channels.lst, scrapes the YOUTUBE_URLS seeds,
+and recursively scrapes every new channel it finds. Persists discovered
+channels (with subscriber counts) and failed scrapes to append-only
+JSONL files so a crashed run can be resumed.
+
+Depends on scrape_exchange.youtube.youtube_client.AsyncYouTubeClient from
+the sibling repo ../scrape-python. Either `pip install -e ../scrape-python`
+or put that repo on PYTHONPATH before running this tool.
+
+:maintainer : Steven Hessing <steven@byoda.org>
+:copyright  : Copyright 2026
+:license    : GPLv3
+'''
+
+import re
+import asyncio
+import logging
+
+from typing import Self
+from random import shuffle
+from collections import deque
+
+import orjson
+import aiofiles
+
+from bs4 import BeautifulSoup
+from pydantic import AliasChoices, Field
+import redis.asyncio as redis_asyncio
+
+from scrape_exchange.logging import configure_logging
+from scrape_exchange.settings import ScraperSettings
+from scrape_exchange.youtube.youtube_rate_limiter import (
+    YouTubeRateLimiter,
+)
+
+from scrape_exchange.youtube.youtube_channel import (
+    YouTubeChannel as ScrapeYouTubeChannel,
+)
+from scrape_exchange.youtube.youtube_client import AsyncYouTubeClient
+
+REDIS_CHANNEL_MAP_KEY: str = 'youtube:creator_map'
+
+_LOGGER: logging.Logger = logging.getLogger(__name__)
+
+CHANNEL_PREFIX: str = 'channel/'
+
+CHANNEL_RX: re.Pattern = re.compile(r'\"canonicalBaseUrl\":\"\/@(.*?)\"')
+CHANNEL_SCRAPE_REGEX_SHORT: re.Pattern[str] = re.compile(
+    r'var ytInitialData = (.*?);'
+)
+CHANNEL_SCRAPE_REGEX: re.Pattern[str] = re.compile(
+    r'var ytInitialData = (.*?);$'
+)
+
+YOUTUBE_URLS: list[str] = [
+    'https://www.youtube.com/feed/trending',
+    'https://www.youtube.com/channel/UCkYQyvc_i9hXEo4xic9Hh2g',  # shopping
+    'https://www.youtube.com/gaming',
+    'https://www.youtube.com/podcasts',
+    'https://www.youtube.com/channel/UCrpQ4p1Ql_hG8rKXIKM1MOQ',  # Fashion
+    'https://www.youtube.com/feed/guide_builder',
+]
+
+IGNORE_CHANNELS: set[str] = set(
+    ['news', 'live', 'YouTube', '360', 'gaming', 'music', 'movies', 'sports']
+)
+
+
+def parse_nested_dicts(keys: list[str], data: dict[str, any],
+                       final_type: callable) -> object | None:
+    for key in keys:
+        if key in data:
+            data = data.get(key)
+        else:
+            return None
+
+    if not isinstance(data, final_type):
+        _LOGGER.debug(
+            f'Expected value of {final_type} but got {type(data)}: {data}'
+        )
+        return None
+
+    return data
+
+
+def convert_number_string(number_text: str | int) -> int | None:
+    '''Convert a number with optional k/m/b suffix to an integer.'''
+
+    if not number_text or isinstance(number_text, int):
+        return number_text
+
+    words: list[str] = number_text.split(' ')
+    number_text = words[0].strip()
+
+    try:
+        multiplier: str = number_text[-1].upper()
+        if not multiplier.isnumeric():
+            multipliers: dict[str, int] = {
+                'K': 1000,
+                'M': 1000000,
+                'B': 1000000000,
+            }
+            count_pre: float = float(number_text[:-1])
+            count = int(count_pre * multipliers[multiplier])
+        else:
+            count = int(number_text)
+        return count
+    except Exception as exc:
+        _LOGGER.debug(
+            f'Could not convert text {number_text} to a number: {exc}'
+        )
+        return None
+
+
+def parse_channel_id(data: dict) -> str | None:
+    '''Parse the channel ID (UC...) from ytInitialData.'''
+
+    channel_id: str | None = parse_nested_dicts(
+        [
+            'metadata', 'channelMetadataRenderer',
+            'externalId',
+        ], data, str,
+    )
+    return channel_id
+
+
+def parse_subscriber_count(data: dict) -> int | None:
+    '''Parse the subscriber count from the scraped ytInitialData.'''
+
+    paths: list[list[str]] = [
+        [
+            'header', 'pageHeaderRenderer', 'content',
+            'pageHeaderViewModel', 'metadata', 'contentMetadataViewModel',
+            'metadataRows'
+        ],
+        [
+            'header', 'pageHeaderRenderer', 'metadata',
+            'contentMetadataViewModel', 'metadataRows',
+        ],
+    ]
+
+    metadata_rows = None
+    for path in paths:
+        metadata_rows = parse_nested_dicts(path, data, list)
+        if metadata_rows:
+            break
+
+    if not metadata_rows or not isinstance(metadata_rows, list):
+        return None
+
+    for metadata_row in metadata_rows:
+        if 'metadataParts' not in metadata_row:
+            continue
+        for metadata_part in metadata_row['metadataParts']:
+            metadatapart_text: dict[str, any] = metadata_part.get('text')
+            if not metadatapart_text:
+                continue
+            subs_text = metadata_part['text'].get('content')
+            if not subs_text or subs_text.startswith('@'):
+                continue
+            youtube_subs_count: int | None = convert_number_string(subs_text)
+            if youtube_subs_count is not None:
+                return youtube_subs_count
+
+    return None
+
+
+def parse_page_text(channel: str, page_text: str) -> dict[str, any]:
+    '''Extract the ytInitialData JSON blob from a YouTube HTML page.'''
+
+    soup = BeautifulSoup(page_text, 'html.parser')
+    script = soup.find('script', string=CHANNEL_SCRAPE_REGEX_SHORT)
+    if not script:
+        _LOGGER.debug(f'Did not find ytInitialData script for {channel}')
+        soup.decompose()
+        return {}
+
+    raw_data: str = CHANNEL_SCRAPE_REGEX.search(script.text).group(1)
+    soup.decompose()
+    soup = None
+    script = None
+
+    try:
+        parsed_data: dict[str, any] = orjson.loads(raw_data)
+    except orjson.JSONDecodeError as exc:
+        _LOGGER.debug(
+            f'Failed parsing JSON data for channel {channel}: {exc}'
+        )
+        return {}
+
+    return parsed_data
+
+
+def _collect_video_authors(node: any,
+                           page_links: set[tuple[str, int | None]]) -> None:
+    '''
+    Recursively walk a ytInitialData tree. For every `videoRenderer`
+    node found, add the author's channel (handle when available, else
+    UC-id path) to `page_links` with subs=None.
+    '''
+
+    if isinstance(node, dict):
+        vr: dict | None = node.get('videoRenderer')
+        if isinstance(vr, dict):
+            for field in ('ownerText', 'longBylineText', 'shortBylineText'):
+                runs = (vr.get(field) or {}).get('runs')
+                if not isinstance(runs, list):
+                    continue
+                for run in runs:
+                    canonical: str | None = parse_nested_dicts(
+                        ['navigationEndpoint', 'browseEndpoint',
+                         'canonicalBaseUrl'],
+                        run if isinstance(run, dict) else {}, str,
+                    )
+                    name: str | None = None
+                    if canonical:
+                        name = canonical.lstrip('/@')
+                    else:
+                        browse_id: str | None = parse_nested_dicts(
+                            ['navigationEndpoint', 'browseEndpoint',
+                             'browseId'],
+                            run if isinstance(run, dict) else {}, str,
+                        )
+                        if browse_id and browse_id.startswith('UC'):
+                            name = f'channel/{browse_id}'
+                    if name:
+                        page_links.add((name, None))
+                        break
+                else:
+                    continue
+                break
+        for value in node.values():
+            _collect_video_authors(value, page_links)
+    elif isinstance(node, list):
+        for item in node:
+            _collect_video_authors(item, page_links)
+
+
+class DiscoveredChannel:
+    def __init__(
+        self, channel_name: str,
+        page_links: set[tuple[str, int | None]],
+        description: str | None,
+        subs: int | None,
+        channel_id: str | None,
+    ) -> None:
+        self.channel_name: str = channel_name
+        self.page_links: set[tuple[str, int | None]] = (
+            page_links
+        )
+        self.description: str | None = description
+        self.subs: int | None = subs
+        self.channel_id: str | None = channel_id
+
+    @staticmethod
+    def parse_channel_page(channel_name: str,
+                           page_data: dict[str, any]) -> Self:
+        page_links: set[tuple[str, int | None]] = set()
+
+        channel_id: str | None = parse_channel_id(page_data)
+        subs_count: int | None = parse_subscriber_count(page_data)
+
+        description: str | None = parse_nested_dicts(
+            [
+                'header', 'pageHeaderRenderer', 'content',
+                'pageHeaderViewModel', 'description',
+                'descriptionPreviewViewModel', 'description',
+                'content'
+            ], page_data, str
+        )
+
+        tabs: list[dict[str, any]] = parse_nested_dicts(
+            ['contents', 'twoColumnBrowseResultsRenderer', 'tabs'],
+            page_data, list
+        )
+        for tab in tabs or []:
+            section_items: list[dict[str, any]] = parse_nested_dicts(
+                ['tabRenderer', 'content', 'sectionListRenderer', 'contents'],
+                tab, list
+            )
+            for section_item in section_items or []:
+                item: dict[str, any] | None = section_item.get(
+                    'itemSectionRenderer'
+                )
+                if not item:
+                    continue
+
+                section_item_contents: list[dict[str, any]] = item.get(
+                    'contents'
+                )
+                if (not section_item_contents
+                        or not isinstance(section_item_contents, list)):
+                    continue
+
+                for section_item_content in section_item_contents:
+                    list_items: list[dict[str, any]] = parse_nested_dicts(
+                        [
+                            'shelfRenderer', 'content',
+                            'horizontalListRenderer', 'items'
+                        ], section_item_content, list
+                    )
+                    if not list_items:
+                        list_items = parse_nested_dicts(
+                            [
+                                'shelfRenderer', 'content',
+                                'gridRenderer', 'items'
+                            ], section_item_content, list
+                        )
+                    if not list_items:
+                        continue
+
+                    for list_item in list_items:
+                        channel_renderer: dict[str, any] = list_item.get(
+                            'gridChannelRenderer'
+                        )
+                        if not channel_renderer:
+                            continue
+
+                        url: str | None = parse_nested_dicts(
+                            [
+                                'navigationEndpoint', 'commandMetadata',
+                                'webCommandMetadata', 'url'
+                            ], channel_renderer, str
+                        )
+                        if not url:
+                            continue
+                        url = url.lstrip('/@')
+
+                        subs: int | None = None
+                        subs_text: str | None = parse_nested_dicts(
+                            ['subscriberCountText', 'simpleText'],
+                            channel_renderer, str
+                        )
+                        if subs_text:
+                            subs = convert_number_string(subs_text)
+                        page_links.add((url, subs))
+
+        _collect_video_authors(page_data, page_links)
+
+        return DiscoveredChannel(
+            channel_name, page_links, description,
+            subs_count, channel_id,
+        )
+
+
+def load_known_channels(filepath: str) -> set[str]:
+    '''
+    Read the known-channels list and return a set of normalized handles.
+
+    File format: one channel per line. Lines may optionally start with '@'
+    or 'https://www.youtube.com/'. Blank lines and '#' comments skipped.
+    Tab-separated lines: use the second column if present, otherwise first.
+    '''
+
+    url_prefix: str = 'https://www.youtube.com/'
+    known: set[str] = set()
+    try:
+        with open(filepath, 'r') as file_in:
+            for line in file_in.readlines():
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if (line.startswith('{') and line.endswith('}')
+                        and 'channel' in line):
+                    try:
+                        data: dict[str, str | int] = orjson.loads(line)
+                        channel = data.get('channel', line)
+                    except orjson.JSONDecodeError:
+                        channel = line
+                words: list[str] = line.split('\t')
+                if not words:
+                    continue
+                channel: str
+                if len(words) == 1:
+                    channel = words[0].strip().lstrip('@')
+                else:
+                    channel = words[1].strip().lstrip('@')
+                channel = channel.strip().lstrip('@').split(',')[0]
+                if channel.startswith(url_prefix):
+                    channel = channel[len(url_prefix):]
+                if '@' in channel:
+                    _LOGGER.warning(
+                        f'Channel {channel} has @ mid-string, skipping'
+                    )
+                    continue
+                channel = channel.strip()
+                if channel:
+                    known.add(channel)
+    except FileNotFoundError:
+        _LOGGER.warning(f'Channel list {filepath} not found, starting empty')
+    _LOGGER.info(f'Loaded {len(known)} known channels from {filepath}')
+    return known
+
+
+def load_discovered(filepath: str
+                    ) -> tuple[dict[str, int | None], set[str]]:
+    '''
+    Load discovered.jsonl into (discovered_map, fully_scraped_set).
+
+    Later records overwrite earlier ones. Channels with source='scrape'
+    are added to the fully_scraped set so the BFS skips rescraping them.
+    '''
+
+    discovered: dict[str, int | None] = {}
+    fully_scraped: set[str] = set()
+    try:
+        with open(filepath, 'r') as file_in:
+            for lineno, line in enumerate(file_in, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record: dict = orjson.loads(line)
+                except orjson.JSONDecodeError as exc:
+                    _LOGGER.warning(
+                        f'{filepath}:{lineno} skipping malformed JSON: {exc}'
+                    )
+                    continue
+                channel = record.get('channel')
+                if not channel:
+                    _LOGGER.warning(
+                        f'{filepath}:{lineno} missing channel field'
+                    )
+                    continue
+                discovered[channel] = record.get('subs')
+                if record.get('source') == 'scrape':
+                    fully_scraped.add(channel)
+    except FileNotFoundError:
+        _LOGGER.info(f'{filepath} does not exist, starting fresh')
+    _LOGGER.info(
+        f'Resumed {len(discovered)} discovered records '
+        f'({len(fully_scraped)} fully scraped) from {filepath}'
+    )
+    return discovered, fully_scraped
+
+
+def load_failed(filepath: str) -> dict[str, dict]:
+    '''Load failed.jsonl into a channel -> record dict.'''
+
+    failed: dict[str, dict] = {}
+    try:
+        with open(filepath, 'r') as file_in:
+            for lineno, line in enumerate(file_in, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record: dict = orjson.loads(line)
+                except orjson.JSONDecodeError as exc:
+                    _LOGGER.warning(
+                        f'{filepath}:{lineno} skipping malformed JSON: {exc}'
+                    )
+                    continue
+                channel = record.get('channel')
+                if not channel:
+                    continue
+                failed[channel] = record
+    except FileNotFoundError:
+        _LOGGER.info(f'{filepath} does not exist, starting fresh')
+    _LOGGER.info(f'Resumed {len(failed)} failed records from {filepath}')
+    return failed
+
+
+async def record_discovered(
+    channel: str, subs: int | None, source: str,
+    discovered: dict[str, int | None],
+    out_fd,
+    channel_id: str | None = None,
+) -> None:
+    '''Update in-memory dict and append one JSONL record to out_fd.'''
+
+    discovered[channel] = subs
+    payload: dict = {
+        'channel': channel, 'subs': subs, 'source': source,
+    }
+    if channel_id:
+        payload['channel_id'] = channel_id
+    try:
+        await out_fd.write(orjson.dumps(payload).decode('utf-8') + '\n')
+        await out_fd.flush()
+    except OSError as exc:
+        _LOGGER.warning(f'Failed to persist discovered record: {exc}')
+
+
+async def record_failed(channel: str, info: dict,
+                        failed: dict[str, dict], out_fd) -> None:
+    '''Update in-memory dict and append one JSONL record to out_fd.'''
+
+    payload: dict = {'channel': channel}
+    payload.update(info)
+    failed[channel] = payload
+    try:
+        await out_fd.write(orjson.dumps(payload).decode('utf-8') + '\n')
+        await out_fd.flush()
+    except OSError as exc:
+        _LOGGER.warning(f'Failed to persist failed record: {exc}')
+
+
+def _is_channel_target(target: str) -> bool:
+    '''Return True if *target* is a channel handle or
+    ``channel/UC...`` path, not a feed/full URL.'''
+
+    if target.startswith(('http://', 'https://')):
+        return False
+    return True
+
+
+async def _scrape_channel(
+    target: str,
+    proxies: list[str] | None,
+) -> DiscoveredChannel:
+    '''Scrape a channel page using
+    :class:`ScrapeYouTubeChannel` and return a
+    :class:`DiscoveredChannel`.'''
+
+    name: str = target
+    if target.startswith(CHANNEL_PREFIX):
+        name = target[len(CHANNEL_PREFIX):]
+
+    yt_channel: ScrapeYouTubeChannel = (
+        ScrapeYouTubeChannel(
+            name, with_download_client=False,
+        )
+    )
+    await yt_channel.scrape_about_page(proxies=proxies)
+
+    page_links: set[tuple[str, int | None]] = set()
+    for link in yt_channel.channel_links:
+        page_links.add((
+            link.channel_name,
+            link.subscriber_count,
+        ))
+
+    return DiscoveredChannel(
+        channel_name=target,
+        page_links=page_links,
+        description=yt_channel.description,
+        subs=yt_channel.subscriber_count,
+        channel_id=yt_channel.channel_id,
+    )
+
+
+async def fetch(client: AsyncYouTubeClient, url: str
+                ) -> tuple[str | None, dict | None]:
+    '''
+    Wrap client.get. Returns (page_text, None) on success, or
+    (None, error_info) with a classified failure reason.
+    '''
+
+    try:
+        text: str | None = await client.get(url)
+    except ValueError:
+        return None, {'reason': 'not_found', 'status_code': 404}
+    except RuntimeError:
+        return None, {'reason': 'retries_exhausted', 'status_code': None}
+    except Exception as exc:
+        return None, {
+            'reason': 'exception',
+            'status_code': None,
+            'exception': repr(exc),
+        }
+    if text is None:
+        return None, {'reason': 'http_non_200', 'status_code': None}
+    return text, None
+
+
+async def resolve_channel_paths(
+        redis_client: redis_asyncio.Redis | None,
+        page_links: set[tuple[str, int | None]],
+        ) -> set[tuple[str, int | None]]:
+    '''
+    Replace `channel/UC...` entries in page_links with their handle form
+    by looking up the UC-id in the Redis hash `youtube:creator_map`. Entries
+    whose UC-id is not present in the hash, or anything other than a
+    `channel/UC...` path, are returned unchanged.
+    '''
+
+    uc_ids: list[str] = []
+    for name, _ in page_links:
+        if name.startswith(CHANNEL_PREFIX):
+            uc_id: str = name.removeprefix(CHANNEL_PREFIX)
+            if uc_id.startswith('UC'):
+                uc_ids.append(uc_id)
+    if not uc_ids or redis_client is None:
+        return page_links
+
+    try:
+        raw_handles = await redis_client.hmget(
+            REDIS_CHANNEL_MAP_KEY, uc_ids
+        )
+    except Exception as exc:
+        _LOGGER.warning(f'Redis HMGET failed, skipping resolution: {exc}')
+        return page_links
+
+    resolved_map: dict[str, str] = {}
+    for uc_id, raw in zip(uc_ids, raw_handles):
+        if raw is None:
+            continue
+        handle: str = raw.decode() if isinstance(raw, bytes) else raw
+        if handle:
+            resolved_map[uc_id] = handle.lstrip('@')
+
+    resolved: set[tuple[str, int | None]] = set()
+    for name, subs in page_links:
+        if name.startswith(CHANNEL_PREFIX):
+            uc_id = name.removeprefix(CHANNEL_PREFIX)
+            handle = resolved_map.get(uc_id)
+            resolved.add((handle, subs) if handle else (name, subs))
+        else:
+            resolved.add((name, subs))
+    return resolved
+
+
+async def _scrape_feed_page(
+    client: AsyncYouTubeClient,
+    redis_client: redis_asyncio.Redis | None,
+    target: str,
+) -> DiscoveredChannel:
+    '''Scrape a non-channel URL (feed, trending, etc.)
+    and return a :class:`DiscoveredChannel`.
+
+    :raises ValueError: on HTTP or parse failure.
+    '''
+
+    page_text, err = await fetch(client, target)
+    if err is not None:
+        raise ValueError(
+            f'fetch failed: {err}'
+        )
+
+    page_data: dict = parse_page_text(
+        target, page_text,
+    )
+    if not page_data:
+        raise ValueError('parse_error')
+
+    channel: DiscoveredChannel = (
+        DiscoveredChannel.parse_channel_page(
+            target, page_data,
+        )
+    )
+    channel.page_links = await resolve_channel_paths(
+        redis_client, channel.page_links,
+    )
+    return channel
+
+
+async def _scrape_target(
+    client: AsyncYouTubeClient,
+    redis_client: redis_asyncio.Redis | None,
+    target: str,
+    proxies: list[str] | None,
+) -> DiscoveredChannel:
+    '''Dispatch *target* to the right scraper.
+
+    :raises ValueError, RuntimeError: on failure.
+    '''
+
+    if _is_channel_target(target):
+        return await _scrape_channel(target, proxies)
+
+    return await _scrape_feed_page(
+        client, redis_client, target,
+    )
+
+
+async def _enqueue_links(
+    channel: DiscoveredChannel,
+    min_subs: int,
+    known_channels: set[str],
+    discovered: dict[str, int | None],
+    fully_scraped: set[str],
+    failed: dict[str, dict],
+    in_queue: set[str],
+    to_scrape: deque[str],
+    discovered_fd,
+) -> None:
+    '''Record discovered links and enqueue new ones.'''
+
+    for link_name, link_subs in channel.page_links:
+        if not link_name:
+            continue
+        if link_name in known_channels:
+            continue
+        if link_name in IGNORE_CHANNELS:
+            continue
+        if link_subs is not None and link_subs < min_subs:
+            continue
+        await record_discovered(
+            link_name, link_subs, 'link',
+            discovered, discovered_fd,
+        )
+        if (link_name not in fully_scraped
+                and link_name not in failed
+                and link_name not in in_queue):
+            to_scrape.append(link_name)
+            in_queue.add(link_name)
+
+
+def _build_initial_queue(
+    discovered: dict[str, int | None],
+    fully_scraped: set[str],
+    failed: dict[str, dict],
+    known_channels: set[str],
+) -> deque[str]:
+    '''Seed the BFS queue with YOUTUBE_URLS and
+    orphan channels from a previous run.'''
+
+    to_scrape: deque[str] = deque()
+    seeds: list[str] = list(YOUTUBE_URLS)
+    shuffle(seeds)
+    to_scrape.extend(seeds)
+
+    orphans: set[str] = (
+        set(discovered.keys())
+        - fully_scraped
+        - set(failed.keys())
+        - known_channels
+        - set(seeds)
+    )
+    to_scrape.extend(orphans)
+    if orphans:
+        _LOGGER.info(
+            f'Re-enqueued {len(orphans)} orphan '
+            f'link-only channels from resume'
+        )
+
+    return to_scrape
+
+
+async def discover(client: AsyncYouTubeClient,
+                   redis_client: redis_asyncio.Redis | None,
+                   known_channels: set[str],
+                   discovered: dict[str, int | None],
+                   fully_scraped: set[str],
+                   failed: dict[str, dict],
+                   discovered_fd,
+                   failed_fd,
+                   min_subs: int,
+                   proxies: list[str] | None = None,
+                   ) -> None:
+    '''Drive the serial BFS until the queue is empty.'''
+
+    to_scrape: deque[str] = _build_initial_queue(
+        discovered, fully_scraped, failed,
+        known_channels,
+    )
+    in_queue: set[str] = set(to_scrape)
+
+    while to_scrape:
+        target: str = to_scrape.popleft()
+        in_queue.discard(target)
+
+        _LOGGER.info(
+            f'scraping {target} '
+            f'(queue={len(to_scrape)}, '
+            f'discovered={len(discovered)}, '
+            f'fully_scraped={len(fully_scraped)}, '
+            f'failed={len(failed)})'
+        )
+
+        try:
+            channel: DiscoveredChannel = (
+                await _scrape_target(
+                    client, redis_client,
+                    target, proxies,
+                )
+            )
+        except (ValueError, RuntimeError) as exc:
+            _LOGGER.info(f'failed {target}: {exc}')
+            if target not in YOUTUBE_URLS:
+                await record_failed(
+                    target,
+                    {
+                        'reason': str(exc),
+                        'status_code': None,
+                    },
+                    failed, failed_fd,
+                )
+            continue
+
+        fully_scraped.add(target)
+
+        if target not in YOUTUBE_URLS:
+            if (channel.subs is None
+                    or channel.subs >= min_subs):
+                await record_discovered(
+                    target, channel.subs, 'scrape',
+                    discovered, discovered_fd,
+                    channel_id=channel.channel_id,
+                )
+            else:
+                _LOGGER.info(
+                    f'{target} below min-subs '
+                    f'({channel.subs}), not recorded'
+                )
+
+        await _enqueue_links(
+            channel, min_subs, known_channels,
+            discovered, fully_scraped, failed,
+            in_queue, to_scrape, discovered_fd,
+        )
+
+    _LOGGER.info('BFS queue empty, discovery complete')
+
+
+class DiscoverSettings(ScraperSettings):
+    '''Settings for the YouTube channel discovery tool.'''
+
+    channel_list: str = Field(
+        default='channels.lst',
+        validation_alias=AliasChoices(
+            'YOUTUBE_CHANNEL_LIST', 'channel_list',
+        ),
+        description=(
+            'Known channels file (one handle per line)'
+        ),
+    )
+    discovered_channels: str = Field(
+        default='discovered-channels.jsonl',
+        validation_alias=AliasChoices(
+            'YOUTUBE_DISCOVERED_CHANNELS', 'youtube_discovered_channels',
+        ),
+        description=(
+            'Output JSONL file for discovered channels'
+        ),
+    )
+    failed_channels: str = Field(
+        default='failed-channels.jsonl',
+        validation_alias=AliasChoices(
+            'YOUTUBE_FAILED_CHANNELS', 'youtube_failed_channels',
+        ),
+        description=(
+            'Output JSONL file for failed scrapes'
+        ),
+    )
+    min_subs: int = Field(
+        default=100,
+        validation_alias=AliasChoices(
+            'MIN_SUBS', 'min_subs',
+        ),
+        description=(
+            'Minimum subscriber count to keep a channel'
+        ),
+    )
+
+
+async def main() -> None:
+    settings: DiscoverSettings = DiscoverSettings()
+
+    configure_logging(
+        level=settings.log_level,
+        filename=settings.log_file,
+        log_format=settings.log_format,
+    )
+
+    known_channels: set[str] = load_known_channels(
+        settings.channel_list,
+    )
+    discovered: dict[str, int | None]
+    fully_scraped: set[str]
+    discovered, fully_scraped = load_discovered(
+        settings.discovered_channels,
+    )
+    failed: dict[str, str] = load_failed(settings.failed_channels)
+
+    _LOGGER.info(
+        f'startup state: known={len(known_channels)}, '
+        f'discovered={len(discovered)}, '
+        f'fully_scraped={len(fully_scraped)}, '
+        f'failed={len(failed)}'
+    )
+
+    redis_client: redis_asyncio.Redis | None = None
+    if settings.redis_dsn:
+        try:
+            redis_client = redis_asyncio.from_url(
+                settings.redis_dsn,
+            )
+            await redis_client.ping()
+            _LOGGER.info(
+                f'Connected to Redis at '
+                f'{settings.redis_dsn}'
+            )
+        except Exception as exc:
+            _LOGGER.warning(
+                f'Redis unavailable ({exc}); '
+                f'channel-id resolution disabled'
+            )
+            redis_client = None
+
+    rate_limiter: YouTubeRateLimiter = (
+        YouTubeRateLimiter.get(
+            state_dir=settings.rate_limiter_state_dir,
+            redis_dsn=settings.redis_dsn,
+        )
+    )
+    rate_limiter.set_proxies(settings.proxies)
+
+    disc_channels: str = settings.discovered_channels
+    fail_channels: str = settings.failed_channels
+    try:
+        async with (
+            aiofiles.open(disc_channels, 'a') as discovered_fd,
+            aiofiles.open(fail_channels, 'a') as failed_fd,
+        ):
+            async with AsyncYouTubeClient() as client:
+                proxies: list[str] | None = (
+                    settings.proxies.split(',')
+                    if settings.proxies
+                    else None
+                )
+                await discover(
+                    client, redis_client,
+                    known_channels,
+                    discovered, fully_scraped, failed,
+                    discovered_fd, failed_fd,
+                    settings.min_subs,
+                    proxies=proxies,
+                )
+    finally:
+        if redis_client is not None:
+            await redis_client.aclose()
+
+
+if __name__ == '__main__':
+    asyncio.run(main())

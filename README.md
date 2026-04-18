@@ -237,7 +237,7 @@ The scrapers in this repository use JSONSchema to validate the data before it is
 
 # Running the tools
 
-The tools described below should be run from the root of the repository using the `uv` tool. We'll need to set the PYTHONPATH environment variable because scrape-python is not installed as a package.
+In addition to running the scrape tools in a container, the tools described below can also be run from the root of the repository using the `uv` tool. We'll need to set the PYTHONPATH environment variable because scrape-python is not installed as a package.
 
 ```bash
 # For the YouTube channel scraper:

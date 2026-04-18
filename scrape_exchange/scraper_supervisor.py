@@ -122,6 +122,13 @@ class SupervisorConfig:
         (which is higher priority) to the per-worker file. Set to
         ``None`` if the scraper doesn't use a scraper-specific
         log-file alias.
+    :param metrics_port_env_var: Name of the scraper-specific
+        metrics-port environment variable (for example
+        ``RSS_METRICS_PORT``). When set,
+        :func:`spawn_children` writes the computed child port
+        to **both** ``METRICS_PORT`` and this var so the
+        child's pydantic settings resolves the scraper-specific
+        alias to the per-worker port.
     :param shutdown_grace_seconds: Seconds to wait after
         forwarding SIGTERM/SIGINT to children before escalating
         to SIGKILL. Defaults to 30.
@@ -135,6 +142,7 @@ class SupervisorConfig:
     metrics_port: int
     log_file: str | None
     log_file_env_var: str | None = None
+    metrics_port_env_var: str | None = None
     api_key_id: str | None = None
     api_key_secret: str | None = None
     exchange_url: str = 'https://scrape.exchange'
@@ -245,7 +253,10 @@ def spawn_children(
       per-proxy metrics to its own slice.
     * ``METRICS_PORT=<base + worker_instance>`` where
       ``worker_instance = index + 1`` — the base port is reserved
-      for the supervisor.
+      for the supervisor. When *config.metrics_port_env_var* is
+      set, the same value is also written to that variable (e.g.
+      ``RSS_METRICS_PORT``) so the child's pydantic settings
+      resolves its scraper-specific alias.
     * ``LOG_FILE=<root>-<worker_instance><ext>`` (only when
       *config.log_file* is non-empty) — each child writes to its
       own file so they don't tear up a shared log.
@@ -265,9 +276,14 @@ def spawn_children(
         child_env: dict[str, str] = os.environ.copy()
         child_env[config.num_processes_env_var] = '1'
         child_env['PROXIES'] = ','.join(chunk)
-        child_env['METRICS_PORT'] = str(
+        child_metrics_port: str = str(
             config.metrics_port + worker_instance
         )
+        child_env['METRICS_PORT'] = child_metrics_port
+        if config.metrics_port_env_var:
+            child_env[
+                config.metrics_port_env_var
+            ] = child_metrics_port
         child_env['WORKER_ID'] = str(worker_instance)
         if jwt_header is not None:
             child_env[EXCHANGE_JWT_ENV_VAR] = jwt_header

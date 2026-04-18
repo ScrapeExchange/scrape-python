@@ -13,13 +13,9 @@ until the next polling interval.
 '''
 
 import os
-import shutil
 import sys
-import heapq
-import random
 import asyncio
 import logging
-from pathlib import Path
 from time import monotonic
 from datetime import UTC
 from datetime import datetime
@@ -27,7 +23,6 @@ from datetime import datetime
 import brotli
 import orjson
 import untangle
-import aiofiles
 
 import httpx
 from httpx import Response
@@ -45,6 +40,9 @@ from scrape_exchange.scraper_runner import (
     ScraperRunner,
 )
 from scrape_exchange.settings import normalize_log_level
+from scrape_exchange.youtube.youtube_channel import (
+    YouTubeChannel,
+)
 from scrape_exchange.youtube.youtube_channel_tabs import YouTubeChannelTabs
 from scrape_exchange.youtube.youtube_rate_limiter import (
     YouTubeRateLimiter, YouTubeCallType
@@ -942,22 +940,14 @@ async def update_channel(
         'metadata', {}
     ).get('channelMetadataRenderer', {})
 
-    header: dict = channel_data.get('header', {}).get(
-        'c4TabbedHeaderRenderer', {}
-    )
-
     title: str = metadata.get('title', channel_name)
     description: str = metadata.get('description', '')
 
-    subscriber_text: str = header.get('subscriberCountText', {}).get(
-        'simpleText', ''
+    subscriber_count: int = (
+        YouTubeChannel.parse_subscriber_count(
+            channel_data,
+        ) or 0
     )
-    subscriber_count: int = 0
-    if subscriber_text:
-        try:
-            subscriber_count = parse_count(subscriber_text) or 0
-        except Exception:
-            pass
 
     # Fire-and-forget: background worker inside ExchangeClient handles
     # the POST with retries. No file_manager is passed because an RSS

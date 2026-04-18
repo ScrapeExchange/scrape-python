@@ -16,15 +16,47 @@ Requires REDIS_DSN to be set.
 :license    : GPLv3
 '''
 
-import argparse
 import asyncio
 import sys
+
+from pydantic import Field, model_validator
 
 from scrape_exchange.creator_map import (
     FileCreatorMap,
     RedisCreatorMap,
 )
 from scrape_exchange.settings import ScraperSettings
+
+
+class ExportSettings(ScraperSettings):
+    '''Settings for the channel-map export/import tool.'''
+
+    output: str | None = Field(
+        default='channel_map.csv',
+        description=(
+            'Export Redis channel map to CSV file'
+        ),
+    )
+    import_file: str | None = Field(
+        default=None,
+        description=(
+            'Import CSV file into Redis channel map'
+        ),
+    )
+
+    @model_validator(mode='after')
+    def _require_one_action(self) -> 'ExportSettings':
+        if self.output and self.import_file:
+            raise ValueError(
+                '--output and --import-file are '
+                'mutually exclusive'
+            )
+        if not self.output and not self.import_file:
+            raise ValueError(
+                'one of --output or --import-file '
+                'is required'
+            )
+        return self
 
 
 async def export_to_csv(
@@ -59,8 +91,8 @@ async def import_from_csv(
     )
 
 
-async def main(args: argparse.Namespace) -> None:
-    settings: ScraperSettings = ScraperSettings()
+async def main() -> None:
+    settings: ExportSettings = ExportSettings()
     if not settings.redis_dsn:
         print(
             'Error: REDIS_DSN must be set',
@@ -73,39 +105,13 @@ async def main(args: argparse.Namespace) -> None:
         platform='youtube',
     )
 
-    if args.output:
-        await export_to_csv(redis_cm, args.output)
-    elif args.import_file:
+    if settings.output:
+        await export_to_csv(redis_cm, settings.output)
+    elif settings.import_file:
         await import_from_csv(
-            redis_cm, args.import_file,
+            redis_cm, settings.import_file,
         )
 
 
 if __name__ == '__main__':
-    parser: argparse.ArgumentParser = (
-        argparse.ArgumentParser(
-            description=(
-                'Export/import channel map between '
-                'Redis and CSV'
-            ),
-        )
-    )
-    group = parser.add_mutually_exclusive_group(
-        required=True,
-    )
-    group.add_argument(
-        '--output',
-        help='Export Redis channel map to CSV file',
-    )
-    group.add_argument(
-        '--import-file',
-        help='Import CSV file into Redis channel map',
-    )
-    # Parse our args first; leave the rest for
-    # pydantic-settings (ScraperSettings has
-    # cli_parse_args=True and would reject unknown flags).
-    args: argparse.Namespace
-    remaining: list[str]
-    args, remaining = parser.parse_known_args()
-    sys.argv = [sys.argv[0]] + remaining
-    asyncio.run(main(args))
+    asyncio.run(main())
