@@ -124,6 +124,10 @@ class ScraperRunner:
                     f'{self._scraper_label.upper()}'
                     '_LOG_FILE'
                 ),
+                metrics_port_env_var=(
+                    f'{self._scraper_label.upper()}'
+                    '_METRICS_PORT'
+                ),
                 num_processes=self._num_processes,
                 concurrency=self._concurrency,
                 proxies=self._settings.proxies,

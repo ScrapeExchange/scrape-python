@@ -1073,7 +1073,12 @@ async def read_channels(
                     and ('channel' in line)):
                 # JSONL, perhaps created with yt_discover_channels.py
                 data: dict[str, str | int] = json.loads(line)
+                if data.get('channel') and data.get('channel_id'):
+                    await creator_map_backend.put(
+                        data['channel_id'], data['channel']
+                    )
                 line = data.get('channel', line)
+
             channel_name: str | None = None
             if ',' in line:
                 _: str
