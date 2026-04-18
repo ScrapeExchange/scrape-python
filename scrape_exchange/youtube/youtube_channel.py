@@ -1305,15 +1305,69 @@ class YouTubeChannel:
         return None
 
     @staticmethod
+    def _parse_view_count_from_metadata_rows(
+        data: dict,
+    ) -> int | None:
+        '''Extract view count from the new
+        ``pageHeaderRenderer`` metadata rows.'''
+
+        metadata_rows: list = data.get(
+            'header', {}
+        ).get(
+            'pageHeaderRenderer', {}
+        ).get(
+            'content', {}
+        ).get(
+            'pageHeaderViewModel', {}
+        ).get(
+            'metadata', {}
+        ).get(
+            'contentMetadataViewModel', {}
+        ).get(
+            'metadataRows', []
+        )
+
+        for row in metadata_rows:
+            parts: list[dict] = (
+                row.get('metadataParts', []) or []
+            )
+            for part in parts:
+                text: dict | None = part.get('text')
+                if not isinstance(text, dict):
+                    continue
+                content: str = text.get('content', '')
+                if content and 'view' in content:
+                    count: int | None = (
+                        convert_number_string(content)
+                    )
+                    if count is not None:
+                        return count
+        return None
+
+    @staticmethod
     def parse_view_count(data: dict) -> int | None:
         '''
-        Parse the total views count for the channel from the scraped data
+        Parse the total views count for the channel
+        from the scraped data.
+
+        Tries the new ``pageHeaderRenderer`` path first,
+        then falls back to the legacy
+        ``c4TabbedHeaderRenderer``.
 
         :param data: the scraped data
-        :returns: the subscriber count
+        :returns: the view count, or None
         '''
 
         try:
+            count: int | None = (
+                YouTubeChannel
+                ._parse_view_count_from_metadata_rows(
+                    data,
+                )
+            )
+            if count is not None:
+                return count
+
             views_data: str = data.get(
                 'header', {}
             ).get(
@@ -1323,15 +1377,14 @@ class YouTubeChannel:
             ).get(
                 'simpleText', ''
             )
+            if views_data:
+                return convert_number_string(views_data)
 
-            if not views_data:
-                return None
-
-            view_count: int | None = convert_number_string(views_data)
-
-            return view_count
+            return None
         except Exception as exc:
-            _LOGGER.debug('Failed to parse views count', exc=exc)
+            _LOGGER.debug(
+                'Failed to parse views count', exc=exc,
+            )
             return None
 
     @staticmethod
