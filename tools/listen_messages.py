@@ -2,7 +2,7 @@
 '''
 Tool to listen for real-time messages from the messages API via WebSocket.
 
-Connects to the /api/messages/v1 WebSocket endpoint and prints incoming
+Connects to the /api/v1/messages WebSocket endpoint and prints incoming
 messages to stdout. Filters can be applied server-side (username, platform,
 entity, platform_topic_id) or client-side (schema_owner, schema_version).
 '''
@@ -21,8 +21,8 @@ import websockets
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 # URL path pattern:
-# /api/data/v1/param/{schema_username}/{platform}/{entity}/{version}/...
-_DATA_URL_PARAM_PREFIX = '/api/data/v1/param/'
+# /api/v1/data/param/{schema_username}/{platform}/{entity}/{version}/...
+_DATA_URL_PARAM_PREFIX = '/api/v1/data/param/'
 
 
 def _parse_args() -> argparse.Namespace:
@@ -35,7 +35,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         '--url',
-        default='wss://scrape.exchange/api/messages/v1',
+        default='wss://scrape.exchange/api/v1/messages',
         help='WebSocket URL of the messages endpoint',
     )
     parser.add_argument(
@@ -119,7 +119,7 @@ def _parse_data_url(data_url: str) -> dict[str, str]:
     Extract schema fields from the data URL.
 
     Expected URL path format:
-    /api/data/v1/param/{schema_username}/{platform}/{entity}/{version}/...
+    /api/v1/data/param/{schema_username}/{platform}/{entity}/{version}/...
     '''
     parsed: ParseResult = urlparse(data_url)
     path: str = parsed.path

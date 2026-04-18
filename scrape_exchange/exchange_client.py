@@ -28,7 +28,7 @@ from scrape_exchange.worker_id import get_worker_id
 if TYPE_CHECKING:
     from scrape_exchange.file_management import AssetFileManagement
 
-TOKEN_ENDPOINT: str = '/api/account/v1/token'
+TOKEN_ENDPOINT: str = '/api/v1/account/token'
 
 SCRAPE_EXCHANGE_URL: str = 'https://scrape.exchange'
 
@@ -128,19 +128,19 @@ class _UploadJob:
 class ExchangeClient(AsyncClient):
     TOKEN_API: str = '/token'
     ME_API: str = '/me'
-    POST_REGISTER_API: str = '/api/account/v1/register'
-    POST_TOKEN_API: str = '/api/account/v1/token'
-    GET_NEWEST_SCHEMA_API: str = '/api/schema/v1/newest'
-    GET_ALL_SCHEMAS_API: str = '/api/schema/v1'
-    GET_SCHEMA_COUNTERS_API: str = '/api/schema/v1/counters'
-    GET_DATA_PARAM: str = '/api/data/v1/param'
-    POST_SCHEMA_API: str = '/api/schema/v1'
-    POST_DATA_API: str = '/api/data/v1'
-    GET_CONTENT_API: str = '/api/data/v1/content'
-    GET_FILTER_API: str = '/api/filter/v1'
-    GET_STATS_API: str = '/api/stats/v1'
-    GET_METRICS_API: str = '/api/metrics/v1'
-    GET_STATUS_API: str = '/api/status/v1'
+    POST_REGISTER_API: str = '/api/v1/account/register'
+    POST_TOKEN_API: str = '/api/v1/account/token'
+    GET_NEWEST_SCHEMA_API: str = '/api/v1/schema/newest'
+    GET_ALL_SCHEMAS_API: str = '/api/v1/schema'
+    GET_SCHEMA_COUNTERS_API: str = '/api/v1/schema/counters'
+    GET_DATA_PARAM: str = '/api/v1/data/param'
+    POST_SCHEMA_API: str = '/api/v1/schema'
+    POST_DATA_API: str = '/api/v1/data'
+    GET_CONTENT_API: str = '/api/v1/data/content'
+    GET_FILTER_API: str = '/api/v1/filter'
+    GET_STATS_API: str = '/api/v1/stats'
+    GET_METRICS_API: str = '/api/v1/metrics'
+    GET_STATUS_API: str = '/api/v1/status'
 
     # Background fire-and-forget upload queue tuning. These are class
     # attributes so tests and tools can override them before

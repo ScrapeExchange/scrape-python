@@ -246,17 +246,17 @@ Examples of fields that qualify:
 You can query which fields are gauges for a schema via:
 
 ```
-GET /api/schema/v1/counters/{username}/{platform}/{entity}/{version}
+GET /api/v1/schema/counters/{username}/{platform}/{entity}/{version}
 ```
 
 ## Registering a Schema
 
 ### Via the API
 
-Send a `POST` to `/api/schema/v1` with your authentication token:
+Send a `POST` to `/api/v1/schema` with your authentication token:
 
 ```bash
-curl -X POST https://scrape.exchange/api/schema/v1 \
+curl -X POST https://scrape.exchange/api/v1/schema \
   -H "Authorization: Bearer <your-token>" \
   -H "Content-Type: application/json" \
   -d '{
@@ -287,7 +287,7 @@ The API returns the generated schema name (e.g. `youruser-youtube-video-1.0.0`) 
 If you already have scraped data, you can generate a schema from it:
 
 ```bash
-curl -X POST https://scrape.exchange/api/schema/v1/generate \
+curl -X POST https://scrape.exchange/api/v1/schema/generate \
   -H "Authorization: Bearer <your-token>" \
   -F "file=@my_data.json"
 ```
@@ -300,18 +300,18 @@ Note: the generated schema won't include `x-scrape-field` annotations -- you'll 
 
 | Endpoint | Description |
 |---|---|
-| `GET /api/schema/v1` | List all schemas (paginated) |
-| `GET /api/schema/v1/{schema_name}` | Get schema by name |
-| `GET /api/schema/v1/newest/{username}/{platform}/{entity}` | Get the latest version of a schema |
-| `GET /api/schema/v1/param/{username}/{platform}/{entity}/{version}` | Get a specific version |
-| `GET /api/schema/v1/param/{username}/{platform}/{entity}` | List all versions for an entity |
-| `GET /api/schema/v1/param/{username}/{platform}` | List all schemas for a platform |
-| `GET /api/schema/v1/param/{username}` | List all schemas for a user |
+| `GET /api/v1/schema` | List all schemas (paginated) |
+| `GET /api/v1/schema/{schema_name}` | Get schema by name |
+| `GET /api/v1/schema/newest/{username}/{platform}/{entity}` | Get the latest version of a schema |
+| `GET /api/v1/schema/param/{username}/{platform}/{entity}/{version}` | Get a specific version |
+| `GET /api/v1/schema/param/{username}/{platform}/{entity}` | List all versions for an entity |
+| `GET /api/v1/schema/param/{username}/{platform}` | List all schemas for a platform |
+| `GET /api/v1/schema/param/{username}` | List all schemas for a user |
 
 ## Deleting a Schema
 
 ```
-DELETE /api/schema/v1/param/{platform}/{entity}/{version}
+DELETE /api/v1/schema/param/{platform}/{entity}/{version}
 ```
 
 Requires authentication. You can only delete your own schemas.
@@ -396,7 +396,7 @@ Below is a complete schema for YouTube channel metadata:
 Register it with:
 
 ```bash
-curl -X POST https://scrape.exchange/api/schema/v1 \
+curl -X POST https://scrape.exchange/api/v1/schema \
   -H "Authorization: Bearer <your-token>" \
   -H "Content-Type: application/json" \
   -d '{

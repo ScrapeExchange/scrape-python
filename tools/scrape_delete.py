@@ -4,7 +4,7 @@
 Scrape Delete Tool, used when scraping errors made it into the system.
 Iterates over brotli-compressed JSON files in a specified directory,
 extracts the platform content ID from each, and calls the DELETE
-/api/data/v1 endpoint on Scrape.Exchange for the specified platform and entity.
+/api/v1/data endpoint on Scrape.Exchange for the specified platform and entity.
 
 :maintainer : Boinko <boinko@scrape.exchange>
 :copyright  : Copyright 2026
@@ -139,7 +139,7 @@ async def get_item_id(client: ExchangeClient, exchange_url: str,
 
 async def delete_by_item_id(client: ExchangeClient, exchange_url: str,
                             item_id: str) -> bool:
-    url: str = f'{exchange_url}/api/data/v1/item_id/{item_id}'
+    url: str = f'{exchange_url}/api/v1/data/item_id/{item_id}'
     resp: Response = await client.delete(url)
     if resp.status_code in (200, 204):
         logging.info('Deleted item', extra={'item_id': item_id})
