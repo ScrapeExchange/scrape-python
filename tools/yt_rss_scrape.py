@@ -948,6 +948,11 @@ async def update_channel(
             channel_data,
         ) or 0
     )
+    view_count: int = (
+        YouTubeChannel.parse_view_count(
+            channel_data,
+        ) or 0
+    )
 
     # Fire-and-forget: background worker inside ExchangeClient handles
     # the POST with retries. No file_manager is passed because an RSS
@@ -968,7 +973,7 @@ async def update_channel(
                 'channel': channel_name.lstrip('@'),
                 'title': title,
                 'subscriber_count': subscriber_count,
-                'view_count': 0,
+                'view_count': view_count,
                 'description': description,
             },
             'platform_content_id': channel_name,
