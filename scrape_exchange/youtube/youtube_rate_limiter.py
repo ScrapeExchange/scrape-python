@@ -117,7 +117,10 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
     Usage::
 
         limiter = YouTubeRateLimiter.get()
-        await limiter.acquire(YouTubeCallType.BROWSE, proxy='http://proxy:8080')
+        proxy = await limiter.acquire(
+            YouTubeCallType.BROWSE, proxy='http://proxy:8080',
+        )
+        cookie_file = limiter.get_cookie_file_cached(proxy)
 
     The :meth:`acquire` call blocks (via ``asyncio.sleep``) until both the
     per-type bucket and the global bucket have a token available, then adds
@@ -165,32 +168,47 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
                 task.cancel()
         super().reset()
 
-    async def acquire(self, call_type: YouTubeCallType,
-                      proxy: str | None = None
-                      ) -> tuple[str | None, str | None]:
+    async def acquire(
+        self,
+        call_type: YouTubeCallType,
+        proxy: str | None = None,
+    ) -> str | None:
         '''
-        Wait until a request of *call_type* is permitted, then return both the
-        selected proxy and the cached cookie file path for that proxy.
+        Wait until a request of *call_type* is
+        permitted, then return the selected proxy.
 
-        The cookie file is read from the in-process cache only — no network
-        acquisition is triggered here.  Calling :meth:`get_cookie_file` inside
-        ``acquire()`` would deadlock: ``AsyncYouTubeClient.get()`` calls
-        ``acquire()`` for rate-limiting, and cookie acquisition uses
-        ``AsyncYouTubeClient.get()``, creating a circular lock dependency.
-        Cookie files are pre-populated by :meth:`set_proxies` (via the
-        background :meth:`_start_cookie_services` task) and by explicit calls
-        to :meth:`warm_cookie_jar`.
+        Use :meth:`get_cookie_file_cached` to obtain
+        the cookie path for the returned proxy.
+        '''
+        return await super().acquire(
+            call_type, proxy=proxy,
+        )
 
-        :returns: ``(proxy, cookie_file)`` — ``cookie_file`` is ``None`` when
-            no cached entry exists yet for the proxy.
+    def get_cookie_file_cached(
+        self, proxy: str | None,
+    ) -> str | None:
+        '''
+        Return the cached cookie file path for
+        *proxy* without triggering network
+        acquisition.
+
+        This is the synchronous, non-blocking
+        companion to :meth:`acquire`.  Call it
+        immediately after ``acquire()`` returns
+        when you need the cookie path for yt-dlp's
+        ``--cookiefile`` flag.
+
+        :returns: Filesystem path to the temp
+            cookie file, or ``None`` if no valid
+            cached entry exists for the proxy.
         '''
         from .youtube_cookiejar import YouTubeCookieJar
-        proxy = await super().acquire(call_type, proxy=proxy)
-        entry = YouTubeCookieJar.get()._entries.get(proxy)
-        cookie_file: str | None = (
-            entry.path if entry is not None and not entry.is_expired() else None
+        entry = (
+            YouTubeCookieJar.get()._entries.get(proxy)
         )
-        return proxy, cookie_file
+        if entry is not None and not entry.is_expired():
+            return entry.path
+        return None
 
     @property
     def default_configs(self) -> dict[YouTubeCallType, _BucketConfig]:

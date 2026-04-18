@@ -1,7 +1,8 @@
 '''
-Unit tests for scrape_exchange/video_claim.py.
+Unit tests for scrape_exchange/content_claim.py.
 
-Covers FileVideoClaim, RedisVideoClaim, and NullVideoClaim.
+Covers FileContentClaim, RedisContentClaim, and
+NullContentClaim.
 '''
 
 import os
@@ -12,22 +13,24 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from scrape_exchange.video_claim import (
-    FileVideoClaim,
-    NullVideoClaim,
-    RedisVideoClaim,
-    VideoClaim,
+from scrape_exchange.content_claim import (
+    ContentClaim,
+    FileContentClaim,
+    NullContentClaim,
+    RedisContentClaim,
 )
 
 
-class TestFileVideoClaimAcquire(unittest.IsolatedAsyncioTestCase):
-    '''Tests for FileVideoClaim.acquire().'''
+class TestFileContentClaimAcquire(
+    unittest.IsolatedAsyncioTestCase
+):
+    '''Tests for FileContentClaim.acquire().'''
 
     async def asyncSetUp(self) -> None:
         self._tmpdir: tempfile.TemporaryDirectory = (
             tempfile.TemporaryDirectory()
         )
-        self._claim: FileVideoClaim = FileVideoClaim(
+        self._claim: FileContentClaim = FileContentClaim(
             self._tmpdir.name
         )
 
@@ -66,7 +69,7 @@ class TestFileVideoClaimAcquire(unittest.IsolatedAsyncioTestCase):
                 f'release raised unexpectedly: {exc!r}'
             )
 
-    async def test_different_video_ids_claimed_concurrently(
+    async def test_different_content_ids_claimed_concurrently(
         self,
     ) -> None:
         result_a: bool = await self._claim.acquire('vidA')
@@ -96,7 +99,7 @@ class TestFileVideoClaimAcquire(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         '''A claim older than TTL is treated as stale
         and can be reclaimed by another caller.'''
-        claim: FileVideoClaim = FileVideoClaim(
+        claim: FileContentClaim = FileContentClaim(
             self._tmpdir.name, ttl=1,
         )
         await claim.acquire('vid_exp')
@@ -115,7 +118,7 @@ class TestFileVideoClaimAcquire(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         '''A claim within TTL cannot be reclaimed.'''
-        claim: FileVideoClaim = FileVideoClaim(
+        claim: FileContentClaim = FileContentClaim(
             self._tmpdir.name, ttl=3600,
         )
         await claim.acquire('vid_fresh')
@@ -123,14 +126,16 @@ class TestFileVideoClaimAcquire(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result)
 
 
-class TestFileVideoClaimCleanup(unittest.IsolatedAsyncioTestCase):
-    '''Tests for FileVideoClaim.cleanup_stale().'''
+class TestFileContentClaimCleanup(
+    unittest.IsolatedAsyncioTestCase
+):
+    '''Tests for FileContentClaim.cleanup_stale().'''
 
     async def asyncSetUp(self) -> None:
         self._tmpdir: tempfile.TemporaryDirectory = (
             tempfile.TemporaryDirectory()
         )
-        self._claim: FileVideoClaim = FileVideoClaim(
+        self._claim: FileContentClaim = FileContentClaim(
             self._tmpdir.name
         )
 
@@ -201,10 +206,10 @@ def _make_redis_mocks() -> tuple[MagicMock, MagicMock]:
     return redis_mod, redis_instance
 
 
-class TestRedisVideoClaimAcquire(
+class TestRedisContentClaimAcquire(
     unittest.IsolatedAsyncioTestCase
 ):
-    '''Tests for RedisVideoClaim.acquire().'''
+    '''Tests for RedisContentClaim.acquire().'''
 
     def setUp(self) -> None:
         self._redis_mod, self._redis_inst = (
@@ -218,8 +223,10 @@ class TestRedisVideoClaimAcquire(
             },
         )
         self._patcher.start()
-        self._claim: RedisVideoClaim = RedisVideoClaim(
-            'redis://localhost:6379/0', ttl=600
+        self._claim: RedisContentClaim = RedisContentClaim(
+            'redis://localhost:6379/0',
+            platform='youtube',
+            ttl=600,
         )
 
     def tearDown(self) -> None:
@@ -232,7 +239,7 @@ class TestRedisVideoClaimAcquire(
         result: bool = await self._claim.acquire('vid001')
         self.assertTrue(result)
         self._redis_inst.set.assert_awaited_once_with(
-            'video:claim:vid001',
+            'youtube:claim:vid001',
             str(__import__('os').getpid()),
             nx=True,
             ex=600,
@@ -246,10 +253,10 @@ class TestRedisVideoClaimAcquire(
         self.assertFalse(result)
 
 
-class TestRedisVideoClaimRelease(
+class TestRedisContentClaimRelease(
     unittest.IsolatedAsyncioTestCase
 ):
-    '''Tests for RedisVideoClaim.release().'''
+    '''Tests for RedisContentClaim.release().'''
 
     def setUp(self) -> None:
         self._redis_mod, self._redis_inst = (
@@ -263,8 +270,9 @@ class TestRedisVideoClaimRelease(
             },
         )
         self._patcher.start()
-        self._claim: RedisVideoClaim = RedisVideoClaim(
-            'redis://localhost:6379/0'
+        self._claim: RedisContentClaim = RedisContentClaim(
+            'redis://localhost:6379/0',
+            platform='youtube',
         )
 
     def tearDown(self) -> None:
@@ -275,14 +283,14 @@ class TestRedisVideoClaimRelease(
     ) -> None:
         await self._claim.release('vid001')
         self._redis_inst.delete.assert_awaited_once_with(
-            'video:claim:vid001'
+            'youtube:claim:vid001'
         )
 
 
-class TestRedisVideoClaimCleanup(
+class TestRedisContentClaimCleanup(
     unittest.IsolatedAsyncioTestCase
 ):
-    '''Tests for RedisVideoClaim.cleanup_stale().'''
+    '''Tests for RedisContentClaim.cleanup_stale().'''
 
     def setUp(self) -> None:
         self._redis_mod, self._redis_inst = (
@@ -296,8 +304,9 @@ class TestRedisVideoClaimCleanup(
             },
         )
         self._patcher.start()
-        self._claim: RedisVideoClaim = RedisVideoClaim(
-            'redis://localhost:6379/0'
+        self._claim: RedisContentClaim = RedisContentClaim(
+            'redis://localhost:6379/0',
+            platform='youtube',
         )
 
     def tearDown(self) -> None:
@@ -307,9 +316,9 @@ class TestRedisVideoClaimCleanup(
         self,
     ) -> None:
         keys: list[str] = [
-            'video:claim:v1',
-            'video:claim:v2',
-            'video:claim:v3',
+            'youtube:claim:v1',
+            'youtube:claim:v2',
+            'youtube:claim:v3',
         ]
         # Single-page scan: cursor goes 0 → 0
         self._redis_inst.scan.return_value = (0, keys)
@@ -323,10 +332,10 @@ class TestRedisVideoClaimCleanup(
 
     async def test_cleanup_multi_page_scan(self) -> None:
         page1: list[str] = [
-            'video:claim:v1',
-            'video:claim:v2',
+            'youtube:claim:v1',
+            'youtube:claim:v2',
         ]
-        page2: list[str] = ['video:claim:v3']
+        page2: list[str] = ['youtube:claim:v3']
         # First call returns cursor=42 (more pages),
         # second call returns cursor=0 (done).
         self._redis_inst.scan.side_effect = [
@@ -352,11 +361,11 @@ class TestRedisVideoClaimCleanup(
         self._redis_inst.delete.assert_not_awaited()
 
 
-class TestNullVideoClaim(unittest.IsolatedAsyncioTestCase):
-    '''Tests for NullVideoClaim.'''
+class TestNullContentClaim(unittest.IsolatedAsyncioTestCase):
+    '''Tests for NullContentClaim.'''
 
     async def asyncSetUp(self) -> None:
-        self._claim: NullVideoClaim = NullVideoClaim()
+        self._claim: NullContentClaim = NullContentClaim()
 
     async def test_acquire_always_returns_true(
         self,
@@ -388,27 +397,27 @@ class TestNullVideoClaim(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(removed, 0)
 
 
-class TestVideoClaimAbstractBase(unittest.TestCase):
-    '''Structural tests for the VideoClaim ABC.'''
+class TestContentClaimAbstractBase(unittest.TestCase):
+    '''Structural tests for the ContentClaim ABC.'''
 
     def test_is_abstract(self) -> None:
         self.assertTrue(
-            hasattr(VideoClaim, '__abstractmethods__')
+            hasattr(ContentClaim, '__abstractmethods__')
         )
 
     def test_file_claim_is_subclass(self) -> None:
         self.assertTrue(
-            issubclass(FileVideoClaim, VideoClaim)
+            issubclass(FileContentClaim, ContentClaim)
         )
 
     def test_redis_claim_is_subclass(self) -> None:
         self.assertTrue(
-            issubclass(RedisVideoClaim, VideoClaim)
+            issubclass(RedisContentClaim, ContentClaim)
         )
 
     def test_null_claim_is_subclass(self) -> None:
         self.assertTrue(
-            issubclass(NullVideoClaim, VideoClaim)
+            issubclass(NullContentClaim, ContentClaim)
         )
 
 

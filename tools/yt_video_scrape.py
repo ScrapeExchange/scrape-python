@@ -13,7 +13,6 @@ to Scrape Exchange and moves the file to an "uploaded" sub-directory.
 '''
 
 import os
-import signal
 import sys
 import time
 import asyncio
@@ -27,30 +26,24 @@ import brotli
 
 from httpx import Response
 
-from prometheus_client import Counter, Gauge, Histogram, start_http_server
+from prometheus_client import Counter, Gauge, Histogram
 
 from pydantic import AliasChoices, Field, field_validator
 from yt_dlp.YoutubeDL import YoutubeDL
 
 from scrape_exchange.exchange_client import ExchangeClient
 from scrape_exchange.file_management import AssetFileManagement
-from scrape_exchange.video_claim import (
-    FileVideoClaim,
-    NullVideoClaim,
-    RedisVideoClaim,
-    VideoClaim,
+from scrape_exchange.content_claim import (
+    ContentClaim,
+    FileContentClaim,
+    NullContentClaim,
+    RedisContentClaim,
 )
-from scrape_exchange.logging import configure_logging
 from scrape_exchange.worker_id import get_worker_id
-from scrape_exchange.scraper_supervisor import (
-    SupervisorConfig,
-    publish_config_metrics,
-    run_supervisor,
-)
 from scrape_exchange.settings import normalize_log_level
-
-from scrape_exchange.scrape_exchange_rate_limiter import (
-    ScrapeExchangeRateLimiter,
+from scrape_exchange.scraper_runner import (
+    ScraperRunContext,
+    ScraperRunner,
 )
 from scrape_exchange.youtube.youtube_rate_limiter import YouTubeRateLimiter
 from scrape_exchange.youtube.youtube_video import YouTubeVideo
@@ -376,148 +369,89 @@ class VideoSettings(YouTubeScraperSettings):
 
 def main() -> None:
     '''
-    Top-level entry point. Reads settings and dispatches to either
-    the shared supervisor (when ``video_num_processes > 1``) or the
-    in-process scraper worker (when ``video_num_processes == 1``).
+    Top-level entry point. Reads settings and
+    dispatches to either the shared supervisor
+    (when ``video_num_processes > 1``) or the
+    in-process scraper worker.
     '''
 
     settings: VideoSettings = VideoSettings()
-    os.makedirs(settings.ytdlp_cache_dir, exist_ok=True)
-    configure_logging(
-        level=settings.video_log_level,
-        filename=settings.video_log_file,
-        log_format=settings.log_format,
+    os.makedirs(
+        settings.ytdlp_cache_dir, exist_ok=True,
     )
 
     if settings.video_upload_only:
         settings.video_num_processes = 1
-        settings.metrics_port = settings.metrics_port - 1
-        logging.info(
-            'Upload-only mode: forcing single process '
-            'with metrics port %d',
-            settings.metrics_port,
+        settings.metrics_port = (
+            settings.metrics_port - 1
         )
 
-    if settings.video_num_processes > 1:
-        sys.exit(run_supervisor(SupervisorConfig(
-            scraper_label='video',
-            num_processes_env_var='VIDEO_NUM_PROCESSES',
-            log_file_env_var='VIDEO_LOG_FILE',
-            num_processes=settings.video_num_processes,
-            concurrency=settings.video_concurrency,
-            proxies=settings.proxies,
-            metrics_port=settings.metrics_port,
-            log_file=settings.video_log_file or None,
-            api_key_id=settings.api_key_id,
-            api_key_secret=settings.api_key_secret,
-            exchange_url=settings.exchange_url,
-        )))
+    runner: ScraperRunner = ScraperRunner(
+        settings=settings,
+        scraper_label='video',
+        platform='youtube',
+        num_processes=settings.video_num_processes,
+        concurrency=settings.video_concurrency,
+        metrics_port=settings.metrics_port,
+        log_file=settings.video_log_file,
+        log_level=settings.video_log_level,
+        rate_limiter_factory=lambda s: (
+            YouTubeRateLimiter.get(
+                state_dir=s.rate_limiter_state_dir,
+                redis_dsn=s.redis_dsn,
+            )
+        ),
+        client_required=(
+            not settings.video_no_upload
+        ),
+    )
+    sys.exit(runner.run_sync(_run_worker))
 
-    asyncio.run(_run_worker(settings))
 
-
-async def _run_worker(settings: VideoSettings) -> None:
+async def _run_worker(
+    ctx: ScraperRunContext,
+) -> None:
     '''
     Run a single in-process scraper worker (the leaf of the
     supervisor tree). Spawns ``settings.video_concurrency`` async
     workers that share the proxy pool round-robin.
     '''
 
-    # AssetFileManagement creates video_data_directory and its 'uploaded'
-    # subdirectory automatically.
-    video_fm: AssetFileManagement = AssetFileManagement(
-        settings.video_data_directory
+    settings: VideoSettings = ctx.settings
+
+    video_fm: AssetFileManagement = (
+        AssetFileManagement(
+            settings.video_data_directory,
+        )
     )
     logging.info(
         'Starting YouTube video scrape tool',
-        extra={'settings': settings.model_dump_json(indent=2)},
-    )
-    worker_proxies: list[str] = [
-        p.strip() for p in settings.proxies.split(',') if p.strip()
-    ] if settings.proxies else []
-    logging.info(
-        'Scraper worker started',
         extra={
-            'metrics_port': settings.metrics_port,
-            'proxies_count': len(worker_proxies),
-            'first_proxy': (
-                worker_proxies[0] if worker_proxies else None
-            ),
-            'last_proxy': (
-                worker_proxies[-1] if worker_proxies else None
+            'settings': (
+                settings.model_dump_json(indent=2)
             ),
         },
     )
 
-    try:
-        start_http_server(settings.metrics_port)
-        logging.info(
-            'Prometheus metrics available',
-            extra={'metrics_port': settings.metrics_port},
-        )
-    except OSError as exc:
-        logging.warning(
-            'Failed to bind Prometheus metrics port; '
-            'worker will run without metrics',
-            exc=exc,
-            extra={'metrics_port': settings.metrics_port},
-        )
-    publish_config_metrics(
-        role='worker', scraper_label='video',
-        num_processes=1,
-        concurrency=settings.video_concurrency,
-    )
-
-    YouTubeRateLimiter.get(
-        state_dir=settings.rate_limiter_state_dir,
-        redis_dsn=settings.redis_dsn,
-    ).set_proxies(settings.proxies)
-
-    post_rate: float = float(max(
-        1,
-        settings.video_num_processes
-        * settings.video_concurrency,
-    ))
-    ScrapeExchangeRateLimiter.get(
-        state_dir=settings.rate_limiter_state_dir,
-        post_rate=post_rate,
-        redis_dsn=settings.redis_dsn,
-    )
-
-    # Select the cross-process claim backend.  Redis is
-    # preferred when available; filesystem is the fallback;
-    # single-process mode uses a no-op to avoid overhead.
-    claim: VideoClaim
+    claim: ContentClaim
     if settings.video_num_processes > 1:
         if settings.redis_dsn:
-            claim = RedisVideoClaim(settings.redis_dsn)
+            claim = RedisContentClaim(
+                settings.redis_dsn,
+                platform='youtube',
+            )
         else:
-            claim = FileVideoClaim(
+            claim = FileContentClaim(
                 settings.video_data_directory,
             )
         await claim.cleanup_stale()
     else:
-        claim = NullVideoClaim()
+        claim = NullContentClaim()
 
-    # Wire SIGINT/SIGTERM to cancel the worker loop so the finally
-    # block gets a chance to drain the ExchangeClient upload queue.
-    loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
-    main_task: Task = asyncio.current_task()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, main_task.cancel)
-        except NotImplementedError:
-            # add_signal_handler is not available on all platforms
-            # (e.g. Windows). Fall through without signal wiring.
-            pass
-
-    try:
-        await worker_loop(settings, video_fm, claim)
-    except asyncio.CancelledError:
-        logging.info(
-            'Shutdown signal received; upload queue drained'
-        )
-        raise
+    await worker_loop(
+        settings, video_fm, claim,
+        ctx.client,
+    )
 
 
 async def video_needs_uploading(video_fm: AssetFileManagement,
@@ -632,21 +566,26 @@ async def prepare_workload(settings: VideoSettings,
 async def worker_loop(
     settings: VideoSettings,
     video_fm: AssetFileManagement,
-    claim: VideoClaim,
+    claim: ContentClaim,
+    exchange_client: ExchangeClient | None = None,
 ) -> None:
     '''
     Main worker loop to continuously scrape and upload videos.
 
-    Creates a single shared :class:`ExchangeClient` for all proxy
-    workers so that the background fire-and-forget upload queue is
-    centralised. On shutdown (SIGINT/SIGTERM / all workers done),
-    the client's upload queue is drained for up to 10 seconds in the
-    ``finally`` block so in-flight POSTs get a chance to complete.
+    Uses the shared :class:`ExchangeClient` provided by
+    :class:`ScraperRunner` for all proxy workers so that the
+    background fire-and-forget upload queue is centralised.
+    On shutdown (SIGINT/SIGTERM / all workers done), the
+    client's upload queue is drained for up to 10 seconds in
+    the ``finally`` block so in-flight POSTs get a chance to
+    complete.
 
     :param settings: Configuration settings for the tool
-    :param video_fm: AssetFileManagement instance owning the video data
-        directory.
+    :param video_fm: AssetFileManagement instance owning the
+        video data directory.
     :param claim: Cross-process claim lock backend.
+    :param exchange_client: Shared Scrape.Exchange client,
+        or ``None`` when upload is disabled.
     :returns: (none)
     :raises: (none)
     '''
@@ -656,28 +595,6 @@ async def worker_loop(
         if settings.proxies else []
     )
     queue: Queue = await prepare_workload(settings, video_fm)
-
-    exchange_client: ExchangeClient | None = None
-    if not settings.video_no_upload:
-        try:
-            exchange_client = await ExchangeClient.setup(
-                api_key_id=settings.api_key_id,
-                api_key_secret=settings.api_key_secret,
-                exchange_url=settings.exchange_url,
-            )
-        except Exception as exc:
-            if settings.video_upload_only:
-                logging.critical(
-                    'ExchangeClient setup failed in '
-                    'upload-only mode; cannot proceed',
-                    exc=exc,
-                )
-                return
-            logging.warning(
-                'ExchangeClient setup failed — workers '
-                'will scrape but not upload',
-                exc=exc,
-            )
 
     # Honour VIDEO_CONCURRENCY: spawn exactly
     # settings.video_concurrency workers and distribute the proxy
@@ -973,7 +890,7 @@ async def worker(
     settings: VideoSettings,
     video_fm: AssetFileManagement,
     exchange_client: ExchangeClient | None,
-    claim: VideoClaim,
+    claim: ContentClaim,
 ) -> None:
     '''
     Worker function to process video files from the queue

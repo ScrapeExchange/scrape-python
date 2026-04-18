@@ -14,7 +14,6 @@ until the next polling interval.
 
 import os
 import shutil
-import signal
 import sys
 import heapq
 import random
@@ -33,7 +32,7 @@ import aiofiles
 import httpx
 from httpx import Response
 
-from prometheus_client import Counter, Gauge, start_http_server
+from prometheus_client import Counter, Gauge
 
 from pydantic import AliasChoices, Field, field_validator
 
@@ -41,17 +40,12 @@ from innertube import InnerTube
 
 from scrape_exchange.exchange_client import ExchangeClient
 from scrape_exchange.file_management import AssetFileManagement
-from scrape_exchange.logging import configure_logging
-from scrape_exchange.scraper_supervisor import (
-    SupervisorConfig,
-    publish_config_metrics,
-    run_supervisor,
+from scrape_exchange.scraper_runner import (
+    ScraperRunContext,
+    ScraperRunner,
 )
 from scrape_exchange.settings import normalize_log_level
 from scrape_exchange.youtube.youtube_channel_tabs import YouTubeChannelTabs
-from scrape_exchange.scrape_exchange_rate_limiter import (
-    ScrapeExchangeRateLimiter,
-)
 from scrape_exchange.youtube.youtube_rate_limiter import (
     YouTubeRateLimiter, YouTubeCallType
 )
@@ -61,10 +55,10 @@ from scrape_exchange.youtube.youtube_video_innertube import (
 )
 from scrape_exchange.worker_id import get_worker_id
 from scrape_exchange.youtube.settings import YouTubeScraperSettings
-from scrape_exchange.channel_map import (
-    ChannelMap,
-    FileChannelMap,
-    RedisChannelMap,
+from scrape_exchange.creator_map import (
+    CreatorMap,
+    FileCreatorMap,
+    RedisCreatorMap,
 )
 from scrape_exchange.creator_queue import (
     CreatorQueue,
@@ -1183,7 +1177,7 @@ async def worker_loop(
     channel_fm: AssetFileManagement,
     creator_queue: CreatorQueue,
     tiers: list[TierConfig],
-    channel_map: ChannelMap,
+    creator_map_backend: CreatorMap,
 ) -> None:
     '''
     Runs indefinitely, processing channels in priority order.
@@ -1199,11 +1193,11 @@ async def worker_loop(
         channel data directory.
     :param creator_queue: Queue backend (file or Redis).
     :param tiers: Priority tier configuration.
-    :param channel_map: Channel map backend (file or Redis).
+    :param creator_map_backend: Creator map backend (file or Redis).
     '''
 
     channel_map_data: dict[str, str] = (
-        await channel_map.get_all()
+        await creator_map_backend.get_all()
     )
     subscriber_counts: dict[str, int] = {}
     known_ids: set[str] = (
@@ -1252,7 +1246,7 @@ async def worker_loop(
                 worker_id=get_worker_id()
             ).set(0)
             channel_map_data = (
-                await channel_map.get_all()
+                await creator_map_backend.get_all()
             )
             subscriber_counts = {}
             known_ids = (
@@ -1368,51 +1362,17 @@ async def worker_loop(
         ).set(0)
 
 
-async def _run_worker(settings: RssSettings) -> None:
+async def _run_worker(
+    ctx: ScraperRunContext,
+) -> None:
     '''
     Run a single in-process RSS scraper worker (the leaf of the
-    supervisor tree). Authenticates with Scrape Exchange, sets up
-    the rate limiter, and enters :func:`worker_loop`.
+    supervisor tree). Receives an already-configured
+    :class:`ScraperRunContext` from :class:`ScraperRunner` and
+    enters :func:`worker_loop`.
     '''
-    logging.info(
-        'Starting YouTube RSS scrape tool',
-        extra={'settings': settings.model_dump()},
-    )
-    worker_proxies: list[str] = [
-        p.strip() for p in settings.proxies.split(',') if p.strip()
-    ] if settings.proxies else []
-    logging.info(
-        'RSS scraper worker started',
-        extra={
-            'metrics_port': settings.metrics_port,
-            'proxies_count': len(worker_proxies),
-            'first_proxy': (
-                worker_proxies[0] if worker_proxies else None
-            ),
-            'last_proxy': (
-                worker_proxies[-1] if worker_proxies else None
-            ),
-        },
-    )
+    settings: RssSettings = ctx.settings
 
-    try:
-        start_http_server(settings.metrics_port)
-        logging.info(
-            'Prometheus metrics available',
-            extra={'metrics_port': settings.metrics_port},
-        )
-    except OSError as exc:
-        logging.warning(
-            'Failed to bind Prometheus metrics port; '
-            'worker will run without metrics',
-            exc=exc,
-            extra={'metrics_port': settings.metrics_port},
-        )
-    publish_config_metrics(
-        role='worker', scraper_label='rss',
-        num_processes=1,
-        concurrency=settings.rss_concurrency,
-    )
     # AssetFileManagement creates channel_data_directory and its
     # 'uploaded' subdirectory automatically. video_data_directory is
     # still managed by YouTubeVideo.to_file directly, so we create
@@ -1421,38 +1381,6 @@ async def _run_worker(settings: RssSettings) -> None:
         settings.channel_data_directory
     )
     os.makedirs(settings.video_data_directory, exist_ok=True)
-
-    try:
-        client: ExchangeClient = await ExchangeClient.setup(
-            api_key_id=settings.api_key_id,
-            api_key_secret=settings.api_key_secret,
-            exchange_url=settings.exchange_url,
-        )
-    except Exception as exc:
-        logging.critical(
-            'Failed to connect to Scrape Exchange API',
-            exc=exc,
-            extra={
-                'exchange_url': settings.exchange_url,
-            },
-        )
-        logging.shutdown()
-        sys.exit(1)
-
-    YouTubeRateLimiter.get(
-        state_dir=settings.rate_limiter_state_dir,
-        redis_dsn=settings.redis_dsn,
-    ).set_proxies(settings.proxies)
-
-    post_rate: float = float(max(
-        1,
-        settings.rss_num_processes * settings.rss_concurrency,
-    ))
-    ScrapeExchangeRateLimiter.get(
-        state_dir=settings.rate_limiter_state_dir,
-        post_rate=post_rate,
-        redis_dsn=settings.redis_dsn,
-    )
 
     creator_queue: CreatorQueue
     if settings.redis_dsn:
@@ -1467,13 +1395,14 @@ async def _run_worker(settings: RssSettings) -> None:
             settings.no_feeds_file,
         )
 
-    channel_map_backend: ChannelMap
+    creator_map_backend: CreatorMap
     if settings.redis_dsn:
-        channel_map_backend = RedisChannelMap(
+        creator_map_backend = RedisCreatorMap(
             settings.redis_dsn,
+            platform='youtube',
         )
     else:
-        channel_map_backend = FileChannelMap(
+        creator_map_backend = FileCreatorMap(
             settings.channel_map_file,
         )
 
@@ -1481,29 +1410,11 @@ async def _run_worker(settings: RssSettings) -> None:
         settings.priority_queues,
     )
 
-    # Wire SIGINT/SIGTERM so they cancel the main task;
-    # ExchangeClient's overridden aclose() (invoked by
-    # ``async with client``) drains the background upload queue with
-    # a 10-second timeout before the HTTP transport is torn down.
-    loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
-    main_task: asyncio.Task = asyncio.current_task()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, main_task.cancel)
-        except NotImplementedError:
-            pass
-
-    try:
-        async with client:
-            await worker_loop(
-                settings, client, channel_fm,
-                creator_queue, tiers, channel_map_backend,
-            )
-    except asyncio.CancelledError:
-        logging.info(
-            'Shutdown signal received; upload queue drained'
-        )
-        raise
+    await worker_loop(
+        settings, ctx.client, channel_fm,
+        creator_queue, tiers,
+        creator_map_backend,
+    )
 
 
 def main() -> None:
@@ -1514,36 +1425,35 @@ def main() -> None:
     '''
     settings: RssSettings = RssSettings()
 
-    if not settings.api_key_id or not settings.api_key_secret:
+    if not settings.api_key_id or (
+        not settings.api_key_secret
+    ):
         print(
-            'Error: API key ID and secret must be provided via '
-            '--api-key-id/--api-key-secret, environment variables '
-            'API_KEY_ID/API_KEY_SECRET, or a .env file'
+            'Error: API key ID and secret must be '
+            'provided via --api-key-id/--api-key-'
+            'secret, environment variables '
+            'API_KEY_ID/API_KEY_SECRET, or a .env '
+            'file'
         )
         sys.exit(1)
 
-    configure_logging(
-        level=settings.rss_log_level,
-        filename=settings.rss_log_file,
-        log_format=settings.log_format,
+    runner: ScraperRunner = ScraperRunner(
+        settings=settings,
+        scraper_label='rss',
+        platform='youtube',
+        num_processes=settings.rss_num_processes,
+        concurrency=settings.rss_concurrency,
+        metrics_port=settings.metrics_port,
+        log_file=settings.rss_log_file,
+        log_level=settings.rss_log_level,
+        rate_limiter_factory=lambda s: (
+            YouTubeRateLimiter.get(
+                state_dir=s.rate_limiter_state_dir,
+                redis_dsn=s.redis_dsn,
+            )
+        ),
     )
-
-    if settings.rss_num_processes > 1:
-        sys.exit(run_supervisor(SupervisorConfig(
-            scraper_label='rss',
-            num_processes_env_var='RSS_NUM_PROCESSES',
-            log_file_env_var='RSS_LOG_FILE',
-            num_processes=settings.rss_num_processes,
-            concurrency=settings.rss_concurrency,
-            proxies=settings.proxies,
-            metrics_port=settings.metrics_port,
-            log_file=settings.rss_log_file or None,
-            api_key_id=settings.api_key_id,
-            api_key_secret=settings.api_key_secret,
-            exchange_url=settings.exchange_url,
-        )))
-
-    asyncio.run(_run_worker(settings))
+    sys.exit(runner.run_sync(_run_worker))
 
 
 if __name__ == '__main__':

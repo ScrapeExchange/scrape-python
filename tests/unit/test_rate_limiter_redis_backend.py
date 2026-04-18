@@ -17,6 +17,7 @@ try:
 except ImportError:
     HAS_FAKEREDIS = False
 
+from scrape_exchange.worker_id import get_worker_id
 from scrape_exchange.rate_limiter import (
     _BucketConfig,
     _RedisBackend,
@@ -286,6 +287,7 @@ class TestRedisBackendMetrics(unittest.TestCase):
             'operation': 'try_acquire',
             'result': 'success',
             'platform': 'test',
+            'worker_id': get_worker_id(),
         }
 
         async def run():

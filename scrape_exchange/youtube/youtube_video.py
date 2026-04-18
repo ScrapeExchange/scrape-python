@@ -988,8 +988,14 @@ class YouTubeVideo:
                 'No download_client available for scraping video'
             )
 
-        proxy, cookie_file = await YouTubeRateLimiter.get().acquire(
+        limiter: YouTubeRateLimiter = (
+            YouTubeRateLimiter.get()
+        )
+        proxy = await limiter.acquire(
             YouTubeCallType.PLAYER, proxy=proxy,
+        )
+        cookie_file: str | None = (
+            limiter.get_cookie_file_cached(proxy)
         )
         self.download_client.params['proxy'] = proxy
         if cookie_file:

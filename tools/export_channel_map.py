@@ -20,15 +20,15 @@ import argparse
 import asyncio
 import sys
 
-from scrape_exchange.channel_map import (
-    FileChannelMap,
-    RedisChannelMap,
+from scrape_exchange.creator_map import (
+    FileCreatorMap,
+    RedisCreatorMap,
 )
 from scrape_exchange.settings import ScraperSettings
 
 
 async def export_to_csv(
-    redis_cm: RedisChannelMap, output_path: str,
+    redis_cm: RedisCreatorMap, output_path: str,
 ) -> None:
     '''Export all entries from Redis to a CSV file.'''
     data: dict[str, str] = await redis_cm.get_all()
@@ -44,10 +44,10 @@ async def export_to_csv(
 
 
 async def import_from_csv(
-    redis_cm: RedisChannelMap, input_path: str,
+    redis_cm: RedisCreatorMap, input_path: str,
 ) -> None:
     '''Import entries from a CSV file into Redis.'''
-    file_cm: FileChannelMap = FileChannelMap(input_path)
+    file_cm: FileCreatorMap = FileCreatorMap(input_path)
     data: dict[str, str] = await file_cm.get_all()
     if not data:
         print('No entries found in input file')
@@ -68,8 +68,9 @@ async def main(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
-    redis_cm: RedisChannelMap = RedisChannelMap(
+    redis_cm: RedisCreatorMap = RedisCreatorMap(
         settings.redis_dsn,
+        platform='youtube',
     )
 
     if args.output:
