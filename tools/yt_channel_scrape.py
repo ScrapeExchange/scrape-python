@@ -14,6 +14,7 @@ to Scrape Exchange and moves the file to an "uploaded" sub-directory.
 
 import os
 import sys
+import json
 import asyncio
 import logging
 import resource
@@ -24,9 +25,8 @@ from pathlib import Path
 import aiofiles
 
 from httpx import Response
-
+from watchfiles import awatch, Change
 from prometheus_client import Counter, Gauge
-
 from pydantic import AliasChoices, Field, field_validator
 
 from scrape_exchange.creator_map import (
@@ -48,7 +48,7 @@ from scrape_exchange.youtube.youtube_channel import YouTubeChannel
 from scrape_exchange.youtube.youtube_rate_limiter import YouTubeRateLimiter
 from scrape_exchange.youtube.youtube_video import DENO_PATH, PO_TOKEN_URL
 from scrape_exchange.worker_id import get_worker_id
-from watchfiles import awatch, Change
+
 from scrape_exchange.youtube.settings import YouTubeScraperSettings
 
 CHANNEL_FILE_POSTFIX = '.json.br'
@@ -1069,7 +1069,11 @@ async def read_channels(
                 line = line[len('channel/'):]
                 if line.startswith('uc'):
                     line = line[0].upper() + line[1].upper() + line[2:]
-
+            elif (line.startswith('{') and line.endswith('}')
+                    and ('channel' in line)):
+                # JSONL, perhaps created with yt_discover_channels.py
+                data: dict[str, str | int] = json.loads(line)
+                line = data.get('channel', line)
             channel_name: str | None = None
             if ',' in line:
                 _: str

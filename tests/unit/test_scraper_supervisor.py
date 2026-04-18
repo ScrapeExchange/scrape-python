@@ -159,6 +159,7 @@ class TestSpawnChildrenEnv(unittest.TestCase):
             metrics_port=9600,
             log_file=log_file,
             log_file_env_var=log_file_env_var,
+            metrics_port_env_var='CHANNEL_METRICS_PORT',
         )
 
     def test_env_overrides_per_child(self) -> None:
@@ -190,6 +191,9 @@ class TestSpawnChildrenEnv(unittest.TestCase):
         self.assertEqual(captured_envs[0]['PROXIES'], 'http://a')
         self.assertEqual(captured_envs[0]['METRICS_PORT'], '9601')
         self.assertEqual(
+            captured_envs[0]['CHANNEL_METRICS_PORT'], '9601',
+        )
+        self.assertEqual(
             captured_envs[0]['LOG_FILE'],
             '/var/log/channel-1.log',
         )
@@ -206,6 +210,10 @@ class TestSpawnChildrenEnv(unittest.TestCase):
             captured_envs[1]['METRICS_PORT'], '9602',
         )
         self.assertEqual(
+            captured_envs[1]['CHANNEL_METRICS_PORT'],
+            '9602',
+        )
+        self.assertEqual(
             captured_envs[1]['LOG_FILE'],
             '/var/log/channel-2.log',
         )
@@ -216,6 +224,10 @@ class TestSpawnChildrenEnv(unittest.TestCase):
         # Worker 3 → base + 3, log -3
         self.assertEqual(
             captured_envs[2]['METRICS_PORT'], '9603',
+        )
+        self.assertEqual(
+            captured_envs[2]['CHANNEL_METRICS_PORT'],
+            '9603',
         )
         self.assertEqual(
             captured_envs[2]['LOG_FILE'],
