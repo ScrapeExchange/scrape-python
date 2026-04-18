@@ -4,9 +4,8 @@
 #   docker compose -f docker-compose.yml \
 #     -f docker-compose.<your-host>.yml up -d
 #
-# All services use the same image built from ./Dockerfile.
-# Host-specific settings (NUM_PROCESSES, CONCURRENCY, volumes)
-# go in the override file.
+# All services use the ghcr.io image.  Host-specific settings
+# (NUM_PROCESSES, CONCURRENCY, volumes) go in the override file.
 
 # Container-internal paths that override the relative paths
 # from .env. Compose 'environment' takes precedence over
@@ -21,8 +20,7 @@ x-container-paths: &container-paths
   DENO_PATH: /usr/local/deno/bin/deno
 
 x-scraper-common: &scraper-common
-  build: .
-  image: scrape-python:latest
+  image: ghcr.io/scrapeexchange/scrape-python:latest
   env_file: .env
   restart: unless-stopped
   network_mode: host
