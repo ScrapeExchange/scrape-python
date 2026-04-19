@@ -570,7 +570,7 @@ async def _enrich_and_store_video(
             'Failed to get InnerTube video data, '
             'will continue with RSS data',
             exc=exc,
-            extra={'video_id': video.video_id},
+            extra={'video_id': video.video_id, 'proxy': proxy},
         )
 
     try:
@@ -986,7 +986,7 @@ async def update_channel(
         logging.debug(
             'Failed to browse channel via InnerTube',
             exc=exc,
-            extra={'channel_name': channel_name},
+            extra={'channel_name': channel_name, 'proxy': proxy},
         )
         return False, 0, None
 
@@ -1237,9 +1237,12 @@ async def _enrich_subscriber_counts(
     _MAX_LOOKUPS: int = 100_000
     if len(missing) > _MAX_LOOKUPS:
         logging.info(
-            'Capping API enrichment to %d of %d '
-            'channels (rest default to lowest tier)',
-            _MAX_LOOKUPS, len(missing),
+            'Capping API enrichment (rest default to '
+            'lowest tier)',
+            extra={
+                'enrichment_cap': _MAX_LOOKUPS,
+                'missing_count': len(missing),
+            },
         )
         missing = missing[:_MAX_LOOKUPS]
 

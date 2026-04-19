@@ -886,7 +886,12 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
             logging.warning(
                 'Failed to scrape channel',
                 exc=exc,
-                extra={'channel_name': channel_name},
+                extra={
+                    'channel_name': channel_name,
+                    'proxy': getattr(
+                        channel.browse_client, 'proxy', None,
+                    ),
+                },
             )
             return False
         except Exception as exc:
@@ -897,7 +902,12 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
                 'Unexpected error while scraping '
                 'channel',
                 exc=exc,
-                extra={'channel_name': channel_name},
+                extra={
+                    'channel_name': channel_name,
+                    'proxy': getattr(
+                        channel.browse_client, 'proxy', None,
+                    ),
+                },
             )
             return False
         finally:

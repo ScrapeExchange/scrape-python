@@ -555,18 +555,28 @@ class YouTubeChannelTabs:
                         YouTubeCallType.BROWSE, self.proxy, penalty
                     )
                     _LOGGER.warning(
-                        'InnerTube BROWSE 429 for channel %s '
-                        '(attempt %d/%d), penalty %.1fs',
-                        self.channel_id, attempt, max_retries, penalty,
+                        'InnerTube BROWSE rate-limited',
+                        extra={
+                            'channel_id': self.channel_id,
+                            'attempt': attempt,
+                            'max_retries': max_retries,
+                            'penalty_seconds': penalty,
+                            'proxy': self.proxy
+                        },
                     )
                     penalty = min(penalty * 2, _PENALTY_MAX)
                     if attempt < max_retries:
                         await AsyncYouTubeClient._delay(penalty, penalty)
                 else:
                     _LOGGER.error(
-                        'InnerTube BROWSE error for channel %s '
-                        '(attempt %d/%d): %s',
-                        self.channel_id, attempt, max_retries, exc,
+                        'InnerTube BROWSE error',
+                        exc=exc,
+                        extra={
+                            'channel_id': self.channel_id,
+                            'attempt': attempt,
+                            'max_retries': max_retries,
+                            'proxy': self.proxy
+                        },
                     )
                     if attempt < max_retries:
                         await AsyncYouTubeClient._delay(
@@ -580,9 +590,14 @@ class YouTubeChannelTabs:
                     worker_id=get_worker_id(),
                 ).observe(time.monotonic() - start)
                 _LOGGER.error(
-                    'InnerTube BROWSE error for channel %s '
-                    '(attempt %d/%d): %s',
-                    self.channel_id, attempt, max_retries, exc,
+                    'InnerTube BROWSE error',
+                    exc=exc,
+                    extra={
+                        'channel_id': self.channel_id,
+                        'attempt': attempt,
+                        'max_retries': max_retries,
+                        'proxy': self.proxy,
+                    },
                 )
                 if attempt < max_retries:
                     await AsyncYouTubeClient._delay(penalty - 1, penalty)

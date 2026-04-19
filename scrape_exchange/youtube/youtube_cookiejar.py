@@ -171,8 +171,9 @@ class YouTubeCookieJar:
             session.cookies.update(jar)
         except OSError as exc:
             _LOGGER.warning(
-                'Failed to load cookie file %s for proxy=%s: %s',
-                entry.path, proxy, exc,
+                'Failed to load cookie file',
+                exc=exc,
+                extra={'cookie_file': entry.path, 'proxy': proxy},
             )
 
     async def _acquire(self, proxy: str | None) -> _CookieEntry | None:
@@ -215,13 +216,19 @@ class YouTubeCookieJar:
             tmp.close()
 
             _LOGGER.debug(
-                'Acquired %d cookies for proxy=%s → %s',
-                len(cookies), proxy, tmp.name,
+                'Acquired cookies for proxy',
+                extra={
+                    'cookie_count': len(cookies),
+                    'proxy': proxy,
+                    'cookie_file': tmp.name,
+                },
             )
             return _CookieEntry(path=tmp.name)
 
         except Exception as exc:
             _LOGGER.warning(
-                'Failed to acquire cookies for proxy=%s: %s', proxy, exc,
+                'Failed to acquire cookies for proxy',
+                exc=exc,
+                extra={'proxy': proxy},
             )
             return None

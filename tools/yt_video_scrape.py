@@ -525,9 +525,9 @@ async def prepare_workload(settings: VideoSettings,
         # because they always require scraping.
         candidates: list[str] = dlp_files
         logging.info(
-            'Upload-only mode: queuing %d video-dlp '
+            'Upload-only mode: queuing video-dlp '
             'files, skipping video-min files',
-            len(dlp_files),
+            extra={'dlp_files_count': len(dlp_files)},
         )
     else:
         min_files: list[str] = video_fm.list_base(
@@ -870,7 +870,7 @@ async def _scrape_and_save(
         logging.info(
             'Failed to scrape video',
             exc=exc,
-            extra={'video_id': video_id},
+            extra={'video_id': video_id, 'proxy': proxy},
         )
         METRIC_SCRAPE_FAILURES.labels(
             proxy=proxy, reason='other',
@@ -907,7 +907,7 @@ async def _scrape_and_save(
             'Failed to write scraped video '
             'file to disk',
             exc=exc,
-            extra={'video_id': video_id},
+            extra={'video_id': video_id, 'proxy': proxy},
         )
         return None, sleep
 
@@ -1046,7 +1046,7 @@ async def worker(
                 logging.debug(
                     'Video was already uploaded, '
                     'skipping',
-                    extra={'video_id': video_id},
+                    extra={'video_id': video_id, 'proxy': proxy},
                 )
                 METRIC_VIDEOS_ALREADY_UPLOADED.labels(
                     worker_id=get_worker_id(),
@@ -1227,21 +1227,21 @@ async def _handle_scrape_failure(
         logging.warning(
             'Rate limited during scraping video',
             exc=exc,
-            extra={'video_id': video_id},
+            extra={'video_id': video_id, 'proxy': proxy},
         )
         return _next_failure_sleep(sleep)
     if reason == 'missing_data':
         logging.info(
             'Missing microformat data for video',
             exc=exc,
-            extra={'video_id': video_id},
+            extra={'video_id': video_id, 'proxy': proxy},
         )
         return 0
     if reason == 'unavailable':
         logging.info(
             'Video not available for scraping',
             exc=exc,
-            extra={'video_id': video_id},
+            extra={'video_id': video_id, 'proxy': proxy},
         )
         try:
             await video_fm.mark_unavailable(entry)
@@ -1252,7 +1252,7 @@ async def _handle_scrape_failure(
         logging.info(
             'Video is a Premiere, skipping for now',
             exc=exc,
-            extra={'video_id': video_id},
+            extra={'video_id': video_id, 'proxy': proxy},
         )
         return 0
     if reason == 'transient':
@@ -1261,13 +1261,13 @@ async def _handle_scrape_failure(
         logging.info(
             'Transient failure during scraping',
             exc=exc,
-            extra={'video_id': video_id},
+            extra={'video_id': video_id, 'proxy': proxy},
         )
         return sleep
     logging.info(
         'Failed to scrape video',
         exc=exc,
-        extra={'video_id': video_id},
+        extra={'video_id': video_id, 'proxy': proxy},
     )
     return _next_failure_sleep(sleep)
 
@@ -1376,7 +1376,7 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
         sleep = 0
         logging.info(
             'Successfully scraped video',
-            extra={'video_id': video_id},
+            extra={'video_id': video_id, 'proxy': proxy},
         )
     except Exception as exc:
         METRIC_SCRAPE_DURATION.labels(
@@ -1439,10 +1439,11 @@ async def resolve_video_upload_handle(
         logging.warning(
             'Video scraper: InnerTube handle resolution failed; '
             'skipping upload, will retry next tick',
-            exc_info=exc,
+            exc=exc,
             extra={
                 'video_id': video.video_id,
                 'channel_id': video.channel_id,
+                'proxy': proxy,
             },
         )
         CREATOR_MAP_RESOLUTION_TOTAL.labels(

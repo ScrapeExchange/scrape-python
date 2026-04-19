@@ -148,8 +148,8 @@ class ScraperRunner:
             asyncio.run(self.run(worker_func))
         except asyncio.CancelledError:
             logging.info(
-                '%s scraper shutdown complete',
-                self._scraper_label,
+                'Scraper shutdown complete',
+                extra={'scraper': self._scraper_label},
             )
         return 0
 
