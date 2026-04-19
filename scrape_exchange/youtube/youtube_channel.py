@@ -1225,13 +1225,12 @@ class YouTubeChannel:
         return None
 
     @staticmethod
-    def parse_video_count(data: dict) -> int | None:
-        '''
-        Parse the video count from the scraped data
-
-        :param data: the scraped data
-        :returns: the subscriber count
-        '''
+    @staticmethod
+    def _parse_video_count_from_metadata_rows(
+        data: dict,
+    ) -> int | None:
+        '''Extract video count from the new
+        ``pageHeaderRenderer`` metadata rows.'''
 
         metadata_rows: list[dict[str, any]] = data.get(
             'header', {}
@@ -1249,17 +1248,56 @@ class YouTubeChannel:
             'metadataRows', []
         )
 
-        for metadata_row in metadata_rows:
-            metadata_parts: list[dict] = metadata_row.get(
-                'metadataParts', []
-            ) or []
-            for metadata_part in metadata_parts:
-                if isinstance(metadata_part.get('text'), dict):
-                    content: str = metadata_part['text'].get('content', '')
-                    if content and 'videos' in content:
-                        youtube_video_count: int | None = \
-                            convert_number_string(content)
-                        return youtube_video_count
+        for row in metadata_rows:
+            parts: list[dict] = (
+                row.get('metadataParts', []) or []
+            )
+            for part in parts:
+                text: dict | None = part.get('text')
+                if not isinstance(text, dict):
+                    continue
+                content: str = text.get('content', '')
+                if content and 'video' in content:
+                    count: int | None = (
+                        convert_number_string(content)
+                    )
+                    if count is not None:
+                        return count
+        return None
+
+    @staticmethod
+    def parse_video_count(data: dict) -> int | None:
+        '''
+        Parse the video count from the scraped data.
+
+        Tries the new ``pageHeaderRenderer`` path first,
+        then falls back to the legacy
+        ``c4TabbedHeaderRenderer``.
+
+        :param data: the scraped data
+        :returns: the video count, or None
+        '''
+
+        count: int | None = (
+            YouTubeChannel
+            ._parse_video_count_from_metadata_rows(data)
+        )
+        if count is not None:
+            return count
+
+        videos_text: str = data.get(
+            'header', {}
+        ).get(
+            'c4TabbedHeaderRenderer', {}
+        ).get(
+            'videosCountText', {}
+        ).get(
+            'runs', [{}]
+        )[0].get('text', '')
+        if videos_text:
+            count = convert_number_string(videos_text)
+            if count is not None:
+                return count
 
         _LOGGER.debug('Failed to parse videos count')
         return None

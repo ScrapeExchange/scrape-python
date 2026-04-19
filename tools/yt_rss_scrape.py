@@ -388,10 +388,10 @@ async def fetch_rss(rss_url: str) -> list[YouTubeVideo] | None:
     '''
 
     logging.debug('Fetching RSS feed', extra={'rss_url': rss_url})
-    proxy: str | None
-    __cookie_file: str | None
-    proxy, __cookie_file = await YouTubeRateLimiter.get().acquire(
-        YouTubeCallType.RSS
+    proxy: str | None = (
+        await YouTubeRateLimiter.get().acquire(
+            YouTubeCallType.RSS
+        )
     )
 
     try:
@@ -983,6 +983,11 @@ async def update_channel(
             channel_data,
         ) or 0
     )
+    video_count: int = (
+        YouTubeChannel.parse_video_count(
+            channel_data,
+        ) or 0
+    )
 
     # Fire-and-forget: background worker inside ExchangeClient handles
     # the POST with retries. No file_manager is passed because an RSS
@@ -1003,6 +1008,7 @@ async def update_channel(
                 'channel': channel_name.lstrip('@'),
                 'title': title,
                 'subscriber_count': subscriber_count,
+                'video_count': video_count,
                 'view_count': view_count,
                 'description': description,
             },
