@@ -422,10 +422,10 @@ class TestRedisCreatorQueueClaimBatch(
         )
         await self._redis.zrem(_queue_key(1), 'UCaaa')
 
-        batch: list[tuple[str, str]] = (
+        batch: list[tuple[str, str, float]] = (
             await self.q.claim_batch(10, 'test-worker')
         )
-        cids: set[str] = {cid for cid, _ in batch}
+        cids: set[str] = {cid for cid, _, _ in batch}
         self.assertNotIn('UCaaa', cids)
         self.assertIn('UCbbb', cids)
 
@@ -849,6 +849,161 @@ class TestRedisCreatorQueueCleanupStaleClaims(
             )
         )
         self.assertIsNotNone(score)
+
+
+class TestRedisCreatorQueueTierInterval(
+    unittest.IsolatedAsyncioTestCase,
+):
+
+    async def asyncSetUp(self) -> None:
+        self._redis: aioredis.Redis = (
+            aioredis.from_url(
+                REDIS_DSN, decode_responses=True,
+            )
+        )
+        await _clean(self._redis)
+        self.tmp: str = tempfile.mkdtemp()
+        self.fm: AssetFileManagement = (
+            AssetFileManagement(self.tmp)
+        )
+        self.q: RedisCreatorQueue = RedisCreatorQueue(
+            REDIS_DSN,
+            'test-worker',
+            platform=TEST_PLATFORM,
+        )
+
+    async def asyncTearDown(self) -> None:
+        await _clean(self._redis)
+        await self._redis.aclose()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    async def test_returns_interval_for_known_tier(
+        self,
+    ) -> None:
+        await self.q.populate(
+            {'UCa': 'a'},
+            self.fm,
+            DEFAULT_TIERS,
+            {'UCa': 5_000_000},
+        )
+        self.assertEqual(
+            self.q.get_tier_interval(1), 4.0,
+        )
+        self.assertEqual(
+            self.q.get_tier_interval(3), 24.0,
+        )
+
+    async def test_returns_last_tier_for_unknown(
+        self,
+    ) -> None:
+        await self.q.populate(
+            {'UCa': 'a'},
+            self.fm,
+            DEFAULT_TIERS,
+            {'UCa': 5_000_000},
+        )
+        self.assertEqual(
+            self.q.get_tier_interval(99), 48.0,
+        )
+
+
+class TestRedisCreatorQueueEligibilityFraction(
+    unittest.IsolatedAsyncioTestCase,
+):
+
+    async def asyncSetUp(self) -> None:
+        self._redis: aioredis.Redis = (
+            aioredis.from_url(
+                REDIS_DSN, decode_responses=True,
+            )
+        )
+        await _clean(self._redis)
+        self.tmp: str = tempfile.mkdtemp()
+        self.fm: AssetFileManagement = (
+            AssetFileManagement(self.tmp)
+        )
+
+    async def asyncTearDown(self) -> None:
+        await _clean(self._redis)
+        await self._redis.aclose()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    async def test_release_with_half_fraction(
+        self,
+    ) -> None:
+        q: RedisCreatorQueue = RedisCreatorQueue(
+            REDIS_DSN,
+            'test-worker',
+            platform=TEST_PLATFORM,
+            eligibility_fraction=0.5,
+        )
+        # Tier 4 → 48 h interval.
+        past: float = (
+            datetime.now(UTC).timestamp() - 60
+        )
+        pipe = self._redis.pipeline()
+        pipe.zadd(_queue_key(4), {'UCt4': past})
+        pipe.hset(_creators_key(), 'UCt4', 't4')
+        pipe.hset(_tiers_key(), 'UCt4', '4')
+        await pipe.execute()
+        await q.populate(
+            {}, self.fm, DEFAULT_TIERS, {},
+        )
+
+        await q.claim_batch(10, 'test-worker')
+        await q.release('UCt4')
+
+        score: float | None = (
+            await self._redis.zscore(
+                _queue_key(4), 'UCt4',
+            )
+        )
+        self.assertIsNotNone(score)
+        # 48 h * 0.5 = 24 h
+        expected: float = (
+            datetime.now(UTC).timestamp() + 24 * 3600
+        )
+        assert score is not None
+        self.assertAlmostEqual(
+            score, expected, delta=5,
+        )
+
+    async def test_default_fraction_is_one(
+        self,
+    ) -> None:
+        q: RedisCreatorQueue = RedisCreatorQueue(
+            REDIS_DSN,
+            'test-worker',
+            platform=TEST_PLATFORM,
+        )
+        past: float = (
+            datetime.now(UTC).timestamp() - 60
+        )
+        pipe = self._redis.pipeline()
+        pipe.zadd(_queue_key(4), {'UCt4': past})
+        pipe.hset(_creators_key(), 'UCt4', 't4')
+        pipe.hset(_tiers_key(), 'UCt4', '4')
+        await pipe.execute()
+        await q.populate(
+            {}, self.fm, DEFAULT_TIERS, {},
+        )
+
+        await q.claim_batch(10, 'test-worker')
+        await q.release('UCt4')
+
+        score: float | None = (
+            await self._redis.zscore(
+                _queue_key(4), 'UCt4',
+            )
+        )
+        self.assertIsNotNone(score)
+        expected: float = (
+            datetime.now(UTC).timestamp() + 48 * 3600
+        )
+        assert score is not None
+        self.assertAlmostEqual(
+            score, expected, delta=5,
+        )
 
 
 if __name__ == '__main__':

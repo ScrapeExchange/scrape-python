@@ -693,5 +693,115 @@ class TestFileCreatorQueueCleanupStaleClaims(
             self.assertEqual(result, 0)
 
 
+class TestFileCreatorQueueTierInterval(
+    unittest.IsolatedAsyncioTestCase,
+):
+
+    async def test_returns_interval_for_known_tier(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            q: FileCreatorQueue = _make_queue(tmp)
+            fm: AssetFileManagement = _make_fm(tmp)
+            await q.populate(
+                {'UCa': 'a'},
+                fm,
+                DEFAULT_TIERS,
+                {'UCa': 5_000_000},
+            )
+            self.assertEqual(
+                q.get_tier_interval(1), 4.0,
+            )
+            self.assertEqual(
+                q.get_tier_interval(3), 24.0,
+            )
+
+    async def test_returns_last_tier_for_unknown(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            q: FileCreatorQueue = _make_queue(tmp)
+            fm: AssetFileManagement = _make_fm(tmp)
+            await q.populate(
+                {'UCa': 'a'},
+                fm,
+                DEFAULT_TIERS,
+                {'UCa': 5_000_000},
+            )
+            self.assertEqual(
+                q.get_tier_interval(99), 48.0,
+            )
+
+
+class TestFileCreatorQueueEligibilityFraction(
+    unittest.IsolatedAsyncioTestCase,
+):
+
+    async def test_release_with_half_fraction(
+        self,
+    ) -> None:
+        '''eligibility_fraction=0.5 schedules at half
+        the tier interval.'''
+        with tempfile.TemporaryDirectory() as tmp:
+            queue_file: str = os.path.join(
+                tmp, 'queue.json',
+            )
+            no_feeds_file: str = os.path.join(
+                tmp, 'no_feeds.tsv',
+            )
+            q: FileCreatorQueue = FileCreatorQueue(
+                queue_file,
+                no_feeds_file,
+                eligibility_fraction=0.5,
+            )
+            fm: AssetFileManagement = _make_fm(tmp)
+            await q.populate(
+                {'UCa': 'a'},
+                fm,
+                DEFAULT_TIERS,
+                {'UCa': 5_000_000},  # tier 1 → 4 h
+            )
+            await q.claim_batch(10, 'worker-1')
+            before_release: float = _now()
+            await q.release('UCa')
+            ts: float = q._heaps[1][0][0]
+            # 4 h * 0.5 = 2 h
+            expected_min: float = (
+                before_release + 2.0 * 3600 - 5
+            )
+            expected_max: float = (
+                before_release + 2.0 * 3600 + 5
+            )
+            self.assertGreaterEqual(ts, expected_min)
+            self.assertLessEqual(ts, expected_max)
+
+    async def test_default_fraction_is_one(
+        self,
+    ) -> None:
+        '''Default constructor preserves the original
+        full-interval behaviour.'''
+        with tempfile.TemporaryDirectory() as tmp:
+            q: FileCreatorQueue = _make_queue(tmp)
+            fm: AssetFileManagement = _make_fm(tmp)
+            await q.populate(
+                {'UCa': 'a'},
+                fm,
+                DEFAULT_TIERS,
+                {'UCa': 5_000_000},  # tier 1 → 4 h
+            )
+            await q.claim_batch(10, 'worker-1')
+            before_release: float = _now()
+            await q.release('UCa')
+            ts: float = q._heaps[1][0][0]
+            expected_min: float = (
+                before_release + 4.0 * 3600 - 5
+            )
+            expected_max: float = (
+                before_release + 4.0 * 3600 + 5
+            )
+            self.assertGreaterEqual(ts, expected_min)
+            self.assertLessEqual(ts, expected_max)
+
+
 if __name__ == '__main__':
     unittest.main()
