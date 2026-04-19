@@ -42,6 +42,8 @@ from scrape_exchange.scraper_runner import (
 from scrape_exchange.settings import normalize_log_level
 from scrape_exchange.youtube.youtube_channel import (
     YouTubeChannel,
+    canonical_handle_from_browse,
+    fallback_handle,
 )
 from scrape_exchange.youtube.youtube_channel_tabs import YouTubeChannelTabs
 from scrape_exchange.youtube.youtube_rate_limiter import (
@@ -57,6 +59,8 @@ from scrape_exchange.creator_map import (
     CreatorMap,
     FileCreatorMap,
     RedisCreatorMap,
+    CREATOR_HANDLE_MISMATCH_TOTAL,
+    CREATOR_MAP_RESOLUTION_TOTAL,
 )
 from scrape_exchange.creator_queue import (
     CreatorQueue,
@@ -473,7 +477,7 @@ async def check_video_exists(
 
 def enqueue_upload_video(
     client: ExchangeClient, settings: RssSettings,
-    channel_name: str, video: YouTubeVideo,
+    handle: str, video: YouTubeVideo,
 ) -> bool:
     '''
     Fire-and-forget upload of an RSS-discovered video to Scrape
@@ -486,6 +490,8 @@ def enqueue_upload_video(
     or failure. If the queue is full the job is dropped and will be
     re-enqueued the next time the RSS feed is polled.
 
+    :param handle: Canonical channel handle to use as
+        platform_creator_id; must match the channel entity's handle.
     :returns: ``True`` if the job was enqueued, ``False`` if dropped.
     '''
 
@@ -499,13 +505,13 @@ def enqueue_upload_video(
             'source_url': video.url,
             'data': video.to_dict(),
             'platform_content_id': video.video_id,
-            'platform_creator_id': channel_name,
+            'platform_creator_id': handle,
             'platform_topic_id': None,
         },
         entity='video',
         log_extra={
             'platform_content_id': video.video_id,
-            'platform_creator_id': channel_name,
+            'platform_creator_id': handle,
         },
     )
     if enqueued:
@@ -536,12 +542,17 @@ async def _enrich_and_store_video(
     proxy: str | None,
     client: ExchangeClient,
     channel_name: str,
+    handle: str,
     settings: RssSettings,
 ) -> str | None:
     '''
     Enrich a single video via InnerTube, write it to
     disk, and enqueue the upload.  Returns the filename
     on success, ``None`` on failure.
+
+    :param channel_name: Display name of the channel, used only
+        for logging.
+    :param handle: Canonical handle used as platform_creator_id.
     '''
     try:
         await video.from_innertube(
@@ -591,7 +602,7 @@ async def _enrich_and_store_video(
         },
     )
     if enqueue_upload_video(
-        client, settings, channel_name, video,
+        client, settings, handle, video,
     ):
         METRIC_VIDEOS_ENQUEUED.labels(
             worker_id=get_worker_id()
@@ -610,6 +621,7 @@ async def _enrich_and_store_video(
 async def process_channel(
     channel_name: str, channel_id: str, client: ExchangeClient,
     creator_queue: CreatorQueue, settings: RssSettings,
+    creator_map_backend: CreatorMap,
 ) -> bool | None:
     '''
     Fetches the RSS feed for one channel and checks or stores each video.
@@ -690,17 +702,19 @@ async def process_channel(
     CHANNEL_LAST_CHECKED[channel_id] = monotonic()
 
     # --- Phase 1: channel update + RSS fetch in parallel ---
-    update_result: tuple[bool, int]
+    update_result: tuple[bool, int, str | None]
     rss_result: list[YouTubeVideo] | None | Exception
     update_result, rss_result = await asyncio.gather(
         update_channel(
-            client, channel_name, channel_id, proxy,
+            client, channel_name, channel_id,
+            creator_map_backend, proxy,
         ),
         _fetch_rss_safe(rss_url),
     )
 
     update_ok: bool = update_result[0]
     sub_count: int = update_result[1]
+    resolved_handle: str | None = update_result[2]
 
     if not update_ok:
         # Leave the tier unchanged — don't overwrite a
@@ -878,12 +892,16 @@ async def process_channel(
         ):
             session.close()
 
+    # update_ok was True above, so resolved_handle is set; assert for
+    # the type-checker.
+    assert resolved_handle is not None
     enrich_results: list[str | None | Exception] = (
         await asyncio.gather(
             *[
                 _enrich_and_store_video(
                     video, innertube, proxy,
-                    client, channel_name, settings,
+                    client, channel_name, resolved_handle,
+                    settings,
                 )
                 for video in new_videos
             ],
@@ -940,18 +958,24 @@ async def process_channel(
 
 async def update_channel(
     client: ExchangeClient, channel_name: str,
-    channel_id: str, proxy: str | None = None,
-) -> tuple[bool, int]:
+    channel_id: str,
+    creator_map_backend: CreatorMap,
+    proxy: str | None = None,
+) -> tuple[bool, int, str | None]:
     '''
     Fetches channel metadata via InnerTube and updates the channel
     data on Scrape Exchange via the data API.
 
     :param client: The authenticated Scrape Exchange API client.
-    :param channel_name: The channel handle / vanity name.
+    :param channel_name: The channel handle / vanity name as known
+        to the caller (may be mis-cased; canonicalised here).
     :param channel_id: The YouTube channel ID.
+    :param creator_map_backend: CreatorMap to persist the resolved
+        handle for reads by other scrapers.
     :param proxy: Optional proxy URL for the InnerTube request.
-    :returns: Tuple of (success, subscriber_count). success is True
-              if the channel data was fetched successfully.
+    :returns: Tuple of (success, subscriber_count, resolved_handle).
+        ``success`` is True if the channel data was fetched and
+        uploaded. ``resolved_handle`` is None when fetch failed.
     :raises: (none)
     '''
 
@@ -964,7 +988,33 @@ async def update_channel(
             exc=exc,
             extra={'channel_name': channel_name},
         )
-        return False, 0
+        return False, 0, None
+
+    canonical: str | None = canonical_handle_from_browse(channel_data)
+    resolved_handle: str
+    if canonical:
+        resolved_handle = canonical
+        CREATOR_MAP_RESOLUTION_TOTAL.labels(
+            scraper='rss', outcome='canonical',
+        ).inc()
+    else:
+        resolved_handle = fallback_handle(channel_name)
+        CREATOR_MAP_RESOLUTION_TOTAL.labels(
+            scraper='rss', outcome='fallback',
+        ).inc()
+
+    if channel_name != resolved_handle:
+        CREATOR_HANDLE_MISMATCH_TOTAL.labels(scraper='rss').inc()
+        logging.info(
+            'RSS update_channel: canonicalising handle',
+            extra={
+                'channel_id': channel_id,
+                'input_name': channel_name,
+                'canonical_handle': resolved_handle,
+            },
+        )
+
+    await creator_map_backend.put(channel_id, resolved_handle)
 
     metadata: dict = channel_data.get(
         'metadata', {}
@@ -1005,24 +1055,24 @@ async def update_channel(
                 f'{channel_id}'
             ),
             'data': {
-                'channel': channel_name.lstrip('@'),
+                'channel': resolved_handle,
                 'title': title,
                 'subscriber_count': subscriber_count,
                 'video_count': video_count,
                 'view_count': view_count,
                 'description': description,
             },
-            'platform_content_id': channel_name,
-            'platform_creator_id': channel_name,
+            'platform_content_id': resolved_handle,
+            'platform_creator_id': resolved_handle,
             'platform_topic_id': None,
         },
         entity='channel',
-        log_extra={'channel_name': channel_name},
+        log_extra={'channel_name': resolved_handle},
     )
     if enqueued:
         METRIC_API_CHANNEL_CALLS.labels(worker_id=get_worker_id()).inc()
 
-    return True, subscriber_count
+    return True, subscriber_count, resolved_handle
 
 
 def read_channel_file(filepath: str) -> dict[str, any]:
@@ -1400,6 +1450,7 @@ async def worker_loop(
                 process_channel(
                     name, cid, client,
                     creator_queue, settings,
+                    creator_map_backend,
                 )
                 for cid, name, _ in batch
             ],

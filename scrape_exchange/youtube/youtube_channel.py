@@ -55,6 +55,50 @@ HTTP_PREFIX: str = 'http://'
 HTTPS_PREFIX: str = 'https://'
 
 
+def canonical_handle_from_browse(channel_data: dict) -> str | None:
+    '''
+    Extract the canonical @-handle from an InnerTube browse_channel()
+    response. YouTube normalises the casing in vanityChannelUrl, so
+    this is the UI-faithful handle we use for platform_creator_id.
+
+    :param channel_data: Return value of
+        YouTubeChannelTabs.browse_channel().
+    :returns: The handle without the leading '@' (e.g. 'HistoryMatters'),
+        or None when vanityChannelUrl is missing, empty, or contains no
+        '/@' segment (legacy handle-less channels).
+    '''
+
+    metadata: dict = channel_data.get(
+        'metadata', {},
+    ).get('channelMetadataRenderer', {})
+    vanity_url: str | None = metadata.get('vanityChannelUrl')
+    if not vanity_url or '/@' not in vanity_url:
+        return None
+    handle: str = vanity_url.split('/@', 1)[1]
+    handle = handle.split('/', 1)[0].split('?', 1)[0]
+    return handle or None
+
+
+def fallback_handle(name: str) -> str:
+    '''
+    Deterministic fallback for channels with no canonical handle.
+    Strips leading '@' and whitespace, then lowercases. Used only
+    when YouTube returns no vanityChannelUrl for a channel. Never
+    used to paper over InnerTube failures.
+
+    :param name: The channel name or title to normalise.
+    :returns: Lowercased, stripped name.
+    :raises ValueError: When the result would be empty.
+    '''
+
+    result: str = name.strip().lstrip('@').strip().lower()
+    if not result:
+        raise ValueError(
+            f'fallback_handle produced empty result from {name!r}'
+        )
+    return result
+
+
 class YouTubeChannel:
     CHANNEL_URL: str = AsyncYouTubeClient.SCRAPE_URL + '/{channel_name}'
     CHANNEL_URL_WITH_AT: str = \
@@ -120,6 +164,7 @@ class YouTubeChannel:
 
         self.url: str | None = None
         self.title: str | None = None
+        self.canonical_handle: str | None = None
         if name:
             self.name = name.lstrip('@')
             self.url: str = YouTubeChannel.CHANNEL_URL_WITH_AT.format(
@@ -1040,6 +1085,8 @@ class YouTubeChannel:
 
         tabs = YouTubeChannelTabs(self.channel_id)
         page_data: dict[str, any] = await tabs.browse_channel()
+
+        self.canonical_handle = canonical_handle_from_browse(page_data)
 
         self.parse_channel_video_data(page_data)
 
