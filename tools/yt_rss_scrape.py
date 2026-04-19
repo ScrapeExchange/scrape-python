@@ -219,6 +219,36 @@ class RssSettings(YouTubeScraperSettings):
             'are only transiently unreachable.'
         ),
     )
+    eligibility_fraction: float = Field(
+        default=0.5,
+        validation_alias=AliasChoices(
+            'RSS_ELIGIBILITY_FRACTION',
+            'eligibility_fraction',
+        ),
+        description=(
+            'Fraction of the tier interval after '
+            'which a channel becomes eligible to be '
+            'RSS-fetched again. 0.5 means a channel '
+            're-enters the queue once half its tier '
+            'interval has elapsed since the last run. '
+            'Setting this < 1.0 introduces headroom '
+            'so the SLA panel can report on-time '
+            'fetches.'
+        ),
+    )
+
+    @field_validator('eligibility_fraction')
+    @classmethod
+    def _validate_eligibility_fraction(
+        cls, v: float,
+    ) -> float:
+        if not (0.0 < v <= 1.0):
+            raise ValueError(
+                'eligibility_fraction must be in '
+                f'(0.0, 1.0]; got {v!r}'
+            )
+        return v
+
     no_feeds_file: str = Field(
         default='yt-rss-reader-no-feeds.txt',
         validation_alias=AliasChoices(
@@ -1041,22 +1071,55 @@ def _log_channel_result(
         )
 
 
+def _is_on_time(
+    scheduled_time: float,
+    now: float,
+    interval_seconds: float,
+    eligibility_fraction: float,
+) -> bool:
+    '''Return True iff *now* is within the tier's
+    full target interval.
+
+    The queue score (*scheduled_time*) is set to
+    ``last_run + eligibility_fraction * interval``
+    by ``release()``, so the deadline for an on-time
+    fetch is::
+
+        scheduled + (1 - eligibility_fraction)
+                  * interval
+
+    which is equivalent to ``last_run + interval``.
+
+    With ``eligibility_fraction = 1.0`` the deadline
+    collapses to *scheduled_time* itself; combined
+    with the claim cutoff (``score <= now``) every
+    fetch is then overdue. That is the historical
+    behaviour and is mathematically correct: with no
+    scheduling headroom there is no room to be
+    on-time.
+    '''
+
+    deadline: float = (
+        scheduled_time
+        + (1.0 - eligibility_fraction) * interval_seconds
+    )
+    return now <= deadline
+
+
 def _record_tier_sla(
     tier: int,
     scheduled_time: float,
     now: float,
+    interval_seconds: float,
+    eligibility_fraction: float,
 ) -> None:
-    '''
-    Increment the on-time or overdue SLA counter.
-
-    Compares the current time against the queue score
-    (the time the channel was scheduled to be fetched).
-    If ``now <= scheduled_time`` the fetch is on-time;
-    otherwise it is overdue.
-    '''
+    '''Increment the on-time or overdue SLA counter.'''
 
     wid: str = get_worker_id()
-    if now <= scheduled_time:
+    if _is_on_time(
+        scheduled_time, now,
+        interval_seconds, eligibility_fraction,
+    ):
         METRIC_TIER_ON_TIME.labels(
             tier=str(tier), worker_id=wid,
         ).inc()
@@ -1346,9 +1409,15 @@ async def worker_loop(
                 tier: int = (
                     await creator_queue.get_tier(cid)
                 )
+                interval_seconds: float = (
+                    creator_queue.get_tier_interval(tier)
+                    * 3600
+                )
                 await creator_queue.release(cid)
                 _record_tier_sla(
                     tier, sched, process_now,
+                    interval_seconds,
+                    settings.eligibility_fraction,
                 )
 
         await _publish_queue_sizes(creator_queue)
@@ -1383,11 +1452,13 @@ async def _run_worker(
             settings.redis_dsn,
             get_worker_id(),
             platform='youtube',
+            eligibility_fraction=settings.eligibility_fraction,
         )
     else:
         creator_queue = FileCreatorQueue(
             settings.queue_file,
             settings.no_feeds_file,
+            eligibility_fraction=settings.eligibility_fraction,
         )
 
     creator_map_backend: CreatorMap

@@ -262,8 +262,11 @@ class CreatorQueue(ABC):
         Release a claim and re-enqueue the creator.
 
         The next check time is computed from the
-        creator's current tier:
-        ``now + tier.interval_hours * 3600``.
+        creator's current tier and the queue's
+        ``eligibility_fraction`` (set at construction
+        time, default ``1.0``):
+        ``now + tier.interval_hours * 3600
+        * eligibility_fraction``.
         '''
 
     @abstractmethod
@@ -284,6 +287,14 @@ class CreatorQueue(ABC):
     @abstractmethod
     async def get_tier(self, creator_id: str) -> int:
         '''Return the creator's current tier number.'''
+
+    @abstractmethod
+    def get_tier_interval(self, tier: int) -> float:
+        '''
+        Return the polling interval (in hours) for the
+        given tier. Falls back to the last (lowest)
+        tier's interval when the tier is unknown.
+        '''
 
     @abstractmethod
     async def next_due_time(self) -> float | None:
@@ -377,9 +388,11 @@ class FileCreatorQueue(CreatorQueue):
         self,
         queue_file: str,
         no_feeds_file: str,
+        eligibility_fraction: float = 1.0,
     ) -> None:
         self._queue_file: str = queue_file
         self._no_feeds_file: str = no_feeds_file
+        self._eligibility_fraction: float = eligibility_fraction
 
         # Per-tier heaps: tier number → heap of
         # (timestamp, name, creator_id).
@@ -631,6 +644,9 @@ class FileCreatorQueue(CreatorQueue):
                 return tc
         return self._tiers[-1]
 
+    def get_tier_interval(self, tier: int) -> float:
+        return self._tier_config(tier).interval_hours
+
     def _retier_existing(
         self,
         tiers: list[TierConfig],
@@ -790,7 +806,8 @@ class FileCreatorQueue(CreatorQueue):
         tc: TierConfig = self._tier_config(tier)
         now: float = datetime.now(UTC).timestamp()
         next_check: float = (
-            now + tc.interval_hours * 3600
+            now
+            + tc.interval_hours * 3600 * self._eligibility_fraction
         )
         name: str = self._names.get(
             creator_id, creator_id,
@@ -1039,6 +1056,7 @@ class RedisCreatorQueue(CreatorQueue):
         redis_dsn: str,
         worker_id: str,
         platform: str = 'youtube',
+        eligibility_fraction: float = 1.0,
     ) -> None:
         import redis.asyncio as aioredis
         self._redis: aioredis.Redis = (
@@ -1048,6 +1066,7 @@ class RedisCreatorQueue(CreatorQueue):
         )
         self._worker_id: str = worker_id
         self._platform: str = platform
+        self._eligibility_fraction: float = eligibility_fraction
 
         p: str = self._platform
         self._key_creators: str = (
@@ -1138,7 +1157,7 @@ class RedisCreatorQueue(CreatorQueue):
             )
         )
 
-    def _tier_interval(self, tier: int) -> float:
+    def get_tier_interval(self, tier: int) -> float:
         '''Return interval_hours for the given tier.'''
 
         for tc in self._tiers:
@@ -1430,9 +1449,12 @@ class RedisCreatorQueue(CreatorQueue):
         tier: int = (
             int(tier_str) if tier_str else fallback_tier
         )
-        interval: float = self._tier_interval(tier)
+        interval: float = self.get_tier_interval(tier)
         now: float = datetime.now(UTC).timestamp()
-        next_check: float = now + interval * 3600
+        next_check: float = (
+            now
+            + interval * 3600 * self._eligibility_fraction
+        )
         p: str = self._platform
         queue_key: str = f'rss:{p}:queue:{tier}'
         pipe = self._redis.pipeline()
