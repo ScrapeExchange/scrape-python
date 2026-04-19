@@ -146,7 +146,7 @@ class InnerTubeVideoParser:
 
         player_data: dict | None = None
         for attempt in range(1, max_retries + 1):
-            proxy, _ = await limiter.acquire(
+            proxy = await limiter.acquire(
                 YouTubeCallType.PLAYER, proxy=proxy
             )
             start: float = time.monotonic()
