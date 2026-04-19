@@ -217,16 +217,17 @@ def chunks_are_disjoint_cover(
     assigned: list[str] = [p for chunk in chunks for p in chunk]
     if len(assigned) != len(proxies):
         _LOGGER.error(
-            'Supervisor proxy split dropped or added proxies '
-            '(input_count=%d assigned_count=%d)',
-            len(proxies), len(assigned),
+            'Supervisor proxy split dropped or added proxies',
+            extra={
+                'input_count': len(proxies),
+                'assigned_count': len(assigned),
+            },
         )
         return False
     if len(set(assigned)) != len(assigned):
         _LOGGER.error(
-            'Supervisor proxy split produced overlapping chunks '
-            '(assigned_count=%d)',
-            len(assigned),
+            'Supervisor proxy split produced overlapping chunks',
+            extra={'assigned_count': len(assigned)},
         )
         return False
     if set(assigned) != set(proxies):
@@ -296,11 +297,14 @@ def spawn_children(
             if config.log_file_env_var:
                 child_env[config.log_file_env_var] = child_log_file
         _LOGGER.info(
-            'Spawning %s scraper child '
-            '(worker_instance=%d proxies_count=%d '
-            'metrics_port=%s log_file=%s)',
-            config.scraper_label, worker_instance, len(chunk),
-            child_env['METRICS_PORT'], child_log_file,
+            'Spawning scraper child',
+            extra={
+                'scraper': config.scraper_label,
+                'worker_instance': worker_instance,
+                'proxies_count': len(chunk),
+                'metrics_port': child_env['METRICS_PORT'],
+                'log_file': child_log_file,
+            },
         )
         children.append(subprocess.Popen(
             [sys.executable, script_path], env=child_env,
@@ -342,9 +346,12 @@ def _kill_children(
     '''Send SIGKILL to every still-running child in *pending*.'''
 
     _LOGGER.warning(
-        '%s supervisor grace period expired; '
-        'sending SIGKILL to %d remaining children',
-        scraper_label, len(pending),
+        'Supervisor grace period expired; sending SIGKILL '
+        'to remaining children',
+        extra={
+            'scraper': scraper_label,
+            'remaining_children': len(pending),
+        },
     )
     for child in pending:
         if child.poll() is None:
@@ -366,16 +373,18 @@ def _handle_child_exit(
     '''
 
     _LOGGER.info(
-        '%s scraper child exited '
-        '(pid=%d returncode=%s)',
-        scraper_label, child.pid, rc,
+        'Scraper child exited',
+        extra={
+            'scraper': scraper_label,
+            'pid': child.pid,
+            'returncode': rc,
+        },
     )
     if rc == 0:
         return 0
     _LOGGER.error(
-        'Child failed; terminating siblings '
-        '(pid=%d returncode=%s)',
-        child.pid, rc,
+        'Child failed; terminating siblings',
+        extra={'pid': child.pid, 'returncode': rc},
     )
     terminate_children(pending)
     return rc or 1
@@ -440,9 +449,11 @@ def install_signal_forwarders(
 
     def _forward_signal(signum: int, _frame: object) -> None:
         _LOGGER.info(
-            'Supervisor forwarding signal to children '
-            '(signum=%d children=%d)',
-            signum, len(children),
+            'Supervisor forwarding signal to children',
+            extra={
+                'signum': signum,
+                'children_count': len(children),
+            },
         )
         if (shutdown_state is not None
                 and shutdown_state.get('deadline') is None):
@@ -476,9 +487,8 @@ def run_supervisor(config: SupervisorConfig) -> int:
 
     if not config.proxies:
         _LOGGER.error(
-            '%s scraper num_processes > 1 requires PROXIES to '
-            'be set',
-            config.scraper_label,
+            'Scraper num_processes > 1 requires PROXIES to be set',
+            extra={'scraper': config.scraper_label},
         )
         return 1
 
@@ -487,8 +497,8 @@ def run_supervisor(config: SupervisorConfig) -> int:
     ]
     if not proxies:
         _LOGGER.error(
-            '%s scraper PROXIES is empty after parsing',
-            config.scraper_label,
+            'Scraper PROXIES is empty after parsing',
+            extra={'scraper': config.scraper_label},
         )
         return 1
 
@@ -514,33 +524,25 @@ def run_supervisor(config: SupervisorConfig) -> int:
                     )
                 )
                 _LOGGER.info(
-                    '%s supervisor acquired JWT for children',
-                    config.scraper_label,
+                    'Supervisor acquired JWT for children',
+                    extra={'scraper': config.scraper_label},
                 )
                 break
             except Exception as exc:
                 if delay > max_delay:
                     _LOGGER.critical(
-                        '%s supervisor failed to acquire '
-                        'JWT after retries; exiting',
-                        config.scraper_label,
-                        extra={
-                            'exc_type': (
-                                type(exc).__name__
-                            ),
-                            'exc': str(exc),
-                        },
+                        'Supervisor failed to acquire JWT '
+                        'after retries; exiting',
+                        exc=exc,
+                        extra={'scraper': config.scraper_label},
                     )
                     return 1
                 _LOGGER.warning(
-                    '%s supervisor JWT attempt failed, '
-                    'retrying in %.0fs',
-                    config.scraper_label, delay,
+                    'Supervisor JWT attempt failed, retrying',
+                    exc=exc,
                     extra={
-                        'exc_type': (
-                            type(exc).__name__
-                        ),
-                        'exc': str(exc),
+                        'scraper': config.scraper_label,
+                        'retry_in_seconds': delay,
                     },
                 )
                 time.sleep(delay)
@@ -548,9 +550,11 @@ def run_supervisor(config: SupervisorConfig) -> int:
 
     start_http_server(config.metrics_port)
     _LOGGER.info(
-        '%s supervisor metrics server started '
-        '(metrics_port=%d)',
-        config.scraper_label, config.metrics_port,
+        'Supervisor metrics server started',
+        extra={
+            'scraper': config.scraper_label,
+            'metrics_port': config.metrics_port,
+        },
     )
     publish_config_metrics(
         role='supervisor',

@@ -185,8 +185,8 @@ def _assert_local_filesystem(path: str) -> None:
     fs_type: str | None = _detect_fs_type(path)
     if fs_type is None:
         _LOGGER.warning(
-            'Could not determine filesystem type for %s; proceeding',
-            path,
+            'Could not determine filesystem type; proceeding',
+            extra={'path': str(path)},
         )
         return
     if fs_type in _REJECTED_FS_TYPES:
@@ -1074,9 +1074,8 @@ class RateLimiter(ABC, Generic[CallTypeT]):
                 resolved_state_dir,
             )
             _LOGGER.info(
-                'Rate limiter using shared-file '
-                'backend at %s',
-                resolved_state_dir,
+                'Rate limiter using shared-file backend',
+                extra={'state_dir': str(resolved_state_dir)},
             )
         else:
             backend = _InProcessBackend(
@@ -1226,8 +1225,12 @@ class RateLimiter(ABC, Generic[CallTypeT]):
                     break
                 METRIC_WAIT_EVENTS.labels(**labels).inc()
                 _LOGGER.debug(
-                    'Rate limiter: %s (proxy=%s) waiting %.2fs',
-                    call_type.value, proxy, wait,
+                    'Rate limiter waiting',
+                    extra={
+                        'call_type': call_type.value,
+                        'proxy': proxy,
+                        'wait_seconds': wait,
+                    },
                 )
                 lock.release()
                 try:
@@ -1243,8 +1246,12 @@ class RateLimiter(ABC, Generic[CallTypeT]):
         jitter: float = random.uniform(cfg.jitter_min, cfg.jitter_max)
         if jitter > 0:
             _LOGGER.debug(
-                'Rate limiter: %s (proxy=%s) jitter %.2fs',
-                call_type.value, proxy, jitter,
+                'Rate limiter jitter',
+                extra={
+                    'call_type': call_type.value,
+                    'proxy': proxy,
+                    'jitter_seconds': jitter,
+                },
             )
             await asyncio.sleep(jitter)
 
@@ -1268,6 +1275,10 @@ class RateLimiter(ABC, Generic[CallTypeT]):
             call_type, proxy, penalty_seconds,
         )
         _LOGGER.warning(
-            'Rate limiter: penalised %s (proxy=%s) by %.1fs',
-            call_type.value, proxy, penalty_seconds,
+            'Rate limiter penalised',
+            extra={
+                'call_type': call_type.value,
+                'proxy': proxy,
+                'penalty_seconds': penalty_seconds,
+            },
         )

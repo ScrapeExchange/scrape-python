@@ -81,7 +81,12 @@ def parse_nested_dicts(keys: list[str], data: dict[str, any],
 
     if not isinstance(data, final_type):
         _LOGGER.debug(
-            f'Expected value of {final_type} but got {type(data)}: {data}'
+            'Unexpected data type',
+            extra={
+                'expected_type': repr(final_type),
+                'actual_type': repr(type(data)),
+                'data': repr(data),
+            },
         )
         return None
 
@@ -112,7 +117,9 @@ def convert_number_string(number_text: str | int) -> int | None:
         return count
     except Exception as exc:
         _LOGGER.debug(
-            f'Could not convert text {number_text} to a number: {exc}'
+            'Could not convert text to a number',
+            exc=exc,
+            extra={'number_text': number_text},
         )
         return None
 
@@ -176,7 +183,10 @@ def parse_page_text(channel: str, page_text: str) -> dict[str, any]:
     soup = BeautifulSoup(page_text, 'html.parser')
     script = soup.find('script', string=CHANNEL_SCRAPE_REGEX_SHORT)
     if not script:
-        _LOGGER.debug(f'Did not find ytInitialData script for {channel}')
+        _LOGGER.debug(
+            'Did not find ytInitialData script for channel',
+            extra={'channel': channel},
+        )
         soup.decompose()
         return {}
 
@@ -189,7 +199,9 @@ def parse_page_text(channel: str, page_text: str) -> dict[str, any]:
         parsed_data: dict[str, any] = orjson.loads(raw_data)
     except orjson.JSONDecodeError as exc:
         _LOGGER.debug(
-            f'Failed parsing JSON data for channel {channel}: {exc}'
+            'Failed parsing JSON data for channel',
+            exc=exc,
+            extra={'channel': channel},
         )
         return {}
 
@@ -385,15 +397,22 @@ def load_known_channels(filepath: str) -> set[str]:
                     channel = channel[len(url_prefix):]
                 if '@' in channel:
                     _LOGGER.warning(
-                        f'Channel {channel} has @ mid-string, skipping'
+                        'Channel has @ mid-string, skipping',
+                        extra={'channel': channel},
                     )
                     continue
                 channel = channel.strip()
                 if channel:
                     known.add(channel)
     except FileNotFoundError:
-        _LOGGER.warning(f'Channel list {filepath} not found, starting empty')
-    _LOGGER.info(f'Loaded {len(known)} known channels from {filepath}')
+        _LOGGER.warning(
+            'Channel list not found, starting empty',
+            extra={'filepath': filepath},
+        )
+    _LOGGER.info(
+        'Loaded known channels',
+        extra={'count': len(known), 'filepath': filepath},
+    )
     return known
 
 
@@ -418,23 +437,33 @@ def load_discovered(filepath: str
                     record: dict = orjson.loads(line)
                 except orjson.JSONDecodeError as exc:
                     _LOGGER.warning(
-                        f'{filepath}:{lineno} skipping malformed JSON: {exc}'
+                        'Skipping malformed JSON',
+                        exc=exc,
+                        extra={'filepath': filepath, 'lineno': lineno},
                     )
                     continue
                 channel = record.get('channel')
                 if not channel:
                     _LOGGER.warning(
-                        f'{filepath}:{lineno} missing channel field'
+                        'Missing channel field',
+                        extra={'filepath': filepath, 'lineno': lineno},
                     )
                     continue
                 discovered[channel] = record.get('subs')
                 if record.get('source') == 'scrape':
                     fully_scraped.add(channel)
     except FileNotFoundError:
-        _LOGGER.info(f'{filepath} does not exist, starting fresh')
+        _LOGGER.info(
+            'Discovered-records file does not exist, starting fresh',
+            extra={'filepath': filepath},
+        )
     _LOGGER.info(
-        f'Resumed {len(discovered)} discovered records '
-        f'({len(fully_scraped)} fully scraped) from {filepath}'
+        'Resumed discovered records',
+        extra={
+            'discovered_count': len(discovered),
+            'fully_scraped_count': len(fully_scraped),
+            'filepath': filepath,
+        },
     )
     return discovered, fully_scraped
 
@@ -453,7 +482,9 @@ def load_failed(filepath: str) -> dict[str, dict]:
                     record: dict = orjson.loads(line)
                 except orjson.JSONDecodeError as exc:
                     _LOGGER.warning(
-                        f'{filepath}:{lineno} skipping malformed JSON: {exc}'
+                        'Skipping malformed JSON',
+                        exc=exc,
+                        extra={'filepath': filepath, 'lineno': lineno},
                     )
                     continue
                 channel = record.get('channel')
@@ -461,8 +492,14 @@ def load_failed(filepath: str) -> dict[str, dict]:
                     continue
                 failed[channel] = record
     except FileNotFoundError:
-        _LOGGER.info(f'{filepath} does not exist, starting fresh')
-    _LOGGER.info(f'Resumed {len(failed)} failed records from {filepath}')
+        _LOGGER.info(
+            'Failed-records file does not exist, starting fresh',
+            extra={'filepath': filepath},
+        )
+    _LOGGER.info(
+        'Resumed failed records',
+        extra={'count': len(failed), 'filepath': filepath},
+    )
     return failed
 
 
@@ -484,7 +521,11 @@ async def record_discovered(
         await out_fd.write(orjson.dumps(payload).decode('utf-8') + '\n')
         await out_fd.flush()
     except OSError as exc:
-        _LOGGER.warning(f'Failed to persist discovered record: {exc}')
+        _LOGGER.warning(
+            'Failed to persist discovered record',
+            exc=exc,
+            extra={'channel': channel},
+        )
 
 
 async def record_failed(channel: str, info: dict,
@@ -498,7 +539,11 @@ async def record_failed(channel: str, info: dict,
         await out_fd.write(orjson.dumps(payload).decode('utf-8') + '\n')
         await out_fd.flush()
     except OSError as exc:
-        _LOGGER.warning(f'Failed to persist failed record: {exc}')
+        _LOGGER.warning(
+            'Failed to persist failed record',
+            exc=exc,
+            extra={'channel': channel},
+        )
 
 
 def _is_channel_target(target: str) -> bool:
@@ -594,7 +639,11 @@ async def resolve_channel_paths(
             REDIS_CHANNEL_MAP_KEY, uc_ids
         )
     except Exception as exc:
-        _LOGGER.warning(f'Redis HMGET failed, skipping resolution: {exc}')
+        _LOGGER.warning(
+            'Redis HMGET failed, skipping resolution',
+            exc=exc,
+            extra={'uc_ids_count': len(uc_ids)},
+        )
         return page_links
 
     resolved_map: dict[str, str] = {}
@@ -726,8 +775,8 @@ def _build_initial_queue(
     to_scrape.extend(orphans)
     if orphans:
         _LOGGER.info(
-            f'Re-enqueued {len(orphans)} orphan '
-            f'link-only channels from resume'
+            'Re-enqueued orphan link-only channels from resume',
+            extra={'orphan_count': len(orphans)},
         )
 
     return to_scrape
@@ -757,11 +806,14 @@ async def discover(client: AsyncYouTubeClient,
         in_queue.discard(target)
 
         _LOGGER.info(
-            f'scraping {target} '
-            f'(queue={len(to_scrape)}, '
-            f'discovered={len(discovered)}, '
-            f'fully_scraped={len(fully_scraped)}, '
-            f'failed={len(failed)})'
+            'Scraping target',
+            extra={
+                'target': target,
+                'queue': len(to_scrape),
+                'discovered': len(discovered),
+                'fully_scraped': len(fully_scraped),
+                'failed': len(failed),
+            },
         )
 
         try:
@@ -772,7 +824,11 @@ async def discover(client: AsyncYouTubeClient,
                 )
             )
         except (ValueError, RuntimeError) as exc:
-            _LOGGER.info(f'failed {target}: {exc}')
+            _LOGGER.info(
+                'Target scrape failed',
+                exc=exc,
+                extra={'target': target, 'proxies': proxies},
+            )
             if target not in YOUTUBE_URLS:
                 await record_failed(
                     target,
@@ -796,8 +852,11 @@ async def discover(client: AsyncYouTubeClient,
                 )
             else:
                 _LOGGER.info(
-                    f'{target} below min-subs '
-                    f'({channel.subs}), not recorded'
+                    'Target below min-subs, not recorded',
+                    extra={
+                        'target': target,
+                        'subs': channel.subs,
+                    },
                 )
 
         await _enqueue_links(
@@ -870,10 +929,13 @@ async def main() -> None:
     failed: dict[str, str] = load_failed(settings.failed_channels)
 
     _LOGGER.info(
-        f'startup state: known={len(known_channels)}, '
-        f'discovered={len(discovered)}, '
-        f'fully_scraped={len(fully_scraped)}, '
-        f'failed={len(failed)}'
+        'Startup state',
+        extra={
+            'known': len(known_channels),
+            'discovered': len(discovered),
+            'fully_scraped': len(fully_scraped),
+            'failed': len(failed),
+        },
     )
 
     redis_client: redis_asyncio.Redis | None = None
@@ -884,13 +946,13 @@ async def main() -> None:
             )
             await redis_client.ping()
             _LOGGER.info(
-                f'Connected to Redis at '
-                f'{settings.redis_dsn}'
+                'Connected to Redis',
+                extra={'redis_dsn': settings.redis_dsn},
             )
         except Exception as exc:
             _LOGGER.warning(
-                f'Redis unavailable ({exc}); '
-                f'channel-id resolution disabled'
+                'Redis unavailable; channel-id resolution disabled',
+                exc=exc,
             )
             redis_client = None
 

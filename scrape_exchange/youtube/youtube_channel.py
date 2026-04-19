@@ -581,14 +581,21 @@ class YouTubeChannel:
         except ValueError:
             _LOGGER.warning(
                 'About page not found for channel',
-                extra={'channel': self.name, 'url': about_url}
+                extra={
+                    'channel': self.name,
+                    'url': about_url,
+                    'proxy': self.browse_client.proxy,
+                },
             )
             raise
         except Exception as exc:
             _LOGGER.warning(
                 'Error fetching about page for channel',
                 exc=exc,
-                extra={'channel': self.name},
+                extra={
+                    'channel': self.name,
+                    'proxy': self.browse_client.proxy,
+                },
             )
             raise RuntimeError(
                 f'Could not retrieve about page for channel {self.name}'
@@ -1034,7 +1041,7 @@ class YouTubeChannel:
             _LOGGER.debug(
                 'Failed to browse channel for ID',
                 exc=exc,
-                extra={'channel_id': channel_id},
+                extra={'channel_id': channel_id, 'proxy': proxy},
             )
             return None
 

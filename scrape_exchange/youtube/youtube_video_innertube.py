@@ -176,9 +176,14 @@ class InnerTubeVideoParser:
                         YouTubeCallType.NEXT, proxy, penalty
                     )
                     logging.warning(
-                        'InnerTube PLAYER 429 for %s (attempt %d/%d), '
-                        'penalty %.1fs',
-                        video.video_id, attempt, max_retries, penalty,
+                        'InnerTube PLAYER rate-limited',
+                        extra={
+                            'video_id': video.video_id,
+                            'attempt': attempt,
+                            'max_retries': max_retries,
+                            'penalty_seconds': penalty,
+                            'proxy': proxy,
+                        },
                     )
                     penalty = min(penalty * 2, _PLAYER_PENALTY_MAX)
                     if attempt == max_retries:
@@ -327,9 +332,14 @@ class InnerTubeVideoParser:
                         YouTubeCallType.PLAYER, proxy, _next_penalty
                     )
                     logging.warning(
-                        'InnerTube NEXT 429 for %s (attempt %d/%d), '
-                        'penalty %.1fs',
-                        video.video_id, attempt, max_retries, _next_penalty,
+                        'InnerTube NEXT rate-limited',
+                        extra={
+                            'video_id': video.video_id,
+                            'attempt': attempt,
+                            'max_retries': max_retries,
+                            'penalty_seconds': _next_penalty,
+                            'proxy': proxy,
+                        },
                     )
                     _next_penalty = min(
                         _next_penalty * 2, _PLAYER_PENALTY_MAX

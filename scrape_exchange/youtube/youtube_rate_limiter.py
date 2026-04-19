@@ -269,7 +269,7 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
             await asyncio.sleep(sleep_for)
             proxies: list[str | None] = self._proxies or [None]
             _LOGGER.info(
-                'Pre-emptively renewing cookies for %d proxy/proxies',
-                len(proxies),
+                'Pre-emptively renewing cookies for proxies',
+                extra={'proxy_count': len(proxies)},
             )
             await asyncio.gather(*[jar.force_renew(p) for p in proxies])

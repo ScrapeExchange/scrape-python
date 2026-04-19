@@ -189,7 +189,7 @@ class AsyncYouTubeClient(AsyncClient):
                 raise
             _LOGGER.debug(
                 'HTTP GET cancelled (curl_cffi internal)',
-                extra={'url': url}
+                extra={'url': url, 'proxy': self.proxy},
             )
             if retries > 0:
                 await asyncio.sleep(random.uniform(delay - 1, delay))
@@ -207,13 +207,17 @@ class AsyncYouTubeClient(AsyncClient):
             _LOGGER.debug(
                 'HTTP GET timeout',
                 exc=exc,
-                extra={'url': url},
+                extra={'url': url, 'proxy': self.proxy},
             )
             if retries > 0:
                 await asyncio.sleep(random.uniform(delay-1, delay))
                 _LOGGER.debug(
                     'Retrying GET request',
-                    extra={'url': url, 'retries_left': retries}
+                    extra={
+                        'url': url,
+                        'proxy': self.proxy,
+                        'retries_left': retries,
+                    },
                 )
                 return await self.get(
                     url, retries=retries - 1, delay=delay*2, **kwargs
@@ -228,7 +232,7 @@ class AsyncYouTubeClient(AsyncClient):
             _LOGGER.debug(
                 'HTTP GET request error',
                 exc=exc,
-                extra={'url': url},
+                extra={'url': url, 'proxy': self.proxy},
             )
             raise
         except Exception as exc:
@@ -239,13 +243,17 @@ class AsyncYouTubeClient(AsyncClient):
             _LOGGER.debug(
                 'HTTP GET error',
                 exc=exc,
-                extra={'url': url},
+                extra={'url': url, 'proxy': self.proxy},
             )
             if retries > 0:
                 await asyncio.sleep(random.uniform(delay-1, delay))
                 _LOGGER.debug(
                     'Retrying GET request',
-                    extra={'url': url, 'retries_left': retries}
+                    extra={
+                        'url': url,
+                        'proxy': self.proxy,
+                        'retries_left': retries,
+                    },
                 )
                 return await self.get(
                     url, retries=retries - 1, delay=delay*2, **kwargs
