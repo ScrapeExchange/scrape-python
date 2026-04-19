@@ -1582,5 +1582,79 @@ class TestToDictSchemaValidation(unittest.TestCase):
         self._validate(sample)
 
 
+class TestCanonicalHandleAttribute(unittest.IsolatedAsyncioTestCase):
+    '''canonical_handle is populated by scrape_channel_content.'''
+
+    async def test_canonical_handle_set_from_browse(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as save_dir:
+            channel: YouTubeChannel = YouTubeChannel(
+                name='input_casing',
+            )
+            channel.channel_id = 'UC1234567890abcdefghij'
+
+            browse_response: dict = {
+                'metadata': {
+                    'channelMetadataRenderer': {
+                        'vanityChannelUrl': (
+                            'http://www.youtube.com/@HistoryMatters'
+                        ),
+                    },
+                },
+            }
+
+            with patch(
+                'scrape_exchange.youtube.youtube_channel'
+                '.YouTubeChannelTabs',
+            ) as tabs_cls:
+                tabs_cls.return_value.browse_channel = AsyncMock(
+                    return_value=browse_response,
+                )
+                tabs_cls.return_value.scrape_loaded_tabs = AsyncMock(
+                    return_value=(
+                        set(), set(), set(), set(), set(), set(),
+                    ),
+                )
+                with patch.object(
+                    channel, 'parse_channel_video_data',
+                ):
+                    await channel.scrape_channel_content(
+                        save_dir=save_dir,
+                    )
+
+            self.assertEqual(
+                channel.canonical_handle, 'HistoryMatters',
+            )
+
+    async def test_canonical_handle_none_when_no_vanity(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as save_dir:
+            channel: YouTubeChannel = YouTubeChannel(name='legacy')
+            channel.channel_id = 'UC1234567890abcdefghij'
+
+            with patch(
+                'scrape_exchange.youtube.youtube_channel'
+                '.YouTubeChannelTabs',
+            ) as tabs_cls:
+                tabs_cls.return_value.browse_channel = AsyncMock(
+                    return_value={'metadata': {}},
+                )
+                tabs_cls.return_value.scrape_loaded_tabs = AsyncMock(
+                    return_value=(
+                        set(), set(), set(), set(), set(), set(),
+                    ),
+                )
+                with patch.object(
+                    channel, 'parse_channel_video_data',
+                ):
+                    await channel.scrape_channel_content(
+                        save_dir=save_dir,
+                    )
+
+            self.assertIsNone(channel.canonical_handle)
+
+
 if __name__ == '__main__':
     unittest.main()

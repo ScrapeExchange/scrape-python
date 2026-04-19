@@ -50,6 +50,18 @@ from scrape_exchange.youtube.youtube_video import YouTubeVideo
 from scrape_exchange.youtube.youtube_video import (
     DENO_PATH, PO_TOKEN_URL, YTDLP_CACHE_DIR,
 )
+from scrape_exchange.youtube.youtube_channel import (
+    YouTubeChannel,
+    fallback_handle,
+)
+from scrape_exchange.creator_map import (
+    CreatorMap,
+    FileCreatorMap,
+    NullCreatorMap,
+    RedisCreatorMap,
+    CREATOR_MAP_LOOKUP_TOTAL,
+    CREATOR_MAP_RESOLUTION_TOTAL,
+)
 from watchfiles import awatch, Change
 from scrape_exchange.youtube.settings import YouTubeScraperSettings
 
@@ -448,9 +460,20 @@ async def _run_worker(
     else:
         claim = NullContentClaim()
 
+    creator_map_backend: CreatorMap
+    if settings.redis_dsn:
+        creator_map_backend = RedisCreatorMap(
+            settings.redis_dsn,
+            platform='youtube',
+        )
+    else:
+        creator_map_backend = FileCreatorMap(
+            settings.channel_map_file,
+        )
+
     await worker_loop(
         settings, video_fm, claim,
-        ctx.client,
+        ctx.client, creator_map_backend,
     )
 
 
@@ -568,6 +591,7 @@ async def worker_loop(
     video_fm: AssetFileManagement,
     claim: ContentClaim,
     exchange_client: ExchangeClient | None = None,
+    creator_map_backend: CreatorMap | None = None,
 ) -> None:
     '''
     Main worker loop to continuously scrape and upload videos.
@@ -611,6 +635,11 @@ async def worker_loop(
             proxies[i % len(proxies)] for i in range(worker_count)
         ]
 
+    effective_creator_map: CreatorMap = (
+        creator_map_backend
+        if creator_map_backend is not None
+        else NullCreatorMap()
+    )
     tasks: list[Task] = []
     try:
         for proxy in worker_assignments:
@@ -618,6 +647,7 @@ async def worker_loop(
                 worker(
                     proxy, queue, settings, video_fm,
                     exchange_client, claim,
+                    effective_creator_map,
                 )
             )
             tasks.append(task)
@@ -891,6 +921,7 @@ async def worker(
     video_fm: AssetFileManagement,
     exchange_client: ExchangeClient | None,
     claim: ContentClaim,
+    creator_map_backend: CreatorMap,
 ) -> None:
     '''
     Worker function to process video files from the queue
@@ -1068,16 +1099,30 @@ async def worker(
             if (video is not None
                     and not settings.video_no_upload
                     and exchange_client is not None):
-                enqueued: bool = enqueue_upload_video(
-                    exchange_client, settings,
-                    video_fm, video.channel_name,
-                    video,
+                handle: str | None = (
+                    await resolve_video_upload_handle(
+                        video, creator_map_backend, proxy,
+                    )
                 )
-                if enqueued:
-                    files_uploaded += 1
-                    METRIC_VIDEOS_ENQUEUED.labels(
-                        worker_id=get_worker_id(),
-                    ).inc()
+                if handle is None:
+                    logging.info(
+                        'Video upload skipped: handle '
+                        'unresolved; file remains for retry',
+                        extra={
+                            'video_id': video.video_id,
+                            'channel_id': video.channel_id,
+                        },
+                    )
+                else:
+                    enqueued: bool = enqueue_upload_video(
+                        exchange_client, settings,
+                        video_fm, handle, video,
+                    )
+                    if enqueued:
+                        files_uploaded += 1
+                        METRIC_VIDEOS_ENQUEUED.labels(
+                            worker_id=get_worker_id(),
+                        ).inc()
 
             logging.debug(
                 'Worker progress',
@@ -1346,9 +1391,86 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
     return video, sleep
 
 
+async def resolve_video_upload_handle(
+    video: YouTubeVideo,
+    creator_map_backend: CreatorMap,
+    proxy: str | None,
+) -> str | None:
+    '''
+    Resolve the handle to use as platform_creator_id for *video*.
+
+    Read path:
+        1. Try the creator map by channel_id (hit → return it).
+        2. On miss, resolve via InnerTube. On success with a handle,
+           write to the map and return it.
+        3. On success without a handle (legacy channel), fall back to
+           fallback_handle(video.channel_name) and write to map.
+        4. On InnerTube failure, return None — caller must skip the
+           upload. Do NOT write to the map; the next tick retries.
+
+    :returns: The handle to use, or None when the upload should be
+        skipped.
+    '''
+
+    if not video.channel_id:
+        CREATOR_MAP_RESOLUTION_TOTAL.labels(
+            scraper='video', outcome='fallback',
+        ).inc()
+        return fallback_handle(video.channel_name or '')
+
+    cached: str | None = await creator_map_backend.get(
+        video.channel_id,
+    )
+    if cached:
+        CREATOR_MAP_LOOKUP_TOTAL.labels(
+            scraper='video', outcome='hit',
+        ).inc()
+        return cached
+
+    CREATOR_MAP_LOOKUP_TOTAL.labels(
+        scraper='video', outcome='miss',
+    ).inc()
+
+    try:
+        resolved: str | None = await YouTubeChannel.resolve_channel_id(
+            video.channel_id, proxy=proxy,
+        )
+    except Exception as exc:
+        logging.warning(
+            'Video scraper: InnerTube handle resolution failed; '
+            'skipping upload, will retry next tick',
+            exc_info=exc,
+            extra={
+                'video_id': video.video_id,
+                'channel_id': video.channel_id,
+            },
+        )
+        CREATOR_MAP_RESOLUTION_TOTAL.labels(
+            scraper='video', outcome='error',
+        ).inc()
+        return None
+
+    handle: str
+    if resolved:
+        handle = resolved
+        CREATOR_MAP_RESOLUTION_TOTAL.labels(
+            scraper='video', outcome='canonical',
+        ).inc()
+    else:
+        handle = fallback_handle(
+            video.channel_name or video.channel_id,
+        )
+        CREATOR_MAP_RESOLUTION_TOTAL.labels(
+            scraper='video', outcome='fallback',
+        ).inc()
+
+    await creator_map_backend.put(video.channel_id, handle)
+    return handle
+
+
 def enqueue_upload_video(
     client: ExchangeClient, settings: VideoSettings,
-    video_fm: AssetFileManagement, channel_name: str,
+    video_fm: AssetFileManagement, handle: str,
     video: YouTubeVideo,
 ) -> bool:
     '''
@@ -1362,6 +1484,8 @@ def enqueue_upload_video(
     the file stays in ``base_dir`` to be retried on the next
     iteration.
 
+    :param handle: Canonical channel handle to use as
+        platform_creator_id; must match the channel entity's handle.
     :returns: ``True`` if the job was enqueued, ``False`` if dropped.
     '''
 
@@ -1378,7 +1502,7 @@ def enqueue_upload_video(
             'source_url': video.url,
             'data': video.to_dict(),
             'platform_content_id': video.video_id,
-            'platform_creator_id': channel_name,
+            'platform_creator_id': handle,
             'platform_topic_id': None,
         },
         file_manager=video_fm,

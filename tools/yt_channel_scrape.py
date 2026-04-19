@@ -33,6 +33,8 @@ from scrape_exchange.creator_map import (
     CreatorMap,
     FileCreatorMap,
     RedisCreatorMap,
+    CREATOR_HANDLE_MISMATCH_TOTAL,
+    CREATOR_MAP_RESOLUTION_TOTAL,
 )
 from scrape_exchange.exchange_client import ExchangeClient
 
@@ -44,7 +46,10 @@ from scrape_exchange.scraper_runner import (
 )
 from scrape_exchange.settings import normalize_log_level
 
-from scrape_exchange.youtube.youtube_channel import YouTubeChannel
+from scrape_exchange.youtube.youtube_channel import (
+    YouTubeChannel,
+    fallback_handle,
+)
 from scrape_exchange.youtube.youtube_rate_limiter import YouTubeRateLimiter
 from scrape_exchange.youtube.youtube_video import DENO_PATH, PO_TOKEN_URL
 from scrape_exchange.worker_id import get_worker_id
@@ -379,12 +384,12 @@ async def _run_worker(
 
     if not settings.channel_no_upload:
         await upload_channels(
-            settings, ctx.client, fm,
+            settings, ctx.client, fm, creator_map_backend,
         )
 
     if settings.channel_upload_only:
         await _watch_and_upload_channels(
-            settings, ctx.client, fm,
+            settings, ctx.client, fm, creator_map_backend,
         )
     else:
         await scrape_channels(
@@ -546,7 +551,7 @@ async def scrape_channels(
                 )
                 failed: bool = await scrape_channel(
                     settings, client, fm,
-                    channel_name,
+                    channel_name, creator_map_backend,
                 )
                 if failed:
                     errors += 1
@@ -597,6 +602,7 @@ async def upload_channels(
     settings: ChannelSettings,
     client: ExchangeClient,
     fm: AssetFileManagement,
+    creator_map_backend: CreatorMap,
 ) -> None:
     files: list[str] = [
         f for f in fm.list_base(
@@ -615,7 +621,7 @@ async def upload_channels(
     )
     for filename in files:
         await _upload_single_channel(
-            filename, settings, client, fm,
+            filename, settings, client, fm, creator_map_backend,
         )
 
 
@@ -633,6 +639,7 @@ async def _upload_single_channel(
     settings: ChannelSettings,
     client: ExchangeClient,
     fm: AssetFileManagement,
+    creator_map_backend: CreatorMap,
 ) -> None:
     '''Upload a single channel file if it needs uploading.'''
 
@@ -657,8 +664,9 @@ async def _upload_single_channel(
             await fm.delete(filename, fail_ok=False)
             return
 
-        if enqueue_upload_channel(
+        if await enqueue_upload_channel(
             settings, client, fm, filename, channel,
+            creator_map_backend,
         ):
             METRIC_CHANNELS_ENQUEUED.labels(
                 worker_id=get_worker_id(),
@@ -675,6 +683,7 @@ async def _watch_and_upload_channels(
     settings: ChannelSettings,
     client: ExchangeClient,
     fm: AssetFileManagement,
+    creator_map_backend: CreatorMap,
 ) -> None:
     '''
     Upload-only watcher loop.  Watches
@@ -713,16 +722,23 @@ async def _watch_and_upload_channels(
             )
             await _upload_single_channel(
                 filename, settings, client, fm,
+                creator_map_backend,
             )
 
 
 def normalize_channel_name(channel_name: str) -> str:
     '''
-    Normalizes a YouTube channel name by stripping whitespace and converting
-    to lowercase.
+    Normalises a YouTube channel name extracted from user input by
+    stripping whitespace and a leading '@'. Also strips URL prefixes
+    and anything after an '@' when the input looks like an email
+    address.
+
+    Case is preserved: input at this stage may not yet be the
+    canonical handle. The canonical handle is resolved later by
+    resolve_channel_upload_handle() using YouTube's vanityChannelUrl.
 
     :param channel_name: The original channel name.
-    :returns: The normalized channel name.
+    :returns: The stripped channel name.
     '''
 
     name: str = channel_name.strip().lstrip('@')
@@ -754,7 +770,8 @@ def get_channel_filename(channel_name: str) -> str:
 
 
 async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
-                         fm: AssetFileManagement, channel_name: str) -> bool:
+                         fm: AssetFileManagement, channel_name: str,
+                         creator_map_backend: CreatorMap) -> bool:
     '''
     Scrapes a single YouTube channel and uploads it to the Scrape Exchange.
 
@@ -762,6 +779,8 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
     :param client: The Scrape Exchange client instance.
     :param fm: AssetFileManagement instance owning the channel data directory.
     :param channel_name: The name of the YouTube channel to scrape.
+    :param creator_map_backend: Shared CreatorMap for
+        channel_id → handle persistence.
     :returns: whether channel scraping/uploading failed
     :raises: (none)
     '''
@@ -975,8 +994,9 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
             return True
     # Fire-and-forget: background worker moves the file on success;
     # on queue full the file stays in base_dir for the next retry.
-    if enqueue_upload_channel(
+    if await enqueue_upload_channel(
         settings, client, fm, filename, channel,
+        creator_map_backend,
     ):
         METRIC_CHANNELS_ENQUEUED.labels(
             worker_id=get_worker_id()
@@ -984,9 +1004,51 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
     return False
 
 
-def enqueue_upload_channel(
+async def resolve_channel_upload_handle(
+    channel: YouTubeChannel, creator_map_backend: CreatorMap,
+) -> str:
+    '''
+    Resolve the handle to use for uploading *channel*.
+
+    Prefers ``channel.canonical_handle`` (set by scrape_channel_content
+    from YouTube's vanityChannelUrl). Falls back to fallback_handle()
+    on the channel's current name when no canonical handle exists.
+    Writes the result to the creator map so RSS/video scrapers can
+    read it.
+
+    :param channel: The scraped channel.
+    :param creator_map_backend: Shared creator map backend.
+    :returns: The handle to use for the upload.
+    '''
+
+    handle: str
+    if channel.canonical_handle:
+        handle = channel.canonical_handle
+        CREATOR_MAP_RESOLUTION_TOTAL.labels(
+            scraper='channel', outcome='canonical',
+        ).inc()
+    else:
+        handle = fallback_handle(channel.name)
+        CREATOR_MAP_RESOLUTION_TOTAL.labels(
+            scraper='channel', outcome='fallback',
+        ).inc()
+
+    if channel.name != handle:
+        CREATOR_HANDLE_MISMATCH_TOTAL.labels(
+            scraper='channel',
+        ).inc()
+
+    if channel.channel_id:
+        await creator_map_backend.put(
+            channel.channel_id, handle,
+        )
+    return handle
+
+
+async def enqueue_upload_channel(
     settings: ChannelSettings, client: ExchangeClient,
     fm: AssetFileManagement, filename: str, channel: YouTubeChannel,
+    creator_map_backend: CreatorMap,
 ) -> bool:
     '''
     Fire-and-forget upload of a scraped channel to Scrape Exchange.
@@ -1001,8 +1063,14 @@ def enqueue_upload_channel(
     :returns: ``True`` if the job was enqueued, ``False`` if dropped.
     '''
 
+    handle: str = await resolve_channel_upload_handle(
+        channel, creator_map_backend,
+    )
+    channel.name = handle
+
     logging.info(
-        'Enqueuing channel for upload', extra={'channel_name': channel.name}
+        'Enqueuing channel for upload',
+        extra={'channel_name': channel.name},
     )
     return client.enqueue_upload(
         f'{settings.exchange_url}{client.POST_DATA_API}',
@@ -1071,12 +1139,12 @@ async def read_channels(
                     line = line[0].upper() + line[1].upper() + line[2:]
             elif (line.startswith('{') and line.endswith('}')
                     and ('channel' in line)):
-                # JSONL, perhaps created with yt_discover_channels.py
+                # JSONL, perhaps created with yt_discover_channels.py.
+                # The authoritative map write happens post-scrape in
+                # resolve_channel_upload_handle using YouTube's
+                # canonical handle; the user-supplied casing here is
+                # not written.
                 data: dict[str, str | int] = json.loads(line)
-                if data.get('channel') and data.get('channel_id'):
-                    await creator_map_backend.put(
-                        data['channel_id'], data['channel']
-                    )
                 line = data.get('channel', line)
 
             channel_name: str | None = None
