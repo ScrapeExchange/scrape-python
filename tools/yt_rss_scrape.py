@@ -209,7 +209,7 @@ class RssSettings(YouTubeScraperSettings):
         description='Path to JSON file for persisting the channel queue',
     )
     rss_max_no_feed_failures: int = Field(
-        default=3,
+        default=10,
         validation_alias=AliasChoices(
             'RSS_MAX_NO_FEED_FAILURES',
             'rss_max_no_feed_failures',
@@ -220,7 +220,9 @@ class RssSettings(YouTubeScraperSettings):
             'silently degrades RSS feeds for flagged '
             'IPs, so a higher threshold avoids '
             'permanently blacklisting channels that '
-            'are only transiently unreachable.'
+            'are only transiently unreachable. A single '
+            'successful RSS fetch clears the counter via '
+            'clear_no_feeds().'
         ),
     )
     eligibility_fraction: float = Field(
@@ -1326,6 +1328,17 @@ async def worker_loop(
     )
     added: int = await creator_queue.populate(
         channel_map_data, channel_fm, tiers, subscriber_counts,
+    )
+    # Re-enqueue creators whose tier hash entry exists but
+    # which are missing from every tier zset (abandoned
+    # claims from worker crashes, stale state from older
+    # schema versions, etc.). Runs once at startup after
+    # populate so repopulation and recovery complete before
+    # workers start claiming.
+    recovered: int = await creator_queue.cleanup_stale_claims()
+    logging.info(
+        'Recovered orphan creators at startup',
+        extra={'recovered_count': recovered},
     )
     queue_size: int = await creator_queue.queue_size()
     METRIC_CHANNEL_MAP_SIZE.labels(
