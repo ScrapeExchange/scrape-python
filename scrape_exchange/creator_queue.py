@@ -1465,6 +1465,18 @@ class RedisCreatorQueue(CreatorQueue):
             queue_key,
             {creator_id: next_check},
         )
+        # Self-heal: if the tier hash had no entry for this
+        # creator, write the fallback so the cid never ends
+        # up as a zset orphan (in queue:N but missing from
+        # _key_tiers). Historical schema drift and partial
+        # failures produce such orphans; this keeps the two
+        # data structures in sync going forward.
+        if tier_str is None:
+            pipe.hset(
+                self._key_tiers,
+                creator_id,
+                str(tier),
+            )
         await pipe.execute()
 
     async def update_tier(
