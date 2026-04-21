@@ -2,10 +2,13 @@
 Docstring for scrape_exchange.util
 '''
 
+import re
 from datetime import datetime
 
 from .datatypes import IngestStatus
 from .file_management import AssetFileManagement
+
+_PROXY_HOST_RE: re.Pattern[str] = re.compile(r'^[A-Za-z0-9._-]+$')
 
 
 def convert_number_string(number_text: str | int) -> int | None:
@@ -182,3 +185,43 @@ def split_quoted_string(text: str, delimiters: str = ', ') -> set[str]:
         result.add(''.join(current_token))
 
     return result
+
+
+def extract_proxy_ip(proxy: str) -> str:
+    '''
+    Extracts the IP address (or hostname) from a proxy URL for use as a
+    Prometheus label value or a log field. Strips the scheme and any
+    user:password@ prefix, then drops the port. Keeping only the host
+    portion avoids leaking proxy credentials into metrics and logs and
+    keeps Prometheus label cardinality bounded by the proxy pool size.
+
+    Examples::
+
+        extract_proxy_ip('http://127.0.0.1:8080')            -> '127.0.0.1'
+        extract_proxy_ip('http://user:pass@127.0.0.1:8080')  -> '127.0.0.1'
+        extract_proxy_ip('http://user:pass@127.0.0.1')       -> '127.0.0.1'
+        extract_proxy_ip('socks5://proxy.example:1080')      -> 'proxy.example'
+
+    :param proxy: The proxy URL.
+    :returns: Host portion of the URL.
+    :raises ValueError: On an IPv6 address (not yet supported), an
+        unparseable URL, or a host portion that doesn't look like a
+        valid hostname or IPv4 address.
+    '''
+
+    if proxy.count(':') > 3 or '[' in proxy:
+        raise ValueError(f'IPv6 addresses are not supported: {proxy}')
+
+    remainder: str = proxy
+    # Strip scheme.
+    if '://' in remainder:
+        remainder = remainder.split('://', 1)[1]
+    # Strip user:pass@ prefix before splitting off the port, so
+    # the ':' in 'user:pass' doesn't steal the first segment.
+    if '@' in remainder:
+        remainder = remainder.split('@', 1)[1]
+    # Drop :port if present.
+    host: str = remainder.split(':', 1)[0]
+    if not host or not _PROXY_HOST_RE.match(host):
+        raise ValueError(f'Invalid proxy URL: {proxy!r}')
+    return host

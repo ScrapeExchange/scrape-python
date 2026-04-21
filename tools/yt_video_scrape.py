@@ -353,6 +353,19 @@ class VideoSettings(YouTubeScraperSettings):
             'scraper-specific var is unset.'
         ),
     )
+    # overrdide the base ScraperSettings proxies field with an RSS-specific one
+    # pydantic-settings takes the value of the first matching alias
+    proxies: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            'VIDEO_PROXIES', 'video_proxies', 'PROXIES', 'proxies'
+        ),
+        description=(
+            'Comma-separated list of proxy URLs to use for scraping (e.g. '
+            '"http://proxy1:port,http://proxy2:port"). If not set, no '
+            'proxy will be used.'
+        )
+    )
 
     @field_validator('video_log_level', mode='before')
     @classmethod

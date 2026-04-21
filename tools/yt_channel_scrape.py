@@ -45,6 +45,7 @@ from scrape_exchange.scraper_runner import (
     ScraperRunner,
 )
 from scrape_exchange.settings import normalize_log_level
+from scrape_exchange.util import extract_proxy_ip
 
 from scrape_exchange.youtube.youtube_channel import (
     YouTubeChannel,
@@ -187,6 +188,19 @@ class ChannelSettings(YouTubeScraperSettings):
             'scraper-specific var is unset.'
         ),
     )
+    # overrdide the base ScraperSettings proxies field with an RSS-specific one
+    # pydantic-settings takes the value of the first matching alias
+    proxies: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            'CHANNEL_PROXIES', 'channel_proxies', 'PROXIES', 'proxies'
+        ),
+        description=(
+            'Comma-separated list of proxy URLs to use for scraping (e.g. '
+            '"http://proxy1:port,http://proxy2:port"). If not set, no '
+            'proxy will be used.'
+        )
+    )
 
     @field_validator('channel_log_level', mode='before')
     @classmethod
@@ -228,7 +242,7 @@ METRIC_UPLOADED_FILE_EXISTS = Counter(
 METRIC_CHANNELS_SCRAPED = Counter(
     'yt_channel_scraped_total',
     'Number of channels successfully scraped',
-    ['worker_id'],
+    ['worker_id', 'proxy_ip'],
 )
 METRIC_CHANNELS_ENQUEUED = Counter(
     'yt_channel_enqueued_total',
@@ -240,7 +254,7 @@ METRIC_CHANNELS_ENQUEUED = Counter(
 METRIC_SCRAPE_FAILURES = Counter(
     'yt_channel_scrape_failures_total',
     'Number of times channel scraping failed',
-    ['worker_id'],
+    ['worker_id', 'proxy_ip'],
 )
 METRIC_CHANNEL_IDS_TO_RESOLVE = Gauge(
     'yt_channel_ids_to_resolve',
@@ -261,7 +275,7 @@ METRIC_CHANNEL_NO_CONTENT_FOUND = Counter(
     'yt_channel_no_content_found_total',
     'Number of channels scraped that had no videos, playlists, courses, '
     'podcasts, or products',
-    ['worker_id'],
+    ['worker_id', 'proxy_ip'],
 )
 
 # -- upload-only watcher metrics --
@@ -785,24 +799,22 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
     :raises: (none)
     '''
 
-    logging.debug(
-        'Processing channel', extra={'channel_name': channel_name}
-    )
+    extra: dict[str, str] = {'channel_name': channel_name}
+    logging.debug('Processing channel', extra=extra)
     channel: YouTubeChannel | None = None
     filename: str = get_channel_filename(channel_name)
     base_path: Path = fm.base_dir / filename
     uploaded_path: Path = fm.uploaded_dir / filename
     failed_path: Path = fm.base_dir / f'{filename}.failed'
 
+    extra['filename'] = filename
     upload_mtime: float = 0
     if uploaded_path.exists():
         upload_mtime = uploaded_path.stat().st_mtime
         logging.debug(
-            'Found uploaded path for channel',
-            extra={
-                'uploaded_path': uploaded_path,
-                'channel_name': channel_name,
-            },
+            'Found uploaded path for channel', extra=extra | {
+                'uploaded_path': str(uploaded_path),
+            }
         )
 
     saved_path: Path = base_path
@@ -811,16 +823,14 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
         saved_mtime = base_path.stat().st_mtime
         logging.debug(
             'Found base path for channel',
-            extra={
-                'base_path': base_path,
-                'channel_name': channel_name,
+            extra=extra | {
+                'base_path': str(base_path),
             },
         )
     if failed_path.exists():
         logging.debug(
             'Found previously failed upload file for channel, '
-            'skipping',
-            extra={'channel_name': channel_name},
+            'skipping', extra=extra | {'failed_path': str(failed_path)}
         )
         saved_path = failed_path
         saved_mtime = failed_path.stat().st_mtime
@@ -828,8 +838,7 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
     if upload_mtime:
         if saved_mtime and upload_mtime >= saved_mtime:
             logging.debug(
-                'Channel already uploaded, skipping',
-                extra={'channel_name': channel_name},
+                'Channel already uploaded, skipping', extra=extra
             )
             await fm.delete(saved_path.name, fail_ok=False)
 
@@ -838,8 +847,7 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
 
     if not saved_mtime:
         logging.debug(
-            'Channel not scraped, scraping now',
-            extra={'channel_name': channel_name},
+            'Channel not scraped, scraping now', extra=extra,
         )
         channel = YouTubeChannel(
             name=channel_name, deno_path=DENO_PATH,
@@ -848,20 +856,14 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
             with_download_client=False
         )
         try:
-            logging.info(
-                'Scraping channel',
-                extra={'channel_name': channel_name},
-            )
+            logging.info('Scraping channel', extra=extra)
             await channel.scrape(
                 with_about_page=True,
                 max_videos_per_channel=0,
                 proxies=settings.proxies,
             )
         except ValueError:
-            logging.debug(
-                'Channel not found, skipping',
-                extra={'channel_name': channel_name},
-            )
+            logging.debug('Channel not found, skipping', extra=extra)
             try:
                 await fm.mark_not_found(
                     f'{CHANNEL_FILE_PREFIX}'
@@ -871,32 +873,41 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
             except OSError:
                 logging.warning(
                     'Failed to write not_found marker '
-                    'for channel',
-                    extra={
-                        'channel_name': channel_name,
-                    },
+                    'for channel', extra=extra,
                 )
             return False
         except asyncio.CancelledError:
             raise
         except RuntimeError as exc:
+            proxy_used: str | None = getattr(
+                channel.browse_client, 'proxy', None,
+            )
             METRIC_SCRAPE_FAILURES.labels(
-                worker_id=get_worker_id()
+                worker_id=get_worker_id(),
+                proxy_ip=(
+                    extract_proxy_ip(proxy_used)
+                    if proxy_used else 'none'
+                ),
             ).inc()
             logging.warning(
                 'Failed to scrape channel',
-                exc=exc,
-                extra={
-                    'channel_name': channel_name,
-                    'proxy': getattr(
-                        channel.browse_client, 'proxy', None,
-                    ),
-                },
+                exc=exc, extra=extra | {
+                    'proxy': proxy_used,
+                    'proxy_ip': extract_proxy_ip(proxy_used)
+                    if proxy_used else 'none'
+                }
             )
             return False
         except Exception as exc:
+            proxy_used = getattr(
+                channel.browse_client, 'proxy', None,
+            )
             METRIC_SCRAPE_FAILURES.labels(
-                worker_id=get_worker_id()
+                worker_id=get_worker_id(),
+                proxy_ip=(
+                    extract_proxy_ip(proxy_used)
+                    if proxy_used else 'none'
+                ),
             ).inc()
             logging.warning(
                 'Unexpected error while scraping '
@@ -904,19 +915,28 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
                 exc=exc,
                 extra={
                     'channel_name': channel_name,
-                    'proxy': getattr(
-                        channel.browse_client, 'proxy', None,
-                    ),
+                    'proxy': proxy_used,
                 },
             )
             return False
         finally:
+            # Capture the proxy used *before* we close the
+            # browse client so downstream metric emissions
+            # (CHANNEL_NO_CONTENT_FOUND, CHANNELS_SCRAPED)
+            # can still label by proxy_ip.
+            scrape_proxy: str | None = getattr(
+                channel.browse_client, 'proxy', None,
+            )
             # Close the browse client so its curl
             # transport releases sockets and buffers
             # immediately rather than waiting for GC.
             if (channel.browse_client is not None):
                 await channel.browse_client.aclose()
                 channel.browse_client = None
+        scrape_proxy_ip: str = (
+            extract_proxy_ip(scrape_proxy)
+            if scrape_proxy else 'none'
+        )
 
         if (not channel.video_ids and not channel.playlists
                 and not channel.courses
@@ -929,12 +949,14 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
                     extra={'channel_name': channel_name},
                 )
             METRIC_CHANNEL_NO_CONTENT_FOUND.labels(
-                worker_id=get_worker_id()
+                worker_id=get_worker_id(),
+                proxy_ip=scrape_proxy_ip,
             ).inc()
             logging.info(
                 'YouTube channel content counts',
                 extra={
                     'channel_name': channel_name,
+                    'proxy_ip': scrape_proxy_ip,
                     'playlists_length': (
                         len(channel.playlists)
                     ),
@@ -967,11 +989,15 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
             )
             return True
         METRIC_CHANNELS_SCRAPED.labels(
-            worker_id=get_worker_id()
+            worker_id=get_worker_id(),
+            proxy_ip=scrape_proxy_ip,
         ).inc()
         logging.info(
             'Downloaded channel',
-            extra={'channel_name': channel_name},
+            extra={
+                'channel_name': channel_name,
+                'proxy_ip': scrape_proxy_ip,
+            },
         )
 
     if settings.channel_no_upload:

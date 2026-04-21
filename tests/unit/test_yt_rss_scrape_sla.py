@@ -123,6 +123,32 @@ class TestIsOnTime(unittest.TestCase):
             )
         )
 
+    def test_extract_proxy_ip(self) -> None:
+        '''Verify that the proxy IP is correctly extracted from the URL.'''
+        self.assertEqual(
+            yt_rss_scrape._extract_proxy_ip('http://127.0.0.1:8080'),
+            '127.0.0.1'
+        )
+        self.assertEqual(
+            yt_rss_scrape._extract_proxy_ip('http://user:pass@127.0.0.1:8080'),
+            '127.0.0.1'
+        )
+        self.assertEqual(
+            yt_rss_scrape._extract_proxy_ip('http://user:pass@127.0.0.1'),
+            '127.0.0.1'
+        )
+        self.assertRaises(
+            ValueError,
+            yt_rss_scrape._extract_proxy_ip,
+            'not a valid url'
+        )
+
+        self.assertRaises(
+            ValueError,
+            yt_rss_scrape._extract_proxy_ip,
+            'http://[1:2:3:4:5:6:7:8]:8080'
+        )
+
 
 if __name__ == '__main__':
     unittest.main()

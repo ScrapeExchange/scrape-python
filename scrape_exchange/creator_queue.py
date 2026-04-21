@@ -356,6 +356,37 @@ class CreatorQueue(ABC):
         (crash recovery).  Returns count recovered.
         '''
 
+    @abstractmethod
+    async def scan_and_recover_orphans(
+        self,
+        recover: bool = True,
+    ) -> dict[int, dict[str, int]]:
+        '''
+        Scan the tier membership, classify each creator
+        by state, and optionally re-enqueue orphans.
+
+        States, in classification priority order (first
+        match wins):
+
+        * ``queued``   — cid appears in any tier queue
+        * ``claimed``  — cid has an active claim key
+        * ``no_feeds`` — cid has a no_feeds entry
+        * ``orphan``   — cid is in the tiers record
+                         but none of the above
+
+        :param recover: When ``True`` (default), any
+            creator classified as ``orphan`` is
+            re-enqueued into the queue that matches its
+            tier hash entry. When ``False`` the method
+            is pure-read.
+
+        :returns: ``{tier: {state: count}}`` — the
+            per-tier, per-state breakdown captured
+            **before** recovery, so callers see the
+            per-cycle leak rate rather than
+            post-recovery zeros.
+        '''
+
 
 # -----------------------------------------------------------
 # File-backed implementation (single host)
@@ -923,6 +954,31 @@ class FileCreatorQueue(CreatorQueue):
         # File backend is single-process; claims
         # are in-memory and never stale.
         return 0
+
+    async def scan_and_recover_orphans(
+        self,
+        recover: bool = True,
+    ) -> dict[int, dict[str, int]]:
+        '''
+        Single-process queue cannot produce orphans.
+
+        Every cid in ``_creator_tiers`` is also in
+        ``_heaps[tier]``, so there is nothing to
+        recover. Returns all known cids as ``queued``
+        regardless of ``recover``.
+        '''
+
+        breakdown: dict[int, dict[str, int]] = {
+            tc.tier: {
+                'queued': 0, 'claimed': 0,
+                'no_feeds': 0, 'orphan': 0,
+            }
+            for tc in self._tiers
+        }
+        for cid, tier in self._creator_tiers.items():
+            if tier in breakdown:
+                breakdown[tier]['queued'] += 1
+        return breakdown
 
 
 # -----------------------------------------------------------
@@ -1628,3 +1684,120 @@ class RedisCreatorQueue(CreatorQueue):
                 str(last_tier),
             ],
         )
+
+    async def scan_and_recover_orphans(
+        self,
+        recover: bool = True,
+    ) -> dict[int, dict[str, int]]:
+        '''See ``CreatorQueue.scan_and_recover_orphans``.
+
+        Python-side HSCAN over ``_key_tiers`` in batches
+        of 500. For each batch, one Redis pipeline
+        issues ZSCORE against every tier queue plus
+        EXISTS for the claim and no_feeds keys. Orphan
+        recovery (if ``recover=True``) runs as a second
+        pipeline on the same batch.
+
+        Smaller pipelined batches are preferred over a
+        single blocking Lua scan (which
+        ``cleanup_stale_claims`` uses at boot) because
+        this method runs periodically — it must yield
+        control between batches so other Redis clients
+        are not held up.
+        '''
+
+        breakdown: dict[int, dict[str, int]] = {
+            tc.tier: {
+                'queued': 0, 'claimed': 0,
+                'no_feeds': 0, 'orphan': 0,
+            }
+            for tc in self._tiers
+        }
+        if not self._tiers:
+            return breakdown
+
+        valid_tiers: set[int] = set(breakdown.keys())
+        num_queues: int = len(self._key_queues)
+        ops_per_cid: int = num_queues + 2
+        now: float = datetime.now(UTC).timestamp()
+        cursor: int = 0
+
+        while True:
+            cursor, data = await self._redis.hscan(
+                self._key_tiers,
+                cursor,
+                count=500,
+            )
+            if data:
+                items: list[tuple[str, int]] = []
+                pipe = self._redis.pipeline()
+                for cid, tier_str in data.items():
+                    try:
+                        tier: int = int(tier_str)
+                    except (TypeError, ValueError):
+                        continue
+                    if tier not in valid_tiers:
+                        continue
+                    items.append((cid, tier))
+                    for key in self._key_queues:
+                        pipe.zscore(key, cid)
+                    pipe.exists(
+                        f'{self._claim_prefix}{cid}',
+                    )
+                    pipe.exists(
+                        f'{self._no_feeds_prefix}{cid}',
+                    )
+
+                if items:
+                    results: list = await pipe.execute()
+                    orphans: list[tuple[str, int]] = []
+                    for idx, (cid, tier) in (
+                        enumerate(items)
+                    ):
+                        offset: int = idx * ops_per_cid
+                        zscores: list = (
+                            results[
+                                offset:offset + num_queues
+                            ]
+                        )
+                        claim_exists: int = (
+                            results[offset + num_queues]
+                        )
+                        no_feeds_exists: int = (
+                            results[
+                                offset + num_queues + 1
+                            ]
+                        )
+                        if any(
+                            s is not None for s in zscores
+                        ):
+                            state: str = 'queued'
+                        elif claim_exists:
+                            state = 'claimed'
+                        elif no_feeds_exists:
+                            state = 'no_feeds'
+                        else:
+                            state = 'orphan'
+                            orphans.append((cid, tier))
+                        breakdown[tier][state] += 1
+
+                    if recover and orphans:
+                        rec_pipe = self._redis.pipeline()
+                        p: str = self._platform
+                        for cid, tier in orphans:
+                            # nx=True so a concurrent release()
+                            # that runs between scan and recovery
+                            # (writing a future next_check score)
+                            # is preserved — we only want to
+                            # re-enqueue truly absent creators.
+                            rec_pipe.zadd(
+                                f'rss:{p}:queue:{tier}',
+                                {cid: now},
+                                nx=True,
+                            )
+                        await rec_pipe.execute()
+
+            if cursor == 0:
+                break
+
+        return breakdown
