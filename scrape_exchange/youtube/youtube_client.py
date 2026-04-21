@@ -27,6 +27,7 @@ from httpx_curl_cffi import AsyncCurlTransport, CurlOpt
 from prometheus_client import Histogram
 
 from scrape_exchange.worker_id import get_worker_id
+from scrape_exchange.util import extract_proxy_ip
 from .youtube_rate_limiter import YouTubeRateLimiter, YouTubeCallType
 
 _LOGGER: Logger = getLogger(__name__)
@@ -41,13 +42,16 @@ _LOGGER: Logger = getLogger(__name__)
 METRIC_YT_REQUEST_DURATION: Histogram = Histogram(
     'youtube_client_request_duration_seconds',
     'Duration of requests to YouTube, by kind '
-    '(http/innertube) and HTTP status class.',
-    ['kind', 'status_class', 'worker_id'],
+    '(http/innertube), HTTP status class, and the '
+    'outbound proxy IP used.',
+    ['kind', 'status_class', 'worker_id', 'proxy_ip'],
     buckets=(
         0.1, 0.25, 0.5, 1.0, 2.5,
         5.0, 10.0, 30.0, 60.0,
     ),
 )
+
+YOUTUBE_DOMAIN: str = '.youtube.com'
 
 
 def _yt_status_class(status_code: int | None) -> str:
@@ -57,7 +61,6 @@ def _yt_status_class(status_code: int | None) -> str:
         return 'error'
     return f'{status_code // 100}xx'
 
-YOUTUBE_DOMAIN: str = '.youtube.com'
 
 # InnerTube client identity matching the WEB client that a real Chrome
 # browser sends on every YouTube page navigation and XHR request.
@@ -87,7 +90,8 @@ class AsyncYouTubeClient(AsyncClient):
     '''
     An HTTP client for connecting to YouTube.
     '''
-    SCRAPE_URL: str = 'https://www.youtube.com'
+
+    SCRAPE_URL: str = f'https://www{YOUTUBE_DOMAIN}'
 
     def __init__(self, consent_cookies: dict[str, str] = CONSENT_COOKIES,
                  proxies: list[str] | str | None = None,
@@ -119,9 +123,10 @@ class AsyncYouTubeClient(AsyncClient):
             self.proxy = None
 
         if self.proxy:
+            proxy_ip: str = extract_proxy_ip(self.proxy)
             _LOGGER.debug(
                 'Initializing AsyncYouTubeClient with proxy',
-                extra={'proxy': self.proxy}
+                extra={'proxy': self.proxy, 'proxy_ip': proxy_ip}
             )
         else:
             _LOGGER.warning('Initializing AsyncYouTubeClient without proxy')
@@ -172,7 +177,11 @@ class AsyncYouTubeClient(AsyncClient):
         await YouTubeRateLimiter.get().acquire(
             YouTubeCallType.HTML, proxy=self.proxy
         )
-        _LOGGER.debug('HTTP GET', extra={'url': url})
+        proxy_ip: str = (
+            extract_proxy_ip(self.proxy) if self.proxy else 'none'
+        )
+        extra: dict[str, str] = {'proxy_ip': proxy_ip, 'url': url}
+        _LOGGER.debug('HTTP GET', extra=extra)
         start: float = time.monotonic()
         try:
             resp: Response = await super().get(url, **kwargs)
@@ -180,6 +189,7 @@ class AsyncYouTubeClient(AsyncClient):
             METRIC_YT_REQUEST_DURATION.labels(
                 kind='http', status_class='error',
                 worker_id=get_worker_id(),
+                proxy_ip=proxy_ip,
             ).observe(time.monotonic() - start)
             # curl_cffi can raise CancelledError from its internal stream task
             # during cleanup even when the outer task is not being cancelled.
@@ -188,8 +198,7 @@ class AsyncYouTubeClient(AsyncClient):
             if task is not None and task.cancelling() > 0:
                 raise
             _LOGGER.debug(
-                'HTTP GET cancelled (curl_cffi internal)',
-                extra={'url': url, 'proxy': self.proxy},
+                'HTTP GET cancelled (curl_cffi internal)', extra=extra,
             )
             if retries > 0:
                 await asyncio.sleep(random.uniform(delay - 1, delay))
@@ -203,21 +212,14 @@ class AsyncYouTubeClient(AsyncClient):
             METRIC_YT_REQUEST_DURATION.labels(
                 kind='http', status_class='error',
                 worker_id=get_worker_id(),
+                proxy_ip=proxy_ip,
             ).observe(time.monotonic() - start)
-            _LOGGER.debug(
-                'HTTP GET timeout',
-                exc=exc,
-                extra={'url': url, 'proxy': self.proxy},
-            )
+            _LOGGER.debug('HTTP GET timeout', exc=exc, extra=extra)
             if retries > 0:
                 await asyncio.sleep(random.uniform(delay-1, delay))
                 _LOGGER.debug(
                     'Retrying GET request',
-                    extra={
-                        'url': url,
-                        'proxy': self.proxy,
-                        'retries_left': retries,
-                    },
+                    extra=extra | {'retries_left': retries, 'delay': delay},
                 )
                 return await self.get(
                     url, retries=retries - 1, delay=delay*2, **kwargs
@@ -228,32 +230,22 @@ class AsyncYouTubeClient(AsyncClient):
             METRIC_YT_REQUEST_DURATION.labels(
                 kind='http', status_class='error',
                 worker_id=get_worker_id(),
+                proxy_ip=proxy_ip,
             ).observe(time.monotonic() - start)
-            _LOGGER.debug(
-                'HTTP GET request error',
-                exc=exc,
-                extra={'url': url, 'proxy': self.proxy},
-            )
+            _LOGGER.debug('HTTP GET request error', exc=exc, extra=extra)
             raise
         except Exception as exc:
             METRIC_YT_REQUEST_DURATION.labels(
                 kind='http', status_class='error',
                 worker_id=get_worker_id(),
+                proxy_ip=proxy_ip,
             ).observe(time.monotonic() - start)
-            _LOGGER.debug(
-                'HTTP GET error',
-                exc=exc,
-                extra={'url': url, 'proxy': self.proxy},
-            )
+            _LOGGER.debug('HTTP GET error', exc=exc, extra=extra)
             if retries > 0:
                 await asyncio.sleep(random.uniform(delay-1, delay))
                 _LOGGER.debug(
                     'Retrying GET request',
-                    extra={
-                        'url': url,
-                        'proxy': self.proxy,
-                        'retries_left': retries,
-                    },
+                    extra=extra | {'retries_left': retries, 'delay': delay}
                 )
                 return await self.get(
                     url, retries=retries - 1, delay=delay*2, **kwargs
@@ -265,6 +257,7 @@ class AsyncYouTubeClient(AsyncClient):
             kind='http',
             status_class=_yt_status_class(resp.status_code),
             worker_id=get_worker_id(),
+            proxy_ip=proxy_ip,
         ).observe(time.monotonic() - start)
 
         if (resp.status_code == 303

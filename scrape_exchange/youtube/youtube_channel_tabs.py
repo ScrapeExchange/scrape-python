@@ -27,6 +27,7 @@ from .youtube_client import (
     generate_visitor_info,
 )
 from scrape_exchange.worker_id import get_worker_id
+from scrape_exchange.util import extract_proxy_ip
 from .youtube_cookiejar import YouTubeCookieJar
 from .youtube_rate_limiter import YouTubeRateLimiter, YouTubeCallType
 from .youtube_playlist import YouTubePlaylist
@@ -166,6 +167,7 @@ class YouTubeChannelTabs:
         posts: set[YouTubePost] = set()
         products: set[YouTubeProduct] = set()
 
+        extra: dict[str, str] = {'channel_id': self.channel_id}
         tab: dict[str, any]
         for tab in tabs:
             tab_renderer: dict[str, any] = tab.get('tabRenderer')
@@ -174,8 +176,7 @@ class YouTubeChannelTabs:
                 _LOGGER.debug(
                     'Channel has a tab without a tabRenderer, '
                     'skipping tab',
-                    extra={
-                        'channel_id': self.channel_id,
+                    extra=extra | {
                         'title': tab.get('title', ''),
                     }
                 )
@@ -196,28 +197,28 @@ class YouTubeChannelTabs:
                 playlists = self._get_playlist_items(page_tab)
                 _LOGGER.debug(
                     'Parsed playlists',
-                    extra={'playlists_length': len(playlists)}
+                    extra=extra | {'playlists_length': len(playlists)}
                 )
                 continue
             elif title == 'courses':
                 courses = self._get_course_items(page_tab)
                 _LOGGER.debug(
                     'Parsed courses',
-                    extra={'courses_length': len(courses)}
+                    extra=extra | {'courses_length': len(courses)}
                 )
                 continue
             elif title == 'posts':
                 posts = self._get_post_items(page_tab)
                 _LOGGER.debug(
                     'Parsed posts',
-                    extra={'posts_length': len(posts)}
+                    extra=extra | {'posts_length': len(posts)}
                 )
                 continue
             elif title == 'store':
                 products = self._get_product_items(page_tab)
                 _LOGGER.debug(
                     'Parsed merch products',
-                    extra={'products_length': len(products)}
+                    extra=extra | {'products_length': len(products)}
                 )
                 continue
 
@@ -230,10 +231,7 @@ class YouTubeChannelTabs:
             if not contents:
                 _LOGGER.debug(
                     'No contents found for channel tab',
-                    extra={
-                        'channel_id': self.channel_id,
-                        'title': title,
-                    }
+                    extra=extra | {'title': title}
                 )
                 continue
 
@@ -243,7 +241,7 @@ class YouTubeChannelTabs:
                 podcast_ids = self._get_podcast_ids(contents)
                 _LOGGER.debug(
                     'Parsed podcasts',
-                    extra={'podcast_ids_length': len(podcast_ids)}
+                    extra=extra | {'podcast_ids_length': len(podcast_ids)}
                 )
                 continue
 
@@ -253,7 +251,7 @@ class YouTubeChannelTabs:
 
             _LOGGER.debug(
                 'Parsed videos or shorts',
-                extra={'contents_length': len(contents)}
+                extra=extra | {'contents_length': len(contents)}
             )
             for content in contents:
                 video_id = self._extract_video_id(content, title)
@@ -287,7 +285,7 @@ class YouTubeChannelTabs:
 
                 _LOGGER.debug(
                     'Parsed videos or shorts',
-                    extra={
+                    extra=extra | {
                         'continuation_items_length': len(
                             continuation_items
                         )
@@ -505,13 +503,21 @@ class YouTubeChannelTabs:
         penalty: float = 4.0
         _PENALTY_MAX: float = 300.0
 
+        proxy_ip: str = (
+            extract_proxy_ip(self.proxy) if self.proxy else 'none'
+        )
+        extra: dict[str, str] = {
+            'channel_id': self.channel_id,
+            'proxy': self.proxy or 'none',
+            'proxy_ip': proxy_ip,
+        }
         for attempt in range(1, max_retries + 1):
             self.client_request_count += 1
             if self.client_request_count > MAX_KEEPALIVE_REQUESTS:
                 _LOGGER.debug(
                     'Client request count exceeded threshold, '
                     'creating new client',
-                    extra={
+                    extra=extra | {
                         'client_request_count': (
                             self.client_request_count
                         ),
@@ -520,35 +526,32 @@ class YouTubeChannelTabs:
                 self.client = self.get_innertube_client()
 
             await limiter.acquire(YouTubeCallType.BROWSE, proxy=self.proxy)
+
             start: float = time.monotonic()
             try:
+                result: dict
                 if not params:
                     if not continuation_token:
                         result = self.client.browse(self.channel_id)
                     else:
                         result = self.client.browse(
-                            self.channel_id,
-                            continuation=continuation_token,
+                            self.channel_id, continuation=continuation_token
                         )
                 else:
-                    result = self.client.browse(
-                        self.channel_id, params=params
-                    )
+                    result = self.client.browse(self.channel_id, params=params)
                 METRIC_YT_REQUEST_DURATION.labels(
                     kind='innertube',
                     status_class='2xx',
                     worker_id=get_worker_id(),
+                    proxy_ip=proxy_ip,
                 ).observe(time.monotonic() - start)
                 return result
             except InnerTubeRequestError as exc:
                 METRIC_YT_REQUEST_DURATION.labels(
                     kind='innertube',
-                    status_class=(
-                        '4xx'
-                        if exc.error.code == 429
-                        else 'error'
-                    ),
+                    status_class=('4xx' if exc.error.code == 429 else 'error'),
                     worker_id=get_worker_id(),
+                    proxy_ip=proxy_ip,
                 ).observe(time.monotonic() - start)
                 if exc.error.code == 429:
                     await limiter.penalise(
@@ -556,12 +559,10 @@ class YouTubeChannelTabs:
                     )
                     _LOGGER.warning(
                         'InnerTube BROWSE rate-limited',
-                        extra={
-                            'channel_id': self.channel_id,
+                        extra=extra | {
                             'attempt': attempt,
                             'max_retries': max_retries,
                             'penalty_seconds': penalty,
-                            'proxy': self.proxy
                         },
                     )
                     penalty = min(penalty * 2, _PENALTY_MAX)
@@ -571,11 +572,18 @@ class YouTubeChannelTabs:
                     _LOGGER.error(
                         'InnerTube BROWSE error',
                         exc=exc,
-                        extra={
-                            'channel_id': self.channel_id,
-                            'attempt': attempt,
-                            'max_retries': max_retries,
-                            'proxy': self.proxy
+                        extra=extra | {
+                            'attempt': attempt, 'max_retries': max_retries,
+                            'penalty_seconds': penalty,
+                        },
+                    )
+                    penalty = min(penalty * 2, _PENALTY_MAX)
+                    if attempt < max_retries:
+                        await AsyncYouTubeClient._delay(penalty, penalty)
+                    _LOGGER.error(
+                        'InnerTube BROWSE error',
+                        exc=exc, extra=extra | {
+                            'attempt': attempt, 'max_retries': max_retries,
                         },
                     )
                     if attempt < max_retries:
@@ -588,15 +596,14 @@ class YouTubeChannelTabs:
                     kind='innertube',
                     status_class='error',
                     worker_id=get_worker_id(),
+                    proxy_ip=proxy_ip,
                 ).observe(time.monotonic() - start)
                 _LOGGER.error(
                     'InnerTube BROWSE error',
                     exc=exc,
-                    extra={
-                        'channel_id': self.channel_id,
+                    extra=extra | {
                         'attempt': attempt,
                         'max_retries': max_retries,
-                        'proxy': self.proxy,
                     },
                 )
                 if attempt < max_retries:

@@ -3,6 +3,7 @@ Unit tests for scrape_exchange.creator_queue.FileCreatorQueue
 with the tier-aware interface.
 '''
 
+import copy
 import heapq
 import os
 import tempfile
@@ -801,6 +802,100 @@ class TestFileCreatorQueueEligibilityFraction(
             )
             self.assertGreaterEqual(ts, expected_min)
             self.assertLessEqual(ts, expected_max)
+
+
+class TestFileCreatorQueueScanAndRecoverOrphans(
+    unittest.IsolatedAsyncioTestCase,
+):
+    '''
+    FileCreatorQueue is single-process; every cid in
+    _creator_tiers is also in _heaps, so orphans are
+    impossible. The method returns all known cids as
+    ``queued`` regardless of the ``recover`` flag.
+    '''
+
+    def _queue(self) -> FileCreatorQueue:
+        tmp = tempfile.mkdtemp()
+        q: FileCreatorQueue = FileCreatorQueue(
+            queue_file=os.path.join(tmp, 'q.json'),
+            no_feeds_file=os.path.join(tmp, 'nf.tsv'),
+        )
+        q._tiers = [
+            TierConfig(
+                tier=1, min_subscribers=1_000_000,
+                interval_hours=4.0,
+            ),
+            TierConfig(
+                tier=2, min_subscribers=0,
+                interval_hours=24.0,
+            ),
+        ]
+        # Three cids in tier 1, one in tier 2.
+        q._heaps = {
+            1: [
+                (1.0, 'a', 'UC_a'),
+                (2.0, 'b', 'UC_b'),
+                (3.0, 'c', 'UC_c'),
+            ],
+            2: [(4.0, 'd', 'UC_d')],
+        }
+        q._creator_tiers = {
+            'UC_a': 1, 'UC_b': 1, 'UC_c': 1, 'UC_d': 2,
+        }
+        q._loaded = True
+        return q
+
+    async def test_returns_all_cids_as_queued(
+        self,
+    ) -> None:
+        q: FileCreatorQueue = self._queue()
+        breakdown: dict[int, dict[str, int]] = (
+            await q.scan_and_recover_orphans()
+        )
+        self.assertEqual(
+            breakdown,
+            {
+                1: {
+                    'queued': 3, 'claimed': 0,
+                    'no_feeds': 0, 'orphan': 0,
+                },
+                2: {
+                    'queued': 1, 'claimed': 0,
+                    'no_feeds': 0, 'orphan': 0,
+                },
+            },
+        )
+
+    async def test_recover_false_is_read_only(
+        self,
+    ) -> None:
+        q: FileCreatorQueue = self._queue()
+        before: dict[int, list[tuple[float, str, str]]] = (
+            copy.deepcopy(q._heaps)
+        )
+        await q.scan_and_recover_orphans(recover=False)
+        self.assertEqual(q._heaps, before)
+
+    async def test_empty_queue(self) -> None:
+        q: FileCreatorQueue = self._queue()
+        q._heaps = {1: [], 2: []}
+        q._creator_tiers = {}
+        breakdown: dict[int, dict[str, int]] = (
+            await q.scan_and_recover_orphans()
+        )
+        self.assertEqual(
+            breakdown,
+            {
+                1: {
+                    'queued': 0, 'claimed': 0,
+                    'no_feeds': 0, 'orphan': 0,
+                },
+                2: {
+                    'queued': 0, 'claimed': 0,
+                    'no_feeds': 0, 'orphan': 0,
+                },
+            },
+        )
 
 
 if __name__ == '__main__':
