@@ -332,5 +332,349 @@ class TestLoadProxiesFromFile(unittest.TestCase):
             self.assertTrue(p.startswith('http'))
 
 
+class TestRssCircuitBreaker(_InProcessTestBase):
+    '''
+    The RSS circuit breaker trips after a configurable number of
+    consecutive soft-ban signals (HTTP 404 on an RSS fetch) for a
+    given proxy, stalls RSS acquire() for that proxy for a
+    cooldown that doubles on each successive open up to a cap, and
+    resets on any RSS success.
+    '''
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._ev_patcher = patch.dict(
+            os.environ,
+            {
+                'YOUTUBE_RSS_CIRCUIT_THRESHOLD': '5',
+                'YOUTUBE_RSS_CIRCUIT_MIN_COOLDOWN_SECONDS': '300',
+                'YOUTUBE_RSS_CIRCUIT_MAX_COOLDOWN_SECONDS': '14400',
+            },
+            clear=False,
+        )
+        self._ev_patcher.start()
+        YouTubeRateLimiter.reset()
+
+    def tearDown(self) -> None:
+        self._ev_patcher.stop()
+        super().tearDown()
+
+    def test_circuit_closed_by_default(self) -> None:
+        limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
+        self.assertFalse(
+            limiter.is_rss_circuit_open('http://a:3128')
+        )
+
+    def test_circuit_opens_after_threshold_failures(self) -> None:
+        limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
+        proxy: str = 'http://a:3128'
+        for _ in range(4):
+            limiter.report_rss_failure(proxy)
+        self.assertFalse(limiter.is_rss_circuit_open(proxy))
+        limiter.report_rss_failure(proxy)
+        self.assertTrue(limiter.is_rss_circuit_open(proxy))
+
+    def test_non_tripping_failure_ignored(self) -> None:
+        limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
+        proxy: str = 'http://a:3128'
+        for _ in range(20):
+            limiter.report_rss_failure(
+                proxy, is_circuit_tripping=False,
+            )
+        self.assertFalse(limiter.is_rss_circuit_open(proxy))
+
+    def test_success_resets_counter(self) -> None:
+        limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
+        proxy: str = 'http://a:3128'
+        for _ in range(4):
+            limiter.report_rss_failure(proxy)
+        limiter.report_rss_success(proxy)
+        for _ in range(4):
+            limiter.report_rss_failure(proxy)
+        self.assertFalse(limiter.is_rss_circuit_open(proxy))
+
+    def test_per_proxy_isolation(self) -> None:
+        limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
+        for _ in range(5):
+            limiter.report_rss_failure('http://a:3128')
+        self.assertTrue(
+            limiter.is_rss_circuit_open('http://a:3128')
+        )
+        self.assertFalse(
+            limiter.is_rss_circuit_open('http://b:3128')
+        )
+
+    def test_first_cooldown_is_min_cooldown(self) -> None:
+        limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
+        proxy: str = 'http://a:3128'
+        with patch(
+            'scrape_exchange.youtube.youtube_rate_limiter.time.time',
+            return_value=1000.0,
+        ):
+            for _ in range(5):
+                limiter.report_rss_failure(proxy)
+            open_until: float = (
+                limiter._rss_circuit_open_until(proxy)
+            )
+        self.assertAlmostEqual(open_until - 1000.0, 300.0, delta=0.01)
+
+    def test_cooldown_doubles_on_successive_opens(self) -> None:
+        limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
+        proxy: str = 'http://a:3128'
+        with patch(
+            'scrape_exchange.youtube.youtube_rate_limiter.time.time',
+        ) as tm:
+            tm.return_value = 1000.0
+            for _ in range(5):
+                limiter.report_rss_failure(proxy)
+            first_until: float = (
+                limiter._rss_circuit_open_until(proxy)
+            )
+            tm.return_value = first_until + 1.0
+            for _ in range(5):
+                limiter.report_rss_failure(proxy)
+            second_until: float = (
+                limiter._rss_circuit_open_until(proxy)
+            )
+        first_duration: float = first_until - 1000.0
+        second_duration: float = second_until - (first_until + 1.0)
+        self.assertAlmostEqual(
+            second_duration, first_duration * 2.0, delta=0.01,
+        )
+
+    def test_cooldown_capped_at_max(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                'YOUTUBE_RSS_CIRCUIT_THRESHOLD': '2',
+                'YOUTUBE_RSS_CIRCUIT_MIN_COOLDOWN_SECONDS': '10',
+                'YOUTUBE_RSS_CIRCUIT_MAX_COOLDOWN_SECONDS': '40',
+            },
+            clear=False,
+        ):
+            YouTubeRateLimiter.reset()
+            limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
+            proxy: str = 'http://a:3128'
+            durations: list[float] = []
+            with patch(
+                'scrape_exchange.youtube.youtube_rate_limiter.time.time',
+            ) as tm:
+                now: float = 1000.0
+                for _ in range(6):
+                    tm.return_value = now
+                    limiter.report_rss_failure(proxy)
+                    limiter.report_rss_failure(proxy)
+                    open_until: float = (
+                        limiter._rss_circuit_open_until(proxy)
+                    )
+                    durations.append(open_until - now)
+                    now = open_until + 1.0
+        # Expected: 10, 20, 40, 40, 40, 40 (capped)
+        self.assertEqual(durations[0], 10.0)
+        self.assertEqual(durations[1], 20.0)
+        for d in durations[2:]:
+            self.assertEqual(d, 40.0)
+
+    def test_success_clears_consecutive_opens(self) -> None:
+        limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
+        proxy: str = 'http://a:3128'
+        with patch(
+            'scrape_exchange.youtube.youtube_rate_limiter.time.time',
+        ) as tm:
+            tm.return_value = 1000.0
+            for _ in range(5):
+                limiter.report_rss_failure(proxy)
+            first_until: float = (
+                limiter._rss_circuit_open_until(proxy)
+            )
+            tm.return_value = first_until + 1.0
+            limiter.report_rss_success(proxy)
+            for _ in range(5):
+                limiter.report_rss_failure(proxy)
+            new_until: float = (
+                limiter._rss_circuit_open_until(proxy)
+            )
+        # After success, the next trip must start from the min
+        # cooldown again, not continue the exponential.
+        self.assertAlmostEqual(
+            new_until - (first_until + 1.0), 300.0, delta=0.01,
+        )
+
+    def test_select_proxy_skips_open_circuit_for_rss(self) -> None:
+        limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
+        limiter.set_proxies([
+            'http://a:3128', 'http://b:3128', 'http://c:3128',
+        ])
+        for _ in range(5):
+            limiter.report_rss_failure('http://a:3128')
+        seen: set[str | None] = set()
+        for _ in range(30):
+            seen.add(limiter.select_proxy(YouTubeCallType.RSS))
+        self.assertNotIn('http://a:3128', seen)
+        self.assertEqual(
+            seen, {'http://b:3128', 'http://c:3128'},
+        )
+
+    def test_select_proxy_unaffected_for_non_rss(self) -> None:
+        limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
+        limiter.set_proxies(['http://a:3128', 'http://b:3128'])
+        for _ in range(5):
+            limiter.report_rss_failure('http://a:3128')
+        seen: set[str | None] = set()
+        for _ in range(50):
+            seen.add(limiter.select_proxy(YouTubeCallType.BROWSE))
+        # BROWSE circuit state is separate — proxy A still eligible.
+        self.assertIn('http://a:3128', seen)
+        self.assertIn('http://b:3128', seen)
+
+    def test_select_proxy_all_open_returns_earliest_to_reopen(
+        self,
+    ) -> None:
+        limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
+        proxies: list[str] = ['http://a:3128', 'http://b:3128']
+        limiter.set_proxies(proxies)
+        with patch(
+            'scrape_exchange.youtube.youtube_rate_limiter.time.time',
+        ) as tm:
+            tm.return_value = 1000.0
+            for _ in range(5):
+                limiter.report_rss_failure('http://a:3128')
+            tm.return_value = 1100.0
+            for _ in range(5):
+                limiter.report_rss_failure('http://b:3128')
+            # A trips at t=1000 → open until 1300
+            # B trips at t=1100 → open until 1400
+            # Both open while now < 1300; A is earliest.
+            tm.return_value = 1200.0
+            chosen: str | None = limiter.select_proxy(
+                YouTubeCallType.RSS
+            )
+        self.assertEqual(chosen, 'http://a:3128')
+
+
+class TestRssCircuitBreakerAcquire(unittest.IsolatedAsyncioTestCase):
+    '''acquire() must honour open RSS circuits.'''
+
+    def setUp(self) -> None:
+        self._env_patcher = patch.dict(
+            os.environ,
+            {
+                'RATE_LIMITER_STATE_DIR': '',
+                'YOUTUBE_RSS_CIRCUIT_THRESHOLD': '5',
+                'YOUTUBE_RSS_CIRCUIT_MIN_COOLDOWN_SECONDS': '300',
+                'YOUTUBE_RSS_CIRCUIT_MAX_COOLDOWN_SECONDS': '14400',
+            },
+            clear=False,
+        )
+        self._env_patcher.start()
+        YouTubeRateLimiter.reset()
+        self._jitter_patcher = patch(
+            'scrape_exchange.rate_limiter.random.uniform',
+            return_value=0.0,
+        )
+        self._jitter_patcher.start()
+        self._svc_patcher = patch.object(
+            YouTubeRateLimiter,
+            '_start_cookie_services',
+            return_value=None,
+        )
+        self._svc_patcher.start()
+
+    def tearDown(self) -> None:
+        self._jitter_patcher.stop()
+        self._svc_patcher.stop()
+        YouTubeRateLimiter.reset()
+        self._env_patcher.stop()
+
+    async def test_acquire_rss_skips_open_circuit_proxy(
+        self,
+    ) -> None:
+        limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
+        limiter.set_proxies(['http://a:3128', 'http://b:3128'])
+        for _ in range(5):
+            limiter.report_rss_failure('http://a:3128')
+        for _ in range(5):
+            chosen: str | None = await limiter.acquire(
+                YouTubeCallType.RSS,
+            )
+            self.assertEqual(chosen, 'http://b:3128')
+
+    async def test_acquire_rss_all_open_sleeps_until_reopen(
+        self,
+    ) -> None:
+        '''When all circuits are open, acquire() must sleep until
+        the earliest reopen time.'''
+        limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
+        limiter.set_proxies(['http://a:3128'])
+
+        fake_now: list[float] = [1000.0]
+
+        def fake_time() -> float:
+            return fake_now[0]
+
+        sleeps: list[float] = []
+
+        async def fake_sleep(s: float) -> None:
+            sleeps.append(s)
+            fake_now[0] += s
+
+        with patch(
+            'scrape_exchange.youtube.youtube_rate_limiter.time.time',
+            side_effect=fake_time,
+        ), patch(
+            'scrape_exchange.youtube.youtube_rate_limiter.asyncio.sleep',
+            new=fake_sleep,
+        ):
+            for _ in range(5):
+                limiter.report_rss_failure('http://a:3128')
+            # now=1000, open_until=1300
+            await limiter.acquire(YouTubeCallType.RSS)
+        # Must have slept roughly 300s to wait out the circuit.
+        self.assertGreaterEqual(sum(sleeps), 300.0)
+
+    async def test_acquire_non_rss_ignores_rss_circuit(
+        self,
+    ) -> None:
+        limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
+        limiter.set_proxies(['http://a:3128', 'http://b:3128'])
+        for _ in range(5):
+            limiter.report_rss_failure('http://a:3128')
+        seen: set[str | None] = set()
+        for _ in range(20):
+            seen.add(
+                await limiter.acquire(YouTubeCallType.BROWSE),
+            )
+        # BROWSE rate-limit is balanced by tokens, not circuit.
+        # Proxy A must still be reachable.
+        self.assertIn('http://a:3128', seen)
+
+
+class TestRssDefaultRate(unittest.TestCase):
+    '''
+    Guard against unintentional changes to the RSS bucket config.
+    The production RSS rate was halved to reduce soft-ban pressure
+    on the VPN-tunneled proxies.
+    '''
+
+    def test_rss_bucket_is_halved(self) -> None:
+        cfg = _DEFAULT_CONFIGS[YouTubeCallType.RSS]
+        self.assertEqual(cfg.burst, 8)
+        self.assertEqual(cfg.refill_rate, 0.5)
+
+
+class TestPlayerDefaultRate(unittest.TestCase):
+    '''
+    Guard against unintentional changes to the PLAYER bucket
+    config. The production player rate was halved alongside RSS
+    to reduce per-IP pressure during the soft-ban on the
+    VPN-tunneled proxies.
+    '''
+
+    def test_player_bucket_is_halved(self) -> None:
+        cfg = _DEFAULT_CONFIGS[YouTubeCallType.PLAYER]
+        self.assertEqual(cfg.burst, 2)
+        self.assertEqual(cfg.refill_rate, 10 / 60)
+
+
 if __name__ == '__main__':
     unittest.main()

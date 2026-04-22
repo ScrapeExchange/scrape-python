@@ -51,9 +51,7 @@ from scrape_exchange.youtube.youtube_rate_limiter import (
     YouTubeRateLimiter, YouTubeCallType
 )
 from scrape_exchange.youtube.youtube_video import YouTubeVideo
-from scrape_exchange.youtube.youtube_video_innertube import (
-    _parse_count as parse_count
-)
+
 from scrape_exchange.worker_id import get_worker_id
 from scrape_exchange.youtube.settings import YouTubeScraperSettings
 from scrape_exchange.creator_map import (
@@ -112,6 +110,12 @@ METRIC_QUEUE_SIZE = Gauge(
     'Number of channels in the processing queue',
     ['tier', 'worker_id'],
 )
+METRIC_NO_FEED_LIMIT_HIT = Counter(
+    'yt_rss_no_feed_limit_hit_total',
+    'Number of times a channel hit the no-feed failure limit',
+    ['worker_id', 'limit'],
+)
+
 METRIC_VIDEOS_ENQUEUED = Counter(
     'yt_rss_videos_enqueued_total',
     'Total number of videos successfully enqueued for background '
@@ -132,7 +136,7 @@ METRIC_API_VIDEO_CALLS = Counter(
 METRIC_RSS_FAILURES = Counter(
     'yt_rss_feed_download_failures_total',
     'Number of times an RSS feed could not be downloaded',
-    ['worker_id', 'proxy_ip'],
+    ['worker_id', 'proxy_ip', 'reason'],
 )
 METRIC_RSS_DOWNLOADED = Counter(
     'yt_rss_feeds_downloaded_total',
@@ -151,10 +155,15 @@ METRIC_CONCURRENCY = Gauge(
     'current batch',
     ['worker_id'],
 )
+METRIC_INNERTUBE_SUCCESS = Counter(
+    'yt_rss_innertube_success_total',
+    'Number of times an Innertube API call succeeded',
+    ['worker_id', 'proxy_ip', 'entity'],
+)
 METRIC_INNERTUBE_FAILURES = Counter(
     'yt_rss_innertube_call_failures_total',
     'Number of times an Innertube API call failed',
-    ['worker_id', 'proxy_ip'],
+    ['worker_id', 'proxy_ip', 'entity'],
 )
 METRIC_CHANNEL_SECONDS_SINCE_LAST_PROCESSED = Gauge(
     'yt_rss_channel_seconds_since_last_processed',
@@ -243,6 +252,38 @@ class RssSettings(YouTubeScraperSettings):
             'clear_no_feeds().'
         ),
     )
+    rss_max_no_feed_failures_had_feed: int = Field(
+        default=50,
+        validation_alias=AliasChoices(
+            'RSS_MAX_NO_FEED_FAILURES_HAD_FEED',
+            'rss_max_no_feed_failures_had_feed',
+        ),
+        description=(
+            'Threshold (consecutive RSS 404 '
+            'failures) before a channel is dropped '
+            'from the queue, when that channel has '
+            'previously served at least one '
+            'successful RSS feed. Intended to be '
+            'larger than rss_max_no_feed_failures so '
+            'that established channels are not lost '
+            'to transient YouTube soft-bans.'
+        ),
+    )
+    had_feed_file: str = Field(
+        default='yt-rss-reader-had-feed.txt',
+        validation_alias=AliasChoices(
+            'HAD_FEED_FILE', 'had_feed_file',
+        ),
+        description=(
+            'Path to file used by FileCreatorQueue '
+            'to persist the set of channel ids that '
+            'have ever successfully served an RSS '
+            'feed. Used to decide which threshold '
+            '(rss_max_no_feed_failures vs. '
+            'multiplier * rss_max_no_feed_failures) '
+            'applies to a given channel.'
+        ),
+    )
     # overrdide the base ScraperSettings proxies field with an RSS-specific one
     # pydantic-settings takes the value of the first matching alias
     proxies: str | None = Field(
@@ -296,22 +337,6 @@ class RssSettings(YouTubeScraperSettings):
             'logged (one channel name per line)'
         ),
     )
-    with_innertube: bool = Field(
-        default=True,
-        validation_alias=AliasChoices(
-            'WITH_INNERTUBE', 'with_innertube'
-        ),
-        description=(
-            'Whether to fetch additional video data from YouTube Innertube '
-            'API (default: True). If enabled, the worker will attempt to '
-            'fetch additional metadata for each video using the YouTube '
-            'Innertube API. If an Innertube request fails, the worker will '
-            'log the error and continue processing with the data obtained '
-            'from the RSS feed. Disable this feature if you want to retrieve '
-            'RSS feeds from many channels as it may get you rate-limited by '
-            'YouTube.'
-        ),
-    )
     min_interval: int = Field(
         default=MIN_CHANNEL_INTERVAL_SECONDS,
         validation_alias=AliasChoices(
@@ -339,8 +364,16 @@ class RssSettings(YouTubeScraperSettings):
             'RETRY_INTERVAL_SECONDS', 'retry_interval'
         ),
         description=(
-            f'Seconds before retrying a failed channel '
-            f'(default: {RETRY_INTERVAL_SECONDS})'
+            f'Minimum seconds before a failed channel '
+            f'is polled again. Applied as a floor on '
+            f'top of the tier interval: effective '
+            f'delay is '
+            f'max(tier.interval_hours*3600, '
+            f'retry_interval) after any failed '
+            f'process_channel attempt. Successful '
+            f'attempts ignore this and use the tier '
+            f'interval directly. Default: '
+            f'{RETRY_INTERVAL_SECONDS}.'
         ),
     )
     metrics_port: int = Field(
@@ -420,11 +453,18 @@ class RssSettings(YouTubeScraperSettings):
 _extract_proxy_ip = extract_proxy_ip
 
 
-async def fetch_rss(rss_url: str) -> list[YouTubeVideo] | None:
+async def fetch_rss(
+    rss_url: str,
+    channel_name_override: str | None = None,
+) -> list[YouTubeVideo] | None:
     '''
     Fetches and parses the YouTube RSS feed for a channel.
 
     :param rss_url: The URL of the YouTube RSS feed.
+    :param channel_name_override: Pre-resolved display name (usually
+        the canonical handle from the creator map) to stamp onto
+        every YouTubeVideo parsed from the feed. When None, the
+        author name embedded in each RSS entry is kept.
     :param proxy: Optional proxy URL for the HTTP request.
     :returns: A list of YouTubeVideo instances populated from the RSS feed.
     :raises: httpx.HTTPStatusError on non-2xx HTTP responses.
@@ -443,7 +483,7 @@ async def fetch_rss(rss_url: str) -> list[YouTubeVideo] | None:
         proxy_ip: str | None = _extract_proxy_ip(proxy) if proxy else None
     except ValueError as exc:
         logging.warning(
-            'Failed to parse proxy URL, proceeding without proxy',
+            'Failed to parse proxy URL to get proxy_ip for metrics labeling',
             exc=exc,
             extra={'proxy': proxy},
         )
@@ -456,16 +496,8 @@ async def fetch_rss(rss_url: str) -> list[YouTubeVideo] | None:
             response.raise_for_status()
             data: str = response.text
             logging.debug('Fetched RSS feed successfully', extra=extra)
+            YouTubeRateLimiter.get().report_rss_success(proxy)
     except httpx.HTTPStatusError as exc:
-        METRIC_RSS_FAILURES.labels(
-            worker_id=get_worker_id(), proxy_ip=proxy_ip
-        ).inc()
-        if exc.response.status_code == 404:
-            raise ValueError(f'RSS feed not found: {rss_url}') from exc
-        if exc.response.status_code == 500:
-            raise RuntimeError(
-                f'Server error fetching RSS feed: {rss_url}'
-            ) from exc
         logging.warning(
             'HTTP error fetching RSS feed',
             extra=extra | {
@@ -473,20 +505,43 @@ async def fetch_rss(rss_url: str) -> list[YouTubeVideo] | None:
                 'response_text': exc.response.text,
             },
         )
+        if exc.response.status_code == 404:
+            METRIC_RSS_FAILURES.labels(
+                worker_id=get_worker_id(), proxy_ip=proxy_ip,
+                reason='not_found'
+            ).inc()
+            YouTubeRateLimiter.get().report_rss_failure(
+                proxy, is_circuit_tripping=True,
+            )
+            raise ValueError(f'RSS feed not found: {rss_url}') from exc
+        if exc.response.status_code == 500:
+            METRIC_RSS_FAILURES.labels(
+                worker_id=get_worker_id(), proxy_ip=proxy_ip,
+                reason='server_error'
+            ).inc()
+            raise RuntimeError(
+                f'Server error fetching RSS feed: {rss_url}'
+            ) from exc
         raise
     except Exception as exc:
         METRIC_RSS_FAILURES.labels(
-            worker_id=get_worker_id(), proxy_ip=proxy_ip
+            worker_id=get_worker_id(), proxy_ip=proxy_ip,
+            reason='unknown'
         ).inc()
-        logging.debug('Getting RSS data failed', exc=exc)
+        logging.warning('Getting RSS data failed', exc=exc, extra=extra)
         raise
+
+    if not data:
+        METRIC_RSS_FAILURES.labels(
+            worker_id=get_worker_id(), proxy_ip=proxy_ip,
+            reason='no_data'
+        ).inc()
+        logging.warning('No data received from RSS feed', extra=extra)
+        raise RuntimeError(f'No data received from RSS feed {rss_url}')
 
     METRIC_RSS_DOWNLOADED.labels(
         worker_id=get_worker_id(), proxy_ip=proxy_ip
     ).inc()
-
-    if not data:
-        raise RuntimeError(f'No data received from RSS feed {rss_url}')
 
     feed: untangle.Element = untangle.parse(data)
     raw_entries: list | object = getattr(feed.feed, 'entry', [])
@@ -496,10 +551,15 @@ async def fetch_rss(rss_url: str) -> list[YouTubeVideo] | None:
     videos: list[YouTubeVideo] = []
     for entry in raw_entries:
         try:
-            video: YouTubeVideo = YouTubeVideo.from_rss_entry(entry)
+            video: YouTubeVideo = YouTubeVideo.from_rss_entry(
+                entry,
+                channel_name_override=channel_name_override,
+            )
             videos.append(video)
         except AttributeError as exc:
-            logging.warning('Skipping malformed RSS entry', exc=exc)
+            logging.warning(
+                'Skipping malformed RSS entry', exc=exc, extra=extra
+            )
 
     return videos
 
@@ -582,6 +642,7 @@ MSG_PROCESSED_VIDEOS: str = 'Processed videos for channel'
 
 async def _fetch_rss_safe(
     rss_url: str,
+    channel_name_override: str | None = None,
 ) -> list[YouTubeVideo] | None | Exception:
     '''
     Wrapper around :func:`fetch_rss` that captures
@@ -589,7 +650,10 @@ async def _fetch_rss_safe(
     ``asyncio.gather`` without aborting sibling tasks.
     '''
     try:
-        return await fetch_rss(rss_url)
+        return await fetch_rss(
+            rss_url,
+            channel_name_override=channel_name_override,
+        )
     except Exception as exc:
         return exc
 
@@ -626,9 +690,12 @@ async def _enrich_and_store_video(
         logging.debug(
             'Updated video using InnerTube data', extra=extra,
         )
+        METRIC_INNERTUBE_SUCCESS.labels(
+            worker_id=get_worker_id(), proxy_ip=proxy_ip, entity='video'
+        ).inc()
     except Exception as exc:
         METRIC_INNERTUBE_FAILURES.labels(
-            worker_id=get_worker_id(), proxy_ip=proxy_ip
+            worker_id=get_worker_id(), proxy_ip=proxy_ip, entity='video'
         ).inc()
         logging.warning(
             'Failed to get InnerTube video data, '
@@ -711,13 +778,11 @@ async def process_channel(
             worker_id=get_worker_id()
         ).set(elapsed)
         logging.debug(
-            'Processing channel',
-            extra=extra | {'elapsed': elapsed},
+            'Processing channel', extra=extra | {'elapsed': elapsed},
         )
     else:
         logging.debug(
-            'First time processing channel',
-            extra=extra,
+            'First time processing channel', extra=extra,
         )
 
     rss_url: str = YOUTUBE_RSS_URL.format(channel_id=channel_id)
@@ -732,19 +797,41 @@ async def process_channel(
     if no_feed_entry is not None:
         _: str
         rss_url, _, fail_count = no_feed_entry
-        if fail_count >= settings.rss_max_no_feed_failures:
+        threshold: int = settings.rss_max_no_feed_failures
+        if await creator_queue.has_had_feed(channel_id):
+            threshold = (
+                settings.rss_max_no_feed_failures_had_feed
+            )
+        if fail_count >= threshold:
             logging.debug(
                 'Channel has exceeded no-feed failure '
                 'threshold, removing from queue',
-                extra=extra | {'fail_count': fail_count},
+                extra=extra | {
+                    'fail_count': fail_count,
+                    'threshold': threshold,
+                },
             )
+            METRIC_NO_FEED_LIMIT_HIT.labels(
+                worker_id=get_worker_id(), limit='all',
+            ).inc()
             return None
         logging.debug(
             'Channel had missing RSS feed',
-            extra=extra | {'fail_count': fail_count},
+            extra=extra | {
+                'fail_count': fail_count,
+                'threshold': threshold,
+            },
         )
 
     CHANNEL_LAST_CHECKED[channel_id] = monotonic()
+
+    # Resolve the canonical channel handle from the creator
+    # map so fetch_rss can stamp it onto every YouTubeVideo
+    # it parses. None means the channel is not yet mapped —
+    # from_rss_entry falls back to the RSS <author><name>.
+    mapped_handle: str | None = (
+        await creator_map_backend.get(channel_id)
+    )
 
     # --- Phase 1: channel update + RSS fetch in parallel ---
     update_result: tuple[bool, int, str | None]
@@ -754,7 +841,10 @@ async def process_channel(
             client, channel_name, channel_id,
             creator_map_backend, proxy,
         ),
-        _fetch_rss_safe(rss_url),
+        _fetch_rss_safe(
+            rss_url,
+            channel_name_override=mapped_handle,
+        ),
     )
 
     update_ok: bool = update_result[0]
@@ -774,8 +864,8 @@ async def process_channel(
     # Handle RSS fetch errors.
     if isinstance(rss_result, RuntimeError):
         logging.debug(
-            'Server error fetching RSS feed, '
-            'will retry later', extra=extra | {'error': str(rss_result)}
+            'Server error fetching RSS feed',
+            extra=extra | {'error': str(rss_result)}
         )
         return True
     if isinstance(rss_result, Exception):
@@ -797,6 +887,8 @@ async def process_channel(
         )
         return False
 
+    await creator_queue.mark_had_feed(channel_id)
+
     no_feed_entry = await creator_queue.get_no_feeds(
         channel_id,
     )
@@ -805,8 +897,7 @@ async def process_channel(
 
     if not videos:
         logging.debug(
-            'No videos found in RSS feed for channel',
-            extra=extra,
+            'No videos found in RSS feed for channel', extra=extra
         )
         return True
 
@@ -939,12 +1030,10 @@ async def process_channel(
             videos_uploaded += 1
 
     missed: int = (
-        len(new_videos) - videos_uploaded
-        - videos_failed
+        len(new_videos) - videos_uploaded - videos_failed
     )
     logging.info(
-        MSG_PROCESSED_VIDEOS,
-        extra={
+        MSG_PROCESSED_VIDEOS, extra={
             'channel_name': channel_name,
             'videos_uploaded': videos_uploaded,
             'videos_existing': videos_existing,
@@ -989,6 +1078,7 @@ async def update_channel(
     '''
 
     try:
+        proxy_ip: str = _extract_proxy_ip(proxy) if proxy else 'none'
         tabs: YouTubeChannelTabs = YouTubeChannelTabs(channel_id, proxy)
         channel_data: dict = await tabs.browse_channel()
     except Exception as exc:
@@ -997,7 +1087,14 @@ async def update_channel(
             exc=exc,
             extra={'channel_name': channel_name, 'proxy': proxy},
         )
+        METRIC_INNERTUBE_FAILURES.labels(
+            worker_id=get_worker_id(), proxy_ip=proxy_ip, entity='channel'
+        ).inc()
         return False, 0, None
+
+    METRIC_INNERTUBE_SUCCESS.labels(
+        worker_id=get_worker_id(), proxy_ip=proxy_ip, entity='channel'
+    ).inc()
 
     canonical: str | None = canonical_handle_from_browse(channel_data)
     resolved_handle: str
@@ -1543,7 +1640,18 @@ async def worker_loop(
                     creator_queue.get_tier_interval(tier)
                     * 3600
                 )
-                await creator_queue.release(cid)
+                failed: bool = (
+                    result is False
+                    or isinstance(result, Exception)
+                )
+                retry_s: float | None = (
+                    float(settings.retry_interval)
+                    if failed else None
+                )
+                await creator_queue.release(
+                    cid,
+                    retry_interval_seconds=retry_s,
+                )
                 _record_tier_sla(
                     tier, sched, process_now,
                     interval_seconds,
@@ -1589,6 +1697,7 @@ async def _run_worker(
             settings.queue_file,
             settings.no_feeds_file,
             eligibility_fraction=settings.eligibility_fraction,
+            had_feed_file=settings.had_feed_file,
         )
 
     creator_map_backend: CreatorMap

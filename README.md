@@ -40,8 +40,8 @@ cp .env-example .env
 # settings in .env are overridden by the container paths
 # automatically, so you can leave them as-is.
 
-# Build the scraper image and start all services
-docker compose up -d --build
+# Start all services
+docker compose up -d
 ```
 
 This starts five services defined in `docker-compose.yml`:
@@ -63,18 +63,6 @@ docker compose up -d po-token-provider channel
 
 # Or just the RSS scraper
 docker compose up -d rss
-```
-
-Monitor the scrapers with:
-```bash
-# View logs for all services
-docker compose logs -f
-
-# View logs for a specific service
-docker compose logs -f video
-
-# Check service status
-docker compose ps
 ```
 
 ## Mapping host directories into containers

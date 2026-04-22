@@ -21,16 +21,15 @@ unauthenticated browser cookies acquired via :class:`YouTubeCookieJar`
 
     browse – ~150 req/min, burst 20
             (50% of 300/min valid-context soft limit)
-    player – ~30  req/min, burst 4
-            (30% of 100/min; yt-dlp extract_info
-             adds ~5 ungated sub-requests ≈160/min
-             effective load, 47% headroom)
+    player – ~10  req/min, burst 2
     next   – ~150 req/min, burst 20
             (50% of 300/min valid-context soft limit)
     html   – ~90  req/min, burst 10
             (50% of 180/min with-cookies soft limit)
-    rss    – ~60  req/min, burst 15
-            (plain XML, low risk)
+    rss    – ~30  req/min, burst 8
+            (halved from 60/min after sustained
+             HTTP 404 soft-ban pressure on
+             VPN-tunneled proxies)
     global – ~250 req/min aggregate across all types
             (83% of 300/min valid-context IP ceiling)
 
@@ -39,15 +38,52 @@ unauthenticated browser cookies acquired via :class:`YouTubeCookieJar`
 :license    : GPLv3
 '''
 
+import os
+import time
+import random
 import asyncio
 import logging
 
+from dataclasses import dataclass
 from enum import Enum
 from typing import ClassVar
+
+from prometheus_client import Counter, Gauge
 
 from scrape_exchange.rate_limiter import RateLimiter, _BucketConfig
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
+
+
+METRIC_RSS_CIRCUIT_OPENED: Counter = Counter(
+    'yt_rss_circuit_opened_total',
+    'Times the RSS circuit breaker tripped open for a proxy '
+    'after consecutive soft-ban (404) signals',
+    ['proxy'],
+)
+METRIC_RSS_CIRCUIT_STATE: Gauge = Gauge(
+    'yt_rss_circuit_open',
+    '1 while the RSS circuit is open for this proxy, 0 otherwise',
+    ['proxy'],
+)
+
+
+@dataclass
+class _RssCircuitState:
+    '''Per-proxy circuit-breaker state for RSS fetches.
+
+    :param consecutive_failures: running count of consecutive
+        circuit-tripping failures since the last success or trip.
+    :param open_until: wall-clock time at which the circuit
+        reopens. ``0.0`` means closed.
+    :param consecutive_opens: number of times the circuit has
+        opened without an intervening success. Used to compute the
+        exponential cooldown.
+    '''
+    consecutive_failures: int = 0
+    open_until: float = 0.0
+    consecutive_opens: int = 0
+
 
 # Renew cookies this many seconds before the TTL expires so there is never
 # a gap where all workers hit an expired cookie file simultaneously.
@@ -72,12 +108,8 @@ _DEFAULT_CONFIGS: dict[YouTubeCallType, _BucketConfig] = {
         burst=20, refill_rate=150 / 60,
         jitter_min=0.3, jitter_max=1.2,
     ),
-    # ~30 req/min (yt-dlp makes ~5 sub-requests per
-    # extract_info, so effective YouTube load is ~160 req/min
-    # per proxy — under the 300/min soft limit with 47%
-    # headroom)
     YouTubeCallType.PLAYER: _BucketConfig(
-        burst=4, refill_rate=30 / 60,
+        burst=2, refill_rate=10 / 60,
         jitter_min=1.0, jitter_max=3.0,
     ),
     # ~150 req/min
@@ -90,9 +122,9 @@ _DEFAULT_CONFIGS: dict[YouTubeCallType, _BucketConfig] = {
         burst=10, refill_rate=90 / 60,
         jitter_min=1.5, jitter_max=4.0,
     ),
-    # ~60 req/min (plain XML, low ban risk)
+    # ~30 req/min.
     YouTubeCallType.RSS: _BucketConfig(
-        burst=15, refill_rate=1.0,
+        burst=8, refill_rate=0.5,
         jitter_min=0.2, jitter_max=0.8,
     ),
 }
@@ -139,6 +171,27 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
             redis_dsn=redis_dsn,
         )
         self._renewal_task: asyncio.Task | None = None
+        # RSS circuit-breaker state. Keyed by the same proxy URL
+        # passed to :meth:`acquire` so that each VPN tunnel /
+        # direct-connection endpoint gets its own breaker.
+        self._rss_circuit: dict[str | None, _RssCircuitState] = {}
+        self._rss_circuit_threshold: int = int(
+            os.environ.get(
+                'YOUTUBE_RSS_CIRCUIT_THRESHOLD', '5',
+            )
+        )
+        self._rss_circuit_min_cooldown_s: float = float(
+            os.environ.get(
+                'YOUTUBE_RSS_CIRCUIT_MIN_COOLDOWN_SECONDS',
+                '300',
+            )
+        )
+        self._rss_circuit_max_cooldown_s: float = float(
+            os.environ.get(
+                'YOUTUBE_RSS_CIRCUIT_MAX_COOLDOWN_SECONDS',
+                '14400',
+            )
+        )
 
     def set_proxies(self, proxies: list[str] | str | None) -> None:
         '''
@@ -168,6 +221,122 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
                 task.cancel()
         super().reset()
 
+    def _rss_circuit_open_until(
+        self, proxy: str | None,
+    ) -> float:
+        state: _RssCircuitState | None = self._rss_circuit.get(proxy)
+        return state.open_until if state is not None else 0.0
+
+    def is_rss_circuit_open(self, proxy: str | None) -> bool:
+        '''Return True while the RSS circuit breaker is open for
+        *proxy* (i.e. further RSS requests should be withheld).'''
+        return self._rss_circuit_open_until(proxy) > time.time()
+
+    def report_rss_failure(
+        self, proxy: str | None,
+        is_circuit_tripping: bool = True,
+    ) -> None:
+        '''
+        Record an RSS failure for *proxy* and trip the circuit
+        breaker if the consecutive-failure threshold has been
+        reached.
+
+        :param is_circuit_tripping: ``True`` for failures that
+            indicate YouTube is soft-banning this IP (HTTP 404 on
+            the RSS feed URL). Network-layer failures such as
+            ``ConnectTimeout`` or ``EndOfStream`` should be
+            reported with ``False``; they do not count toward the
+            threshold.
+        '''
+        if not is_circuit_tripping:
+            return
+        state: _RssCircuitState = self._rss_circuit.setdefault(
+            proxy, _RssCircuitState(),
+        )
+        state.consecutive_failures += 1
+        if state.consecutive_failures < self._rss_circuit_threshold:
+            return
+        cooldown: float = min(
+            self._rss_circuit_min_cooldown_s
+            * (2 ** state.consecutive_opens),
+            self._rss_circuit_max_cooldown_s,
+        )
+        state.open_until = time.time() + cooldown
+        state.consecutive_opens += 1
+        state.consecutive_failures = 0
+        METRIC_RSS_CIRCUIT_OPENED.labels(
+            proxy=proxy or 'none',
+        ).inc()
+        METRIC_RSS_CIRCUIT_STATE.labels(
+            proxy=proxy or 'none',
+        ).set(1)
+        _LOGGER.warning(
+            'RSS circuit breaker opened for proxy',
+            extra={
+                'proxy': proxy,
+                'cooldown_seconds': cooldown,
+                'consecutive_opens': state.consecutive_opens,
+                'threshold': self._rss_circuit_threshold,
+            },
+        )
+
+    def report_rss_success(self, proxy: str | None) -> None:
+        '''Reset the RSS circuit breaker state for *proxy* on a
+        successful RSS fetch.'''
+        state: _RssCircuitState | None = self._rss_circuit.get(proxy)
+        if state is None:
+            return
+        had_state: bool = (
+            state.consecutive_failures > 0
+            or state.consecutive_opens > 0
+            or state.open_until > 0.0
+        )
+        state.consecutive_failures = 0
+        state.consecutive_opens = 0
+        state.open_until = 0.0
+        METRIC_RSS_CIRCUIT_STATE.labels(
+            proxy=proxy or 'none',
+        ).set(0)
+        if had_state:
+            _LOGGER.info(
+                'RSS circuit breaker reset by successful fetch',
+                extra={'proxy': proxy},
+            )
+
+    def select_proxy(
+        self, call_type: YouTubeCallType,
+    ) -> str | None:
+        '''Route around open RSS circuits when called for RSS.
+
+        For non-RSS call types, delegates to the base
+        implementation. For RSS, excludes proxies whose circuit
+        is currently open from the token-richness comparison. If
+        every proxy's circuit is open, returns the one with the
+        earliest reopen time so :meth:`acquire` can sleep it out.
+        '''
+        if call_type != YouTubeCallType.RSS or not self._proxies:
+            return super().select_proxy(call_type)
+        now: float = time.time()
+        candidates: list[str] = [
+            p for p in self._proxies
+            if self._rss_circuit_open_until(p) <= now
+        ]
+        if not candidates:
+            return min(
+                self._proxies,
+                key=self._rss_circuit_open_until,
+            )
+        best_tokens: float = -float('inf')
+        best: list[str] = []
+        for p in candidates:
+            tokens: float = self._backend.peek_tokens(call_type, p)
+            if tokens > best_tokens:
+                best_tokens = tokens
+                best = [p]
+            elif tokens == best_tokens:
+                best.append(p)
+        return random.choice(best)
+
     async def acquire(
         self,
         call_type: YouTubeCallType,
@@ -177,9 +346,33 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
         Wait until a request of *call_type* is
         permitted, then return the selected proxy.
 
+        For RSS acquisitions without an explicit proxy, loops
+        :meth:`select_proxy` and sleeps if every proxy's circuit
+        is currently open. Non-RSS call types are unaffected.
+
         Use :meth:`get_cookie_file_cached` to obtain
         the cookie path for the returned proxy.
         '''
+        if (
+            call_type == YouTubeCallType.RSS
+            and proxy is None
+            and self._proxies
+        ):
+            while True:
+                proxy = self.select_proxy(call_type)
+                open_until: float = self._rss_circuit_open_until(proxy)
+                wait: float = open_until - time.time()
+                if wait <= 0:
+                    break
+                _LOGGER.info(
+                    'All RSS circuits open; sleeping until '
+                    'earliest reopens',
+                    extra={
+                        'proxy': proxy,
+                        'wait_seconds': wait,
+                    },
+                )
+                await asyncio.sleep(wait)
         return await super().acquire(
             call_type, proxy=proxy,
         )

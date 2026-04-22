@@ -401,7 +401,10 @@ class YouTubeVideo:
         return video
 
     @staticmethod
-    def from_rss_entry(entry: untangle.Element) -> Self:
+    def from_rss_entry(
+        entry: untangle.Element,
+        channel_name_override: str | None = None,
+    ) -> Self:
         '''
         Factory for YouTubeVideo, populates the subset of fields available
         from a YouTube channel RSS feed entry. Fields not present in the
@@ -417,10 +420,16 @@ class YouTubeVideo:
         YouTubeVideo
 
         :param entry: An untangle Element for a single <entry> in a YouTube
-        channel RSS feed (https://www.youtube.com/feeds/videos.xml).
+            channel RSS feed (https://www.youtube.com/feeds/videos.xml).
+        :param channel_name_override: When non-None, replaces the
+            ``channel_name`` value derived from the RSS entry's
+            ``<author><name>``. Intended for callers that have already
+            resolved the canonical channel handle via the creator map.
+            When ``None`` (the default), the RSS entry's author name is
+            used, preserving previous behaviour.
         :returns: A YouTubeVideo instance with RSS-available fields set.
         :raises: AttributeError if the entry is missing the mandatory
-        yt:videoId or title elements.
+            yt:videoId or title elements.
         '''
 
         video = YouTubeVideo(video_id=entry.yt_videoId.cdata)
@@ -440,6 +449,9 @@ class YouTubeVideo:
             video.channel_url = entry.author.uri.cdata
         except AttributeError:
             pass
+
+        if channel_name_override is not None:
+            video.channel_name = channel_name_override
 
         try:
             video.published_timestamp = dateutil_parser.parse(
@@ -479,7 +491,7 @@ class YouTubeVideo:
                 thumb_data['height'] = int(
                     entry.media_group.media_thumbnail['height']
                 )
-            except (KeyError, ValueError):
+            except (KeyError, ValueError, TypeError):
                 pass
             video.thumbnails = YouTubeVideo._parse_thumbnails(
                 None, [thumb_data]
