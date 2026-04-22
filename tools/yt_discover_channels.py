@@ -18,6 +18,7 @@ or put that repo on PYTHONPATH before running this tool.
 '''
 
 import re
+import sys
 import asyncio
 import logging
 
@@ -30,8 +31,12 @@ import aiofiles
 
 from bs4 import BeautifulSoup
 from pydantic import AliasChoices, Field
-import redis.asyncio as redis_asyncio
 
+from scrape_exchange.creator_map import (
+    CreatorMap,
+    FileCreatorMap,
+    RedisCreatorMap,
+)
 from scrape_exchange.logging import configure_logging
 from scrape_exchange.settings import ScraperSettings
 from scrape_exchange.youtube.youtube_rate_limiter import (
@@ -43,11 +48,22 @@ from scrape_exchange.youtube.youtube_channel import (
 )
 from scrape_exchange.youtube.youtube_client import AsyncYouTubeClient
 
+# The underlying Redis hash name when the Redis backend is
+# active. Kept here for reference; RedisCreatorMap derives
+# the same key internally from ``platform='youtube'``.
 REDIS_CHANNEL_MAP_KEY: str = 'youtube:creator_map'
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 CHANNEL_PREFIX: str = 'channel/'
+
+# Matches bare YouTube channel ids ("UC" + 22 id chars).
+# Used to avoid writing UC-id → UC-id rows into the
+# creator_map hash when a scrape target was given as a
+# channel/UC... URL rather than as a handle.
+_UC_ID_RE: re.Pattern = re.compile(
+    r'^UC[A-Za-z0-9_-]{22}$',
+)
 
 CHANNEL_RX: re.Pattern = re.compile(r'\"canonicalBaseUrl\":\"\/@(.*?)\"')
 CHANNEL_SCRAPE_REGEX_SHORT: re.Pattern[str] = re.compile(
@@ -503,13 +519,72 @@ def load_failed(filepath: str) -> dict[str, dict]:
     return failed
 
 
+def _handle_from_target(target: str) -> str | None:
+    '''
+    Extract the plain handle from a scrape target. Returns
+    ``None`` when the target is a bare UC-id or an empty
+    string, since those are not handles and should not be
+    written to the creator_map.
+    '''
+    handle: str = target
+    if handle.startswith(CHANNEL_PREFIX):
+        handle = handle[len(CHANNEL_PREFIX):]
+    handle = handle.lstrip('@')
+    if not handle or _UC_ID_RE.match(handle):
+        return None
+    return handle
+
+
+async def update_creator_map(
+    creator_map: CreatorMap | None,
+    channel: str,
+    channel_id: str | None,
+) -> None:
+    '''
+    Record ``channel_id → handle`` in the shared
+    creator_map so that downstream scrapers can resolve
+    UC-ids to handles without re-scraping the channel
+    page. Backend-agnostic — works against both
+    :class:`FileCreatorMap` and :class:`RedisCreatorMap`.
+
+    Silent no-op when no creator_map is configured, the
+    channel_id is missing, or *channel* does not resolve
+    to a handle (e.g. it was a ``channel/UC...`` URL form).
+    Backend errors are logged as a warning; they never
+    propagate so a transient storage outage cannot derail
+    the discovery BFS.
+    '''
+    if creator_map is None or not channel_id:
+        return
+    handle: str | None = _handle_from_target(channel)
+    if handle is None:
+        return
+    try:
+        await creator_map.put(channel_id, handle)
+    except Exception as exc:
+        _LOGGER.warning(
+            'Failed to update creator_map',
+            exc=exc,
+            extra={
+                'channel_id': channel_id,
+                'handle': handle,
+            },
+        )
+
+
 async def record_discovered(
     channel: str, subs: int | None, source: str,
     discovered: dict[str, int | None],
     out_fd,
     channel_id: str | None = None,
+    creator_map: CreatorMap | None = None,
 ) -> None:
-    '''Update in-memory dict and append one JSONL record to out_fd.'''
+    '''Update in-memory dict and append one JSONL record to out_fd.
+
+    When both *channel_id* and *creator_map* are supplied, the
+    shared creator_map (file- or Redis-backed) is also updated
+    via :func:`update_creator_map`.
+    '''
 
     discovered[channel] = subs
     payload: dict = {
@@ -526,6 +601,9 @@ async def record_discovered(
             exc=exc,
             extra={'channel': channel},
         )
+    await update_creator_map(
+        creator_map, channel, channel_id,
+    )
 
 
 async def record_failed(channel: str, info: dict,
@@ -615,14 +693,19 @@ async def fetch(client: AsyncYouTubeClient, url: str
 
 
 async def resolve_channel_paths(
-        redis_client: redis_asyncio.Redis | None,
+        creator_map: CreatorMap | None,
         page_links: set[tuple[str, int | None]],
         ) -> set[tuple[str, int | None]]:
     '''
-    Replace `channel/UC...` entries in page_links with their handle form
-    by looking up the UC-id in the Redis hash `youtube:creator_map`. Entries
-    whose UC-id is not present in the hash, or anything other than a
-    `channel/UC...` path, are returned unchanged.
+    Replace ``channel/UC...`` entries in *page_links* with their
+    handle form by looking up the UC-id in the shared creator_map
+    (file- or Redis-backed). Entries whose UC-id is not present in
+    the map, and anything other than a ``channel/UC...`` path, are
+    returned unchanged.
+
+    Backend errors are logged once and the original *page_links*
+    is returned unchanged — a transient outage must not break the
+    discovery BFS.
     '''
 
     uc_ids: list[str] = []
@@ -631,35 +714,29 @@ async def resolve_channel_paths(
             uc_id: str = name.removeprefix(CHANNEL_PREFIX)
             if uc_id.startswith('UC'):
                 uc_ids.append(uc_id)
-    if not uc_ids or redis_client is None:
+    if not uc_ids or creator_map is None:
         return page_links
 
+    resolved_map: dict[str, str] = {}
     try:
-        raw_handles = await redis_client.hmget(
-            REDIS_CHANNEL_MAP_KEY, uc_ids
-        )
+        for uc_id in uc_ids:
+            handle: str | None = await creator_map.get(uc_id)
+            if handle:
+                resolved_map[uc_id] = handle.lstrip('@')
     except Exception as exc:
         _LOGGER.warning(
-            'Redis HMGET failed, skipping resolution',
+            'creator_map lookup failed, skipping resolution',
             exc=exc,
             extra={'uc_ids_count': len(uc_ids)},
         )
         return page_links
 
-    resolved_map: dict[str, str] = {}
-    for uc_id, raw in zip(uc_ids, raw_handles):
-        if raw is None:
-            continue
-        handle: str = raw.decode() if isinstance(raw, bytes) else raw
-        if handle:
-            resolved_map[uc_id] = handle.lstrip('@')
-
     resolved: set[tuple[str, int | None]] = set()
     for name, subs in page_links:
         if name.startswith(CHANNEL_PREFIX):
             uc_id = name.removeprefix(CHANNEL_PREFIX)
-            handle = resolved_map.get(uc_id)
-            resolved.add((handle, subs) if handle else (name, subs))
+            mapped: str | None = resolved_map.get(uc_id)
+            resolved.add((mapped, subs) if mapped else (name, subs))
         else:
             resolved.add((name, subs))
     return resolved
@@ -667,7 +744,7 @@ async def resolve_channel_paths(
 
 async def _scrape_feed_page(
     client: AsyncYouTubeClient,
-    redis_client: redis_asyncio.Redis | None,
+    creator_map: CreatorMap | None,
     target: str,
 ) -> DiscoveredChannel:
     '''Scrape a non-channel URL (feed, trending, etc.)
@@ -694,14 +771,14 @@ async def _scrape_feed_page(
         )
     )
     channel.page_links = await resolve_channel_paths(
-        redis_client, channel.page_links,
+        creator_map, channel.page_links,
     )
     return channel
 
 
 async def _scrape_target(
     client: AsyncYouTubeClient,
-    redis_client: redis_asyncio.Redis | None,
+    creator_map: CreatorMap | None,
     target: str,
     proxies: list[str] | None,
 ) -> DiscoveredChannel:
@@ -714,7 +791,7 @@ async def _scrape_target(
         return await _scrape_channel(target, proxies)
 
     return await _scrape_feed_page(
-        client, redis_client, target,
+        client, creator_map, target,
     )
 
 
@@ -783,7 +860,7 @@ def _build_initial_queue(
 
 
 async def discover(client: AsyncYouTubeClient,
-                   redis_client: redis_asyncio.Redis | None,
+                   creator_map: CreatorMap | None,
                    known_channels: set[str],
                    discovered: dict[str, int | None],
                    fully_scraped: set[str],
@@ -819,7 +896,7 @@ async def discover(client: AsyncYouTubeClient,
         try:
             channel: DiscoveredChannel = (
                 await _scrape_target(
-                    client, redis_client,
+                    client, creator_map,
                     target, proxies,
                 )
             )
@@ -849,6 +926,7 @@ async def discover(client: AsyncYouTubeClient,
                     target, channel.subs, 'scrape',
                     discovered, discovered_fd,
                     channel_id=channel.channel_id,
+                    creator_map=creator_map,
                 )
             else:
                 _LOGGER.info(
@@ -866,6 +944,55 @@ async def discover(client: AsyncYouTubeClient,
         )
 
     _LOGGER.info('BFS queue empty, discovery complete')
+
+
+async def build_creator_map(
+    settings: 'DiscoverSettings',
+) -> CreatorMap:
+    '''
+    Construct the creator_map backend from *settings*.
+
+    * If ``REDIS_DSN`` is set, instantiate
+      :class:`RedisCreatorMap` and probe connectivity with
+      a single ``HLEN``. If the probe fails, log an error
+      and ``sys.exit(1)`` — a misconfigured REDIS_DSN is a
+      startup fault, not a silent degrade.
+    * Otherwise, fall back to :class:`FileCreatorMap`
+      rooted at ``settings.creator_map_file``.
+    '''
+    if settings.redis_dsn:
+        cmap: RedisCreatorMap = RedisCreatorMap(
+            settings.redis_dsn,
+            platform='youtube',
+        )
+        try:
+            await cmap.size()
+        except Exception as exc:
+            _LOGGER.error(
+                'REDIS_DSN is set but Redis is '
+                'unreachable; refusing to start',
+                exc=exc,
+                extra={'redis_dsn': settings.redis_dsn},
+            )
+            sys.exit(1)
+        _LOGGER.info(
+            'Using Redis creator_map',
+            extra={'redis_dsn': settings.redis_dsn},
+        )
+        return cmap
+
+    fmap: FileCreatorMap = FileCreatorMap(
+        settings.creator_map_file,
+    )
+    _LOGGER.info(
+        'Using file creator_map',
+        extra={
+            'creator_map_file': (
+                settings.creator_map_file
+            ),
+        },
+    )
+    return fmap
 
 
 class DiscoverSettings(ScraperSettings):
@@ -896,6 +1023,23 @@ class DiscoverSettings(ScraperSettings):
         ),
         description=(
             'Output JSONL file for failed scrapes'
+        ),
+    )
+    creator_map_file: str = Field(
+        default='channel_map.csv',
+        validation_alias=AliasChoices(
+            'YOUTUBE_CHANNEL_MAP_FILE',
+            'youtube_channel_map_file',
+            'creator_map_file',
+        ),
+        description=(
+            'Path to the CSV file used by '
+            'FileCreatorMap when REDIS_DSN is not '
+            'set. One "creator_id,handle" line per '
+            'channel. Ignored when Redis is '
+            'configured, in which case the shared '
+            'youtube:creator_map hash is used '
+            'instead.'
         ),
     )
     min_subs: int = Field(
@@ -938,23 +1082,9 @@ async def main() -> None:
         },
     )
 
-    redis_client: redis_asyncio.Redis | None = None
-    if settings.redis_dsn:
-        try:
-            redis_client = redis_asyncio.from_url(
-                settings.redis_dsn,
-            )
-            await redis_client.ping()
-            _LOGGER.info(
-                'Connected to Redis',
-                extra={'redis_dsn': settings.redis_dsn},
-            )
-        except Exception as exc:
-            _LOGGER.warning(
-                'Redis unavailable; channel-id resolution disabled',
-                exc=exc,
-            )
-            redis_client = None
+    creator_map: CreatorMap = await build_creator_map(
+        settings,
+    )
 
     rate_limiter: YouTubeRateLimiter = (
         YouTubeRateLimiter.get(
@@ -966,28 +1096,24 @@ async def main() -> None:
 
     disc_channels: str = settings.discovered_channels
     fail_channels: str = settings.failed_channels
-    try:
-        async with (
-            aiofiles.open(disc_channels, 'a') as discovered_fd,
-            aiofiles.open(fail_channels, 'a') as failed_fd,
-        ):
-            async with AsyncYouTubeClient() as client:
-                proxies: list[str] | None = (
-                    settings.proxies.split(',')
-                    if settings.proxies
-                    else None
-                )
-                await discover(
-                    client, redis_client,
-                    known_channels,
-                    discovered, fully_scraped, failed,
-                    discovered_fd, failed_fd,
-                    settings.min_subs,
-                    proxies=proxies,
-                )
-    finally:
-        if redis_client is not None:
-            await redis_client.aclose()
+    async with (
+        aiofiles.open(disc_channels, 'a') as discovered_fd,
+        aiofiles.open(fail_channels, 'a') as failed_fd,
+    ):
+        async with AsyncYouTubeClient() as client:
+            proxies: list[str] | None = (
+                settings.proxies.split(',')
+                if settings.proxies
+                else None
+            )
+            await discover(
+                client, creator_map,
+                known_channels,
+                discovered, fully_scraped, failed,
+                discovered_fd, failed_fd,
+                settings.min_subs,
+                proxies=proxies,
+            )
 
 
 if __name__ == '__main__':

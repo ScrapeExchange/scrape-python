@@ -257,6 +257,8 @@ class CreatorQueue(ABC):
     async def release(
         self,
         creator_id: str,
+        *,
+        retry_interval_seconds: float | None = None,
     ) -> None:
         '''
         Release a claim and re-enqueue the creator.
@@ -267,6 +269,18 @@ class CreatorQueue(ABC):
         time, default ``1.0``):
         ``now + tier.interval_hours * 3600
         * eligibility_fraction``.
+
+        :param retry_interval_seconds: When the last
+            attempt for this creator failed, pass a
+            floor on the next-check delay in seconds.
+            The effective interval becomes
+            ``max(tier.interval_hours * 3600,
+            retry_interval_seconds)``. The floor is
+            applied before ``eligibility_fraction``,
+            matching the success path. ``None`` (the
+            default) means no floor — i.e. the normal
+            tier interval is used, which is the right
+            choice for successful releases.
         '''
 
     @abstractmethod
@@ -323,6 +337,33 @@ class CreatorQueue(ABC):
         creator_id: str,
     ) -> None:
         '''Remove a no-feeds entry.'''
+
+    @abstractmethod
+    async def mark_had_feed(
+        self,
+        creator_id: str,
+    ) -> None:
+        '''
+        Record that at least one RSS fetch for this
+        creator has succeeded. Persistent across
+        restarts. Idempotent: calling more than once
+        is a no-op after the first call.
+        '''
+
+    @abstractmethod
+    async def has_had_feed(
+        self,
+        creator_id: str,
+    ) -> bool:
+        '''
+        Return ``True`` when :meth:`mark_had_feed` has
+        been called for *creator_id* at any point in
+        the past. Used to apply a more forgiving
+        no-feed failure threshold to creators that
+        have previously served a valid RSS feed, so
+        transient soft-bans do not permanently remove
+        them from the queue.
+        '''
 
     @abstractmethod
     async def remove(
@@ -420,9 +461,16 @@ class FileCreatorQueue(CreatorQueue):
         queue_file: str,
         no_feeds_file: str,
         eligibility_fraction: float = 1.0,
+        *,
+        had_feed_file: str | None = None,
     ) -> None:
         self._queue_file: str = queue_file
         self._no_feeds_file: str = no_feeds_file
+        self._had_feed_file: str = (
+            had_feed_file
+            if had_feed_file is not None
+            else self._derive_had_feed_file(no_feeds_file)
+        )
         self._eligibility_fraction: float = eligibility_fraction
 
         # Per-tier heaps: tier number → heap of
@@ -440,9 +488,17 @@ class FileCreatorQueue(CreatorQueue):
         self._no_feeds: dict[
             str, tuple[str, str, int]
         ] = {}
+        self._had_feed: set[str] = set()
         self._claimed: set[str] = set()
         self._tiers: list[TierConfig] = []
         self._loaded: bool = False
+
+    @staticmethod
+    def _derive_had_feed_file(no_feeds_file: str) -> str:
+        head: str
+        tail: str
+        head, tail = os.path.splitext(no_feeds_file)
+        return f'{head}-had-feed{tail}'
 
     def _ensure_heap(self, tier: int) -> None:
         if tier not in self._heaps:
@@ -667,6 +723,34 @@ class FileCreatorQueue(CreatorQueue):
                 extra={'exc': str(exc)},
             )
 
+    async def _load_had_feed(self) -> None:
+        '''Load the had-feed cid set from the text file.'''
+
+        if not os.path.isfile(self._had_feed_file):
+            return
+        async with aiofiles.open(
+            self._had_feed_file, 'r',
+        ) as f:
+            async for line in f:
+                cid: str = line.strip()
+                if cid:
+                    self._had_feed.add(cid)
+
+    async def _persist_had_feed(self) -> None:
+        '''Write the had-feed cid set to the text file.'''
+
+        try:
+            async with aiofiles.open(
+                self._had_feed_file, 'w',
+            ) as f:
+                for cid in sorted(self._had_feed):
+                    await f.write(f'{cid}\n')
+        except OSError as exc:
+            _LOGGER.warning(
+                'Failed to write had-feed file',
+                extra={'exc': str(exc)},
+            )
+
     def _tier_config(self, tier: int) -> TierConfig:
         '''Look up TierConfig by tier number.'''
 
@@ -746,6 +830,7 @@ class FileCreatorQueue(CreatorQueue):
         if not self._loaded:
             await self._load_queue()
             await self._load_no_feeds()
+            await self._load_had_feed()
             self._loaded = True
 
             # Re-tier existing entries whose subscriber
@@ -828,6 +913,8 @@ class FileCreatorQueue(CreatorQueue):
     async def release(
         self,
         creator_id: str,
+        *,
+        retry_interval_seconds: float | None = None,
     ) -> None:
         self._claimed.discard(creator_id)
         tier: int = self._creator_tiers.get(
@@ -835,10 +922,16 @@ class FileCreatorQueue(CreatorQueue):
             self._tiers[-1].tier if self._tiers else 1,
         )
         tc: TierConfig = self._tier_config(tier)
+        interval_seconds: float = tc.interval_hours * 3600
+        if retry_interval_seconds is not None:
+            interval_seconds = max(
+                interval_seconds,
+                retry_interval_seconds,
+            )
         now: float = datetime.now(UTC).timestamp()
         next_check: float = (
             now
-            + tc.interval_hours * 3600 * self._eligibility_fraction
+            + interval_seconds * self._eligibility_fraction
         )
         name: str = self._names.get(
             creator_id, creator_id,
@@ -918,6 +1011,19 @@ class FileCreatorQueue(CreatorQueue):
     ) -> None:
         self._no_feeds.pop(creator_id, None)
         await self._persist_no_feeds()
+
+    async def mark_had_feed(
+        self, creator_id: str,
+    ) -> None:
+        if creator_id in self._had_feed:
+            return
+        self._had_feed.add(creator_id)
+        await self._persist_had_feed()
+
+    async def has_had_feed(
+        self, creator_id: str,
+    ) -> bool:
+        return creator_id in self._had_feed
 
     async def remove(
         self, creator_id: str,
@@ -1134,6 +1240,9 @@ class RedisCreatorQueue(CreatorQueue):
         )
         self._no_feeds_prefix: str = (
             f'rss:{p}:no_feeds:'
+        )
+        self._key_had_feed: str = (
+            f'rss:{p}:had_feed'
         )
         self._key_names: str = f'rss:{p}:names'
         self._names_indexed: bool = False
@@ -1493,6 +1602,8 @@ class RedisCreatorQueue(CreatorQueue):
     async def release(
         self,
         creator_id: str,
+        *,
+        retry_interval_seconds: float | None = None,
     ) -> None:
         tier_str: str | None = (
             await self._redis.hget(
@@ -1505,11 +1616,18 @@ class RedisCreatorQueue(CreatorQueue):
         tier: int = (
             int(tier_str) if tier_str else fallback_tier
         )
-        interval: float = self.get_tier_interval(tier)
+        interval_seconds: float = (
+            self.get_tier_interval(tier) * 3600
+        )
+        if retry_interval_seconds is not None:
+            interval_seconds = max(
+                interval_seconds,
+                retry_interval_seconds,
+            )
         now: float = datetime.now(UTC).timestamp()
         next_check: float = (
             now
-            + interval * 3600 * self._eligibility_fraction
+            + interval_seconds * self._eligibility_fraction
         )
         p: str = self._platform
         queue_key: str = f'rss:{p}:queue:{tier}'
@@ -1630,6 +1748,22 @@ class RedisCreatorQueue(CreatorQueue):
     ) -> None:
         await self._redis.delete(
             f'{self._no_feeds_prefix}{creator_id}',
+        )
+
+    async def mark_had_feed(
+        self, creator_id: str,
+    ) -> None:
+        await self._redis.sadd(
+            self._key_had_feed, creator_id,
+        )
+
+    async def has_had_feed(
+        self, creator_id: str,
+    ) -> bool:
+        return bool(
+            await self._redis.sismember(
+                self._key_had_feed, creator_id,
+            )
         )
 
     async def remove(

@@ -1173,8 +1173,8 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(yt_rss_feed_download_failures_total{job=~\"$job\", instance=~\"$instance\"}[5m]))",
-          "legendFormat": "rss feed failures",
+          "expr": "sum by (reason) (rate(yt_rss_feed_download_failures_total{job=~\"$job\", instance=~\"$instance\"}[5m]))",
+          "legendFormat": "rss feed failures — {{reason}}",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
@@ -1182,8 +1182,8 @@
           }
         },
         {
-          "expr": "sum(rate(yt_rss_innertube_call_failures_total{job=~\"$job\", instance=~\"$instance\"}[5m]))",
-          "legendFormat": "innertube failures",
+          "expr": "sum by (entity) (rate(yt_rss_innertube_call_failures_total{job=~\"$job\", instance=~\"$instance\"}[5m]))",
+          "legendFormat": "innertube failures — {{entity}}",
           "refId": "B",
           "datasource": {
             "type": "prometheus",
@@ -3837,6 +3837,245 @@
           "expr": "sum by (tier) (rate(yt_rss_orphans_recovered_total{job=~\"$job\", instance=~\"$instance\"}[15m]))",
           "legendFormat": "tier {{tier}}",
           "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 69,
+      "type": "timeseries",
+      "title": "RSS circuit breaker — trips by proxy (rate)",
+      "description": "Rate at which the per-proxy RSS circuit breaker opens due to consecutive HTTP 404 (soft-ban) signals. A sustained nonzero rate on a specific proxy means that VPN tunnel or IP is being flagged by YouTube; rotate or wait out the cooldown.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 181,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (proxy) (rate(yt_rss_circuit_opened_total{job=~\"$job\", instance=~\"$instance\"}[15m]))",
+          "legendFormat": "{{proxy}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 70,
+      "type": "timeseries",
+      "title": "RSS circuit breaker — currently open (per proxy)",
+      "description": "1 while the RSS circuit is open for this proxy, 0 otherwise. A stuck '1' means every retry for that tunnel is landing inside the exponential cooldown; when all proxies are simultaneously at 1, acquire() is sleeping until the earliest reopens.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 181,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": 1,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "none"
+            },
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "max by (proxy) (yt_rss_circuit_open{job=~\"$job\", instance=~\"$instance\"})",
+          "legendFormat": "{{proxy}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 71,
+      "type": "timeseries",
+      "title": "RSS no-feed threshold hits (channels dropped)",
+      "description": "Rate at which channels are removed from the RSS queue for exceeding the no-feed failure threshold. Broken down by which threshold fired ('rss_max_no_feed_failures' for never-had-feed channels, 'rss_max_no_feed_failures_had_feed' for previously-successful ones). Nonzero means queue attrition is ongoing; correlate with circuit-opened rate to decide if soft-ban rotation is needed.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 189,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max",
+            "sum"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (limit) (rate(yt_rss_no_feed_limit_hit_total{job=~\"$job\", instance=~\"$instance\"}[15m]))",
+          "legendFormat": "limit={{limit}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "id": 72,
+      "type": "timeseries",
+      "title": "RSS InnerTube — success vs failure rate",
+      "description": "InnerTube call rate split into successes and failures. A persistent failure:success ratio well above 1:5 suggests YouTube is degrading InnerTube for the scraping IPs, not just the RSS feed endpoint.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 189,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (entity) (rate(yt_rss_innertube_success_total{job=~\"$job\", instance=~\"$instance\"}[5m]))",
+          "legendFormat": "success — {{entity}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "sum by (entity) (rate(yt_rss_innertube_call_failures_total{job=~\"$job\", instance=~\"$instance\"}[5m]))",
+          "legendFormat": "failure — {{entity}}",
+          "refId": "B",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"

@@ -898,5 +898,211 @@ class TestFileCreatorQueueScanAndRecoverOrphans(
         )
 
 
+class TestFileCreatorQueueReleaseRetryInterval(
+    unittest.IsolatedAsyncioTestCase,
+):
+    '''release() accepts an optional retry_interval_seconds
+    floor so that failed channels can be held back longer
+    than their tier interval would normally allow.'''
+
+    async def test_no_retry_interval_uses_tier_interval(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            q: FileCreatorQueue = _make_queue(tmp)
+            fm: AssetFileManagement = _make_fm(tmp)
+            await q.populate(
+                {'UCaaa': 'alpha'},
+                fm,
+                DEFAULT_TIERS,
+                {'UCaaa': 5_000_000},  # tier 1 → 4h
+            )
+            await q.claim_batch(10, 'worker-1')
+            before: float = _now()
+            await q.release('UCaaa')
+            ts: float = q._heaps[1][0][0]
+            self.assertAlmostEqual(
+                ts - before, 4.0 * 3600, delta=5.0,
+            )
+
+    async def test_retry_interval_raises_floor(
+        self,
+    ) -> None:
+        '''When the retry floor is longer than the tier
+        interval, it wins.'''
+        with tempfile.TemporaryDirectory() as tmp:
+            q: FileCreatorQueue = _make_queue(tmp)
+            fm: AssetFileManagement = _make_fm(tmp)
+            await q.populate(
+                {'UCaaa': 'alpha'},
+                fm,
+                DEFAULT_TIERS,
+                {'UCaaa': 5_000_000},  # tier 1 → 4h
+            )
+            await q.claim_batch(10, 'worker-1')
+            before: float = _now()
+            await q.release(
+                'UCaaa',
+                retry_interval_seconds=24.0 * 3600,
+            )
+            ts: float = q._heaps[1][0][0]
+            # 24h > 4h — retry floor applies.
+            self.assertAlmostEqual(
+                ts - before, 24.0 * 3600, delta=5.0,
+            )
+
+    async def test_retry_interval_below_tier_is_ignored(
+        self,
+    ) -> None:
+        '''When the retry floor is shorter than the tier
+        interval, the tier interval wins.'''
+        with tempfile.TemporaryDirectory() as tmp:
+            q: FileCreatorQueue = _make_queue(tmp)
+            fm: AssetFileManagement = _make_fm(tmp)
+            await q.populate(
+                {'UCaaa': 'alpha'},
+                fm,
+                DEFAULT_TIERS,
+                {'UCaaa': 5_000},  # tier 4 → 48h
+            )
+            await q.claim_batch(10, 'worker-1')
+            before: float = _now()
+            await q.release(
+                'UCaaa',
+                retry_interval_seconds=4.0 * 3600,
+            )
+            ts: float = q._heaps[4][0][0]
+            # 48h > 4h — tier interval wins.
+            self.assertAlmostEqual(
+                ts - before, 48.0 * 3600, delta=5.0,
+            )
+
+    async def test_retry_interval_scales_with_eligibility(
+        self,
+    ) -> None:
+        '''eligibility_fraction still scales the effective
+        interval after the floor is applied.'''
+        with tempfile.TemporaryDirectory() as tmp:
+            queue_file: str = os.path.join(
+                tmp, 'queue.json',
+            )
+            no_feeds_file: str = os.path.join(
+                tmp, 'no_feeds.tsv',
+            )
+            q: FileCreatorQueue = FileCreatorQueue(
+                queue_file, no_feeds_file,
+                eligibility_fraction=0.5,
+            )
+            fm: AssetFileManagement = _make_fm(tmp)
+            await q.populate(
+                {'UCaaa': 'alpha'},
+                fm,
+                DEFAULT_TIERS,
+                {'UCaaa': 5_000_000},  # tier 1 → 4h
+            )
+            await q.claim_batch(10, 'worker-1')
+            before: float = _now()
+            await q.release(
+                'UCaaa',
+                retry_interval_seconds=8.0 * 3600,
+            )
+            ts: float = q._heaps[1][0][0]
+            # max(4h, 8h) = 8h, scaled by 0.5 → 4h.
+            self.assertAlmostEqual(
+                ts - before, 4.0 * 3600, delta=5.0,
+            )
+
+
+class TestFileCreatorQueueHadFeed(
+    unittest.IsolatedAsyncioTestCase,
+):
+    '''The had-feed flag tracks which creators have ever
+    served a successful RSS feed. Used to apply a more
+    forgiving no-feed failure threshold to established
+    channels.'''
+
+    async def test_has_had_feed_false_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            q: FileCreatorQueue = _make_queue(tmp)
+            self.assertFalse(
+                await q.has_had_feed('UC_x'),
+            )
+
+    async def test_mark_had_feed_sets_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            q: FileCreatorQueue = _make_queue(tmp)
+            await q.mark_had_feed('UC_x')
+            self.assertTrue(
+                await q.has_had_feed('UC_x'),
+            )
+            self.assertFalse(
+                await q.has_had_feed('UC_y'),
+            )
+
+    async def test_mark_had_feed_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            q: FileCreatorQueue = _make_queue(tmp)
+            await q.mark_had_feed('UC_x')
+            await q.mark_had_feed('UC_x')
+            await q.mark_had_feed('UC_x')
+            self.assertTrue(
+                await q.has_had_feed('UC_x'),
+            )
+
+    async def test_persists_across_instances(self) -> None:
+        '''The had-feed set survives re-instantiation
+        (simulates a worker restart).'''
+        with tempfile.TemporaryDirectory() as tmp:
+            queue_file: str = os.path.join(
+                tmp, 'queue.json',
+            )
+            no_feeds_file: str = os.path.join(
+                tmp, 'no_feeds.tsv',
+            )
+            had_feed_file: str = os.path.join(
+                tmp, 'had-feed.txt',
+            )
+            q1: FileCreatorQueue = FileCreatorQueue(
+                queue_file, no_feeds_file,
+                had_feed_file=had_feed_file,
+            )
+            await q1.mark_had_feed('UC_a')
+            await q1.mark_had_feed('UC_b')
+
+            q2: FileCreatorQueue = FileCreatorQueue(
+                queue_file, no_feeds_file,
+                had_feed_file=had_feed_file,
+            )
+            fm: AssetFileManagement = _make_fm(tmp)
+            await q2.populate(
+                {}, fm, DEFAULT_TIERS, {},
+            )
+            self.assertTrue(
+                await q2.has_had_feed('UC_a'),
+            )
+            self.assertTrue(
+                await q2.has_had_feed('UC_b'),
+            )
+            self.assertFalse(
+                await q2.has_had_feed('UC_c'),
+            )
+
+    async def test_had_feed_default_file_path(self) -> None:
+        '''When had_feed_file is not supplied, a sibling
+        path is derived from the no-feeds file.'''
+        with tempfile.TemporaryDirectory() as tmp:
+            no_feeds_file: str = os.path.join(
+                tmp, 'no-feeds.tsv',
+            )
+            q: FileCreatorQueue = FileCreatorQueue(
+                os.path.join(tmp, 'queue.json'),
+                no_feeds_file,
+            )
+            expected: str = os.path.join(
+                tmp, 'no-feeds-had-feed.tsv',
+            )
+            self.assertEqual(q._had_feed_file, expected)
+
+
 if __name__ == '__main__':
     unittest.main()
