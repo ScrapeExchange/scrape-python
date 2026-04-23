@@ -27,7 +27,7 @@ from httpx_curl_cffi import AsyncCurlTransport, CurlOpt
 from prometheus_client import Histogram
 
 from scrape_exchange.worker_id import get_worker_id
-from scrape_exchange.util import extract_proxy_ip
+from scrape_exchange.util import extract_proxy_ip, proxy_network_for
 from .youtube_rate_limiter import YouTubeRateLimiter, YouTubeCallType
 
 _LOGGER: Logger = getLogger(__name__)
@@ -44,7 +44,7 @@ METRIC_YT_REQUEST_DURATION: Histogram = Histogram(
     'Duration of requests to YouTube, by kind '
     '(http/innertube), HTTP status class, and the '
     'outbound proxy IP used.',
-    ['kind', 'status_class', 'worker_id', 'proxy_ip'],
+    ['kind', 'status_class', 'worker_id', 'proxy_ip', 'proxy_network'],
     buckets=(
         0.1, 0.25, 0.5, 1.0, 2.5,
         5.0, 10.0, 30.0, 60.0,
@@ -126,7 +126,11 @@ class AsyncYouTubeClient(AsyncClient):
             proxy_ip: str = extract_proxy_ip(self.proxy)
             _LOGGER.debug(
                 'Initializing AsyncYouTubeClient with proxy',
-                extra={'proxy': self.proxy, 'proxy_ip': proxy_ip}
+                extra={
+                    'proxy': self.proxy,
+                    'proxy_ip': proxy_ip,
+                    'proxy_network': proxy_network_for(proxy_ip),
+                }
             )
         else:
             _LOGGER.warning('Initializing AsyncYouTubeClient without proxy')
@@ -180,7 +184,12 @@ class AsyncYouTubeClient(AsyncClient):
         proxy_ip: str = (
             extract_proxy_ip(self.proxy) if self.proxy else 'none'
         )
-        extra: dict[str, str] = {'proxy_ip': proxy_ip, 'url': url}
+        proxy_network: str = proxy_network_for(proxy_ip)
+        extra: dict[str, str] = {
+            'proxy_ip': proxy_ip,
+            'proxy_network': proxy_network,
+            'url': url,
+        }
         _LOGGER.debug('HTTP GET', extra=extra)
         start: float = time.monotonic()
         try:
@@ -190,6 +199,7 @@ class AsyncYouTubeClient(AsyncClient):
                 kind='http', status_class='error',
                 worker_id=get_worker_id(),
                 proxy_ip=proxy_ip,
+                proxy_network=proxy_network,
             ).observe(time.monotonic() - start)
             # curl_cffi can raise CancelledError from its internal stream task
             # during cleanup even when the outer task is not being cancelled.
@@ -213,6 +223,7 @@ class AsyncYouTubeClient(AsyncClient):
                 kind='http', status_class='error',
                 worker_id=get_worker_id(),
                 proxy_ip=proxy_ip,
+                proxy_network=proxy_network,
             ).observe(time.monotonic() - start)
             _LOGGER.debug('HTTP GET timeout', exc=exc, extra=extra)
             if retries > 0:
@@ -231,6 +242,7 @@ class AsyncYouTubeClient(AsyncClient):
                 kind='http', status_class='error',
                 worker_id=get_worker_id(),
                 proxy_ip=proxy_ip,
+                proxy_network=proxy_network,
             ).observe(time.monotonic() - start)
             _LOGGER.debug('HTTP GET request error', exc=exc, extra=extra)
             raise
@@ -239,6 +251,7 @@ class AsyncYouTubeClient(AsyncClient):
                 kind='http', status_class='error',
                 worker_id=get_worker_id(),
                 proxy_ip=proxy_ip,
+                proxy_network=proxy_network,
             ).observe(time.monotonic() - start)
             _LOGGER.debug('HTTP GET error', exc=exc, extra=extra)
             if retries > 0:
@@ -258,6 +271,7 @@ class AsyncYouTubeClient(AsyncClient):
             status_class=_yt_status_class(resp.status_code),
             worker_id=get_worker_id(),
             proxy_ip=proxy_ip,
+            proxy_network=proxy_network,
         ).observe(time.monotonic() - start)
 
         if (resp.status_code == 303

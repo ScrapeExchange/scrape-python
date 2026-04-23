@@ -12,6 +12,7 @@ tests/collateral/local
 docker-compose.override.yml
 
 .claude/
+.claudeignore
 CLAUDE.md
 docs/superpowers/
 

@@ -83,7 +83,7 @@ YOUTUBE_URLS: list[str] = [
 ]
 
 IGNORE_CHANNELS: set[str] = set(
-    ['news', 'live', 'YouTube', '360', 'gaming', 'music', 'movies', 'sports']
+    ['news', 'live', 'youtube', '360', 'gaming', 'music', 'movies', 'sports']
 )
 
 
@@ -411,6 +411,7 @@ def load_known_channels(filepath: str) -> set[str]:
                 channel = channel.strip().lstrip('@').split(',')[0]
                 if channel.startswith(url_prefix):
                     channel = channel[len(url_prefix):]
+                channel = channel.lstrip('@')
                 if '@' in channel:
                     _LOGGER.warning(
                         'Channel has @ mid-string, skipping',
@@ -419,7 +420,7 @@ def load_known_channels(filepath: str) -> set[str]:
                     continue
                 channel = channel.strip()
                 if channel:
-                    known.add(channel)
+                    known.add(channel.lower())
     except FileNotFoundError:
         _LOGGER.warning(
             'Channel list not found, starting empty',
@@ -811,9 +812,9 @@ async def _enqueue_links(
     for link_name, link_subs in channel.page_links:
         if not link_name:
             continue
-        if link_name in known_channels:
+        if link_name.lower() in known_channels:
             continue
-        if link_name in IGNORE_CHANNELS:
+        if link_name.lower() in IGNORE_CHANNELS:
             continue
         if link_subs is not None and link_subs < min_subs:
             continue

@@ -27,7 +27,7 @@ from .youtube_client import (
     generate_visitor_info,
 )
 from scrape_exchange.worker_id import get_worker_id
-from scrape_exchange.util import extract_proxy_ip
+from scrape_exchange.util import extract_proxy_ip, proxy_network_for
 from .youtube_cookiejar import YouTubeCookieJar
 from .youtube_rate_limiter import YouTubeRateLimiter, YouTubeCallType
 from .youtube_playlist import YouTubePlaylist
@@ -506,10 +506,12 @@ class YouTubeChannelTabs:
         proxy_ip: str = (
             extract_proxy_ip(self.proxy) if self.proxy else 'none'
         )
+        proxy_network: str = proxy_network_for(proxy_ip)
         extra: dict[str, str] = {
             'channel_id': self.channel_id,
             'proxy': self.proxy or 'none',
             'proxy_ip': proxy_ip,
+            'proxy_network': proxy_network,
         }
         for attempt in range(1, max_retries + 1):
             self.client_request_count += 1
@@ -544,6 +546,7 @@ class YouTubeChannelTabs:
                     status_class='2xx',
                     worker_id=get_worker_id(),
                     proxy_ip=proxy_ip,
+                    proxy_network=proxy_network,
                 ).observe(time.monotonic() - start)
                 return result
             except InnerTubeRequestError as exc:
@@ -552,6 +555,7 @@ class YouTubeChannelTabs:
                     status_class=('4xx' if exc.error.code == 429 else 'error'),
                     worker_id=get_worker_id(),
                     proxy_ip=proxy_ip,
+                    proxy_network=proxy_network,
                 ).observe(time.monotonic() - start)
                 if exc.error.code == 429:
                     await limiter.penalise(
@@ -597,6 +601,7 @@ class YouTubeChannelTabs:
                     status_class='error',
                     worker_id=get_worker_id(),
                     proxy_ip=proxy_ip,
+                    proxy_network=proxy_network,
                 ).observe(time.monotonic() - start)
                 _LOGGER.error(
                     'InnerTube BROWSE error',

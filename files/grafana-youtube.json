@@ -2070,8 +2070,8 @@
       },
       "targets": [
         {
-          "expr": "max(yt_video_proxy_sleep_seconds{job=~\"$job\", instance=~\"$instance\"}) by (proxy)",
-          "legendFormat": "video worker {{proxy}}",
+          "expr": "max by (proxy_network) (yt_video_proxy_sleep_seconds{job=~\"$job\", instance=~\"$instance\"})",
+          "legendFormat": "video worker {{proxy_network}}",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
@@ -2536,7 +2536,7 @@
     {
       "id": 40,
       "type": "timeseries",
-      "title": "global bucket tokens (per proxy)",
+      "title": "global bucket tokens (per proxy network)",
       "description": "",
       "datasource": {
         "type": "prometheus",
@@ -2579,8 +2579,8 @@
       },
       "targets": [
         {
-          "expr": "avg by (proxy) (rate_limiter_global_bucket_tokens{job=~\"$job\", instance=~\"$instance\"})",
-          "legendFormat": "{{proxy}}",
+          "expr": "avg by (proxy_network) (rate_limiter_global_bucket_tokens{job=~\"$job\", instance=~\"$instance\"})",
+          "legendFormat": "{{proxy_network}}",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
@@ -2592,7 +2592,7 @@
     {
       "id": 42,
       "type": "timeseries",
-      "title": "Videos scraped per second by proxy",
+      "title": "Videos scraped per second by proxy network",
       "description": "",
       "datasource": {
         "type": "prometheus",
@@ -2635,8 +2635,8 @@
       },
       "targets": [
         {
-          "expr": "sum by (proxy) (rate(yt_video_proxy_videos_scraped_total{job=~\"$job\", instance=~\"$instance\"}[5m]))",
-          "legendFormat": "{{proxy}}",
+          "expr": "sum by (proxy_network) (rate(yt_video_proxy_videos_scraped_total{job=~\"$job\", instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{proxy_network}}",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
@@ -2648,7 +2648,7 @@
     {
       "id": 43,
       "type": "timeseries",
-      "title": "Rate-limit hits by proxy",
+      "title": "Rate-limit hits by proxy network",
       "description": "",
       "datasource": {
         "type": "prometheus",
@@ -2691,8 +2691,8 @@
       },
       "targets": [
         {
-          "expr": "sum by (proxy) (rate(yt_video_proxy_rate_limit_hits_total{job=~\"$job\", instance=~\"$instance\"}[5m]))",
-          "legendFormat": "{{proxy}}",
+          "expr": "sum by (proxy_network) (rate(yt_video_proxy_rate_limit_hits_total{job=~\"$job\", instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{proxy_network}}",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
@@ -2704,7 +2704,7 @@
     {
       "id": 44,
       "type": "timeseries",
-      "title": "Video scrape failures by proxy (top 10)",
+      "title": "Video scrape failures by proxy network (top 10)",
       "description": "",
       "datasource": {
         "type": "prometheus",
@@ -2747,8 +2747,8 @@
       },
       "targets": [
         {
-          "expr": "topk(10, sum by (proxy) (rate(yt_video_proxy_scrape_failures_total{job=~\"$job\", instance=~\"$instance\"}[5m])))",
-          "legendFormat": "{{proxy}}",
+          "expr": "topk(10, sum by (proxy_network) (rate(yt_video_proxy_scrape_failures_total{job=~\"$job\", instance=~\"$instance\"}[5m])))",
+          "legendFormat": "{{proxy_network}}",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
@@ -2760,7 +2760,7 @@
     {
       "id": 45,
       "type": "timeseries",
-      "title": "Video scrape failures by proxy/reason (top 15)",
+      "title": "Video scrape failures by proxy network/reason (top 15)",
       "description": "",
       "datasource": {
         "type": "prometheus",
@@ -2803,8 +2803,8 @@
       },
       "targets": [
         {
-          "expr": "topk(15, sum by (proxy, reason) (rate(yt_video_proxy_scrape_failures_total{job=~\"$job\", instance=~\"$instance\"}[5m])))",
-          "legendFormat": "{{proxy}} / {{reason}}",
+          "expr": "topk(15, sum by (proxy_network, reason) (rate(yt_video_proxy_scrape_failures_total{job=~\"$job\", instance=~\"$instance\"}[5m])))",
+          "legendFormat": "{{proxy_network}} / {{reason}}",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
@@ -3847,7 +3847,7 @@
     {
       "id": 69,
       "type": "timeseries",
-      "title": "RSS circuit breaker — trips by proxy (rate)",
+      "title": "RSS circuit breaker — trips by proxy network (rate)",
       "description": "Rate at which the per-proxy RSS circuit breaker opens due to consecutive HTTP 404 (soft-ban) signals. A sustained nonzero rate on a specific proxy means that VPN tunnel or IP is being flagged by YouTube; rotate or wait out the cooldown.",
       "datasource": {
         "type": "prometheus",
@@ -3891,8 +3891,8 @@
       },
       "targets": [
         {
-          "expr": "sum by (proxy) (rate(yt_rss_circuit_opened_total{job=~\"$job\", instance=~\"$instance\"}[15m]))",
-          "legendFormat": "{{proxy}}",
+          "expr": "sum by (proxy_network) (rate(yt_rss_circuit_opened_total{job=~\"$job\", instance=~\"$instance\"}[15m]))",
+          "legendFormat": "{{proxy_network}}",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
@@ -3904,7 +3904,7 @@
     {
       "id": 70,
       "type": "timeseries",
-      "title": "RSS circuit breaker — currently open (per proxy)",
+      "title": "RSS circuit breaker — currently open (per proxy network)",
       "description": "1 while the RSS circuit is open for this proxy, 0 otherwise. A stuck '1' means every retry for that tunnel is landing inside the exponential cooldown; when all proxies are simultaneously at 1, acquire() is sleeping until the earliest reopens.",
       "datasource": {
         "type": "prometheus",
@@ -3949,8 +3949,8 @@
       },
       "targets": [
         {
-          "expr": "max by (proxy) (yt_rss_circuit_open{job=~\"$job\", instance=~\"$instance\"})",
-          "legendFormat": "{{proxy}}",
+          "expr": "max by (proxy_network) (yt_rss_circuit_open{job=~\"$job\", instance=~\"$instance\"})",
+          "legendFormat": "{{proxy_network}}",
           "refId": "A",
           "datasource": {
             "type": "prometheus",

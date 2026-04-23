@@ -51,6 +51,7 @@ from typing import ClassVar
 from prometheus_client import Counter, Gauge
 
 from scrape_exchange.rate_limiter import RateLimiter, _BucketConfig
+from scrape_exchange.util import extract_proxy_ip, proxy_network_for
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -59,13 +60,25 @@ METRIC_RSS_CIRCUIT_OPENED: Counter = Counter(
     'yt_rss_circuit_opened_total',
     'Times the RSS circuit breaker tripped open for a proxy '
     'after consecutive soft-ban (404) signals',
-    ['proxy'],
+    ['proxy', 'proxy_network'],
 )
 METRIC_RSS_CIRCUIT_STATE: Gauge = Gauge(
     'yt_rss_circuit_open',
     '1 while the RSS circuit is open for this proxy, 0 otherwise',
-    ['proxy'],
+    ['proxy', 'proxy_network'],
 )
+
+
+def _rss_proxy_network(proxy: str | None) -> str:
+    '''Derive the proxy_network label for an RSS-circuit
+    metric emission, tolerating malformed proxy URLs so
+    metric code never raises.'''
+    if not proxy:
+        return 'none'
+    try:
+        return proxy_network_for(extract_proxy_ip(proxy))
+    except ValueError:
+        return 'other'
 
 
 @dataclass
@@ -266,9 +279,11 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
         state.consecutive_failures = 0
         METRIC_RSS_CIRCUIT_OPENED.labels(
             proxy=proxy or 'none',
+            proxy_network=_rss_proxy_network(proxy),
         ).inc()
         METRIC_RSS_CIRCUIT_STATE.labels(
             proxy=proxy or 'none',
+            proxy_network=_rss_proxy_network(proxy),
         ).set(1)
         _LOGGER.warning(
             'RSS circuit breaker opened for proxy',
@@ -296,6 +311,7 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
         state.open_until = 0.0
         METRIC_RSS_CIRCUIT_STATE.labels(
             proxy=proxy or 'none',
+            proxy_network=_rss_proxy_network(proxy),
         ).set(0)
         if had_state:
             _LOGGER.info(
