@@ -192,119 +192,74 @@ class ScraperRunner:
             start_http_server(self._metrics_port)
             logging.info(
                 'Prometheus metrics available',
-                extra={
-                    'metrics_port': (
-                        self._metrics_port
-                    ),
-                },
+                extra={'metrics_port': (self._metrics_port)}
             )
         except OSError as exc:
             logging.warning(
-                'Failed to bind Prometheus metrics '
-                'port; worker will run without '
-                'metrics',
-                exc=exc,
-                extra={
-                    'metrics_port': (
-                        self._metrics_port
-                    ),
+                'Failed to bind Prometheus metrics port; worker will run '
+                'without metrics', exc=exc, extra={
+                    'metrics_port': (self._metrics_port)
                 },
             )
         publish_config_metrics(
-            role='worker',
-            scraper_label=self._scraper_label,
-            num_processes=1,
+            role='worker', scraper_label=self._scraper_label, num_processes=1,
             concurrency=self._concurrency,
         )
 
-        rate_limiter: RateLimiter = (
-            self._rl_factory(self._settings)
-        )
-        rate_limiter.set_proxies(
-            self._settings.proxies,
-        )
+        rate_limiter: RateLimiter = (self._rl_factory(self._settings))
+        rate_limiter.set_proxies(self._settings.proxies)
 
         post_rate: float = float(max(
-            1,
-            self._num_processes
-            * self._concurrency,
+            1, self._num_processes * self._concurrency,
         ))
         ScrapeExchangeRateLimiter.get(
-            state_dir=(
-                self._settings
-                .rate_limiter_state_dir
-            ),
-            post_rate=post_rate,
-            redis_dsn=self._settings.redis_dsn,
+            state_dir=(self._settings.rate_limiter_state_dir),
+            post_rate=post_rate, redis_dsn=self._settings.redis_dsn,
         )
 
         client: ExchangeClient | None = None
         try:
             client = await ExchangeClient.setup(
-                api_key_id=(
-                    self._settings.api_key_id
-                ),
-                api_key_secret=(
-                    self._settings.api_key_secret
-                ),
-                exchange_url=(
-                    self._settings.exchange_url
-                ),
+                api_key_id=(self._settings.api_key_id),
+                api_key_secret=(self._settings.api_key_secret),
+                exchange_url=(self._settings.exchange_url),
             )
         except Exception as exc:
             if self._client_required:
                 logging.critical(
-                    'Failed to connect to '
-                    'Scrape Exchange API',
-                    exc=exc,
-                    extra={
-                        'exchange_url': (
-                            self._settings
-                            .exchange_url
-                        ),
-                    },
+                    'Failed to connect to Scrape Exchange API',
+                    exc=exc, extra={
+                        'exchange_url': (self._settings.exchange_url),
+                    }
                 )
                 logging.shutdown()
                 sys.exit(1)
             logging.warning(
-                'ExchangeClient setup failed; '
-                'continuing without upload '
-                'capability',
-                exc=exc,
+                'ExchangeClient setup failed; continuing without upload '
+                'capability', exc=exc,
             )
 
-        loop: asyncio.AbstractEventLoop = (
-            asyncio.get_running_loop()
-        )
-        main_task: asyncio.Task[Any] = (
-            asyncio.current_task()
-        )
+        loop: asyncio.AbstractEventLoop = (asyncio.get_running_loop())
+        main_task: asyncio.Task[Any] = (asyncio.current_task())
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
-                loop.add_signal_handler(
-                    sig, main_task.cancel,
-                )
+                loop.add_signal_handler(sig, main_task.cancel)
             except NotImplementedError:
                 pass
 
         try:
             ctx: ScraperRunContext = (
                 ScraperRunContext(
-                    settings=self._settings,
-                    client=client,
-                    rate_limiter=rate_limiter,
-                    proxies=proxies,
+                    settings=self._settings, client=client,
+                    rate_limiter=rate_limiter, proxies=proxies,
                 )
             )
             await worker_func(ctx)
         except asyncio.CancelledError:
             logging.info(
-                'Shutdown signal received; '
-                'draining background uploads',
+                'Shutdown signal received; draining background uploads'
             )
             raise
         finally:
             if client is not None:
-                await client.drain_uploads(
-                    timeout=10.0,
-                )
+                await client.drain_uploads(timeout=10.0)

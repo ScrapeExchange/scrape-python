@@ -257,7 +257,12 @@ class AssetFileManagement:
         :returns: List of absolute paths (as strings) of files that were
             deleted.
         '''
-        group, prefix, identifier = self._parse_filename(filename)
+
+        group: str | None
+        _: str | None
+        identifier: str | None
+
+        group, _, identifier = self._parse_filename(filename)
         if group is None or identifier is None:
             return []
 
@@ -296,7 +301,8 @@ class AssetFileManagement:
                 if key not in found:
                     continue
                 _, mtime = found[key]
-                if rank > best_rank or (rank == best_rank and mtime > best_mtime):
+                if (rank > best_rank
+                        or (rank == best_rank and mtime > best_mtime)):
                     best_rank = rank
                     best_mtime = mtime
 
@@ -476,7 +482,8 @@ class AssetFileManagement:
         to *filename* inside the base directory.  After writing, any file in
         the base or uploaded directory that has the same content identifier but
         a lower-ranked prefix, or the same prefix in the uploaded directory,
-        is deleted if its modification time is older than the file just written.
+        is deleted if its modification time is older than the file just
+        written.
 
         :param filename: Bare filename to write (will be created or
             overwritten).
@@ -709,6 +716,27 @@ class AssetFileManagement:
         :returns: The path of the marker file.
         '''
         return await self._touch_marker(f'{name}.unresolved', content)
+
+    def marker_path(self, name: str, suffix: str) -> Path:
+        '''
+        Return the base-directory path where a marker file for *name* with
+        *suffix* would live. Does **not** create the file; callers who want
+        to touch the marker should use :meth:`mark_not_found` or
+        :meth:`mark_unresolved`.
+
+        :param name: Bare prefix+identifier (e.g. ``channel-UCxyz``).
+        :param suffix: Marker suffix including the leading dot (e.g.
+            ``.unresolved``).
+        :raises ValueError: If *suffix* is not a recognized marker suffix.
+        :returns: The path the marker file would have on disk.
+        '''
+        filename: str = f'{name}{suffix}'
+        if not self.is_marker(filename):
+            raise ValueError(
+                f'{suffix!r} is not a recognized marker suffix '
+                f'(must be one of {MARKER_SUFFIXES})'
+            )
+        return self.base_dir / filename
 
     async def _touch_marker(self, marker_filename: str,
                             content: str | None) -> Path:

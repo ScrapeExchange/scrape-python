@@ -433,17 +433,14 @@ def main() -> None:
         settings=settings,
         scraper_label='channel',
         platform='youtube',
-        num_processes=(
-            settings.channel_num_processes
-        ),
+        num_processes=(settings.channel_num_processes),
         concurrency=settings.channel_concurrency,
         metrics_port=settings.metrics_port,
         log_file=settings.channel_log_file,
         log_level=settings.channel_log_level,
         rate_limiter_factory=lambda s: (
             YouTubeRateLimiter.get(
-                state_dir=s.rate_limiter_state_dir,
-                redis_dsn=s.redis_dsn,
+                state_dir=s.rate_limiter_state_dir, redis_dsn=s.redis_dsn
             )
         ),
     )
@@ -480,30 +477,23 @@ async def channel_exists(client: ExchangeClient, channel_name: str) -> bool:
         data: dict = resp.json()
         exists: bool = data.get('exists', False)
         if exists:
-            METRIC_CHANNEL_EXISTS_FOUND.labels(
-                worker_id=get_worker_id()
-            ).inc()
+            METRIC_CHANNEL_EXISTS_FOUND.labels(worker_id=get_worker_id()).inc()
         else:
             METRIC_CHANNEL_EXISTS_NOT_FOUND.labels(
                 worker_id=get_worker_id()
             ).inc()
         return exists
     elif resp.status_code == 404:
-        METRIC_CHANNEL_EXISTS_NOT_FOUND.labels(
-            worker_id=get_worker_id()
-        ).inc()
+        METRIC_CHANNEL_EXISTS_NOT_FOUND.labels(worker_id=get_worker_id()).inc()
         return False
     else:
-        METRIC_CHANNEL_EXISTS_FAILURES.labels(
-            worker_id=get_worker_id()
-        ).inc()
+        METRIC_CHANNEL_EXISTS_FAILURES.labels(worker_id=get_worker_id()).inc()
         logging.warning(
             'Failed to check existence of channel',
             extra={
-                'channel_name': channel_name,
-                'status_code': resp.status_code,
+                'channel_name': channel_name, 'status_code': resp.status_code,
                 'response_text': resp.text,
-            },
+            }
         )
         # Assume the channel does not exist if there was
         # an error checking
@@ -526,16 +516,13 @@ async def scrape_channels(
     )
 
     logging.info(
-        'Read unique channel names from .lst files not '
-        'already scraped or marked as not found',
-        extra={
-            'new_channels_length': len(new_channels),
-        },
+        'Read unique channel names from .lst files not already scraped or '
+        'marked as not found',
+        extra={'new_channels_length': len(new_channels)},
     )
     # Only keep channel handles (no spaces)
     channel_list: list[str] = [
-        ch for ch in new_channels
-        if ' ' not in ch and ch
+        ch for ch in new_channels if ' ' not in ch and ch
     ]
     shuffle(channel_list)
 
@@ -805,7 +792,7 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
     filename: str = get_channel_filename(channel_name)
     base_path: Path = fm.base_dir / filename
     uploaded_path: Path = fm.uploaded_dir / filename
-    failed_path: Path = fm.base_dir / f'{filename}.failed'
+    failed_path: Path = fm.marker_path(filename, '.failed')
 
     extra['filename'] = filename
     upload_mtime: float = 0
@@ -1142,6 +1129,179 @@ async def enqueue_upload_channel(
     )
 
 
+def _normalize_channel_line(raw_line: str) -> str | None:
+    '''
+    Strip and normalize one raw line from the channel list file.
+
+    :returns: the normalized line, or ``None`` when the line should
+        be skipped (blank, comment, or contains whitespace).
+    '''
+
+    line: str = raw_line.strip()
+    if not line or line.startswith('#'):
+        return None
+    if ' ' in line:
+        logging.info(
+            'Skipping line with spaces, likely not a channel handle',
+            extra={'line': line},
+        )
+        return None
+
+    if line.startswith('channel/'):
+        line = line[len('channel/'):]
+    if line.startswith('uc'):
+        line = line[0].upper() + line[1].upper() + line[2:]
+    elif (line.startswith('{') and line.endswith('}')
+            and ('channel' in line)):
+        # JSONL, perhaps created with yt_discover_channels.py.
+        # The authoritative map write happens post-scrape in
+        # resolve_channel_upload_handle using YouTube's canonical
+        # handle; the user-supplied casing here is not written.
+        data: dict[str, str | int] = json.loads(line)
+        line = data.get('channel', line)
+
+    return line
+
+
+def _resolve_known_channel_id(
+    channel_id: str, channel_map_data: dict[str, str],
+    fm: AssetFileManagement,
+) -> tuple[str | None, str | None]:
+    '''
+    Look up a channel ID in the creator map and on the unresolved
+    marker file. Returns ``(handle, unresolved_id)``: a handle if we
+    already have a mapping, an unresolved id to queue for resolution,
+    or both ``None`` if the id previously failed to resolve and
+    should be ignored.
+    '''
+
+    if channel_id in channel_map_data:
+
+        return channel_map_data[channel_id], None
+
+    marker: Path = fm.marker_path(
+        f'{CHANNEL_FILE_PREFIX}{channel_id}', '.unresolved',
+    )
+    if marker.exists():
+        logging.debug(
+            'Channel ID previously failed to resolve, skipping',
+            extra={'channel_id': channel_id},
+        )
+        return None, None
+    return None, channel_id
+
+
+def _parse_channel_line(
+    raw_line: str, channel_map_data: dict[str, str],
+    fm: AssetFileManagement,
+) -> tuple[str | None, str | None]:
+    '''
+    Parse one line from the channel list file.
+
+    :returns: a ``(channel_handle, unresolved_channel_id)`` tuple.
+        Either or both may be ``None``. An ``unresolved_channel_id``
+        indicates a channel ID for which no mapping is known yet and
+        which the caller should submit to the resolution step.
+    '''
+
+    line: str | None = _normalize_channel_line(raw_line)
+    if line is None:
+        return None, None
+
+    channel_handle: str | None = None
+    if ',' in line:
+        _: str
+        _, channel_handle = line.split(',', 1)
+        channel_handle = channel_handle.strip()
+
+    if not channel_handle and YouTubeChannel.is_channel_id(line):
+        return _resolve_known_channel_id(line, channel_map_data, fm)
+    elif line.startswith('https://www.youtube.com/@'):
+        channel_handle = line[len('https://www.youtube.com/@'):].strip()
+    elif line.startswith(('handle', 'custom', 'user', 'c/')):
+        parts: list[str] = line.split('\\')
+        if len(parts) >= 2:
+            channel_handle = parts[1].strip()
+    elif '\t' in line:
+        channel_handle = line.split('\t')[1].strip()
+    else:
+        channel_handle = line
+
+    return channel_handle, None
+
+
+def _filter_unscraped_candidates(
+    channel_handles: set[str], fm: AssetFileManagement,
+) -> list[str]:
+    '''
+    Drop handles we already have local data for. A handle is skipped
+    when any of these exist on disk: a ``.not_found`` marker, a
+    scraped file in ``base_dir``, or an uploaded file in
+    ``uploaded_dir``.
+    '''
+
+    candidates: list[str] = []
+    for channel_handle in channel_handles:
+        if not channel_handle:
+            continue
+        filename: str = get_channel_filename(channel_handle)
+        not_found_path: Path = fm.marker_path(
+            f'{CHANNEL_FILE_PREFIX}{channel_handle}', '.not_found',
+        )
+        scraped_path: Path = fm.base_dir / filename
+        uploaded_path: Path = fm.uploaded_dir / filename
+        if (not_found_path.exists()
+                or scraped_path.exists()
+                or uploaded_path.exists()):
+            logging.debug(
+                'Skipping channel as we already have data for it',
+                extra={'channel_handle': channel_handle},
+            )
+            continue
+        candidates.append(channel_handle)
+    return candidates
+
+
+async def _select_new_channels(
+    candidates: list[str], exchange_client: ExchangeClient,
+    max_new_channels: int, already_resolved_count: int,
+) -> set[str]:
+    '''
+    Concurrently check up to ``max_new_channels`` candidates for
+    existence on Scrape Exchange and return the ones that do not yet
+    exist, stopping once the per-run budget (less the channels already
+    resolved earlier in the same run) has been hit.
+    '''
+
+    exists_semaphore: asyncio.Semaphore = asyncio.Semaphore(10)
+
+    async def check_exists(name: str) -> tuple[str, bool]:
+        async with exists_semaphore:
+            return name, await channel_exists(exchange_client, name)
+
+    existence_results: list[tuple[str, bool]] = await asyncio.gather(
+        *(check_exists(name) for name in candidates[:max_new_channels])
+    )
+
+    selected: set[str] = set()
+    for channel_handle, exists in existence_results:
+        if exists:
+            logging.debug(
+                'Skipping channel handle previously marked as not '
+                'found or found to exist',
+                extra={'channel_handle': channel_handle},
+            )
+            continue
+        selected.add(channel_handle)
+        if (len(selected) + already_resolved_count) >= max_new_channels:
+            logging.info(
+                'Reached maximum new channels to scrape, stopping read',
+                extra={'max_new_channels': max_new_channels},
+            )
+            break
+    return selected
+
+
 async def read_channels(
     file_path: str, creator_map_backend: CreatorMap,
     fm: AssetFileManagement,
@@ -1151,12 +1311,13 @@ async def read_channels(
 ) -> set[str]:
     '''
     Reads .lst files from the specified directory and extracts YouTube channel
-    names. This function accepts:
-    - Lines that start with 'UC' and are 24 characters long, which are treated
-      as channel IDs (these will be resolved to channel names later).
+    handles. This function accepts:
+    - Lines that start with 'UC' or 'uc' and are 24 characters long, which are
+      treated as channel IDs (these will be resolved to channel names later).
     - Lines that contain a tab character, where the channel name is expected to
       be the second word (after the tab).
     - Lines that start with youtube URL
+    - a JSON object on a line
 
     :param directory: The directory containing .lst files with channel names.
     :param concurrency: Number of channel ID resolutions to run concurrently.
@@ -1164,75 +1325,28 @@ async def read_channels(
     :raises: (none)
     '''
 
-    logging.info(
-        'Reading channel names', extra={'file_path': file_path}
-    )
+    logging.info('Reading channel names', extra={'file_path': file_path})
 
-    # These are known names but not necesarily will have been scraped
-    channel_map_data: dict[str, str] = (
-        await creator_map_backend.get_all()
-    )
-    new_channel_names: set[str] = set()
-
-    # Channel IDs that need to be resolved to names
+    channel_map_data: dict[str, str] = await creator_map_backend.get_all()
+    new_channel_handles: set[str] = set()
     unresolved_ids: set[str] = set()
 
     line: str
     async with aiofiles.open(file_path, 'r') as file_desc:
         async for line in file_desc:
-            line = line.strip()
-            if not line or line.startswith('#') or ' ' in line:
-                continue
-            if line.startswith('channel/'):
-                line = line[len('channel/'):]
-                if line.startswith('uc'):
-                    line = line[0].upper() + line[1].upper() + line[2:]
-            elif (line.startswith('{') and line.endswith('}')
-                    and ('channel' in line)):
-                # JSONL, perhaps created with yt_discover_channels.py.
-                # The authoritative map write happens post-scrape in
-                # resolve_channel_upload_handle using YouTube's
-                # canonical handle; the user-supplied casing here is
-                # not written.
-                data: dict[str, str | int] = json.loads(line)
-                line = data.get('channel', line)
-
-            channel_name: str | None = None
-            if ',' in line:
-                _: str
-                _, channel_name = line.split(',', 1)
-                channel_name = channel_name.strip()
-            if not channel_name and YouTubeChannel.is_channel_id(line):
-                if line in channel_map_data:
-                    channel_name = channel_map_data[line]
-                elif (fm.base_dir
-                      / f'{CHANNEL_FILE_PREFIX}{line}.unresolved').exists():
-                    logging.debug(
-                        'Channel ID previously failed to resolve, '
-                        'skipping',
-                        extra={'channel_id': line},
-                    )
-                else:
-                    unresolved_ids.add(line)
-            elif line.startswith('https://www.youtube.com/@'):
-                channel_name = line[len('https://www.youtube.com/@'):].strip()
-            elif (line.startswith('handle') or line.startswith('custom')
-                    or line.startswith('user') or line.startswith('c/')):
-                parts: list[str] = line.split('\\')
-                if len(parts) >= 2:
-                    channel_name = parts[1].strip()
-            elif '\t' in line:
-                channel_name = line.split('\t')[1].strip()
-            else:
-                channel_name = line
-
-            if channel_name:
-                new_channel_names.add(channel_name)
+            channel_handle: str | None
+            unresolved_id: str | None
+            channel_handle, unresolved_id = _parse_channel_line(
+                line, channel_map_data, fm,
+            )
+            if channel_handle:
+                new_channel_handles.add(channel_handle)
+            if unresolved_id:
+                unresolved_ids.add(unresolved_id)
 
     logging.info(
-        'Found unique channel names in file',
-        extra={
-            'new_channel_names_length': len(new_channel_names),
+        'Found unique channel handles in file', extra={
+            'new_channel_handles_length': len(new_channel_handles),
             'file_path': file_path,
         },
     )
@@ -1254,71 +1368,34 @@ async def read_channels(
             unresolved_ids, creator_map_backend, fm,
             concurrency, max_resolved_channels
         )
-        new_channel_names.update(resolved_channels)
+        new_channel_handles.update(resolved_channels)
 
-    candidates: list[str] = []
-    for channel_name in new_channel_names:
-        if not channel_name:
-            continue
-        filename: str = get_channel_filename(channel_name)
-        not_found_path: Path = (
-            fm.base_dir / f'{CHANNEL_FILE_PREFIX}{channel_name}.not_found'
-        )
-        scraped_path: Path = fm.base_dir / filename
-        uploaded_path: Path = fm.uploaded_dir / filename
-        if (not_found_path.exists()
-                or scraped_path.exists()
-                or uploaded_path.exists()):
-            logging.debug(
-                'Skipping channel as we already have data for it',
-                extra={'channel_name': channel_name},
-            )
-            continue
-        candidates.append(channel_name)
+    candidates: list[str] = _filter_unscraped_candidates(
+        new_channel_handles, fm,
+    )
 
-    exists_semaphore: asyncio.Semaphore = asyncio.Semaphore(10)
     logging.info(
-        'Checking existence of channel names on Scrape Exchange',
+        'Checking existence of channel handles on Scrape Exchange',
         extra={'max_new_channels': max_new_channels},
     )
-
-    async def check_exists(name: str) -> tuple[str, bool]:
-        async with exists_semaphore:
-            return name, await channel_exists(exchange_client, name)
-
-    existence_results: list[tuple[str, bool]] = await asyncio.gather(
-        *(check_exists(name) for name in candidates[:max_new_channels])
+    checked_channel_handles: set[str] = await _select_new_channels(
+        candidates, exchange_client, max_new_channels,
+        len(resolved_channels),
     )
-
-    checked_channel_names: set[str] = set()
-    for channel_name, exists in existence_results:
-        if exists:
-            logging.debug(
-                'Skipping channel name previously marked as not found '
-                'or found to exist',
-                extra={'channel_name': channel_name},
-            )
-            continue
-        checked_channel_names.add(channel_name)
-        if ((len(checked_channel_names) + len(resolved_channels))
-                >= max_new_channels):
-            logging.info(
-                'Reached maximum new channels to scrape, stopping read',
-                extra={'max_new_channels': max_new_channels},
-            )
-            break
 
     METRIC_UNIQUE_CHANNELS_READ.labels(
         worker_id=get_worker_id()
-    ).set(len(checked_channel_names))
+    ).set(len(checked_channel_handles))
     logging.info(
-        'Read unique channel names from file',
+        'Read unique channel handles from file',
         extra={
-            'checked_channel_names_length': len(checked_channel_names),
+            'checked_channel_handles_length': (
+                len(checked_channel_handles)
+            ),
             'file_path': file_path,
         },
     )
-    return checked_channel_names
+    return checked_channel_handles
 
 
 async def review_unresolved_ids(
@@ -1351,9 +1428,9 @@ async def review_unresolved_ids(
                     channel_id
                 )
                 if not name:
-                    unresolved_file_path: Path = (
-                        fm.base_dir
-                        / f'{CHANNEL_FILE_PREFIX}{channel_id}.unresolved'
+                    unresolved_file_path: Path = fm.marker_path(
+                        f'{CHANNEL_FILE_PREFIX}{channel_id}',
+                        '.unresolved',
                     )
                     if unresolved_file_path.exists():
                         logging.debug(

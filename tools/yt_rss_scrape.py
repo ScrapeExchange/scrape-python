@@ -453,6 +453,46 @@ class RssSettings(YouTubeScraperSettings):
 _extract_proxy_ip = extract_proxy_ip
 
 
+def _record_rss_failure(
+    reason: str, proxy_ip: str | None, proxy_network: str,
+) -> None:
+    METRIC_RSS_FAILURES.labels(
+        worker_id=get_worker_id(), proxy_ip=proxy_ip,
+        proxy_network=proxy_network,
+        reason=reason,
+    ).inc()
+
+
+def _handle_http_status_error(
+    exc: httpx.HTTPStatusError, rss_url: str, proxy: str | None,
+    proxy_ip: str | None, proxy_network: str,
+    extra: dict[str, str],
+) -> None:
+    '''
+    Classify an HTTP status error, bump the appropriate failure metric,
+    and raise the caller-facing exception. Always raises.
+    '''
+    logging.warning(
+        'HTTP error fetching RSS feed',
+        extra=extra | {
+            'status_code': exc.response.status_code,
+            'response_text': exc.response.text,
+        },
+    )
+    if exc.response.status_code == 404:
+        _record_rss_failure('not_found', proxy_ip, proxy_network)
+        YouTubeRateLimiter.get().report_rss_failure(
+            proxy, is_circuit_tripping=True,
+        )
+        raise ValueError(f'RSS feed not found: {rss_url}') from exc
+    if exc.response.status_code == 500:
+        _record_rss_failure('server_error', proxy_ip, proxy_network)
+        raise RuntimeError(
+            f'Server error fetching RSS feed: {rss_url}'
+        ) from exc
+    raise exc
+
+
 async def fetch_rss(
     rss_url: str,
     channel_name_override: str | None = None,
@@ -500,48 +540,26 @@ async def fetch_rss(
             logging.debug('Fetched RSS feed successfully', extra=extra)
             YouTubeRateLimiter.get().report_rss_success(proxy)
     except httpx.HTTPStatusError as exc:
-        logging.warning(
-            'HTTP error fetching RSS feed',
-            extra=extra | {
-                'status_code': exc.response.status_code,
-                'response_text': exc.response.text,
-            },
+        _handle_http_status_error(
+            exc, rss_url, proxy, proxy_ip, proxy_network, extra,
         )
-        if exc.response.status_code == 404:
-            METRIC_RSS_FAILURES.labels(
-                worker_id=get_worker_id(), proxy_ip=proxy_ip,
-                proxy_network=proxy_network,
-                reason='not_found'
-            ).inc()
-            YouTubeRateLimiter.get().report_rss_failure(
-                proxy, is_circuit_tripping=True,
-            )
-            raise ValueError(f'RSS feed not found: {rss_url}') from exc
-        if exc.response.status_code == 500:
-            METRIC_RSS_FAILURES.labels(
-                worker_id=get_worker_id(), proxy_ip=proxy_ip,
-                proxy_network=proxy_network,
-                reason='server_error'
-            ).inc()
-            raise RuntimeError(
-                f'Server error fetching RSS feed: {rss_url}'
-            ) from exc
+    except httpx.TimeoutException as exc:
+        _record_rss_failure('timeout', proxy_ip, proxy_network)
+        logging.warning('Timeout fetching RSS feed', exc=exc, extra=extra)
+        raise
+    except (httpx.NetworkError, httpx.ProxyError) as exc:
+        _record_rss_failure('network', proxy_ip, proxy_network)
+        logging.warning(
+            'Network error fetching RSS feed', exc=exc, extra=extra,
+        )
         raise
     except Exception as exc:
-        METRIC_RSS_FAILURES.labels(
-            worker_id=get_worker_id(), proxy_ip=proxy_ip,
-            proxy_network=proxy_network,
-            reason='unknown'
-        ).inc()
+        _record_rss_failure('unknown', proxy_ip, proxy_network)
         logging.warning('Getting RSS data failed', exc=exc, extra=extra)
         raise
 
     if not data:
-        METRIC_RSS_FAILURES.labels(
-            worker_id=get_worker_id(), proxy_ip=proxy_ip,
-            proxy_network=proxy_network,
-            reason='no_data'
-        ).inc()
+        _record_rss_failure('no_data', proxy_ip, proxy_network)
         logging.warning('No data received from RSS feed', extra=extra)
         raise RuntimeError(f'No data received from RSS feed {rss_url}')
 
