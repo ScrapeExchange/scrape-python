@@ -65,7 +65,7 @@ METRIC_BUCKET_TOKENS: Gauge = Gauge(
 METRIC_GLOBAL_BUCKET_TOKENS: Gauge = Gauge(
     'rate_limiter_global_bucket_tokens',
     'Current token level in the global rate-limit bucket',
-    ['proxy', 'script', 'platform', 'worker_id'],
+    ['proxy', 'proxy_network', 'script', 'platform', 'worker_id'],
 )
 
 
@@ -1177,8 +1177,20 @@ class RateLimiter(ABC, Generic[CallTypeT]):
     def _global_labels(
         self, proxy: str | None,
     ) -> dict[str, str]:
+        proxy_network: str = 'none'
+        if proxy:
+            try:
+                from scrape_exchange.util import (
+                    extract_proxy_ip, proxy_network_for,
+                )
+                proxy_network = proxy_network_for(
+                    extract_proxy_ip(proxy),
+                )
+            except ValueError:
+                proxy_network = 'other'
         return {
             'proxy': proxy or 'none',
+            'proxy_network': proxy_network,
             'script': _SCRIPT_NAME,
             'platform': self._platform,
             'worker_id': get_worker_id(),

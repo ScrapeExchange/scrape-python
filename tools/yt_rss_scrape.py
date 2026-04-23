@@ -40,7 +40,7 @@ from scrape_exchange.scraper_runner import (
     ScraperRunner,
 )
 from scrape_exchange.settings import normalize_log_level
-from scrape_exchange.util import extract_proxy_ip
+from scrape_exchange.util import extract_proxy_ip, proxy_network_for
 from scrape_exchange.youtube.youtube_channel import (
     YouTubeChannel,
     canonical_handle_from_browse,
@@ -121,7 +121,7 @@ METRIC_VIDEOS_ENQUEUED = Counter(
     'Total number of videos successfully enqueued for background '
     'upload. Actual delivery is tracked by '
     'exchange_client_background_uploads_total{entity="video"}.',
-    ['worker_id', 'proxy_ip'],
+    ['worker_id', 'proxy_ip', 'proxy_network'],
 )
 METRIC_API_CHANNEL_CALLS = Counter(
     'yt_rss_post_data_api_channel_calls_total',
@@ -136,12 +136,12 @@ METRIC_API_VIDEO_CALLS = Counter(
 METRIC_RSS_FAILURES = Counter(
     'yt_rss_feed_download_failures_total',
     'Number of times an RSS feed could not be downloaded',
-    ['worker_id', 'proxy_ip', 'reason'],
+    ['worker_id', 'proxy_ip', 'proxy_network', 'reason'],
 )
 METRIC_RSS_DOWNLOADED = Counter(
     'yt_rss_feeds_downloaded_total',
     'Number of RSS feeds successfully downloaded',
-    ['worker_id', 'proxy_ip'],
+    ['worker_id', 'proxy_ip', 'proxy_network'],
 )
 METRIC_SLEEP_SECONDS = Gauge(
     'yt_rss_sleep_seconds_before_next_channel',
@@ -158,12 +158,12 @@ METRIC_CONCURRENCY = Gauge(
 METRIC_INNERTUBE_SUCCESS = Counter(
     'yt_rss_innertube_success_total',
     'Number of times an Innertube API call succeeded',
-    ['worker_id', 'proxy_ip', 'entity'],
+    ['worker_id', 'proxy_ip', 'proxy_network', 'entity'],
 )
 METRIC_INNERTUBE_FAILURES = Counter(
     'yt_rss_innertube_call_failures_total',
     'Number of times an Innertube API call failed',
-    ['worker_id', 'proxy_ip', 'entity'],
+    ['worker_id', 'proxy_ip', 'proxy_network', 'entity'],
 )
 METRIC_CHANNEL_SECONDS_SINCE_LAST_PROCESSED = Gauge(
     'yt_rss_channel_seconds_since_last_processed',
@@ -488,7 +488,9 @@ async def fetch_rss(
             extra={'proxy': proxy},
         )
         proxy_ip = None
+    proxy_network: str = proxy_network_for(proxy_ip)
     extra['proxy_ip'] = proxy_ip or 'none'
+    extra['proxy_network'] = proxy_network
     extra['proxy'] = proxy or 'none'
     try:
         async with httpx.AsyncClient(proxies=proxy) as http:
@@ -508,6 +510,7 @@ async def fetch_rss(
         if exc.response.status_code == 404:
             METRIC_RSS_FAILURES.labels(
                 worker_id=get_worker_id(), proxy_ip=proxy_ip,
+                proxy_network=proxy_network,
                 reason='not_found'
             ).inc()
             YouTubeRateLimiter.get().report_rss_failure(
@@ -517,6 +520,7 @@ async def fetch_rss(
         if exc.response.status_code == 500:
             METRIC_RSS_FAILURES.labels(
                 worker_id=get_worker_id(), proxy_ip=proxy_ip,
+                proxy_network=proxy_network,
                 reason='server_error'
             ).inc()
             raise RuntimeError(
@@ -526,6 +530,7 @@ async def fetch_rss(
     except Exception as exc:
         METRIC_RSS_FAILURES.labels(
             worker_id=get_worker_id(), proxy_ip=proxy_ip,
+            proxy_network=proxy_network,
             reason='unknown'
         ).inc()
         logging.warning('Getting RSS data failed', exc=exc, extra=extra)
@@ -534,13 +539,15 @@ async def fetch_rss(
     if not data:
         METRIC_RSS_FAILURES.labels(
             worker_id=get_worker_id(), proxy_ip=proxy_ip,
+            proxy_network=proxy_network,
             reason='no_data'
         ).inc()
         logging.warning('No data received from RSS feed', extra=extra)
         raise RuntimeError(f'No data received from RSS feed {rss_url}')
 
     METRIC_RSS_DOWNLOADED.labels(
-        worker_id=get_worker_id(), proxy_ip=proxy_ip
+        worker_id=get_worker_id(), proxy_ip=proxy_ip,
+        proxy_network=proxy_network,
     ).inc()
 
     feed: untangle.Element = untangle.parse(data)
@@ -678,10 +685,12 @@ async def _enrich_and_store_video(
     '''
 
     proxy_ip: str = _extract_proxy_ip(proxy) if proxy else 'none'
+    proxy_network: str = proxy_network_for(proxy_ip)
     extra: dict[str, str] = {
         'video_id': video.video_id,
         'channel_name': channel_name,
-        'proxy_ip': proxy_ip
+        'proxy_ip': proxy_ip,
+        'proxy_network': proxy_network,
     }
     try:
         await video.from_innertube(
@@ -691,11 +700,13 @@ async def _enrich_and_store_video(
             'Updated video using InnerTube data', extra=extra,
         )
         METRIC_INNERTUBE_SUCCESS.labels(
-            worker_id=get_worker_id(), proxy_ip=proxy_ip, entity='video'
+            worker_id=get_worker_id(), proxy_ip=proxy_ip,
+            proxy_network=proxy_network, entity='video',
         ).inc()
     except Exception as exc:
         METRIC_INNERTUBE_FAILURES.labels(
-            worker_id=get_worker_id(), proxy_ip=proxy_ip, entity='video'
+            worker_id=get_worker_id(), proxy_ip=proxy_ip,
+            proxy_network=proxy_network, entity='video',
         ).inc()
         logging.warning(
             'Failed to get InnerTube video data, '
@@ -727,7 +738,8 @@ async def _enrich_and_store_video(
         client, settings, handle, video,
     ):
         METRIC_VIDEOS_ENQUEUED.labels(
-            worker_id=get_worker_id(), proxy_ip=proxy_ip
+            worker_id=get_worker_id(), proxy_ip=proxy_ip,
+            proxy_network=proxy_network,
         ).inc()
         logging.debug(
             'Video enqueued for upload',
@@ -1079,6 +1091,7 @@ async def update_channel(
 
     try:
         proxy_ip: str = _extract_proxy_ip(proxy) if proxy else 'none'
+        proxy_network: str = proxy_network_for(proxy_ip)
         tabs: YouTubeChannelTabs = YouTubeChannelTabs(channel_id, proxy)
         channel_data: dict = await tabs.browse_channel()
     except Exception as exc:
@@ -1088,12 +1101,14 @@ async def update_channel(
             extra={'channel_name': channel_name, 'proxy': proxy},
         )
         METRIC_INNERTUBE_FAILURES.labels(
-            worker_id=get_worker_id(), proxy_ip=proxy_ip, entity='channel'
+            worker_id=get_worker_id(), proxy_ip=proxy_ip,
+            proxy_network=proxy_network, entity='channel',
         ).inc()
         return False, 0, None
 
     METRIC_INNERTUBE_SUCCESS.labels(
-        worker_id=get_worker_id(), proxy_ip=proxy_ip, entity='channel'
+        worker_id=get_worker_id(), proxy_ip=proxy_ip,
+        proxy_network=proxy_network, entity='channel',
     ).inc()
 
     canonical: str | None = canonical_handle_from_browse(channel_data)

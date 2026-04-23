@@ -45,7 +45,7 @@ from scrape_exchange.scraper_runner import (
     ScraperRunner,
 )
 from scrape_exchange.settings import normalize_log_level
-from scrape_exchange.util import extract_proxy_ip
+from scrape_exchange.util import extract_proxy_ip, proxy_network_for
 
 from scrape_exchange.youtube.youtube_channel import (
     YouTubeChannel,
@@ -242,7 +242,7 @@ METRIC_UPLOADED_FILE_EXISTS = Counter(
 METRIC_CHANNELS_SCRAPED = Counter(
     'yt_channel_scraped_total',
     'Number of channels successfully scraped',
-    ['worker_id', 'proxy_ip'],
+    ['worker_id', 'proxy_ip', 'proxy_network'],
 )
 METRIC_CHANNELS_ENQUEUED = Counter(
     'yt_channel_enqueued_total',
@@ -254,7 +254,7 @@ METRIC_CHANNELS_ENQUEUED = Counter(
 METRIC_SCRAPE_FAILURES = Counter(
     'yt_channel_scrape_failures_total',
     'Number of times channel scraping failed',
-    ['worker_id', 'proxy_ip'],
+    ['worker_id', 'proxy_ip', 'proxy_network'],
 )
 METRIC_CHANNEL_IDS_TO_RESOLVE = Gauge(
     'yt_channel_ids_to_resolve',
@@ -275,7 +275,7 @@ METRIC_CHANNEL_NO_CONTENT_FOUND = Counter(
     'yt_channel_no_content_found_total',
     'Number of channels scraped that had no videos, playlists, courses, '
     'podcasts, or products',
-    ['worker_id', 'proxy_ip'],
+    ['worker_id', 'proxy_ip', 'proxy_network'],
 )
 
 # -- upload-only watcher metrics --
@@ -882,19 +882,22 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
             proxy_used: str | None = getattr(
                 channel.browse_client, 'proxy', None,
             )
+            proxy_used_ip: str = (
+                extract_proxy_ip(proxy_used)
+                if proxy_used else 'none'
+            )
             METRIC_SCRAPE_FAILURES.labels(
                 worker_id=get_worker_id(),
-                proxy_ip=(
-                    extract_proxy_ip(proxy_used)
-                    if proxy_used else 'none'
+                proxy_ip=proxy_used_ip,
+                proxy_network=proxy_network_for(
+                    proxy_used_ip,
                 ),
             ).inc()
             logging.warning(
                 'Failed to scrape channel',
                 exc=exc, extra=extra | {
                     'proxy': proxy_used,
-                    'proxy_ip': extract_proxy_ip(proxy_used)
-                    if proxy_used else 'none'
+                    'proxy_ip': proxy_used_ip,
                 }
             )
             return False
@@ -902,11 +905,15 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
             proxy_used = getattr(
                 channel.browse_client, 'proxy', None,
             )
+            proxy_used_ip = (
+                extract_proxy_ip(proxy_used)
+                if proxy_used else 'none'
+            )
             METRIC_SCRAPE_FAILURES.labels(
                 worker_id=get_worker_id(),
-                proxy_ip=(
-                    extract_proxy_ip(proxy_used)
-                    if proxy_used else 'none'
+                proxy_ip=proxy_used_ip,
+                proxy_network=proxy_network_for(
+                    proxy_used_ip,
                 ),
             ).inc()
             logging.warning(
@@ -937,6 +944,9 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
             extract_proxy_ip(scrape_proxy)
             if scrape_proxy else 'none'
         )
+        scrape_proxy_network: str = proxy_network_for(
+            scrape_proxy_ip,
+        )
 
         if (not channel.video_ids and not channel.playlists
                 and not channel.courses
@@ -951,12 +961,14 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
             METRIC_CHANNEL_NO_CONTENT_FOUND.labels(
                 worker_id=get_worker_id(),
                 proxy_ip=scrape_proxy_ip,
+                proxy_network=scrape_proxy_network,
             ).inc()
             logging.info(
                 'YouTube channel content counts',
                 extra={
                     'channel_name': channel_name,
                     'proxy_ip': scrape_proxy_ip,
+                    'proxy_network': scrape_proxy_network,
                     'playlists_length': (
                         len(channel.playlists)
                     ),
@@ -991,12 +1003,14 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
         METRIC_CHANNELS_SCRAPED.labels(
             worker_id=get_worker_id(),
             proxy_ip=scrape_proxy_ip,
+            proxy_network=scrape_proxy_network,
         ).inc()
         logging.info(
             'Downloaded channel',
             extra={
                 'channel_name': channel_name,
                 'proxy_ip': scrape_proxy_ip,
+                'proxy_network': scrape_proxy_network,
             },
         )
 

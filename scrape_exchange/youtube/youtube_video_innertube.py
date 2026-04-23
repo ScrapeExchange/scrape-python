@@ -20,7 +20,7 @@ from dateutil import parser as dateutil_parser
 
 from .youtube_caption import YouTubeCaption
 from scrape_exchange.worker_id import get_worker_id
-from scrape_exchange.util import extract_proxy_ip
+from scrape_exchange.util import extract_proxy_ip, proxy_network_for
 from .youtube_client import METRIC_YT_REQUEST_DURATION
 from .youtube_format import YouTubeFormat
 from .youtube_cookiejar import YouTubeCookieJar
@@ -153,6 +153,7 @@ class InnerTubeVideoParser:
             proxy_ip: str = (
                 extract_proxy_ip(proxy) if proxy else 'none'
             )
+            proxy_network: str = proxy_network_for(proxy_ip)
             start: float = time.monotonic()
             try:
                 player_data = self.innertube.player(video.video_id)
@@ -161,6 +162,7 @@ class InnerTubeVideoParser:
                     status_class='2xx',
                     worker_id=get_worker_id(),
                     proxy_ip=proxy_ip,
+                    proxy_network=proxy_network,
                 ).observe(time.monotonic() - start)
                 break
             except InnerTubeRequestError as exc:
@@ -173,6 +175,7 @@ class InnerTubeVideoParser:
                     ),
                     worker_id=get_worker_id(),
                     proxy_ip=proxy_ip,
+                    proxy_network=proxy_network,
                 ).observe(time.monotonic() - start)
                 if exc.error.code == 429:
                     await limiter.penalise(
@@ -208,6 +211,7 @@ class InnerTubeVideoParser:
                     status_class='error',
                     worker_id=get_worker_id(),
                     proxy_ip=proxy_ip,
+                    proxy_network=proxy_network,
                 ).observe(time.monotonic() - start)
                 raise RuntimeError(f'InnerTube API call failed: {exc}')
 
@@ -319,6 +323,7 @@ class InnerTubeVideoParser:
                     status_class='2xx',
                     worker_id=get_worker_id(),
                     proxy_ip=proxy_ip,
+                    proxy_network=proxy_network,
                 ).observe(time.monotonic() - next_start)
                 self._parse_next_data(next_data)
                 break
@@ -332,6 +337,7 @@ class InnerTubeVideoParser:
                     ),
                     worker_id=get_worker_id(),
                     proxy_ip=proxy_ip,
+                    proxy_network=proxy_network,
                 ).observe(time.monotonic() - next_start)
                 if exc.error.code == 429:
                     await limiter.penalise(
@@ -364,6 +370,7 @@ class InnerTubeVideoParser:
                     status_class='error',
                     worker_id=get_worker_id(),
                     proxy_ip=proxy_ip,
+                    proxy_network=proxy_network,
                 ).observe(time.monotonic() - next_start)
                 break  # NEXT is best-effort; never fail the whole scrape
 

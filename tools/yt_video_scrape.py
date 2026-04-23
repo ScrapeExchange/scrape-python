@@ -40,6 +40,7 @@ from scrape_exchange.content_claim import (
     RedisContentClaim,
 )
 from scrape_exchange.worker_id import get_worker_id
+from scrape_exchange.util import extract_proxy_ip, proxy_network_for
 from scrape_exchange.settings import normalize_log_level
 from scrape_exchange.scraper_runner import (
     ScraperRunContext,
@@ -167,18 +168,33 @@ def _classify_yt_dlp_error(error_str: str) -> str:
     return 'other'
 
 
+def _proxy_network(proxy: str | None) -> str:
+    '''
+    Derive the proxy_network label (CIDR string, 'other',
+    or 'none') from a proxy URL. Wrapping extract_proxy_ip
+    catches the rare malformed-URL case so metric emission
+    never raises.
+    '''
+    if not proxy:
+        return 'none'
+    try:
+        return proxy_network_for(extract_proxy_ip(proxy))
+    except ValueError:
+        return 'other'
+
+
 # Prometheus metrics
 METRIC_VIDEOS_SCRAPED = Counter(
     'yt_video_proxy_videos_scraped_total',
     'Number of videos successfully scraped with yt-dlp',
-    ['proxy', 'worker_id'],
+    ['proxy', 'proxy_network', 'worker_id'],
 )
 METRIC_SCRAPE_FAILURES = Counter(
     'yt_video_proxy_scrape_failures_total',
     'Number of times video scraping failed, labelled by reason '
     '(rate_limit, unavailable, premiere, transient, missing_data, '
     'other) and by proxy.',
-    ['proxy', 'reason', 'worker_id'],
+    ['proxy', 'proxy_network', 'reason', 'worker_id'],
 )
 METRIC_SCRAPE_DURATION = Histogram(
     'yt_video_proxy_scrape_duration_seconds',
@@ -190,7 +206,7 @@ METRIC_SCRAPE_DURATION = Histogram(
 METRIC_RATE_LIMIT_HITS = Counter(
     'yt_video_proxy_rate_limit_hits_total',
     'Number of times a proxy was rate-limited by YouTube',
-    ['proxy', 'worker_id'],
+    ['proxy', 'proxy_network', 'worker_id'],
 )
 METRIC_VIDEOS_ENQUEUED = Counter(
     'yt_video_proxy_videos_enqueued_total',
@@ -212,7 +228,7 @@ METRIC_QUEUE_SIZE = Gauge(
 METRIC_SLEEP_SECONDS = Gauge(
     'yt_video_proxy_sleep_seconds',
     'Seconds the worker will sleep before processing the next video',
-    ['proxy', 'worker_id'],
+    ['proxy', 'proxy_network', 'worker_id'],
 )
 METRIC_VIDEOS_SKIPPED_HAS_FORMATS = Counter(
     'yt_video_proxy_videos_skipped_has_formats_total',
@@ -886,7 +902,8 @@ async def _scrape_and_save(
             extra={'video_id': video_id, 'proxy': proxy},
         )
         METRIC_SCRAPE_FAILURES.labels(
-            proxy=proxy, reason='other',
+            proxy=proxy, proxy_network=_proxy_network(proxy),
+            reason='other',
             worker_id=get_worker_id(),
         ).inc()
         try:
@@ -896,6 +913,7 @@ async def _scrape_and_save(
         if sleep:
             METRIC_SLEEP_SECONDS.labels(
                 proxy=proxy,
+                proxy_network=_proxy_network(proxy),
                 worker_id=get_worker_id(),
             ).set(sleep)
         return None, sleep
@@ -1106,6 +1124,7 @@ async def worker(
                 scrapes_since_refresh += 1
                 METRIC_VIDEOS_SCRAPED.labels(
                     proxy=proxy,
+                    proxy_network=_proxy_network(proxy),
                     worker_id=get_worker_id(),
                 ).inc()
 
@@ -1228,14 +1247,16 @@ async def _handle_scrape_failure(
     '''
 
     reason: str = _classify_yt_dlp_error(str(exc))
+    proxy_net: str = _proxy_network(proxy)
     METRIC_SCRAPE_FAILURES.labels(
-        proxy=proxy, reason=reason,
+        proxy=proxy, proxy_network=proxy_net, reason=reason,
         worker_id=get_worker_id(),
     ).inc()
 
     if reason == 'rate_limit':
         METRIC_RATE_LIMIT_HITS.labels(
-            proxy=proxy, worker_id=get_worker_id(),
+            proxy=proxy, proxy_network=proxy_net,
+            worker_id=get_worker_id(),
         ).inc()
         logging.warning(
             'Rate limited during scraping video',

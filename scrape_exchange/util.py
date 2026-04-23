@@ -2,13 +2,91 @@
 Docstring for scrape_exchange.util
 '''
 
+import os
 import re
+import logging
+
 from datetime import datetime
+from ipaddress import IPv4Address, IPv4Network
 
 from .datatypes import IngestStatus
 from .file_management import AssetFileManagement
 
+_LOGGER: logging.Logger = logging.getLogger(__name__)
+
 _PROXY_HOST_RE: re.Pattern[str] = re.compile(r'^[A-Za-z0-9._-]+$')
+
+# Parsed form of the PROXY_NETWORKS env var, rebuilt
+# whenever the env var value changes at runtime. This lets
+# a worker pick up a config reload via SIGHUP / env refresh
+# without a full restart, though typical usage is set-once
+# at start.
+_PROXY_NETWORKS_CACHE_KEY: str | None = None
+_PROXY_NETWORKS: list[IPv4Network] = []
+
+
+def _load_proxy_networks() -> list[IPv4Network]:
+    '''Parse the PROXY_NETWORKS env var into IPv4Network
+    objects, skipping and warning on invalid entries.'''
+    raw: str = os.environ.get('PROXY_NETWORKS', '')
+    nets: list[IPv4Network] = []
+    for entry in raw.split(','):
+        cidr: str = entry.strip()
+        if not cidr:
+            continue
+        try:
+            nets.append(IPv4Network(cidr, strict=False))
+        except ValueError as exc:
+            _LOGGER.warning(
+                'Invalid CIDR in PROXY_NETWORKS; skipping',
+                extra={
+                    'cidr': cidr,
+                    'error': str(exc),
+                },
+            )
+    return nets
+
+
+def _current_proxy_networks() -> list[IPv4Network]:
+    global _PROXY_NETWORKS_CACHE_KEY, _PROXY_NETWORKS
+    current_key: str = os.environ.get('PROXY_NETWORKS', '')
+    if _PROXY_NETWORKS_CACHE_KEY != current_key:
+        _PROXY_NETWORKS = _load_proxy_networks()
+        _PROXY_NETWORKS_CACHE_KEY = current_key
+    return _PROXY_NETWORKS
+
+
+def proxy_network_for(proxy_ip: str | None) -> str:
+    '''
+    Return a Prometheus-label-safe category for *proxy_ip*
+    derived from the ``PROXY_NETWORKS`` env var (comma-
+    separated CIDRs, e.g.
+    ``"65.181.160.0/21,158.94.48.0/20"``).
+
+    * ``"none"`` when *proxy_ip* is ``None`` or the
+      sentinel ``"none"`` — i.e. no proxy in use.
+    * The matching CIDR string (e.g. ``"65.181.160.0/21"``)
+      for the first configured network that contains the
+      IP. Order in ``PROXY_NETWORKS`` is the match order.
+    * ``"other"`` when the IP is valid but falls outside
+      every configured network, or when *proxy_ip* is not
+      a parseable IPv4 address (e.g. a hostname).
+
+    The helper is used to add a ``proxy_network`` label
+    alongside existing ``proxy_ip`` labels so that metrics
+    can be aggregated by provider / CIDR without blowing
+    up dashboard cardinality.
+    '''
+    if proxy_ip is None or proxy_ip == 'none':
+        return 'none'
+    try:
+        addr: IPv4Address = IPv4Address(proxy_ip)
+    except ValueError:
+        return 'other'
+    for net in _current_proxy_networks():
+        if addr in net:
+            return str(net)
+    return 'other'
 
 
 def convert_number_string(number_text: str | int) -> int | None:
