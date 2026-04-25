@@ -860,7 +860,7 @@ async def _load_video_file(
 async def _scrape_and_save(
     entry: str,
     video_id: str,
-    channel_name: str,
+    channel_handle: str,
     download_client: YoutubeDL,
     settings: VideoSettings,
     video_fm: AssetFileManagement,
@@ -878,7 +878,7 @@ async def _scrape_and_save(
 
     :param entry: Original queue filename.
     :param video_id: YouTube video ID.
-    :param channel_name: Channel name for the video.
+    :param channel_handle: Channel name for the video.
     :param download_client: Configured YoutubeDL client.
     :param settings: Scraper settings.
     :param video_fm: File manager owning the data dir.
@@ -891,7 +891,7 @@ async def _scrape_and_save(
     try:
         video: YouTubeVideo | None
         video, sleep = await _scrape(
-            entry, video_id, channel_name,
+            entry, video_id, channel_handle,
             download_client,
             settings, video_fm, proxy, sleep,
         )
@@ -1101,7 +1101,7 @@ async def worker(
                     video, sleep = (
                         await _scrape_and_save(
                             entry, video_id,
-                            video.channel_name,
+                            video.channel_handle,
                             download_client, settings,
                             video_fm, proxy, sleep,
                         )
@@ -1365,7 +1365,7 @@ async def _video_has_formats_on_server(
     return isinstance(formats, list) and len(formats) > 0
 
 
-async def _scrape(entry: str, video_id: str, channel_name: str,
+async def _scrape(entry: str, video_id: str, channel_handle: str,
                   download_client: YoutubeDL, settings: VideoSettings,
                   video_fm: AssetFileManagement,
                   proxy: str, sleep: int = 0
@@ -1377,7 +1377,7 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
 
     :param entry: Filename of the video data file to scrape
     :param video_id: YouTube video ID to scrape
-    :param channel_name: YouTube channel name associated with the video
+    :param channel_handle: YouTube channel name associated with the video
     :param download_client: YoutubeDL instance for downloading video data
     :param settings: Configuration settings for the tool
     :param video_fm: AssetFileManagement instance owning the video data
@@ -1394,7 +1394,7 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
     scrape_start: float = time.monotonic()
     try:
         video: YouTubeVideo = await YouTubeVideo.scrape(
-            video_id, channel_name=channel_name,
+            video_id, channel_handle=channel_handle,
             channel_thumbnail=None,
             ytdlp_cache_dir=settings.ytdlp_cache_dir,
             download_client=download_client,
@@ -1438,7 +1438,7 @@ async def resolve_video_upload_handle(
         2. On miss, resolve via InnerTube. On success with a handle,
            write to the map and return it.
         3. On success without a handle (legacy channel), fall back to
-           fallback_handle(video.channel_name) and write to map.
+           fallback_handle(video.channel_handle) and write to map.
         4. On InnerTube failure, return None — caller must skip the
            upload. Do NOT write to the map; the next tick retries.
 
@@ -1450,7 +1450,7 @@ async def resolve_video_upload_handle(
         CREATOR_MAP_RESOLUTION_TOTAL.labels(
             scraper='video', outcome='fallback',
         ).inc()
-        return fallback_handle(video.channel_name or '')
+        return fallback_handle(video.channel_handle or '')
 
     cached: str | None = await creator_map_backend.get(
         video.channel_id,
@@ -1493,7 +1493,7 @@ async def resolve_video_upload_handle(
         ).inc()
     else:
         handle = fallback_handle(
-            video.channel_name or video.channel_id,
+            video.channel_handle or video.channel_id,
         )
         CREATOR_MAP_RESOLUTION_TOTAL.labels(
             scraper='video', outcome='fallback',

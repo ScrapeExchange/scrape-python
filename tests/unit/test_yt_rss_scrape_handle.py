@@ -66,7 +66,7 @@ class TestRssUpdateChannelHandleResolution(
             )
             result = await update_channel(
                 exchange_client,
-                channel_name='input_casing',
+                channel_handle='input_casing',
                 channel_id='UC1234567890abcdefghij',
                 creator_map_backend=cm,
             )
@@ -111,7 +111,7 @@ class TestRssUpdateChannelHandleResolution(
             )
             result = await update_channel(
                 exchange_client,
-                channel_name='INPUT',
+                channel_handle='INPUT',
                 channel_id='UC1234567890abcdefghij',
                 creator_map_backend=cm,
             )
@@ -141,7 +141,7 @@ class TestRssUpdateChannelHandleResolution(
             )
             result = await update_channel(
                 exchange_client,
-                channel_name='input',
+                channel_handle='input',
                 channel_id='UC1234567890abcdefghij',
                 creator_map_backend=cm,
             )

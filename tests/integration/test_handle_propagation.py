@@ -24,10 +24,10 @@ class TestHandlePropagation(unittest.IsolatedAsyncioTestCase):
             )
 
             # Simulate a video from that channel with a different
-            # casing in its RSS-populated channel_name.
+            # casing in its RSS-populated channel_handle.
             video: YouTubeVideo = YouTubeVideo(video_id='vid1234')
             video.channel_id = 'UC1234567890abcdefghij'
-            video.channel_name = 'canonicalhandle'
+            video.channel_handle = 'canonicalhandle'
 
             # Fresh FileCreatorMap instance (another process) reading
             # the same file.

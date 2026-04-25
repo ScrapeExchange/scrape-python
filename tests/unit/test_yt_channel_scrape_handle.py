@@ -1,4 +1,4 @@
-'''Tests that the channel scraper uses the canonical handle for upload.'''
+'''Tests that the channel scraper uses channel_handle for upload.'''
 
 import unittest
 from unittest.mock import AsyncMock
@@ -9,7 +9,7 @@ from scrape_exchange.creator_map import NullCreatorMap
 class TestChannelScraperHandleResolution(
     unittest.IsolatedAsyncioTestCase,
 ):
-    async def test_canonical_handle_used_and_mapped(self) -> None:
+    async def test_channel_handle_used_and_mapped(self) -> None:
         from scrape_exchange.youtube.youtube_channel import (
             YouTubeChannel,
         )
@@ -17,9 +17,10 @@ class TestChannelScraperHandleResolution(
             resolve_channel_upload_handle,
         )
 
-        channel: YouTubeChannel = YouTubeChannel(name='INPUT_CASING')
+        channel: YouTubeChannel = YouTubeChannel(
+            channel_handle='InputCasing',
+        )
         channel.channel_id = 'UC1234567890abcdefghij'
-        channel.canonical_handle = 'InputCasing'
 
         cm: NullCreatorMap = NullCreatorMap()
         cm.put = AsyncMock()
@@ -31,7 +32,9 @@ class TestChannelScraperHandleResolution(
             'UC1234567890abcdefghij', 'InputCasing',
         )
 
-    async def test_fallback_when_no_canonical_handle(self) -> None:
+    async def test_no_creator_map_write_without_channel_id(
+        self,
+    ) -> None:
         from scrape_exchange.youtube.youtube_channel import (
             YouTubeChannel,
         )
@@ -39,16 +42,15 @@ class TestChannelScraperHandleResolution(
             resolve_channel_upload_handle,
         )
 
-        channel: YouTubeChannel = YouTubeChannel(name='Legacy Channel')
-        channel.channel_id = 'UC1234567890abcdefghij'
-        channel.canonical_handle = None
+        channel: YouTubeChannel = YouTubeChannel(
+            channel_handle='InputCasing',
+        )
+        channel.channel_id = None
 
         cm: NullCreatorMap = NullCreatorMap()
         cm.put = AsyncMock()
 
         handle: str = await resolve_channel_upload_handle(channel, cm)
 
-        self.assertEqual(handle, 'legacy channel')
-        cm.put.assert_awaited_once_with(
-            'UC1234567890abcdefghij', 'legacy channel',
-        )
+        self.assertEqual(handle, 'InputCasing')
+        cm.put.assert_not_awaited()

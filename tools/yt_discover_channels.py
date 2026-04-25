@@ -271,13 +271,13 @@ def _collect_video_authors(node: any,
 
 class DiscoveredChannel:
     def __init__(
-        self, channel_name: str,
+        self, channel_handle: str,
         page_links: set[tuple[str, int | None]],
         description: str | None,
         subs: int | None,
         channel_id: str | None,
     ) -> None:
-        self.channel_name: str = channel_name
+        self.channel_handle: str = channel_handle
         self.page_links: set[tuple[str, int | None]] = (
             page_links
         )
@@ -286,7 +286,7 @@ class DiscoveredChannel:
         self.channel_id: str | None = channel_id
 
     @staticmethod
-    def parse_channel_page(channel_name: str,
+    def parse_channel_page(channel_handle: str,
                            page_data: dict[str, any]) -> Self:
         page_links: set[tuple[str, int | None]] = set()
 
@@ -371,7 +371,7 @@ class DiscoveredChannel:
         _collect_video_authors(page_data, page_links)
 
         return DiscoveredChannel(
-            channel_name, page_links, description,
+            channel_handle, page_links, description,
             subs_count, channel_id,
         )
 
@@ -656,12 +656,12 @@ async def _scrape_channel(
     page_links: set[tuple[str, int | None]] = set()
     for link in yt_channel.channel_links:
         page_links.add((
-            link.channel_name,
+            link.channel_handle,
             link.subscriber_count,
         ))
 
     return DiscoveredChannel(
-        channel_name=target,
+        channel_handle=target,
         page_links=page_links,
         description=yt_channel.description,
         subs=yt_channel.subscriber_count,

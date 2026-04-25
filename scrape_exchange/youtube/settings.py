@@ -27,7 +27,7 @@ class YouTubeScraperSettings(ScraperSettings):
         ),
         description=(
             'CSV file to save mapping of channel IDs to names for channels '
-            'scraped during this run (format: channel_id,channel_name).'
+            'scraped during this run (format: channel_id,channel_handle).'
         )
     )
     channel_list: str = Field(

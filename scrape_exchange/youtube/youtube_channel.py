@@ -9,7 +9,6 @@ Model a Youtube channel
 import os
 import re
 
-from uuid import UUID
 from typing import Self
 from logging import Logger
 from logging import getLogger
@@ -100,13 +99,13 @@ def fallback_handle(name: str) -> str:
 
 
 class YouTubeChannel:
-    CHANNEL_URL: str = AsyncYouTubeClient.SCRAPE_URL + '/{channel_name}'
+    CHANNEL_URL: str = AsyncYouTubeClient.SCRAPE_URL + '/{channel_handle}'
     CHANNEL_URL_WITH_AT: str = \
-        AsyncYouTubeClient.SCRAPE_URL + '/@{channel_name}'
+        AsyncYouTubeClient.SCRAPE_URL + '/@{channel_handle}'
     CHANNEL_URL_WITH_ID: str = \
         AsyncYouTubeClient.SCRAPE_URL + '/channel/{channel_id}'
 
-    CHANNEL_NAME_REGEX: re.Pattern[str] = re.compile(
+    CHANNEL_HANDLE_REGEX: re.Pattern[str] = re.compile(
         r'"canonicalBaseUrl":"/@([^"]+)"'
     )
     CHANNEL_ID_REGEX_SCRAPE: re.Pattern[str] = \
@@ -124,7 +123,8 @@ class YouTubeChannel:
         re.compile(r'^UC[A-Z0-9_-]{22}$', re.IGNORECASE)
 
     def __init__(
-        self, name: str | None = None, channel_id: str | None = None,
+        self, channel_handle: str | None = None,
+        channel_id: str | None = None,
         deno_path: str = DENO_PATH, po_token_url: str = PO_TOKEN_URL,
         ytdlp_cache_dir: str = YTDLP_CACHE_DIR,
         debug: bool = False, save_dir: str = None,
@@ -132,17 +132,21 @@ class YouTubeChannel:
         with_download_client: bool = True,
     ) -> None:
         '''
-        Models a YouTube channel
+        Models a YouTube channel.
 
-        :param name: the name of the channel as it appears in the vanity URL,
-        i.e., for https://www.youtube.com/@HistoryMatters, name is
-        'HistoryMatters'
+        :param channel_handle: the channel's URL-slug handle as it appears
+            in the vanity URL — e.g. for
+            ``https://www.youtube.com/@HistoryMatters``
+            the handle is ``'HistoryMatters'``. Distinct from
+            :attr:`title` (the human-readable display name).
+        :param channel_id: the opaque ``UC...`` identifier (immutable across
+            renames, unlike the handle).
         :param deno_path: path to the Deno executable for running the
-        download client
-        :param po_token_url: URL to get the PO token for the download client
-        :debug: whether to enable debug logging for the download client
-        :param save_dir: directory to save downloaded media assets to
-        :param consent_cookies: cookies to use to bypass consent pages
+            download client.
+        :param po_token_url: URL to get the PO token for the download client.
+        :debug: whether to enable debug logging for the download client.
+        :param save_dir: directory to save downloaded media assets to.
+        :param consent_cookies: cookies to use to bypass consent pages.
         '''
 
         self.consent_cookies: dict[str, str] = consent_cookies
@@ -164,12 +168,11 @@ class YouTubeChannel:
 
         self.url: str | None = None
         self.title: str | None = None
-        self.canonical_handle: str | None = None
-        self.name: str | None = None
-        if name:
-            self.name = name.lstrip('@')
+        self.channel_handle: str | None = None
+        if channel_handle:
+            self.channel_handle = channel_handle.lstrip('@')
             self.url = YouTubeChannel.CHANNEL_URL_WITH_AT.format(
-                channel_name=self.name.replace(' ', '')
+                channel_handle=self.channel_handle.replace(' ', '')
             )
         elif channel_id:
             self.url = YouTubeChannel.CHANNEL_URL_WITH_ID.format(
@@ -178,7 +181,6 @@ class YouTubeChannel:
         self.channel_id: str | None = channel_id
         self.description: str | None = None
         self.keywords: set[str] = set()
-        self.categories: set[str] = set()
         self.verified: bool = False
         self.is_family_safe: bool = False
         self.available_country_codes: set[str] = set()
@@ -232,7 +234,7 @@ class YouTubeChannel:
             return False
 
         equal: bool = (
-            self.name == other.name and
+            self.channel_handle == other.channel_handle and
             self.channel_id == other.channel_id and
             self.title == other.title and
             self.description == other.description and
@@ -245,7 +247,6 @@ class YouTubeChannel:
             self.subscriber_count == other.subscriber_count and
             self.channel_links == other.channel_links and
             self.external_urls == other.external_urls and
-            self.categories == other.categories and
             self.country == other.country and
             self.keywords == other.keywords and
             self.banners == other.banners and
@@ -258,11 +259,13 @@ class YouTubeChannel:
     def to_dict(self, with_video_ids: bool = False) -> dict[str, any]:
         data: dict[str, any] = {
             'channel_id': self.channel_id,
-            'channel': self.name.lstrip('@'),
+            'channel_handle': (
+                self.channel_handle.lstrip('@')
+                if self.channel_handle else None
+            ),
             'title': self.title,
             'description': self.description,
             'keywords': list(self.keywords),
-            'categories': list(self.categories),
             'is_family_safe': self.is_family_safe,
             'country': self.country,
             'available_country_codes': list(self.available_country_codes),
@@ -273,7 +276,9 @@ class YouTubeChannel:
             'external_urls': [
                 el.to_dict() for el in self.external_urls or set()
             ],
-            'joined_date': self.joined_date.isoformat() if self.joined_date else None,
+            'joined_date':
+                self.joined_date.isoformat() if self.joined_date else None,
+            'url': self.url,
             'rss_url': self.rss_url,
             'verified': self.verified,
             'subscriber_count': self.subscriber_count or 0,
@@ -296,13 +301,12 @@ class YouTubeChannel:
     @staticmethod
     def from_dict(data: dict[str, any]) -> Self:
         channel = YouTubeChannel(
-            name=data.get('channel', data.get('channel_name'))
+            channel_handle=data.get('channel_handle'),
+            channel_id=data.get('channel_id'),
         )
-        channel.channel_id = data.get('channel_id')
         channel.title = data.get('title')
         channel.description = data.get('description')
         channel.keywords = set(data.get('keywords', []))
-        channel.categories = set(data.get('categories', []))
         channel.is_family_safe = data.get('is_family_safe', False)
         channel.country = data.get('country')
         channel.available_country_codes = set(
@@ -324,6 +328,7 @@ class YouTubeChannel:
         joined_date_str: str | None = data.get('joined_date')
         if joined_date_str:
             channel.joined_date = datetime.fromisoformat(joined_date_str)
+        channel.url = data.get('url') or channel.url
         channel.rss_url = data.get('rss_url')
         channel.verified = data.get('verified', False)
         channel.subscriber_count = data.get('subscriber_count')
@@ -385,7 +390,9 @@ class YouTubeChannel:
                 except orjson.JSONDecodeError:
                     continue
 
-        raise ValueError(f'Could not extract data for channel {self.name}')
+        raise ValueError(
+            f'Could not extract data for channel {self.channel_handle}'
+        )
 
     def _extract_handle(self, url: str, metadata: dict) -> str | None:
         '''
@@ -582,34 +589,29 @@ class YouTubeChannel:
         if not self.browse_client:
             self._create_browse_client(proxies=proxies)
 
+        extra: dict[str, any] = {
+            'channel_handle': self.channel_handle,
+            'url': about_url,
+            'proxy': self.browse_client.proxy,
+        }
         try:
             page_contents: str | None = await self.browse_client.get(about_url)
         except ValueError:
-            _LOGGER.warning(
-                'About page not found for channel',
-                extra={
-                    'channel': self.name,
-                    'url': about_url,
-                    'proxy': self.browse_client.proxy,
-                },
-            )
+            _LOGGER.warning('About page not found for channel', extra=extra)
             raise
         except Exception as exc:
             _LOGGER.warning(
-                'Error fetching about page for channel',
-                exc=exc,
-                extra={
-                    'channel': self.name,
-                    'proxy': self.browse_client.proxy,
-                },
+                'Error fetching about page for channel', exc=exc, extra=extra
             )
             raise RuntimeError(
-                f'Could not retrieve about page for channel {self.name}'
+                'Could not retrieve about page for channel '
+                f'{self.channel_handle}'
             ) from exc
 
         if not page_contents:
             raise RuntimeError(
-                f'Could not retrieve about page for channel {self.name}'
+                'Could not retrieve about page for channel '
+                f'{self.channel_handle}'
             )
 
         page_data: dict[str, any] = self._extract_initial_data(page_contents)
@@ -629,9 +631,10 @@ class YouTubeChannel:
             page_data
         )
         if not about_data:
-            _LOGGER.warning('Could not find about tab renderer')
+            _LOGGER.warning('Could not find about tab renderer', extra=extra)
             raise RuntimeError(
-                f'Could not find about tab renderer for channel {self.name}'
+                'Could not find about tab renderer for channel '
+                f'{self.channel_handle}'
             )
 
         self._parse_channel_about_data(about_data)
@@ -688,7 +691,7 @@ class YouTubeChannel:
 
         _LOGGER.warning(
             'Could not find about tab renderer',
-            extra={'channel': self.name, 'url': self.url}
+            extra={'channel_handle': self.channel_handle, 'url': self.url}
         )
         return None
 
@@ -737,7 +740,7 @@ class YouTubeChannel:
 
         if vanity_url:
             try:
-                self.name = vanity_url.split('/@', 1)[1]
+                self.channel_handle = vanity_url.split('/@', 1)[1]
             except IndexError:
                 pass
 
@@ -832,12 +835,13 @@ class YouTubeChannel:
         )
         if not channel_info:
             raise ValueError(
-                f'No channel metadata found for channel: {self.name}'
+                f'No channel metadata found for channel: {self.channel_handle}'
             )
 
         # We already get the channel name from the channel metadata but we
         # keep it here in case YouTube changes their metadata structure
-        self.name: str = self.name or channel_info.get('name', '').lstrip('@')
+        self.channel_handle: str = \
+            self.channel_handle or channel_info.get('name', '').lstrip('@')
         self.title = self.title or channel_info.get('title')
 
         # We already get description from about metadata but we
@@ -946,7 +950,7 @@ class YouTubeChannel:
                 if not channel_path:
                     continue
 
-                channel_name: str = channel_path.lstrip('/@')
+                channel_handle: str = channel_path.lstrip('/@')
                 subs_text: str | None = channel_renderer.get(
                     'subscriberCountText', {}
                 ).get(
@@ -958,7 +962,7 @@ class YouTubeChannel:
                 subs: int = convert_number_string(subs_text)
                 page_links.add(
                     YouTubeChannelLink(
-                        channel_name=channel_name, subscriber_count=subs
+                        channel_handle=channel_handle, subscriber_count=subs
                     )
                 )
             return page_links
@@ -983,7 +987,8 @@ class YouTubeChannel:
 
             return page_links
 
-        def parse_section_items(section_items: list) -> set[YouTubeChannelLink]:
+        def parse_section_items(section_items: list
+                                ) -> set[YouTubeChannelLink]:
             page_links: set[YouTubeChannelLink] = set()
             section_item: dict[str, any]
             for section_item in section_items or []:
@@ -1036,7 +1041,7 @@ class YouTubeChannel:
     def is_channel_id(name: str) -> bool:
         if not name:
             return False
-    
+
         return bool(YouTubeChannel.CHANNEL_ID_REGEX_MATCH.match(name))
 
     @staticmethod
@@ -1112,7 +1117,12 @@ class YouTubeChannel:
         tabs = YouTubeChannelTabs(self.channel_id)
         page_data: dict[str, any] = await tabs.browse_channel()
 
-        self.canonical_handle = canonical_handle_from_browse(page_data)
+        # Prefer the canonical handle from InnerTube when available;
+        # otherwise keep whatever was set during construction (URL slug
+        # or fallback handle derived from the title).
+        canonical: str | None = canonical_handle_from_browse(page_data)
+        if canonical:
+            self.channel_handle = canonical
 
         self.parse_channel_video_data(page_data)
 
@@ -1135,7 +1145,7 @@ class YouTubeChannel:
             'Scraped videos from YouTube channel',
             extra={
                 'videos_imported': videos_imported,
-                'channel': self.name,
+                'channel_handle': self.channel_handle,
             }
         )
 
@@ -1158,15 +1168,14 @@ class YouTubeChannel:
         already_ingested_videos: dict[str, tuple[IngestStatus, datetime]] = \
             get_imported_assets(save_dir)
 
+        extra: dict[str, any] = {
+            'channel_handle': self.channel_handle, 'video_ids': video_ids
+        }
         videos_imported: int = 0
         for video_id in video_ids:
             if video_id in already_ingested_videos:
                 _LOGGER.debug(
-                    'Skipping already ingested video for channel',
-                    extra={
-                        'video_id': video_id,
-                        'channel': self.name,
-                    }
+                    'Skipping already ingested video for channel', extra=extra
                 )
                 continue
 
@@ -1194,13 +1203,7 @@ class YouTubeChannel:
                     IngestStatus.SCRAPED, video.published_timestamp
                 )
 
-                _LOGGER.debug(
-                    'Scraped video for channel',
-                    extra={
-                        'video_id': video_id,
-                        'channel': self.name,
-                    }
-                )
+                _LOGGER.debug('Scraped video for channel', extra=extra)
                 self.videos.add(video)
 
                 if videos_imported >= max_videos_per_channel:
@@ -1215,7 +1218,7 @@ class YouTubeChannel:
     @staticmethod
     def extract_channel_id(page_data: str) -> str | None:
         '''
-        Extracts the YouTube channel ID (ie. 'gxefuvUivrjesETjg') from the
+        Extracts the YouTube channel ID (ie. 'UC<22 characters>') from the
         channel page data
 
         :param page_data: channel description
@@ -1664,7 +1667,7 @@ class YouTubeChannel:
         )
 
         video: YouTubeVideo = await YouTubeVideo.scrape(
-            video_id, self.name, channel_thumbnail,
+            video_id, self.channel_handle, channel_thumbnail,
             download_client=self.download_client,
         )
 

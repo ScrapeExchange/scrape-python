@@ -20,10 +20,10 @@ YOUTUBE_HISTORYMATTERS_CHANNEL_ID: str = 'UC22BdTgxefuvUivrjesETjg'
 
 class TestIntegration(unittest.IsolatedAsyncioTestCase):
     async def test_resolve_channel_id(self):
-        channel_name: str | None = await YouTubeChannel.resolve_channel_id(
+        channel_handle: str | None = await YouTubeChannel.resolve_channel_id(
             YOUTUBE_HISTORYMATTERS_CHANNEL_ID
         )
-        self.assertEqual(channel_name, YOUTUBE_HISTORYMATTERS_CHANNEL)
+        self.assertEqual(channel_handle, YOUTUBE_HISTORYMATTERS_CHANNEL)
 
 
 if __name__ == '__main__':

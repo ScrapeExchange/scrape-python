@@ -274,16 +274,16 @@ class TestRedisCreatorQueuePopulate(
     async def test_populate_skips_not_found_marker(
         self,
     ) -> None:
-        channel_name: str = 'mychannel'
+        channel_handle: str = 'mychannel'
         marker: str = (
             f'{CHANNEL_FILENAME_PREFIX}'
-            f'{channel_name}.not_found'
+            f'{channel_handle}.not_found'
         )
         open(
             os.path.join(self.tmp, marker), 'w',
         ).close()
         creators: dict[str, str] = {
-            'UCaaa': channel_name,
+            'UCaaa': channel_handle,
         }
         added: int = await self.q.populate(
             creators, self.fm, DEFAULT_TIERS, {},

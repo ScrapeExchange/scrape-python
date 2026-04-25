@@ -33,7 +33,6 @@ from scrape_exchange.creator_map import (
     CreatorMap,
     FileCreatorMap,
     RedisCreatorMap,
-    CREATOR_HANDLE_MISMATCH_TOTAL,
     CREATOR_MAP_RESOLUTION_TOTAL,
 )
 from scrape_exchange.exchange_client import ExchangeClient
@@ -47,10 +46,7 @@ from scrape_exchange.scraper_runner import (
 from scrape_exchange.settings import normalize_log_level
 from scrape_exchange.util import extract_proxy_ip, proxy_network_for
 
-from scrape_exchange.youtube.youtube_channel import (
-    YouTubeChannel,
-    fallback_handle,
-)
+from scrape_exchange.youtube.youtube_channel import YouTubeChannel
 from scrape_exchange.youtube.youtube_rate_limiter import YouTubeRateLimiter
 from scrape_exchange.youtube.youtube_video import DENO_PATH, PO_TOKEN_URL
 from scrape_exchange.worker_id import get_worker_id
@@ -442,12 +438,12 @@ def main() -> None:
     sys.exit(runner.run_sync(_run_worker))
 
 
-async def channel_exists(client: ExchangeClient, channel_name: str) -> bool:
+async def channel_exists(client: ExchangeClient, channel_handle: str) -> bool:
     '''
     Checks if a channel with the given name already exists on Scrape Exchange.
 
     :param client: The Scrape Exchange client instance.
-    :param channel_name: The name of the YouTube channel to check.
+    :param channel_handle: The name of the YouTube channel to check.
     :returns: True if the channel exists, False otherwise.
     :raises: (none)
     '''
@@ -455,7 +451,7 @@ async def channel_exists(client: ExchangeClient, channel_name: str) -> bool:
     try:
         resp: Response = await client.get(
             f'{client.exchange_url}{ExchangeClient.GET_CONTENT_API}'
-            f'/youtube/channel/{channel_name}'
+            f'/youtube/channel/{channel_handle}'
         )
     except Exception as exc:
         METRIC_CHANNEL_EXISTS_FAILURES.labels(
@@ -464,7 +460,7 @@ async def channel_exists(client: ExchangeClient, channel_name: str) -> bool:
         logging.warning(
             'Network error checking channel existence',
             exc=exc,
-            extra={'channel_name': channel_name},
+            extra={'channel_handle': channel_handle},
         )
         return False
 
@@ -486,7 +482,8 @@ async def channel_exists(client: ExchangeClient, channel_name: str) -> bool:
         logging.warning(
             'Failed to check existence of channel',
             extra={
-                'channel_name': channel_name, 'status_code': resp.status_code,
+                'channel_handle': channel_handle,
+                'status_code': resp.status_code,
                 'response_text': resp.text,
             }
         )
@@ -539,12 +536,12 @@ async def scrape_channels(
                 queue.task_done()
                 break
             try:
-                channel_name: str = (
+                channel_handle: str = (
                     normalize_channel_name(name)
                 )
                 failed: bool = await scrape_channel(
                     settings, client, fm,
-                    channel_name, creator_map_backend,
+                    channel_handle, creator_map_backend,
                 )
                 if failed:
                     errors += 1
@@ -558,7 +555,7 @@ async def scrape_channels(
                     'Unexpected error in channel '
                     'scrape worker',
                     exc=exc,
-                    extra={'channel_name': name},
+                    extra={'channel_handle': name},
                 )
                 if errors > 100:
                     abort = True
@@ -634,7 +631,9 @@ async def _upload_single_channel(
     fm: AssetFileManagement,
     creator_map_backend: CreatorMap,
 ) -> None:
-    '''Upload a single channel file if it needs uploading.'''
+    '''
+    Upload a single channel file if it needs uploading.
+    '''
 
     if fm.is_superseded(filename):
         METRIC_UPLOADED_FILE_EXISTS.labels(
@@ -653,7 +652,7 @@ async def _upload_single_channel(
         channel: YouTubeChannel = (
             YouTubeChannel.from_dict(channel_data)
         )
-        if await channel_exists(client, channel.name):
+        if await channel_exists(client, channel.channel_handle):
             await fm.delete(filename, fail_ok=False)
             return
 
@@ -719,7 +718,7 @@ async def _watch_and_upload_channels(
             )
 
 
-def normalize_channel_name(channel_name: str) -> str:
+def normalize_channel_name(channel_handle: str) -> str:
     '''
     Normalises a YouTube channel name extracted from user input by
     stripping whitespace and a leading '@'. Also strips URL prefixes
@@ -730,17 +729,17 @@ def normalize_channel_name(channel_name: str) -> str:
     canonical handle. The canonical handle is resolved later by
     resolve_channel_upload_handle() using YouTube's vanityChannelUrl.
 
-    :param channel_name: The original channel name.
+    :param channel_handle: The original channel name.
     :returns: The stripped channel name.
     '''
 
-    name: str = channel_name.strip().lstrip('@')
+    name: str = channel_handle.strip().lstrip('@')
     if name.startswith('https://'):
         name = name.split('/')[-1]
         logging.debug(
             'Extracted channel name from URL',
             extra={
-                'original_channel_name': channel_name,
+                'original_channel_name': channel_handle,
                 'name': name,
             },
         )
@@ -750,7 +749,7 @@ def normalize_channel_name(channel_name: str) -> str:
         logging.debug(
             'Extracted channel name from email',
             extra={
-                'original_channel_name': channel_name,
+                'original_channel_name': channel_handle,
                 'name': name,
             },
         )
@@ -758,8 +757,8 @@ def normalize_channel_name(channel_name: str) -> str:
     return name
 
 
-def get_channel_filename(channel_name: str) -> str:
-    return f'{CHANNEL_FILE_PREFIX}{channel_name}{CHANNEL_FILE_POSTFIX}'
+def get_channel_filename(channel_handle: str) -> str:
+    return f'{CHANNEL_FILE_PREFIX}{channel_handle}{CHANNEL_FILE_POSTFIX}'
 
 
 def _failed_marker_is_stale(
@@ -860,7 +859,7 @@ def _record_scrape_failure(
 
 async def _try_scrape_channel(
     channel: YouTubeChannel, settings: ChannelSettings,
-    fm: AssetFileManagement, channel_name: str,
+    fm: AssetFileManagement, channel_handle: str,
     extra: dict[str, str],
 ) -> tuple[bool, str | None]:
     '''
@@ -884,8 +883,8 @@ async def _try_scrape_channel(
         logging.debug('Channel not found, skipping', extra=extra)
         try:
             await fm.mark_not_found(
-                f'{CHANNEL_FILE_PREFIX}{channel_name}',
-                content=f'{channel_name}\n',
+                f'{CHANNEL_FILE_PREFIX}{channel_handle}',
+                content=f'{channel_handle}\n',
             )
         except OSError:
             logging.warning(
@@ -924,7 +923,7 @@ async def _try_scrape_channel(
 
 def _channel_has_no_content(
     channel: YouTubeChannel, scrape_proxy_ip: str,
-    scrape_proxy_network: str, channel_name: str,
+    scrape_proxy_network: str, channel_handle: str,
 ) -> bool:
     '''
     Return True (and emit the no-content metric) when *channel* has no
@@ -938,7 +937,7 @@ def _channel_has_no_content(
         logging.info(
             'Channel has description but no other content, skipping '
             'upload',
-            extra={'channel_name': channel_name},
+            extra={'channel_handle': channel_handle},
         )
     METRIC_CHANNEL_NO_CONTENT_FOUND.labels(
         worker_id=get_worker_id(),
@@ -948,7 +947,7 @@ def _channel_has_no_content(
     logging.info(
         'YouTube channel content counts',
         extra={
-            'channel_name': channel_name,
+            'channel_handle': channel_handle,
             'proxy_ip': scrape_proxy_ip,
             'proxy_network': scrape_proxy_network,
             'playlists_length': len(channel.playlists),
@@ -962,7 +961,7 @@ def _channel_has_no_content(
 
 async def _persist_scraped_channel(
     fm: AssetFileManagement, filename: str,
-    channel: YouTubeChannel, channel_name: str,
+    channel: YouTubeChannel, channel_handle: str,
 ) -> bool:
     '''
     Write the freshly-scraped channel to disk. Returns True on success,
@@ -977,7 +976,7 @@ async def _persist_scraped_channel(
             'Failed to write channel file to disk',
             exc=exc,
             extra={
-                'channel_name': channel_name, 'filename': filename,
+                'channel_handle': channel_handle, 'filename': filename,
             },
         )
         return False
@@ -985,7 +984,7 @@ async def _persist_scraped_channel(
 
 
 async def _load_channel_from_disk(
-    fm: AssetFileManagement, filename: str, channel_name: str,
+    fm: AssetFileManagement, filename: str, channel_handle: str,
 ) -> YouTubeChannel | None:
     '''
     Load a previously-scraped channel from *fm*. Returns None on a read
@@ -999,14 +998,14 @@ async def _load_channel_from_disk(
             'Failed to load channel file for upload',
             exc=exc,
             extra={
-                'channel_name': channel_name, 'filename': filename,
+                'channel_handle': channel_handle, 'filename': filename,
             },
         )
         return None
 
 
 async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
-                         fm: AssetFileManagement, channel_name: str,
+                         fm: AssetFileManagement, channel_handle: str,
                          creator_map_backend: CreatorMap) -> bool:
     '''
     Scrapes a single YouTube channel and uploads it to the Scrape Exchange.
@@ -1014,16 +1013,16 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
     :param settings: Tool settings.
     :param client: The Scrape Exchange client instance.
     :param fm: AssetFileManagement instance owning the channel data directory.
-    :param channel_name: The name of the YouTube channel to scrape.
+    :param channel_handle: The name of the YouTube channel to scrape.
     :param creator_map_backend: Shared CreatorMap for
         channel_id → handle persistence.
     :returns: whether channel scraping/uploading failed
     :raises: (none)
     '''
 
-    extra: dict[str, str] = {'channel_name': channel_name}
+    extra: dict[str, str] = {'channel_handle': channel_handle}
     logging.debug('Processing channel', extra=extra)
-    filename: str = get_channel_filename(channel_name)
+    filename: str = get_channel_filename(channel_handle)
     extra['filename'] = filename
     base_path: Path = fm.base_dir / filename
 
@@ -1037,7 +1036,7 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
             'Channel not scraped, scraping now', extra=extra,
         )
         channel = YouTubeChannel(
-            name=channel_name, deno_path=DENO_PATH,
+            channel_handle=channel_handle, deno_path=DENO_PATH,
             po_token_url=PO_TOKEN_URL, debug=True,
             save_dir=settings.channel_data_directory,
             with_download_client=False,
@@ -1045,7 +1044,7 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
         ok: bool
         scrape_proxy: str | None
         ok, scrape_proxy = await _try_scrape_channel(
-            channel, settings, fm, channel_name, extra,
+            channel, settings, fm, channel_handle, extra,
         )
         if not ok:
             return False
@@ -1056,12 +1055,12 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
         scrape_proxy_network: str = proxy_network_for(scrape_proxy_ip)
 
         if _channel_has_no_content(
-            channel, scrape_proxy_ip, scrape_proxy_network, channel_name,
+            channel, scrape_proxy_ip, scrape_proxy_network, channel_handle,
         ):
             return False
 
         if not await _persist_scraped_channel(
-            fm, filename, channel, channel_name,
+            fm, filename, channel, channel_handle,
         ):
             return True
 
@@ -1073,7 +1072,7 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
         logging.info(
             'Downloaded channel',
             extra={
-                'channel_name': channel_name,
+                'channel_handle': channel_handle,
                 'proxy_ip': scrape_proxy_ip,
                 'proxy_network': scrape_proxy_network,
             },
@@ -1082,13 +1081,13 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
     if settings.channel_no_upload:
         logging.debug(
             'No-upload flag set, skipping upload for channel',
-            extra={'channel_name': channel_name},
+            extra={'channel_handle': channel_handle},
         )
         return False
 
     logging.debug(
         'Uploading channel to Scrape Exchange',
-        extra={'channel_name': channel_name},
+        extra={'channel_handle': channel_handle},
     )
     # If we reached here via the on-disk path (file existed but was
     # never uploaded, or local base is newer than uploaded copy),
@@ -1096,7 +1095,7 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
     # enqueueing.
     if channel is None:
         channel = await _load_channel_from_disk(
-            fm, filename, channel_name,
+            fm, filename, channel_handle,
         )
         if channel is None:
             return True
@@ -1118,33 +1117,21 @@ async def resolve_channel_upload_handle(
     '''
     Resolve the handle to use for uploading *channel*.
 
-    Prefers ``channel.canonical_handle`` (set by scrape_channel_content
-    from YouTube's vanityChannelUrl). Falls back to fallback_handle()
-    on the channel's current name when no canonical handle exists.
-    Writes the result to the creator map so RSS/video scrapers can
-    read it.
+    Returns ``channel.channel_handle``, which ``scrape_channel_content``
+    has already populated with the canonical handle from YouTube's
+    vanityChannelUrl (or left as the input handle when no canonical
+    was returned). Writes the result to the creator map so RSS/video
+    scrapers can read it.
 
     :param channel: The scraped channel.
     :param creator_map_backend: Shared creator map backend.
     :returns: The handle to use for the upload.
     '''
 
-    handle: str
-    if channel.canonical_handle:
-        handle = channel.canonical_handle
-        CREATOR_MAP_RESOLUTION_TOTAL.labels(
-            scraper='channel', outcome='canonical',
-        ).inc()
-    else:
-        handle = fallback_handle(channel.name)
-        CREATOR_MAP_RESOLUTION_TOTAL.labels(
-            scraper='channel', outcome='fallback',
-        ).inc()
-
-    if channel.name != handle:
-        CREATOR_HANDLE_MISMATCH_TOTAL.labels(
-            scraper='channel',
-        ).inc()
+    handle: str = channel.channel_handle
+    CREATOR_MAP_RESOLUTION_TOTAL.labels(
+        scraper='channel', outcome='canonical',
+    ).inc()
 
     if channel.channel_id:
         await creator_map_backend.put(
@@ -1174,11 +1161,11 @@ async def enqueue_upload_channel(
     handle: str = await resolve_channel_upload_handle(
         channel, creator_map_backend,
     )
-    channel.name = handle
+    channel.channel_handle = handle
 
     logging.info(
         'Enqueuing channel for upload',
-        extra={'channel_name': channel.name},
+        extra={'channel_handle': channel.channel_handle},
     )
     return client.enqueue_upload(
         f'{settings.exchange_url}{client.POST_DATA_API}',
@@ -1189,14 +1176,17 @@ async def enqueue_upload_channel(
             'version': settings.schema_version,
             'source_url': channel.url,
             'data': channel.to_dict(with_video_ids=False),
-            'platform_content_id': channel.name,
-            'platform_creator_id': channel.name,
+            'platform_content_id': channel.channel_id,
+            'platform_creator_id': channel.channel_handle,
             'platform_topic_id': None,
         },
         file_manager=fm,
         filename=filename,
         entity='channel',
-        log_extra={'channel_name': channel.name},
+        log_extra={
+            'channel_handle': channel.channel_handle,
+            'channel_id': channel.channel_id,
+        },
     )
 
 

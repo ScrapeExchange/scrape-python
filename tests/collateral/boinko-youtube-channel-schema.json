@@ -7,12 +7,13 @@
   "properties": {
     "channel_id": {
       "type": ["string", "null"],
-      "description": "The channel identifier"
+      "description": "The channel identifier",
+      "x-scrape-field": "platform_content_id"
     },
-    "channel": {
+    "channel_handle": {
       "type": "string",
-      "description": "The channel vanity name (without @)",
-      "x-scrape-field": ["platform_creator_id", "platform_content_id"]
+      "description": "The channel handle (without @)",
+      "x-scrape-field": "platform_creator_id"
     },
     "title": {
       "type": ["string", "null"],
@@ -26,11 +27,6 @@
       "type": "array",
       "items": { "type": "string" },
       "description": "List of keywords/tags associated with the channel"
-    },
-    "categories": {
-      "type": "array",
-      "items": { "type": "string" },
-      "description": "Channel categories"
     },
     "is_family_safe": {
       "type": "boolean",
@@ -48,7 +44,11 @@
     "channel_thumbnails": {
       "type": "array",
       "items": { "$ref": "#/$defs/thumbnail" },
-      "description": "Thumbnails for the channel avatar"
+      "description": "Thumbnails for the channel avatar",
+      "x-scrape-field": [
+        "platform_creator_thumbnail_url",
+        "platform_content_thumbnail_url"
+      ]
     },
     "banners": {
       "type": "array",
@@ -64,6 +64,12 @@
       "type": ["string", "null"],
       "format": "date-time",
       "description": "Channel joined date as an ISO-8601 datetime string"
+    },
+    "url": {
+      "type": ["string", "null"],
+      "format": "uri",
+      "description": "URL of the channel homepage, can use /@<handle> or /channel/<channel_id>",
+      "x-scrape-field": "source_url"
     },
     "rss_url": {
       "type": ["string", "null"],
@@ -123,7 +129,7 @@
       "description": "Video IDs belonging to the channel (only present when requested)"
     }
   },
-  "required": ["channel"],
+  "required": ["channel_handle", "channel_id", "url"],
   "additionalProperties": false,
   "$defs": {
     "thumbnail": {

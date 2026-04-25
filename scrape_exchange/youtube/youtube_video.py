@@ -81,7 +81,7 @@ class YouTubeVideo:
 
     def __init__(self,
                  video_id: str | None = None,
-                 channel_name: str | None = None,
+                 channel_handle: str | None = None,
                  channel_thumbnail: YouTubeThumbnail | None = None,
                  browse_client: AsyncYouTubeClient | None = None,
                  download_client: YoutubeDL | None = None) -> None:
@@ -97,7 +97,7 @@ class YouTubeVideo:
 
         # Info about the channel
         self.channel_id: str | None = None
-        self.channel_name = channel_name
+        self.channel_handle = channel_handle
         self.channel_url: str | None = None
         self.channel_is_verified: bool | None = None
         self.channel_follower_count: int | None = None
@@ -153,7 +153,7 @@ class YouTubeVideo:
 
         self.tags: set[str] = set()
         self.annotations: set[str] = set()
-        self.categories: set[str] = set()
+        self.category: str | None = None
         self.keywords: set[str] = set()
         self.privacy_status: str = 'public'
 
@@ -167,7 +167,7 @@ class YouTubeVideo:
             and self.long_title == other.long_title
             and self.description == other.description
             and self.channel_id == other.channel_id
-            and self.channel_name == other.channel_name
+            and self.channel_handle == other.channel_handle
             and self.channel_url == other.channel_url
             and self.channel_is_verified == other.channel_is_verified
             and self.channel_thumbnail_url == other.channel_thumbnail_url
@@ -187,7 +187,7 @@ class YouTubeVideo:
             and self.aspect_ratio == other.aspect_ratio
             and self.duration == other.duration
             and self.license == other.license
-            and self.categories == other.categories
+            and self.category == other.category
             and self.default_audio_language == other.default_audio_language
             and self.privacy_status == other.privacy_status
         )
@@ -226,7 +226,7 @@ class YouTubeVideo:
             'long_title': self.long_title,
             'description': self.description,
             'channel_id': self.channel_id,
-            'channel_name': self.channel_name,
+            'channel_handle': self.channel_handle,
             'channel_url': self.channel_url,
             'channel_is_verified': self.channel_is_verified,
             'channel_follower_count': self.channel_follower_count,
@@ -254,7 +254,7 @@ class YouTubeVideo:
             'tags': list(self.tags),
             'annotations': list(self.annotations),
             'keywords': list(self.keywords),
-            'categories': list(self.categories),
+            'category': self.category,
             'privacy_status': self.privacy_status
         }
 
@@ -308,7 +308,7 @@ class YouTubeVideo:
 
         video = YouTubeVideo(
             video_id=data.get('video_id'),
-            channel_name=data.get('channel_name'),
+            channel_handle=data.get('channel_handle'),
             channel_thumbnail=YouTubeThumbnail.from_yt_dict(
                 data['channel_thumbnail']
             ) if data.get('channel_thumbnail') else None
@@ -345,7 +345,7 @@ class YouTubeVideo:
         video.license = data.get('license')
         video.locale = data.get('locale')
         video.default_audio_language = data.get('default_audio_language')
-        video.categories = set(data.get('categories', []))
+        video.category = data.get('category')
         video.tags = set(data.get('tags', []))
         video.annotations = set(data.get('annotations', []))
         video.keywords = set(data.get('keywords', []))
@@ -401,10 +401,7 @@ class YouTubeVideo:
         return video
 
     @staticmethod
-    def from_rss_entry(
-        entry: untangle.Element,
-        channel_name_override: str | None = None,
-    ) -> Self:
+    def from_rss_entry(entry: untangle.Element, channel_handle: str) -> Self:
         '''
         Factory for YouTubeVideo, populates the subset of fields available
         from a YouTube channel RSS feed entry. Fields not present in the
@@ -421,12 +418,10 @@ class YouTubeVideo:
 
         :param entry: An untangle Element for a single <entry> in a YouTube
             channel RSS feed (https://www.youtube.com/feeds/videos.xml).
-        :param channel_name_override: When non-None, replaces the
-            ``channel_name`` value derived from the RSS entry's
-            ``<author><name>``. Intended for callers that have already
-            resolved the canonical channel handle via the creator map.
-            When ``None`` (the default), the RSS entry's author name is
-            used, preserving previous behaviour.
+        :param channel_handle: Canonical channel handle to stamp onto the
+            YouTubeVideo. Callers must resolve this from an authoritative
+            source (e.g. the creator map); it is never derived from the
+            RSS entry's ``<author><name>``.
         :returns: A YouTubeVideo instance with RSS-available fields set.
         :raises: AttributeError if the entry is missing the mandatory
             yt:videoId or title elements.
@@ -444,14 +439,12 @@ class YouTubeVideo:
         except AttributeError:
             pass
 
+        video.channel_handle = channel_handle
+
         try:
-            video.channel_name = entry.author.name.cdata
             video.channel_url = entry.author.uri.cdata
         except AttributeError:
             pass
-
-        if channel_name_override is not None:
-            video.channel_name = channel_name_override
 
         try:
             video.published_timestamp = dateutil_parser.parse(
@@ -555,7 +548,7 @@ class YouTubeVideo:
 
     @staticmethod
     async def scrape(
-        video_id: str, channel_name: str | None,
+        video_id: str, channel_handle: str | None,
         channel_thumbnail: YouTubeThumbnail | None,
         deno_path: str = DENO_PATH, po_token_url: str = PO_TOKEN_URL,
         ytdlp_cache_dir: str = YTDLP_CACHE_DIR, download_client: YoutubeDL | None = None,
@@ -568,7 +561,7 @@ class YouTubeVideo:
         for format extraction.
 
         :param video_id: YouTube video ID
-        :param channel_name: Name of the channel that we are scraping the
+        :param channel_handle: Name of the channel that we are scraping the
         video for
         :param channel_thumbnail: Thumbnail for the creator of the video
         page
@@ -590,7 +583,7 @@ class YouTubeVideo:
 
         self: YouTubeVideo = YouTubeVideo(
             video_id=video_id,
-            channel_name=channel_name,
+            channel_handle=channel_handle,
             channel_thumbnail=channel_thumbnail,
             download_client=download_client,
         )
@@ -871,12 +864,12 @@ class YouTubeVideo:
                 microformat['uploadDate']
             )
 
-        category: str | None = video_details.get('category')
-        if category:
+        category: str | list[str] | None = video_details.get('category')
+        if category and not self.category:
             if isinstance(category, str):
-                self.categories.add(category)
-            elif isinstance(category, list):
-                self.categories |= set(category)
+                self.category = category
+            elif isinstance(category, list) and category:
+                self.category = category[0]
 
         # TODO: does this ever get a value?
         self.default_audio_language = microformat.get(
@@ -1018,7 +1011,7 @@ class YouTubeVideo:
                 'Scraping YouTube video',
                 extra={'video_id': self.video_id}
             )
-            loop = asyncio.get_event_loop()
+            loop: asyncio.AbstractEventLoop = asyncio.get_event_loop()
             proxy_label: str = proxy or 'none'
             wid: str = get_worker_id()
             METRIC_EXTRACT_INFO_ACTIVE.labels(
@@ -1064,7 +1057,7 @@ class YouTubeVideo:
             ) from exc
 
         self.channel_id = video_info.get('channel_id')
-        self.channel_name: str = self.channel_name or video_info.get('channel')
+        self.channel_handle: str = self.channel_handle or video_info.get('channel')
         self.channel_url: str = video_info.get('channel_url')
         self.channel_is_verified: bool = video_info.get('channel_is_verified')
         self.channel_follower_count: int = video_info.get(
@@ -1091,8 +1084,12 @@ class YouTubeVideo:
         self.availability = video_info.get('availability')
         self.duration = self.duration or video_info.get('duration')
         self.tags = self.tags | set(video_info.get('tags', []))
-        self.categories = \
-            self.categories | set(video_info.get('categories', []))
+        if not self.category:
+            yt_dlp_categories: list[str] = video_info.get(
+                'categories', [],
+            ) or []
+            if yt_dlp_categories:
+                self.category = yt_dlp_categories[0]
         self.default_audio_language = video_info.get('language')
         self.age_limit = self.age_limit or video_info.get('age_limit', 0)
         self.heatmaps = video_info.get('heatmap', [])

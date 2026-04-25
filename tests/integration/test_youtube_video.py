@@ -74,7 +74,7 @@ class TestIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(video.is_family_safe)
         self.assertFalse(video.is_tv_film_video)
         self.assertEqual(video.age_limit, 0)
-        self.assertEqual(video.categories, set(['Music']))
+        self.assertEqual(video.category, 'Music')
         self.assertGreaterEqual(len(video.available_country_codes), 40)
         self.assertEqual(video.privacy_status, 'public')
         self.assertIn('rick astley', video.keywords)
@@ -89,7 +89,7 @@ class TestIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             video.channel_url, 'http://www.youtube.com/@RickAstleyYT'
         )
-        self.assertEqual(video.channel_name, 'Rick Astley')
+        self.assertEqual(video.channel_handle, 'Rick Astley')
         self.assertEqual(video.privacy_status, 'public')
 
         self._validate_schema(video.to_dict())
@@ -97,7 +97,7 @@ class TestIntegration(unittest.IsolatedAsyncioTestCase):
     async def test_youtube_video(self) -> None:
         video: YouTubeVideo = await YouTubeVideo.scrape(
             video_id=YOUTUBE_VIDEO_ID,
-            channel_name='Rick Astley', channel_thumbnail=None,
+            channel_handle='Rick Astley', channel_thumbnail=None,
             deno_path=DENO_PATH, po_token_url=PO_TOKEN_URL,
             ytdlp_cache_dir=self.temp_dir, debug=True,
             save_dir=self.temp_dir, proxies=self.proxies
@@ -118,7 +118,7 @@ class TestIntegration(unittest.IsolatedAsyncioTestCase):
     async def test_youtube_short(self) -> None:
         short: YouTubeVideo = await YouTubeVideo.scrape(
             video_id=YOUTUBE_SHORT_ID,
-            channel_name='byjacobward', channel_thumbnail=None,
+            channel_handle='byjacobward', channel_thumbnail=None,
             ytdlp_cache_dir=self.temp_dir, deno_path=DENO_PATH,
             po_token_url=PO_TOKEN_URL, debug=True, save_dir=self.temp_dir
         )
