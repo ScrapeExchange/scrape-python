@@ -87,7 +87,7 @@ class ReingestSettings(YouTubeScraperSettings):
         ),
     )
     video_archive_dir: str | None = Field(
-        default='scraped-videos',
+        default=None,
         validation_alias=AliasChoices(
             'VIDEO_ARCHIVE_DIR', 'video_archive_dir',
         ),
