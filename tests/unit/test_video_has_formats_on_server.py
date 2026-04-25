@@ -10,55 +10,12 @@ payload contains a non-empty 'formats' list.  Any exception or
 unexpected shape returns False (fail-open).
 '''
 
-import asyncio
-import importlib.util
 import unittest
 
-from pathlib import Path
-from types import ModuleType
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
-
-def _load_yt_video_scrape() -> ModuleType:
-    '''
-    Load tools/yt_video_scrape.py directly from
-    its file path. ``tools/`` is not a Python
-    package so a normal import fails.
-
-    Cached in ``sys.modules`` to avoid duplicate
-    Prometheus metric registration when multiple
-    test files load the same module in one process.
-    '''
-    import sys
-    if 'yt_video_scrape' in sys.modules:
-        return sys.modules['yt_video_scrape']
-
-    repo_root: Path = (
-        Path(__file__).resolve().parents[2]
-    )
-    module_path: Path = (
-        repo_root / 'tools' / 'yt_video_scrape.py'
-    )
-    spec = importlib.util.spec_from_file_location(
-        'yt_video_scrape', module_path,
-    )
-    assert (
-        spec is not None
-        and spec.loader is not None
-    )
-    module: ModuleType = (
-        importlib.util.module_from_spec(spec)
-    )
-    sys.modules['yt_video_scrape'] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-yt_video_scrape: ModuleType = _load_yt_video_scrape()
-_video_has_formats_on_server = (
-    yt_video_scrape._video_has_formats_on_server
-)
+from tools.yt_video_scrape import _video_has_formats_on_server
 
 # Constants mirrored from ExchangeClient so tests are self-contained.
 _GET_DATA_PARAM: str = '/api/v1/data/param'

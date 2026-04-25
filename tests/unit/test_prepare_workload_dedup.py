@@ -8,39 +8,17 @@ deleted and only the video-dlp entry queued for upload. When only one
 variant exists it passes through unchanged.
 '''
 
-import importlib.util
-import sys
 import unittest
 
 from asyncio import Queue
-from pathlib import Path
-from types import ModuleType
 from unittest.mock import AsyncMock, MagicMock, call
 
-
-def _load_yt_video_scrape() -> ModuleType:
-    '''
-    Load tools/yt_video_scrape.py as a module without importing it
-    as a package (``tools/`` has no ``__init__.py``).
-    '''
-    repo_root: Path = Path(__file__).resolve().parents[2]
-    module_path: Path = repo_root / 'tools' / 'yt_video_scrape.py'
-    spec = importlib.util.spec_from_file_location(
-        'yt_video_scrape', module_path,
-    )
-    assert spec is not None and spec.loader is not None
-    mod: ModuleType = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-_mod: ModuleType = _load_yt_video_scrape()
-prepare_workload = _mod.prepare_workload
-
-VIDEO_MIN_PREFIX: str = _mod.VIDEO_MIN_PREFIX
-VIDEO_YTDLP_PREFIX: str = _mod.VIDEO_YTDLP_PREFIX
-FILE_EXTENSION: str = _mod.FILE_EXTENSION
+from tools.yt_video_scrape import (
+    FILE_EXTENSION,
+    VIDEO_MIN_PREFIX,
+    VIDEO_YTDLP_PREFIX,
+    prepare_workload,
+)
 
 
 def _min(vid: str) -> str:

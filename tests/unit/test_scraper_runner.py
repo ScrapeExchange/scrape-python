@@ -298,7 +298,10 @@ class TestScraperRunnerWorker(
             rate_limiter_factory=lambda s: rl,
             client_required=False,
         )
-        await runner.run(worker_fn)
+        # ScraperRunner.run logs a WARNING via the root logger
+        # when the optional ExchangeClient setup fails.
+        with self.assertLogs(level='WARNING'):
+            await runner.run(worker_fn)
 
         worker_fn.assert_awaited_once()
         ctx: ScraperRunContext = (

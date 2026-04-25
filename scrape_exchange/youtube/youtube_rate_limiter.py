@@ -102,6 +102,13 @@ class _RssCircuitState:
 # a gap where all workers hit an expired cookie file simultaneously.
 _COOKIE_RENEWAL_BUFFER: float = 10 * 60.0
 
+# Cap the number of in-flight ``get_cookie_file`` calls during
+# :meth:`YouTubeRateLimiter.warm_cookie_jar`. The cookie jar further
+# caps *network* fetches with its own semaphore; this one bounds the
+# fan-out at dispatch time so we don't queue 58+ ``flock`` waits on
+# the default thread pool when many processes start simultaneously.
+_WARM_COOKIE_CONCURRENCY: int = 8
+
 
 class YouTubeCallType(str, Enum):
     '''Discriminator for the different YouTube endpoint families.'''
@@ -443,17 +450,31 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
 
     async def warm_cookie_jar(self) -> None:
         '''
-        Pre-acquire cookie files for every registered proxy concurrently.
+        Pre-acquire cookie files for every registered proxy.
 
-        Called automatically by :meth:`set_proxies` via a background task.
-        Can also be awaited directly when the caller needs cookies to be ready
-        before proceeding (e.g. in tests).  When no proxy pool is registered a
-        single direct-connection cookie file is acquired instead.
+        Called automatically by :meth:`set_proxies` via a background
+        task.  Can also be awaited directly when the caller needs
+        cookies to be ready before proceeding (e.g. in tests).  When no
+        proxy pool is registered a single direct-connection cookie
+        file is acquired instead.
+
+        Parallelism is bounded by ``_WARM_COOKIE_CONCURRENCY`` so that
+        dispatch doesn't flood the threadpool with pending ``flock``
+        waits; the underlying cookie jar further caps *network* fetches
+        with its own semaphore.
         '''
         from .youtube_cookiejar import YouTubeCookieJar
         jar: YouTubeCookieJar = YouTubeCookieJar.get()
         proxies: list[str | None] = self._proxies or [None]
-        await asyncio.gather(*[jar.get_cookie_file(p) for p in proxies])
+        sem: asyncio.Semaphore = asyncio.Semaphore(
+            _WARM_COOKIE_CONCURRENCY,
+        )
+
+        async def _warm_one(p: str | None) -> None:
+            async with sem:
+                await jar.get_cookie_file(p)
+
+        await asyncio.gather(*[_warm_one(p) for p in proxies])
 
     async def _start_cookie_services(self) -> None:
         '''Warm the cookie jar then start the proactive renewal loop.'''

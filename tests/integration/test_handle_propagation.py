@@ -1,38 +1,13 @@
 '''Integration: handle written by channel/RSS reaches video uploads.'''
 
-import importlib.util
 import os
 import tempfile
 import unittest
 
-from pathlib import Path
-from types import ModuleType
-
 from scrape_exchange.creator_map import FileCreatorMap
 from scrape_exchange.youtube.youtube_video import YouTubeVideo
 
-
-def _load_yt_video_scrape() -> ModuleType:
-    import sys
-    if 'yt_video_scrape' in sys.modules:
-        return sys.modules['yt_video_scrape']
-
-    repo_root: Path = Path(__file__).resolve().parents[2]
-    module_path: Path = repo_root / 'tools' / 'yt_video_scrape.py'
-    spec = importlib.util.spec_from_file_location(
-        'yt_video_scrape', module_path,
-    )
-    assert spec is not None and spec.loader is not None
-    module: ModuleType = importlib.util.module_from_spec(spec)
-    sys.modules['yt_video_scrape'] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-yt_video_scrape: ModuleType = _load_yt_video_scrape()
-resolve_video_upload_handle = (
-    yt_video_scrape.resolve_video_upload_handle
-)
+from tools.yt_video_scrape import resolve_video_upload_handle
 
 
 class TestHandlePropagation(unittest.IsolatedAsyncioTestCase):

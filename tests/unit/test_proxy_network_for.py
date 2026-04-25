@@ -93,10 +93,13 @@ class TestProxyNetworkFor(unittest.TestCase):
         '''A junk entry in PROXY_NETWORKS is logged and
         skipped; the valid entries still work.'''
         with self._env('not-a-cidr,65.181.160.0/21'):
-            self.assertEqual(
-                proxy_network_for('65.181.160.5'),
-                '65.181.160.0/21',
-            )
+            with self.assertLogs(
+                'scrape_exchange.util', level='WARNING',
+            ):
+                self.assertEqual(
+                    proxy_network_for('65.181.160.5'),
+                    '65.181.160.0/21',
+                )
 
     def test_whitespace_entries_tolerated(self) -> None:
         with self._env(

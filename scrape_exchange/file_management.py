@@ -180,6 +180,21 @@ class AssetFileManagement:
 
         return False
 
+    def was_uploaded(self, filename: str) -> bool:
+        '''
+        Return True if *filename* exists in the uploaded directory,
+        regardless of whether a copy still lives in the base directory or
+        what their relative mtimes are.
+
+        This is the simplest "did we already ship this asset?" predicate.
+        Use :meth:`is_superseded` when you also want to know whether the
+        uploaded copy renders the base copy obsolete (mtime comparison).
+
+        :param filename: Bare filename to test.
+        :returns: ``True`` if ``uploaded_dir / filename`` exists.
+        '''
+        return (self.uploaded_dir / filename).exists()
+
     def is_superseded(self, filename: str) -> bool:
         '''
         Return True if *filename* in the base directory has been superseded

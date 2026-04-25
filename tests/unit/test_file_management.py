@@ -550,9 +550,12 @@ class TestMarkerHelpers(unittest.IsolatedAsyncioTestCase):
             await self.fm.delete('does-not-exist.json.br')
 
     async def test_delete_fail_ok_false_suppresses_missing(self):
-        await self.fm.delete(
-            'does-not-exist.json.br', fail_ok=False
-        )  # must not raise
+        with self.assertLogs(
+            'scrape_exchange.file_management', level='WARNING',
+        ):
+            await self.fm.delete(
+                'does-not-exist.json.br', fail_ok=False
+            )  # must not raise
 
     async def test_delete_fail_ok_false_suppresses_arbitrary_oserror(self):
         # An OSError other than FileNotFoundError must also be swallowed.
@@ -561,9 +564,12 @@ class TestMarkerHelpers(unittest.IsolatedAsyncioTestCase):
             'aiofiles.os.remove',
             side_effect=PermissionError('nope'),
         ):
-            await self.fm.delete(
-                'channel-foo.json.br', fail_ok=False
-            )  # must not raise
+            with self.assertLogs(
+                'scrape_exchange.file_management', level='WARNING',
+            ):
+                await self.fm.delete(
+                    'channel-foo.json.br', fail_ok=False
+                )  # must not raise
 
     async def test_delete_fail_ok_true_propagates_oserror(self):
         import unittest.mock as mock
@@ -821,9 +827,12 @@ class TestDeleteUploaded(unittest.IsolatedAsyncioTestCase):
             await self.fm.delete_uploaded('does-not-exist.json.br')
 
     async def test_delete_uploaded_fail_ok_false_suppresses(self):
-        await self.fm.delete_uploaded(
-            'does-not-exist.json.br', fail_ok=False
-        )  # must not raise
+        with self.assertLogs(
+            'scrape_exchange.file_management', level='WARNING',
+        ):
+            await self.fm.delete_uploaded(
+                'does-not-exist.json.br', fail_ok=False
+            )  # must not raise
 
 
 if __name__ == '__main__':

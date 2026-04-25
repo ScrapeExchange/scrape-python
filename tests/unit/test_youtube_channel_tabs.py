@@ -5,6 +5,7 @@ These tests use mocked InnerTube responses to cover all code-paths
 without making real network calls.
 '''
 
+import logging
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -13,6 +14,24 @@ from scrape_exchange.youtube.youtube_types import YouTubeChannelPageType
 
 
 CHANNEL_ID: str = 'UCtest123'
+
+
+# Constructing YouTubeChannelTabs without a proxy logs a 'No proxies
+# configured' warning on every call. Unit tests never pass a proxy, so
+# silence that specific logger for the duration of the module to keep
+# the test log floor clean.
+_TABS_LOGGER: logging.Logger = logging.getLogger(
+    'scrape_exchange.youtube.youtube_channel_tabs',
+)
+_TABS_LOGGER_PRIOR_LEVEL: int = _TABS_LOGGER.level
+
+
+def setUpModule() -> None:
+    _TABS_LOGGER.setLevel(logging.ERROR)
+
+
+def tearDownModule() -> None:
+    _TABS_LOGGER.setLevel(_TABS_LOGGER_PRIOR_LEVEL)
 
 
 class TestYouTubeChannelTabsInit(unittest.TestCase):
@@ -539,7 +558,11 @@ class TestBrowse(unittest.IsolatedAsyncioTestCase):
             Exception('fail2'),
             {'data': 'recovered'},
         ]
-        result = await tabs._browse(max_retries=4)
+        with self.assertLogs(
+            'scrape_exchange.youtube.youtube_channel_tabs',
+            level='ERROR',
+        ):
+            result = await tabs._browse(max_retries=4)
         self.assertEqual(result, {'data': 'recovered'})
         self.assertEqual(tabs.client.browse.call_count, 3)
 
@@ -551,8 +574,12 @@ class TestBrowse(unittest.IsolatedAsyncioTestCase):
         tabs = YouTubeChannelTabs(CHANNEL_ID)
         tabs.client = MagicMock()
         tabs.client.browse.side_effect = Exception('always fail')
-        with self.assertRaises(RuntimeError) as ctx:
-            await tabs._browse(max_retries=2)
+        with self.assertLogs(
+            'scrape_exchange.youtube.youtube_channel_tabs',
+            level='ERROR',
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                await tabs._browse(max_retries=2)
         self.assertIn('Failed to fetch tabbed data', str(ctx.exception))
 
 

@@ -6,8 +6,26 @@ Unit tests for YouTubeChannel class and related functions.
 :license: GPLv3
 '''
 
+import logging
 import unittest
 import unittest.mock
+
+
+# A handful of tests exercise parse/extract branches that log a
+# WARNING when input is malformed. Silence the module logger for the
+# duration of the file to keep the test output clean.
+_YC_LOGGER: logging.Logger = logging.getLogger(
+    'scrape_exchange.youtube.youtube_channel',
+)
+_YC_LOGGER_PRIOR_LEVEL: int = _YC_LOGGER.level
+
+
+def setUpModule() -> None:
+    _YC_LOGGER.setLevel(logging.ERROR)
+
+
+def tearDownModule() -> None:
+    _YC_LOGGER.setLevel(_YC_LOGGER_PRIOR_LEVEL)
 
 from pathlib import Path
 from datetime import UTC, datetime
@@ -881,10 +899,10 @@ class TestFindNestedDicts(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# parse_nested_dicts
+# find_nested_dicts — additional path-traversal cases
 # ---------------------------------------------------------------------------
 
-class TestFindNestedDicts(unittest.TestCase):
+class TestFindNestedDictsTraversal(unittest.TestCase):
     def test_traverses_path(self) -> None:
         data = {'a': {'b': {'c': 'value'}}}
         self.assertEqual(

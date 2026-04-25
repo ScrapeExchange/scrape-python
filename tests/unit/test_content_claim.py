@@ -110,8 +110,12 @@ class TestFileContentClaimAcquire(
         )
         old_time: float = time.time() - 2
         os.utime(str(path), (old_time, old_time))
-        # Second acquire should succeed (stale claim).
-        result: bool = await claim.acquire('vid_exp')
+        # Second acquire should succeed (stale claim) and log
+        # a WARNING that the stale claim was reclaimed.
+        with self.assertLogs(
+            'scrape_exchange.content_claim', level='WARNING',
+        ):
+            result: bool = await claim.acquire('vid_exp')
         self.assertTrue(result)
 
     async def test_non_expired_claim_not_reclaimed(

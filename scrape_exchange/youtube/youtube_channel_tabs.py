@@ -69,7 +69,7 @@ class YouTubeChannelTabs:
 
         self.client_request_count = 0
         if not self.proxy:
-            logging.warning(
+            _LOGGER.warning(
                 'No proxies configured, proceeding without proxies'
             )
 

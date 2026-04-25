@@ -6,6 +6,7 @@ out so that acquire() returns almost immediately and only the token-bucket
 logic is exercised.
 '''
 
+import logging
 import os
 import unittest
 from unittest.mock import patch
@@ -16,6 +17,24 @@ from scrape_exchange.youtube.youtube_rate_limiter import (
     YouTubeCallType,
     _DEFAULT_CONFIGS,
 )
+
+
+# Circuit-breaker tests deliberately trip the breaker many times;
+# the rate-limiter logs a WARNING on every open. Silence that logger
+# for the module so the test output stays signal-only. A real
+# regression at ERROR level still propagates.
+_RL_LOGGER: logging.Logger = logging.getLogger(
+    'scrape_exchange.youtube.youtube_rate_limiter',
+)
+_RL_LOGGER_PRIOR_LEVEL: int = _RL_LOGGER.level
+
+
+def setUpModule() -> None:
+    _RL_LOGGER.setLevel(logging.ERROR)
+
+
+def tearDownModule() -> None:
+    _RL_LOGGER.setLevel(_RL_LOGGER_PRIOR_LEVEL)
 
 
 def _in_process_backend(

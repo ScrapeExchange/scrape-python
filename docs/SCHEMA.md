@@ -333,6 +333,11 @@ Below is a complete schema for YouTube channel metadata:
       "description": "The YouTube channel ID",
       "x-scrape-field": "platform_content_id"
     },
+    "channel": {
+      "type": "string",
+      "description": "The channel handle (e.g. @channelname)"m
+      "x-scrape-field": "platform_creator_id"
+    },
     "title": {
       "type": "string",
       "description": "The channel name"
@@ -344,7 +349,8 @@ Below is a complete schema for YouTube channel metadata:
     "channel_url": {
       "type": "string",
       "format": "uri",
-      "description": "URL to the channel page"
+      "description": "URL to the channel page",
+      "x-scrape-field": "platform_creator_thumbnail_url"
     },
     "subscriber_count": {
       "type": "integer",

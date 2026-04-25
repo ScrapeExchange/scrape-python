@@ -67,22 +67,42 @@ class TestChunksAreDisjointCover(unittest.TestCase):
     def test_overlap_rejected(self) -> None:
         proxies: list[str] = ['a', 'b', 'c']
         chunks = [['a', 'b'], ['b', 'c']]  # 'b' in both
-        self.assertFalse(chunks_are_disjoint_cover(chunks, proxies))
+        with self.assertLogs(
+            'scrape_exchange.scraper_supervisor', level='ERROR',
+        ):
+            self.assertFalse(
+                chunks_are_disjoint_cover(chunks, proxies),
+            )
 
     def test_drop_rejected(self) -> None:
         proxies: list[str] = ['a', 'b', 'c']
         chunks = [['a'], ['b']]  # 'c' missing
-        self.assertFalse(chunks_are_disjoint_cover(chunks, proxies))
+        with self.assertLogs(
+            'scrape_exchange.scraper_supervisor', level='ERROR',
+        ):
+            self.assertFalse(
+                chunks_are_disjoint_cover(chunks, proxies),
+            )
 
     def test_extra_rejected(self) -> None:
         proxies: list[str] = ['a', 'b']
         chunks = [['a'], ['b'], ['c']]
-        self.assertFalse(chunks_are_disjoint_cover(chunks, proxies))
+        with self.assertLogs(
+            'scrape_exchange.scraper_supervisor', level='ERROR',
+        ):
+            self.assertFalse(
+                chunks_are_disjoint_cover(chunks, proxies),
+            )
 
     def test_different_set_rejected(self) -> None:
         proxies: list[str] = ['a', 'b']
         chunks = [['x'], ['y']]
-        self.assertFalse(chunks_are_disjoint_cover(chunks, proxies))
+        with self.assertLogs(
+            'scrape_exchange.scraper_supervisor', level='ERROR',
+        ):
+            self.assertFalse(
+                chunks_are_disjoint_cover(chunks, proxies),
+            )
 
 
 class TestPublishConfigMetrics(unittest.TestCase):
@@ -390,7 +410,10 @@ class TestKillChildren(unittest.TestCase):
         dead: MagicMock = MagicMock()
         dead.poll.return_value = 0
 
-        _kill_children('test', [alive, dead])
+        with self.assertLogs(
+            'scrape_exchange.scraper_supervisor', level='WARNING',
+        ):
+            _kill_children('test', [alive, dead])
 
         alive.kill.assert_called_once()
         dead.kill.assert_not_called()
@@ -400,7 +423,10 @@ class TestKillChildren(unittest.TestCase):
         child.poll.return_value = None
         child.kill.side_effect = ProcessLookupError
 
-        _kill_children('test', [child])
+        with self.assertLogs(
+            'scrape_exchange.scraper_supervisor', level='WARNING',
+        ):
+            _kill_children('test', [child])
         child.kill.assert_called_once()
 
 
@@ -423,9 +449,12 @@ class TestHandleChildExit(unittest.TestCase):
         sibling.poll.return_value = None
         pending: list[MagicMock] = [sibling]
 
-        result: int = _handle_child_exit(
-            'test', child, 2, pending,
-        )
+        with self.assertLogs(
+            'scrape_exchange.scraper_supervisor', level='ERROR',
+        ):
+            result: int = _handle_child_exit(
+                'test', child, 2, pending,
+            )
         self.assertEqual(result, 2)
         sibling.terminate.assert_called_once()
 
@@ -473,9 +502,10 @@ class TestWaitForChildren(unittest.TestCase):
         shutdown_state: dict[str, float | None] = {
             'deadline': time.monotonic() - 1,
         }
-        rc: int = wait_for_children(
-            'test', [child], shutdown_state,
-        )
+        with self.assertLogs(
+            'scrape_exchange.scraper_supervisor', level='ERROR',
+        ):
+            wait_for_children('test', [child], shutdown_state)
         child.kill.assert_called_once()
 
     def test_no_escalation_without_deadline(self) -> None:

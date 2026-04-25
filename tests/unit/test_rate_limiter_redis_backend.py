@@ -240,12 +240,18 @@ class TestRedisBackendKeyTTL(unittest.TestCase):
 )
 class TestRedisBackendDegradation(unittest.TestCase):
 
-    def test_try_acquire_degrades_on_error(self) -> None:
+    def test_try_acquire_raises_on_error(self) -> None:
+        '''
+        ``try_acquire`` must re-raise the underlying Redis error
+        (after logging a WARNING) so the caller knows the rate
+        limiter is unavailable rather than silently letting a
+        request through. See commit 7baca18.
+        '''
         backend = _make_backend()
 
         async def run():
             _wire(backend)
-            await backend._ensure_scripts()
+            await backend._ensure_lua_scripts()
             backend._redis = AsyncMock()
             backend._redis.evalsha = AsyncMock(
                 side_effect=ConnectionError('down'),
@@ -254,17 +260,23 @@ class TestRedisBackendDegradation(unittest.TestCase):
                 _TEST_CALL_TYPE, None,
             )
 
-        wait, bt, gt = _run(run())
-        self.assertEqual(wait, 0.0)
-        self.assertEqual(bt, 0.0)
-        self.assertEqual(gt, 0.0)
+        with self.assertLogs(
+            'scrape_exchange.rate_limiter', level='WARNING',
+        ):
+            with self.assertRaises(ConnectionError):
+                _run(run())
 
     def test_penalise_degrades_on_error(self) -> None:
+        '''
+        ``penalise`` is best-effort — it logs a WARNING and returns
+        rather than raising, because a lost penalty is less harmful
+        than forcing every penalty site to handle Redis faults.
+        '''
         backend = _make_backend()
 
         async def run():
             _wire(backend)
-            await backend._ensure_scripts()
+            await backend._ensure_lua_scripts()
             backend._redis = AsyncMock()
             backend._redis.evalsha = AsyncMock(
                 side_effect=ConnectionError('down'),
@@ -273,7 +285,10 @@ class TestRedisBackendDegradation(unittest.TestCase):
                 _TEST_CALL_TYPE, None, 5.0,
             )
 
-        _run(run())  # should not raise
+        with self.assertLogs(
+            'scrape_exchange.rate_limiter', level='WARNING',
+        ):
+            _run(run())  # should not raise
 
 
 @unittest.skipUnless(

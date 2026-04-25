@@ -236,8 +236,11 @@ class TestBuildCreatorMap(
         with patch.object(
             RedisCreatorMap, 'size', new=_boom,
         ):
-            with self.assertRaises(SystemExit) as ctx:
-                await build_creator_map(settings)
+            with self.assertLogs(
+                'tools.yt_discover_channels', level='ERROR',
+            ):
+                with self.assertRaises(SystemExit) as ctx:
+                    await build_creator_map(settings)
         self.assertEqual(ctx.exception.code, 1)
 
 
