@@ -144,7 +144,7 @@ class AsyncYouTubeClient(AsyncClient):
             ), **kwargs
         )
 
-        self.consent_cookies: dict[str, str] = CONSENT_COOKIES
+        self.consent_cookies: dict[str, str] = consent_cookies
 
         for name, value in consent_cookies.items():
             self.cookies.set(
@@ -215,7 +215,9 @@ class AsyncYouTubeClient(AsyncClient):
                 return await self.get(
                     url, retries=retries - 1, delay=delay * 2, **kwargs
                 )
-            raise RuntimeError(f'Request cancelled fetching URL {url}')
+            raise RuntimeError(
+                f'Request cancelled fetching URL {url}'
+            ) from exc
         except (TimeoutException, ConnectError, ReadTimeout,
                 ConnectTimeout, ConnectionResetError,
                 ConnectionRefusedError) as exc:
@@ -236,7 +238,7 @@ class AsyncYouTubeClient(AsyncClient):
                     url, retries=retries - 1, delay=delay*2, **kwargs
                 )
 
-            raise RuntimeError(f'Timeout fetching URL {url}')
+            raise RuntimeError(f'Timeout fetching URL {url}') from exc
         except RequestError as exc:
             METRIC_YT_REQUEST_DURATION.labels(
                 kind='http', status_class='error',

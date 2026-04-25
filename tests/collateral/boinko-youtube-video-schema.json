@@ -1,25 +1,49 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "boinko-youtube-video-0.0.1.jsonschema",
+  "$id": "https://scrape.exchange/schemas/boinko-youtube-video-0.0.1",
   "title": "YouTube Video Metadata",
-  "description": "Schema representing the output of YouTubeVideo.to_dict(), including identifiers, timestamps, thumbnails, captions, formats and statistics.",
+  "description": "Schema representing a YouTube video and its associated metadata, including identifiers, descriptive fields, statistics, availability, media information, and related channel data.",
   "type": "object",
   "properties": {
-    "video_id": { "type": ["string", "null"], "description": "YouTube video id" },
-    "title": { "type": ["string", "null"], "description": "Short title" },
+    "video_id": {
+      "type": ["string", "null"],
+      "description": "YouTube video id",
+      "x-scrape-field": "platform_content_id"
+    },
+    "title": { "type": ["string", "null"], "description": "Channel name" },
     "long_title": { "type": ["string", "null"], "description": "Long title" },
     "description": { "type": ["string", "null"], "description": "Video description" },
     "channel_id": { "type": ["string", "null"], "description": "Channel id" },
-    "channel_name": { "type": ["string", "null"], "description": "Channel vanity name" },
+    "channel_name": {
+      "type": ["string", "null"],
+      "description": "Channel handle",
+      "x-scrape-field": "platform_creator_id"
+    },
     "channel_url": { "type": ["string", "null"], "format": "uri", "description": "Channel URL" },
     "channel_is_verified": { "type": ["boolean", "null"], "description": "Channel verified flag" },
     "channel_follower_count": { "type": ["integer", "null"], "minimum": 0 },
     "channel_thumbnail": { "$ref": "#/$defs/thumbnail" },
     "availability": { "type": ["string", "null"] },
-    "view_count": { "type": ["integer", "null"], "minimum": 0 },
-    "like_count": { "type": ["integer", "null"], "minimum": 0 },
-    "dislike_count": { "type": ["integer", "null"], "minimum": 0 },
-    "comment_count": { "type": ["integer", "null"], "minimum": 0 },
+    "view_count": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "x-scrape-gauge": true
+  },
+    "like_count": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "x-scrape-gauge": true
+    },
+    "dislike_count": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "x-scrape-gauge": true
+    },
+    "comment_count": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "x-scrape-gauge": true
+    },
     "url": { "type": ["string", "null"], "format": "uri" },
     "embed_url": { "type": ["string", "null"], "format": "uri" },
     "is_live": { "type": "boolean" },
@@ -43,12 +67,15 @@
     "created_timestamp": { "type": ["string", "null"], "format": "date-time" },
     "uploaded_timestamp": { "type": ["string", "null"], "format": "date-time" },
     "published_timestamp": { "type": ["string", "null"], "format": "date-time" },
-    "thumbnails": { "type": "object", "additionalProperties": { "$ref": "#/$defs/thumbnail" } },
+    "thumbnails": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/thumbnail" },
+        "x-scrape-field": "platform_content_thumbnail_url"
+
+    },
     "subtitles": { "type": "object", "additionalProperties": { "$ref": "#/$defs/caption" } },
     "automatic_captions": { "type": "object", "additionalProperties": { "$ref": "#/$defs/caption" } },
-    "formats": { "type": "object", "additionalProperties": { "$ref": "#/$defs/format" } },
-    "available_country_codes": { "type": "array", "items": { "type": "string" }, "description": "List of ISO 3166-1 alpha-2 country codes where the video is available" },
-    "is_tv_film_video": { "type": "boolean", "description": "Whether the video is classified as a TV film or video by YouTube" }
+    "formats": { "type": "object", "additionalProperties": { "$ref": "#/$defs/format" } }
   },
   "required": ["video_id"],
   "additionalProperties": false,

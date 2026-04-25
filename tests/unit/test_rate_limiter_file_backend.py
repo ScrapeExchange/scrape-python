@@ -104,7 +104,10 @@ class TestDetectFsType(unittest.TestCase):
             return_value=None,
         ):
             # No raise; a warning is logged.
-            _assert_local_filesystem('/definitely/not/mounted')
+            with self.assertLogs(
+                'scrape_exchange.rate_limiter', level='WARNING',
+            ):
+                _assert_local_filesystem('/definitely/not/mounted')
 
 
 class TestSharedFileBackendBasics(unittest.TestCase):
@@ -251,9 +254,12 @@ class TestSharedFileBackendBasics(unittest.TestCase):
             f.write('{ this is not valid json')
 
         # Should not raise; backend reinits the bucket.
-        wait, bucket_tokens, _ = _run(
-            backend.try_acquire(YouTubeCallType.BROWSE, proxy),
-        )
+        with self.assertLogs(
+            'scrape_exchange.rate_limiter', level='WARNING',
+        ):
+            wait, bucket_tokens, _ = _run(
+                backend.try_acquire(YouTubeCallType.BROWSE, proxy),
+            )
         self.assertEqual(wait, 0.0)
         burst: int = _DEFAULT_CONFIGS[YouTubeCallType.BROWSE].burst
         self.assertAlmostEqual(
@@ -387,13 +393,17 @@ class TestRateLimiterSharedBackend(unittest.IsolatedAsyncioTestCase):
         )
         limiter.set_proxies(['http://a:3128'])
 
-        # Warm the bucket and then drain it via penalty.
+        # Warm the bucket and then drain it via penalty. penalise()
+        # logs a WARNING on fleet-wide state mutation.
         await limiter.acquire(
             YouTubeCallType.BROWSE, proxy='http://a:3128',
         )
-        await limiter.penalise(
-            YouTubeCallType.BROWSE, 'http://a:3128', 50.0,
-        )
+        with self.assertLogs(
+            'scrape_exchange.rate_limiter', level='WARNING',
+        ):
+            await limiter.penalise(
+                YouTubeCallType.BROWSE, 'http://a:3128', 50.0,
+            )
 
         # A second limiter (different process simulation) sees the
         # drained tokens.

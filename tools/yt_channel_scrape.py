@@ -115,12 +115,11 @@ class ChannelSettings(YouTubeScraperSettings):
     max_resolved_channels: int = Field(
         default=MAX_RESOLVED_CHANNELS,
         validation_alias=AliasChoices(
-            'MAX_NEW_CHANNELS', 'max_new_channels'
+            'MAX_RESOLVED_CHANNELS', 'max_resolved_channels'
         ),
         description=(
-            'Maximum number of new channels to scrape in this run (channels '
-            'that have already been scraped or marked as not found are not '
-            'counted against this limit).'
+            'Maximum number of channels with channel-ids for which '
+            'we do try to resolve the channel handle'
         )
     )
     metrics_port: int = Field(
@@ -351,13 +350,11 @@ async def _run_worker(
 
     settings: ChannelSettings = ctx.settings
 
-    _soft, _hard = resource.getrlimit(
-        resource.RLIMIT_NOFILE,
-    )
+    _: int
+    _hard: int
+    _, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     _target: int = (
-        _hard
-        if _hard != resource.RLIM_INFINITY
-        else 1048576
+        _hard if _hard != resource.RLIM_INFINITY else 1048576
     )
     resource.setrlimit(
         resource.RLIMIT_NOFILE,
@@ -366,9 +363,7 @@ async def _run_worker(
 
     logging.info(
         'Starting YouTube channel upload tool',
-        extra={
-            'settings': settings.model_dump(),
-        },
+        extra={'settings': settings.model_dump()}
     )
 
     # AssetFileManagement creates the 'uploaded' subdirectory
@@ -528,10 +523,7 @@ async def scrape_channels(
 
     # Feed channel names through a queue so only
     # ``channel_concurrency`` scrapes are live at any
-    # time.  Previous approach created all tasks upfront,
-    # holding ~1 000 coroutine frames (and their
-    # YouTubeChannel objects) simultaneously — this
-    # version lets completed work be GC'd immediately.
+    # time.
     queue: asyncio.Queue[str | None] = asyncio.Queue()
     for name in channel_list:
         queue.put_nowait(name)
@@ -770,6 +762,249 @@ def get_channel_filename(channel_name: str) -> str:
     return f'{CHANNEL_FILE_PREFIX}{channel_name}{CHANNEL_FILE_POSTFIX}'
 
 
+def _failed_marker_is_stale(
+    fm: AssetFileManagement, filename: str,
+    base_path: Path, failed_path: Path,
+) -> bool:
+    '''
+    Return True if a ``.failed`` marker has been superseded by either
+    an uploaded copy of the same channel or a newer (re-scraped) base
+    file. In that case the caller should remove the marker and proceed
+    rather than skip.
+    '''
+    if fm.was_uploaded(filename):
+        return True
+    try:
+        base_mtime: float = base_path.stat().st_mtime
+        failed_mtime: float = failed_path.stat().st_mtime
+    except OSError:
+        return False
+    return base_mtime > failed_mtime
+
+
+async def _skip_due_to_existing_state(
+    fm: AssetFileManagement, filename: str,
+    base_path: Path, extra: dict[str, str],
+) -> bool:
+    '''
+    Decide whether the channel can be skipped without scraping or
+    uploading based on what's already on disk.
+
+    :returns: True if the channel should be skipped (caller returns
+        ``False``); False if the caller should proceed.
+    '''
+    failed_path: Path = fm.marker_path(filename, '.failed')
+    if failed_path.exists():
+        if _failed_marker_is_stale(
+            fm, filename, base_path, failed_path,
+        ):
+            await fm.delete(failed_path.name, fail_ok=True)
+            logging.debug(
+                'Removed stale .failed marker', extra=extra,
+            )
+        else:
+            logging.debug(
+                'Channel has .failed marker, skipping', extra=extra,
+            )
+            return True
+
+    if not fm.was_uploaded(filename):
+        return False
+
+    if fm.is_superseded(filename):
+        await fm.delete(filename, fail_ok=False)
+        logging.debug(
+            'Channel already uploaded, dropped stale base copy, '
+            'skipping',
+            extra=extra,
+        )
+        return True
+    if not base_path.exists():
+        logging.debug(
+            'Channel already uploaded, no local base copy, skipping',
+            extra=extra,
+        )
+        return True
+    logging.debug(
+        'Local base copy is newer than uploaded copy, re-uploading',
+        extra=extra,
+    )
+    return False
+
+
+def _record_scrape_failure(
+    channel: YouTubeChannel, message: str, exc: BaseException,
+    extra: dict[str, str],
+) -> None:
+    '''
+    Bump the scrape-failure metric and log *message* with proxy labels.
+    Reads the proxy off ``channel.browse_client`` if it's still open.
+    '''
+    proxy_used: str | None = getattr(
+        channel.browse_client, 'proxy', None,
+    )
+    proxy_used_ip: str = (
+        extract_proxy_ip(proxy_used) if proxy_used else 'none'
+    )
+    METRIC_SCRAPE_FAILURES.labels(
+        worker_id=get_worker_id(),
+        proxy_ip=proxy_used_ip,
+        proxy_network=proxy_network_for(proxy_used_ip),
+    ).inc()
+    logging.warning(
+        message, exc=exc, extra=extra | {
+            'proxy': proxy_used, 'proxy_ip': proxy_used_ip,
+        },
+    )
+
+
+async def _try_scrape_channel(
+    channel: YouTubeChannel, settings: ChannelSettings,
+    fm: AssetFileManagement, channel_name: str,
+    extra: dict[str, str],
+) -> tuple[bool, str | None]:
+    '''
+    Run ``channel.scrape()``, handling expected failure modes (channel
+    not found, runtime errors, generic exceptions) and always closing
+    the browse client.
+
+    :returns: ``(succeeded, scrape_proxy)``. On any failure mode that
+        the caller should treat as a clean miss, ``succeeded`` is
+        False and the caller returns ``False`` from
+        :func:`scrape_channel`.
+    '''
+    try:
+        logging.info('Scraping channel', extra=extra)
+        await channel.scrape(
+            with_about_page=True,
+            max_videos_per_channel=0,
+            proxies=settings.proxies,
+        )
+    except ValueError:
+        logging.debug('Channel not found, skipping', extra=extra)
+        try:
+            await fm.mark_not_found(
+                f'{CHANNEL_FILE_PREFIX}{channel_name}',
+                content=f'{channel_name}\n',
+            )
+        except OSError:
+            logging.warning(
+                'Failed to write not_found marker for channel',
+                extra=extra,
+            )
+        return False, None
+    except asyncio.CancelledError:
+        raise
+    except RuntimeError as exc:
+        _record_scrape_failure(
+            channel, 'Failed to scrape channel', exc, extra,
+        )
+        return False, None
+    except Exception as exc:
+        _record_scrape_failure(
+            channel, 'Unexpected error while scraping channel',
+            exc, extra,
+        )
+        return False, None
+    finally:
+        # Capture the proxy used *before* we close the browse client
+        # so downstream metric emissions (CHANNEL_NO_CONTENT_FOUND,
+        # CHANNELS_SCRAPED) can still label by proxy_ip.
+        scrape_proxy: str | None = getattr(
+            channel.browse_client, 'proxy', None,
+        )
+        # Close the browse client so its curl transport releases
+        # sockets and buffers immediately rather than waiting for GC.
+        if channel.browse_client is not None:
+            await channel.browse_client.aclose()
+            channel.browse_client = None
+
+    return True, scrape_proxy
+
+
+def _channel_has_no_content(
+    channel: YouTubeChannel, scrape_proxy_ip: str,
+    scrape_proxy_network: str, channel_name: str,
+) -> bool:
+    '''
+    Return True (and emit the no-content metric) when *channel* has no
+    videos, playlists, courses, podcasts, or products to upload.
+    '''
+    if (channel.video_ids or channel.playlists or channel.courses
+            or channel.podcast_ids or channel.products):
+        return False
+
+    if channel.description:
+        logging.info(
+            'Channel has description but no other content, skipping '
+            'upload',
+            extra={'channel_name': channel_name},
+        )
+    METRIC_CHANNEL_NO_CONTENT_FOUND.labels(
+        worker_id=get_worker_id(),
+        proxy_ip=scrape_proxy_ip,
+        proxy_network=scrape_proxy_network,
+    ).inc()
+    logging.info(
+        'YouTube channel content counts',
+        extra={
+            'channel_name': channel_name,
+            'proxy_ip': scrape_proxy_ip,
+            'proxy_network': scrape_proxy_network,
+            'playlists_length': len(channel.playlists),
+            'courses_length': len(channel.courses),
+            'podcast_ids_length': len(channel.podcast_ids),
+            'products_length': len(channel.products),
+        },
+    )
+    return True
+
+
+async def _persist_scraped_channel(
+    fm: AssetFileManagement, filename: str,
+    channel: YouTubeChannel, channel_name: str,
+) -> bool:
+    '''
+    Write the freshly-scraped channel to disk. Returns True on success,
+    False on a write failure (caller should propagate as "failed").
+    '''
+    try:
+        await fm.write_file(
+            filename, channel.to_dict(with_video_ids=True),
+        )
+    except Exception as exc:
+        logging.error(
+            'Failed to write channel file to disk',
+            exc=exc,
+            extra={
+                'channel_name': channel_name, 'filename': filename,
+            },
+        )
+        return False
+    return True
+
+
+async def _load_channel_from_disk(
+    fm: AssetFileManagement, filename: str, channel_name: str,
+) -> YouTubeChannel | None:
+    '''
+    Load a previously-scraped channel from *fm*. Returns None on a read
+    or deserialisation failure.
+    '''
+    try:
+        channel_data: dict = await fm.read_file(filename)
+        return YouTubeChannel.from_dict(channel_data)
+    except Exception as exc:
+        logging.error(
+            'Failed to load channel file for upload',
+            exc=exc,
+            extra={
+                'channel_name': channel_name, 'filename': filename,
+            },
+        )
+        return None
+
+
 async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
                          fm: AssetFileManagement, channel_name: str,
                          creator_map_backend: CreatorMap) -> bool:
@@ -788,51 +1023,16 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
 
     extra: dict[str, str] = {'channel_name': channel_name}
     logging.debug('Processing channel', extra=extra)
-    channel: YouTubeChannel | None = None
     filename: str = get_channel_filename(channel_name)
-    base_path: Path = fm.base_dir / filename
-    uploaded_path: Path = fm.uploaded_dir / filename
-    failed_path: Path = fm.marker_path(filename, '.failed')
-
     extra['filename'] = filename
-    upload_mtime: float = 0
-    if uploaded_path.exists():
-        upload_mtime = uploaded_path.stat().st_mtime
-        logging.debug(
-            'Found uploaded path for channel', extra=extra | {
-                'uploaded_path': str(uploaded_path),
-            }
-        )
+    base_path: Path = fm.base_dir / filename
 
-    saved_path: Path = base_path
-    saved_mtime: float = 0
-    if base_path.exists():
-        saved_mtime = base_path.stat().st_mtime
-        logging.debug(
-            'Found base path for channel',
-            extra=extra | {
-                'base_path': str(base_path),
-            },
-        )
-    if failed_path.exists():
-        logging.debug(
-            'Found previously failed upload file for channel, '
-            'skipping', extra=extra | {'failed_path': str(failed_path)}
-        )
-        saved_path = failed_path
-        saved_mtime = failed_path.stat().st_mtime
-
-    if upload_mtime:
-        if saved_mtime and upload_mtime >= saved_mtime:
-            logging.debug(
-                'Channel already uploaded, skipping', extra=extra
-            )
-            await fm.delete(saved_path.name, fail_ok=False)
-
-        # If the channel was already uploaded then there is nothing to do
+    if await _skip_due_to_existing_state(fm, filename, base_path, extra):
         return False
 
-    if not saved_mtime:
+    channel: YouTubeChannel | None = None
+
+    if not base_path.exists():
         logging.debug(
             'Channel not scraped, scraping now', extra=extra,
         )
@@ -840,153 +1040,31 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
             name=channel_name, deno_path=DENO_PATH,
             po_token_url=PO_TOKEN_URL, debug=True,
             save_dir=settings.channel_data_directory,
-            with_download_client=False
+            with_download_client=False,
         )
-        try:
-            logging.info('Scraping channel', extra=extra)
-            await channel.scrape(
-                with_about_page=True,
-                max_videos_per_channel=0,
-                proxies=settings.proxies,
-            )
-        except ValueError:
-            logging.debug('Channel not found, skipping', extra=extra)
-            try:
-                await fm.mark_not_found(
-                    f'{CHANNEL_FILE_PREFIX}'
-                    f'{channel_name}',
-                    content=f'{channel_name}\n',
-                )
-            except OSError:
-                logging.warning(
-                    'Failed to write not_found marker '
-                    'for channel', extra=extra,
-                )
+        ok: bool
+        scrape_proxy: str | None
+        ok, scrape_proxy = await _try_scrape_channel(
+            channel, settings, fm, channel_name, extra,
+        )
+        if not ok:
             return False
-        except asyncio.CancelledError:
-            raise
-        except RuntimeError as exc:
-            proxy_used: str | None = getattr(
-                channel.browse_client, 'proxy', None,
-            )
-            proxy_used_ip: str = (
-                extract_proxy_ip(proxy_used)
-                if proxy_used else 'none'
-            )
-            METRIC_SCRAPE_FAILURES.labels(
-                worker_id=get_worker_id(),
-                proxy_ip=proxy_used_ip,
-                proxy_network=proxy_network_for(
-                    proxy_used_ip,
-                ),
-            ).inc()
-            logging.warning(
-                'Failed to scrape channel',
-                exc=exc, extra=extra | {
-                    'proxy': proxy_used,
-                    'proxy_ip': proxy_used_ip,
-                }
-            )
-            return False
-        except Exception as exc:
-            proxy_used = getattr(
-                channel.browse_client, 'proxy', None,
-            )
-            proxy_used_ip = (
-                extract_proxy_ip(proxy_used)
-                if proxy_used else 'none'
-            )
-            METRIC_SCRAPE_FAILURES.labels(
-                worker_id=get_worker_id(),
-                proxy_ip=proxy_used_ip,
-                proxy_network=proxy_network_for(
-                    proxy_used_ip,
-                ),
-            ).inc()
-            logging.warning(
-                'Unexpected error while scraping '
-                'channel',
-                exc=exc,
-                extra={
-                    'channel_name': channel_name,
-                    'proxy': proxy_used,
-                },
-            )
-            return False
-        finally:
-            # Capture the proxy used *before* we close the
-            # browse client so downstream metric emissions
-            # (CHANNEL_NO_CONTENT_FOUND, CHANNELS_SCRAPED)
-            # can still label by proxy_ip.
-            scrape_proxy: str | None = getattr(
-                channel.browse_client, 'proxy', None,
-            )
-            # Close the browse client so its curl
-            # transport releases sockets and buffers
-            # immediately rather than waiting for GC.
-            if (channel.browse_client is not None):
-                await channel.browse_client.aclose()
-                channel.browse_client = None
+
         scrape_proxy_ip: str = (
-            extract_proxy_ip(scrape_proxy)
-            if scrape_proxy else 'none'
+            extract_proxy_ip(scrape_proxy) if scrape_proxy else 'none'
         )
-        scrape_proxy_network: str = proxy_network_for(
-            scrape_proxy_ip,
-        )
+        scrape_proxy_network: str = proxy_network_for(scrape_proxy_ip)
 
-        if (not channel.video_ids and not channel.playlists
-                and not channel.courses
-                and not channel.podcast_ids
-                and not channel.products):
-            if channel.description:
-                logging.info(
-                    'Channel has description but no other '
-                    'content, skipping upload',
-                    extra={'channel_name': channel_name},
-                )
-            METRIC_CHANNEL_NO_CONTENT_FOUND.labels(
-                worker_id=get_worker_id(),
-                proxy_ip=scrape_proxy_ip,
-                proxy_network=scrape_proxy_network,
-            ).inc()
-            logging.info(
-                'YouTube channel content counts',
-                extra={
-                    'channel_name': channel_name,
-                    'proxy_ip': scrape_proxy_ip,
-                    'proxy_network': scrape_proxy_network,
-                    'playlists_length': (
-                        len(channel.playlists)
-                    ),
-                    'courses_length': (
-                        len(channel.courses)
-                    ),
-                    'podcast_ids_length': (
-                        len(channel.podcast_ids)
-                    ),
-                    'products_length': (
-                        len(channel.products)
-                    ),
-                },
-            )
+        if _channel_has_no_content(
+            channel, scrape_proxy_ip, scrape_proxy_network, channel_name,
+        ):
             return False
 
-        try:
-            await fm.write_file(
-                filename,
-                channel.to_dict(with_video_ids=True),
-            )
-        except Exception as exc:
-            logging.error(
-                'Failed to write channel file to disk',
-                exc=exc,
-                extra={
-                    'channel_name': channel_name,
-                    'filename': filename,
-                },
-            )
+        if not await _persist_scraped_channel(
+            fm, filename, channel, channel_name,
+        ):
             return True
+
         METRIC_CHANNELS_SCRAPED.labels(
             worker_id=get_worker_id(),
             proxy_ip=scrape_proxy_ip,
@@ -1012,31 +1090,24 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
         'Uploading channel to Scrape Exchange',
         extra={'channel_name': channel_name},
     )
-    # If we reached here via the saved_mtime path (file existed on
-    # disk but was never uploaded), ``channel`` was never assigned.
-    # Load it from the persisted file before enqueueing.
+    # If we reached here via the on-disk path (file existed but was
+    # never uploaded, or local base is newer than uploaded copy),
+    # ``channel`` was never assigned. Load it from disk before
+    # enqueueing.
     if channel is None:
-        try:
-            channel_data: dict = await fm.read_file(filename)
-            channel = YouTubeChannel.from_dict(channel_data)
-        except Exception as exc:
-            logging.error(
-                'Failed to load channel file for upload',
-                exc=exc,
-                extra={
-                    'channel_name': channel_name,
-                    'filename': filename,
-                },
-            )
+        channel = await _load_channel_from_disk(
+            fm, filename, channel_name,
+        )
+        if channel is None:
             return True
+
     # Fire-and-forget: background worker moves the file on success;
     # on queue full the file stays in base_dir for the next retry.
     if await enqueue_upload_channel(
-        settings, client, fm, filename, channel,
-        creator_map_backend,
+        settings, client, fm, filename, channel, creator_map_backend,
     ):
         METRIC_CHANNELS_ENQUEUED.labels(
-            worker_id=get_worker_id()
+            worker_id=get_worker_id(),
         ).inc()
     return False
 
@@ -1458,12 +1529,20 @@ async def review_unresolved_ids(
                     return None
                 elif ' ' in name:
                     logging.info(
-                        'Resolved channel ID to name with spaces',
+                        'Resolved channel ID to name with spaces; '
+                        'marking unresolved to avoid re-querying',
                         extra={
                             'channel_id': channel_id,
                             'name': name,
                         },
                     )
+                    await fm.mark_unresolved(
+                        f'{CHANNEL_FILE_PREFIX}{channel_id}',
+                        content=f'{channel_id}\t{name}\n',
+                    )
+                    METRIC_CHANNEL_ID_RESOLUTION_FAILURES.labels(
+                        worker_id=get_worker_id()
+                    ).inc()
                     return None
                 await creator_map_backend.put(
                     channel_id, name,
@@ -1493,7 +1572,17 @@ async def review_unresolved_ids(
 
     ids: list[str] = list(unresolved_ids)
     shuffle(ids)
+    deferred: int = max(0, len(ids) - max_resolved_channels)
     ids = ids[:max_resolved_channels]
+    if deferred:
+        logging.info(
+            'Deferred channel IDs over the per-run resolution cap',
+            extra={
+                'deferred_count': deferred,
+                'max_resolved_channels': max_resolved_channels,
+                'total_unresolved': len(unresolved_ids),
+            },
+        )
 
     results: list[str | None] = await asyncio.gather(
         *(resolve(cid) for cid in ids)

@@ -1,39 +1,11 @@
 '''Tests for video scraper handle resolution.'''
 
-import importlib.util
 import unittest
 
-from pathlib import Path
-from types import ModuleType
 from unittest.mock import AsyncMock, patch
 
-
-def _load_yt_video_scrape() -> ModuleType:
-    '''Load tools/yt_video_scrape.py under the bare name
-    ``yt_video_scrape`` so top-level Prometheus metrics do not get
-    double-registered alongside any other test modules that import
-    the same tool file.
-    '''
-    import sys
-    if 'yt_video_scrape' in sys.modules:
-        return sys.modules['yt_video_scrape']
-
-    repo_root: Path = Path(__file__).resolve().parents[2]
-    module_path: Path = repo_root / 'tools' / 'yt_video_scrape.py'
-    spec = importlib.util.spec_from_file_location(
-        'yt_video_scrape', module_path,
-    )
-    assert spec is not None and spec.loader is not None
-    module: ModuleType = importlib.util.module_from_spec(spec)
-    sys.modules['yt_video_scrape'] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-yt_video_scrape: ModuleType = _load_yt_video_scrape()
-resolve_video_upload_handle = (
-    yt_video_scrape.resolve_video_upload_handle
-)
+from tools import yt_video_scrape
+from tools.yt_video_scrape import resolve_video_upload_handle
 
 
 class TestResolveVideoUploadHandle(
@@ -106,9 +78,12 @@ class TestResolveVideoUploadHandle(
             'resolve_channel_id',
             new=AsyncMock(side_effect=RuntimeError('innertube down')),
         ):
-            result: str | None = await resolve_video_upload_handle(
-                video, cm, proxy=None,
-            )
+            # resolve_video_upload_handle logs a WARNING via the
+            # root logger when InnerTube resolution fails.
+            with self.assertLogs(level='WARNING'):
+                result: str | None = await resolve_video_upload_handle(
+                    video, cm, proxy=None,
+                )
 
         self.assertIsNone(result)
         cm.put.assert_not_awaited()

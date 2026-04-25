@@ -124,7 +124,7 @@ class YouTubeChannel:
         re.compile(r'^UC[A-Z0-9_-]{22}$', re.IGNORECASE)
 
     def __init__(
-        self, name: str = None,
+        self, name: str | None = None, channel_id: str | None = None,
         deno_path: str = DENO_PATH, po_token_url: str = PO_TOKEN_URL,
         ytdlp_cache_dir: str = YTDLP_CACHE_DIR,
         debug: bool = False, save_dir: str = None,
@@ -165,13 +165,17 @@ class YouTubeChannel:
         self.url: str | None = None
         self.title: str | None = None
         self.canonical_handle: str | None = None
+        self.name: str | None = None
         if name:
             self.name = name.lstrip('@')
-            self.url: str = YouTubeChannel.CHANNEL_URL_WITH_AT.format(
+            self.url = YouTubeChannel.CHANNEL_URL_WITH_AT.format(
                 channel_name=self.name.replace(' ', '')
             )
-
-        self.channel_id: UUID | None = None
+        elif channel_id:
+            self.url = YouTubeChannel.CHANNEL_URL_WITH_ID.format(
+                channel_id=channel_id
+            )
+        self.channel_id: str | None = channel_id
         self.description: str | None = None
         self.keywords: set[str] = set()
         self.categories: set[str] = set()
@@ -291,7 +295,9 @@ class YouTubeChannel:
 
     @staticmethod
     def from_dict(data: dict[str, any]) -> Self:
-        channel = YouTubeChannel(name=data.get('channel'))
+        channel = YouTubeChannel(
+            name=data.get('channel', data.get('channel_name'))
+        )
         channel.channel_id = data.get('channel_id')
         channel.title = data.get('title')
         channel.description = data.get('description')
@@ -606,10 +612,6 @@ class YouTubeChannel:
                 f'Could not retrieve about page for channel {self.name}'
             )
 
-        self.channel_id = (
-            self.channel_id or YouTubeChannel.extract_channel_id(page_contents)
-        )
-
         page_data: dict[str, any] = self._extract_initial_data(page_contents)
 
         # This parses the channel metadata
@@ -618,6 +620,10 @@ class YouTubeChannel:
         ).get('channelMetadataRenderer', {})
         if metadata:
             self._parse_channel_about_metadata(metadata)
+
+        self.channel_id = (
+            self.channel_id or YouTubeChannel.extract_channel_id(page_contents)
+        )
 
         about_data: dict[str, any] | None = self._find_about_renderer(
             page_data
@@ -725,6 +731,16 @@ class YouTubeChannel:
             set(metadata.get('availableCountryCodes', []))
 
         vanity_url: str = metadata.get('vanityChannelUrl')
+        if (not vanity_url and isinstance(metadata.get('ownerUrls'), list)
+                and len(metadata['ownerUrls']) > 0):
+            vanity_url = metadata['ownerUrls'][0]
+
+        if vanity_url:
+            try:
+                self.name = vanity_url.split('/@', 1)[1]
+            except IndexError:
+                pass
+
         self.external_urls.add(
             YouTubeExternalLink(
                 name='YouTube', url=vanity_url, priority=0,
@@ -1018,6 +1034,9 @@ class YouTubeChannel:
 
     @staticmethod
     def is_channel_id(name: str) -> bool:
+        if not name:
+            return False
+    
         return bool(YouTubeChannel.CHANNEL_ID_REGEX_MATCH.match(name))
 
     @staticmethod

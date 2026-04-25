@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "boinko-youtube-channel-0.2.0.jsonschema",
+  "$id": "https://scrape.exchange/schemas/boinko-youtube-channel-0.0.1",
   "title": "YouTube Channel Metadata",
   "description": "Schema for representing metadata about a YouTube channel, including identifiers, descriptive fields, statistics, and related media.",
   "type": "object",
@@ -11,7 +11,8 @@
     },
     "channel": {
       "type": "string",
-      "description": "The channel vanity name (without @)"
+      "description": "The channel vanity name (without @)",
+      "x-scrape-field": ["platform_creator_id", "platform_content_id"]
     },
     "title": {
       "type": ["string", "null"],
@@ -76,17 +77,20 @@
     "subscriber_count": {
       "type": "integer",
       "minimum": 0,
-      "description": "Number of subscribers (defaults to 0 when unknown)"
+      "description": "Number of subscribers (defaults to 0 when unknown)",
+      "x-scrape-gauge": true
     },
     "video_count": {
       "type": "integer",
       "minimum": 0,
-      "description": "Number of videos on the channel (defaults to 0)"
+      "description": "Number of videos on the channel (defaults to 0)",
+      "x-scrape-gauge": true
     },
     "view_count": {
       "type": "integer",
       "minimum": 0,
-      "description": "Total view count for the channel (defaults to 0)"
+      "description": "Total view count for the channel (defaults to 0)",
+      "x-scrape-gauge": true
     },
     "courses": {
       "type": "array",

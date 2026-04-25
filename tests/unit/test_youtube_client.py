@@ -4,6 +4,7 @@ Unit tests for the AsyncYouTubeClient class.
 
 '''
 
+import logging
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch, AsyncMock
@@ -11,6 +12,23 @@ from unittest.mock import patch, AsyncMock
 import httpx
 
 from scrape_exchange.youtube.youtube_client import AsyncYouTubeClient
+
+
+# Auth-failure tests deliberately drive the client into non-200 and
+# network-error branches; the production code logs a WARNING on each.
+# Silence the module's logger so clean runs don't emit those records.
+_YT_CLIENT_LOGGER: logging.Logger = logging.getLogger(
+    'scrape_exchange.youtube.youtube_client',
+)
+_YT_CLIENT_LOGGER_PRIOR_LEVEL: int = _YT_CLIENT_LOGGER.level
+
+
+def setUpModule() -> None:
+    _YT_CLIENT_LOGGER.setLevel(logging.ERROR)
+
+
+def tearDownModule() -> None:
+    _YT_CLIENT_LOGGER.setLevel(_YT_CLIENT_LOGGER_PRIOR_LEVEL)
 
 
 class TestAuth(unittest.IsolatedAsyncioTestCase):

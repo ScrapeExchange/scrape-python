@@ -1306,7 +1306,7 @@ class RedisCreatorQueue(CreatorQueue):
             )
         ]
 
-    def _ensure_scripts(self) -> None:
+    def _ensure_lua_scripts(self) -> None:
         '''Register Lua scripts on first use.'''
 
         if self._claim_script is not None:
@@ -1474,7 +1474,7 @@ class RedisCreatorQueue(CreatorQueue):
         self._key_queues = self._build_queue_keys(
             tiers,
         )
-        self._ensure_scripts()
+        self._ensure_lua_scripts()
 
         # Migrate old single-queue key if present.
         await self._migrate_legacy_key(
@@ -1569,7 +1569,7 @@ class RedisCreatorQueue(CreatorQueue):
         claim_ttl: int = DEFAULT_CLAIM_TTL,
         cutoff: float | None = None,
     ) -> list[tuple[str, str, float]]:
-        self._ensure_scripts()
+        self._ensure_lua_scripts()
         ts: float = (
             cutoff
             if cutoff is not None
@@ -1801,7 +1801,7 @@ class RedisCreatorQueue(CreatorQueue):
         return sizes
 
     async def cleanup_stale_claims(self) -> int:
-        self._ensure_scripts()
+        self._ensure_lua_scripts()
         now: float = datetime.now(UTC).timestamp()
         last_tier: int = (
             self._tiers[-1].tier if self._tiers else 1

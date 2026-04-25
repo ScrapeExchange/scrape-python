@@ -100,7 +100,10 @@ class EnqueueUploadTests(unittest.IsolatedAsyncioTestCase):
                 file_manager=fm,
                 filename='video-dlp-xyz.json.br',
             )
-            await client.drain_uploads(timeout=5.0)
+            with self.assertLogs(
+                'scrape_exchange.exchange_client', level='ERROR',
+            ):
+                await client.drain_uploads(timeout=5.0)
 
             self.assertEqual(fm.marked, [])
         finally:
@@ -195,10 +198,14 @@ class EnqueueUploadTests(unittest.IsolatedAsyncioTestCase):
                     'https://fake/api', json={}, log_extra={'n': 3}
                 )
             )
-            # Queue is now at maxsize=2; this one must be dropped.
-            dropped: bool = client.enqueue_upload(
-                'https://fake/api', json={}, log_extra={'n': 4}
-            )
+            # Queue is now at maxsize=2; this one must be dropped
+            # and a WARNING logged to flag the silent drop.
+            with self.assertLogs(
+                'scrape_exchange.exchange_client', level='WARNING',
+            ):
+                dropped: bool = client.enqueue_upload(
+                    'https://fake/api', json={}, log_extra={'n': 4}
+                )
             self.assertFalse(dropped)
 
             release.set()
@@ -228,7 +235,12 @@ class EnqueueUploadTests(unittest.IsolatedAsyncioTestCase):
                 filename='foo.json.br',
             )
             start: float = asyncio.get_event_loop().time()
-            await client.drain_uploads(timeout=0.2)
+            # drain_uploads logs a WARNING when it cancels stuck
+            # workers to surface the timeout in production.
+            with self.assertLogs(
+                'scrape_exchange.exchange_client', level='WARNING',
+            ):
+                await client.drain_uploads(timeout=0.2)
             elapsed: float = asyncio.get_event_loop().time() - start
             self.assertLess(elapsed, 1.0)
         finally:
@@ -268,7 +280,10 @@ class EnqueueUploadTests(unittest.IsolatedAsyncioTestCase):
                 filename='foo.json.br',
             )
             # Must not raise — the worker swallows and logs.
-            await client.drain_uploads(timeout=2.0)
+            with self.assertLogs(
+                'scrape_exchange.exchange_client', level='ERROR',
+            ):
+                await client.drain_uploads(timeout=2.0)
             self.assertEqual(fm.marked, [])
         finally:
             await httpx.AsyncClient.aclose(client)

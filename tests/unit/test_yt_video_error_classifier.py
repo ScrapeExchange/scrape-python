@@ -10,57 +10,15 @@ tests pin every reason against representative real-world yt-dlp
 messages so that case bug never returns.
 '''
 
-import importlib.util
 import unittest
 
-from pathlib import Path
-from types import ModuleType
-
-
-def _load_yt_video_scrape() -> ModuleType:
-    '''
-    Load tools/yt_video_scrape.py as a module.
-    ``tools/`` is not a Python package so a normal
-    ``import`` would fail; load it directly from
-    the file path instead.
-
-    The module is cached in ``sys.modules`` so that
-    repeated loads (e.g. VS Code test discovery
-    running all test files in one process) do not
-    re-register Prometheus metrics and trigger a
-    ``Duplicated timeseries`` error.
-    '''
-
-    import sys
-    if 'yt_video_scrape' in sys.modules:
-        return sys.modules['yt_video_scrape']
-
-    repo_root: Path = (
-        Path(__file__).resolve().parents[2]
-    )
-    module_path: Path = (
-        repo_root / 'tools' / 'yt_video_scrape.py'
-    )
-    spec = importlib.util.spec_from_file_location(
-        'yt_video_scrape', module_path,
-    )
-    assert (
-        spec is not None
-        and spec.loader is not None
-    )
-    module: ModuleType = (
-        importlib.util.module_from_spec(spec)
-    )
-    sys.modules['yt_video_scrape'] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-yt_video_scrape: ModuleType = _load_yt_video_scrape()
-classify = yt_video_scrape._classify_yt_dlp_error
-next_failure_sleep = yt_video_scrape._next_failure_sleep
-FAILURE_SLEEP_MIN: int = yt_video_scrape.FAILURE_SLEEP_MIN
-FAILURE_SLEEP_MAX: int = yt_video_scrape.FAILURE_SLEEP_MAX
+from tools import yt_video_scrape
+from tools.yt_video_scrape import (
+    FAILURE_SLEEP_MAX,
+    FAILURE_SLEEP_MIN,
+    _classify_yt_dlp_error as classify,
+    _next_failure_sleep as next_failure_sleep,
+)
 
 
 class TestRateLimitClassification(unittest.TestCase):

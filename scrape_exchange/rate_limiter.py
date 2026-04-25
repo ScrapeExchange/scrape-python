@@ -820,7 +820,7 @@ class _RedisBackend(_Backend[CallTypeT]):
             'worker_id': get_worker_id(),
         }
 
-    async def _ensure_scripts(self) -> None:
+    async def _ensure_lua_scripts(self) -> None:
         '''Load Lua scripts into Redis on first use.'''
         if self._scripts_loaded:
             return
@@ -859,7 +859,7 @@ class _RedisBackend(_Backend[CallTypeT]):
                 'Redis NOSCRIPT — reloading Lua scripts',
             )
             self._scripts_loaded = False
-            await self._ensure_scripts()
+            await self._ensure_lua_scripts()
             # Re-resolve SHA after reload
             if script is _LUA_TRY_ACQUIRE:
                 sha = self._try_acquire_sha
@@ -903,7 +903,7 @@ class _RedisBackend(_Backend[CallTypeT]):
         self, call_type: CallTypeT,
         proxy: str | None,
     ) -> tuple[float, float, float]:
-        await self._ensure_scripts()
+        await self._ensure_lua_scripts()
         cfg: _BucketConfig = (
             self._default_configs[call_type]
         )
@@ -923,17 +923,20 @@ class _RedisBackend(_Backend[CallTypeT]):
                     str(self._KEY_TTL),
                 )
             )
-        except Exception:
+        except Exception as e:
             _LOGGER.warning(
-                'Redis unavailable; allowing request',
-                exc_info=True,
+                'Redis unavailable; blocking request',
+                exc_info=True, extra={
+                    'proxy': proxy, 'call_type': call_type.value,
+                    'exc': str(e)
+                },
             )
             METRIC_REDIS_OPS.labels(
                 **self._metric_labels(
                     'try_acquire', 'error',
                 )
             ).inc()
-            return 0.0, 0.0, 0.0
+            raise
 
         METRIC_REDIS_OPS.labels(
             **self._metric_labels(
@@ -959,7 +962,7 @@ class _RedisBackend(_Backend[CallTypeT]):
         proxy: str | None,
         penalty_seconds: float,
     ) -> None:
-        await self._ensure_scripts()
+        await self._ensure_lua_scripts()
         cfg: _BucketConfig = (
             self._default_configs[call_type]
         )
