@@ -51,6 +51,7 @@ import re
 import sys
 
 from pathlib import Path
+from urllib.parse import unquote
 
 import aiofiles
 import brotli
@@ -204,8 +205,14 @@ def _resolve_handle_and_id(
         unresolved. Caller decides whether to drop the record.
     '''
 
+    # Some legacy archive files store the handle URL-encoded
+    # (e.g. ``%ce%95%ce%ba%ce%b4...`` for the Greek handle
+    # ``Εκδόσεις...``). ``unquote`` is a no-op on plain strings so
+    # it's safe to apply unconditionally; this only affects file
+    # values, not CreatorMap-fetched handles which are written in
+    # canonical form by the creator scraper.
     handle: str | None = _valid_handle(
-        raw_handle.lstrip('@') if raw_handle else None,
+        unquote(raw_handle.lstrip('@')) if raw_handle else None,
     )
     channel_id: str | None = _valid_channel_id(raw_channel_id)
 

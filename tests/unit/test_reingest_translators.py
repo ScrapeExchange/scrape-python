@@ -153,6 +153,50 @@ class TestTranslateChannelHandleLooksLikeHandle(unittest.TestCase):
         assert new is not None
         self.assertEqual(new['channel_handle'], 'a.b_c-d')
 
+    def test_accepts_url_encoded_handle_lowercase(self) -> None:
+        '''
+        Some legacy archive files store the handle URL-encoded.
+        The translator must percent-decode before validating, so a
+        record whose ``channel`` slot holds the percent-encoded
+        UTF-8 bytes of ``ΕκδόσειςΊτανος`` round-trips to that
+        Greek handle.
+        '''
+
+        encoded: str = (
+            '%ce%95%ce%ba%ce%b4%cf%8c%cf%83%ce%b5%ce%b9%cf%82'
+            '%ce%8a%cf%84%ce%b1%ce%bd%ce%bf%cf%82'
+        )
+        old: dict = {
+            'channel': encoded,
+            'channel_id': 'UCFGTVIo4sa1XFBKhKUlbNLA',
+        }
+        new: dict | None = translate_channel(old)
+        assert new is not None
+        self.assertEqual(
+            new['channel_handle'], 'ΕκδόσειςΊτανος',
+        )
+
+    def test_accepts_url_encoded_handle_uppercase(self) -> None:
+        '''
+        YouTube URLs themselves use uppercase percent-encoding
+        (e.g. ``%CE%95``). ``unquote`` is case-insensitive but
+        pinning the uppercase form prevents a future regression.
+        '''
+
+        encoded: str = (
+            '%CE%95%CE%BA%CE%B4%CF%8C%CF%83%CE%B5%CE%B9%CF%82'
+            '%CE%8A%CF%84%CE%B1%CE%BD%CE%BF%CF%82'
+        )
+        old: dict = {
+            'channel': encoded,
+            'channel_id': 'UCFGTVIo4sa1XFBKhKUlbNLA',
+        }
+        new: dict | None = translate_channel(old)
+        assert new is not None
+        self.assertEqual(
+            new['channel_handle'], 'ΕκδόσειςΊτανος',
+        )
+
     def test_accepts_unicode_handle(self) -> None:
         '''
         YouTube accepts handles in non-Latin scripts (Cyrillic,
