@@ -390,13 +390,16 @@ async def _read_brotli_json(path: Path) -> dict:
 
 async def _load_creator_maps(
     redis_dsn: str | None,
-) -> tuple[dict[str, str], dict[str, str]]:
+) -> tuple[dict[str, str], dict[str, str], RedisCreatorMap | None]:
     '''
     Load the YouTube CreatorMap from Redis once per worker and return
-    both the forward (channel_id → channel_handle) and reverse
-    (channel_handle → channel_id) lookup tables. The translators use
-    these to fill in records that carry only one of the two
-    identifiers.
+    the forward (channel_id → channel_handle) and reverse
+    (channel_handle → channel_id) lookup tables alongside the
+    :class:`RedisCreatorMap` instance itself. The translators use the
+    in-memory tables to fill in records that carry only one of the
+    two identifiers; the chunk loops use the instance to back-write
+    newly-discovered ``(channel_id, channel_handle)`` pairs that
+    weren't already in the map.
 
     With ~150k entries the full map fits comfortably in memory and a
     single ``HGETALL`` is dramatically cheaper than per-record
@@ -404,14 +407,15 @@ async def _load_creator_maps(
 
     :param redis_dsn: Redis DSN. When ``None`` or empty (e.g. when
         ``REDIS_DSN`` is unset in the environment), returns empty
-        maps and the translators behave as before.
+        maps and ``None`` for the instance; the translators then
+        behave as before and no back-write is attempted.
     '''
 
     if not redis_dsn:
         _LOGGER.info(
             'No redis_dsn configured; CreatorMap lookup disabled',
         )
-        return {}, {}
+        return {}, {}, None
 
     cm: RedisCreatorMap = RedisCreatorMap(
         redis_dsn=redis_dsn, platform='youtube',
@@ -426,7 +430,7 @@ async def _load_creator_maps(
         'Loaded creator_map for re-ingest',
         extra={'entries': len(id_to_handle)},
     )
-    return id_to_handle, handle_to_id
+    return id_to_handle, handle_to_id, cm
 
 
 # ---------------------------------------------------------------------------
@@ -510,6 +514,60 @@ def _record_drop_reason(
         counters['skipped_no_handle_or_id'] += 1
 
 
+async def _write_translated(
+    fm: AssetFileManagement,
+    filename: str,
+    data: dict,
+    counters: dict[str, int],
+    src_path_str: str,
+    label: str,
+) -> None:
+    '''
+    Write *data* to ``<out_dir>/<filename>`` via *fm* and bump the
+    appropriate counter. ``written`` on success, ``errors`` (with a
+    log line) when ``write_file`` raises. Pulling this branch out
+    of the per-record loop keeps the chunk functions under the
+    cognitive-complexity ceiling.
+    '''
+
+    try:
+        await fm.write_file(filename, data)
+    except Exception as exc:
+        _LOGGER.warning(
+            f'Failed to write translated {label} file',
+            exc=exc,
+            extra={'path': filename, 'src': src_path_str},
+        )
+        counters['errors'] += 1
+        return
+    counters['written'] += 1
+
+
+def _maybe_queue_creator_update(
+    cm: RedisCreatorMap | None,
+    pending: dict[str, str],
+    id_to_handle: dict[str, str],
+    handle_to_id: dict[str, str],
+    channel_id: str,
+    channel_handle: str,
+) -> None:
+    '''
+    When *channel_id* is not already in the in-memory CreatorMap
+    cache, stage it for back-write at chunk end and update the
+    in-memory cache so subsequent records in the same chunk don't
+    re-queue the same pair. No-op when *cm* is ``None`` (CreatorMap
+    lookup disabled) or the id is already present.
+    '''
+
+    if cm is None:
+        return
+    if channel_id in id_to_handle:
+        return
+    pending[channel_id] = channel_handle
+    id_to_handle[channel_id] = channel_handle
+    handle_to_id[channel_handle] = channel_id
+
+
 def _record_video_drop_reason(
     counters: dict[str, int],
     path_str: str,
@@ -555,16 +613,19 @@ async def _translate_channel_chunk(
     dry_run: bool,
     id_to_handle: dict[str, str],
     handle_to_id: dict[str, str],
+    cm: RedisCreatorMap | None,
 ) -> dict[str, int]:
     fm: AssetFileManagement = AssetFileManagement(out_dir)
     counters: dict[str, int] = {
         'read': 0, 'written': 0,
         'recovered_handle_from_map': 0,
         'recovered_id_from_map': 0,
+        'added_to_creator_map': 0,
         'skipped_already_migrated': 0,
         'skipped_invalid_channel_id': 0,
         'skipped_no_handle_or_id': 0, 'errors': 0,
     }
+    pending_creator_updates: dict[str, str] = {}
 
     for path_str in work_items:
         src: Path = Path(path_str)
@@ -599,6 +660,11 @@ async def _translate_channel_chunk(
             counters['recovered_handle_from_map'] += 1
         if not old.get('channel_id'):
             counters['recovered_id_from_map'] += 1
+        _maybe_queue_creator_update(
+            cm, pending_creator_updates,
+            id_to_handle, handle_to_id,
+            new['channel_id'], new['channel_handle'],
+        )
 
         filename: str = (
             f'{CHANNEL_FILE_PREFIX}{new["channel_handle"]}.json.br'
@@ -607,19 +673,13 @@ async def _translate_channel_chunk(
         if dry_run:
             counters['written'] += 1
             continue
+        await _write_translated(
+            fm, filename, new, counters, path_str, 'channel',
+        )
 
-        try:
-            await fm.write_file(filename, new)
-        except Exception as exc:
-            _LOGGER.warning(
-                'Failed to write translated channel file',
-                exc=exc,
-                extra={'path': filename, 'src': path_str},
-            )
-            counters['errors'] += 1
-            continue
-        counters['written'] += 1
-
+    counters['added_to_creator_map'] = len(pending_creator_updates)
+    if cm is not None and pending_creator_updates and not dry_run:
+        await cm.put_many(pending_creator_updates)
     return counters
 
 
@@ -629,17 +689,20 @@ async def _translate_video_chunk(
     dry_run: bool,
     id_to_handle: dict[str, str],
     handle_to_id: dict[str, str],
+    cm: RedisCreatorMap | None,
 ) -> dict[str, int]:
     fm: AssetFileManagement = AssetFileManagement(out_dir)
     counters: dict[str, int] = {
         'read': 0, 'written': 0,
         'recovered_handle_from_map': 0,
         'recovered_id_from_map': 0,
+        'added_to_creator_map': 0,
         'skipped_already_migrated': 0,
         'skipped_invalid_video_id': 0,
         'skipped_invalid_channel_id': 0,
         'skipped_no_handle_or_id': 0, 'errors': 0,
     }
+    pending_creator_updates: dict[str, str] = {}
 
     for path_str in work_items:
         src: Path = Path(path_str)
@@ -671,25 +734,24 @@ async def _translate_video_chunk(
             counters['recovered_handle_from_map'] += 1
         if not old.get('channel_id'):
             counters['recovered_id_from_map'] += 1
+        _maybe_queue_creator_update(
+            cm, pending_creator_updates,
+            id_to_handle, handle_to_id,
+            new['channel_id'], new['channel_handle'],
+        )
 
         filename: str = src.name
 
         if dry_run:
             counters['written'] += 1
             continue
+        await _write_translated(
+            fm, filename, new, counters, path_str, 'video',
+        )
 
-        try:
-            await fm.write_file(filename, new)
-        except Exception as exc:
-            _LOGGER.warning(
-                'Failed to write translated video file',
-                exc=exc,
-                extra={'path': filename, 'src': path_str},
-            )
-            counters['errors'] += 1
-            continue
-        counters['written'] += 1
-
+    counters['added_to_creator_map'] = len(pending_creator_updates)
+    if cm is not None and pending_creator_updates and not dry_run:
+        await cm.put_many(pending_creator_updates)
     return counters
 
 
@@ -722,10 +784,13 @@ async def _run_channel_worker(
 ) -> dict[str, int]:
     id_to_handle: dict[str, str]
     handle_to_id: dict[str, str]
-    id_to_handle, handle_to_id = await _load_creator_maps(redis_dsn)
+    cm: RedisCreatorMap | None
+    id_to_handle, handle_to_id, cm = (
+        await _load_creator_maps(redis_dsn)
+    )
     return await _translate_channel_chunk(
         work_items, out_dir, dry_run,
-        id_to_handle, handle_to_id,
+        id_to_handle, handle_to_id, cm,
     )
 
 
@@ -737,10 +802,13 @@ async def _run_video_worker(
 ) -> dict[str, int]:
     id_to_handle: dict[str, str]
     handle_to_id: dict[str, str]
-    id_to_handle, handle_to_id = await _load_creator_maps(redis_dsn)
+    cm: RedisCreatorMap | None
+    id_to_handle, handle_to_id, cm = (
+        await _load_creator_maps(redis_dsn)
+    )
     return await _translate_video_chunk(
         work_items, out_dir, dry_run,
-        id_to_handle, handle_to_id,
+        id_to_handle, handle_to_id, cm,
     )
 
 
@@ -813,7 +881,7 @@ def _enumerate_archive(root: Path, prefix: str) -> list[str]:
     '''
     return [
         str(p) for p in root.rglob(
-            '*.json.br', recurse_symlinks=True,
+            f'{prefix}*.json.br', recurse_symlinks=True,
         ) if p.is_file()
     ]
 
@@ -1010,6 +1078,8 @@ def _run(settings: ReingestSettings) -> int:
         f'{channel_counters.get("recovered_handle_from_map", 0)} '
         f'recovered_id_from_map='
         f'{channel_counters.get("recovered_id_from_map", 0)} '
+        f'added_to_creator_map='
+        f'{channel_counters.get("added_to_creator_map", 0)} '
         f'skipped_already_migrated='
         f'{channel_counters.get("skipped_already_migrated", 0)} '
         f'skipped_invalid_channel_id='
@@ -1026,6 +1096,8 @@ def _run(settings: ReingestSettings) -> int:
             f'{video_counters.get("recovered_handle_from_map", 0)} '
             f'recovered_id_from_map='
             f'{video_counters.get("recovered_id_from_map", 0)} '
+            f'added_to_creator_map='
+            f'{video_counters.get("added_to_creator_map", 0)} '
             f'skipped_already_migrated='
             f'{video_counters.get("skipped_already_migrated", 0)} '
             f'skipped_invalid_video_id='

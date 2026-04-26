@@ -493,7 +493,10 @@ class TestTranslateVideoCreatorMapRecovery(unittest.TestCase):
     '''
 
     def test_fills_handle_from_id_when_handle_missing(self) -> None:
-        old: dict = {'video_id': _TEST_VIDEO_ID, 'channel_id': _TEST_CHANNEL_ID}
+        old: dict = {
+            'video_id': _TEST_VIDEO_ID,
+            'channel_id': _TEST_CHANNEL_ID,
+        }
         self.assertIsNone(translate_video(old))
         id_to_handle: dict[str, str] = {
             _TEST_CHANNEL_ID: 'XChannel',
@@ -528,7 +531,10 @@ class TestTranslateVideoCreatorMapRecovery(unittest.TestCase):
         self.assertEqual(new['channel_id'], _TEST_CHANNEL_ID)
 
     def test_drops_when_mapped_handle_invalid(self) -> None:
-        old: dict = {'video_id': _TEST_VIDEO_ID, 'channel_id': _TEST_CHANNEL_ID}
+        old: dict = {
+            'video_id': _TEST_VIDEO_ID,
+            'channel_id': _TEST_CHANNEL_ID,
+        }
         id_to_handle: dict[str, str] = {
             _TEST_CHANNEL_ID: 'has space',
         }
@@ -766,6 +772,13 @@ class TestEnumerateArchive(unittest.TestCase):
         )
 
     def test_filters_by_prefix(self) -> None:
+        '''
+        ``_enumerate_archive`` matches ``<prefix>*.json.br`` so the
+        channel dispatch only sees ``channel-*.json.br`` and the
+        video dispatch only sees ``video-*.json.br``, even when the
+        two record types share an archive root.
+        '''
+
         with tempfile.TemporaryDirectory() as d:
             root: Path = Path(d)
             (root / 'channel-a.json.br').write_text('x')
