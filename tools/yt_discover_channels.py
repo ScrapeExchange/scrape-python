@@ -573,14 +573,28 @@ async def update_creator_map(
         )
 
 
+async def _append_jsonl(out_path: str, payload: dict) -> None:
+    '''
+    Append *payload* as a single JSONL record to *out_path*. The
+    file is opened in append mode for this one write and closed
+    again immediately so a crash leaves a consistent, flushed file
+    behind and concurrent readers always see whole records.
+    '''
+
+    line: str = orjson.dumps(payload).decode('utf-8') + '\n'
+    async with aiofiles.open(out_path, 'a') as fd:
+        await fd.write(line)
+
+
 async def record_discovered(
     channel: str, subs: int | None, source: str,
     discovered: dict[str, int | None],
-    out_fd,
+    out_path: str,
     channel_id: str | None = None,
     creator_map: CreatorMap | None = None,
 ) -> None:
-    '''Update in-memory dict and append one JSONL record to out_fd.
+    '''Update in-memory dict and append one JSONL record to
+    *out_path*.
 
     When both *channel_id* and *creator_map* are supplied, the
     shared creator_map (file- or Redis-backed) is also updated
@@ -594,8 +608,7 @@ async def record_discovered(
     if channel_id:
         payload['channel_id'] = channel_id
     try:
-        await out_fd.write(orjson.dumps(payload).decode('utf-8') + '\n')
-        await out_fd.flush()
+        await _append_jsonl(out_path, payload)
     except OSError as exc:
         _LOGGER.warning(
             'Failed to persist discovered record',
@@ -608,15 +621,16 @@ async def record_discovered(
 
 
 async def record_failed(channel: str, info: dict,
-                        failed: dict[str, dict], out_fd) -> None:
-    '''Update in-memory dict and append one JSONL record to out_fd.'''
+                        failed: dict[str, dict],
+                        out_path: str) -> None:
+    '''Update in-memory dict and append one JSONL record to
+    *out_path*.'''
 
     payload: dict = {'channel': channel}
     payload.update(info)
     failed[channel] = payload
     try:
-        await out_fd.write(orjson.dumps(payload).decode('utf-8') + '\n')
-        await out_fd.flush()
+        await _append_jsonl(out_path, payload)
     except OSError as exc:
         _LOGGER.warning(
             'Failed to persist failed record',
@@ -805,7 +819,7 @@ async def _enqueue_links(
     failed: dict[str, dict],
     in_queue: set[str],
     to_scrape: deque[str],
-    discovered_fd,
+    discovered_path: str,
 ) -> None:
     '''Record discovered links and enqueue new ones.'''
 
@@ -820,7 +834,7 @@ async def _enqueue_links(
             continue
         await record_discovered(
             link_name, link_subs, 'link',
-            discovered, discovered_fd,
+            discovered, discovered_path,
         )
         if (link_name not in fully_scraped
                 and link_name not in failed
@@ -866,8 +880,8 @@ async def discover(client: AsyncYouTubeClient,
                    discovered: dict[str, int | None],
                    fully_scraped: set[str],
                    failed: dict[str, dict],
-                   discovered_fd,
-                   failed_fd,
+                   discovered_path: str,
+                   failed_path: str,
                    min_subs: int,
                    proxies: list[str] | None = None,
                    ) -> None:
@@ -914,7 +928,7 @@ async def discover(client: AsyncYouTubeClient,
                         'reason': str(exc),
                         'status_code': None,
                     },
-                    failed, failed_fd,
+                    failed, failed_path,
                 )
             continue
 
@@ -925,7 +939,7 @@ async def discover(client: AsyncYouTubeClient,
                     or channel.subs >= min_subs):
                 await record_discovered(
                     target, channel.subs, 'scrape',
-                    discovered, discovered_fd,
+                    discovered, discovered_path,
                     channel_id=channel.channel_id,
                     creator_map=creator_map,
                 )
@@ -941,7 +955,7 @@ async def discover(client: AsyncYouTubeClient,
         await _enqueue_links(
             channel, min_subs, known_channels,
             discovered, fully_scraped, failed,
-            in_queue, to_scrape, discovered_fd,
+            in_queue, to_scrape, discovered_path,
         )
 
     _LOGGER.info('BFS queue empty, discovery complete')
@@ -1097,24 +1111,20 @@ async def main() -> None:
 
     disc_channels: str = settings.discovered_channels
     fail_channels: str = settings.failed_channels
-    async with (
-        aiofiles.open(disc_channels, 'a') as discovered_fd,
-        aiofiles.open(fail_channels, 'a') as failed_fd,
-    ):
-        async with AsyncYouTubeClient() as client:
-            proxies: list[str] | None = (
-                settings.proxies.split(',')
-                if settings.proxies
-                else None
-            )
-            await discover(
-                client, creator_map,
-                known_channels,
-                discovered, fully_scraped, failed,
-                discovered_fd, failed_fd,
-                settings.min_subs,
-                proxies=proxies,
-            )
+    async with AsyncYouTubeClient() as client:
+        proxies: list[str] | None = (
+            settings.proxies.split(',')
+            if settings.proxies
+            else None
+        )
+        await discover(
+            client, creator_map,
+            known_channels,
+            discovered, fully_scraped, failed,
+            disc_channels, fail_channels,
+            settings.min_subs,
+            proxies=proxies,
+        )
 
 
 if __name__ == '__main__':
