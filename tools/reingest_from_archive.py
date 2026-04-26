@@ -622,6 +622,128 @@ def _record_video_drop_reason(
     )
 
 
+_VIDEO_UNKNOWN_PREFIX: str = 'video-unknown-'
+
+
+def _unwrap_unknown_video(parsed: dict) -> dict:
+    '''
+    Additional unwrap step for ``video-unknown-*`` archive files:
+    if the parsed payload still has a ``data`` key whose value is a
+    dict, take that as the payload. Distinct from
+    :func:`_unwrap_server_envelope` because it doesn't require any
+    envelope marker keys — ``video-unknown-`` files are produced by
+    pipelines that may wrap the scraped payload in ``{"data": {…}}``
+    without the platform/source metadata.
+    '''
+
+    inner: object = parsed.get('data')
+    if isinstance(inner, dict):
+        return inner
+    return parsed
+
+
+def _video_target_prefix(payload: dict) -> str:
+    '''
+    Decide the output prefix for a re-ingested ``video-unknown-*``
+    file based on payload content. Presence of a non-empty
+    ``formats`` list (the yt-dlp signature) means we have full DLP
+    data and the file should be written as ``video-dlp-``;
+    otherwise it's a minimal record and the prefix is ``video-min-``.
+    '''
+
+    formats: object = payload.get('formats')
+    if isinstance(formats, list) and formats:
+        return 'video-dlp-'
+    return 'video-min-'
+
+
+def _video_dest_filename(payload: dict) -> str:
+    '''
+    Output filename for a migrated video record. Always
+    ``{video-dlp-|video-min-}{video_id}.json.br`` regardless of
+    what the source filename looked like — the prefix comes from
+    payload content (presence of a non-empty ``formats`` list)
+    and the identifier is the validated ``video_id``.
+
+    This collapses the legacy ``video-{channel_id}-{video_id}``
+    naming and the ``video-unknown-`` shape into the canonical
+    ``{prefix}{video_id}`` form that ``AssetFileManagement``
+    expects.
+    '''
+
+    return f'{_video_target_prefix(payload)}{payload["video_id"]}.json.br'
+
+
+def _extract_video_id_from_name(src_name: str) -> str | None:
+    '''
+    Best-effort extraction of the video_id from a source filename.
+    Used by :func:`_video_already_migrated` to decide whether the
+    canonical ``{prefix}{video_id}.json.br`` destination already
+    exists *before* opening the source file.
+
+    Takes the last ``-``-separated segment of the basename (so it
+    works for ``video-X-Y``, ``video-min-Y``, ``video-dlp-Y``, and
+    ``video-unknown-Y``) and only returns it when it matches
+    ``_VIDEO_ID_PATTERN`` — a malformed candidate yields ``None``
+    so the caller falls back to a conservative source-name check.
+    '''
+
+    if not src_name.endswith('.json.br'):
+        return None
+    stem: str = src_name[:-len('.json.br')]
+    if '-' not in stem:
+        return None
+    candidate: str = stem.rsplit('-', 1)[1]
+    return candidate if _VIDEO_ID_PATTERN.match(candidate) else None
+
+
+async def _read_video_payload(
+    src: Path,
+    is_unknown: bool,
+    counters: dict[str, int],
+) -> dict | None:
+    '''
+    Read and pre-unwrap a video archive file. Returns the payload
+    ready for ``translate_video``, or ``None`` when the file
+    couldn't be read (caller should ``continue``). Bumps
+    ``errors`` on failure. Pulled out of the chunk loop to keep
+    its cognitive complexity below the linter ceiling.
+    '''
+
+    try:
+        payload: dict = await _read_brotli_json(src)
+    except Exception as exc:
+        _LOGGER.warning(
+            'Failed to read video archive file',
+            exc=exc, extra={'path': str(src)},
+        )
+        counters['errors'] += 1
+        return None
+    if is_unknown:
+        payload = _unwrap_unknown_video(payload)
+    return payload
+
+
+def _video_already_migrated(out_dir: str, src_name: str) -> bool:
+    '''
+    Check whether the canonical migrated counterpart of *src_name*
+    already exists in *out_dir* (or its ``uploaded/`` subdir).
+    The destination is always
+    ``{video-dlp-|video-min-}{video_id}.json.br``, but the prefix
+    can't be known until the file is read, so we check both
+    candidates. Falls back to a source-name check when the
+    video_id can't be derived from the filename.
+    '''
+
+    candidate: str | None = _extract_video_id_from_name(src_name)
+    if candidate is None:
+        return _already_migrated(out_dir, src_name)
+    return (
+        _already_migrated(out_dir, f'video-dlp-{candidate}.json.br')
+        or _already_migrated(out_dir, f'video-min-{candidate}.json.br')
+    )
+
+
 def _was_video_file_handle_invalid(old: dict) -> bool:
     raw: str = (
         old.get('channel_handle')
@@ -731,21 +853,18 @@ async def _translate_video_chunk(
 
     for path_str in work_items:
         src: Path = Path(path_str)
+        is_unknown: bool = src.name.startswith(_VIDEO_UNKNOWN_PREFIX)
 
-        if _already_migrated(out_dir, src.name):
+        if _video_already_migrated(out_dir, src.name):
             counters['skipped_already_migrated'] += 1
             continue
 
         counters['read'] += 1
 
-        try:
-            old: dict = await _read_brotli_json(src)
-        except Exception as exc:
-            _LOGGER.warning(
-                'Failed to read video archive file',
-                exc=exc, extra={'path': path_str},
-            )
-            counters['errors'] += 1
+        old: dict | None = await _read_video_payload(
+            src, is_unknown, counters,
+        )
+        if old is None:
             continue
 
         new: dict | None = translate_video(
@@ -765,7 +884,7 @@ async def _translate_video_chunk(
             new['channel_id'], new['channel_handle'],
         )
 
-        filename: str = src.name
+        filename: str = _video_dest_filename(new)
 
         if dry_run:
             counters['written'] += 1

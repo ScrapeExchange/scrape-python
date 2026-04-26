@@ -14,6 +14,9 @@ from pathlib import Path
 from tools.reingest_from_archive import (
     _enumerate_archive,
     _unwrap_server_envelope,
+    _unwrap_unknown_video,
+    _video_dest_filename,
+    _video_target_prefix,
     translate_channel,
     translate_video,
 )
@@ -937,6 +940,126 @@ class TestEnumerateArchive(unittest.TestCase):
             found: list[str] = _enumerate_archive(root, 'channel-')
         self.assertEqual(len(found), 1)
         self.assertTrue(found[0].endswith('channel-a.json.br'))
+
+
+class TestVideoUnknownHandling(unittest.TestCase):
+    '''
+    ``video-unknown-*`` archive files get an additional unwrap (the
+    payload may be wrapped as ``{"data": {…}}`` without server
+    envelope markers) and their output filename uses ``video-dlp-``
+    or ``video-min-`` based on whether the payload carries a
+    non-empty ``formats`` list.
+    '''
+
+    def test_unwrap_takes_inner_data_when_dict(self) -> None:
+        inner: dict = {'video_id': _TEST_VIDEO_ID}
+        wrapped: dict = {'data': inner, 'unrelated': 1}
+        self.assertIs(_unwrap_unknown_video(wrapped), inner)
+
+    def test_unwrap_passes_through_when_no_data_key(self) -> None:
+        plain: dict = {'video_id': _TEST_VIDEO_ID}
+        self.assertIs(_unwrap_unknown_video(plain), plain)
+
+    def test_unwrap_passes_through_when_data_not_dict(self) -> None:
+        not_a_dict: dict = {'data': 'string-not-dict'}
+        self.assertIs(_unwrap_unknown_video(not_a_dict), not_a_dict)
+
+    def test_target_prefix_dlp_when_formats_non_empty(self) -> None:
+        payload: dict = {'formats': [{'url': 'https://x'}]}
+        self.assertEqual(_video_target_prefix(payload), 'video-dlp-')
+
+    def test_target_prefix_min_when_formats_empty(self) -> None:
+        payload: dict = {'formats': []}
+        self.assertEqual(_video_target_prefix(payload), 'video-min-')
+
+    def test_target_prefix_min_when_formats_missing(self) -> None:
+        payload: dict = {'video_id': _TEST_VIDEO_ID}
+        self.assertEqual(_video_target_prefix(payload), 'video-min-')
+
+    def test_target_prefix_min_when_formats_not_list(self) -> None:
+        '''Defensive: a stray non-list value in ``formats`` falls
+        back to the minimal prefix rather than crashing.'''
+        payload: dict = {'formats': 'something'}
+        self.assertEqual(_video_target_prefix(payload), 'video-min-')
+
+    def test_dest_filename_dlp_when_formats_present(self) -> None:
+        payload: dict = {
+            'video_id': _TEST_VIDEO_ID,
+            'formats': [{'url': 'https://x'}],
+        }
+        self.assertEqual(
+            _video_dest_filename(payload),
+            f'video-dlp-{_TEST_VIDEO_ID}.json.br',
+        )
+
+    def test_dest_filename_min_when_no_formats(self) -> None:
+        payload: dict = {'video_id': _TEST_VIDEO_ID}
+        self.assertEqual(
+            _video_dest_filename(payload),
+            f'video-min-{_TEST_VIDEO_ID}.json.br',
+        )
+
+    def test_dest_filename_uses_payload_id_not_source_name(self) -> None:
+        '''
+        Output filename derives entirely from payload, regardless
+        of what the source filename looked like — so a legacy
+        ``video-{channel_id}-{video_id}`` source still produces
+        the canonical ``{prefix}{video_id}.json.br`` form.
+        '''
+
+        payload: dict = {
+            'video_id': _TEST_VIDEO_ID,
+            'formats': [{'url': 'https://x'}],
+        }
+        self.assertEqual(
+            _video_dest_filename(payload),
+            f'video-dlp-{_TEST_VIDEO_ID}.json.br',
+        )
+
+    def test_envelope_keys_do_not_leak_into_output(self) -> None:
+        '''
+        For a ``video-unknown-`` file with a ``.data`` payload,
+        only fields from inside ``.data`` reach the written record.
+        Outer envelope keys must be dropped end-to-end.
+        '''
+
+        parsed: dict = {
+            'envelope_field_a': 'should-not-leak',
+            'envelope_field_b': 12345,
+            'data': {
+                'video_id': _TEST_VIDEO_ID,
+                'channel_id': _TEST_CHANNEL_ID,
+                'channel_handle': 'XChannel',
+                'title': 'Some Title',
+                'formats': [{'url': 'https://x'}],
+            },
+        }
+        old: dict = _unwrap_unknown_video(parsed)
+        new: dict | None = translate_video(old)
+        assert new is not None
+        self.assertNotIn('envelope_field_a', new)
+        self.assertNotIn('envelope_field_b', new)
+        self.assertNotIn('data', new)
+        self.assertEqual(new['video_id'], _TEST_VIDEO_ID)
+        self.assertEqual(new['title'], 'Some Title')
+
+    def test_dest_filename_downgrades_dlp_source_when_payload_lacks_formats(
+        self,
+    ) -> None:
+        '''
+        The destination derives from payload, not source name. So
+        a ``video-dlp-`` source whose payload has no formats
+        downgrades to ``video-min-`` on output. Trust the payload
+        over the source filename.
+        '''
+
+        payload: dict = {
+            'video_id': _TEST_VIDEO_ID, 'formats': [],
+        }
+        self.assertEqual(
+            _video_dest_filename(payload),
+            f'video-min-{_TEST_VIDEO_ID}.json.br',
+        )
 
 
 if __name__ == '__main__':
