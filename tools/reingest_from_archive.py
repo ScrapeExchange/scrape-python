@@ -57,6 +57,7 @@ import brotli
 import orjson
 from pydantic import AliasChoices, Field
 
+from scrape_exchange.creator_map import RedisCreatorMap
 from scrape_exchange.file_management import (
     AssetFileManagement,
     CHANNEL_FILE_PREFIX,
@@ -73,6 +74,23 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 # (whitespace, slashes, &, etc.) means the legacy slot held a display
 # name or junk rather than an actual handle, and the record is dropped.
 _HANDLE_PATTERN: re.Pattern[str] = re.compile(r'^[A-Za-z0-9_.\-]{3,30}$')
+
+# YouTube channel IDs are always ``UC`` followed by 22 characters from
+# the URL-safe base64 alphabet. Mirrors
+# ``YouTubeChannel.CHANNEL_ID_REGEX_MATCH``. Records carrying a
+# malformed channel_id (e.g. truncated, a display name, or a video
+# id) are dropped — re-ingesting them would pollute the data dir
+# with files keyed by junk.
+_CHANNEL_ID_PATTERN: re.Pattern[str] = re.compile(
+    r'^UC[A-Z0-9_-]{22}$', re.IGNORECASE,
+)
+
+# YouTube video IDs are exactly 11 characters from the URL-safe
+# base64 alphabet. A record with a missing or malformed video_id
+# can't be uniquely keyed and is dropped.
+_VIDEO_ID_PATTERN: re.Pattern[str] = re.compile(
+    r'^[A-Za-z0-9_-]{11}$',
+)
 
 
 class ReingestSettings(YouTubeScraperSettings):
@@ -126,7 +144,80 @@ class ReingestSettings(YouTubeScraperSettings):
 # ---------------------------------------------------------------------------
 
 
-def translate_channel(old: dict) -> dict | None:
+def _valid_handle(value: str | None) -> str | None:
+    '''Return *value* when it matches ``_HANDLE_PATTERN``, else None.'''
+
+    if not value:
+        return None
+    return value if _HANDLE_PATTERN.match(value) else None
+
+
+def _valid_channel_id(value: str | None) -> str | None:
+    '''Return *value* when it matches ``_CHANNEL_ID_PATTERN``, else
+    None.'''
+
+    if not value:
+        return None
+    return value if _CHANNEL_ID_PATTERN.match(value) else None
+
+
+def _valid_video_id(value: str | None) -> str | None:
+    '''Return *value* when it matches ``_VIDEO_ID_PATTERN``, else
+    None.'''
+
+    if not value:
+        return None
+    return value if _VIDEO_ID_PATTERN.match(value) else None
+
+
+def _resolve_handle_and_id(
+    raw_handle: str | None,
+    raw_channel_id: str | None,
+    id_to_handle: dict[str, str],
+    handle_to_id: dict[str, str],
+) -> tuple[str | None, str | None]:
+    '''
+    Resolve a ``(channel_handle, channel_id)`` pair from the raw
+    file values, falling back to the CreatorMap when either side
+    is missing or the in-file handle fails ``_HANDLE_PATTERN``.
+
+    Resolution rules:
+
+    * The candidate handle is taken from *raw_handle*, ``@``-stripped,
+      and accepted only if it matches ``_HANDLE_PATTERN``. A junk
+      in-file handle is treated as missing so the CreatorMap can
+      override it (per project policy: when both are present and the
+      file handle is junk, the map wins).
+    * When the handle is missing/junk and a *raw_channel_id* is
+      present, look up the handle via *id_to_handle*. The mapped
+      handle is also held to ``_HANDLE_PATTERN``: a non-conforming
+      mapped handle is rejected and the pair stays unresolved.
+    * When *raw_channel_id* is missing and a valid handle is in hand,
+      look up the channel_id via *handle_to_id*.
+
+    :returns: ``(handle, channel_id)`` with either side ``None`` when
+        unresolved. Caller decides whether to drop the record.
+    '''
+
+    handle: str | None = _valid_handle(
+        raw_handle.lstrip('@') if raw_handle else None,
+    )
+    channel_id: str | None = _valid_channel_id(raw_channel_id)
+
+    if not handle and channel_id:
+        handle = _valid_handle(id_to_handle.get(channel_id))
+
+    if not channel_id and handle:
+        channel_id = _valid_channel_id(handle_to_id.get(handle))
+
+    return handle, channel_id
+
+
+def translate_channel(
+    old: dict,
+    id_to_handle: dict[str, str] | None = None,
+    handle_to_id: dict[str, str] | None = None,
+) -> dict | None:
     '''
     Translate an old-format channel record to the new schema.
 
@@ -142,9 +233,13 @@ def translate_channel(old: dict) -> dict | None:
     * The resolved handle must match the YouTube handle format
       (3–30 chars, ``[A-Za-z0-9_.-]``); anything containing
       whitespace or other URL-incompatible characters means the
-      slot held a display name or junk and the record is dropped.
-    * ``channel_id`` must be present; without both ``channel_handle``
-      and ``channel_id`` the record is dropped.
+      slot held a display name or junk and the record is dropped
+      unless the CreatorMap can supply a valid handle for the
+      ``channel_id``.
+    * When either ``channel_handle`` or ``channel_id`` is missing,
+      the *id_to_handle* / *handle_to_id* maps are consulted to fill
+      the gap. Pass empty maps (the default) to disable lookup and
+      fall back to file-only resolution.
     * ``title`` (the channel display name) passes through unchanged.
     * The obsolete ``canonical_handle`` slot is dropped because the
       collapsed ``channel_handle`` already carries it.
@@ -156,22 +251,26 @@ def translate_channel(old: dict) -> dict | None:
         should skip the record and log).
     '''
 
-    handle: str | None = (
+    id_to_handle = id_to_handle or {}
+    handle_to_id = handle_to_id or {}
+
+    raw_handle: str | None = (
         old.get('canonical_handle')
         or old.get('channel')
         or old.get('channel_name')
     )
-    if not handle:
-        return None
-    if not old.get('channel_id'):
-        return None
-
-    handle = handle.lstrip('@')
-    if not _HANDLE_PATTERN.match(handle):
+    handle: str | None
+    channel_id: str | None
+    handle, channel_id = _resolve_handle_and_id(
+        raw_handle, old.get('channel_id'),
+        id_to_handle, handle_to_id,
+    )
+    if not handle or not channel_id:
         return None
 
     new: dict = dict(old)
     new['channel_handle'] = handle
+    new['channel_id'] = channel_id
     # ``title`` now also lives at the same key it always has, so the
     # value already passes through via ``dict(old)`` above. Just drop
     # the legacy handle slots.
@@ -190,7 +289,11 @@ def translate_channel(old: dict) -> dict | None:
     return new
 
 
-def translate_video(old: dict) -> dict | None:
+def translate_video(
+    old: dict,
+    id_to_handle: dict[str, str] | None = None,
+    handle_to_id: dict[str, str] | None = None,
+) -> dict | None:
     '''
     Translate an old-format video record to the new schema:
 
@@ -199,11 +302,19 @@ def translate_video(old: dict) -> dict | None:
       assigns each video a single category; the list-shaped slot was
       over-modelled. The first list entry is taken; an empty list
       becomes ``None``.
+    * The resolved handle must match ``_HANDLE_PATTERN``. When
+      either ``channel_handle`` or ``channel_id`` is missing or the
+      handle is junk, the *id_to_handle* / *handle_to_id* maps
+      (typically the YouTube CreatorMap) are consulted to fill the
+      gap.
 
     :returns: The translated dict, or ``None`` when either
         ``channel_handle`` or ``channel_id`` is missing — we only
         re-ingest videos whose owning channel is fully identified.
     '''
+
+    id_to_handle = id_to_handle or {}
+    handle_to_id = handle_to_id or {}
 
     new: dict = dict(old)
     if 'channel_name' in new:
@@ -213,8 +324,22 @@ def translate_video(old: dict) -> dict | None:
         new['category'] = (
             cats[0] if isinstance(cats, list) and cats else None
         )
-    if not new.get('channel_handle') or not new.get('channel_id'):
+
+    video_id: str | None = _valid_video_id(new.get('video_id'))
+    if not video_id:
         return None
+
+    handle: str | None
+    channel_id: str | None
+    handle, channel_id = _resolve_handle_and_id(
+        new.get('channel_handle'), new.get('channel_id'),
+        id_to_handle, handle_to_id,
+    )
+    if not handle or not channel_id:
+        return None
+    new['video_id'] = video_id
+    new['channel_handle'] = handle
+    new['channel_id'] = channel_id
     return new
 
 
@@ -229,22 +354,191 @@ async def _read_brotli_json(path: Path) -> dict:
     return orjson.loads(brotli.decompress(data))
 
 
+async def _load_creator_maps(
+    redis_dsn: str | None,
+) -> tuple[dict[str, str], dict[str, str]]:
+    '''
+    Load the YouTube CreatorMap from Redis once per worker and return
+    both the forward (channel_id → channel_handle) and reverse
+    (channel_handle → channel_id) lookup tables. The translators use
+    these to fill in records that carry only one of the two
+    identifiers.
+
+    With ~150k entries the full map fits comfortably in memory and a
+    single ``HGETALL`` is dramatically cheaper than per-record
+    round-trips against millions of archive files.
+
+    :param redis_dsn: Redis DSN. When ``None`` or empty (e.g. when
+        ``REDIS_DSN`` is unset in the environment), returns empty
+        maps and the translators behave as before.
+    '''
+
+    if not redis_dsn:
+        _LOGGER.info(
+            'No redis_dsn configured; CreatorMap lookup disabled',
+        )
+        return {}, {}
+
+    cm: RedisCreatorMap = RedisCreatorMap(
+        redis_dsn=redis_dsn, platform='youtube',
+    )
+    id_to_handle: dict[str, str] = await cm.get_all()
+    # Reverse map. Handles are unique to a channel in practice; on
+    # the rare collision last-wins is acceptable for re-ingest.
+    handle_to_id: dict[str, str] = {
+        handle: cid for cid, handle in id_to_handle.items()
+    }
+    _LOGGER.info(
+        'Loaded creator_map for re-ingest',
+        extra={'entries': len(id_to_handle)},
+    )
+    return id_to_handle, handle_to_id
+
+
 # ---------------------------------------------------------------------------
 # Per-chunk translators (run inside worker processes)
 # ---------------------------------------------------------------------------
 
 
+def _has_non_empty_file(path: Path) -> bool:
+    '''
+    True when *path* exists, is a regular file, and has non-zero
+    length. Used by the chunk loops to skip archive entries whose
+    migrated counterpart already lives in the data directory.
+    '''
+
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _already_migrated(out_dir: str, filename: str) -> bool:
+    '''
+    True when *filename* already exists under *out_dir* with
+    non-zero length, either at the top level (pending upload) or
+    under ``uploaded/`` (already shipped). Either case means the
+    re-ingest pipeline has handled this record before, so the
+    archive file can be skipped without re-reading or re-writing.
+    '''
+
+    base: Path = Path(out_dir) / filename
+    uploaded: Path = Path(out_dir) / 'uploaded' / filename
+    return _has_non_empty_file(base) or _has_non_empty_file(uploaded)
+
+
+def _was_file_handle_invalid(old: dict) -> bool:
+    '''
+    True when the in-file handle (canonical_handle / channel /
+    channel_name) was missing or failed ``_HANDLE_PATTERN``. Used to
+    increment the ``recovered_handle_from_map`` counter when the
+    translator nevertheless produced a record.
+    '''
+
+    raw: str = (
+        old.get('canonical_handle')
+        or old.get('channel')
+        or old.get('channel_name')
+        or ''
+    )
+    handle: str = raw.lstrip('@') if raw else ''
+    return not bool(_HANDLE_PATTERN.match(handle))
+
+
+def _record_drop_reason(
+    counters: dict[str, int],
+    path_str: str,
+    raw_channel_id: str | None,
+    label: str,
+) -> None:
+    '''
+    Bump the appropriate ``skipped_*`` counter when the translator
+    returned ``None``. ``invalid_channel_id`` wins when the file
+    actually had a channel_id that didn't match the YouTube
+    UC-prefix pattern; otherwise the record is missing one of the
+    required identifiers.
+    '''
+
+    if raw_channel_id and not _CHANNEL_ID_PATTERN.match(raw_channel_id):
+        _LOGGER.info(
+            f'{label} archive file has invalid channel_id, skipping',
+            extra={
+                'path': path_str, 'channel_id': raw_channel_id,
+            },
+        )
+        counters['skipped_invalid_channel_id'] += 1
+    else:
+        _LOGGER.info(
+            f'{label} archive file missing channel_handle or '
+            'channel_id, skipping',
+            extra={'path': path_str},
+        )
+        counters['skipped_no_handle_or_id'] += 1
+
+
+def _record_video_drop_reason(
+    counters: dict[str, int],
+    path_str: str,
+    old: dict,
+) -> None:
+    '''
+    Video drop-reason precedence: video_id problems win over
+    channel_handle/channel_id problems, since a record without a
+    valid video_id can't be uniquely keyed at all. Missing and
+    malformed video_ids both increment the same counter — both mean
+    "no usable video_id".
+    '''
+
+    raw_video_id: str | None = old.get('video_id')
+    if not _valid_video_id(raw_video_id):
+        _LOGGER.info(
+            'Video archive file has missing or invalid video_id, '
+            'skipping',
+            extra={
+                'path': path_str, 'video_id': raw_video_id,
+            },
+        )
+        counters['skipped_invalid_video_id'] += 1
+        return
+    _record_drop_reason(
+        counters, path_str, old.get('channel_id'), 'Video',
+    )
+
+
+def _was_video_file_handle_invalid(old: dict) -> bool:
+    raw: str = (
+        old.get('channel_handle')
+        or old.get('channel_name')
+        or ''
+    )
+    handle: str = raw.lstrip('@') if raw else ''
+    return not bool(_HANDLE_PATTERN.match(handle))
+
+
 async def _translate_channel_chunk(
-    work_items: list[str], out_dir: str, dry_run: bool,
+    work_items: list[str],
+    out_dir: str,
+    dry_run: bool,
+    id_to_handle: dict[str, str],
+    handle_to_id: dict[str, str],
 ) -> dict[str, int]:
     fm: AssetFileManagement = AssetFileManagement(out_dir)
     counters: dict[str, int] = {
         'read': 0, 'written': 0,
+        'recovered_handle_from_map': 0,
+        'recovered_id_from_map': 0,
+        'skipped_already_migrated': 0,
+        'skipped_invalid_channel_id': 0,
         'skipped_no_handle_or_id': 0, 'errors': 0,
     }
 
     for path_str in work_items:
         src: Path = Path(path_str)
+
+        if _already_migrated(out_dir, src.name):
+            counters['skipped_already_migrated'] += 1
+            continue
+
         counters['read'] += 1
 
         try:
@@ -257,15 +551,20 @@ async def _translate_channel_chunk(
             counters['errors'] += 1
             continue
 
-        new: dict | None = translate_channel(old)
+        new: dict | None = translate_channel(
+            old, id_to_handle, handle_to_id,
+        )
         if new is None:
-            _LOGGER.info(
-                'Channel archive file missing channel_handle or '
-                'channel_id, skipping',
-                extra={'path': path_str},
+            _record_drop_reason(
+                counters, path_str, old.get('channel_id'),
+                'Channel',
             )
-            counters['skipped_no_handle_or_id'] += 1
             continue
+
+        if _was_file_handle_invalid(old):
+            counters['recovered_handle_from_map'] += 1
+        if not old.get('channel_id'):
+            counters['recovered_id_from_map'] += 1
 
         filename: str = (
             f'{CHANNEL_FILE_PREFIX}{new["channel_handle"]}.json.br'
@@ -291,16 +590,30 @@ async def _translate_channel_chunk(
 
 
 async def _translate_video_chunk(
-    work_items: list[str], out_dir: str, dry_run: bool,
+    work_items: list[str],
+    out_dir: str,
+    dry_run: bool,
+    id_to_handle: dict[str, str],
+    handle_to_id: dict[str, str],
 ) -> dict[str, int]:
     fm: AssetFileManagement = AssetFileManagement(out_dir)
     counters: dict[str, int] = {
         'read': 0, 'written': 0,
+        'recovered_handle_from_map': 0,
+        'recovered_id_from_map': 0,
+        'skipped_already_migrated': 0,
+        'skipped_invalid_video_id': 0,
+        'skipped_invalid_channel_id': 0,
         'skipped_no_handle_or_id': 0, 'errors': 0,
     }
 
     for path_str in work_items:
         src: Path = Path(path_str)
+
+        if _already_migrated(out_dir, src.name):
+            counters['skipped_already_migrated'] += 1
+            continue
+
         counters['read'] += 1
 
         try:
@@ -313,15 +626,18 @@ async def _translate_video_chunk(
             counters['errors'] += 1
             continue
 
-        new: dict | None = translate_video(old)
+        new: dict | None = translate_video(
+            old, id_to_handle, handle_to_id,
+        )
         if new is None:
-            _LOGGER.info(
-                'Video archive file missing channel_handle or '
-                'channel_id, skipping',
-                extra={'path': path_str},
-            )
-            counters['skipped_no_handle_or_id'] += 1
+            _record_video_drop_reason(counters, path_str, old)
             continue
+
+        if _was_video_file_handle_invalid(old):
+            counters['recovered_handle_from_map'] += 1
+        if not old.get('channel_id'):
+            counters['recovered_id_from_map'] += 1
+
         filename: str = src.name
 
         if dry_run:
@@ -364,6 +680,36 @@ def _install_worker_id_filter(worker_id: int) -> None:
         handler.addFilter(worker_filter)
 
 
+async def _run_channel_worker(
+    work_items: list[str],
+    out_dir: str,
+    dry_run: bool,
+    redis_dsn: str | None,
+) -> dict[str, int]:
+    id_to_handle: dict[str, str]
+    handle_to_id: dict[str, str]
+    id_to_handle, handle_to_id = await _load_creator_maps(redis_dsn)
+    return await _translate_channel_chunk(
+        work_items, out_dir, dry_run,
+        id_to_handle, handle_to_id,
+    )
+
+
+async def _run_video_worker(
+    work_items: list[str],
+    out_dir: str,
+    dry_run: bool,
+    redis_dsn: str | None,
+) -> dict[str, int]:
+    id_to_handle: dict[str, str]
+    handle_to_id: dict[str, str]
+    id_to_handle, handle_to_id = await _load_creator_maps(redis_dsn)
+    return await _translate_video_chunk(
+        work_items, out_dir, dry_run,
+        id_to_handle, handle_to_id,
+    )
+
+
 def _channel_worker_entrypoint(
     worker_id: int,
     work_items: list[str],
@@ -372,18 +718,19 @@ def _channel_worker_entrypoint(
     log_level: str,
     log_file: str,
     log_format: str,
+    redis_dsn: str | None,
 ) -> dict[str, int]:
     '''
     Top-level (pickleable) channel-chunk worker. Configures logging
-    afresh in the child, tags records with ``worker_id``, and
-    delegates to :func:`_translate_channel_chunk`.
+    afresh in the child, tags records with ``worker_id``, loads the
+    CreatorMap once, and delegates to :func:`_translate_channel_chunk`.
     '''
     configure_logging(
         level=log_level, filename=log_file, log_format=log_format,
     )
     _install_worker_id_filter(worker_id)
     return asyncio.run(
-        _translate_channel_chunk(work_items, out_dir, dry_run),
+        _run_channel_worker(work_items, out_dir, dry_run, redis_dsn),
     )
 
 
@@ -395,18 +742,19 @@ def _video_worker_entrypoint(
     log_level: str,
     log_file: str,
     log_format: str,
+    redis_dsn: str | None,
 ) -> dict[str, int]:
     '''
     Top-level (pickleable) video-chunk worker. Configures logging
-    afresh in the child, tags records with ``worker_id``, and
-    delegates to :func:`_translate_video_chunk`.
+    afresh in the child, tags records with ``worker_id``, loads the
+    CreatorMap once, and delegates to :func:`_translate_video_chunk`.
     '''
     configure_logging(
         level=log_level, filename=log_file, log_format=log_format,
     )
     _install_worker_id_filter(worker_id)
     return asyncio.run(
-        _translate_video_chunk(work_items, out_dir, dry_run),
+        _run_video_worker(work_items, out_dir, dry_run, redis_dsn),
     )
 
 
@@ -460,7 +808,7 @@ def _dispatch(
         return worker_fn(
             0, work, out_dir, settings.dry_run,
             settings.log_level, settings.log_file,
-            settings.log_format,
+            settings.log_format, settings.redis_dsn,
         )
 
     chunks: list[list[str]] = [
@@ -494,6 +842,7 @@ def _dispatch(
                 settings.log_level,
                 settings.log_file,
                 settings.log_format,
+                settings.redis_dsn,
             )
             for idx, chunk in enumerate(chunks)
         ]
@@ -612,6 +961,14 @@ def _run(settings: ReingestSettings) -> int:
     print(
         f'Channels: read={channel_counters.get("read", 0)} '
         f'written={channel_counters.get("written", 0)} '
+        f'recovered_handle_from_map='
+        f'{channel_counters.get("recovered_handle_from_map", 0)} '
+        f'recovered_id_from_map='
+        f'{channel_counters.get("recovered_id_from_map", 0)} '
+        f'skipped_already_migrated='
+        f'{channel_counters.get("skipped_already_migrated", 0)} '
+        f'skipped_invalid_channel_id='
+        f'{channel_counters.get("skipped_invalid_channel_id", 0)} '
         f'skipped_no_handle_or_id='
         f'{channel_counters.get("skipped_no_handle_or_id", 0)} '
         f'errors={channel_counters.get("errors", 0)}'
@@ -620,6 +977,16 @@ def _run(settings: ReingestSettings) -> int:
         print(
             f'Videos:   read={video_counters.get("read", 0)} '
             f'written={video_counters.get("written", 0)} '
+            f'recovered_handle_from_map='
+            f'{video_counters.get("recovered_handle_from_map", 0)} '
+            f'recovered_id_from_map='
+            f'{video_counters.get("recovered_id_from_map", 0)} '
+            f'skipped_already_migrated='
+            f'{video_counters.get("skipped_already_migrated", 0)} '
+            f'skipped_invalid_video_id='
+            f'{video_counters.get("skipped_invalid_video_id", 0)} '
+            f'skipped_invalid_channel_id='
+            f'{video_counters.get("skipped_invalid_channel_id", 0)} '
             f'skipped_no_handle_or_id='
             f'{video_counters.get("skipped_no_handle_or_id", 0)} '
             f'errors={video_counters.get("errors", 0)}'
