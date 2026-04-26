@@ -209,6 +209,56 @@ class TestTranslateChannelObsoleteSlotsDropped(unittest.TestCase):
         self.assertEqual(new['title'], 'X Display')
 
 
+class TestTranslateChannelCategory(unittest.TestCase):
+    '''
+    The channel schema has an optional ``category`` (single string)
+    slot. Legacy records that over-modelled it as a list collapse
+    to the first entry; an empty list becomes ``None``.
+    '''
+
+    def test_categories_list_collapses_to_first_entry(self) -> None:
+        old: dict = {
+            'canonical_handle': 'XChannel',
+            'channel_id': _TEST_CHANNEL_ID,
+            'categories': ['Music'],
+        }
+        new: dict | None = translate_channel(old)
+        assert new is not None
+        self.assertEqual(new['category'], 'Music')
+        self.assertNotIn('categories', new)
+
+    def test_empty_categories_list_yields_none(self) -> None:
+        old: dict = {
+            'canonical_handle': 'XChannel',
+            'channel_id': _TEST_CHANNEL_ID,
+            'categories': [],
+        }
+        new: dict | None = translate_channel(old)
+        assert new is not None
+        self.assertIsNone(new['category'])
+        self.assertNotIn('categories', new)
+
+    def test_multiple_categories_takes_first(self) -> None:
+        old: dict = {
+            'canonical_handle': 'XChannel',
+            'channel_id': _TEST_CHANNEL_ID,
+            'categories': ['Music', 'Entertainment'],
+        }
+        new: dict | None = translate_channel(old)
+        assert new is not None
+        self.assertEqual(new['category'], 'Music')
+
+    def test_missing_categories_leaves_record_alone(self) -> None:
+        old: dict = {
+            'canonical_handle': 'XChannel',
+            'channel_id': _TEST_CHANNEL_ID,
+        }
+        new: dict | None = translate_channel(old)
+        assert new is not None
+        self.assertNotIn('category', new)
+        self.assertNotIn('categories', new)
+
+
 class TestTranslateChannelLinks(unittest.TestCase):
     '''
     Featured/related channel entries also use the new vocabulary.

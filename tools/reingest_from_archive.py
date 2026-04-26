@@ -282,6 +282,15 @@ def translate_channel(
     new.pop('canonical_handle', None)
     new.pop('channel', None)
     new.pop('channel_name', None)
+    # Channels carry an optional ``category`` (single string) in the
+    # new schema. Some legacy records used a ``categories`` list slot
+    # over-modelled from the video shape; collapse to the first entry
+    # (or ``None`` when the list is empty).
+    if 'categories' in new:
+        cats = new.pop('categories')
+        new['category'] = (
+            cats[0] if isinstance(cats, list) and cats else None
+        )
 
     fixed_links: list[dict] = []
     for link in old.get('channel_links', []):

@@ -28,6 +28,10 @@
       "items": { "type": "string" },
       "description": "List of keywords/tags associated with the channel"
     },
+    "category": {
+      "type": ["string", "null"],
+      "description": "The channel category/genre if available"
+    },
     "is_family_safe": {
       "type": "boolean",
       "description": "Whether the channel is designated family-safe"
