@@ -6,13 +6,18 @@ decisions made when collapsing the legacy ``channel`` / ``title`` /
 ``channel_handle`` / ``title`` vocabulary.
 '''
 
+import asyncio
 import tempfile
 import unittest
 
 from pathlib import Path
 
+import brotli
+import orjson
+
 from tools.reingest_from_archive import (
     _enumerate_archive,
+    _read_brotli_json,
     _unwrap_server_envelope,
     _unwrap_unknown_video,
     _video_dest_filename,
@@ -1146,6 +1151,73 @@ class TestVideoUnknownHandling(unittest.TestCase):
             _video_dest_filename(payload),
             f'video-min-{_TEST_VIDEO_ID}.json.br',
         )
+
+
+class TestReadBrotliJsonLenient(unittest.TestCase):
+    '''
+    ``_read_brotli_json`` falls back to a streaming brotli decode
+    plus leading-JSON-object parse when the strict decompressor
+    raises. Some legacy archive files have a corrupted brotli
+    tail but a complete JSON payload at the start; those should
+    be processed as if no error occurred.
+    '''
+
+    def _write_brotli_file(self, path: Path, raw: bytes) -> None:
+        path.write_bytes(brotli.compress(raw))
+
+    def _write_corrupted_brotli(self, path: Path, raw: bytes) -> None:
+        '''Compress *raw* into a valid brotli stream, then append
+        trailing garbage. The strict decompressor rejects the
+        whole file (extra bytes after end-of-stream); the lenient
+        streaming decoder recovers the full payload before hitting
+        the garbage.'''
+        compressed: bytes = brotli.compress(raw)
+        path.write_bytes(compressed + b'\x00\x01\x02\x03\x04')
+
+    def test_strict_decode_returns_full_payload(self) -> None:
+        payload: dict = {
+            'video_id': _TEST_VIDEO_ID,
+            'channel_id': _TEST_CHANNEL_ID,
+            'title': 'OK',
+        }
+        with tempfile.TemporaryDirectory() as d:
+            path: Path = Path(d) / 'video-min-x.json.br'
+            self._write_brotli_file(path, orjson.dumps(payload))
+            result: dict = asyncio.run(_read_brotli_json(path))
+        self.assertEqual(result, payload)
+
+    def test_lenient_decode_recovers_corrupted_brotli(self) -> None:
+        '''
+        Construct a brotli file whose stream is followed by junk
+        bytes — the strict decoder rejects the whole file but the
+        lenient streaming decoder recovers the full payload. The
+        reader must succeed without raising.
+        '''
+
+        payload: dict = {
+            'video_id': _TEST_VIDEO_ID,
+            'channel_id': _TEST_CHANNEL_ID,
+            'title': 'X' * 4096,
+        }
+        with tempfile.TemporaryDirectory() as d:
+            path: Path = Path(d) / 'video-min-x.json.br'
+            self._write_corrupted_brotli(path, orjson.dumps(payload))
+            result: dict = asyncio.run(_read_brotli_json(path))
+        self.assertEqual(result, payload)
+
+    def test_unrecoverable_brotli_propagates_error(self) -> None:
+        '''
+        When the streaming decoder can't extract any bytes (e.g.
+        the file is pure garbage, not a brotli stream at all), the
+        original ``brotli.error`` propagates so the chunk's error
+        counter and warning log fire as before.
+        '''
+
+        with tempfile.TemporaryDirectory() as d:
+            path: Path = Path(d) / 'video-min-x.json.br'
+            path.write_bytes(b'this is not brotli')
+            with self.assertRaises(brotli.error):
+                asyncio.run(_read_brotli_json(path))
 
 
 if __name__ == '__main__':

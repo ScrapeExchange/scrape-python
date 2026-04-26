@@ -46,6 +46,7 @@ scope for this tool; pull from there separately if needed.
 
 import asyncio
 import concurrent.futures
+import json
 import logging
 import re
 import sys
@@ -426,10 +427,71 @@ def _unwrap_server_envelope(parsed: dict) -> dict:
     return inner
 
 
+def _decompress_brotli_lenient(data: bytes) -> bytes:
+    '''
+    Streaming brotli decode that returns whatever bytes were
+    successfully decoded before the decoder raised, or empty
+    bytes if nothing was recovered. Some legacy archive files
+    have a corrupted trailing brotli stream while the JSON
+    payload itself decompressed cleanly; this helper lets the
+    caller try to parse the partial output before giving up.
+
+    Empirically, ``brotli.Decompressor.process`` buffers output
+    internally and discards anything still buffered when the next
+    chunk raises. The buffer-flush boundary depends on the
+    specific compressed-block layout, not just chunk size, so the
+    only reliably correct strategy is to feed input one byte at a
+    time. The lenient path only runs on already-broken files, so
+    the per-byte overhead is acceptable.
+    '''
+
+    decompressor = brotli.Decompressor()
+    output: bytearray = bytearray()
+    try:
+        for byte in data:
+            output.extend(decompressor.process(bytes([byte])))
+    except brotli.error:
+        pass
+    return bytes(output)
+
+
+def _parse_leading_json_object(data: bytes) -> dict:
+    '''
+    Parse the leading JSON object from *data*, ignoring any
+    trailing bytes. Used on the lenient decompression path where
+    the partial output may contain a complete JSON object
+    followed by zero or more corrupted bytes.
+
+    Falls back to the standard library parser because ``orjson``
+    does not expose a ``raw_decode``-style API.
+    '''
+
+    text: str = data.decode('utf-8', errors='replace')
+    obj, _ = json.JSONDecoder().raw_decode(text)
+    if not isinstance(obj, dict):
+        raise ValueError('Leading JSON value is not an object')
+    return obj
+
+
 async def _read_brotli_json(path: Path) -> dict:
     async with aiofiles.open(path, 'rb') as f:
         data: bytes = await f.read()
-    parsed: dict = orjson.loads(brotli.decompress(data))
+    try:
+        decompressed: bytes = brotli.decompress(data)
+        parsed: dict = orjson.loads(decompressed)
+    except brotli.error:
+        # Corrupted brotli tail: fall back to the streaming
+        # decoder and parse whatever leading JSON object we can
+        # recover. ``json.JSONDecoder.raw_decode`` ignores
+        # trailing bytes, so a half-decoded stream that ends
+        # cleanly at the closing ``}`` of the payload still
+        # yields the full record. If the partial output isn't
+        # parseable, the original brotli error effectively
+        # propagates via the JSONDecodeError raised here.
+        decompressed = _decompress_brotli_lenient(data)
+        if not decompressed:
+            raise
+        parsed = _parse_leading_json_object(decompressed)
     return _unwrap_server_envelope(parsed)
 
 
