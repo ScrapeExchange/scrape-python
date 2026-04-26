@@ -39,9 +39,12 @@ class TestRssUpdateChannelHandleResolution(
 ):
     async def test_canonical_handle_written_and_used(self) -> None:
         from scrape_exchange.creator_map import NullCreatorMap
+        from scrape_exchange.name_map import NullNameMap
 
         cm: NullCreatorMap = NullCreatorMap()
         cm.put = AsyncMock()
+        nm: NullNameMap = NullNameMap()
+        nm.put = AsyncMock()
         exchange_client: MagicMock = MagicMock()
         exchange_client.exchange_url = 'http://api.example'
         exchange_client.enqueue_upload = MagicMock(return_value=True)
@@ -69,6 +72,7 @@ class TestRssUpdateChannelHandleResolution(
                 channel_handle='input_casing',
                 channel_id='UC1234567890abcdefghij',
                 creator_map_backend=cm,
+                name_map_backend=nm,
             )
 
         success: bool = result[0]
@@ -88,9 +92,12 @@ class TestRssUpdateChannelHandleResolution(
 
     async def test_handle_less_channel_uses_fallback(self) -> None:
         from scrape_exchange.creator_map import NullCreatorMap
+        from scrape_exchange.name_map import NullNameMap
 
         cm: NullCreatorMap = NullCreatorMap()
         cm.put = AsyncMock()
+        nm: NullNameMap = NullNameMap()
+        nm.put = AsyncMock()
         exchange_client: MagicMock = MagicMock()
         exchange_client.exchange_url = 'http://api.example'
         exchange_client.enqueue_upload = MagicMock(return_value=True)
@@ -114,6 +121,7 @@ class TestRssUpdateChannelHandleResolution(
                 channel_handle='INPUT',
                 channel_id='UC1234567890abcdefghij',
                 creator_map_backend=cm,
+                name_map_backend=nm,
             )
 
         self.assertTrue(result[0])
@@ -128,9 +136,12 @@ class TestRssUpdateChannelHandleResolution(
 
     async def test_browse_failure_returns_failure(self) -> None:
         from scrape_exchange.creator_map import NullCreatorMap
+        from scrape_exchange.name_map import NullNameMap
 
         cm: NullCreatorMap = NullCreatorMap()
         cm.put = AsyncMock()
+        nm: NullNameMap = NullNameMap()
+        nm.put = AsyncMock()
         exchange_client: MagicMock = MagicMock()
 
         with patch.object(
@@ -144,6 +155,7 @@ class TestRssUpdateChannelHandleResolution(
                 channel_handle='input',
                 channel_id='UC1234567890abcdefghij',
                 creator_map_backend=cm,
+                name_map_backend=nm,
             )
 
         self.assertFalse(result[0])

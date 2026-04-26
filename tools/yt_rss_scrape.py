@@ -61,6 +61,11 @@ from scrape_exchange.creator_map import (
     CREATOR_HANDLE_MISMATCH_TOTAL,
     CREATOR_MAP_RESOLUTION_TOTAL,
 )
+from scrape_exchange.name_map import (
+    NameMap,
+    NullNameMap,
+    RedisNameMap,
+)
 from scrape_exchange.creator_queue import (
     CreatorQueue,
     FileCreatorQueue,
@@ -770,6 +775,7 @@ async def process_channel(
     channel_handle: str, channel_id: str, client: ExchangeClient,
     creator_queue: CreatorQueue, settings: RssSettings,
     creator_map_backend: CreatorMap,
+    name_map_backend: NameMap,
 ) -> bool | None:
     '''
     Fetches the RSS feed for one channel and checks or stores each video.
@@ -869,7 +875,7 @@ async def process_channel(
     update_result, rss_result = await asyncio.gather(
         update_channel(
             client, channel_handle, channel_id,
-            creator_map_backend, proxy,
+            creator_map_backend, name_map_backend, proxy,
         ),
         _fetch_rss_safe(
             rss_url,
@@ -1088,6 +1094,7 @@ async def update_channel(
     client: ExchangeClient, channel_handle: str,
     channel_id: str,
     creator_map_backend: CreatorMap,
+    name_map_backend: NameMap,
     proxy: str | None = None,
 ) -> tuple[bool, int, str | None]:
     '''
@@ -1100,6 +1107,9 @@ async def update_channel(
     :param channel_id: The YouTube channel ID.
     :param creator_map_backend: CreatorMap to persist the resolved
         handle for reads by other scrapers.
+    :param name_map_backend: NameMap to persist the
+        ``(channel_title, channel_id)`` pair so re-ingest can
+        recover ids from legacy display-name-only records.
     :param proxy: Optional proxy URL for the InnerTube request.
     :returns: Tuple of (success, subscriber_count, resolved_handle).
         ``success`` is True if the channel data was fetched and
@@ -1160,6 +1170,8 @@ async def update_channel(
     ).get('channelMetadataRenderer', {})
 
     title: str = metadata.get('title', channel_handle)
+    if title:
+        await name_map_backend.put(title, channel_id)
     description: str = metadata.get('description', '')
 
     subscriber_count: int = (
@@ -1573,6 +1585,7 @@ async def worker_loop(
     creator_queue: CreatorQueue,
     tiers: list[TierConfig],
     creator_map_backend: CreatorMap,
+    name_map_backend: NameMap,
 ) -> None:
     '''
     Runs indefinitely, processing channels in priority order.
@@ -1758,7 +1771,7 @@ async def worker_loop(
                 process_channel(
                     name, cid, client,
                     creator_queue, settings,
-                    creator_map_backend,
+                    creator_map_backend, name_map_backend,
                 )
                 for cid, name, _ in batch
             ],
@@ -1849,6 +1862,14 @@ async def _run_worker(
             settings.channel_map_file,
         )
 
+    name_map_backend: NameMap
+    if settings.redis_dsn:
+        name_map_backend = RedisNameMap(
+            settings.redis_dsn, platform='youtube',
+        )
+    else:
+        name_map_backend = NullNameMap()
+
     tiers: list[TierConfig] = parse_priority_queues(
         settings.priority_queues,
     )
@@ -1856,7 +1877,7 @@ async def _run_worker(
     await worker_loop(
         settings, ctx.client, channel_fm,
         creator_queue, tiers,
-        creator_map_backend,
+        creator_map_backend, name_map_backend,
     )
 
 

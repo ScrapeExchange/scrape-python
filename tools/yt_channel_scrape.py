@@ -35,6 +35,11 @@ from scrape_exchange.creator_map import (
     RedisCreatorMap,
     CREATOR_MAP_RESOLUTION_TOTAL,
 )
+from scrape_exchange.name_map import (
+    NameMap,
+    NullNameMap,
+    RedisNameMap,
+)
 from scrape_exchange.exchange_client import ExchangeClient
 
 from scrape_exchange.file_management import AssetFileManagement
@@ -380,6 +385,14 @@ async def _run_worker(
             settings.channel_map_file,
         )
 
+    name_map_backend: NameMap
+    if settings.redis_dsn:
+        name_map_backend = RedisNameMap(
+            settings.redis_dsn, platform='youtube',
+        )
+    else:
+        name_map_backend = NullNameMap()
+
     if not settings.proxies:
         logging.info(
             'No proxies configured, using direct '
@@ -389,17 +402,19 @@ async def _run_worker(
 
     if not settings.channel_no_upload:
         await upload_channels(
-            settings, ctx.client, fm, creator_map_backend,
+            settings, ctx.client, fm,
+            creator_map_backend, name_map_backend,
         )
 
     if settings.channel_upload_only:
         await _watch_and_upload_channels(
-            settings, ctx.client, fm, creator_map_backend,
+            settings, ctx.client, fm,
+            creator_map_backend, name_map_backend,
         )
     else:
         await scrape_channels(
             settings, ctx.client, fm,
-            creator_map_backend,
+            creator_map_backend, name_map_backend,
         )
 
 
@@ -497,6 +512,7 @@ async def scrape_channels(
     client: ExchangeClient,
     fm: AssetFileManagement,
     creator_map_backend: CreatorMap,
+    name_map_backend: NameMap,
 ) -> None:
 
     new_channels: set[str] = await read_channels(
@@ -542,6 +558,7 @@ async def scrape_channels(
                 failed: bool = await scrape_channel(
                     settings, client, fm,
                     channel_handle, creator_map_backend,
+                    name_map_backend,
                 )
                 if failed:
                     errors += 1
@@ -593,6 +610,7 @@ async def upload_channels(
     client: ExchangeClient,
     fm: AssetFileManagement,
     creator_map_backend: CreatorMap,
+    name_map_backend: NameMap,
 ) -> None:
     files: list[str] = [
         f for f in fm.list_base(
@@ -611,7 +629,8 @@ async def upload_channels(
     )
     for filename in files:
         await _upload_single_channel(
-            filename, settings, client, fm, creator_map_backend,
+            filename, settings, client, fm,
+            creator_map_backend, name_map_backend,
         )
 
 
@@ -630,6 +649,7 @@ async def _upload_single_channel(
     client: ExchangeClient,
     fm: AssetFileManagement,
     creator_map_backend: CreatorMap,
+    name_map_backend: NameMap,
 ) -> None:
     '''
     Upload a single channel file if it needs uploading.
@@ -658,7 +678,7 @@ async def _upload_single_channel(
 
         if await enqueue_upload_channel(
             settings, client, fm, filename, channel,
-            creator_map_backend,
+            creator_map_backend, name_map_backend,
         ):
             METRIC_CHANNELS_ENQUEUED.labels(
                 worker_id=get_worker_id(),
@@ -676,6 +696,7 @@ async def _watch_and_upload_channels(
     client: ExchangeClient,
     fm: AssetFileManagement,
     creator_map_backend: CreatorMap,
+    name_map_backend: NameMap,
 ) -> None:
     '''
     Upload-only watcher loop.  Watches
@@ -714,7 +735,7 @@ async def _watch_and_upload_channels(
             )
             await _upload_single_channel(
                 filename, settings, client, fm,
-                creator_map_backend,
+                creator_map_backend, name_map_backend,
             )
 
 
@@ -1006,7 +1027,8 @@ async def _load_channel_from_disk(
 
 async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
                          fm: AssetFileManagement, channel_handle: str,
-                         creator_map_backend: CreatorMap) -> bool:
+                         creator_map_backend: CreatorMap,
+                         name_map_backend: NameMap) -> bool:
     '''
     Scrapes a single YouTube channel and uploads it to the Scrape Exchange.
 
@@ -1016,6 +1038,8 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
     :param channel_handle: The name of the YouTube channel to scrape.
     :param creator_map_backend: Shared CreatorMap for
         channel_id → handle persistence.
+    :param name_map_backend: Shared NameMap for
+        channel_title → channel_id persistence.
     :returns: whether channel scraping/uploading failed
     :raises: (none)
     '''
@@ -1103,7 +1127,8 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
     # Fire-and-forget: background worker moves the file on success;
     # on queue full the file stays in base_dir for the next retry.
     if await enqueue_upload_channel(
-        settings, client, fm, filename, channel, creator_map_backend,
+        settings, client, fm, filename, channel,
+        creator_map_backend, name_map_backend,
     ):
         METRIC_CHANNELS_ENQUEUED.labels(
             worker_id=get_worker_id(),
@@ -1112,7 +1137,9 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
 
 
 async def resolve_channel_upload_handle(
-    channel: YouTubeChannel, creator_map_backend: CreatorMap,
+    channel: YouTubeChannel,
+    creator_map_backend: CreatorMap,
+    name_map_backend: NameMap,
 ) -> str:
     '''
     Resolve the handle to use for uploading *channel*.
@@ -1121,10 +1148,15 @@ async def resolve_channel_upload_handle(
     has already populated with the canonical handle from YouTube's
     vanityChannelUrl (or left as the input handle when no canonical
     was returned). Writes the result to the creator map so RSS/video
-    scrapers can read it.
+    scrapers can read it. Also writes
+    ``(channel.title, channel.channel_id)`` to the name map so
+    re-ingest can recover ids from legacy display-name-only video
+    records.
 
     :param channel: The scraped channel.
     :param creator_map_backend: Shared creator map backend.
+    :param name_map_backend: Shared name map backend
+        (channel_title → channel_id).
     :returns: The handle to use for the upload.
     '''
 
@@ -1137,6 +1169,10 @@ async def resolve_channel_upload_handle(
         await creator_map_backend.put(
             channel.channel_id, handle,
         )
+        if channel.title:
+            await name_map_backend.put(
+                channel.title, channel.channel_id,
+            )
     return handle
 
 
@@ -1144,6 +1180,7 @@ async def enqueue_upload_channel(
     settings: ChannelSettings, client: ExchangeClient,
     fm: AssetFileManagement, filename: str, channel: YouTubeChannel,
     creator_map_backend: CreatorMap,
+    name_map_backend: NameMap,
 ) -> bool:
     '''
     Fire-and-forget upload of a scraped channel to Scrape Exchange.
@@ -1159,7 +1196,7 @@ async def enqueue_upload_channel(
     '''
 
     handle: str = await resolve_channel_upload_handle(
-        channel, creator_map_backend,
+        channel, creator_map_backend, name_map_backend,
     )
     channel.channel_handle = handle
 

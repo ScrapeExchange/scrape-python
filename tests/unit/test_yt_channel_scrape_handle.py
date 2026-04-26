@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import AsyncMock
 
 from scrape_exchange.creator_map import NullCreatorMap
+from scrape_exchange.name_map import NullNameMap
 
 
 class TestChannelScraperHandleResolution(
@@ -24,13 +25,19 @@ class TestChannelScraperHandleResolution(
 
         cm: NullCreatorMap = NullCreatorMap()
         cm.put = AsyncMock()
+        nm: NullNameMap = NullNameMap()
+        nm.put = AsyncMock()
 
-        handle: str = await resolve_channel_upload_handle(channel, cm)
+        handle: str = await resolve_channel_upload_handle(
+            channel, cm, nm,
+        )
 
         self.assertEqual(handle, 'InputCasing')
         cm.put.assert_awaited_once_with(
             'UC1234567890abcdefghij', 'InputCasing',
         )
+        # No title set on the channel, so name_map is not written.
+        nm.put.assert_not_awaited()
 
     async def test_no_creator_map_write_without_channel_id(
         self,
@@ -49,8 +56,13 @@ class TestChannelScraperHandleResolution(
 
         cm: NullCreatorMap = NullCreatorMap()
         cm.put = AsyncMock()
+        nm: NullNameMap = NullNameMap()
+        nm.put = AsyncMock()
 
-        handle: str = await resolve_channel_upload_handle(channel, cm)
+        handle: str = await resolve_channel_upload_handle(
+            channel, cm, nm,
+        )
 
         self.assertEqual(handle, 'InputCasing')
         cm.put.assert_not_awaited()
+        nm.put.assert_not_awaited()
