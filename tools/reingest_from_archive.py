@@ -333,9 +333,21 @@ def translate_video(
       (typically the YouTube CreatorMap) are consulted to fill the
       gap.
 
-    :returns: The translated dict, or ``None`` when either
-        ``channel_handle`` or ``channel_id`` is missing — we only
-        re-ingest videos whose owning channel is fully identified.
+    Required fields for the record to be kept:
+
+    * ``video_id`` (must match ``_VIDEO_ID_PATTERN``)
+    * ``channel_id`` (must match ``_CHANNEL_ID_PATTERN``, either
+      from the file or recovered via reverse handle lookup)
+
+    ``channel_handle`` is *not* required: a record with a valid
+    ``channel_id`` but an invalid file handle and no CreatorMap
+    entry is still kept, with ``channel_handle`` stripped from
+    the output. The video data is useful even when the canonical
+    handle isn't yet known; downstream consumers can fill it in
+    later once the channel is scraped.
+
+    :returns: The translated dict, or ``None`` when ``video_id``
+        or ``channel_id`` is missing/invalid.
     '''
 
     id_to_handle = id_to_handle or {}
@@ -360,11 +372,19 @@ def translate_video(
         new.get('channel_handle'), new.get('channel_id'),
         id_to_handle, handle_to_id,
     )
-    if not handle or not channel_id:
+    if not channel_id:
         return None
     new['video_id'] = video_id
-    new['channel_handle'] = handle
     new['channel_id'] = channel_id
+    if handle:
+        new['channel_handle'] = handle
+    else:
+        new.pop('channel_handle', None)
+    # Fill in the canonical watch URL when the source record didn't
+    # carry one — every YouTube video has the same URL shape and
+    # downstream consumers expect the field to be present.
+    if not new.get('url'):
+        new['url'] = f'https://www.youtube.com/watch?v={video_id}'
     return new
 
 
@@ -843,6 +863,7 @@ async def _translate_video_chunk(
         'read': 0, 'written': 0,
         'recovered_handle_from_map': 0,
         'recovered_id_from_map': 0,
+        'kept_without_handle': 0,
         'added_to_creator_map': 0,
         'skipped_already_migrated': 0,
         'skipped_invalid_video_id': 0,
@@ -874,15 +895,22 @@ async def _translate_video_chunk(
             _record_video_drop_reason(counters, path_str, old)
             continue
 
-        if _was_video_file_handle_invalid(old):
+        # ``channel_handle`` is optional in the output now: the
+        # translator strips it when the file's handle is junk and
+        # the CreatorMap can't supply a canonical one.
+        handle_present: bool = 'channel_handle' in new
+        if handle_present and _was_video_file_handle_invalid(old):
             counters['recovered_handle_from_map'] += 1
+        if not handle_present:
+            counters['kept_without_handle'] += 1
         if not old.get('channel_id'):
             counters['recovered_id_from_map'] += 1
-        _maybe_queue_creator_update(
-            cm, pending_creator_updates,
-            id_to_handle, handle_to_id,
-            new['channel_id'], new['channel_handle'],
-        )
+        if handle_present:
+            _maybe_queue_creator_update(
+                cm, pending_creator_updates,
+                id_to_handle, handle_to_id,
+                new['channel_id'], new['channel_handle'],
+            )
 
         filename: str = _video_dest_filename(new)
 
@@ -1258,6 +1286,8 @@ def _run(settings: ReingestSettings) -> int:
             f'{video_counters.get("recovered_handle_from_map", 0)} '
             f'recovered_id_from_map='
             f'{video_counters.get("recovered_id_from_map", 0)} '
+            f'kept_without_handle='
+            f'{video_counters.get("kept_without_handle", 0)} '
             f'added_to_creator_map='
             f'{video_counters.get("added_to_creator_map", 0)} '
             f'skipped_already_migrated='
