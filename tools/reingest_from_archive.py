@@ -98,14 +98,15 @@ _VIDEO_ID_PATTERN: re.Pattern[str] = re.compile(
 
 
 class ReingestSettings(YouTubeScraperSettings):
-    channel_archive_dir: str = Field(
-        default='scraped-channels',
+    channel_archive_dir: str | None = Field(
+        default=None,
         validation_alias=AliasChoices(
             'CHANNEL_ARCHIVE_DIR', 'channel_archive_dir',
         ),
         description=(
             'Directory containing the old-format channel-*.json.br '
-            'files to re-ingest.'
+            'files to re-ingest. Leave unset (or set to an empty '
+            'string) to skip channel re-ingest.'
         ),
     )
     video_archive_dir: str | None = Field(
@@ -975,10 +976,23 @@ def _dispatch(
 
 
 def _validate(settings: ReingestSettings) -> int:
-    if not settings.channel_data_directory:
+    if (
+        not settings.channel_archive_dir
+        and not settings.video_archive_dir
+    ):
+        _LOGGER.error(
+            'At least one of --channel-archive-dir or '
+            '--video-archive-dir must be set',
+        )
+        return 1
+    if (
+        settings.channel_archive_dir
+        and not settings.channel_data_directory
+    ):
         _LOGGER.error(
             'channel_data_directory must be configured to write '
-            'translated channel files',
+            'translated channel files (or leave --channel-archive-dir '
+            'unset to skip channels)',
         )
         return 1
     if (
@@ -987,8 +1001,8 @@ def _validate(settings: ReingestSettings) -> int:
     ):
         _LOGGER.error(
             'video_data_directory must be configured to write '
-            'translated video files (or set --video-archive-dir to '
-            'an empty string to skip videos)',
+            'translated video files (or leave --video-archive-dir '
+            'unset to skip videos)',
         )
         return 1
     if settings.num_processes < 1:
@@ -1005,39 +1019,43 @@ def _run(settings: ReingestSettings) -> int:
     if rc != 0:
         return rc
 
-    channel_archive: Path = Path(settings.channel_archive_dir)
-    if not channel_archive.is_dir():
-        _LOGGER.error(
-            'Channel archive directory does not exist',
-            extra={'channel_archive_dir': str(channel_archive)},
+    channel_counters: dict[str, int] = {}
+    if settings.channel_archive_dir:
+        channel_archive: Path = Path(settings.channel_archive_dir)
+        if not channel_archive.is_dir():
+            _LOGGER.error(
+                'Channel archive directory does not exist',
+                extra={
+                    'channel_archive_dir': str(channel_archive),
+                },
+            )
+            return 1
+
+        _LOGGER.info(
+            'Enumerating channel archive',
+            extra={
+                'channel_archive_dir': settings.channel_archive_dir,
+            },
         )
-        return 1
+        channel_work: list[str] = _enumerate_archive(
+            channel_archive, CHANNEL_FILE_PREFIX,
+        )
+        _LOGGER.info(
+            'Channel archive enumerated',
+            extra={'total_files': len(channel_work)},
+        )
 
-    _LOGGER.info(
-        'Enumerating channel archive',
-        extra={
-            'channel_archive_dir': settings.channel_archive_dir,
-        },
-    )
-    channel_work: list[str] = _enumerate_archive(
-        channel_archive, CHANNEL_FILE_PREFIX,
-    )
-    _LOGGER.info(
-        'Channel archive enumerated',
-        extra={'total_files': len(channel_work)},
-    )
-
-    channel_counters: dict[str, int] = _dispatch(
-        settings,
-        'channel',
-        channel_work,
-        settings.channel_data_directory,
-        _channel_worker_entrypoint,
-    )
-    _LOGGER.info(
-        'Channel re-ingest complete',
-        extra={'counters': channel_counters},
-    )
+        channel_counters = _dispatch(
+            settings,
+            'channel',
+            channel_work,
+            settings.channel_data_directory,
+            _channel_worker_entrypoint,
+        )
+        _LOGGER.info(
+            'Channel re-ingest complete',
+            extra={'counters': channel_counters},
+        )
 
     video_counters: dict[str, int] = {}
     if settings.video_archive_dir:
@@ -1075,23 +1093,24 @@ def _run(settings: ReingestSettings) -> int:
             extra={'counters': video_counters},
         )
 
-    print(
-        f'Channels: read={channel_counters.get("read", 0)} '
-        f'written={channel_counters.get("written", 0)} '
-        f'recovered_handle_from_map='
-        f'{channel_counters.get("recovered_handle_from_map", 0)} '
-        f'recovered_id_from_map='
-        f'{channel_counters.get("recovered_id_from_map", 0)} '
-        f'added_to_creator_map='
-        f'{channel_counters.get("added_to_creator_map", 0)} '
-        f'skipped_already_migrated='
-        f'{channel_counters.get("skipped_already_migrated", 0)} '
-        f'skipped_invalid_channel_id='
-        f'{channel_counters.get("skipped_invalid_channel_id", 0)} '
-        f'skipped_no_handle_or_id='
-        f'{channel_counters.get("skipped_no_handle_or_id", 0)} '
-        f'errors={channel_counters.get("errors", 0)}'
-    )
+    if channel_counters:
+        print(
+            f'Channels: read={channel_counters.get("read", 0)} '
+            f'written={channel_counters.get("written", 0)} '
+            f'recovered_handle_from_map='
+            f'{channel_counters.get("recovered_handle_from_map", 0)} '
+            f'recovered_id_from_map='
+            f'{channel_counters.get("recovered_id_from_map", 0)} '
+            f'added_to_creator_map='
+            f'{channel_counters.get("added_to_creator_map", 0)} '
+            f'skipped_already_migrated='
+            f'{channel_counters.get("skipped_already_migrated", 0)} '
+            f'skipped_invalid_channel_id='
+            f'{channel_counters.get("skipped_invalid_channel_id", 0)} '
+            f'skipped_no_handle_or_id='
+            f'{channel_counters.get("skipped_no_handle_or_id", 0)} '
+            f'errors={channel_counters.get("errors", 0)}'
+        )
     if video_counters:
         print(
             f'Videos:   read={video_counters.get("read", 0)} '
