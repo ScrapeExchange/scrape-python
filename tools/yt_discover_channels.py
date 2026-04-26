@@ -733,23 +733,33 @@ async def _scrape_channel(
             name, with_download_client=False,
         )
     )
-    await yt_channel.scrape_about_page(proxies=proxies)
+    try:
+        await yt_channel.scrape_about_page(proxies=proxies)
 
-    page_links: set[tuple[str, int | None]] = set()
-    for link in yt_channel.channel_links:
-        page_links.add((
-            link.channel_handle,
-            link.subscriber_count,
-        ))
+        page_links: set[tuple[str, int | None]] = set()
+        for link in yt_channel.channel_links:
+            page_links.add((
+                link.channel_handle,
+                link.subscriber_count,
+            ))
 
-    return DiscoveredChannel(
-        channel_handle=target,
-        page_links=page_links,
-        description=yt_channel.description,
-        subs=yt_channel.subscriber_count,
-        channel_id=yt_channel.channel_id,
-        title=yt_channel.title,
-    )
+        return DiscoveredChannel(
+            channel_handle=target,
+            page_links=page_links,
+            description=yt_channel.description,
+            subs=yt_channel.subscriber_count,
+            channel_id=yt_channel.channel_id,
+            title=yt_channel.title,
+        )
+    finally:
+        # Mirrors yt_channel_scrape.py:938. Without this, every
+        # iteration of the discover BFS leaks an httpx connection
+        # pool and we eventually exhaust file descriptors — which
+        # surfaces as "Too many open files" inside the cookie
+        # renewal loop's lock-file open, not here.
+        if yt_channel.browse_client is not None:
+            await yt_channel.browse_client.aclose()
+            yt_channel.browse_client = None
 
 
 async def fetch(client: AsyncYouTubeClient, url: str
