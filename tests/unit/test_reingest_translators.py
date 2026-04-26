@@ -153,6 +153,24 @@ class TestTranslateChannelHandleLooksLikeHandle(unittest.TestCase):
         assert new is not None
         self.assertEqual(new['channel_handle'], 'a.b_c-d')
 
+    def test_accepts_unicode_handle(self) -> None:
+        '''
+        YouTube accepts handles in non-Latin scripts (Cyrillic,
+        Greek, CJK, accented Latin, …). The pattern uses ``\\w``
+        so any Unicode letter/digit qualifies. Pinned by the
+        real-world handle ``@ГеоргиГеоргиев-ь4ч``.
+        '''
+
+        old: dict = {
+            'canonical_handle': 'ГеоргиГеоргиев-ь4ч',
+            'channel_id': _TEST_CHANNEL_ID,
+        }
+        new: dict | None = translate_channel(old)
+        assert new is not None
+        self.assertEqual(
+            new['channel_handle'], 'ГеоргиГеоргиев-ь4ч',
+        )
+
     def test_falls_through_when_canonical_invalid(
         self,
     ) -> None:

@@ -69,11 +69,15 @@ from scrape_exchange.youtube.settings import YouTubeScraperSettings
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
-# YouTube's documented handle format: 3–30 characters from the Latin
-# alphabet, digits, underscore, hyphen, and period. Anything else
-# (whitespace, slashes, &, etc.) means the legacy slot held a display
-# name or junk rather than an actual handle, and the record is dropped.
-_HANDLE_PATTERN: re.Pattern[str] = re.compile(r'^[A-Za-z0-9_.\-]{3,30}$')
+# YouTube handle format: 3–30 characters from any Unicode letter or
+# digit (``\w`` in str-mode regex covers Latin, Cyrillic, Greek, CJK
+# etc. plus underscore), with hyphen and period also allowed. The
+# documented Latin-only set is too strict in practice — YouTube
+# accepts handles like ``@ГеоргиГеоргиев-ь4ч`` and ``@ÁlexMontoya``.
+# Anything containing whitespace, slashes, &, or other URL-incompatible
+# characters still means the legacy slot held a display name or junk
+# and the record is dropped.
+_HANDLE_PATTERN: re.Pattern[str] = re.compile(r'^[\w.\-]{3,30}$')
 
 # YouTube channel IDs are always ``UC`` followed by 22 characters from
 # the URL-safe base64 alphabet. Mirrors
