@@ -10,14 +10,18 @@
       "description": "YouTube video id",
       "x-scrape-field": "platform_content_id"
     },
-    "title": { "type": ["string", "null"], "description": "Channel name" },
-    "long_title": { "type": ["string", "null"], "description": "Long title" },
+    "title": { "type": ["string", "null"], "description": "Video name" },
+    "long_title": { "type": ["string", "null"], "description": "Long title for the video" },
     "description": { "type": ["string", "null"], "description": "Video description" },
     "channel_id": { "type": ["string", "null"], "description": "Channel id" },
     "channel_handle": {
       "type": ["string", "null"],
       "description": "Channel handle",
       "x-scrape-field": "platform_creator_id"
+    },
+    "channel_title": {
+      "type": ["string", "null"],
+      "description": "Channel title"
     },
     "channel_url": {
       "type": ["string", "null"],

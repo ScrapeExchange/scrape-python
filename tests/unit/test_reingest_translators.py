@@ -500,20 +500,39 @@ class TestTranslateVideo(unittest.TestCase):
         self.assertEqual(new['channel_id'], _TEST_CHANNEL_ID)
         self.assertNotIn('channel_handle', new)
 
-    def test_returns_none_when_channel_id_missing(self) -> None:
+    def test_keeps_record_without_id_when_handle_valid(
+        self,
+    ) -> None:
+        '''
+        A valid handle with no recoverable channel_id is enough
+        to keep the record — downstream can fill in the id later
+        once the channel is scraped.
+        '''
+
         old: dict = {
             'video_id': _TEST_VIDEO_ID, 'title': 'T',
             'channel_handle': 'HistoryMatters',
         }
-        self.assertIsNone(translate_video(old))
+        new: dict | None = translate_video(old)
+        assert new is not None
+        self.assertEqual(new['channel_handle'], 'HistoryMatters')
+        self.assertNotIn('channel_id', new)
 
-    def test_returns_none_when_channel_id_empty(self) -> None:
+    def test_keeps_record_when_channel_id_empty_but_handle_valid(
+        self,
+    ) -> None:
+        '''Empty/null channel_id is treated as missing; a valid
+        handle still keeps the record.'''
+
         old: dict = {
             'video_id': _TEST_VIDEO_ID,
             'channel_handle': 'HistoryMatters',
             'channel_id': '',
         }
-        self.assertIsNone(translate_video(old))
+        new: dict | None = translate_video(old)
+        assert new is not None
+        self.assertEqual(new['channel_handle'], 'HistoryMatters')
+        self.assertNotIn('channel_id', new)
 
 
 class TestTranslateVideoCategory(unittest.TestCase):
@@ -704,13 +723,21 @@ class TestTranslateVideoCreatorMapRecovery(unittest.TestCase):
         old: dict = {
             'video_id': _TEST_VIDEO_ID, 'channel_handle': 'XChannel',
         }
-        self.assertIsNone(translate_video(old))
+        # Without map: kept with handle alone (the new "at least
+        # one of id/handle/title" acceptance rule). channel_id
+        # stays absent.
+        baseline: dict | None = translate_video(old)
+        assert baseline is not None
+        self.assertEqual(baseline['channel_handle'], 'XChannel')
+        self.assertNotIn('channel_id', baseline)
+        # With reverse map: id recovered.
         handle_to_id: dict[str, str] = {
             'XChannel': _TEST_CHANNEL_ID,
         }
         new: dict | None = translate_video(old, {}, handle_to_id)
         assert new is not None
         self.assertEqual(new['channel_id'], _TEST_CHANNEL_ID)
+        self.assertEqual(new['channel_handle'], 'XChannel')
 
     def test_strips_handle_when_mapped_handle_invalid(self) -> None:
         '''
@@ -764,13 +791,21 @@ class TestChannelIdPattern(unittest.TestCase):
         }
         self.assertIsNone(translate_channel(old))
 
-    def test_video_translator_drops_short_channel_id(self) -> None:
+    def test_video_translator_strips_short_channel_id(self) -> None:
+        '''A short/invalid channel_id is treated as missing. With
+        a valid handle the record is still kept (handle-only
+        acceptance path) but channel_id is dropped from the
+        output rather than written through.'''
+
         old: dict = {
             'video_id': _TEST_VIDEO_ID,
             'channel_handle': 'XChannel',
             'channel_id': 'UCabc',
         }
-        self.assertIsNone(translate_video(old))
+        new: dict | None = translate_video(old)
+        assert new is not None
+        self.assertEqual(new['channel_handle'], 'XChannel')
+        self.assertNotIn('channel_id', new)
 
     def test_recovers_id_when_file_id_invalid(self) -> None:
         '''An invalid file channel_id is treated as missing, so
@@ -796,6 +831,270 @@ class TestChannelIdPattern(unittest.TestCase):
         handle_to_id: dict[str, str] = {'XChannel': 'UCabc'}
         self.assertIsNone(
             translate_channel(old, {}, handle_to_id),
+        )
+
+
+class TestTranslateVideoAcceptanceRule(unittest.TestCase):
+    '''
+    A video record is kept when ``video_id`` is valid AND at
+    least one of ``channel_id``, ``channel_handle``, or
+    ``channel_title`` can be populated. Records with a valid
+    video_id but no usable channel context are dropped.
+    '''
+
+    def test_drops_when_no_channel_context(self) -> None:
+        old: dict = {
+            'video_id': _TEST_VIDEO_ID,
+            'title': 'Orphaned',
+        }
+        self.assertIsNone(translate_video(old))
+
+    def test_drops_when_only_invalid_channel_id(self) -> None:
+        '''A junk channel_id alone (no handle, no display name)
+        leaves no channel context to salvage.'''
+
+        old: dict = {
+            'video_id': _TEST_VIDEO_ID,
+            'channel_id': 'UCabc',  # too short
+        }
+        self.assertIsNone(translate_video(old))
+
+    def test_keeps_with_only_channel_id(self) -> None:
+        old: dict = {
+            'video_id': _TEST_VIDEO_ID,
+            'channel_id': _TEST_CHANNEL_ID,
+        }
+        new: dict | None = translate_video(old)
+        assert new is not None
+        self.assertEqual(new['channel_id'], _TEST_CHANNEL_ID)
+        self.assertNotIn('channel_handle', new)
+        self.assertNotIn('channel_title', new)
+
+    def test_keeps_with_only_channel_handle(self) -> None:
+        old: dict = {
+            'video_id': _TEST_VIDEO_ID,
+            'channel_handle': 'XChannel',
+        }
+        new: dict | None = translate_video(old)
+        assert new is not None
+        self.assertEqual(new['channel_handle'], 'XChannel')
+        self.assertNotIn('channel_id', new)
+        self.assertNotIn('channel_title', new)
+
+    def test_keeps_with_only_channel_title(self) -> None:
+        old: dict = {
+            'video_id': _TEST_VIDEO_ID,
+            'channel_name': 'Some Display Name',
+        }
+        new: dict | None = translate_video(old)
+        assert new is not None
+        self.assertEqual(new['channel_title'], 'Some Display Name')
+        self.assertNotIn('channel_id', new)
+        self.assertNotIn('channel_handle', new)
+
+
+class TestTranslateVideoNameMapResolution(unittest.TestCase):
+    '''
+    When a video file has a display name in the channel slot but
+    no usable channel_id/handle, the translator consults the
+    NameMap (channel_title → channel_id). On a hit it also tries
+    the CreatorMap to recover the canonical handle.
+    '''
+
+    def test_recovers_id_from_name_map(self) -> None:
+        old: dict = {
+            'video_id': _TEST_VIDEO_ID,
+            'channel_name': 'Shaun Wood',
+        }
+        title_to_id: dict[str, str] = {
+            'Shaun Wood': _TEST_CHANNEL_ID,
+        }
+        new: dict | None = translate_video(
+            old, {}, {}, title_to_id,
+        )
+        assert new is not None
+        self.assertEqual(new['channel_id'], _TEST_CHANNEL_ID)
+        self.assertNotIn('channel_handle', new)
+        self.assertNotIn('channel_title', new)
+
+    def test_recovers_id_and_handle_from_name_and_creator_maps(
+        self,
+    ) -> None:
+        '''Cascade: NameMap supplies the id, CreatorMap (looked
+        up on that id) supplies the canonical handle.'''
+
+        old: dict = {
+            'video_id': _TEST_VIDEO_ID,
+            'channel_name': 'Shaun Wood',
+        }
+        title_to_id: dict[str, str] = {
+            'Shaun Wood': _TEST_CHANNEL_ID,
+        }
+        id_to_handle: dict[str, str] = {
+            _TEST_CHANNEL_ID: 'ShaunWood',
+        }
+        new: dict | None = translate_video(
+            old, id_to_handle, {}, title_to_id,
+        )
+        assert new is not None
+        self.assertEqual(new['channel_id'], _TEST_CHANNEL_ID)
+        self.assertEqual(new['channel_handle'], 'ShaunWood')
+
+    def test_falls_back_to_channel_title_when_name_map_misses(
+        self,
+    ) -> None:
+        old: dict = {
+            'video_id': _TEST_VIDEO_ID,
+            'channel_name': 'Unknown Display',
+        }
+        title_to_id: dict[str, str] = {
+            'Other Channel': _TEST_CHANNEL_ID,
+        }
+        new: dict | None = translate_video(
+            old, {}, {}, title_to_id,
+        )
+        assert new is not None
+        self.assertEqual(new['channel_title'], 'Unknown Display')
+        self.assertNotIn('channel_id', new)
+        self.assertNotIn('channel_handle', new)
+
+    def test_name_map_not_consulted_when_handle_valid(self) -> None:
+        '''NameMap fallback only fires when the file slot is a
+        non-handle. A valid handle uses the existing reverse
+        lookup path, not the NameMap.'''
+
+        old: dict = {
+            'video_id': _TEST_VIDEO_ID,
+            'channel_name': 'XChannel',
+        }
+        title_to_id: dict[str, str] = {
+            'XChannel': _TEST_CHANNEL_ID,
+        }
+        new: dict | None = translate_video(
+            old, {}, {}, title_to_id,
+        )
+        assert new is not None
+        # Without a handle_to_id reverse lookup, channel_id stays
+        # absent; the NameMap is not consulted because the file's
+        # value 'XChannel' is itself a valid handle.
+        self.assertEqual(new['channel_handle'], 'XChannel')
+        self.assertNotIn('channel_id', new)
+
+    def test_name_map_not_consulted_when_id_already_present(
+        self,
+    ) -> None:
+        old: dict = {
+            'video_id': _TEST_VIDEO_ID,
+            'channel_id': _TEST_CHANNEL_ID,
+            'channel_name': 'Display Name',
+        }
+        # NameMap maps the same display name to a DIFFERENT id;
+        # since the file already has a valid id, the NameMap is
+        # not consulted.
+        title_to_id: dict[str, str] = {
+            'Display Name': 'UCotherchannelxxxxxxxxxx',
+        }
+        new: dict | None = translate_video(
+            old, {}, {}, title_to_id,
+        )
+        assert new is not None
+        self.assertEqual(new['channel_id'], _TEST_CHANNEL_ID)
+
+
+class TestTranslateVideoChannelTitleSalvage(unittest.TestCase):
+    '''
+    When a video file has no usable ``channel_id`` (missing or
+    invalid) but its channel slot held a non-handle value (a
+    display name), the translator preserves that value as
+    ``channel_title`` and keeps the record. Lets downstream
+    consumers display the channel name even when the
+    authoritative id isn't available.
+    '''
+
+    def test_salvages_channel_name_when_no_channel_id(self) -> None:
+        old: dict = {
+            'video_id': _TEST_VIDEO_ID,
+            'channel_name': 'Shaun Wood',
+            'title': 'A Video',
+        }
+        new: dict | None = translate_video(old)
+        assert new is not None
+        self.assertEqual(new['channel_title'], 'Shaun Wood')
+        self.assertNotIn('channel_handle', new)
+        self.assertNotIn('channel_id', new)
+
+    def test_salvages_channel_field_when_no_channel_id(self) -> None:
+        '''Some legacy files use ``channel`` rather than
+        ``channel_name``; both should be salvaged.'''
+
+        old: dict = {
+            'video_id': _TEST_VIDEO_ID,
+            'channel': 'Display Name',
+        }
+        new: dict | None = translate_video(old)
+        assert new is not None
+        self.assertEqual(new['channel_title'], 'Display Name')
+        self.assertNotIn('channel', new)
+
+    def test_salvages_url_encoded_display_name(self) -> None:
+        '''Percent-encoded display names are decoded before
+        being stored as ``channel_title`` for human-readability.'''
+
+        old: dict = {
+            'video_id': _TEST_VIDEO_ID,
+            'channel_name': '%20Shaun%20Wood',
+        }
+        new: dict | None = translate_video(old)
+        assert new is not None
+        self.assertEqual(new['channel_title'], ' Shaun Wood')
+
+    def test_does_not_salvage_when_channel_is_valid_handle(
+        self,
+    ) -> None:
+        '''A valid handle in the channel slot with no channel_id
+        is kept via the handle-only acceptance path, not via
+        channel_title salvage. ``channel_title`` must NOT be set
+        in that case.'''
+
+        old: dict = {
+            'video_id': _TEST_VIDEO_ID,
+            'channel_name': 'XChannel',
+        }
+        new: dict | None = translate_video(old)
+        assert new is not None
+        self.assertEqual(new['channel_handle'], 'XChannel')
+        self.assertNotIn('channel_id', new)
+        self.assertNotIn('channel_title', new)
+
+    def test_does_not_salvage_when_channel_id_present(self) -> None:
+        '''When channel_id is present and valid, the regular path
+        (kept-without-handle) applies — channel_title is not used
+        and the junk handle is just stripped.'''
+
+        old: dict = {
+            'video_id': _TEST_VIDEO_ID,
+            'channel_id': _TEST_CHANNEL_ID,
+            'channel_name': 'Shaun Wood',
+        }
+        new: dict | None = translate_video(old)
+        assert new is not None
+        self.assertEqual(new['channel_id'], _TEST_CHANNEL_ID)
+        self.assertNotIn('channel_handle', new)
+        self.assertNotIn('channel_title', new)
+
+    def test_salvage_fills_canonical_url(self) -> None:
+        '''Salvaged records still get the canonical watch URL
+        filled in like other kept records.'''
+
+        old: dict = {
+            'video_id': _TEST_VIDEO_ID,
+            'channel_name': 'Shaun Wood',
+        }
+        new: dict | None = translate_video(old)
+        assert new is not None
+        self.assertEqual(
+            new['url'],
+            f'https://www.youtube.com/watch?v={_TEST_VIDEO_ID}',
         )
 
 
