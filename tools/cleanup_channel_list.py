@@ -75,13 +75,89 @@ def _is_json_entry(line: str) -> bool:
     return True
 
 
+def _jsonl_channel_field(entry: str) -> str | None:
+    '''
+    Return the value of the ``channel`` field when *entry* is a
+    JSON object containing a non-empty string ``channel`` value,
+    or ``None`` otherwise. Used so that a JSONL line and a plain
+    handle line that point at the same channel collapse to one
+    entry during dedup.
+    '''
+
+    if not (entry.startswith('{') and entry.endswith('}')):
+        return None
+    try:
+        data: object = orjson.loads(entry)
+    except orjson.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    channel: object = data.get('channel')
+    if isinstance(channel, str) and channel:
+        return channel
+    return None
+
+
+def _entry_handle_part(entry: str) -> str | None:
+    '''
+    When *entry* is not a JSON line but contains a comma, return
+    the part before the first ``,`` (whitespace-stripped). Used
+    so dedup keys ``<handle>,<extra>`` lines on the leading
+    handle. Returns ``None`` when *entry* is JSON, has no comma,
+    or has an empty leading part.
+    '''
+
+    if _is_json_entry(entry):
+        return None
+    if ',' not in entry:
+        return None
+    head: str = entry.split(',', 1)[0].strip()
+    return head or None
+
+
+def _entry_dedupe_key(entry: str) -> str:
+    '''
+    Comparison key used by :func:`_dedupe_preserving_case`. A
+    JSONL entry with a ``channel`` field keys on that value
+    (lower-cased); a plain line containing a comma keys on the
+    part before the first comma (lower-cased); every other entry
+    keys on its own lower-cased text.
+    '''
+
+    channel: str | None = _jsonl_channel_field(entry)
+    if channel is not None:
+        return channel.lower()
+    head: str | None = _entry_handle_part(entry)
+    if head is not None:
+        return head.lower()
+    return entry.lower()
+
+
+def _entry_dedupe_rank(entry: str) -> int:
+    '''
+    Preference rank for :func:`_dedupe_preserving_case`. Higher
+    wins. ``2`` for a JSONL line with a ``channel`` field. For
+    plain lines (including ``<handle>,<extra>`` lines) the rank
+    is ``1`` when the handle part contains an upper-case
+    character and ``0`` when it is fully lower-case.
+    '''
+
+    if _jsonl_channel_field(entry) is not None:
+        return 2
+    head: str | None = _entry_handle_part(entry)
+    target: str = head if head is not None else entry
+    if target != target.lower():
+        return 1
+    return 0
+
+
 def _dedupe_preserving_case(entries: list[str]) -> list[str]:
     '''
-    Group *entries* by their lower-cased form. For each group keep
-    the first entry that contains an upper-case character; if the
-    whole group is lower-cased, keep the first entry. The relative
-    order of groups follows the first appearance of each key in
-    the input.
+    Group *entries* by :func:`_entry_dedupe_key` and keep the
+    highest-ranked variant per group (see
+    :func:`_entry_dedupe_rank`). Ties are broken by first
+    appearance, and the relative order of groups follows the
+    first appearance of each key in the input.
     '''
 
     chosen: dict[str, str] = {}
@@ -89,14 +165,14 @@ def _dedupe_preserving_case(entries: list[str]) -> list[str]:
     duplicates_dropped: int = 0
 
     for entry in entries:
-        key: str = entry.lower()
+        key: str = _entry_dedupe_key(entry)
         if key not in chosen:
             chosen[key] = entry
             order.append(key)
             continue
         duplicates_dropped += 1
         existing: str = chosen[key]
-        if existing == existing.lower() and entry != entry.lower():
+        if _entry_dedupe_rank(entry) > _entry_dedupe_rank(existing):
             chosen[key] = entry
 
     if duplicates_dropped:
