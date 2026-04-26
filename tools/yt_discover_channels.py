@@ -37,6 +37,11 @@ from scrape_exchange.creator_map import (
     FileCreatorMap,
     RedisCreatorMap,
 )
+from scrape_exchange.name_map import (
+    NameMap,
+    NullNameMap,
+    RedisNameMap,
+)
 from scrape_exchange.logging import configure_logging
 from scrape_exchange.settings import ScraperSettings
 from scrape_exchange.youtube.youtube_rate_limiter import (
@@ -150,6 +155,27 @@ def parse_channel_id(data: dict) -> str | None:
         ], data, str,
     )
     return channel_id
+
+
+def parse_channel_title(data: dict) -> str | None:
+    '''
+    Parse the human-readable channel title from ytInitialData.
+    Tries ``channelMetadataRenderer.title`` first (matches what
+    the production scrapers write to the NameMap), then the new
+    ``pageHeaderRenderer.pageTitle`` and the legacy
+    ``c4TabbedHeaderRenderer.title`` header paths.
+    '''
+
+    paths: list[list[str]] = [
+        ['metadata', 'channelMetadataRenderer', 'title'],
+        ['header', 'pageHeaderRenderer', 'pageTitle'],
+        ['header', 'c4TabbedHeaderRenderer', 'title'],
+    ]
+    for path in paths:
+        title: str | None = parse_nested_dicts(path, data, str)
+        if title:
+            return title
+    return None
 
 
 def parse_subscriber_count(data: dict) -> int | None:
@@ -276,6 +302,7 @@ class DiscoveredChannel:
         description: str | None,
         subs: int | None,
         channel_id: str | None,
+        title: str | None = None,
     ) -> None:
         self.channel_handle: str = channel_handle
         self.page_links: set[tuple[str, int | None]] = (
@@ -284,6 +311,7 @@ class DiscoveredChannel:
         self.description: str | None = description
         self.subs: int | None = subs
         self.channel_id: str | None = channel_id
+        self.title: str | None = title
 
     @staticmethod
     def parse_channel_page(channel_handle: str,
@@ -291,6 +319,7 @@ class DiscoveredChannel:
         page_links: set[tuple[str, int | None]] = set()
 
         channel_id: str | None = parse_channel_id(page_data)
+        title: str | None = parse_channel_title(page_data)
         subs_count: int | None = parse_subscriber_count(page_data)
 
         description: str | None = parse_nested_dicts(
@@ -372,7 +401,7 @@ class DiscoveredChannel:
 
         return DiscoveredChannel(
             channel_handle, page_links, description,
-            subs_count, channel_id,
+            subs_count, channel_id, title,
         )
 
 
@@ -573,6 +602,38 @@ async def update_creator_map(
         )
 
 
+async def update_name_map(
+    name_map: NameMap | None,
+    title: str | None,
+    channel_id: str | None,
+) -> None:
+    '''
+    Record ``title → channel_id`` in the shared name_map so that
+    downstream tools (notably the re-ingest tool and the channel
+    list cleanup script) can recover a channel id from a legacy
+    display-name reference. Mirrors the writes that
+    ``yt_channel_scrape.py`` and ``yt_rss_scrape.py`` perform.
+
+    Silent no-op when the map is not configured or either field
+    is missing. Backend errors are logged as a warning and never
+    propagated, so a transient storage outage cannot derail the
+    discovery BFS.
+    '''
+    if name_map is None or not title or not channel_id:
+        return
+    try:
+        await name_map.put(title, channel_id)
+    except Exception as exc:
+        _LOGGER.warning(
+            'Failed to update name_map',
+            exc=exc,
+            extra={
+                'title': title,
+                'channel_id': channel_id,
+            },
+        )
+
+
 async def _append_jsonl(out_path: str, payload: dict) -> None:
     '''
     Append *payload* as a single JSONL record to *out_path*. The
@@ -592,13 +653,17 @@ async def record_discovered(
     out_path: str,
     channel_id: str | None = None,
     creator_map: CreatorMap | None = None,
+    title: str | None = None,
+    name_map: NameMap | None = None,
 ) -> None:
     '''Update in-memory dict and append one JSONL record to
     *out_path*.
 
     When both *channel_id* and *creator_map* are supplied, the
     shared creator_map (file- or Redis-backed) is also updated
-    via :func:`update_creator_map`.
+    via :func:`update_creator_map`. Likewise, when *title*,
+    *channel_id*, and *name_map* are all supplied, the shared
+    name_map is updated via :func:`update_name_map`.
     '''
 
     discovered[channel] = subs
@@ -607,6 +672,8 @@ async def record_discovered(
     }
     if channel_id:
         payload['channel_id'] = channel_id
+    if title:
+        payload['channel_title'] = title
     try:
         await _append_jsonl(out_path, payload)
     except OSError as exc:
@@ -618,6 +685,7 @@ async def record_discovered(
     await update_creator_map(
         creator_map, channel, channel_id,
     )
+    await update_name_map(name_map, title, channel_id)
 
 
 async def record_failed(channel: str, info: dict,
@@ -680,6 +748,7 @@ async def _scrape_channel(
         description=yt_channel.description,
         subs=yt_channel.subscriber_count,
         channel_id=yt_channel.channel_id,
+        title=yt_channel.title,
     )
 
 
@@ -876,6 +945,7 @@ def _build_initial_queue(
 
 async def discover(client: AsyncYouTubeClient,
                    creator_map: CreatorMap | None,
+                   name_map: NameMap | None,
                    known_channels: set[str],
                    discovered: dict[str, int | None],
                    fully_scraped: set[str],
@@ -942,6 +1012,8 @@ async def discover(client: AsyncYouTubeClient,
                     discovered, discovered_path,
                     channel_id=channel.channel_id,
                     creator_map=creator_map,
+                    title=channel.title,
+                    name_map=name_map,
                 )
             else:
                 _LOGGER.info(
@@ -1008,6 +1080,30 @@ async def build_creator_map(
         },
     )
     return fmap
+
+
+def build_name_map(
+    settings: 'DiscoverSettings',
+) -> NameMap:
+    '''
+    Construct the name_map backend from *settings*. Returns
+    :class:`RedisNameMap` when ``REDIS_DSN`` is set, otherwise a
+    :class:`NullNameMap` (writes are silently dropped). The
+    creator_map probe in :func:`build_creator_map` already covers
+    Redis connectivity, so no extra probe is performed here.
+    '''
+    if settings.redis_dsn:
+        _LOGGER.info(
+            'Using Redis name_map',
+            extra={'redis_dsn': settings.redis_dsn},
+        )
+        return RedisNameMap(
+            settings.redis_dsn, platform='youtube',
+        )
+    _LOGGER.info(
+        'REDIS_DSN not set; name_map writes will be discarded',
+    )
+    return NullNameMap()
 
 
 class DiscoverSettings(ScraperSettings):
@@ -1100,6 +1196,7 @@ async def main() -> None:
     creator_map: CreatorMap = await build_creator_map(
         settings,
     )
+    name_map: NameMap = build_name_map(settings)
 
     rate_limiter: YouTubeRateLimiter = (
         YouTubeRateLimiter.get(
@@ -1118,7 +1215,7 @@ async def main() -> None:
             else None
         )
         await discover(
-            client, creator_map,
+            client, creator_map, name_map,
             known_channels,
             discovered, fully_scraped, failed,
             disc_channels, fail_channels,
