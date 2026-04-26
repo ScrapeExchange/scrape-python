@@ -70,15 +70,19 @@ from scrape_exchange.youtube.settings import YouTubeScraperSettings
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
-# YouTube handle format: 3–30 characters from any Unicode letter or
-# digit (``\w`` in str-mode regex covers Latin, Cyrillic, Greek, CJK
-# etc. plus underscore), with hyphen and period also allowed. The
-# documented Latin-only set is too strict in practice — YouTube
-# accepts handles like ``@ГеоргиГеоргиев-ь4ч`` and ``@ÁlexMontoya``.
-# Anything containing whitespace, slashes, &, or other URL-incompatible
-# characters still means the legacy slot held a display name or junk
-# and the record is dropped.
-_HANDLE_PATTERN: re.Pattern[str] = re.compile(r'^[\w.\-]{3,30}$')
+# YouTube handle format: 3–30 characters. YouTube's documented
+# allowlist (Latin letters, digits, ``_.-``) is far too strict in
+# practice — confirmed accepted handles include ``@ГеоргиГеоргиев-ь4ч``
+# (Cyrillic), ``@ÁlexMontoya`` (accented Latin), Greek scripts, and
+# even symbols like ``@THENvsNOW™``. So we use a denylist instead:
+# whitespace and URL-structural characters (``/``, ``?``, ``#``,
+# ``\``, ``@``) are the only definitive rejects. A legacy slot
+# holding ``"My Channel Name"`` (whitespace) or ``"foo/bar"`` (slash)
+# still gets dropped as junk; pretty much anything else is accepted
+# and the file is migrated.
+_HANDLE_PATTERN: re.Pattern[str] = re.compile(
+    r'^[^\s/?#\\@]{3,30}$',
+)
 
 # YouTube channel IDs are always ``UC`` followed by 22 characters from
 # the URL-safe base64 alphabet. Mirrors

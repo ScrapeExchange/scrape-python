@@ -197,6 +197,45 @@ class TestTranslateChannelHandleLooksLikeHandle(unittest.TestCase):
             new['channel_handle'], 'ΕκδόσειςΊτανος',
         )
 
+    def test_accepts_handle_with_trademark_symbol(self) -> None:
+        '''
+        YouTube accepts symbol characters (``™``, ``®``, ``©``, …)
+        in handles even though they're outside Unicode word
+        categories. Pinned by the real handle ``@THENvsNOW™``,
+        confirmed by browsing.
+        '''
+
+        old: dict = {
+            'canonical_handle': 'THENvsNOW™',
+            'channel_id': 'UCpQL1LXdI_2pnzrRqk1APWw',
+        }
+        new: dict | None = translate_channel(old)
+        assert new is not None
+        self.assertEqual(new['channel_handle'], 'THENvsNOW™')
+
+    def test_returns_none_when_handle_has_question_mark(self) -> None:
+        old: dict = {
+            'canonical_handle': 'foo?bar',
+            'channel_id': _TEST_CHANNEL_ID,
+        }
+        self.assertIsNone(translate_channel(old))
+
+    def test_returns_none_when_handle_has_hash(self) -> None:
+        old: dict = {
+            'canonical_handle': 'foo#bar',
+            'channel_id': _TEST_CHANNEL_ID,
+        }
+        self.assertIsNone(translate_channel(old))
+
+    def test_returns_none_when_handle_has_internal_at(self) -> None:
+        '''A leading ``@`` is stripped before validation, but ``@``
+        in the middle still indicates junk.'''
+        old: dict = {
+            'canonical_handle': 'foo@bar',
+            'channel_id': _TEST_CHANNEL_ID,
+        }
+        self.assertIsNone(translate_channel(old))
+
     def test_accepts_unicode_handle(self) -> None:
         '''
         YouTube accepts handles in non-Latin scripts (Cyrillic,
