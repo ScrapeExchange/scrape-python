@@ -348,10 +348,44 @@ def translate_video(
 # ---------------------------------------------------------------------------
 
 
+# Marker keys that indicate a record came from the scrape.exchange
+# server: the actual scraped payload sits inside ``data`` and the
+# envelope wraps it with platform/source metadata. At least one of
+# these must be present at the top level for auto-unwrap to fire,
+# so a scraper-format file that happens to carry a ``data`` field
+# is left alone.
+_SERVER_ENVELOPE_KEYS: frozenset[str] = frozenset({
+    'platform_content_id',
+    'platform_creator_id',
+    'source_url',
+})
+
+
+def _unwrap_server_envelope(parsed: dict) -> dict:
+    '''
+    Return the inner record when *parsed* looks like a
+    scrape.exchange server response, else *parsed* unchanged.
+
+    Detection requires both a ``data`` key whose value is a dict
+    and at least one of the known envelope marker keys at the top
+    level. Auto-detection (rather than a CLI flag) lets a single
+    archive directory mix old-format scraper files and server-
+    format files without operator intervention.
+    '''
+
+    inner: object = parsed.get('data')
+    if not isinstance(inner, dict):
+        return parsed
+    if not _SERVER_ENVELOPE_KEYS.intersection(parsed):
+        return parsed
+    return inner
+
+
 async def _read_brotli_json(path: Path) -> dict:
     async with aiofiles.open(path, 'rb') as f:
         data: bytes = await f.read()
-    return orjson.loads(brotli.decompress(data))
+    parsed: dict = orjson.loads(brotli.decompress(data))
+    return _unwrap_server_envelope(parsed)
 
 
 async def _load_creator_maps(
@@ -767,9 +801,20 @@ def _enumerate_archive(root: Path, prefix: str) -> list[str]:
     '''
     Recursively find every ``<prefix>*.json.br`` file under *root*.
     Strings pickle cheaper than ``Path`` objects across processes.
+
+    Directory symlinks are followed (``recurse_symlinks=True``) so
+    archives assembled from multiple disks via symlinked subtrees
+    are walked end to end. Files reached via two different paths
+    (e.g. the real path and a symlinked path) are processed twice,
+    but the second pass hits the ``_already_migrated`` skip and is
+    cheap. Symlink cycles would loop forever — Python's ``rglob``
+    does not detect them — so the operator must avoid linking a
+    subtree back into one of its ancestors.
     '''
     return [
-        str(p) for p in root.rglob(f'{prefix}*.json.br') if p.is_file()
+        str(p) for p in root.rglob(
+            '*.json.br', recurse_symlinks=True,
+        ) if p.is_file()
     ]
 
 

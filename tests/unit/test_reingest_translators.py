@@ -6,9 +6,14 @@ decisions made when collapsing the legacy ``channel`` / ``title`` /
 ``channel_handle`` / ``title`` vocabulary.
 '''
 
+import tempfile
 import unittest
 
+from pathlib import Path
+
 from tools.reingest_from_archive import (
+    _enumerate_archive,
+    _unwrap_server_envelope,
     translate_channel,
     translate_video,
 )
@@ -647,6 +652,127 @@ class TestVideoIdPattern(unittest.TestCase):
         new: dict | None = translate_video(old)
         assert new is not None
         self.assertEqual(new['video_id'], _TEST_VIDEO_ID)
+
+
+class TestUnwrapServerEnvelope(unittest.TestCase):
+    '''
+    Files served by scrape.exchange wrap the actual scraped record
+    inside a ``data`` field at the top level, with envelope
+    metadata (``platform_content_id``, ``platform_creator_id``,
+    ``source_url``) sitting alongside it. The unwrap helper makes
+    those records look like scraper-format records to the
+    translators.
+    '''
+
+    def test_unwraps_when_envelope_keys_present(self) -> None:
+        inner: dict = {
+            'video_id': _TEST_VIDEO_ID,
+            'channel_id': _TEST_CHANNEL_ID,
+            'channel_handle': 'XChannel',
+        }
+        wrapped: dict = {
+            'platform_content_id': _TEST_VIDEO_ID,
+            'platform_creator_id': _TEST_CHANNEL_ID,
+            'source_url': 'https://www.youtube.com/watch?v=' + _TEST_VIDEO_ID,
+            'data': inner,
+        }
+        self.assertIs(_unwrap_server_envelope(wrapped), inner)
+
+    def test_unwraps_with_only_one_envelope_marker(self) -> None:
+        '''A single envelope marker (any of the recognised keys)
+        is enough to fire the unwrap.'''
+        inner: dict = {'channel_id': _TEST_CHANNEL_ID}
+        wrapped: dict = {
+            'platform_creator_id': _TEST_CHANNEL_ID,
+            'data': inner,
+        }
+        self.assertIs(_unwrap_server_envelope(wrapped), inner)
+
+    def test_does_not_unwrap_without_envelope_markers(self) -> None:
+        '''A scraper-format file that happens to carry a ``data``
+        key (no envelope markers) must be left alone.'''
+        scraper_format: dict = {
+            'video_id': _TEST_VIDEO_ID,
+            'channel_id': _TEST_CHANNEL_ID,
+            'data': {'irrelevant': True},
+        }
+        self.assertIs(
+            _unwrap_server_envelope(scraper_format), scraper_format,
+        )
+
+    def test_does_not_unwrap_when_data_not_dict(self) -> None:
+        wrapped: dict = {
+            'platform_content_id': _TEST_VIDEO_ID,
+            'data': 'not a dict',
+        }
+        self.assertIs(_unwrap_server_envelope(wrapped), wrapped)
+
+    def test_does_not_unwrap_when_no_data_key(self) -> None:
+        wrapped: dict = {
+            'platform_content_id': _TEST_VIDEO_ID,
+            'platform_creator_id': _TEST_CHANNEL_ID,
+        }
+        self.assertIs(_unwrap_server_envelope(wrapped), wrapped)
+
+
+class TestEnumerateArchive(unittest.TestCase):
+    '''
+    ``_enumerate_archive`` recursively finds matching files under
+    the archive root and follows directory symlinks (so an archive
+    spread across mounted disks via symlinked subtrees is walked
+    end to end).
+    '''
+
+    def test_finds_files_under_real_subdir(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root: Path = Path(d)
+            (root / 'sub').mkdir()
+            (root / 'sub' / 'channel-a.json.br').write_text('x')
+            found: list[str] = _enumerate_archive(root, 'channel-')
+        self.assertEqual(len(found), 1)
+        self.assertTrue(found[0].endswith('sub/channel-a.json.br'))
+
+    def test_follows_internal_directory_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root: Path = Path(d)
+            (root / 'real').mkdir()
+            (root / 'real' / 'channel-a.json.br').write_text('x')
+            (root / 'link').symlink_to(
+                root / 'real', target_is_directory=True,
+            )
+            found: list[str] = sorted(
+                _enumerate_archive(root, 'channel-'),
+            )
+        # File reachable via both real and link paths.
+        self.assertEqual(len(found), 2)
+        self.assertTrue(any('real/channel-a.json.br' in p for p in found))
+        self.assertTrue(any('link/channel-a.json.br' in p for p in found))
+
+    def test_follows_external_directory_symlink(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as archive_d,
+            tempfile.TemporaryDirectory() as external_d,
+        ):
+            root: Path = Path(archive_d)
+            external: Path = Path(external_d)
+            (external / 'channel-ext.json.br').write_text('x')
+            (root / 'extlink').symlink_to(
+                external, target_is_directory=True,
+            )
+            found: list[str] = _enumerate_archive(root, 'channel-')
+        self.assertEqual(len(found), 1)
+        self.assertTrue(
+            found[0].endswith('extlink/channel-ext.json.br'),
+        )
+
+    def test_filters_by_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root: Path = Path(d)
+            (root / 'channel-a.json.br').write_text('x')
+            (root / 'video-a.json.br').write_text('y')
+            found: list[str] = _enumerate_archive(root, 'channel-')
+        self.assertEqual(len(found), 1)
+        self.assertTrue(found[0].endswith('channel-a.json.br'))
 
 
 if __name__ == '__main__':
