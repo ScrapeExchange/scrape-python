@@ -792,7 +792,11 @@ async def upload_channels(
     for filename in files:
         logging.debug(
             'Considering channel file for bulk upload',
-            extra={'filename': filename},
+            extra={
+                'filename': filename,
+                'batch_position': len(batch_records) + 1,
+                'max_batch_size': max_records,
+            },
         )
         if fm.is_superseded(filename):
             logging.debug(

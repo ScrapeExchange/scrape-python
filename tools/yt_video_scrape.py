@@ -1753,7 +1753,11 @@ async def upload_videos(
     for filename in files:
         logging.debug(
             'Considering video file for bulk upload',
-            extra={'filename': filename},
+            extra={
+                'filename': filename,
+                'batch_position': len(batch_records) + 1,
+                'max_batch_size': max_records,
+            },
         )
         if not await video_needs_uploading(video_fm, filename):
             logging.debug(

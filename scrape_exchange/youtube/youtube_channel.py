@@ -299,10 +299,23 @@ class YouTubeChannel:
         return data
 
     @staticmethod
-    def from_dict(data: dict[str, any]) -> Self:
+    def from_dict(
+        data: dict[str, any],
+        with_download_client: bool = False,
+    ) -> Self:
+        '''
+        Reconstruct a :class:`YouTubeChannel` from a previously-
+        serialised dict. Defaults to ``with_download_client=False``
+        because reconstruction paths (bulk upload, creator-map
+        rebuild, watcher upload, etc.) do not scrape; spinning up
+        yt-dlp per record adds latency and resource cost without
+        benefit. Callers that intend to scrape after reconstruction
+        can opt in via ``with_download_client=True``.
+        '''
         channel = YouTubeChannel(
             channel_handle=data.get('channel_handle'),
             channel_id=data.get('channel_id'),
+            with_download_client=with_download_client,
         )
         channel.title = data.get('title')
         channel.description = data.get('description')
