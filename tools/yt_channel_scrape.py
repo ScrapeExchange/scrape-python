@@ -833,7 +833,7 @@ async def upload_channels(
         batch_records.append((channel_id, filename))
 
     if batch_records:
-        await _upload_one_batch(
+        await _upload_one_channel_batch(
             bytes(batch_buf), batch_records,
             settings, client, fm,
         )
