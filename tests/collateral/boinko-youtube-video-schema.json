@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://scrape.exchange/schemas/boinko-youtube-video-0.0.1",
+  "$id": "https://scrape.exchange/schemas/boinko-youtube-video-0.0.2",
   "title": "YouTube Video Metadata",
   "description": "Schema representing a YouTube video and its associated metadata, including identifiers, descriptive fields, statistics, availability, media information, and related channel data.",
   "type": "object",
@@ -10,31 +10,19 @@
       "description": "YouTube video id",
       "x-scrape-field": "platform_content_id"
     },
-    "title": { "type": ["string", "null"], "description": "Video name" },
-    "long_title": { "type": ["string", "null"], "description": "Long title for the video" },
+    "title": { "type": ["string", "null"], "description": "Channel name" },
+    "long_title": { "type": ["string", "null"], "description": "Long title" },
     "description": { "type": ["string", "null"], "description": "Video description" },
     "channel_id": { "type": ["string", "null"], "description": "Channel id" },
-    "channel_handle": {
+    "channel_name": {
       "type": ["string", "null"],
       "description": "Channel handle",
       "x-scrape-field": "platform_creator_id"
     },
-    "channel_title": {
-      "type": ["string", "null"],
-      "description": "Channel title"
-    },
-    "channel_url": {
-      "type": ["string", "null"],
-      "format": "uri",
-      "description": "Channel URL"
-    },
+    "channel_url": { "type": ["string", "null"], "format": "uri", "description": "Channel URL" },
     "channel_is_verified": { "type": ["boolean", "null"], "description": "Channel verified flag" },
     "channel_follower_count": { "type": ["integer", "null"], "minimum": 0 },
-    "channel_thumbnail": {
-      "$ref": "#/$defs/thumbnail",
-      "description": "Channel thumbnail",
-      "x-scrape-field": "platform_creator_thumbnail_url"
-    },
+    "channel_thumbnail": { "$ref": "#/$defs/thumbnail" },
     "availability": { "type": ["string", "null"] },
     "view_count": {
       "type": ["integer", "null"],
@@ -56,12 +44,7 @@
       "minimum": 0,
       "x-scrape-gauge": true
     },
-    "url": {
-      "type": ["string", "null"],
-      "format": "uri",
-      "x-scrape-field": "source_url",
-      "description": "URL of the video"
-    },
+    "url": { "type": ["string", "null"], "format": "uri" },
     "embed_url": { "type": ["string", "null"], "format": "uri" },
     "is_live": { "type": "boolean" },
     "was_live": { "type": "boolean" },
@@ -77,28 +60,19 @@
     "locale": { "type": ["string", "null"] },
     "default_audio_language": { "type": ["string", "null"] },
     "tags": { "type": "array", "items": { "type": "string" } },
-    "category": {
-      "type": ["string", "null"],
-      "description": "Video category"
-    },
+    "categories": { "type": "array", "items": { "type": "string" }, "description": "Channel categories"},
     "annotations": { "type": "array", "items": { "type": "string" } },
     "keywords": { "type": "array", "items": { "type": "string" } },
     "privacy_status": { "type": "string" },
     "created_timestamp": { "type": ["string", "null"], "format": "date-time" },
     "uploaded_timestamp": { "type": ["string", "null"], "format": "date-time" },
     "published_timestamp": { "type": ["string", "null"], "format": "date-time" },
-    "thumbnails": {
-      "type": "object",
-      "additionalProperties": {
-        "$ref": "#/$defs/thumbnail"
-      },
-      "x-scrape-field": "platform_content_thumbnail_url"
-    },
+    "thumbnails": { "type": "object", "additionalProperties": { "$ref": "#/$defs/thumbnail" } },
     "subtitles": { "type": "object", "additionalProperties": { "$ref": "#/$defs/caption" } },
     "automatic_captions": { "type": "object", "additionalProperties": { "$ref": "#/$defs/caption" } },
     "formats": { "type": "object", "additionalProperties": { "$ref": "#/$defs/format" } }
   },
-  "required": ["video_id", "url"],
+  "required": ["video_id"],
   "additionalProperties": false,
   "$defs": {
     "thumbnail": {

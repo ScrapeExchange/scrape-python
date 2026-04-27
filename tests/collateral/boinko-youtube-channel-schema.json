@@ -1,19 +1,18 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://scrape.exchange/schemas/boinko-youtube-channel-0.0.1",
+  "$id": "https://scrape.exchange/schemas/boinko-youtube-channel-0.0.2",
   "title": "YouTube Channel Metadata",
   "description": "Schema for representing metadata about a YouTube channel, including identifiers, descriptive fields, statistics, and related media.",
   "type": "object",
   "properties": {
     "channel_id": {
       "type": ["string", "null"],
-      "description": "The channel identifier",
-      "x-scrape-field": "platform_content_id"
+      "description": "The channel identifier"
     },
-    "channel_handle": {
+    "channel": {
       "type": "string",
-      "description": "The channel handle (without @)",
-      "x-scrape-field": "platform_creator_id"
+      "description": "The channel vanity name (without @)",
+      "x-scrape-field": ["platform_creator_id", "platform_content_id"]
     },
     "title": {
       "type": ["string", "null"],
@@ -28,9 +27,10 @@
       "items": { "type": "string" },
       "description": "List of keywords/tags associated with the channel"
     },
-    "category": {
-      "type": ["string", "null"],
-      "description": "The channel category/genre if available"
+    "categories": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Channel categories"
     },
     "is_family_safe": {
       "type": "boolean",
@@ -48,11 +48,7 @@
     "channel_thumbnails": {
       "type": "array",
       "items": { "$ref": "#/$defs/thumbnail" },
-      "description": "Thumbnails for the channel avatar",
-      "x-scrape-field": [
-        "platform_creator_thumbnail_url",
-        "platform_content_thumbnail_url"
-      ]
+      "description": "Thumbnails for the channel avatar"
     },
     "banners": {
       "type": "array",
@@ -68,12 +64,6 @@
       "type": ["string", "null"],
       "format": "date-time",
       "description": "Channel joined date as an ISO-8601 datetime string"
-    },
-    "url": {
-      "type": ["string", "null"],
-      "format": "uri",
-      "description": "URL of the channel homepage, can use /@<handle> or /channel/<channel_id>",
-      "x-scrape-field": "source_url"
     },
     "rss_url": {
       "type": ["string", "null"],
@@ -133,7 +123,7 @@
       "description": "Video IDs belonging to the channel (only present when requested)"
     }
   },
-  "required": ["channel_handle", "channel_id", "url"],
+  "required": ["channel"],
   "additionalProperties": false,
   "$defs": {
     "thumbnail": {

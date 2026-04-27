@@ -893,6 +893,7 @@ async def _enqueue_links(
     channel: DiscoveredChannel,
     min_subs: int,
     known_channels: set[str],
+    creator_handles: set[str],
     discovered: dict[str, int | None],
     fully_scraped: set[str],
     failed: dict[str, dict],
@@ -906,6 +907,8 @@ async def _enqueue_links(
         if not link_name:
             continue
         if link_name.lower() in known_channels:
+            continue
+        if link_name.lower() in creator_handles:
             continue
         if link_name.lower() in IGNORE_CHANNELS:
             continue
@@ -927,6 +930,7 @@ def _build_initial_queue(
     fully_scraped: set[str],
     failed: dict[str, dict],
     known_channels: set[str],
+    creator_handles: set[str],
 ) -> deque[str]:
     '''Seed the BFS queue with YOUTUBE_URLS and
     orphan channels from a previous run.'''
@@ -941,6 +945,7 @@ def _build_initial_queue(
         - fully_scraped
         - set(failed.keys())
         - known_channels
+        - creator_handles
         - set(seeds)
     )
     to_scrape.extend(orphans)
@@ -957,6 +962,7 @@ async def discover(client: AsyncYouTubeClient,
                    creator_map: CreatorMap | None,
                    name_map: NameMap | None,
                    known_channels: set[str],
+                   creator_handles: set[str],
                    discovered: dict[str, int | None],
                    fully_scraped: set[str],
                    failed: dict[str, dict],
@@ -969,7 +975,7 @@ async def discover(client: AsyncYouTubeClient,
 
     to_scrape: deque[str] = _build_initial_queue(
         discovered, fully_scraped, failed,
-        known_channels,
+        known_channels, creator_handles,
     )
     in_queue: set[str] = set(to_scrape)
 
@@ -1035,12 +1041,32 @@ async def discover(client: AsyncYouTubeClient,
                 )
 
         await _enqueue_links(
-            channel, min_subs, known_channels,
+            channel, min_subs, known_channels, creator_handles,
             discovered, fully_scraped, failed,
             in_queue, to_scrape, discovered_path,
         )
 
     _LOGGER.info('BFS queue empty, discovery complete')
+
+
+async def load_creator_handles(
+    creator_map: CreatorMap,
+) -> set[str]:
+    '''
+    Return a lowercased set of every handle stored in
+    *creator_map*. Used by the discovery BFS when
+    ``skip_known_creators`` is enabled, to avoid re-scraping
+    channels whose ``UC-id → handle`` mapping is already known.
+    The CreatorMap interface is keyed by ``creator_id`` and has
+    no reverse lookup, so the full mapping must be loaded once
+    at startup and cached in memory.
+    '''
+    mapping: dict[str, str] = await creator_map.get_all()
+    return {
+        handle.lower().lstrip('@')
+        for handle in mapping.values()
+        if handle
+    }
 
 
 async def build_creator_map(
@@ -1172,6 +1198,19 @@ class DiscoverSettings(ScraperSettings):
             'Minimum subscriber count to keep a channel'
         ),
     )
+    skip_known_creators: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            'YOUTUBE_SKIP_KNOWN_CREATORS',
+            'skip_known_creators',
+        ),
+        description=(
+            'Skip channels whose handle is already in the '
+            'creator_map. Useful for resumed runs that aim '
+            'to discover new channels rather than refresh '
+            'known ones.'
+        ),
+    )
 
 
 async def main() -> None:
@@ -1208,6 +1247,14 @@ async def main() -> None:
     )
     name_map: NameMap = build_name_map(settings)
 
+    creator_handles: set[str] = set()
+    if settings.skip_known_creators:
+        creator_handles = await load_creator_handles(creator_map)
+        _LOGGER.info(
+            'Loaded creator_map handles for skip-list',
+            extra={'count': len(creator_handles)},
+        )
+
     rate_limiter: YouTubeRateLimiter = (
         YouTubeRateLimiter.get(
             state_dir=settings.rate_limiter_state_dir,
@@ -1226,7 +1273,7 @@ async def main() -> None:
         )
         await discover(
             client, creator_map, name_map,
-            known_channels,
+            known_channels, creator_handles,
             discovered, fully_scraped, failed,
             disc_channels, fail_channels,
             settings.min_subs,
