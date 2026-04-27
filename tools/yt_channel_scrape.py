@@ -433,17 +433,20 @@ async def _run_worker(
         settings.channel_concurrency = 1
 
     if not settings.channel_no_upload:
+        logging.info('Starting initial channel upload pass')
         await upload_channels(
             settings, ctx.client, fm,
             creator_map_backend, name_map_backend,
         )
 
     if settings.channel_upload_only:
+        logging.info('Starting watching for uploads')
         await _watch_and_upload_channels(
             settings, ctx.client, fm,
             creator_map_backend, name_map_backend,
         )
     else:
+        logging.info('Starting scraping channels')
         await scrape_channels(
             settings, ctx.client, fm,
             creator_map_backend, name_map_backend,
@@ -763,6 +766,7 @@ async def upload_channels(
     arrive and bulk batching offers no benefit for single-file
     arrivals.
     '''
+
     files: list[str] = [
         f for f in fm.list_base(
             prefix=CHANNEL_FILE_PREFIX,
