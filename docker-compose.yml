@@ -50,11 +50,13 @@ services:
       - "tools/yt_video_scrape.py"
       - "--video-upload-only"
       - "true"
+      - "--video-no-upload"
+      - "false"
     depends_on:
       - po-token-provider
     environment:
       <<: *container-paths
-      VIDEO_LOG_FILE: /var/log/scrape/scraper/yt_video.log
+      VIDEO_LOG_FILE: /var/log/scrape/scraper/yt_video-upload-only.log
 
   channel:
     <<: *scraper-common
@@ -69,9 +71,11 @@ services:
       - "tools/yt_channel_scrape.py"
       - "--channel-upload-only"
       - "true"
+      - "--channel-no-upload"
+      - "false"
     environment:
       <<: *container-paths
-      CHANNEL_LOG_FILE: /var/log/scrape/scraper/yt_channel.log
+      CHANNEL_LOG_FILE: /var/log/scrape/scraper/yt_channel-upload-only.log
 
   rss:
     <<: *scraper-common
