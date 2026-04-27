@@ -23,6 +23,7 @@ from pathlib import Path
 from random import shuffle
 
 import brotli
+import orjson
 
 from httpx import Response
 
@@ -31,6 +32,10 @@ from prometheus_client import Counter, Gauge, Histogram
 from pydantic import AliasChoices, Field, field_validator
 from yt_dlp.YoutubeDL import YoutubeDL
 
+from scrape_exchange.bulk_upload import (
+    BulkBatchOutcome,
+    upload_bulk_batch,
+)
 from scrape_exchange.exchange_client import ExchangeClient
 from scrape_exchange.file_management import AssetFileManagement
 from scrape_exchange.content_claim import (
@@ -235,6 +240,33 @@ METRIC_VIDEOS_SKIPPED_HAS_FORMATS = Counter(
     'Number of videos skipped because the server already '
     'has data with a non-empty formats list',
     ['worker_id'],
+)
+
+# -- scheduled bulk-upload metrics --
+METRIC_VIDEOS_BULK_UPLOADED = Counter(
+    'yt_video_bulk_uploaded_total',
+    'Video records confirmed uploaded via the bulk API '
+    '(per-record success in the job results).',
+    ['worker_id'],
+)
+METRIC_VIDEOS_BULK_FAILED = Counter(
+    'yt_video_bulk_failed_total',
+    'Video records that the bulk worker reported as failed. '
+    'Source files are left in base_dir for the next iteration.',
+    ['worker_id'],
+)
+METRIC_VIDEOS_BULK_MISSING_RESULT = Counter(
+    'yt_video_bulk_missing_result_total',
+    'Video records that were submitted in a bulk batch but did '
+    'not appear in the job results. Source files are left in '
+    'base_dir for the next iteration.',
+    ['worker_id'],
+)
+METRIC_VIDEO_BULK_BATCHES = Counter(
+    'yt_video_bulk_batches_total',
+    'Bulk-upload batches dispatched by the scheduled video '
+    'upload sweep.',
+    ['worker_id', 'outcome'],
 )
 
 # -- upload-only watcher metrics --
@@ -498,6 +530,14 @@ async def _run_worker(
     else:
         creator_map_backend = FileCreatorMap(
             settings.channel_map_file,
+        )
+
+    if (
+        not settings.video_no_upload
+        and ctx.client is not None
+    ):
+        await upload_videos(
+            settings, ctx.client, video_fm, creator_map_backend,
         )
 
     await worker_loop(
@@ -1545,6 +1585,211 @@ def enqueue_upload_video(
         entity='video',
         log_extra={'video_id': video.video_id},
     )
+
+
+async def _collect_video_record(
+    filename: str,
+    settings: VideoSettings,
+    video_fm: AssetFileManagement,
+    creator_map_backend: CreatorMap,
+    proxy: str | None,
+) -> tuple[str, dict] | None:
+    '''
+    Read *filename* from base_dir and prepare a bulk-upload record.
+
+    :returns: ``(video_id, record_dict)`` on success, or ``None``
+        when the file should be skipped (read error, unresolved
+        handle, or missing ``video_id``).
+
+    Side effects: updates the shared creator_map via
+    :func:`resolve_video_upload_handle`.
+    '''
+    parsed: tuple[str, str, bool] | None = _parse_entry(filename)
+    if parsed is None:
+        logging.warning(
+            'Skipping unrecognised video filename',
+            extra={'filename': filename},
+        )
+        return None
+    video_id_from_name: str
+    prefix: str
+    video_id_from_name, prefix, _ = parsed
+
+    video: YouTubeVideo | None = await _load_video_file(
+        video_id_from_name,
+        settings.video_data_directory,
+        prefix, filename, video_fm,
+    )
+    if video is None:
+        return None
+
+    handle: str | None = await resolve_video_upload_handle(
+        video, creator_map_backend, proxy,
+    )
+    if handle is None:
+        # Handle resolution failed (e.g. InnerTube transient
+        # error). Leave the file for the next iteration.
+        logging.info(
+            'Video bulk upload skipped: handle unresolved; '
+            'file remains for retry',
+            extra={
+                'filename': filename,
+                'video_id': video.video_id,
+            },
+        )
+        return None
+    video.channel_handle = handle
+
+    if not video.video_id:
+        logging.warning(
+            'Video has no video_id, skipping bulk upload',
+            extra={'filename': filename},
+        )
+        return None
+
+    return video.video_id, video.to_dict()
+
+
+async def _upload_one_video_batch(
+    batch_buf: bytes,
+    batch_records: list[tuple[str, str]],
+    settings: VideoSettings,
+    client: ExchangeClient,
+    video_fm: AssetFileManagement,
+) -> None:
+    '''
+    Dispatch one prepared batch of video records via the shared
+    bulk-upload pipeline and route per-record outcomes into the
+    video-specific Prometheus metrics.
+    '''
+    if not batch_records:
+        return
+
+    outcome: BulkBatchOutcome = await upload_bulk_batch(
+        batch_buf, batch_records,
+        schema_owner=settings.schema_owner,
+        schema_version=settings.schema_version,
+        platform='youtube',
+        entity='video',
+        exchange_url=settings.exchange_url,
+        client=client,
+        fm=video_fm,
+        progress_timeout_seconds=(
+            settings.bulk_progress_timeout_seconds
+        ),
+        filename_prefix='videos',
+    )
+    METRIC_VIDEO_BULK_BATCHES.labels(
+        worker_id=get_worker_id(), outcome=outcome.status,
+    ).inc()
+    if outcome.success:
+        METRIC_VIDEOS_BULK_UPLOADED.labels(
+            worker_id=get_worker_id(),
+        ).inc(outcome.success)
+    if outcome.failed:
+        METRIC_VIDEOS_BULK_FAILED.labels(
+            worker_id=get_worker_id(),
+        ).inc(outcome.failed)
+    if outcome.missing:
+        METRIC_VIDEOS_BULK_MISSING_RESULT.labels(
+            worker_id=get_worker_id(),
+        ).inc(outcome.missing)
+
+
+async def upload_videos(
+    settings: VideoSettings,
+    client: ExchangeClient,
+    video_fm: AssetFileManagement,
+    creator_map_backend: CreatorMap,
+) -> None:
+    '''
+    Sweep ``base_dir`` for already-scraped ``video-dlp-*`` files
+    and upload them via the bulk API in batches of up to
+    ``settings.bulk_batch_size`` records (or
+    ``settings.bulk_max_batch_bytes`` bytes, whichever is hit
+    first). Per-record success in the job results promotes the
+    matching source file to ``uploaded_dir``; failed and missing
+    records are left in ``base_dir`` for the next iteration.
+
+    The live-scrape worker keeps using the per-video POST path at
+    :func:`enqueue_upload_video` because it processes videos as
+    they are scraped and bulk batching offers no latency benefit
+    for that path.
+    '''
+    files: list[str] = video_fm.list_base(
+        prefix=VIDEO_YTDLP_PREFIX, suffix=FILE_EXTENSION,
+    )
+    files = [f for f in files if not f.endswith('failed')]
+    logging.info(
+        'Found video files for bulk upload',
+        extra={'files_length': len(files)},
+    )
+    if not files:
+        return
+
+    # Pick the first proxy for handle resolution on creator_map
+    # misses. ``resolve_video_upload_handle`` only needs a proxy
+    # for InnerTube fallback; cache hits don't touch the network.
+    proxies: list[str] = (
+        [p.strip() for p in settings.proxies.split(',') if p.strip()]
+        if settings.proxies else []
+    )
+    proxy: str | None = proxies[0] if proxies else None
+
+    batch_buf: bytearray = bytearray()
+    batch_records: list[tuple[str, str]] = []
+    max_records: int = settings.bulk_batch_size
+    max_bytes: int = settings.bulk_max_batch_bytes
+
+    for filename in files:
+        if not await video_needs_uploading(video_fm, filename):
+            continue
+
+        record: tuple[str, dict] | None = (
+            await _collect_video_record(
+                filename, settings, video_fm,
+                creator_map_backend, proxy,
+            )
+        )
+        if record is None:
+            continue
+        video_id: str
+        record_dict: dict
+        video_id, record_dict = record
+
+        line: bytes = orjson.dumps(record_dict) + b'\n'
+        if len(line) > max_bytes:
+            logging.warning(
+                'Video record exceeds bulk-batch byte cap, '
+                'skipping',
+                extra={
+                    'filename': filename,
+                    'video_id': video_id,
+                    'record_bytes': len(line),
+                    'max_bytes': max_bytes,
+                },
+            )
+            continue
+
+        if (
+            len(batch_records) >= max_records
+            or len(batch_buf) + len(line) > max_bytes
+        ):
+            await _upload_one_video_batch(
+                bytes(batch_buf), batch_records,
+                settings, client, video_fm,
+            )
+            batch_buf = bytearray()
+            batch_records = []
+
+        batch_buf.extend(line)
+        batch_records.append((video_id, filename))
+
+    if batch_records:
+        await _upload_one_video_batch(
+            bytes(batch_buf), batch_records,
+            settings, client, video_fm,
+        )
 
 
 if __name__ == '__main__':

@@ -1,18 +1,25 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://scrape.exchange/schemas/boinko-youtube-channel-0.0.2",
+  "$id": "https://scrape.exchange/schemas/boinko-youtube-channel-0.0.1",
   "title": "YouTube Channel Metadata",
   "description": "Schema for representing metadata about a YouTube channel, including identifiers, descriptive fields, statistics, and related media.",
   "type": "object",
   "properties": {
     "channel_id": {
       "type": ["string", "null"],
-      "description": "The channel identifier"
+      "description": "The channel identifier",
+      "x-scrape-field": "platform_content_id"
     },
-    "channel": {
+    "channel_handle": {
       "type": "string",
-      "description": "The channel vanity name (without @)",
-      "x-scrape-field": ["platform_creator_id", "platform_content_id"]
+      "description": "The channel handle (without @)",
+      "x-scrape-field": "platform_creator_id"
+    },
+    "url": {
+      "type": "string",
+      "format": "uri",
+      "description": "The full URL to the channel page, either @handle or /channel/channel_id URL",
+      "x-scrape-field": "source_url"
     },
     "title": {
       "type": ["string", "null"],
@@ -27,10 +34,9 @@
       "items": { "type": "string" },
       "description": "List of keywords/tags associated with the channel"
     },
-    "categories": {
-      "type": "array",
-      "items": { "type": "string" },
-      "description": "Channel categories"
+    "category": {
+      "type": ["string", "null"],
+      "description": "The channel category/genre if available"
     },
     "is_family_safe": {
       "type": "boolean",
@@ -48,7 +54,11 @@
     "channel_thumbnails": {
       "type": "array",
       "items": { "$ref": "#/$defs/thumbnail" },
-      "description": "Thumbnails for the channel avatar"
+      "description": "Thumbnails for the channel avatar",
+      "x-scrape-field": [
+        "platform_creator_thumbnail_url",
+        "platform_content_thumbnail_url"
+      ]
     },
     "banners": {
       "type": "array",
@@ -123,7 +133,7 @@
       "description": "Video IDs belonging to the channel (only present when requested)"
     }
   },
-  "required": ["channel"],
+  "required": ["channel_handle", "channel_id", "url"],
   "additionalProperties": false,
   "$defs": {
     "thumbnail": {

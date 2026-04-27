@@ -23,6 +23,7 @@ from random import shuffle
 from pathlib import Path
 
 import aiofiles
+import orjson
 
 from httpx import Response
 from watchfiles import awatch, Change
@@ -39,6 +40,10 @@ from scrape_exchange.name_map import (
     NameMap,
     NullNameMap,
     RedisNameMap,
+)
+from scrape_exchange.bulk_upload import (
+    BulkBatchOutcome,
+    upload_bulk_batch,
 )
 from scrape_exchange.exchange_client import ExchangeClient
 
@@ -62,6 +67,7 @@ CHANNEL_FILE_POSTFIX = '.json.br'
 
 MAX_NEW_CHANNELS: int = 1000
 MAX_RESOLVED_CHANNELS: int = 100
+
 
 
 class ChannelSettings(YouTubeScraperSettings):
@@ -276,6 +282,32 @@ METRIC_CHANNEL_NO_CONTENT_FOUND = Counter(
     'Number of channels scraped that had no videos, playlists, courses, '
     'podcasts, or products',
     ['worker_id', 'proxy_ip', 'proxy_network'],
+)
+
+# -- scheduled bulk-upload metrics --
+METRIC_CHANNELS_BULK_UPLOADED = Counter(
+    'yt_channel_bulk_uploaded_total',
+    'Channel records confirmed uploaded via the bulk API '
+    '(per-record success in the job results).',
+    ['worker_id'],
+)
+METRIC_CHANNELS_BULK_FAILED = Counter(
+    'yt_channel_bulk_failed_total',
+    'Channel records that the bulk worker reported as failed. '
+    'Source files are left in base_dir for the next iteration.',
+    ['worker_id'],
+)
+METRIC_CHANNELS_BULK_MISSING_RESULT = Counter(
+    'yt_channel_bulk_missing_result_total',
+    'Channel records that were submitted in a bulk batch but did '
+    'not appear in the job results. Source files are left in '
+    'base_dir for the next iteration.',
+    ['worker_id'],
+)
+METRIC_BULK_BATCHES = Counter(
+    'yt_channel_bulk_batches_total',
+    'Bulk-upload batches dispatched by the scheduled upload sweep.',
+    ['worker_id', 'outcome'],
 )
 
 # -- upload-only watcher metrics --
@@ -605,6 +637,103 @@ async def scrape_channels(
         )
 
 
+async def _collect_channel_record(
+    filename: str,
+    fm: AssetFileManagement,
+    creator_map_backend: CreatorMap,
+    name_map_backend: NameMap,
+) -> tuple[str, dict] | None:
+    '''
+    Read *filename* from base_dir and prepare a bulk-upload record.
+
+    :returns: ``(channel_id, record_dict)`` on success, or ``None``
+        when the file should be skipped (read error, missing
+        ``channel_id``).
+
+    Side effects: updates the shared creator_map and name_map via
+    :func:`resolve_channel_upload_handle`.
+    '''
+    try:
+        channel_data: dict = await fm.read_file(filename)
+        channel: YouTubeChannel = (
+            YouTubeChannel.from_dict(channel_data)
+        )
+    except Exception as exc:
+        logging.error(
+            'Error reading channel file for bulk upload',
+            exc=exc,
+            extra={'filename': filename},
+        )
+        return None
+
+    handle: str = await resolve_channel_upload_handle(
+        channel, creator_map_backend, name_map_backend,
+    )
+    channel.channel_handle = handle
+
+    if not channel.channel_id:
+        logging.warning(
+            'Channel has no channel_id, skipping bulk upload',
+            extra={
+                'filename': filename,
+                'channel_handle': handle,
+            },
+        )
+        return None
+
+    return channel.channel_id, channel.to_dict(with_video_ids=False)
+
+
+async def _upload_one_channel_batch(
+    batch_buf: bytes,
+    batch_records: list[tuple[str, str]],
+    settings: ChannelSettings,
+    client: ExchangeClient,
+    fm: AssetFileManagement,
+) -> None:
+    '''
+    Dispatch one prepared batch of channel records via the shared
+    bulk-upload pipeline and route per-record outcomes into the
+    channel-specific Prometheus metrics. The shared helper handles
+    POST, progress streaming, and result reconciliation; this
+    function only translates lifecycle outcomes into metric
+    increments.
+    '''
+    if not batch_records:
+        return
+
+    outcome: BulkBatchOutcome = await upload_bulk_batch(
+        batch_buf, batch_records,
+        schema_owner=settings.schema_owner,
+        schema_version=settings.schema_version,
+        platform='youtube',
+        entity='channel',
+        exchange_url=settings.exchange_url,
+        client=client,
+        fm=fm,
+        progress_timeout_seconds=(
+            settings.bulk_progress_timeout_seconds
+        ),
+        filename_prefix='channels',
+    )
+    METRIC_BULK_BATCHES.labels(
+        worker_id=get_worker_id(), outcome=outcome.status,
+    ).inc()
+    if outcome.success:
+        METRIC_CHANNELS_BULK_UPLOADED.labels(
+            worker_id=get_worker_id(),
+        ).inc(outcome.success)
+    if outcome.failed:
+        METRIC_CHANNELS_BULK_FAILED.labels(
+            worker_id=get_worker_id(),
+        ).inc(outcome.failed)
+    if outcome.missing:
+        METRIC_CHANNELS_BULK_MISSING_RESULT.labels(
+            worker_id=get_worker_id(),
+        ).inc(outcome.missing)
+
+
+
 async def upload_channels(
     settings: ChannelSettings,
     client: ExchangeClient,
@@ -612,6 +741,20 @@ async def upload_channels(
     creator_map_backend: CreatorMap,
     name_map_backend: NameMap,
 ) -> None:
+    '''
+    Sweep ``base_dir`` for pending channel files and upload them
+    via the bulk API in batches of up to
+    ``settings.bulk_batch_size`` records (or
+    ``settings.bulk_max_batch_bytes`` bytes, whichever is hit
+    first). Per-record success in the job results promotes the
+    matching source file to ``uploaded_dir``; failed and missing
+    records are left in ``base_dir`` for the next iteration.
+
+    The watcher loop ``_watch_and_upload_channels`` keeps using
+    the per-channel POST path because it processes files as they
+    arrive and bulk batching offers no benefit for single-file
+    arrivals.
+    '''
     files: list[str] = [
         f for f in fm.list_base(
             prefix=CHANNEL_FILE_PREFIX,
@@ -623,14 +766,76 @@ async def upload_channels(
         worker_id=get_worker_id()
     ).set(len(files))
     logging.info(
-        'Found already scraped channel files that may '
-        'need to be uploaded',
+        'Found channel files for bulk upload',
         extra={'files_length': len(files)},
     )
+    if not files:
+        return
+
+    batch_buf: bytearray = bytearray()
+    batch_records: list[tuple[str, str]] = []
+    max_records: int = settings.bulk_batch_size
+    max_bytes: int = settings.bulk_max_batch_bytes
+
     for filename in files:
-        await _upload_single_channel(
-            filename, settings, client, fm,
-            creator_map_backend, name_map_backend,
+        if fm.is_superseded(filename):
+            METRIC_UPLOADED_FILE_EXISTS.labels(
+                worker_id=get_worker_id(),
+            ).inc()
+            try:
+                await fm.delete(filename, fail_ok=False)
+            except Exception as exc:
+                logging.warning(
+                    'Failed to delete superseded channel file',
+                    exc=exc,
+                    extra={'filename': filename},
+                )
+            continue
+
+        record: tuple[str, dict] | None = (
+            await _collect_channel_record(
+                filename, fm,
+                creator_map_backend, name_map_backend,
+            )
+        )
+        if record is None:
+            continue
+        channel_id: str
+        record_dict: dict
+        channel_id, record_dict = record
+
+        line: bytes = orjson.dumps(record_dict) + b'\n'
+        if len(line) > max_bytes:
+            logging.warning(
+                'Channel record exceeds bulk-batch byte cap, '
+                'skipping',
+                extra={
+                    'filename': filename,
+                    'channel_id': channel_id,
+                    'record_bytes': len(line),
+                    'max_bytes': max_bytes,
+                },
+            )
+            continue
+
+        if (
+            len(batch_records) >= max_records
+            or len(batch_buf) + len(line) > max_bytes
+        ):
+            await _upload_one_channel_batch(
+                bytes(batch_buf), batch_records,
+                settings, client, fm,
+            )
+            batch_buf = bytearray()
+            batch_records = []
+
+        batch_buf.extend(line)
+        batch_records.append((channel_id, filename))
+
+    if batch_records:
+        await _upload_one_batch(
+            bytes(batch_buf), batch_records,
+            settings, client, fm,
         )
 
 

@@ -43,3 +43,37 @@ class YouTubeScraperSettings(ScraperSettings):
         ),
         description='Directory to save the scraped video data',
     )
+    bulk_batch_size: int = Field(
+        default=1000,
+        validation_alias=AliasChoices(
+            'BULK_BATCH_SIZE', 'bulk_batch_size',
+        ),
+        description=(
+            'Maximum number of records sent per bulk-upload POST. '
+            'The byte cap ``bulk_max_batch_bytes`` is applied '
+            'alongside and whichever cap is hit first finalises '
+            'the batch.'
+        ),
+    )
+    bulk_max_batch_bytes: int = Field(
+        default=7 * 1024 * 1024 * 1024,
+        validation_alias=AliasChoices(
+            'BULK_MAX_BATCH_BYTES', 'bulk_max_batch_bytes',
+        ),
+        description=(
+            'Soft byte cap for one bulk-upload batch. Stays under '
+            'the bulk endpoint server-side 8 GB limit with '
+            'headroom for multipart framing.'
+        ),
+    )
+    bulk_progress_timeout_seconds: float = Field(
+        default=1800.0,
+        validation_alias=AliasChoices(
+            'BULK_PROGRESS_TIMEOUT', 'bulk_progress_timeout',
+        ),
+        description=(
+            'Maximum seconds to wait on the bulk-upload progress '
+            'WebSocket for a terminal status before giving up. '
+            'Source files are left in base_dir for the next run.'
+        ),
+    )
