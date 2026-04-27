@@ -122,11 +122,23 @@ async def stream_bulk_job_progress(
         asyncio.get_running_loop().time() + timeout_seconds
     )
 
+    logging.debug(
+        'Connecting to bulk progress WebSocket',
+        extra={
+            'job_id': job_id,
+            'ws_url': ws_url,
+            'timeout_seconds': timeout_seconds,
+        },
+    )
     try:
         async with websockets.connect(
             ws_url,
             additional_headers=[('Authorization', auth_header)],
         ) as ws:
+            logging.debug(
+                'Bulk progress WebSocket connected',
+                extra={'job_id': job_id},
+            )
             while True:
                 remaining: float = (
                     deadline - asyncio.get_running_loop().time()
@@ -166,6 +178,16 @@ async def stream_bulk_job_progress(
                     continue
 
                 status: str = message.get('status', '')
+                logging.debug(
+                    'Bulk progress WebSocket message',
+                    extra={
+                        'job_id': job_id,
+                        'status': status,
+                        'worker': message.get('worker'),
+                        'message': message.get('message'),
+                        'timestamp': message.get('timestamp'),
+                    },
+                )
                 if status in TERMINAL_BULK_STATUSES:
                     logging.info(
                         'Bulk job reached terminal status',
@@ -217,6 +239,10 @@ async def fetch_bulk_results(
     results_url: str = (
         f'{exchange_url}{BULK_API_PATH}/{job_id}/results'
     )
+    logging.debug(
+        'Fetching bulk job results',
+        extra={'job_id': job_id, 'results_url': results_url},
+    )
     try:
         resp: Response = await client.get(results_url)
     except Exception as exc:
@@ -237,7 +263,12 @@ async def fetch_bulk_results(
         )
         return []
     body: dict = resp.json()
-    return body.get('results', [])
+    results: list[dict] = body.get('results', [])
+    logging.debug(
+        'Fetched bulk job results',
+        extra={'job_id': job_id, 'results_count': len(results)},
+    )
+    return results
 
 
 async def apply_bulk_results(
@@ -267,6 +298,15 @@ async def apply_bulk_results(
     by_index: dict[int, str] = {
         idx: fname for idx, (_, fname) in enumerate(batch_records)
     }
+    logging.debug(
+        'Reconciling bulk results',
+        extra={
+            'batch_id': batch_id,
+            'job_id': job_id,
+            'results_count': len(results),
+            'records_sent': len(batch_records),
+        },
+    )
 
     seen: set[str] = set()
     success_count: int = 0
@@ -288,6 +328,14 @@ async def apply_bulk_results(
             continue
         seen.add(filename)
         if status == 'success':
+            logging.debug(
+                'Bulk record succeeded, marking uploaded',
+                extra={
+                    'filename': filename,
+                    'job_id': job_id,
+                    'platform_content_id': cid,
+                },
+            )
             try:
                 await fm.mark_uploaded(filename)
                 success_count += 1
@@ -377,6 +425,18 @@ async def upload_bulk_batch(
     )
 
     bulk_url: str = f'{exchange_url}{BULK_API_PATH}'
+    logging.debug(
+        'POSTing bulk batch',
+        extra={
+            'batch_id': batch_id,
+            'bulk_url': bulk_url,
+            'upload_filename': upload_filename,
+            'schema_owner': schema_owner,
+            'schema_version': schema_version,
+            'platform': platform,
+            'entity': entity,
+        },
+    )
     try:
         post_resp: Response = await client.post(
             bulk_url,
@@ -422,6 +482,14 @@ async def upload_bulk_batch(
         )
 
     job_id: str = post_resp.json().get('job_id', '')
+    logging.debug(
+        'Bulk batch POST accepted',
+        extra={
+            'batch_id': batch_id,
+            'status_code': post_resp.status_code,
+            'job_id': job_id,
+        },
+    )
     if not job_id:
         logging.warning(
             'Bulk batch response missing job_id',

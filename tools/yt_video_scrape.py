@@ -1647,6 +1647,15 @@ async def _collect_video_record(
         )
         return None
 
+    logging.debug(
+        'Collected video record for bulk upload',
+        extra={
+            'filename': filename,
+            'video_id': video.video_id,
+            'channel_handle': handle,
+            'channel_id': video.channel_id,
+        },
+    )
     return video.video_id, video.to_dict()
 
 
@@ -1742,7 +1751,15 @@ async def upload_videos(
     max_bytes: int = settings.bulk_max_batch_bytes
 
     for filename in files:
+        logging.debug(
+            'Considering video file for bulk upload',
+            extra={'filename': filename},
+        )
         if not await video_needs_uploading(video_fm, filename):
+            logging.debug(
+                'Video file superseded, skipping',
+                extra={'filename': filename},
+            )
             continue
 
         record: tuple[str, dict] | None = (
@@ -1771,10 +1788,30 @@ async def upload_videos(
             )
             continue
 
+        logging.debug(
+            'Adding video record to bulk batch',
+            extra={
+                'filename': filename,
+                'video_id': video_id,
+                'record_bytes': len(line),
+                'batch_records_count': len(batch_records),
+                'batch_bytes': len(batch_buf),
+            },
+        )
+
         if (
             len(batch_records) >= max_records
             or len(batch_buf) + len(line) > max_bytes
         ):
+            logging.debug(
+                'Video bulk batch reached cap, flushing',
+                extra={
+                    'records': len(batch_records),
+                    'bytes': len(batch_buf),
+                    'max_records': max_records,
+                    'max_bytes': max_bytes,
+                },
+            )
             await _upload_one_video_batch(
                 bytes(batch_buf), batch_records,
                 settings, client, video_fm,
@@ -1786,6 +1823,13 @@ async def upload_videos(
         batch_records.append((video_id, filename))
 
     if batch_records:
+        logging.debug(
+            'Flushing trailing video bulk batch',
+            extra={
+                'records': len(batch_records),
+                'bytes': len(batch_buf),
+            },
+        )
         await _upload_one_video_batch(
             bytes(batch_buf), batch_records,
             settings, client, video_fm,

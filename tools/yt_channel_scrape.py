@@ -681,6 +681,14 @@ async def _collect_channel_record(
         )
         return None
 
+    logging.debug(
+        'Collected channel record for bulk upload',
+        extra={
+            'filename': filename,
+            'channel_id': channel.channel_id,
+            'channel_handle': handle,
+        },
+    )
     return channel.channel_id, channel.to_dict(with_video_ids=False)
 
 
@@ -778,7 +786,15 @@ async def upload_channels(
     max_bytes: int = settings.bulk_max_batch_bytes
 
     for filename in files:
+        logging.debug(
+            'Considering channel file for bulk upload',
+            extra={'filename': filename},
+        )
         if fm.is_superseded(filename):
+            logging.debug(
+                'Channel file superseded, deleting',
+                extra={'filename': filename},
+            )
             METRIC_UPLOADED_FILE_EXISTS.labels(
                 worker_id=get_worker_id(),
             ).inc()
@@ -805,6 +821,16 @@ async def upload_channels(
         channel_id, record_dict = record
 
         line: bytes = orjson.dumps(record_dict) + b'\n'
+        logging.debug(
+            'Adding channel record to bulk batch',
+            extra={
+                'filename': filename,
+                'channel_id': channel_id,
+                'record_bytes': len(line),
+                'batch_records_count': len(batch_records),
+                'batch_bytes': len(batch_buf),
+            },
+        )
         if len(line) > max_bytes:
             logging.warning(
                 'Channel record exceeds bulk-batch byte cap, '
@@ -822,6 +848,15 @@ async def upload_channels(
             len(batch_records) >= max_records
             or len(batch_buf) + len(line) > max_bytes
         ):
+            logging.debug(
+                'Channel bulk batch reached cap, flushing',
+                extra={
+                    'records': len(batch_records),
+                    'bytes': len(batch_buf),
+                    'max_records': max_records,
+                    'max_bytes': max_bytes,
+                },
+            )
             await _upload_one_channel_batch(
                 bytes(batch_buf), batch_records,
                 settings, client, fm,
@@ -833,6 +868,13 @@ async def upload_channels(
         batch_records.append((channel_id, filename))
 
     if batch_records:
+        logging.debug(
+            'Flushing trailing channel bulk batch',
+            extra={
+                'records': len(batch_records),
+                'bytes': len(batch_buf),
+            },
+        )
         await _upload_one_channel_batch(
             bytes(batch_buf), batch_records,
             settings, client, fm,
