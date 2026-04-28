@@ -40,7 +40,7 @@ services:
     command: ["tools/yt_video_scrape.py"]
     depends_on:
       - po-token-provider
-    container_name: yt_video_scraper
+    container_name: video
     environment:
       <<: *container-paths
       VIDEO_LOG_FILE: /var/log/scrape/scraper/yt_video.log
@@ -55,7 +55,7 @@ services:
       - "false"
     depends_on:
       - po-token-provider
-    container_name: yt_video_scraper-upload-only
+    container_name: video-upload-only
     environment:
       <<: *container-paths
       VIDEO_LOG_FILE: /var/log/scrape/scraper/yt_video-upload-only.log
@@ -63,7 +63,7 @@ services:
   channel:
     <<: *scraper-common
     command: ["tools/yt_channel_scrape.py"]
-    container_name: yt_channel_scraper
+    container_name: channel
     environment:
       <<: *container-paths
       CHANNEL_LOG_FILE: /var/log/scrape/scraper/yt_channel.log
@@ -76,7 +76,7 @@ services:
       - "true"
       - "--channel-no-upload"
       - "false"
-    container_name: yt_channel_scraper-upload-only
+    container_name: channel-upload-only
     environment:
       <<: *container-paths
       CHANNEL_LOG_FILE: /var/log/scrape/scraper/yt_channel-upload-only.log
@@ -84,7 +84,7 @@ services:
   rss:
     <<: *scraper-common
     command: ["tools/yt_rss_scrape.py"]
-    container_name: yt_rss_scraper
+    container_name: rss
     environment:
       <<: *container-paths
       RSS_LOG_FILE: /var/log/scrape/scraper/yt_rss.log
