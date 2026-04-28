@@ -695,6 +695,70 @@ async def _collect_channel_record(
     return channel.channel_id, channel.to_dict(with_video_ids=False)
 
 
+async def _prepare_channel_line(
+    filename: str,
+    fm: AssetFileManagement,
+    creator_map_backend: CreatorMap,
+    name_map_backend: NameMap,
+) -> tuple[str, str, bytes] | None:
+    '''
+    Per-file work for the bulk-upload sweep, factored out so that
+    :func:`upload_channels` can run ``channel_concurrency`` of
+    these in flight at once via :func:`asyncio.gather`. Handles
+    the superseded-file branch (delete + skip), the read /
+    handle-resolution / serialise pipeline, and the byte-cap
+    pre-check log.
+
+    :returns: ``(channel_id, filename, line_bytes)`` on success,
+        or ``None`` when the file should be skipped (superseded,
+        read error, missing channel_id).
+    '''
+    logging.debug(
+        'Considering channel file for bulk upload',
+        extra={'filename': filename},
+    )
+    if fm.is_superseded(filename):
+        logging.debug(
+            'Channel file superseded, deleting',
+            extra={'filename': filename},
+        )
+        METRIC_UPLOADED_FILE_EXISTS.labels(
+            worker_id=get_worker_id(),
+        ).inc()
+        try:
+            await fm.delete(filename, fail_ok=False)
+        except Exception as exc:
+            logging.warning(
+                'Failed to delete superseded channel file',
+                exc=exc,
+                extra={'filename': filename},
+            )
+        return None
+
+    record: tuple[str, dict] | None = (
+        await _collect_channel_record(
+            filename, fm,
+            creator_map_backend, name_map_backend,
+        )
+    )
+    if record is None:
+        return None
+    channel_id: str
+    record_dict: dict
+    channel_id, record_dict = record
+
+    line: bytes = orjson.dumps(record_dict) + b'\n'
+    logging.debug(
+        'Prepared channel record for bulk batch',
+        extra={
+            'filename': filename,
+            'channel_id': channel_id,
+            'record_bytes': len(line),
+        },
+    )
+    return channel_id, filename, line
+
+
 async def _upload_one_channel_batch(
     batch_buf: bytes,
     batch_records: list[tuple[str, str]],
@@ -788,92 +852,78 @@ async def upload_channels(
     batch_records: list[tuple[str, str]] = []
     max_records: int = settings.bulk_batch_size
     max_bytes: int = settings.bulk_max_batch_bytes
+    concurrency: int = max(settings.channel_concurrency, 1)
 
-    for filename in files:
-        logging.debug(
-            'Considering channel file for bulk upload',
-            extra={
-                'filename': filename,
-                'batch_position': len(batch_records) + 1,
-                'max_batch_size': max_records,
-            },
-        )
-        if fm.is_superseded(filename):
+    # Process files in concurrent chunks of *concurrency* size.
+    # Each task does the per-file I/O (read+decompress, creator_map
+    # / name_map writes, JSON re-serialise) so the event loop has
+    # ``concurrency`` files in flight at once. Sequential batching
+    # then consumes the prepared lines in submission order, which
+    # keeps the ``record_index`` fallback in
+    # :func:`apply_bulk_results` consistent with the wire order.
+    for start in range(0, len(files), concurrency):
+        chunk: list[str] = files[start:start + concurrency]
+        prepared: list[
+            tuple[str, str, bytes] | None
+        ] = await asyncio.gather(*(
+            _prepare_channel_line(
+                f, fm, creator_map_backend, name_map_backend,
+            )
+            for f in chunk
+        ))
+        for entry in prepared:
+            if entry is None:
+                continue
+            channel_id: str
+            filename: str
+            line: bytes
+            channel_id, filename, line = entry
             logging.debug(
-                'Channel file superseded, deleting',
-                extra={'filename': filename},
-            )
-            METRIC_UPLOADED_FILE_EXISTS.labels(
-                worker_id=get_worker_id(),
-            ).inc()
-            try:
-                await fm.delete(filename, fail_ok=False)
-            except Exception as exc:
-                logging.warning(
-                    'Failed to delete superseded channel file',
-                    exc=exc,
-                    extra={'filename': filename},
-                )
-            continue
-
-        record: tuple[str, dict] | None = (
-            await _collect_channel_record(
-                filename, fm,
-                creator_map_backend, name_map_backend,
-            )
-        )
-        if record is None:
-            continue
-        channel_id: str
-        record_dict: dict
-        channel_id, record_dict = record
-
-        line: bytes = orjson.dumps(record_dict) + b'\n'
-        logging.debug(
-            'Adding channel record to bulk batch',
-            extra={
-                'filename': filename,
-                'channel_id': channel_id,
-                'record_bytes': len(line),
-                'batch_records_count': len(batch_records),
-                'batch_bytes': len(batch_buf),
-            },
-        )
-        if len(line) > max_bytes:
-            logging.warning(
-                'Channel record exceeds bulk-batch byte cap, '
-                'skipping',
+                'Adding channel record to bulk batch',
                 extra={
                     'filename': filename,
                     'channel_id': channel_id,
                     'record_bytes': len(line),
-                    'max_bytes': max_bytes,
+                    'batch_records_count': len(batch_records),
+                    'batch_bytes': len(batch_buf),
                 },
             )
-            continue
 
-        if (
-            len(batch_records) >= max_records
-            or len(batch_buf) + len(line) > max_bytes
-        ):
-            logging.debug(
-                'Channel bulk batch reached cap, flushing',
-                extra={
-                    'records': len(batch_records),
-                    'bytes': len(batch_buf),
-                    'max_records': max_records,
-                    'max_bytes': max_bytes,
-                },
-            )
-            await _upload_one_channel_batch(
-                bytes(batch_buf), batch_records,
-                settings, client, fm,
-            )
-            batch_buf = bytearray()
-            batch_records = []
+            if len(line) > max_bytes:
+                logging.warning(
+                    'Channel record exceeds bulk-batch byte cap, '
+                    'skipping',
+                    extra={
+                        'filename': filename,
+                        'channel_id': channel_id,
+                        'record_bytes': len(line),
+                        'max_bytes': max_bytes,
+                    },
+                )
+                continue
 
-        batch_buf.extend(line)
-        batch_records.append((channel_id, filename))
+            if (
+                len(batch_records) >= max_records
+                or len(batch_buf) + len(line) > max_bytes
+            ):
+                logging.debug(
+                    'Channel bulk batch reached cap, flushing',
+                    extra={
+                        'records': len(batch_records),
+                        'bytes': len(batch_buf),
+                        'max_records': max_records,
+                        'max_bytes': max_bytes,
+                    },
+                )
+                await _upload_one_channel_batch(
+                    bytes(batch_buf), batch_records,
+                    settings, client, fm,
+                )
+                batch_buf = bytearray()
+                batch_records = []
+
+            batch_buf.extend(line)
+            batch_records.append((channel_id, filename))
 
     if batch_records:
         logging.debug(
@@ -1420,14 +1470,20 @@ async def resolve_channel_upload_handle(
         scraper='channel', outcome='canonical',
     ).inc()
 
+    # Issue the creator_map and name_map writes concurrently so the
+    # bulk-upload sweep pays one round-trip of Redis latency per
+    # channel instead of two.
     if channel.channel_id:
-        await creator_map_backend.put(
-            channel.channel_id, handle,
-        )
+        writes: list = [
+            creator_map_backend.put(channel.channel_id, handle),
+        ]
         if channel.title:
-            await name_map_backend.put(
-                channel.title, channel.channel_id,
+            writes.append(
+                name_map_backend.put(
+                    channel.title, channel.channel_id,
+                )
             )
+        await asyncio.gather(*writes)
     return handle
 
 

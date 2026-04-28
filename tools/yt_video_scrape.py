@@ -1659,6 +1659,59 @@ async def _collect_video_record(
     return video.video_id, video.to_dict()
 
 
+async def _prepare_video_line(
+    filename: str,
+    settings: VideoSettings,
+    video_fm: AssetFileManagement,
+    creator_map_backend: CreatorMap,
+    proxy: str | None,
+) -> tuple[str, str, bytes] | None:
+    '''
+    Per-file work for the video bulk-upload sweep, factored out
+    so :func:`upload_videos` can run ``video_concurrency`` of
+    these in flight at once via :func:`asyncio.gather`. Handles
+    the superseded check, the read / handle-resolution /
+    serialise pipeline, and emits the per-record debug logs.
+
+    :returns: ``(video_id, filename, line_bytes)`` on success, or
+        ``None`` when the file should be skipped (superseded,
+        unresolved handle, missing video_id).
+    '''
+    logging.debug(
+        'Considering video file for bulk upload',
+        extra={'filename': filename},
+    )
+    if not await video_needs_uploading(video_fm, filename):
+        logging.debug(
+            'Video file superseded, skipping',
+            extra={'filename': filename},
+        )
+        return None
+
+    record: tuple[str, dict] | None = (
+        await _collect_video_record(
+            filename, settings, video_fm,
+            creator_map_backend, proxy,
+        )
+    )
+    if record is None:
+        return None
+    video_id: str
+    record_dict: dict
+    video_id, record_dict = record
+
+    line: bytes = orjson.dumps(record_dict) + b'\n'
+    logging.debug(
+        'Prepared video record for bulk batch',
+        extra={
+            'filename': filename,
+            'video_id': video_id,
+            'record_bytes': len(line),
+        },
+    )
+    return video_id, filename, line
+
+
 async def _upload_one_video_batch(
     batch_buf: bytes,
     batch_records: list[tuple[str, str]],
@@ -1749,82 +1802,66 @@ async def upload_videos(
     batch_records: list[tuple[str, str]] = []
     max_records: int = settings.bulk_batch_size
     max_bytes: int = settings.bulk_max_batch_bytes
+    concurrency: int = max(settings.video_concurrency, 1)
 
-    for filename in files:
-        logging.debug(
-            'Considering video file for bulk upload',
-            extra={
-                'filename': filename,
-                'batch_position': len(batch_records) + 1,
-                'max_batch_size': max_records,
-            },
-        )
-        if not await video_needs_uploading(video_fm, filename):
-            logging.debug(
-                'Video file superseded, skipping',
-                extra={'filename': filename},
-            )
-            continue
-
-        record: tuple[str, dict] | None = (
-            await _collect_video_record(
-                filename, settings, video_fm,
+    # Run *concurrency* per-file pipelines in flight at once via
+    # :func:`asyncio.gather`. Sequential batching consumes the
+    # prepared lines in submission order so the ``record_index``
+    # fallback in :func:`apply_bulk_results` matches the order the
+    # server iterates the .jsonl.
+    for start in range(0, len(files), concurrency):
+        chunk: list[str] = files[start:start + concurrency]
+        prepared: list[
+            tuple[str, str, bytes] | None
+        ] = await asyncio.gather(*(
+            _prepare_video_line(
+                f, settings, video_fm,
                 creator_map_backend, proxy,
             )
-        )
-        if record is None:
-            continue
-        video_id: str
-        record_dict: dict
-        video_id, record_dict = record
+            for f in chunk
+        ))
+        for entry in prepared:
+            if entry is None:
+                continue
+            video_id: str
+            filename: str
+            line: bytes
+            video_id, filename, line = entry
+            if len(line) > max_bytes:
+                logging.warning(
+                    'Video record exceeds bulk-batch byte cap, '
+                    'skipping',
+                    extra={
+                        'filename': filename,
+                        'video_id': video_id,
+                        'record_bytes': len(line),
+                        'max_bytes': max_bytes,
+                    },
+                )
+                continue
 
-        line: bytes = orjson.dumps(record_dict) + b'\n'
-        if len(line) > max_bytes:
-            logging.warning(
-                'Video record exceeds bulk-batch byte cap, '
-                'skipping',
-                extra={
-                    'filename': filename,
-                    'video_id': video_id,
-                    'record_bytes': len(line),
-                    'max_bytes': max_bytes,
-                },
-            )
-            continue
+            if (
+                len(batch_records) >= max_records
+                or len(batch_buf) + len(line) > max_bytes
+            ):
+                logging.debug(
+                    'Video bulk batch reached cap, flushing',
+                    extra={
+                        'records': len(batch_records),
+                        'bytes': len(batch_buf),
+                        'max_records': max_records,
+                        'max_bytes': max_bytes,
+                    },
+                )
+                await _upload_one_video_batch(
+                    bytes(batch_buf), batch_records,
+                    settings, client, video_fm,
+                )
+                batch_buf = bytearray()
+                batch_records = []
 
-        logging.debug(
-            'Adding video record to bulk batch',
-            extra={
-                'filename': filename,
-                'video_id': video_id,
-                'record_bytes': len(line),
-                'batch_records_count': len(batch_records),
-                'batch_bytes': len(batch_buf),
-            },
-        )
-
-        if (
-            len(batch_records) >= max_records
-            or len(batch_buf) + len(line) > max_bytes
-        ):
-            logging.debug(
-                'Video bulk batch reached cap, flushing',
-                extra={
-                    'records': len(batch_records),
-                    'bytes': len(batch_buf),
-                    'max_records': max_records,
-                    'max_bytes': max_bytes,
-                },
-            )
-            await _upload_one_video_batch(
-                bytes(batch_buf), batch_records,
-                settings, client, video_fm,
-            )
-            batch_buf = bytearray()
-            batch_records = []
-
-        batch_buf.extend(line)
-        batch_records.append((video_id, filename))
+            batch_buf.extend(line)
+            batch_records.append((video_id, filename))
 
     if batch_records:
         logging.debug(
