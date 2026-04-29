@@ -112,9 +112,7 @@ class FileCreatorMap(CreatorMap):
             return self._cache
 
         line: str
-        async with aiofiles.open(
-            self._file_path, 'r',
-        ) as f:
+        async with aiofiles.open(self._file_path, 'r') as f:
             async for line in f:
                 line = line.strip()
                 if not line or line.startswith('#'):

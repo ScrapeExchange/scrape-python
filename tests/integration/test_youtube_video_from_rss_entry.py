@@ -31,6 +31,7 @@ from scrape_exchange.youtube.youtube_video import YouTubeVideo
 
 # Rick Astley — long-lived channel with a stable feed format.
 RICK_ASTLEY_CHANNEL_ID: str = 'UCuAXFkgsw1L7xaCfnd5JJOw'
+RICK_ASTLEY_HANDLE: str = 'RickAstleyYT'
 
 RSS_URL_TEMPLATE: str = (
     'https://www.youtube.com/feeds/videos.xml?channel_id={cid}'
@@ -74,7 +75,7 @@ class TestFromRssEntryLive(unittest.TestCase):
     def test_every_entry_has_video_id_and_title(self) -> None:
         for entry in self.entries:
             video: YouTubeVideo = YouTubeVideo.from_rss_entry(
-                entry,
+                entry, channel_handle=RICK_ASTLEY_HANDLE,
             )
             self.assertTrue(
                 video.video_id,
@@ -87,7 +88,7 @@ class TestFromRssEntryLive(unittest.TestCase):
 
     def test_urls_are_formatted_with_video_id(self) -> None:
         video: YouTubeVideo = YouTubeVideo.from_rss_entry(
-            self.entries[0],
+            self.entries[0], channel_handle=RICK_ASTLEY_HANDLE,
         )
         self.assertEqual(
             video.url,
@@ -100,12 +101,16 @@ class TestFromRssEntryLive(unittest.TestCase):
 
     def test_channel_info_is_populated(self) -> None:
         video: YouTubeVideo = YouTubeVideo.from_rss_entry(
-            self.entries[0],
+            self.entries[0], channel_handle=RICK_ASTLEY_HANDLE,
         )
         self.assertEqual(
             video.channel_id, RICK_ASTLEY_CHANNEL_ID,
         )
-        self.assertTrue(video.channel_name)
+        # channel_handle is always the value the caller passed
+        # in; it is never derived from the RSS entry.
+        self.assertEqual(
+            video.channel_handle, RICK_ASTLEY_HANDLE,
+        )
         self.assertTrue(video.channel_url)
         self.assertIn(
             RICK_ASTLEY_CHANNEL_ID, video.channel_url,
@@ -115,7 +120,7 @@ class TestFromRssEntryLive(unittest.TestCase):
         self,
     ) -> None:
         video: YouTubeVideo = YouTubeVideo.from_rss_entry(
-            self.entries[0],
+            self.entries[0], channel_handle=RICK_ASTLEY_HANDLE,
         )
         self.assertIsInstance(
             video.published_timestamp, datetime,
@@ -136,7 +141,9 @@ class TestFromRssEntryLive(unittest.TestCase):
         count element; over a full feed at least one should
         have it.'''
         counts: list[int | None] = [
-            YouTubeVideo.from_rss_entry(e).view_count
+            YouTubeVideo.from_rss_entry(
+                e, channel_handle=RICK_ASTLEY_HANDLE,
+            ).view_count
             for e in self.entries
         ]
         self.assertTrue(
@@ -150,7 +157,7 @@ class TestFromRssEntryLive(unittest.TestCase):
 
     def test_first_entry_has_thumbnail(self) -> None:
         video: YouTubeVideo = YouTubeVideo.from_rss_entry(
-            self.entries[0],
+            self.entries[0], channel_handle=RICK_ASTLEY_HANDLE,
         )
         self.assertTrue(video.thumbnails)
         for thumb in video.thumbnails.values():

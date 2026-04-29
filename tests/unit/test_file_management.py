@@ -835,5 +835,99 @@ class TestDeleteUploaded(unittest.IsolatedAsyncioTestCase):
             )  # must not raise
 
 
+import asyncio
+
+
+class TestMarkInvalid(unittest.TestCase):
+
+    def test_invalid_suffix_is_marker(self) -> None:
+        self.assertTrue(
+            AssetFileManagement.is_marker('foo.json.br.invalid'),
+        )
+        self.assertIn('.invalid', MARKER_SUFFIXES)
+
+    def test_mark_invalid_renames_file(self) -> None:
+        with tempfile.TemporaryDirectory() as base:
+            fm: AssetFileManagement = AssetFileManagement(base)
+            src: str = os.path.join(base, 'foo.json.br')
+            with open(src, 'wb') as f:
+                f.write(b'payload')
+            new_name: str = asyncio.run(
+                fm.mark_invalid('foo.json.br'),
+            )
+            self.assertEqual(new_name, 'foo.json.br.invalid')
+            self.assertFalse(os.path.exists(src))
+            self.assertTrue(
+                os.path.exists(os.path.join(
+                    base, 'foo.json.br.invalid',
+                )),
+            )
+
+
+class TestAtomicWriteBytes(unittest.TestCase):
+    '''
+    The atomic-write helper is the mitigation for the corrupted-
+    brotli-files-after-kill failure mode that the YouTube scrapers
+    hit in production. Cover the happy path, the temp-file
+    cleanup-on-error path, and the no-orphan-temp-file invariant.
+    '''
+
+    def test_writes_payload_and_no_temp_files_remain(self) -> None:
+        from scrape_exchange.file_management import (
+            atomic_write_bytes,
+        )
+
+        with tempfile.TemporaryDirectory() as base:
+            target: str = os.path.join(base, 'foo.json.br')
+            asyncio.run(atomic_write_bytes(target, b'payload'))
+            self.assertEqual(
+                open(target, 'rb').read(), b'payload',
+            )
+            # No ``foo.json.br.tmp.*`` orphan temp files remain
+            # in the directory.
+            entries: list[str] = os.listdir(base)
+            self.assertEqual(entries, ['foo.json.br'])
+
+    def test_overwrites_existing_file_atomically(self) -> None:
+        from scrape_exchange.file_management import (
+            atomic_write_bytes,
+        )
+
+        with tempfile.TemporaryDirectory() as base:
+            target: str = os.path.join(base, 'foo.json.br')
+            with open(target, 'wb') as f:
+                f.write(b'old')
+            asyncio.run(atomic_write_bytes(target, b'new'))
+            self.assertEqual(
+                open(target, 'rb').read(), b'new',
+            )
+
+    def test_temp_file_cleaned_up_on_rename_failure(
+        self,
+    ) -> None:
+        '''When the rename step raises, the temp file must not
+        be left behind.'''
+        from unittest.mock import patch
+        from scrape_exchange.file_management import (
+            atomic_write_bytes,
+        )
+        import aiofiles.os as aios
+
+        with tempfile.TemporaryDirectory() as base:
+            target: str = os.path.join(base, 'foo.json.br')
+
+            async def boom(*_args, **_kwargs):
+                raise OSError('rename blew up')
+
+            with patch.object(aios, 'rename', new=boom):
+                with self.assertRaises(OSError):
+                    asyncio.run(
+                        atomic_write_bytes(target, b'payload'),
+                    )
+            entries: list[str] = os.listdir(base)
+            # Both the target and the temp file should be absent.
+            self.assertEqual(entries, [])
+
+
 if __name__ == '__main__':
     unittest.main()

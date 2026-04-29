@@ -23,22 +23,22 @@ class YouTubeChannelPageType(Enum):
 
 @dataclass
 class YouTubeChannelLink:
-    channel_name: str
+    channel_handle: str
     subscriber_count: int
 
     def __hash__(self) -> int:
-        return hash(self.channel_name)
+        return hash(self.channel_handle)
 
     def to_dict(self) -> dict[str, str | int]:
         return {
-            'channel_name': self.channel_name,
-            'subscriber_count': self.subscriber_count
+            'channel_handle': self.channel_handle,
+            'subscriber_count': self.subscriber_count,
         }
 
     @staticmethod
     def from_dict(data: dict[str, str | int]) -> Self:
         return YouTubeChannelLink(
-            name=data['name'],
-            subscriber_count=data['subscriber_count']
+            channel_handle=data['channel_handle'],
+            subscriber_count=data['subscriber_count'],
         )
 

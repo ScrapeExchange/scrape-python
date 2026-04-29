@@ -64,7 +64,7 @@ def _yt_status_class(status_code: int | None) -> str:
 
 # InnerTube client identity matching the WEB client that a real Chrome
 # browser sends on every YouTube page navigation and XHR request.
-INNERTUBE_CLIENT_NAME: str = '1'          # 1 = WEB
+INNERTUBE_CLIENT_NAME: str = '1'
 INNERTUBE_CLIENT_VERSION: str = '2.20250626.01.00'
 
 CONSENT_COOKIES: dict[str, str] = {
@@ -194,7 +194,7 @@ class AsyncYouTubeClient(AsyncClient):
         start: float = time.monotonic()
         try:
             resp: Response = await super().get(url, **kwargs)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
             METRIC_YT_REQUEST_DURATION.labels(
                 kind='http', status_class='error',
                 worker_id=get_worker_id(),

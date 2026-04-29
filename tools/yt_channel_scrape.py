@@ -23,6 +23,7 @@ from random import shuffle
 from pathlib import Path
 
 import aiofiles
+import orjson
 
 from httpx import Response
 from watchfiles import awatch, Change
@@ -33,8 +34,16 @@ from scrape_exchange.creator_map import (
     CreatorMap,
     FileCreatorMap,
     RedisCreatorMap,
-    CREATOR_HANDLE_MISMATCH_TOTAL,
     CREATOR_MAP_RESOLUTION_TOTAL,
+)
+from scrape_exchange.name_map import (
+    NameMap,
+    NullNameMap,
+    RedisNameMap,
+)
+from scrape_exchange.bulk_upload import (
+    BulkBatchOutcome,
+    upload_bulk_batch,
 )
 from scrape_exchange.exchange_client import ExchangeClient
 
@@ -47,20 +56,22 @@ from scrape_exchange.scraper_runner import (
 from scrape_exchange.settings import normalize_log_level
 from scrape_exchange.util import extract_proxy_ip, proxy_network_for
 
-from scrape_exchange.youtube.youtube_channel import (
-    YouTubeChannel,
-    fallback_handle,
-)
+from scrape_exchange.youtube.youtube_channel import YouTubeChannel
 from scrape_exchange.youtube.youtube_rate_limiter import YouTubeRateLimiter
 from scrape_exchange.youtube.youtube_video import DENO_PATH, PO_TOKEN_URL
 from scrape_exchange.worker_id import get_worker_id
 
+from scrape_exchange.schema_validator import (
+    SchemaValidator,
+    fetch_schema_dict,
+)
 from scrape_exchange.youtube.settings import YouTubeScraperSettings
 
 CHANNEL_FILE_POSTFIX = '.json.br'
 
 MAX_NEW_CHANNELS: int = 1000
 MAX_RESOLVED_CHANNELS: int = 100
+
 
 
 class ChannelSettings(YouTubeScraperSettings):
@@ -97,7 +108,7 @@ class ChannelSettings(YouTubeScraperSettings):
         description='Username of the owner of the YouTube channel schema'
     )
     schema_version: str = Field(
-        default='0.0.1',
+        default='0.0.2',
         validation_alias=AliasChoices('SCHEMA_VERSION', 'schema_version'),
         description='Schema version string sent with uploads',
     )
@@ -277,6 +288,32 @@ METRIC_CHANNEL_NO_CONTENT_FOUND = Counter(
     ['worker_id', 'proxy_ip', 'proxy_network'],
 )
 
+# -- scheduled bulk-upload metrics --
+METRIC_CHANNELS_BULK_UPLOADED = Counter(
+    'yt_channel_bulk_uploaded_total',
+    'Channel records confirmed uploaded via the bulk API '
+    '(per-record success in the job results).',
+    ['worker_id'],
+)
+METRIC_CHANNELS_BULK_FAILED = Counter(
+    'yt_channel_bulk_failed_total',
+    'Channel records that the bulk worker reported as failed. '
+    'Source files are left in base_dir for the next iteration.',
+    ['worker_id'],
+)
+METRIC_CHANNELS_BULK_MISSING_RESULT = Counter(
+    'yt_channel_bulk_missing_result_total',
+    'Channel records that were submitted in a bulk batch but did '
+    'not appear in the job results. Source files are left in '
+    'base_dir for the next iteration.',
+    ['worker_id'],
+)
+METRIC_BULK_BATCHES = Counter(
+    'yt_channel_bulk_batches_total',
+    'Bulk-upload batches dispatched by the scheduled upload sweep.',
+    ['worker_id', 'outcome'],
+)
+
 # -- upload-only watcher metrics --
 METRIC_WATCHER_FILES_DETECTED = Counter(
     'yt_channel_watcher_files_detected_total',
@@ -384,6 +421,14 @@ async def _run_worker(
             settings.channel_map_file,
         )
 
+    name_map_backend: NameMap
+    if settings.redis_dsn:
+        name_map_backend = RedisNameMap(
+            settings.redis_dsn, platform='youtube',
+        )
+    else:
+        name_map_backend = NullNameMap()
+
     if not settings.proxies:
         logging.info(
             'No proxies configured, using direct '
@@ -391,19 +436,43 @@ async def _run_worker(
         )
         settings.channel_concurrency = 1
 
+    # Build the schema validator once at startup. Used by every
+    # downstream upload site — bulk sweep, the upload-only watcher,
+    # and the live-scrape worker — so that records that don't
+    # conform to the channel JSON schema are rejected client-side
+    # and the on-disk asset is renamed ``<filename>.invalid`` for
+    # operator inspection.
+    schema_dict: dict = await fetch_schema_dict(
+        ctx.client,
+        settings.exchange_url,
+        settings.schema_owner,
+        'youtube',
+        'channel',
+        settings.schema_version,
+    )
+    validator: SchemaValidator = SchemaValidator(schema_dict)
+
     if not settings.channel_no_upload:
+        logging.info('Starting initial channel upload pass')
         await upload_channels(
-            settings, ctx.client, fm, creator_map_backend,
+            settings, ctx.client, fm,
+            creator_map_backend, name_map_backend,
+            validator,
         )
 
     if settings.channel_upload_only:
+        logging.info('Starting watching for uploads')
         await _watch_and_upload_channels(
-            settings, ctx.client, fm, creator_map_backend,
+            settings, ctx.client, fm,
+            creator_map_backend, name_map_backend,
+            validator,
         )
     else:
+        logging.info('Starting scraping channels')
         await scrape_channels(
             settings, ctx.client, fm,
-            creator_map_backend,
+            creator_map_backend, name_map_backend,
+            validator,
         )
 
 
@@ -442,12 +511,12 @@ def main() -> None:
     sys.exit(runner.run_sync(_run_worker))
 
 
-async def channel_exists(client: ExchangeClient, channel_name: str) -> bool:
+async def channel_exists(client: ExchangeClient, channel_handle: str) -> bool:
     '''
     Checks if a channel with the given name already exists on Scrape Exchange.
 
     :param client: The Scrape Exchange client instance.
-    :param channel_name: The name of the YouTube channel to check.
+    :param channel_handle: The name of the YouTube channel to check.
     :returns: True if the channel exists, False otherwise.
     :raises: (none)
     '''
@@ -455,7 +524,7 @@ async def channel_exists(client: ExchangeClient, channel_name: str) -> bool:
     try:
         resp: Response = await client.get(
             f'{client.exchange_url}{ExchangeClient.GET_CONTENT_API}'
-            f'/youtube/channel/{channel_name}'
+            f'/youtube/channel/{channel_handle}'
         )
     except Exception as exc:
         METRIC_CHANNEL_EXISTS_FAILURES.labels(
@@ -464,7 +533,7 @@ async def channel_exists(client: ExchangeClient, channel_name: str) -> bool:
         logging.warning(
             'Network error checking channel existence',
             exc=exc,
-            extra={'channel_name': channel_name},
+            extra={'channel_handle': channel_handle},
         )
         return False
 
@@ -486,7 +555,8 @@ async def channel_exists(client: ExchangeClient, channel_name: str) -> bool:
         logging.warning(
             'Failed to check existence of channel',
             extra={
-                'channel_name': channel_name, 'status_code': resp.status_code,
+                'channel_handle': channel_handle,
+                'status_code': resp.status_code,
                 'response_text': resp.text,
             }
         )
@@ -500,6 +570,8 @@ async def scrape_channels(
     client: ExchangeClient,
     fm: AssetFileManagement,
     creator_map_backend: CreatorMap,
+    name_map_backend: NameMap,
+    validator: SchemaValidator,
 ) -> None:
 
     new_channels: set[str] = await read_channels(
@@ -539,12 +611,13 @@ async def scrape_channels(
                 queue.task_done()
                 break
             try:
-                channel_name: str = (
+                channel_handle: str = (
                     normalize_channel_name(name)
                 )
                 failed: bool = await scrape_channel(
                     settings, client, fm,
-                    channel_name, creator_map_backend,
+                    channel_handle, creator_map_backend,
+                    name_map_backend, validator,
                 )
                 if failed:
                     errors += 1
@@ -558,7 +631,7 @@ async def scrape_channels(
                     'Unexpected error in channel '
                     'scrape worker',
                     exc=exc,
-                    extra={'channel_name': name},
+                    extra={'channel_handle': name},
                 )
                 if errors > 100:
                     abort = True
@@ -591,12 +664,226 @@ async def scrape_channels(
         )
 
 
+async def _collect_channel_record(
+    filename: str,
+    fm: AssetFileManagement,
+    creator_map_backend: CreatorMap,
+    name_map_backend: NameMap,
+    validator: SchemaValidator,
+) -> tuple[str, dict] | None:
+    '''
+    Read *filename* from base_dir and prepare a bulk-upload record.
+
+    :returns: ``(channel_id, record_dict)`` on success, or ``None``
+        when the file should be skipped (read error, missing
+        ``channel_id``, or schema-validation failure — in the last
+        case the file is renamed ``<filename>.invalid``).
+
+    Side effects: updates the shared creator_map and name_map via
+    :func:`resolve_channel_upload_handle`; on validation failure
+    calls :meth:`AssetFileManagement.mark_invalid`.
+    '''
+    try:
+        channel_data: dict = await fm.read_file(filename)
+        channel: YouTubeChannel = (
+            YouTubeChannel.from_dict(channel_data)
+        )
+    except Exception as exc:
+        logging.error(
+            'Error reading channel file for bulk upload',
+            exc=exc,
+            extra={'filename': filename},
+        )
+        return None
+
+    handle: str = await resolve_channel_upload_handle(
+        channel, creator_map_backend, name_map_backend,
+    )
+    channel.channel_handle = handle
+
+    if not channel.channel_id:
+        logging.warning(
+            'Channel has no channel_id, skipping bulk upload',
+            extra={
+                'filename': filename,
+                'channel_handle': handle,
+            },
+        )
+        return None
+
+    record_dict: dict = channel.to_dict(with_video_ids=False)
+    err: str | None = validator.validate(record_dict)
+    if err is not None:
+        logging.warning(
+            'Channel record failed schema validation, '
+            'marking invalid and skipping upload',
+            extra={
+                'filename': filename,
+                'channel_id': channel.channel_id,
+                'channel_handle': handle,
+                'validation_error': err,
+            },
+        )
+        try:
+            await fm.mark_invalid(filename)
+        except OSError as exc:
+            logging.warning(
+                'Failed to mark channel file invalid',
+                exc=exc,
+                extra={'filename': filename},
+            )
+        return None
+
+    logging.debug(
+        'Collected channel record for bulk upload',
+        extra={
+            'filename': filename,
+            'channel_id': channel.channel_id,
+            'channel_handle': handle,
+        },
+    )
+    return channel.channel_id, record_dict
+
+
+async def _prepare_channel_line(
+    filename: str,
+    fm: AssetFileManagement,
+    creator_map_backend: CreatorMap,
+    name_map_backend: NameMap,
+    validator: SchemaValidator,
+) -> tuple[str, str, bytes] | None:
+    '''
+    Per-file work for the bulk-upload sweep, factored out so that
+    :func:`upload_channels` can run ``channel_concurrency`` of
+    these in flight at once via :func:`asyncio.gather`. Handles
+    the superseded-file branch (delete + skip), the read /
+    handle-resolution / serialise pipeline, and the byte-cap
+    pre-check log.
+
+    :returns: ``(channel_id, filename, line_bytes)`` on success,
+        or ``None`` when the file should be skipped (superseded,
+        read error, missing channel_id).
+    '''
+    logging.debug(
+        'Considering channel file for bulk upload',
+        extra={'filename': filename},
+    )
+    if fm.is_superseded(filename):
+        logging.debug(
+            'Channel file superseded, deleting',
+            extra={'filename': filename},
+        )
+        METRIC_UPLOADED_FILE_EXISTS.labels(
+            worker_id=get_worker_id(),
+        ).inc()
+        try:
+            await fm.delete(filename, fail_ok=False)
+        except Exception as exc:
+            logging.warning(
+                'Failed to delete superseded channel file',
+                exc=exc,
+                extra={'filename': filename},
+            )
+        return None
+
+    record: tuple[str, dict] | None = (
+        await _collect_channel_record(
+            filename, fm,
+            creator_map_backend, name_map_backend,
+            validator,
+        )
+    )
+    if record is None:
+        return None
+    channel_id: str
+    record_dict: dict
+    channel_id, record_dict = record
+
+    line: bytes = orjson.dumps(record_dict) + b'\n'
+    logging.debug(
+        'Prepared channel record for bulk batch',
+        extra={
+            'filename': filename,
+            'channel_id': channel_id,
+            'record_bytes': len(line),
+        },
+    )
+    return channel_id, filename, line
+
+
+async def _upload_one_channel_batch(
+    batch_buf: bytes,
+    batch_records: list[tuple[str, str]],
+    settings: ChannelSettings,
+    client: ExchangeClient,
+    fm: AssetFileManagement,
+) -> None:
+    '''
+    Dispatch one prepared batch of channel records via the shared
+    bulk-upload pipeline and route per-record outcomes into the
+    channel-specific Prometheus metrics. The shared helper handles
+    POST, progress streaming, and result reconciliation; this
+    function only translates lifecycle outcomes into metric
+    increments.
+    '''
+    if not batch_records:
+        return
+
+    outcome: BulkBatchOutcome = await upload_bulk_batch(
+        batch_buf, batch_records,
+        schema_owner=settings.schema_owner,
+        schema_version=settings.schema_version,
+        platform='youtube',
+        entity='channel',
+        exchange_url=settings.exchange_url,
+        client=client,
+        fm=fm,
+        progress_timeout_seconds=(
+            settings.bulk_progress_timeout_seconds
+        ),
+        filename_prefix='channels',
+    )
+    METRIC_BULK_BATCHES.labels(
+        worker_id=get_worker_id(), outcome=outcome.status,
+    ).inc()
+    if outcome.success:
+        METRIC_CHANNELS_BULK_UPLOADED.labels(
+            worker_id=get_worker_id(),
+        ).inc(outcome.success)
+    if outcome.failed:
+        METRIC_CHANNELS_BULK_FAILED.labels(
+            worker_id=get_worker_id(),
+        ).inc(outcome.failed)
+    if outcome.missing:
+        METRIC_CHANNELS_BULK_MISSING_RESULT.labels(
+            worker_id=get_worker_id(),
+        ).inc(outcome.missing)
+
+
+
 async def upload_channels(
     settings: ChannelSettings,
     client: ExchangeClient,
     fm: AssetFileManagement,
     creator_map_backend: CreatorMap,
+    name_map_backend: NameMap,
+    validator: SchemaValidator,
 ) -> None:
+    '''
+    Sweep ``base_dir`` for pending channel files and upload them
+    via the bulk API in batches of up to
+    ``settings.bulk_batch_size`` records (or
+    ``settings.bulk_max_batch_bytes`` bytes, whichever is hit
+    first). Per-record success in the job results promotes the
+    matching source file to ``uploaded_dir``; failed and missing
+    records are left in ``base_dir`` for the next iteration.
+
+    The watcher loop ``_watch_and_upload_channels`` keeps using
+    the per-channel POST path because it processes files as they
+    arrive and bulk batching offers no benefit for single-file
+    arrivals.
+    '''
+
     files: list[str] = [
         f for f in fm.list_base(
             prefix=CHANNEL_FILE_PREFIX,
@@ -608,13 +895,102 @@ async def upload_channels(
         worker_id=get_worker_id()
     ).set(len(files))
     logging.info(
-        'Found already scraped channel files that may '
-        'need to be uploaded',
+        'Found channel files for bulk upload',
         extra={'files_length': len(files)},
     )
-    for filename in files:
-        await _upload_single_channel(
-            filename, settings, client, fm, creator_map_backend,
+    if not files:
+        return
+
+    batch_buf: bytearray = bytearray()
+    batch_records: list[tuple[str, str]] = []
+    max_records: int = settings.bulk_batch_size
+    max_bytes: int = settings.bulk_max_batch_bytes
+    concurrency: int = max(settings.channel_concurrency, 1)
+
+    # Process files in concurrent chunks of *concurrency* size.
+    # Each task does the per-file I/O (read+decompress, creator_map
+    # / name_map writes, JSON re-serialise) so the event loop has
+    # ``concurrency`` files in flight at once. Sequential batching
+    # then consumes the prepared lines in submission order, which
+    # keeps the ``record_index`` fallback in
+    # :func:`apply_bulk_results` consistent with the wire order.
+    for start in range(0, len(files), concurrency):
+        chunk: list[str] = files[start:start + concurrency]
+        prepared: list[
+            tuple[str, str, bytes] | None
+        ] = await asyncio.gather(*(
+            _prepare_channel_line(
+                f, fm,
+                creator_map_backend, name_map_backend,
+                validator,
+            )
+            for f in chunk
+        ))
+        for entry in prepared:
+            if entry is None:
+                continue
+            channel_id: str
+            filename: str
+            line: bytes
+            channel_id, filename, line = entry
+            logging.debug(
+                'Adding channel record to bulk batch',
+                extra={
+                    'filename': filename,
+                    'channel_id': channel_id,
+                    'record_bytes': len(line),
+                    'batch_records_count': len(batch_records),
+                    'batch_bytes': len(batch_buf),
+                },
+            )
+
+            if len(line) > max_bytes:
+                logging.warning(
+                    'Channel record exceeds bulk-batch byte cap, '
+                    'skipping',
+                    extra={
+                        'filename': filename,
+                        'channel_id': channel_id,
+                        'record_bytes': len(line),
+                        'max_bytes': max_bytes,
+                    },
+                )
+                continue
+
+            if (
+                len(batch_records) >= max_records
+                or len(batch_buf) + len(line) > max_bytes
+            ):
+                logging.debug(
+                    'Channel bulk batch reached cap, flushing',
+                    extra={
+                        'records': len(batch_records),
+                        'bytes': len(batch_buf),
+                        'max_records': max_records,
+                        'max_bytes': max_bytes,
+                    },
+                )
+                await _upload_one_channel_batch(
+                    bytes(batch_buf), batch_records,
+                    settings, client, fm,
+                )
+                batch_buf = bytearray()
+                batch_records = []
+
+            batch_buf.extend(line)
+            batch_records.append((channel_id, filename))
+
+    if batch_records:
+        logging.debug(
+            'Flushing trailing channel bulk batch',
+            extra={
+                'records': len(batch_records),
+                'bytes': len(batch_buf),
+            },
+        )
+        await _upload_one_channel_batch(
+            bytes(batch_buf), batch_records,
+            settings, client, fm,
         )
 
 
@@ -633,8 +1009,12 @@ async def _upload_single_channel(
     client: ExchangeClient,
     fm: AssetFileManagement,
     creator_map_backend: CreatorMap,
+    name_map_backend: NameMap,
+    validator: SchemaValidator,
 ) -> None:
-    '''Upload a single channel file if it needs uploading.'''
+    '''
+    Upload a single channel file if it needs uploading.
+    '''
 
     if fm.is_superseded(filename):
         METRIC_UPLOADED_FILE_EXISTS.labels(
@@ -653,13 +1033,14 @@ async def _upload_single_channel(
         channel: YouTubeChannel = (
             YouTubeChannel.from_dict(channel_data)
         )
-        if await channel_exists(client, channel.name):
+        if await channel_exists(client, channel.channel_handle):
             await fm.delete(filename, fail_ok=False)
             return
 
         if await enqueue_upload_channel(
             settings, client, fm, filename, channel,
-            creator_map_backend,
+            creator_map_backend, name_map_backend,
+            validator,
         ):
             METRIC_CHANNELS_ENQUEUED.labels(
                 worker_id=get_worker_id(),
@@ -677,6 +1058,8 @@ async def _watch_and_upload_channels(
     client: ExchangeClient,
     fm: AssetFileManagement,
     creator_map_backend: CreatorMap,
+    name_map_backend: NameMap,
+    validator: SchemaValidator,
 ) -> None:
     '''
     Upload-only watcher loop.  Watches
@@ -715,11 +1098,12 @@ async def _watch_and_upload_channels(
             )
             await _upload_single_channel(
                 filename, settings, client, fm,
-                creator_map_backend,
+                creator_map_backend, name_map_backend,
+                validator,
             )
 
 
-def normalize_channel_name(channel_name: str) -> str:
+def normalize_channel_name(channel_handle: str) -> str:
     '''
     Normalises a YouTube channel name extracted from user input by
     stripping whitespace and a leading '@'. Also strips URL prefixes
@@ -730,17 +1114,17 @@ def normalize_channel_name(channel_name: str) -> str:
     canonical handle. The canonical handle is resolved later by
     resolve_channel_upload_handle() using YouTube's vanityChannelUrl.
 
-    :param channel_name: The original channel name.
+    :param channel_handle: The original channel name.
     :returns: The stripped channel name.
     '''
 
-    name: str = channel_name.strip().lstrip('@')
+    name: str = channel_handle.strip().lstrip('@')
     if name.startswith('https://'):
         name = name.split('/')[-1]
         logging.debug(
             'Extracted channel name from URL',
             extra={
-                'original_channel_name': channel_name,
+                'original_channel_name': channel_handle,
                 'name': name,
             },
         )
@@ -750,7 +1134,7 @@ def normalize_channel_name(channel_name: str) -> str:
         logging.debug(
             'Extracted channel name from email',
             extra={
-                'original_channel_name': channel_name,
+                'original_channel_name': channel_handle,
                 'name': name,
             },
         )
@@ -758,8 +1142,8 @@ def normalize_channel_name(channel_name: str) -> str:
     return name
 
 
-def get_channel_filename(channel_name: str) -> str:
-    return f'{CHANNEL_FILE_PREFIX}{channel_name}{CHANNEL_FILE_POSTFIX}'
+def get_channel_filename(channel_handle: str) -> str:
+    return f'{CHANNEL_FILE_PREFIX}{channel_handle}{CHANNEL_FILE_POSTFIX}'
 
 
 def _failed_marker_is_stale(
@@ -860,7 +1244,7 @@ def _record_scrape_failure(
 
 async def _try_scrape_channel(
     channel: YouTubeChannel, settings: ChannelSettings,
-    fm: AssetFileManagement, channel_name: str,
+    fm: AssetFileManagement, channel_handle: str,
     extra: dict[str, str],
 ) -> tuple[bool, str | None]:
     '''
@@ -884,8 +1268,8 @@ async def _try_scrape_channel(
         logging.debug('Channel not found, skipping', extra=extra)
         try:
             await fm.mark_not_found(
-                f'{CHANNEL_FILE_PREFIX}{channel_name}',
-                content=f'{channel_name}\n',
+                f'{CHANNEL_FILE_PREFIX}{channel_handle}',
+                content=f'{channel_handle}\n',
             )
         except OSError:
             logging.warning(
@@ -924,7 +1308,7 @@ async def _try_scrape_channel(
 
 def _channel_has_no_content(
     channel: YouTubeChannel, scrape_proxy_ip: str,
-    scrape_proxy_network: str, channel_name: str,
+    scrape_proxy_network: str, channel_handle: str,
 ) -> bool:
     '''
     Return True (and emit the no-content metric) when *channel* has no
@@ -938,7 +1322,7 @@ def _channel_has_no_content(
         logging.info(
             'Channel has description but no other content, skipping '
             'upload',
-            extra={'channel_name': channel_name},
+            extra={'channel_handle': channel_handle},
         )
     METRIC_CHANNEL_NO_CONTENT_FOUND.labels(
         worker_id=get_worker_id(),
@@ -948,7 +1332,7 @@ def _channel_has_no_content(
     logging.info(
         'YouTube channel content counts',
         extra={
-            'channel_name': channel_name,
+            'channel_handle': channel_handle,
             'proxy_ip': scrape_proxy_ip,
             'proxy_network': scrape_proxy_network,
             'playlists_length': len(channel.playlists),
@@ -962,7 +1346,7 @@ def _channel_has_no_content(
 
 async def _persist_scraped_channel(
     fm: AssetFileManagement, filename: str,
-    channel: YouTubeChannel, channel_name: str,
+    channel: YouTubeChannel, channel_handle: str,
 ) -> bool:
     '''
     Write the freshly-scraped channel to disk. Returns True on success,
@@ -977,7 +1361,7 @@ async def _persist_scraped_channel(
             'Failed to write channel file to disk',
             exc=exc,
             extra={
-                'channel_name': channel_name, 'filename': filename,
+                'channel_handle': channel_handle, 'filename': filename,
             },
         )
         return False
@@ -985,7 +1369,7 @@ async def _persist_scraped_channel(
 
 
 async def _load_channel_from_disk(
-    fm: AssetFileManagement, filename: str, channel_name: str,
+    fm: AssetFileManagement, filename: str, channel_handle: str,
 ) -> YouTubeChannel | None:
     '''
     Load a previously-scraped channel from *fm*. Returns None on a read
@@ -999,31 +1383,39 @@ async def _load_channel_from_disk(
             'Failed to load channel file for upload',
             exc=exc,
             extra={
-                'channel_name': channel_name, 'filename': filename,
+                'channel_handle': channel_handle, 'filename': filename,
             },
         )
         return None
 
 
-async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
-                         fm: AssetFileManagement, channel_name: str,
-                         creator_map_backend: CreatorMap) -> bool:
+async def scrape_channel(
+    settings: ChannelSettings,
+    client: ExchangeClient,
+    fm: AssetFileManagement,
+    channel_handle: str,
+    creator_map_backend: CreatorMap,
+    name_map_backend: NameMap,
+    validator: SchemaValidator,
+) -> bool:
     '''
     Scrapes a single YouTube channel and uploads it to the Scrape Exchange.
 
     :param settings: Tool settings.
     :param client: The Scrape Exchange client instance.
     :param fm: AssetFileManagement instance owning the channel data directory.
-    :param channel_name: The name of the YouTube channel to scrape.
+    :param channel_handle: The name of the YouTube channel to scrape.
     :param creator_map_backend: Shared CreatorMap for
         channel_id → handle persistence.
+    :param name_map_backend: Shared NameMap for
+        channel_title → channel_id persistence.
     :returns: whether channel scraping/uploading failed
     :raises: (none)
     '''
 
-    extra: dict[str, str] = {'channel_name': channel_name}
+    extra: dict[str, str] = {'channel_handle': channel_handle}
     logging.debug('Processing channel', extra=extra)
-    filename: str = get_channel_filename(channel_name)
+    filename: str = get_channel_filename(channel_handle)
     extra['filename'] = filename
     base_path: Path = fm.base_dir / filename
 
@@ -1037,7 +1429,7 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
             'Channel not scraped, scraping now', extra=extra,
         )
         channel = YouTubeChannel(
-            name=channel_name, deno_path=DENO_PATH,
+            channel_handle=channel_handle, deno_path=DENO_PATH,
             po_token_url=PO_TOKEN_URL, debug=True,
             save_dir=settings.channel_data_directory,
             with_download_client=False,
@@ -1045,7 +1437,7 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
         ok: bool
         scrape_proxy: str | None
         ok, scrape_proxy = await _try_scrape_channel(
-            channel, settings, fm, channel_name, extra,
+            channel, settings, fm, channel_handle, extra,
         )
         if not ok:
             return False
@@ -1056,12 +1448,12 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
         scrape_proxy_network: str = proxy_network_for(scrape_proxy_ip)
 
         if _channel_has_no_content(
-            channel, scrape_proxy_ip, scrape_proxy_network, channel_name,
+            channel, scrape_proxy_ip, scrape_proxy_network, channel_handle,
         ):
             return False
 
         if not await _persist_scraped_channel(
-            fm, filename, channel, channel_name,
+            fm, filename, channel, channel_handle,
         ):
             return True
 
@@ -1073,7 +1465,7 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
         logging.info(
             'Downloaded channel',
             extra={
-                'channel_name': channel_name,
+                'channel_handle': channel_handle,
                 'proxy_ip': scrape_proxy_ip,
                 'proxy_network': scrape_proxy_network,
             },
@@ -1082,13 +1474,13 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
     if settings.channel_no_upload:
         logging.debug(
             'No-upload flag set, skipping upload for channel',
-            extra={'channel_name': channel_name},
+            extra={'channel_handle': channel_handle},
         )
         return False
 
     logging.debug(
         'Uploading channel to Scrape Exchange',
-        extra={'channel_name': channel_name},
+        extra={'channel_handle': channel_handle},
     )
     # If we reached here via the on-disk path (file existed but was
     # never uploaded, or local base is newer than uploaded copy),
@@ -1096,7 +1488,7 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
     # enqueueing.
     if channel is None:
         channel = await _load_channel_from_disk(
-            fm, filename, channel_name,
+            fm, filename, channel_handle,
         )
         if channel is None:
             return True
@@ -1104,7 +1496,9 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
     # Fire-and-forget: background worker moves the file on success;
     # on queue full the file stays in base_dir for the next retry.
     if await enqueue_upload_channel(
-        settings, client, fm, filename, channel, creator_map_backend,
+        settings, client, fm, filename, channel,
+        creator_map_backend, name_map_backend,
+        validator,
     ):
         METRIC_CHANNELS_ENQUEUED.labels(
             worker_id=get_worker_id(),
@@ -1113,50 +1507,59 @@ async def scrape_channel(settings: ChannelSettings, client: ExchangeClient,
 
 
 async def resolve_channel_upload_handle(
-    channel: YouTubeChannel, creator_map_backend: CreatorMap,
+    channel: YouTubeChannel,
+    creator_map_backend: CreatorMap,
+    name_map_backend: NameMap,
 ) -> str:
     '''
     Resolve the handle to use for uploading *channel*.
 
-    Prefers ``channel.canonical_handle`` (set by scrape_channel_content
-    from YouTube's vanityChannelUrl). Falls back to fallback_handle()
-    on the channel's current name when no canonical handle exists.
-    Writes the result to the creator map so RSS/video scrapers can
-    read it.
+    Returns ``channel.channel_handle``, which ``scrape_channel_content``
+    has already populated with the canonical handle from YouTube's
+    vanityChannelUrl (or left as the input handle when no canonical
+    was returned). Writes the result to the creator map so RSS/video
+    scrapers can read it. Also writes
+    ``(channel.title, channel.channel_id)`` to the name map so
+    re-ingest can recover ids from legacy display-name-only video
+    records.
 
     :param channel: The scraped channel.
     :param creator_map_backend: Shared creator map backend.
+    :param name_map_backend: Shared name map backend
+        (channel_title → channel_id).
     :returns: The handle to use for the upload.
     '''
 
-    handle: str
-    if channel.canonical_handle:
-        handle = channel.canonical_handle
-        CREATOR_MAP_RESOLUTION_TOTAL.labels(
-            scraper='channel', outcome='canonical',
-        ).inc()
-    else:
-        handle = fallback_handle(channel.name)
-        CREATOR_MAP_RESOLUTION_TOTAL.labels(
-            scraper='channel', outcome='fallback',
-        ).inc()
+    handle: str = channel.channel_handle
+    CREATOR_MAP_RESOLUTION_TOTAL.labels(
+        scraper='channel', outcome='canonical',
+    ).inc()
 
-    if channel.name != handle:
-        CREATOR_HANDLE_MISMATCH_TOTAL.labels(
-            scraper='channel',
-        ).inc()
-
+    # Issue the creator_map and name_map writes concurrently so the
+    # bulk-upload sweep pays one round-trip of Redis latency per
+    # channel instead of two.
     if channel.channel_id:
-        await creator_map_backend.put(
-            channel.channel_id, handle,
-        )
+        writes: list = [
+            creator_map_backend.put(channel.channel_id, handle),
+        ]
+        if channel.title:
+            writes.append(
+                name_map_backend.put(
+                    asset_title=channel.title,
+                    asset_id=channel.channel_id,
+                )
+            )
+        await asyncio.gather(*writes)
     return handle
 
 
 async def enqueue_upload_channel(
     settings: ChannelSettings, client: ExchangeClient,
-    fm: AssetFileManagement, filename: str, channel: YouTubeChannel,
+    fm: AssetFileManagement, filename: str,
+    channel: YouTubeChannel,
     creator_map_backend: CreatorMap,
+    name_map_backend: NameMap,
+    validator: SchemaValidator,
 ) -> bool:
     '''
     Fire-and-forget upload of a scraped channel to Scrape Exchange.
@@ -1168,18 +1571,47 @@ async def enqueue_upload_channel(
     (API down, retries backing up) the enqueue is dropped and the
     file stays in ``base_dir`` for the next iteration to retry.
 
-    :returns: ``True`` if the job was enqueued, ``False`` if dropped.
+    :returns: ``True`` if the job was enqueued, ``False`` if dropped
+        or if schema validation failed.
     '''
 
     handle: str = await resolve_channel_upload_handle(
-        channel, creator_map_backend,
+        channel, creator_map_backend, name_map_backend,
     )
-    channel.name = handle
+    channel.channel_handle = handle
+
+    record_dict: dict = channel.to_dict(with_video_ids=False)
+    err: str | None = validator.validate(record_dict)
+    if err is not None:
+        logging.warning(
+            'Channel record failed schema validation, '
+            'marking invalid and skipping upload',
+            extra={
+                'filename': filename,
+                'channel_id': channel.channel_id,
+                'channel_handle': handle,
+                'validation_error': err,
+            },
+        )
+        try:
+            await fm.mark_invalid(filename)
+        except OSError as exc:
+            logging.warning(
+                'Failed to mark channel file invalid',
+                exc=exc,
+                extra={'filename': filename},
+            )
+        return False
 
     logging.info(
         'Enqueuing channel for upload',
-        extra={'channel_name': channel.name},
+        extra={'channel_handle': channel.channel_handle},
     )
+    # platform_content_id and platform_creator_id are intentionally
+    # omitted: the server derives them from the channel schema's
+    # ``x-scrape-field`` markers (``channel_id`` →
+    # ``platform_content_id``, ``channel_handle`` →
+    # ``platform_creator_id``) which are present in the data dict.
     return client.enqueue_upload(
         f'{settings.exchange_url}{client.POST_DATA_API}',
         json={
@@ -1188,15 +1620,15 @@ async def enqueue_upload_channel(
             'entity': 'channel',
             'version': settings.schema_version,
             'source_url': channel.url,
-            'data': channel.to_dict(with_video_ids=False),
-            'platform_content_id': channel.name,
-            'platform_creator_id': channel.name,
-            'platform_topic_id': None,
+            'data': record_dict,
         },
         file_manager=fm,
         filename=filename,
         entity='channel',
-        log_extra={'channel_name': channel.name},
+        log_extra={
+            'channel_handle': channel.channel_handle,
+            'channel_id': channel.channel_id,
+        },
     )
 
 

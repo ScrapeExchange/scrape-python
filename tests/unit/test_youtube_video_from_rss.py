@@ -17,6 +17,9 @@ from scrape_exchange.youtube.youtube_thumbnail import (
 from scrape_exchange.youtube.youtube_video import YouTubeVideo
 
 
+_TEST_HANDLE: str = 'CanonicalHandle'
+
+
 def _parse_entries(xml: str) -> list[untangle.Element]:
     '''Parse an RSS feed payload and return its entries as a
     list, matching what ``fetch_rss`` in the RSS scraper does.'''
@@ -77,7 +80,7 @@ class TestFromRssEntryFullEntry(unittest.TestCase):
 
     def test_core_fields(self) -> None:
         video: YouTubeVideo = YouTubeVideo.from_rss_entry(
-            self.entry,
+            self.entry, channel_handle=_TEST_HANDLE,
         )
         self.assertEqual(video.video_id, 'abcdefghijk')
         self.assertEqual(video.title, 'Sample video title')
@@ -92,15 +95,15 @@ class TestFromRssEntryFullEntry(unittest.TestCase):
 
     def test_channel_fields(self) -> None:
         video: YouTubeVideo = YouTubeVideo.from_rss_entry(
-            self.entry,
+            self.entry, channel_handle=_TEST_HANDLE,
         )
         self.assertEqual(
             video.channel_id,
             'UCtestchannel0123456789',
         )
-        self.assertEqual(
-            video.channel_name, 'Sample Channel',
-        )
+        # channel_handle is the value passed in, never derived
+        # from the RSS <author><name>.
+        self.assertEqual(video.channel_handle, _TEST_HANDLE)
         self.assertEqual(
             video.channel_url,
             'https://www.youtube.com/channel/'
@@ -109,7 +112,7 @@ class TestFromRssEntryFullEntry(unittest.TestCase):
 
     def test_timestamps_parse_as_aware(self) -> None:
         video: YouTubeVideo = YouTubeVideo.from_rss_entry(
-            self.entry,
+            self.entry, channel_handle=_TEST_HANDLE,
         )
         self.assertEqual(
             video.published_timestamp.year, 2024,
@@ -130,7 +133,7 @@ class TestFromRssEntryFullEntry(unittest.TestCase):
 
     def test_description_preserves_newlines(self) -> None:
         video: YouTubeVideo = YouTubeVideo.from_rss_entry(
-            self.entry,
+            self.entry, channel_handle=_TEST_HANDLE,
         )
         self.assertEqual(
             video.description, 'Line one.\nLine two.',
@@ -138,13 +141,13 @@ class TestFromRssEntryFullEntry(unittest.TestCase):
 
     def test_view_count_parses_as_int(self) -> None:
         video: YouTubeVideo = YouTubeVideo.from_rss_entry(
-            self.entry,
+            self.entry, channel_handle=_TEST_HANDLE,
         )
         self.assertEqual(video.view_count, 12345)
 
     def test_thumbnail_captured_with_dimensions(self) -> None:
         video: YouTubeVideo = YouTubeVideo.from_rss_entry(
-            self.entry,
+            self.entry, channel_handle=_TEST_HANDLE,
         )
         self.assertEqual(len(video.thumbnails), 1)
         thumb: YouTubeThumbnail = next(
@@ -172,14 +175,15 @@ _MINIMAL_ENTRY_XML: str = '''<?xml version="1.0" encoding="UTF-8"?>
 
 class TestFromRssEntryMinimal(unittest.TestCase):
     '''Every optional RSS field is skipped silently; defaults
-    from YouTubeVideo.__init__ remain in place.'''
+    from YouTubeVideo.__init__ remain in place. ``channel_handle``
+    is required and so is always set, even on minimal entries.'''
 
     def test_required_fields_populate(self) -> None:
         entry: untangle.Element = _parse_entries(
             _MINIMAL_ENTRY_XML,
         )[0]
         video: YouTubeVideo = YouTubeVideo.from_rss_entry(
-            entry,
+            entry, channel_handle=_TEST_HANDLE,
         )
         self.assertEqual(video.video_id, 'minimalidxyz')
         self.assertEqual(
@@ -191,10 +195,11 @@ class TestFromRssEntryMinimal(unittest.TestCase):
             _MINIMAL_ENTRY_XML,
         )[0]
         video: YouTubeVideo = YouTubeVideo.from_rss_entry(
-            entry,
+            entry, channel_handle=_TEST_HANDLE,
         )
         self.assertIsNone(video.channel_id)
-        self.assertIsNone(video.channel_name)
+        # channel_handle is required and is always set.
+        self.assertEqual(video.channel_handle, _TEST_HANDLE)
         self.assertIsNone(video.channel_url)
         self.assertIsNone(video.published_timestamp)
         self.assertIsNone(video.uploaded_timestamp)
@@ -233,14 +238,18 @@ class TestFromRssEntryRaisesOnMissingRequired(
             _MISSING_VIDEO_ID_XML,
         )[0]
         with self.assertRaises(AttributeError):
-            YouTubeVideo.from_rss_entry(entry)
+            YouTubeVideo.from_rss_entry(
+                entry, channel_handle=_TEST_HANDLE,
+            )
 
     def test_missing_title_raises(self) -> None:
         entry: untangle.Element = _parse_entries(
             _MISSING_TITLE_XML,
         )[0]
         with self.assertRaises(AttributeError):
-            YouTubeVideo.from_rss_entry(entry)
+            YouTubeVideo.from_rss_entry(
+                entry, channel_handle=_TEST_HANDLE,
+            )
 
 
 _MALFORMED_TIMESTAMP_XML: str = '''<?xml version="1.0" encoding="UTF-8"?>
@@ -268,7 +277,7 @@ class TestFromRssEntryMalformedTimestamp(
             _MALFORMED_TIMESTAMP_XML,
         )[0]
         video: YouTubeVideo = YouTubeVideo.from_rss_entry(
-            entry,
+            entry, channel_handle=_TEST_HANDLE,
         )
         self.assertEqual(video.video_id, 'badtimes123')
         self.assertIsNone(video.published_timestamp)
@@ -310,7 +319,7 @@ class TestFromRssEntryThumbnailWithoutDimensions(
             _THUMBNAIL_NO_DIMENSIONS_XML,
         )[0]
         video: YouTubeVideo = YouTubeVideo.from_rss_entry(
-            entry,
+            entry, channel_handle=_TEST_HANDLE,
         )
         self.assertEqual(len(video.thumbnails), 1)
         thumb: YouTubeThumbnail = next(
@@ -351,23 +360,21 @@ _ENTRY_WITHOUT_AUTHOR_XML: str = '''<?xml version="1.0" encoding="UTF-8"?>
 </feed>'''
 
 
-class TestFromRssEntryChannelNameOverride(unittest.TestCase):
-    '''``channel_name_override`` lets callers stamp a
-    pre-resolved handle (e.g. from CreatorMap) onto every
-    video parsed from a feed, replacing the RSS entry's
-    ``<author><name>`` value. ``None`` preserves the
-    author-name fallback, and channel_url is never
-    overridden.'''
+class TestFromRssEntryChannelHandle(unittest.TestCase):
+    '''``channel_handle`` is a required parameter; the RSS
+    entry's ``<author><name>`` is never consulted. The
+    ``channel_url`` continues to come from the RSS entry's
+    ``<author><uri>`` when present.'''
 
-    def test_override_replaces_author_name(self) -> None:
+    def test_handle_ignores_rss_author_name(self) -> None:
         entry: untangle.Element = _parse_entries(
             _ENTRY_WITH_AUTHOR_XML,
         )[0]
         video: YouTubeVideo = YouTubeVideo.from_rss_entry(
-            entry, channel_name_override='CanonicalHandle',
+            entry, channel_handle='CanonicalHandle',
         )
         self.assertEqual(
-            video.channel_name, 'CanonicalHandle',
+            video.channel_handle, 'CanonicalHandle',
         )
         # channel_url still comes from the RSS entry.
         self.assertEqual(
@@ -376,58 +383,20 @@ class TestFromRssEntryChannelNameOverride(unittest.TestCase):
             'UCoverridechannel0000000',
         )
 
-    def test_none_override_keeps_author_name(self) -> None:
-        entry: untangle.Element = _parse_entries(
-            _ENTRY_WITH_AUTHOR_XML,
-        )[0]
-        video: YouTubeVideo = YouTubeVideo.from_rss_entry(
-            entry, channel_name_override=None,
-        )
-        self.assertEqual(
-            video.channel_name, 'RSS Author Name',
-        )
-
-    def test_default_omits_override_kwarg(self) -> None:
-        '''Not passing the kwarg at all must behave like
-        ``None`` — the existing fetch_rss callers relied on
-        the RSS entry author name.'''
-        entry: untangle.Element = _parse_entries(
-            _ENTRY_WITH_AUTHOR_XML,
-        )[0]
-        video: YouTubeVideo = YouTubeVideo.from_rss_entry(
-            entry,
-        )
-        self.assertEqual(
-            video.channel_name, 'RSS Author Name',
-        )
-
-    def test_override_populates_when_author_missing(
-        self,
-    ) -> None:
-        '''When the entry has no <author> block, the
-        override still wins and channel_name is set from
-        it.'''
+    def test_handle_set_when_author_missing(self) -> None:
+        '''When the entry has no <author> block, channel_handle
+        is still set from the parameter and channel_url stays
+        unset.'''
         entry: untangle.Element = _parse_entries(
             _ENTRY_WITHOUT_AUTHOR_XML,
         )[0]
         video: YouTubeVideo = YouTubeVideo.from_rss_entry(
-            entry, channel_name_override='CanonicalHandle',
+            entry, channel_handle='CanonicalHandle',
         )
         self.assertEqual(
-            video.channel_name, 'CanonicalHandle',
+            video.channel_handle, 'CanonicalHandle',
         )
         self.assertIsNone(video.channel_url)
-
-    def test_empty_string_override_is_applied(self) -> None:
-        '''Only ``None`` triggers the fallback — an empty
-        string is treated as a deliberate override.'''
-        entry: untangle.Element = _parse_entries(
-            _ENTRY_WITH_AUTHOR_XML,
-        )[0]
-        video: YouTubeVideo = YouTubeVideo.from_rss_entry(
-            entry, channel_name_override='',
-        )
-        self.assertEqual(video.channel_name, '')
 
 
 if __name__ == '__main__':

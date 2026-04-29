@@ -170,10 +170,16 @@ class ExchangeClient(AsyncClient):
         self._upload_tasks: list[asyncio.Task] = []
         self._upload_shutdown: bool = False
 
+        # No default Content-Type. httpx auto-sets the correct
+        # value per body kind: ``application/json`` for ``json=``
+        # callers, ``multipart/form-data; boundary=...`` for the
+        # bulk-upload path that passes ``data=`` + ``files=``. A
+        # client-level default would win the header-merge step in
+        # :class:`httpx.Client._merge_headers` and stop httpx from
+        # emitting the multipart boundary, leaving the server to
+        # parse multipart bytes as JSON and reject every field as
+        # missing.
         super().__init__(
-            headers={
-                'Content-Type': 'application/json',
-            },
             trust_env=False,
         )
 
@@ -718,6 +724,7 @@ class ExchangeClient(AsyncClient):
                     METRIC_BACKGROUND_UPLOADS.labels(
                         outcome='failure',
                         entity=job.entity,
+                        worker_id=get_worker_id(),
                     ).inc()
                     _LOGGER.warning(
                         'Upload succeeded but '
@@ -777,6 +784,7 @@ class ExchangeClient(AsyncClient):
         METRIC_BACKGROUND_UPLOADS.labels(
             outcome='failure',
             entity=job.entity,
+            worker_id=get_worker_id(),
         ).inc()
         _LOGGER.warning(
             'Background upload rejected by API',

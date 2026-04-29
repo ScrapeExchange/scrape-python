@@ -39,9 +39,12 @@ class TestRssUpdateChannelHandleResolution(
 ):
     async def test_canonical_handle_written_and_used(self) -> None:
         from scrape_exchange.creator_map import NullCreatorMap
+        from scrape_exchange.name_map import NullNameMap
 
         cm: NullCreatorMap = NullCreatorMap()
         cm.put = AsyncMock()
+        nm: NullNameMap = NullNameMap()
+        nm.put = AsyncMock()
         exchange_client: MagicMock = MagicMock()
         exchange_client.exchange_url = 'http://api.example'
         exchange_client.enqueue_upload = MagicMock(return_value=True)
@@ -64,11 +67,17 @@ class TestRssUpdateChannelHandleResolution(
             tabs_cls.return_value.browse_channel = AsyncMock(
                 return_value=browse_response,
             )
+            permissive_validator = MagicMock()
+            permissive_validator.validate = MagicMock(
+                return_value=None,
+            )
             result = await update_channel(
                 exchange_client,
-                channel_name='input_casing',
+                channel_handle='input_casing',
                 channel_id='UC1234567890abcdefghij',
                 creator_map_backend=cm,
+                name_map_backend=nm,
+                validator=permissive_validator,
             )
 
         success: bool = result[0]
@@ -78,19 +87,27 @@ class TestRssUpdateChannelHandleResolution(
         cm.put.assert_awaited_once_with(
             'UC1234567890abcdefghij', 'Canonical',
         )
+        # platform_content_id and platform_creator_id are no longer
+        # sent explicitly; the server derives them from the channel
+        # schema's x-scrape-field markers, which point at
+        # data.channel_id and data.channel_handle.
         _args, kwargs = exchange_client.enqueue_upload.call_args
         self.assertEqual(
-            kwargs['json']['platform_creator_id'], 'Canonical',
+            kwargs['json']['data']['channel_handle'], 'Canonical',
         )
         self.assertEqual(
-            kwargs['json']['platform_content_id'], 'Canonical',
+            kwargs['json']['data']['channel_id'],
+            'UC1234567890abcdefghij',
         )
 
     async def test_handle_less_channel_uses_fallback(self) -> None:
         from scrape_exchange.creator_map import NullCreatorMap
+        from scrape_exchange.name_map import NullNameMap
 
         cm: NullCreatorMap = NullCreatorMap()
         cm.put = AsyncMock()
+        nm: NullNameMap = NullNameMap()
+        nm.put = AsyncMock()
         exchange_client: MagicMock = MagicMock()
         exchange_client.exchange_url = 'http://api.example'
         exchange_client.enqueue_upload = MagicMock(return_value=True)
@@ -109,11 +126,17 @@ class TestRssUpdateChannelHandleResolution(
             tabs_cls.return_value.browse_channel = AsyncMock(
                 return_value=browse_response,
             )
+            permissive_validator = MagicMock()
+            permissive_validator.validate = MagicMock(
+                return_value=None,
+            )
             result = await update_channel(
                 exchange_client,
-                channel_name='INPUT',
+                channel_handle='INPUT',
                 channel_id='UC1234567890abcdefghij',
                 creator_map_backend=cm,
+                name_map_backend=nm,
+                validator=permissive_validator,
             )
 
         self.assertTrue(result[0])
@@ -123,14 +146,17 @@ class TestRssUpdateChannelHandleResolution(
         )
         _args, kwargs = exchange_client.enqueue_upload.call_args
         self.assertEqual(
-            kwargs['json']['platform_creator_id'], 'input',
+            kwargs['json']['data']['channel_handle'], 'input',
         )
 
     async def test_browse_failure_returns_failure(self) -> None:
         from scrape_exchange.creator_map import NullCreatorMap
+        from scrape_exchange.name_map import NullNameMap
 
         cm: NullCreatorMap = NullCreatorMap()
         cm.put = AsyncMock()
+        nm: NullNameMap = NullNameMap()
+        nm.put = AsyncMock()
         exchange_client: MagicMock = MagicMock()
 
         with patch.object(
@@ -139,11 +165,17 @@ class TestRssUpdateChannelHandleResolution(
             tabs_cls.return_value.browse_channel = AsyncMock(
                 side_effect=RuntimeError('innertube down'),
             )
+            permissive_validator = MagicMock()
+            permissive_validator.validate = MagicMock(
+                return_value=None,
+            )
             result = await update_channel(
                 exchange_client,
-                channel_name='input',
+                channel_handle='input',
                 channel_id='UC1234567890abcdefghij',
                 creator_map_backend=cm,
+                name_map_backend=nm,
+                validator=permissive_validator,
             )
 
         self.assertFalse(result[0])

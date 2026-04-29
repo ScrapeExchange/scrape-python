@@ -23,6 +23,7 @@ from pathlib import Path
 from random import shuffle
 
 import brotli
+import orjson
 
 from httpx import Response
 
@@ -31,6 +32,10 @@ from prometheus_client import Counter, Gauge, Histogram
 from pydantic import AliasChoices, Field, field_validator
 from yt_dlp.YoutubeDL import YoutubeDL
 
+from scrape_exchange.bulk_upload import (
+    BulkBatchOutcome,
+    upload_bulk_batch,
+)
 from scrape_exchange.exchange_client import ExchangeClient
 from scrape_exchange.file_management import AssetFileManagement
 from scrape_exchange.content_claim import (
@@ -64,6 +69,10 @@ from scrape_exchange.creator_map import (
     CREATOR_MAP_RESOLUTION_TOTAL,
 )
 from watchfiles import awatch, Change
+from scrape_exchange.schema_validator import (
+    SchemaValidator,
+    fetch_schema_dict,
+)
 from scrape_exchange.youtube.settings import YouTubeScraperSettings
 
 VIDEO_MIN_PREFIX = 'video-min-'
@@ -237,6 +246,33 @@ METRIC_VIDEOS_SKIPPED_HAS_FORMATS = Counter(
     ['worker_id'],
 )
 
+# -- scheduled bulk-upload metrics --
+METRIC_VIDEOS_BULK_UPLOADED = Counter(
+    'yt_video_bulk_uploaded_total',
+    'Video records confirmed uploaded via the bulk API '
+    '(per-record success in the job results).',
+    ['worker_id'],
+)
+METRIC_VIDEOS_BULK_FAILED = Counter(
+    'yt_video_bulk_failed_total',
+    'Video records that the bulk worker reported as failed. '
+    'Source files are left in base_dir for the next iteration.',
+    ['worker_id'],
+)
+METRIC_VIDEOS_BULK_MISSING_RESULT = Counter(
+    'yt_video_bulk_missing_result_total',
+    'Video records that were submitted in a bulk batch but did '
+    'not appear in the job results. Source files are left in '
+    'base_dir for the next iteration.',
+    ['worker_id'],
+)
+METRIC_VIDEO_BULK_BATCHES = Counter(
+    'yt_video_bulk_batches_total',
+    'Bulk-upload batches dispatched by the scheduled video '
+    'upload sweep.',
+    ['worker_id', 'outcome'],
+)
+
 # -- upload-only watcher metrics --
 METRIC_WATCHER_FILES_DETECTED = Counter(
     'yt_video_watcher_files_detected_total',
@@ -293,7 +329,7 @@ class VideoSettings(YouTubeScraperSettings):
         description='Username of the owner of the YouTube channel schema'
     )
     schema_version: str = Field(
-        default='0.0.1',
+        default='0.0.2',
         validation_alias=AliasChoices('SCHEMA_VERSION', 'schema_version'),
         description='Schema version string sent with uploads',
     )
@@ -500,8 +536,34 @@ async def _run_worker(
             settings.channel_map_file,
         )
 
+    # Build the schema validator once at startup. Used by both the
+    # bulk-upload sweep and the live-scrape worker so that records
+    # that don't conform to the video JSON schema are rejected
+    # client-side and the on-disk asset is renamed
+    # ``<filename>.invalid`` for operator inspection.
+    video_schema_dict: dict = await fetch_schema_dict(
+        ctx.client,
+        settings.exchange_url,
+        settings.schema_owner,
+        'youtube',
+        'video',
+        settings.schema_version,
+    )
+    video_validator: SchemaValidator = SchemaValidator(
+        video_schema_dict,
+    )
+
+    if (
+        not settings.video_no_upload
+        and ctx.client is not None
+    ):
+        await upload_videos(
+            settings, ctx.client, video_fm, creator_map_backend,
+            video_validator,
+        )
+
     await worker_loop(
-        settings, video_fm, claim,
+        settings, video_fm, claim, video_validator,
         ctx.client, creator_map_backend,
     )
 
@@ -619,6 +681,7 @@ async def worker_loop(
     settings: VideoSettings,
     video_fm: AssetFileManagement,
     claim: ContentClaim,
+    validator: SchemaValidator,
     exchange_client: ExchangeClient | None = None,
     creator_map_backend: CreatorMap | None = None,
 ) -> None:
@@ -676,7 +739,7 @@ async def worker_loop(
                 worker(
                     proxy, queue, settings, video_fm,
                     exchange_client, claim,
-                    effective_creator_map,
+                    effective_creator_map, validator,
                 )
             )
             tasks.append(task)
@@ -860,7 +923,7 @@ async def _load_video_file(
 async def _scrape_and_save(
     entry: str,
     video_id: str,
-    channel_name: str,
+    channel_handle: str,
     download_client: YoutubeDL,
     settings: VideoSettings,
     video_fm: AssetFileManagement,
@@ -878,7 +941,7 @@ async def _scrape_and_save(
 
     :param entry: Original queue filename.
     :param video_id: YouTube video ID.
-    :param channel_name: Channel name for the video.
+    :param channel_handle: Channel name for the video.
     :param download_client: Configured YoutubeDL client.
     :param settings: Scraper settings.
     :param video_fm: File manager owning the data dir.
@@ -891,7 +954,7 @@ async def _scrape_and_save(
     try:
         video: YouTubeVideo | None
         video, sleep = await _scrape(
-            entry, video_id, channel_name,
+            entry, video_id, channel_handle,
             download_client,
             settings, video_fm, proxy, sleep,
         )
@@ -953,6 +1016,7 @@ async def worker(
     exchange_client: ExchangeClient | None,
     claim: ContentClaim,
     creator_map_backend: CreatorMap,
+    validator: SchemaValidator,
 ) -> None:
     '''
     Worker function to process video files from the queue
@@ -1101,7 +1165,7 @@ async def worker(
                     video, sleep = (
                         await _scrape_and_save(
                             entry, video_id,
-                            video.channel_name,
+                            video.channel_handle,
                             download_client, settings,
                             video_fm, proxy, sleep,
                         )
@@ -1146,9 +1210,9 @@ async def worker(
                         },
                     )
                 else:
-                    enqueued: bool = enqueue_upload_video(
+                    enqueued: bool = await enqueue_upload_video(
                         exchange_client, settings,
-                        video_fm, handle, video,
+                        video_fm, handle, video, validator,
                     )
                     if enqueued:
                         files_uploaded += 1
@@ -1365,7 +1429,7 @@ async def _video_has_formats_on_server(
     return isinstance(formats, list) and len(formats) > 0
 
 
-async def _scrape(entry: str, video_id: str, channel_name: str,
+async def _scrape(entry: str, video_id: str, channel_handle: str,
                   download_client: YoutubeDL, settings: VideoSettings,
                   video_fm: AssetFileManagement,
                   proxy: str, sleep: int = 0
@@ -1377,7 +1441,7 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
 
     :param entry: Filename of the video data file to scrape
     :param video_id: YouTube video ID to scrape
-    :param channel_name: YouTube channel name associated with the video
+    :param channel_handle: YouTube channel name associated with the video
     :param download_client: YoutubeDL instance for downloading video data
     :param settings: Configuration settings for the tool
     :param video_fm: AssetFileManagement instance owning the video data
@@ -1394,7 +1458,7 @@ async def _scrape(entry: str, video_id: str, channel_name: str,
     scrape_start: float = time.monotonic()
     try:
         video: YouTubeVideo = await YouTubeVideo.scrape(
-            video_id, channel_name=channel_name,
+            video_id, channel_handle=channel_handle,
             channel_thumbnail=None,
             ytdlp_cache_dir=settings.ytdlp_cache_dir,
             download_client=download_client,
@@ -1438,7 +1502,7 @@ async def resolve_video_upload_handle(
         2. On miss, resolve via InnerTube. On success with a handle,
            write to the map and return it.
         3. On success without a handle (legacy channel), fall back to
-           fallback_handle(video.channel_name) and write to map.
+           fallback_handle(video.channel_handle) and write to map.
         4. On InnerTube failure, return None — caller must skip the
            upload. Do NOT write to the map; the next tick retries.
 
@@ -1450,7 +1514,7 @@ async def resolve_video_upload_handle(
         CREATOR_MAP_RESOLUTION_TOTAL.labels(
             scraper='video', outcome='fallback',
         ).inc()
-        return fallback_handle(video.channel_name or '')
+        return fallback_handle(video.channel_handle or '')
 
     cached: str | None = await creator_map_backend.get(
         video.channel_id,
@@ -1493,7 +1557,7 @@ async def resolve_video_upload_handle(
         ).inc()
     else:
         handle = fallback_handle(
-            video.channel_name or video.channel_id,
+            video.channel_handle or video.channel_id,
         )
         CREATOR_MAP_RESOLUTION_TOTAL.labels(
             scraper='video', outcome='fallback',
@@ -1503,13 +1567,15 @@ async def resolve_video_upload_handle(
     return handle
 
 
-def enqueue_upload_video(
+async def enqueue_upload_video(
     client: ExchangeClient, settings: VideoSettings,
     video_fm: AssetFileManagement, handle: str,
     video: YouTubeVideo,
+    validator: SchemaValidator,
 ) -> bool:
     '''
-    Fire-and-forget upload of a scraped video to Scrape Exchange.
+    Fire-and-forget upload of a scraped video to Scrape Exchange,
+    gated by client-side schema validation.
 
     Returns immediately: the background worker inside
     :class:`ExchangeClient` performs the POST with retries and, on
@@ -1517,16 +1583,45 @@ def enqueue_upload_video(
     ``uploaded_dir`` via ``video_fm.mark_uploaded``. If the queue is
     full (API down, retries backing up) the enqueue is dropped and
     the file stays in ``base_dir`` to be retried on the next
-    iteration.
+    iteration. On validation failure the on-disk asset is renamed
+    ``<filename>.invalid`` and the function returns ``False``
+    without enqueuing anything.
 
     :param handle: Canonical channel handle to use as
         platform_creator_id; must match the channel entity's handle.
-    :returns: ``True`` if the job was enqueued, ``False`` if dropped.
+    :returns: ``True`` if the job was enqueued, ``False`` if
+        dropped or if schema validation failed.
     '''
 
     filename: str = (
         f'{VIDEO_YTDLP_PREFIX}{video.video_id}{FILE_EXTENSION}'
     )
+    record_dict: dict = video.to_dict()
+    err: str | None = validator.validate(record_dict)
+    if err is not None:
+        logging.warning(
+            'Video record failed schema validation, '
+            'marking invalid and skipping upload',
+            extra={
+                'filename': filename,
+                'video_id': video.video_id,
+                'validation_error': err,
+            },
+        )
+        try:
+            await video_fm.mark_invalid(filename)
+        except OSError as exc:
+            logging.warning(
+                'Failed to mark video file invalid',
+                exc=exc,
+                extra={'filename': filename},
+            )
+        return False
+    # platform_content_id and platform_creator_id are intentionally
+    # omitted: the server derives them from the video schema's
+    # ``x-scrape-field`` markers (``video_id`` →
+    # ``platform_content_id``, ``channel_handle`` →
+    # ``platform_creator_id``) which are present in the data dict.
     return client.enqueue_upload(
         f'{settings.exchange_url}{ExchangeClient.POST_DATA_API}',
         json={
@@ -1535,16 +1630,328 @@ def enqueue_upload_video(
             'entity': 'video',
             'version': settings.schema_version,
             'source_url': video.url,
-            'data': video.to_dict(),
-            'platform_content_id': video.video_id,
-            'platform_creator_id': handle,
-            'platform_topic_id': None,
+            'data': record_dict,
         },
         file_manager=video_fm,
         filename=filename,
         entity='video',
         log_extra={'video_id': video.video_id},
     )
+
+
+async def _collect_video_record(
+    filename: str,
+    settings: VideoSettings,
+    video_fm: AssetFileManagement,
+    creator_map_backend: CreatorMap,
+    proxy: str | None,
+    validator: SchemaValidator,
+) -> tuple[str, dict] | None:
+    '''
+    Read *filename* from base_dir and prepare a bulk-upload record.
+
+    :returns: ``(video_id, record_dict)`` on success, or ``None``
+        when the file should be skipped (read error, unresolved
+        handle, or missing ``video_id``).
+
+    Side effects: updates the shared creator_map via
+    :func:`resolve_video_upload_handle`.
+    '''
+    parsed: tuple[str, str, bool] | None = _parse_entry(filename)
+    if parsed is None:
+        logging.warning(
+            'Skipping unrecognised video filename',
+            extra={'filename': filename},
+        )
+        return None
+    video_id_from_name: str
+    prefix: str
+    video_id_from_name, prefix, _ = parsed
+
+    video: YouTubeVideo | None = await _load_video_file(
+        video_id_from_name,
+        settings.video_data_directory,
+        prefix, filename, video_fm,
+    )
+    if video is None:
+        return None
+
+    handle: str | None = await resolve_video_upload_handle(
+        video, creator_map_backend, proxy,
+    )
+    if handle is None:
+        # Handle resolution failed (e.g. InnerTube transient
+        # error). Leave the file for the next iteration.
+        logging.info(
+            'Video bulk upload skipped: handle unresolved; '
+            'file remains for retry',
+            extra={
+                'filename': filename,
+                'video_id': video.video_id,
+            },
+        )
+        return None
+    video.channel_handle = handle
+
+    if not video.video_id:
+        logging.warning(
+            'Video has no video_id, skipping bulk upload',
+            extra={'filename': filename},
+        )
+        return None
+
+    record_dict: dict = video.to_dict()
+    err: str | None = validator.validate(record_dict)
+    if err is not None:
+        logging.warning(
+            'Video record failed schema validation, '
+            'marking invalid and skipping upload',
+            extra={
+                'filename': filename,
+                'video_id': video.video_id,
+                'validation_error': err,
+            },
+        )
+        try:
+            await video_fm.mark_invalid(filename)
+        except OSError as exc:
+            logging.warning(
+                'Failed to mark video file invalid',
+                exc=exc,
+                extra={'filename': filename},
+            )
+        return None
+
+    logging.debug(
+        'Collected video record for bulk upload',
+        extra={
+            'filename': filename,
+            'video_id': video.video_id,
+            'channel_handle': handle,
+            'channel_id': video.channel_id,
+        },
+    )
+    return video.video_id, record_dict
+
+
+async def _prepare_video_line(
+    filename: str,
+    settings: VideoSettings,
+    video_fm: AssetFileManagement,
+    creator_map_backend: CreatorMap,
+    proxy: str | None,
+    validator: SchemaValidator,
+) -> tuple[str, str, bytes] | None:
+    '''
+    Per-file work for the video bulk-upload sweep, factored out
+    so :func:`upload_videos` can run ``video_concurrency`` of
+    these in flight at once via :func:`asyncio.gather`. Handles
+    the superseded check, the read / handle-resolution /
+    serialise pipeline, and emits the per-record debug logs.
+
+    :returns: ``(video_id, filename, line_bytes)`` on success, or
+        ``None`` when the file should be skipped (superseded,
+        unresolved handle, missing video_id).
+    '''
+    logging.debug(
+        'Considering video file for bulk upload',
+        extra={'filename': filename},
+    )
+    if not await video_needs_uploading(video_fm, filename):
+        logging.debug(
+            'Video file superseded, skipping',
+            extra={'filename': filename},
+        )
+        return None
+
+    record: tuple[str, dict] | None = (
+        await _collect_video_record(
+            filename, settings, video_fm,
+            creator_map_backend, proxy, validator,
+        )
+    )
+    if record is None:
+        return None
+    video_id: str
+    record_dict: dict
+    video_id, record_dict = record
+
+    line: bytes = orjson.dumps(record_dict) + b'\n'
+    logging.debug(
+        'Prepared video record for bulk batch',
+        extra={
+            'filename': filename,
+            'video_id': video_id,
+            'record_bytes': len(line),
+        },
+    )
+    return video_id, filename, line
+
+
+async def _upload_one_video_batch(
+    batch_buf: bytes,
+    batch_records: list[tuple[str, str]],
+    settings: VideoSettings,
+    client: ExchangeClient,
+    video_fm: AssetFileManagement,
+) -> None:
+    '''
+    Dispatch one prepared batch of video records via the shared
+    bulk-upload pipeline and route per-record outcomes into the
+    video-specific Prometheus metrics.
+    '''
+    if not batch_records:
+        return
+
+    outcome: BulkBatchOutcome = await upload_bulk_batch(
+        batch_buf, batch_records,
+        schema_owner=settings.schema_owner,
+        schema_version=settings.schema_version,
+        platform='youtube',
+        entity='video',
+        exchange_url=settings.exchange_url,
+        client=client,
+        fm=video_fm,
+        progress_timeout_seconds=(
+            settings.bulk_progress_timeout_seconds
+        ),
+        filename_prefix='videos',
+    )
+    METRIC_VIDEO_BULK_BATCHES.labels(
+        worker_id=get_worker_id(), outcome=outcome.status,
+    ).inc()
+    if outcome.success:
+        METRIC_VIDEOS_BULK_UPLOADED.labels(
+            worker_id=get_worker_id(),
+        ).inc(outcome.success)
+    if outcome.failed:
+        METRIC_VIDEOS_BULK_FAILED.labels(
+            worker_id=get_worker_id(),
+        ).inc(outcome.failed)
+    if outcome.missing:
+        METRIC_VIDEOS_BULK_MISSING_RESULT.labels(
+            worker_id=get_worker_id(),
+        ).inc(outcome.missing)
+
+
+async def upload_videos(
+    settings: VideoSettings,
+    client: ExchangeClient,
+    video_fm: AssetFileManagement,
+    creator_map_backend: CreatorMap,
+    validator: SchemaValidator,
+) -> None:
+    '''
+    Sweep ``base_dir`` for already-scraped ``video-dlp-*`` files
+    and upload them via the bulk API in batches of up to
+    ``settings.bulk_batch_size`` records (or
+    ``settings.bulk_max_batch_bytes`` bytes, whichever is hit
+    first). Per-record success in the job results promotes the
+    matching source file to ``uploaded_dir``; failed and missing
+    records are left in ``base_dir`` for the next iteration.
+
+    The live-scrape worker keeps using the per-video POST path at
+    :func:`enqueue_upload_video` because it processes videos as
+    they are scraped and bulk batching offers no latency benefit
+    for that path.
+    '''
+    files: list[str] = video_fm.list_base(
+        prefix=VIDEO_YTDLP_PREFIX, suffix=FILE_EXTENSION,
+    )
+    files = [f for f in files if not f.endswith('failed')]
+    logging.info(
+        'Found video files for bulk upload',
+        extra={'files_length': len(files)},
+    )
+    if not files:
+        return
+
+    # Pick the first proxy for handle resolution on creator_map
+    # misses. ``resolve_video_upload_handle`` only needs a proxy
+    # for InnerTube fallback; cache hits don't touch the network.
+    proxies: list[str] = (
+        [p.strip() for p in settings.proxies.split(',') if p.strip()]
+        if settings.proxies else []
+    )
+    proxy: str | None = proxies[0] if proxies else None
+
+    batch_buf: bytearray = bytearray()
+    batch_records: list[tuple[str, str]] = []
+    max_records: int = settings.bulk_batch_size
+    max_bytes: int = settings.bulk_max_batch_bytes
+    concurrency: int = max(settings.video_concurrency, 1)
+
+    # Run *concurrency* per-file pipelines in flight at once via
+    # :func:`asyncio.gather`. Sequential batching consumes the
+    # prepared lines in submission order so the ``record_index``
+    # fallback in :func:`apply_bulk_results` matches the order the
+    # server iterates the .jsonl.
+    for start in range(0, len(files), concurrency):
+        chunk: list[str] = files[start:start + concurrency]
+        prepared: list[
+            tuple[str, str, bytes] | None
+        ] = await asyncio.gather(*(
+            _prepare_video_line(
+                f, settings, video_fm,
+                creator_map_backend, proxy, validator,
+            )
+            for f in chunk
+        ))
+        for entry in prepared:
+            if entry is None:
+                continue
+            video_id: str
+            filename: str
+            line: bytes
+            video_id, filename, line = entry
+            if len(line) > max_bytes:
+                logging.warning(
+                    'Video record exceeds bulk-batch byte cap, '
+                    'skipping',
+                    extra={
+                        'filename': filename,
+                        'video_id': video_id,
+                        'record_bytes': len(line),
+                        'max_bytes': max_bytes,
+                    },
+                )
+                continue
+
+            if (
+                len(batch_records) >= max_records
+                or len(batch_buf) + len(line) > max_bytes
+            ):
+                logging.debug(
+                    'Video bulk batch reached cap, flushing',
+                    extra={
+                        'records': len(batch_records),
+                        'bytes': len(batch_buf),
+                        'max_records': max_records,
+                        'max_bytes': max_bytes,
+                    },
+                )
+                await _upload_one_video_batch(
+                    bytes(batch_buf), batch_records,
+                    settings, client, video_fm,
+                )
+                batch_buf = bytearray()
+                batch_records = []
+
+            batch_buf.extend(line)
+            batch_records.append((video_id, filename))
+
+    if batch_records:
+        logging.debug(
+            'Flushing trailing video bulk batch',
+            extra={
+                'records': len(batch_records),
+                'bytes': len(batch_buf),
+            },
+        )
+        await _upload_one_video_batch(
+            bytes(batch_buf), batch_records,
+            settings, client, video_fm,
+        )
 
 
 if __name__ == '__main__':

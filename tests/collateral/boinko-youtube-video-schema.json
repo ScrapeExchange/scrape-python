@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://scrape.exchange/schemas/boinko-youtube-video-0.0.1",
+  "$id": "https://scrape.exchange/schemas/boinko-youtube-video-0.0.2",
   "title": "YouTube Video Metadata",
   "description": "Schema representing a YouTube video and its associated metadata, including identifiers, descriptive fields, statistics, availability, media information, and related channel data.",
   "type": "object",
@@ -14,15 +14,23 @@
     "long_title": { "type": ["string", "null"], "description": "Long title" },
     "description": { "type": ["string", "null"], "description": "Video description" },
     "channel_id": { "type": ["string", "null"], "description": "Channel id" },
-    "channel_name": {
+    "channel_handle": {
       "type": ["string", "null"],
       "description": "Channel handle",
       "x-scrape-field": "platform_creator_id"
     },
-    "channel_url": { "type": ["string", "null"], "format": "uri", "description": "Channel URL" },
+    "channel_url": {
+      "type": ["string", "null"],
+      "format": "uri",
+      "description": "Channel URL"
+    },
     "channel_is_verified": { "type": ["boolean", "null"], "description": "Channel verified flag" },
     "channel_follower_count": { "type": ["integer", "null"], "minimum": 0 },
-    "channel_thumbnail": { "$ref": "#/$defs/thumbnail" },
+    "channel_thumbnail": {
+      "$ref": "#/$defs/thumbnail",
+      "description": "Channel thumbnail",
+      "x-scrape-field": "platform_creator_thumbnail_url"
+    },
     "availability": { "type": ["string", "null"] },
     "view_count": {
       "type": ["integer", "null"],
@@ -44,11 +52,22 @@
       "minimum": 0,
       "x-scrape-gauge": true
     },
-    "url": { "type": ["string", "null"], "format": "uri" },
+    "url": {
+      "type": "string",
+      "format": "uri",
+      "x-scrape-field": "source_url",
+      "description": "URL of the video"
+    },
+    "available_country_codes": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "List of available country codes for the video"
+    },
     "embed_url": { "type": ["string", "null"], "format": "uri" },
     "is_live": { "type": "boolean" },
     "was_live": { "type": "boolean" },
     "media_type": { "type": ["string", "null"], "description": "One of the YouTube media types", "enum": ["video", "short", "playlist", "channel", "live", "movie", null] },
+    "is_tv_film_video": { "type": ["boolean", "null"], "description": "Whether the video is a TV film or movie" },
     "embedable": { "type": ["boolean", "null"] },
     "age_limit": { "type": "integer", "minimum": 0 },
     "age_restricted": { "type": "boolean" },
@@ -60,7 +79,10 @@
     "locale": { "type": ["string", "null"] },
     "default_audio_language": { "type": ["string", "null"] },
     "tags": { "type": "array", "items": { "type": "string" } },
-    "categories": { "type": "array", "items": { "type": "string" }, "description": "Channel categories"},
+    "category": {
+      "type": ["string", "null"],
+      "description": "Video category"
+    },
     "annotations": { "type": "array", "items": { "type": "string" } },
     "keywords": { "type": "array", "items": { "type": "string" } },
     "privacy_status": { "type": "string" },
@@ -69,15 +91,20 @@
     "published_timestamp": { "type": ["string", "null"], "format": "date-time" },
     "thumbnails": {
       "type": "object",
-      "additionalProperties": { "$ref": "#/$defs/thumbnail" },
-        "x-scrape-field": "platform_content_thumbnail_url"
-
+      "additionalProperties": {
+        "$ref": "#/$defs/thumbnail"
+      },
+      "x-scrape-field": "platform_content_thumbnail_url"
     },
     "subtitles": { "type": "object", "additionalProperties": { "$ref": "#/$defs/caption" } },
     "automatic_captions": { "type": "object", "additionalProperties": { "$ref": "#/$defs/caption" } },
     "formats": { "type": "object", "additionalProperties": { "$ref": "#/$defs/format" } }
   },
-  "required": ["video_id"],
+  "required": ["video_id", "url"],
+  "anyOf": [
+    { "required": ["channel_id"] },
+    { "required": ["channel_handle"] }
+  ],
   "additionalProperties": false,
   "$defs": {
     "thumbnail": {

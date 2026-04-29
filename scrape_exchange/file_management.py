@@ -16,6 +16,7 @@ Responsibilities:
 '''
 
 import logging
+import secrets
 
 import aiofiles
 import aiofiles.os
@@ -27,6 +28,48 @@ from pathlib import Path
 
 VIDEO_FILE_PREFIX: str = 'video-'
 CHANNEL_FILE_PREFIX: str = 'channel-'
+
+
+async def atomic_write_bytes(
+    path: Path | str, data: bytes,
+) -> None:
+    '''
+    Write *data* to *path* atomically: write to a temp file in
+    the same directory, then ``os.rename`` onto *path*. The
+    rename is atomic on POSIX same-filesystem operations, so a
+    crash mid-write leaves either the previous version of the
+    file or no file at all — never a half-written file that
+    fails to decompress.
+
+    Used by every scraper write path that produces brotli-
+    compressed JSON so that an interrupted process does not
+    leave behind ``.json.br`` files that
+    :func:`brotli.decompress` cannot read.
+
+    On any regular exception during the write, the temp file is
+    removed best-effort before the exception is re-raised. A
+    :class:`asyncio.CancelledError` skips cleanup so the cancel
+    is not delayed; orphan ``<path>.tmp.<hex>`` files can be
+    removed by an operator or a future periodic sweep.
+
+    :param path: Final destination path. The temp file is created
+        in the same directory so the rename is on the same
+        filesystem (a cross-device rename is not atomic).
+    :param data: Raw bytes to write.
+    :raises OSError: If the temp-file write or the rename fails.
+    '''
+    target: Path = Path(path)
+    tmp: Path = Path(f'{target}.tmp.{secrets.token_hex(8)}')
+    try:
+        async with aiofiles.open(tmp, 'wb') as f:
+            await f.write(data)
+        await aiofiles.os.rename(tmp, target)
+    except Exception:
+        try:
+            await aiofiles.os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +89,7 @@ DEFAULT_PREFIX_RANKINGS: dict[str, list[str]] = {
 # any other file.
 MARKER_SUFFIXES: tuple[str, ...] = (
     '.failed', '.not_found', '.unresolved', '.unavailable',
+    '.invalid',
 )
 
 
@@ -506,12 +550,12 @@ class AssetFileManagement:
         :raises OSError: If the file cannot be written.
         '''
         path: Path = self.base_dir / filename
-        async with aiofiles.open(path, 'wb') as f:
-            await f.write(brotli.compress(
-                orjson.dumps(data, option=orjson.OPT_INDENT_2),
-                quality=11,
-                mode=brotli.MODE_TEXT,
-            ))
+        compressed: bytes = brotli.compress(
+            orjson.dumps(data, option=orjson.OPT_INDENT_2),
+            quality=11,
+            mode=brotli.MODE_TEXT,
+        )
+        await atomic_write_bytes(path, compressed)
         if self.is_marker(filename):
             # Marker files (.failed/.not_found/.unresolved) have the lowest
             # priority and must never trigger deletion of other files.
@@ -648,16 +692,35 @@ class AssetFileManagement:
 
     async def mark_uploaded(self, filename: str) -> Path:
         '''
-        Move *filename* from the base directory into the uploaded directory.
+        Move *filename* from the base directory into the uploaded
+        directory. Idempotent: if the source is already absent and
+        the destination exists (e.g. a concurrent uploader already
+        marked it), the call returns the destination silently
+        instead of raising. This benign-race case happens in
+        production where two YouTube scrapers share one data
+        directory — the live-scrape process and the upload-only
+        process — and one of them wins the race to mark a file
+        uploaded.
 
         :param filename: Bare filename (no directory component) inside
             ``base_dir`` to move.
         :returns: The new path inside the uploaded directory.
-        :raises OSError: If the rename fails.
+        :raises OSError: For any rename failure other than the
+            already-marked race described above.
         '''
         src: Path = self.base_dir / filename
         dst: Path = self.uploaded_dir / filename
-        await aiofiles.os.rename(src, dst)
+        try:
+            await aiofiles.os.rename(src, dst)
+        except FileNotFoundError:
+            if dst.exists():
+                logger.debug(
+                    'Source already moved to uploaded dir by '
+                    'another process; treating as success',
+                    extra={'src': str(src), 'dst': str(dst)},
+                )
+                return dst
+            raise
         logger.debug(
             'Marked src as uploaded',
             extra={'src': src, 'dst': dst},
@@ -687,6 +750,24 @@ class AssetFileManagement:
         :raises OSError: If the rename fails.
         '''
         return await self._rename_with_suffix(filename, '.unavailable')
+
+    async def mark_invalid(self, filename: str) -> str:
+        '''
+        Rename *filename* in the base directory by appending
+        ``.invalid`` so future runs recognise it as a previously
+        scraped record that failed client-side schema validation.
+
+        Used by the YouTube scrapers when a record fails
+        :meth:`scrape_exchange.schema_validator\
+.SchemaValidator.validate`.
+        The on-disk bytes are preserved so an operator can inspect
+        the offending payload before deleting the marker.
+
+        :param filename: Bare filename inside ``base_dir`` to mark.
+        :returns: The new filename (``{filename}.invalid``).
+        :raises OSError: If the rename fails.
+        '''
+        return await self._rename_with_suffix(filename, '.invalid')
 
     async def _rename_with_suffix(self, filename: str, suffix: str) -> str:
         new_name: str = f'{filename}{suffix}'

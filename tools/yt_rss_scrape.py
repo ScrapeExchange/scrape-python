@@ -35,6 +35,10 @@ from innertube import InnerTube
 
 from scrape_exchange.exchange_client import ExchangeClient
 from scrape_exchange.file_management import AssetFileManagement
+from scrape_exchange.schema_validator import (
+    SchemaValidator,
+    fetch_schema_dict,
+)
 from scrape_exchange.scraper_runner import (
     ScraperRunContext,
     ScraperRunner,
@@ -60,6 +64,11 @@ from scrape_exchange.creator_map import (
     RedisCreatorMap,
     CREATOR_HANDLE_MISMATCH_TOTAL,
     CREATOR_MAP_RESOLUTION_TOTAL,
+)
+from scrape_exchange.name_map import (
+    NameMap,
+    NullNameMap,
+    RedisNameMap,
 )
 from scrape_exchange.creator_queue import (
     CreatorQueue,
@@ -90,7 +99,7 @@ YOUTUBE_RSS_URL: str = (
 FAILURE_DELAY: int = 60
 
 CHANNEL_SCHEMA_OWNER: str = 'boinko'
-CHANNEL_SCHEMA_VERSION: str = '0.0.1'
+CHANNEL_SCHEMA_VERSION: str = '0.0.2'
 CHANNEL_SCHEMA_PLATFORM: str = 'youtube'
 CHANNEL_SCHEMA_ENTITY: str = 'channel'
 
@@ -348,7 +357,7 @@ class RssSettings(YouTubeScraperSettings):
         ),
     )
     priority_queues: str = Field(
-        default='4:1000000,12:100000,24:10000,48:0',
+        default='1:10_000_000,4:1_000_000,12:100_000,72:10_000,168:0',
         validation_alias=AliasChoices(
             'PRIORITY_QUEUES', 'priority_queues',
         ),
@@ -479,14 +488,25 @@ def _handle_http_status_error(
             'response_text': exc.response.text,
         },
     )
-    if exc.response.status_code == 404:
+    status_code: int = exc.response.status_code
+    if status_code == 404:
         _record_rss_failure('not_found', proxy_ip, proxy_network)
         YouTubeRateLimiter.get().report_rss_failure(
             proxy, is_circuit_tripping=True,
         )
         raise ValueError(f'RSS feed not found: {rss_url}') from exc
-    if exc.response.status_code == 500:
+    if 500 <= status_code < 600:
+        # YouTube returns 5xx under per-IP rate-limit pressure
+        # (alongside 404s) when an aggressive scraper is hammering
+        # one of its endpoints. Treat as a soft-ban signal so the
+        # circuit breaker yanks the proxy off the rotation, the
+        # same as for 404. Without this the limiter keeps issuing
+        # tokens at full rate while every fetch from the IP is
+        # rejected.
         _record_rss_failure('server_error', proxy_ip, proxy_network)
+        YouTubeRateLimiter.get().report_rss_failure(
+            proxy, is_circuit_tripping=True,
+        )
         raise RuntimeError(
             f'Server error fetching RSS feed: {rss_url}'
         ) from exc
@@ -495,16 +515,15 @@ def _handle_http_status_error(
 
 async def fetch_rss(
     rss_url: str,
-    channel_name_override: str | None = None,
+    channel_handle: str,
 ) -> list[YouTubeVideo] | None:
     '''
     Fetches and parses the YouTube RSS feed for a channel.
 
     :param rss_url: The URL of the YouTube RSS feed.
-    :param channel_name_override: Pre-resolved display name (usually
-        the canonical handle from the creator map) to stamp onto
-        every YouTubeVideo parsed from the feed. When None, the
-        author name embedded in each RSS entry is kept.
+    :param channel_handle: Canonical channel handle (typically from
+        the creator map, falling back to the queue's stored handle)
+        to stamp onto every YouTubeVideo parsed from the feed.
     :param proxy: Optional proxy URL for the HTTP request.
     :returns: A list of YouTubeVideo instances populated from the RSS feed.
     :raises: httpx.HTTPStatusError on non-2xx HTTP responses.
@@ -534,7 +553,10 @@ async def fetch_rss(
     extra['proxy'] = proxy or 'none'
     try:
         async with httpx.AsyncClient(proxies=proxy) as http:
-            response: Response = await http.get(rss_url, timeout=10)
+            response: Response = await http.get(
+                rss_url,
+                timeout=httpx.Timeout(10.0, connect=2.0),
+            )
             response.raise_for_status()
             data: str = response.text
             logging.debug('Fetched RSS feed successfully', extra=extra)
@@ -578,7 +600,7 @@ async def fetch_rss(
         try:
             video: YouTubeVideo = YouTubeVideo.from_rss_entry(
                 entry,
-                channel_name_override=channel_name_override,
+                channel_handle=channel_handle,
             )
             videos.append(video)
         except AttributeError as exc:
@@ -621,23 +643,45 @@ async def check_video_exists(
 def enqueue_upload_video(
     client: ExchangeClient, settings: RssSettings,
     handle: str, video: YouTubeVideo,
+    validator: SchemaValidator,
 ) -> bool:
     '''
     Fire-and-forget upload of an RSS-discovered video to Scrape
-    Exchange.
+    Exchange, gated by client-side schema validation.
 
-    RSS-sourced videos have no on-disk asset backing them (they come
-    straight out of the RSS feed), so no ``file_manager`` is passed:
-    the background worker just POSTs with retries and increments the
-    ``exchange_client_background_uploads_total`` counter on success
-    or failure. If the queue is full the job is dropped and will be
-    re-enqueued the next time the RSS feed is polled.
+    RSS-sourced videos have no on-disk asset backing them (they
+    come straight out of the RSS feed), so a validation failure
+    is logged + dropped without ``mark_invalid`` (no file to mark).
+    The background worker just POSTs with retries and increments
+    the ``exchange_client_background_uploads_total`` counter on
+    success or failure. If the queue is full the job is dropped
+    and will be re-enqueued the next time the RSS feed is polled.
 
     :param handle: Canonical channel handle to use as
         platform_creator_id; must match the channel entity's handle.
-    :returns: ``True`` if the job was enqueued, ``False`` if dropped.
+    :returns: ``True`` if the job was enqueued, ``False`` if
+        dropped or if schema validation failed.
     '''
 
+    record_dict: dict = video.to_dict()
+    err: str | None = validator.validate(record_dict)
+    if err is not None:
+        logging.warning(
+            'RSS-derived video record failed schema validation, '
+            'skipping upload',
+            extra={
+                'video_id': video.video_id,
+                'channel_handle': handle,
+                'validation_error': err,
+            },
+        )
+        return False
+
+    # platform_content_id and platform_creator_id are intentionally
+    # omitted: the server derives them from the video schema's
+    # ``x-scrape-field`` markers (``video_id`` →
+    # ``platform_content_id``, ``channel_handle`` →
+    # ``platform_creator_id``) which are present in the data dict.
     enqueued: bool = client.enqueue_upload(
         f'{settings.exchange_url}{ExchangeClient.POST_DATA_API}',
         json={
@@ -646,15 +690,12 @@ def enqueue_upload_video(
             'entity': 'video',
             'version': settings.schema_version,
             'source_url': video.url,
-            'data': video.to_dict(),
-            'platform_content_id': video.video_id,
-            'platform_creator_id': handle,
-            'platform_topic_id': None,
+            'data': record_dict,
         },
         entity='video',
         log_extra={
-            'platform_content_id': video.video_id,
-            'platform_creator_id': handle,
+            'video_id': video.video_id,
+            'channel_handle': handle,
         },
     )
     if enqueued:
@@ -667,7 +708,7 @@ MSG_PROCESSED_VIDEOS: str = 'Processed videos for channel'
 
 async def _fetch_rss_safe(
     rss_url: str,
-    channel_name_override: str | None = None,
+    channel_handle: str,
 ) -> list[YouTubeVideo] | None | Exception:
     '''
     Wrapper around :func:`fetch_rss` that captures
@@ -677,7 +718,7 @@ async def _fetch_rss_safe(
     try:
         return await fetch_rss(
             rss_url,
-            channel_name_override=channel_name_override,
+            channel_handle=channel_handle,
         )
     except Exception as exc:
         return exc
@@ -688,16 +729,17 @@ async def _enrich_and_store_video(
     innertube: InnerTube,
     proxy: str | None,
     client: ExchangeClient,
-    channel_name: str,
+    channel_handle: str,
     handle: str,
     settings: RssSettings,
+    video_validator: SchemaValidator,
 ) -> str | None:
     '''
     Enrich a single video via InnerTube, write it to
     disk, and enqueue the upload.  Returns the filename
     on success, ``None`` on failure.
 
-    :param channel_name: Display name of the channel, used only
+    :param channel_handle: Display name of the channel, used only
         for logging.
     :param handle: Canonical handle used as platform_creator_id.
     '''
@@ -706,7 +748,7 @@ async def _enrich_and_store_video(
     proxy_network: str = proxy_network_for(proxy_ip)
     extra: dict[str, str] = {
         'video_id': video.video_id,
-        'channel_name': channel_name,
+        'channel_handle': channel_handle,
         'proxy_ip': proxy_ip,
         'proxy_network': proxy_network,
     }
@@ -753,7 +795,7 @@ async def _enrich_and_store_video(
         extra=extra
     )
     if enqueue_upload_video(
-        client, settings, handle, video,
+        client, settings, handle, video, video_validator,
     ):
         METRIC_VIDEOS_ENQUEUED.labels(
             worker_id=get_worker_id(), proxy_ip=proxy_ip,
@@ -768,9 +810,12 @@ async def _enrich_and_store_video(
 
 
 async def process_channel(
-    channel_name: str, channel_id: str, client: ExchangeClient,
+    channel_handle: str, channel_id: str, client: ExchangeClient,
     creator_queue: CreatorQueue, settings: RssSettings,
     creator_map_backend: CreatorMap,
+    name_map_backend: NameMap,
+    video_validator: SchemaValidator,
+    channel_validator: SchemaValidator,
 ) -> bool | None:
     '''
     Fetches the RSS feed for one channel and checks or stores each video.
@@ -783,7 +828,7 @@ async def process_channel(
     Raises on RSS fetch failure or if any video could not be stored, so
     the worker loop can schedule a retry for the whole channel.
 
-    :param channel_name: Human-readable channel name (for logging).
+    :param channel_handle: Human-readable channel name (for logging).
     :param channel_id: YouTube channel ID.
     :param client: The authenticated Scrape Exchange API client.
     :param creator_queue: Queue backend (file or Redis).
@@ -798,7 +843,7 @@ async def process_channel(
     )
     proxy_ip: str = _extract_proxy_ip(proxy) if proxy else 'none'
     extra: dict[str, str] = {
-        'channel_name': channel_name,
+        'channel_handle': channel_handle,
         'channel_id': channel_id,
         'proxy_ip': proxy_ip,
     }
@@ -857,23 +902,25 @@ async def process_channel(
 
     # Resolve the canonical channel handle from the creator
     # map so fetch_rss can stamp it onto every YouTubeVideo
-    # it parses. None means the channel is not yet mapped —
-    # from_rss_entry falls back to the RSS <author><name>.
+    # it parses. If the channel is not yet mapped, fall back
+    # to the queue's stored handle
     mapped_handle: str | None = (
         await creator_map_backend.get(channel_id)
     )
+    rss_channel_handle: str = mapped_handle or channel_handle
 
     # --- Phase 1: channel update + RSS fetch in parallel ---
     update_result: tuple[bool, int, str | None]
     rss_result: list[YouTubeVideo] | None | Exception
     update_result, rss_result = await asyncio.gather(
         update_channel(
-            client, channel_name, channel_id,
-            creator_map_backend, proxy,
+            client, channel_handle, channel_id,
+            creator_map_backend, name_map_backend,
+            channel_validator, proxy,
         ),
         _fetch_rss_safe(
             rss_url,
-            channel_name_override=mapped_handle,
+            channel_handle=rss_channel_handle,
         ),
     )
 
@@ -886,7 +933,7 @@ async def process_channel(
         # known subscriber count with 0 just because
         # InnerTube failed this time.
         await creator_queue.set_no_feeds(
-            channel_id, rss_url, channel_name, 1,
+            channel_id, rss_url, channel_handle, 1,
         )
         return False
     await creator_queue.update_tier(channel_id, sub_count)
@@ -905,7 +952,7 @@ async def process_channel(
             extra=extra | {'error': str(rss_result)},
         )
         await creator_queue.set_no_feeds(
-            channel_id, rss_url, channel_name, 1
+            channel_id, rss_url, channel_handle, 1
         )
         return False
 
@@ -913,7 +960,7 @@ async def process_channel(
     if videos is None:
         logging.debug(MSG_NO_RSS_FEED, extra=extra)
         await creator_queue.set_no_feeds(
-            channel_id, rss_url, channel_name, 1
+            channel_id, rss_url, channel_handle, 1
         )
         return False
 
@@ -1034,8 +1081,8 @@ async def process_channel(
             *[
                 _enrich_and_store_video(
                     video, innertube, proxy,
-                    client, channel_name, resolved_handle,
-                    settings,
+                    client, channel_handle, resolved_handle,
+                    settings, video_validator,
                 )
                 for video in new_videos
             ],
@@ -1064,7 +1111,7 @@ async def process_channel(
     )
     logging.info(
         MSG_PROCESSED_VIDEOS, extra={
-            'channel_name': channel_name,
+            'channel_handle': channel_handle,
             'videos_uploaded': videos_uploaded,
             'videos_existing': videos_existing,
             'videos_failed': videos_failed,
@@ -1075,7 +1122,7 @@ async def process_channel(
         _close_innertube()
         raise RuntimeError(
             f'{missed} out of {len(videos)} videos '
-            f'for channel {channel_name!r} could not '
+            f'for channel {channel_handle!r} could not '
             f'be processed'
         )
 
@@ -1085,9 +1132,11 @@ async def process_channel(
 
 
 async def update_channel(
-    client: ExchangeClient, channel_name: str,
+    client: ExchangeClient, channel_handle: str,
     channel_id: str,
     creator_map_backend: CreatorMap,
+    name_map_backend: NameMap,
+    validator: SchemaValidator,
     proxy: str | None = None,
 ) -> tuple[bool, int, str | None]:
     '''
@@ -1095,11 +1144,14 @@ async def update_channel(
     data on Scrape Exchange via the data API.
 
     :param client: The authenticated Scrape Exchange API client.
-    :param channel_name: The channel handle / vanity name as known
+    :param channel_handle: The channel handle / vanity name as known
         to the caller (may be mis-cased; canonicalised here).
     :param channel_id: The YouTube channel ID.
     :param creator_map_backend: CreatorMap to persist the resolved
         handle for reads by other scrapers.
+    :param name_map_backend: NameMap to persist the
+        ``(channel_title, channel_id)`` pair so re-ingest can
+        recover ids from legacy display-name-only records.
     :param proxy: Optional proxy URL for the InnerTube request.
     :returns: Tuple of (success, subscriber_count, resolved_handle).
         ``success`` is True if the channel data was fetched and
@@ -1116,7 +1168,7 @@ async def update_channel(
         logging.debug(
             'Failed to browse channel via InnerTube',
             exc=exc,
-            extra={'channel_name': channel_name, 'proxy': proxy},
+            extra={'channel_handle': channel_handle, 'proxy': proxy},
         )
         METRIC_INNERTUBE_FAILURES.labels(
             worker_id=get_worker_id(), proxy_ip=proxy_ip,
@@ -1137,18 +1189,18 @@ async def update_channel(
             scraper='rss', outcome='canonical',
         ).inc()
     else:
-        resolved_handle = fallback_handle(channel_name)
+        resolved_handle = fallback_handle(channel_handle)
         CREATOR_MAP_RESOLUTION_TOTAL.labels(
             scraper='rss', outcome='fallback',
         ).inc()
 
-    if channel_name != resolved_handle:
+    if channel_handle != resolved_handle:
         CREATOR_HANDLE_MISMATCH_TOTAL.labels(scraper='rss').inc()
         logging.info(
             'RSS update_channel: canonicalising handle',
             extra={
                 'channel_id': channel_id,
-                'input_name': channel_name,
+                'input_name': channel_handle,
                 'canonical_handle': resolved_handle,
             },
         )
@@ -1159,7 +1211,11 @@ async def update_channel(
         'metadata', {}
     ).get('channelMetadataRenderer', {})
 
-    title: str = metadata.get('title', channel_name)
+    title: str = metadata.get('title', channel_handle)
+    if title:
+        await name_map_backend.put(
+            asset_title=title, asset_id=channel_id,
+        )
     description: str = metadata.get('description', '')
 
     subscriber_count: int = (
@@ -1182,6 +1238,39 @@ async def update_channel(
     # the POST with retries. No file_manager is passed because an RSS
     # channel update has no on-disk asset backing it; success is
     # tracked via exchange_client_background_uploads_total.
+    #
+    # platform_content_id and platform_creator_id are intentionally
+    # omitted: the server derives them from the channel schema's
+    # ``x-scrape-field`` markers (``channel_id`` →
+    # ``platform_content_id``, ``channel_handle`` →
+    # ``platform_creator_id``) which are now present in the data
+    # dict under the schema-declared field names.
+    channel_url: str = (
+        f'https://www.youtube.com/channel/{channel_id}'
+    )
+    record_dict: dict = {
+        'channel_id': channel_id,
+        'channel_handle': resolved_handle,
+        'url': channel_url,
+        'title': title,
+        'subscriber_count': subscriber_count,
+        'video_count': video_count,
+        'view_count': view_count,
+        'description': description,
+    }
+    err: str | None = validator.validate(record_dict)
+    if err is not None:
+        logging.warning(
+            'RSS channel update failed schema validation, '
+            'skipping upload',
+            extra={
+                'channel_id': channel_id,
+                'channel_handle': resolved_handle,
+                'validation_error': err,
+            },
+        )
+        return False, subscriber_count, resolved_handle
+
     enqueued: bool = client.enqueue_upload(
         f'{client.exchange_url}{ExchangeClient.POST_DATA_API}',
         json={
@@ -1189,24 +1278,14 @@ async def update_channel(
             'platform': CHANNEL_SCHEMA_PLATFORM,
             'entity': CHANNEL_SCHEMA_ENTITY,
             'version': CHANNEL_SCHEMA_VERSION,
-            'source_url': (
-                'https://www.youtube.com/channel/'
-                f'{channel_id}'
-            ),
-            'data': {
-                'channel': resolved_handle,
-                'title': title,
-                'subscriber_count': subscriber_count,
-                'video_count': video_count,
-                'view_count': view_count,
-                'description': description,
-            },
-            'platform_content_id': resolved_handle,
-            'platform_creator_id': resolved_handle,
-            'platform_topic_id': None,
+            'source_url': channel_url,
+            'data': record_dict,
         },
         entity='channel',
-        log_extra={'channel_name': resolved_handle},
+        log_extra={
+            'channel_id': channel_id,
+            'channel_handle': resolved_handle,
+        },
     )
     if enqueued:
         METRIC_API_CHANNEL_CALLS.labels(worker_id=get_worker_id()).inc()
@@ -1249,7 +1328,7 @@ def _log_channel_result(
         logging.info(
             MSG_NO_RSS_FEED,
             extra={
-                'channel_name': name,
+                'channel_handle': name,
                 'channel_id': cid,
             },
         )
@@ -1259,7 +1338,7 @@ def _log_channel_result(
             'Channel failed',
             exc_info=result,
             extra={
-                'channel_name': name,
+                'channel_handle': name,
                 'error_type': type(result).__name__,
                 'error': result,
             },
@@ -1311,10 +1390,8 @@ def _record_tier_sla(
     '''Increment the on-time or overdue SLA counter.'''
 
     wid: str = get_worker_id()
-    if _is_on_time(
-        scheduled_time, now,
-        interval_seconds, eligibility_fraction,
-    ):
+    if _is_on_time(scheduled_time, now,
+                   interval_seconds, eligibility_fraction):
         METRIC_TIER_ON_TIME.labels(
             tier=str(tier), worker_id=wid,
         ).inc()
@@ -1469,6 +1546,105 @@ async def _enrich_subscriber_counts(
         )
 
 
+async def _seed_queue_from_uploaded_channels(
+    creator_queue: CreatorQueue,
+    channel_fm: AssetFileManagement,
+    tiers: list[TierConfig],
+) -> int:
+    '''
+    Walk ``channel_fm.uploaded_dir`` for previously-uploaded channel
+    files and enqueue any whose ``channel_id`` isn't already in the
+    priority queue. Channels in the queue are left alone so this
+    helper is safe to call on every startup.
+
+    Tier selection per file:
+
+    * ``subscriber_count`` is present and > 0 → standard
+      :func:`tier_for_subscriber_count` routing.
+    * ``subscriber_count`` is missing or zero → the **next-to-last**
+      tier (one above the lowest-priority catch-all). Treating
+      "unknown" as second-from-last avoids the populate path's
+      default behaviour of promoting unknown counts to tier 1, which
+      is wrong when bulk-seeding from on-disk archives where most
+      records are simply missing the field.
+
+    Implementation note: tier targeting is achieved by passing a
+    synthetic ``subscriber_count`` equal to the target tier's
+    ``min_subscribers``. This relies on tiers being ordered with
+    monotonically descending min_subscribers (the documented
+    convention in :func:`tier_for_subscriber_count`).
+
+    :returns: Number of channels added to the queue.
+    '''
+
+    if not tiers:
+        return 0
+
+    fallback_tier: TierConfig = (
+        tiers[-2] if len(tiers) >= 2 else tiers[-1]
+    )
+    fallback_min: int = max(fallback_tier.min_subscribers, 0)
+
+    known: set[str] = await creator_queue.known_creator_ids()
+
+    creators: dict[str, str] = {}
+    subscriber_counts: dict[str, int] = {}
+    fallback_count: int = 0
+
+    files: list[str] = channel_fm.list_uploaded(
+        prefix=CHANNEL_FILENAME_PREFIX, suffix='.json.br',
+    )
+
+    for filename in files:
+        try:
+            data: dict = await channel_fm.read_uploaded(filename)
+        except Exception as exc:
+            logging.warning(
+                'Failed to read uploaded channel file during seed',
+                exc=exc, extra={'filename': filename},
+            )
+            continue
+
+        cid: str | None = data.get('channel_id')
+        handle: str | None = data.get('channel_handle')
+        if not cid or not handle:
+            continue
+        if cid in known:
+            continue
+
+        creators[cid] = handle
+        sub_count: int | None = data.get('subscriber_count')
+        if isinstance(sub_count, int) and sub_count > 0:
+            subscriber_counts[cid] = sub_count
+        else:
+            subscriber_counts[cid] = fallback_min
+            fallback_count += 1
+
+    if not creators:
+        logging.info(
+            'No new channels to seed from uploaded directory',
+            extra={
+                'scanned_files': len(files),
+                'already_in_queue': len(files),
+            },
+        )
+        return 0
+
+    added: int = await creator_queue.populate(
+        creators, channel_fm, tiers, subscriber_counts,
+    )
+    logging.info(
+        'Seeded queue from uploaded channel directory',
+        extra={
+            'scanned_files': len(files),
+            'added': added,
+            'unknown_subscriber_count': fallback_count,
+            'fallback_tier': fallback_tier.tier,
+        },
+    )
+    return added
+
+
 async def worker_loop(
     settings: RssSettings,
     client: ExchangeClient,
@@ -1476,6 +1652,9 @@ async def worker_loop(
     creator_queue: CreatorQueue,
     tiers: list[TierConfig],
     creator_map_backend: CreatorMap,
+    name_map_backend: NameMap,
+    video_validator: SchemaValidator,
+    channel_validator: SchemaValidator,
 ) -> None:
     '''
     Runs indefinitely, processing channels in priority order.
@@ -1508,6 +1687,14 @@ async def worker_loop(
     added: int = await creator_queue.populate(
         channel_map_data, channel_fm, tiers, subscriber_counts,
     )
+    # Pull in any channels that exist as uploaded files on disk but
+    # are missing from the creator_map (e.g. after a fleet rebuild
+    # or DB wipe where the local archive is the source of truth).
+    seeded: int = await _seed_queue_from_uploaded_channels(
+        creator_queue, channel_fm, tiers,
+    )
+    if seeded:
+        added += seeded
     # Re-enqueue creators whose tier hash entry exists but
     # which are missing from every tier zset (abandoned
     # claims from worker crashes, stale state from older
@@ -1520,7 +1707,7 @@ async def worker_loop(
         extra={'recovered_count': recovered},
     )
     if get_worker_id() == '1':
-        asyncio.create_task(
+        data: asyncio.Task[None] = asyncio.create_task(
             _scan_and_recover_loop(creator_queue),
         )
         logging.info(
@@ -1653,7 +1840,8 @@ async def worker_loop(
                 process_channel(
                     name, cid, client,
                     creator_queue, settings,
-                    creator_map_backend,
+                    creator_map_backend, name_map_backend,
+                    video_validator, channel_validator,
                 )
                 for cid, name, _ in batch
             ],
@@ -1744,14 +1932,52 @@ async def _run_worker(
             settings.channel_map_file,
         )
 
+    name_map_backend: NameMap
+    if settings.redis_dsn:
+        name_map_backend = RedisNameMap(
+            settings.redis_dsn, platform='youtube',
+        )
+    else:
+        name_map_backend = NullNameMap()
+
     tiers: list[TierConfig] = parse_priority_queues(
         settings.priority_queues,
+    )
+
+    # Build the schema validators once at startup. The RSS scraper
+    # uploads two entity kinds — video records discovered from RSS
+    # feeds and channel-stat updates — so it needs one validator
+    # per entity. Records that don't conform to the relevant schema
+    # are logged at WARNING and dropped (RSS records have no
+    # on-disk asset to mark ``.invalid``).
+    video_schema_dict: dict = await fetch_schema_dict(
+        ctx.client,
+        settings.exchange_url,
+        settings.schema_owner,
+        'youtube',
+        'video',
+        settings.schema_version,
+    )
+    video_validator: SchemaValidator = SchemaValidator(
+        video_schema_dict,
+    )
+    channel_schema_dict: dict = await fetch_schema_dict(
+        ctx.client,
+        settings.exchange_url,
+        CHANNEL_SCHEMA_OWNER,
+        CHANNEL_SCHEMA_PLATFORM,
+        CHANNEL_SCHEMA_ENTITY,
+        CHANNEL_SCHEMA_VERSION,
+    )
+    channel_validator: SchemaValidator = SchemaValidator(
+        channel_schema_dict,
     )
 
     await worker_loop(
         settings, ctx.client, channel_fm,
         creator_queue, tiers,
-        creator_map_backend,
+        creator_map_backend, name_map_backend,
+        video_validator, channel_validator,
     )
 
 

@@ -1,12 +1,9 @@
 {
   "channel_id": "UC22BdTgxefuvUivrjesETjg",
-  "channel": "HistoryMatters",
-  "title": "History Matters",
   "description": "History Matters is a history-focused channel which aims to help students studying for A levels, GCSEs and AP World/Euro History by providing short introductions to multiple topics.  The episodes released are designed to act as both intros and as revision material for students or people who are simply interested in World History. Videos will also focus on the lesser-known parts of history too and dive deep into questions that many people ask but aren't often answered.",
   "keywords": [
     "Education"
   ],
-  "categories": [],
   "is_family_safe": true,
   "country": "GB",
   "available_country_codes": [
@@ -342,5 +339,8 @@
   "playlists": [],
   "posts": [],
   "merch": [],
-  "channel_links": []
+  "channel_links": [],
+  "channel_handle": "HistoryMatters",
+  "title": "History Matters",
+  "url": "https://www.youtube.com/@HistoryMatters"
 }
