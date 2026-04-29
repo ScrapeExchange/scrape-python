@@ -184,6 +184,7 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
     def __init__(
         self, state_dir: str | None = None,
         redis_dsn: str | None = None,
+        auto_warm_cookies: bool = True,
     ) -> None:
         super().__init__(
             'YouTube',
@@ -191,6 +192,18 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
             redis_dsn=redis_dsn,
         )
         self._renewal_task: asyncio.Task | None = None
+        # When False, :meth:`set_proxies` skips the automatic
+        # ``_start_cookie_services`` background task. Used by the
+        # ``--*-upload-only`` modes where the worker reads existing
+        # files from disk and POSTs them to scrape.exchange — no
+        # YouTube traffic happens, so warming a cookie jar for every
+        # proxy is wasted work (and the per-proxy fetches against
+        # ``https://www.youtube.com`` time out and pollute the logs).
+        # The ``yt-dlp`` cookie file is still acquired lazily on
+        # demand for any scraper path that does call YouTube
+        # (e.g. video-upload-only's ``resolve_video_upload_handle``
+        # InnerTube fallback through one proxy).
+        self._auto_warm_cookies: bool = auto_warm_cookies
         # RSS circuit-breaker state. Keyed by the same proxy URL
         # passed to :meth:`acquire` so that each VPN tunnel /
         # direct-connection endpoint gets its own breaker.
@@ -213,17 +226,32 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
             )
         )
 
+    def set_auto_warm_cookies(self, enabled: bool) -> None:
+        '''
+        Toggle whether :meth:`set_proxies` schedules the automatic
+        ``_start_cookie_services`` background task. Lets the
+        upload-only scraper modes opt out after the singleton has
+        already been constructed by another code path with the
+        default ``auto_warm_cookies=True``.
+        '''
+        self._auto_warm_cookies = enabled
+
     def set_proxies(self, proxies: list[str] | str | None) -> None:
         '''
         Register proxies and schedule cookie warm-up + renewal as a background
         task.  Overrides the base implementation to trigger
         :meth:`_start_cookie_services` automatically whenever the proxy pool
-        changes.
+        changes — unless the limiter was constructed with
+        ``auto_warm_cookies=False`` (or :meth:`set_auto_warm_cookies(False)`
+        was called), in which case the warm-up is the caller's
+        responsibility.
 
         If no event loop is running (e.g. unit tests) the cookie services are
         not started; call :meth:`warm_cookie_jar` manually in that case.
         '''
         super().set_proxies(proxies)
+        if not self._auto_warm_cookies:
+            return
         try:
             asyncio.get_running_loop().create_task(
                 self._start_cookie_services(),

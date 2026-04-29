@@ -444,6 +444,26 @@ class VideoSettings(YouTubeScraperSettings):
     )
 
 
+def _build_video_rate_limiter(
+    s: 'VideoSettings',
+) -> YouTubeRateLimiter:
+    '''
+    Construct (or fetch) the per-process YouTubeRateLimiter
+    singleton. In ``--video-upload-only`` mode the worker reads
+    existing files from disk and POSTs them to scrape.exchange,
+    so the proactive cookie warm-up + renewal loop is wasted
+    work and is disabled here. The cookie file for any one
+    proxy is still acquired lazily on demand for the InnerTube
+    fallback inside ``resolve_video_upload_handle``.
+    '''
+    rl: YouTubeRateLimiter = YouTubeRateLimiter.get(
+        state_dir=s.rate_limiter_state_dir,
+        redis_dsn=s.redis_dsn,
+    )
+    rl.set_auto_warm_cookies(not s.video_upload_only)
+    return rl
+
+
 def main() -> None:
     '''
     Top-level entry point. Reads settings and
@@ -472,12 +492,7 @@ def main() -> None:
         metrics_port=settings.metrics_port,
         log_file=settings.video_log_file,
         log_level=settings.video_log_level,
-        rate_limiter_factory=lambda s: (
-            YouTubeRateLimiter.get(
-                state_dir=s.rate_limiter_state_dir,
-                redis_dsn=s.redis_dsn,
-            )
-        ),
+        rate_limiter_factory=_build_video_rate_limiter,
         client_required=(
             not settings.video_no_upload
         ),

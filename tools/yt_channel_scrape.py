@@ -476,6 +476,25 @@ async def _run_worker(
         )
 
 
+def _build_channel_rate_limiter(
+    s: 'ChannelSettings',
+) -> YouTubeRateLimiter:
+    '''
+    Construct (or fetch) the per-process YouTubeRateLimiter
+    singleton. In ``--channel-upload-only`` mode the worker only
+    reads existing files from disk and POSTs them to
+    scrape.exchange — there is no YouTube traffic — so the
+    proactive cookie warm-up + renewal loop is disabled. Outside
+    that mode the warm-up runs as before.
+    '''
+    rl: YouTubeRateLimiter = YouTubeRateLimiter.get(
+        state_dir=s.rate_limiter_state_dir,
+        redis_dsn=s.redis_dsn,
+    )
+    rl.set_auto_warm_cookies(not s.channel_upload_only)
+    return rl
+
+
 def main() -> None:
     '''
     Top-level entry point. Reads settings and dispatches to
@@ -502,11 +521,7 @@ def main() -> None:
         metrics_port=settings.metrics_port,
         log_file=settings.channel_log_file,
         log_level=settings.channel_log_level,
-        rate_limiter_factory=lambda s: (
-            YouTubeRateLimiter.get(
-                state_dir=s.rate_limiter_state_dir, redis_dsn=s.redis_dsn
-            )
-        ),
+        rate_limiter_factory=_build_channel_rate_limiter,
     )
     sys.exit(runner.run_sync(_run_worker))
 
@@ -1045,6 +1060,34 @@ async def _upload_single_channel(
             METRIC_CHANNELS_ENQUEUED.labels(
                 worker_id=get_worker_id(),
             ).inc()
+    except FileNotFoundError:
+        # Race with the parallel scraper worker that runs on the
+        # same data dir (per CLAUDE.md, ``yt_channel_scrape.py``
+        # and ``yt_channel_scrape.py --channel-upload-only`` share
+        # ``channel_data_directory``): the other worker beat us to
+        # ``mark_uploaded`` between our ``is_superseded`` check
+        # above and the read/delete call inside the try block. If
+        # the file is now superseded, treat it as a clean win for
+        # the other worker and bump the same skip metrics. Only
+        # warn if the file genuinely vanished without an uploaded
+        # copy, since that would be unexpected.
+        if fm.is_superseded(filename):
+            METRIC_UPLOADED_FILE_EXISTS.labels(
+                worker_id=get_worker_id(),
+            ).inc()
+            METRIC_WATCHER_FILES_SKIPPED.labels(
+                worker_id=get_worker_id(),
+            ).inc()
+            logging.debug(
+                'Channel file already uploaded by parallel '
+                'worker; treating as superseded',
+                extra={'filename': filename},
+            )
+            return
+        logging.warning(
+            'Channel file disappeared with no uploaded copy',
+            extra={'filename': filename},
+        )
     except Exception as exc:
         logging.error(
             'Error processing channel file',
