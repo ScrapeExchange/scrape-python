@@ -1060,6 +1060,34 @@ async def _upload_single_channel(
             METRIC_CHANNELS_ENQUEUED.labels(
                 worker_id=get_worker_id(),
             ).inc()
+    except FileNotFoundError:
+        # Race with the parallel scraper worker that runs on the
+        # same data dir (per CLAUDE.md, ``yt_channel_scrape.py``
+        # and ``yt_channel_scrape.py --channel-upload-only`` share
+        # ``channel_data_directory``): the other worker beat us to
+        # ``mark_uploaded`` between our ``is_superseded`` check
+        # above and the read/delete call inside the try block. If
+        # the file is now superseded, treat it as a clean win for
+        # the other worker and bump the same skip metrics. Only
+        # warn if the file genuinely vanished without an uploaded
+        # copy, since that would be unexpected.
+        if fm.is_superseded(filename):
+            METRIC_UPLOADED_FILE_EXISTS.labels(
+                worker_id=get_worker_id(),
+            ).inc()
+            METRIC_WATCHER_FILES_SKIPPED.labels(
+                worker_id=get_worker_id(),
+            ).inc()
+            logging.debug(
+                'Channel file already uploaded by parallel '
+                'worker; treating as superseded',
+                extra={'filename': filename},
+            )
+            return
+        logging.warning(
+            'Channel file disappeared with no uploaded copy',
+            extra={'filename': filename},
+        )
     except Exception as exc:
         logging.error(
             'Error processing channel file',
