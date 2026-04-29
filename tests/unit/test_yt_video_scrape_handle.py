@@ -12,14 +12,14 @@ class TestResolveVideoUploadHandle(
     unittest.IsolatedAsyncioTestCase,
 ):
     def _make_video(
-        self, channel_id: str, channel_name: str,
+        self, channel_id: str, channel_handle: str,
     ):
         from scrape_exchange.youtube.youtube_video import (
             YouTubeVideo,
         )
         v: YouTubeVideo = YouTubeVideo(video_id='vid1234')
         v.channel_id = channel_id
-        v.channel_name = channel_name
+        v.channel_handle = channel_handle
         return v
 
     async def test_map_hit_returns_cached_handle(self) -> None:

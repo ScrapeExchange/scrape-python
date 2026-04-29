@@ -262,7 +262,7 @@ class TestYouTubeChannel(unittest.TestCase):
         self.assertEqual(len(links), 1)
         link: YouTubeChannelLink = next(iter(links))
         self.assertIsInstance(link, YouTubeChannelLink)
-        self.assertEqual(link.channel_name, 'FeaturedChannel')
+        self.assertEqual(link.channel_handle, 'FeaturedChannel')
         self.assertEqual(link.subscriber_count, 1200)
 
     def test_historymatters_json_matches_schema(self) -> None:
@@ -285,15 +285,15 @@ class TestYouTubeChannel(unittest.TestCase):
 
 class TestYouTubeChannelInit(unittest.TestCase):
     def test_init_with_name_sets_url(self) -> None:
-        ch = YouTubeChannel(name='HistoryMatters')
-        self.assertEqual(ch.name, 'HistoryMatters')
+        ch = YouTubeChannel(channel_handle='HistoryMatters')
+        self.assertEqual(ch.channel_handle, 'HistoryMatters')
         self.assertIn('@HistoryMatters', ch.url)
         self.assertIsNone(ch.channel_id)
         self.assertEqual(ch.video_ids, set())
 
     def test_init_strips_at_from_name(self) -> None:
-        ch = YouTubeChannel(name='@SomeChannel')
-        self.assertEqual(ch.name, 'SomeChannel')
+        ch = YouTubeChannel(channel_handle='@SomeChannel')
+        self.assertEqual(ch.channel_handle, 'SomeChannel')
 
     def test_init_no_name(self) -> None:
         ch = YouTubeChannel()
@@ -303,24 +303,24 @@ class TestYouTubeChannelInit(unittest.TestCase):
 
 class TestYouTubeChannelEquality(unittest.TestCase):
     def test_equal_channels(self) -> None:
-        ch1 = YouTubeChannel(name='Test')
-        ch2 = YouTubeChannel(name='Test')
+        ch1 = YouTubeChannel(channel_handle='Test')
+        ch2 = YouTubeChannel(channel_handle='Test')
         ch1.channel_id = ch2.channel_id = 'UC123'
         ch1.title = ch2.title = 'Test Title'
         self.assertEqual(ch1, ch2)
 
     def test_not_equal_different_name(self) -> None:
-        ch1 = YouTubeChannel(name='A')
-        ch2 = YouTubeChannel(name='B')
+        ch1 = YouTubeChannel(channel_handle='A')
+        ch2 = YouTubeChannel(channel_handle='B')
         self.assertNotEqual(ch1, ch2)
 
     def test_not_equal_different_type(self) -> None:
-        ch = YouTubeChannel(name='X')
+        ch = YouTubeChannel(channel_handle='X')
         self.assertNotEqual(ch, 'not_a_channel')
 
 class TestYouTubeChannelToFromDict(unittest.TestCase):
     def test_to_dict_basic_fields(self) -> None:
-        ch = YouTubeChannel(name='Test')
+        ch = YouTubeChannel(channel_handle='Test')
         ch.channel_id = 'UC123'
         ch.title = 'My Title'
         ch.description = 'A description'
@@ -330,7 +330,7 @@ class TestYouTubeChannelToFromDict(unittest.TestCase):
         ch.view_count = 100000
         ch.joined_date = datetime(2020, 1, 15, tzinfo=UTC)
         data = ch.to_dict()
-        self.assertEqual(data['channel'], 'Test')
+        self.assertEqual(data['channel_handle'], 'Test')
         self.assertEqual(data['channel_id'], 'UC123')
         self.assertEqual(data['title'], 'My Title')
         self.assertEqual(data['description'], 'A description')
@@ -341,29 +341,28 @@ class TestYouTubeChannelToFromDict(unittest.TestCase):
         self.assertIn('2020', data['joined_date'])
 
     def test_to_dict_with_video_ids(self) -> None:
-        ch = YouTubeChannel(name='Test')
+        ch = YouTubeChannel(channel_handle='Test')
         ch.video_ids = {'v1', 'v2'}
         data = ch.to_dict(with_video_ids=True)
         self.assertEqual(set(data['video_ids']), {'v1', 'v2'})
 
     def test_to_dict_without_video_ids(self) -> None:
-        ch = YouTubeChannel(name='Test')
+        ch = YouTubeChannel(channel_handle='Test')
         ch.video_ids = {'v1'}
         data = ch.to_dict(with_video_ids=False)
         self.assertNotIn('video_ids', data)
 
     def test_to_dict_none_joined_date(self) -> None:
-        ch = YouTubeChannel(name='Test')
+        ch = YouTubeChannel(channel_handle='Test')
         data = ch.to_dict()
         self.assertIsNone(data['joined_date'])
 
     def test_round_trip_from_dict(self) -> None:
-        ch = YouTubeChannel(name='RoundTrip')
+        ch = YouTubeChannel(channel_handle='RoundTrip')
         ch.channel_id = 'UC_RT'
         ch.title = 'RT Title'
         ch.description = 'desc'
         ch.keywords = {'keyword1', 'keyword2'}
-        ch.categories = {'cat1'}
         ch.is_family_safe = True
         ch.country = 'US'
         ch.available_country_codes = {'US', 'GB'}
@@ -394,8 +393,8 @@ class TestYouTubeChannelToFromDict(unittest.TestCase):
         self.assertEqual(ch, restored)
 
     def test_from_dict_empty(self) -> None:
-        ch = YouTubeChannel.from_dict({'channel': 'Empty'})
-        self.assertEqual(ch.name, 'Empty')
+        ch = YouTubeChannel.from_dict({'channel_handle': 'Empty'})
+        self.assertEqual(ch.channel_handle, 'Empty')
         self.assertIsNone(ch.channel_id)
         self.assertIsNone(ch.joined_date)
 
@@ -406,24 +405,24 @@ class TestYouTubeChannelToFromDict(unittest.TestCase):
 
 class TestExtractInitialData(unittest.TestCase):
     def test_extracts_yt_initial_data(self) -> None:
-        ch = YouTubeChannel(name='Test')
+        ch = YouTubeChannel(channel_handle='Test')
         html = 'blah ytInitialData = {"key": "value"}; more stuff'
         result = ch._extract_initial_data(html)
         self.assertEqual(result, {'key': 'value'})
 
     def test_extracts_window_syntax(self) -> None:
-        ch = YouTubeChannel(name='Test')
+        ch = YouTubeChannel(channel_handle='Test')
         html = 'blah window["ytInitialData"] = {"k": 1}; more'
         result = ch._extract_initial_data(html)
         self.assertEqual(result, {'k': 1})
 
     def test_raises_on_missing_data(self) -> None:
-        ch = YouTubeChannel(name='Test')
+        ch = YouTubeChannel(channel_handle='Test')
         with self.assertRaises(ValueError):
             ch._extract_initial_data('no data here')
 
     def test_sets_verified_from_html(self) -> None:
-        ch = YouTubeChannel(name='Test')
+        ch = YouTubeChannel(channel_handle='Test')
         html = (
             '"tooltip":"Verified" '
             'ytInitialData = {"x": 1};'
@@ -438,14 +437,14 @@ class TestExtractInitialData(unittest.TestCase):
 
 class TestExtractHandle(unittest.TestCase):
     def test_from_url(self) -> None:
-        ch = YouTubeChannel(name='Test')
+        ch = YouTubeChannel(channel_handle='Test')
         handle = ch._extract_handle(
             'https://www.youtube.com/@MyHandle/videos', {}
         )
         self.assertEqual(handle, '@MyHandle')
 
     def test_from_metadata_channel_url(self) -> None:
-        ch = YouTubeChannel(name='Test')
+        ch = YouTubeChannel(channel_handle='Test')
         handle = ch._extract_handle(
             'https://www.youtube.com/channel/UC123',
             {'channelUrl': 'https://www.youtube.com/@FromMeta'}
@@ -453,7 +452,7 @@ class TestExtractHandle(unittest.TestCase):
         self.assertEqual(handle, '@FromMeta')
 
     def test_returns_none(self) -> None:
-        ch = YouTubeChannel(name='Test')
+        ch = YouTubeChannel(channel_handle='Test')
         self.assertIsNone(
             ch._extract_handle('https://www.youtube.com/channel/UC12', {})
         )
@@ -465,7 +464,7 @@ class TestExtractHandle(unittest.TestCase):
 
 class TestExtractSimpleText(unittest.TestCase):
     def setUp(self) -> None:
-        self.ch = YouTubeChannel(name='Test')
+        self.ch = YouTubeChannel(channel_handle='Test')
 
     def test_string_input(self) -> None:
         self.assertEqual(self.ch._extract_simple_text('hello'), 'hello')
@@ -498,7 +497,7 @@ class TestExtractSimpleText(unittest.TestCase):
 
 class TestParseThumbnailsHelper(unittest.TestCase):
     def setUp(self) -> None:
-        self.ch = YouTubeChannel(name='Test')
+        self.ch = YouTubeChannel(channel_handle='Test')
 
     def test_three_thumbnails(self) -> None:
         thumbs_list = [
@@ -527,7 +526,7 @@ class TestParseThumbnailsHelper(unittest.TestCase):
 
 class TestParseThumbnail(unittest.TestCase):
     def test_parse_single(self) -> None:
-        ch = YouTubeChannel(name='Test')
+        ch = YouTubeChannel(channel_handle='Test')
         result = ch._parse_thumbnail(
             {'url': 'pic.jpg', 'width': 640, 'height': 480}
         )
@@ -579,7 +578,7 @@ class TestExtractLinks(unittest.TestCase):
 
 class TestParseChannelAboutMetadata(unittest.TestCase):
     def test_parses_all_fields(self) -> None:
-        ch = YouTubeChannel(name='Test')
+        ch = YouTubeChannel(channel_handle='Test')
         metadata = {
             'externalId': 'UC123',
             'title': 'Test Title',
@@ -600,7 +599,7 @@ class TestParseChannelAboutMetadata(unittest.TestCase):
         self.assertIn('keyword1', ch.keywords)
 
     def test_does_not_overwrite_existing(self) -> None:
-        ch = YouTubeChannel(name='Test')
+        ch = YouTubeChannel(channel_handle='Test')
         ch.title = 'Already set'
         ch._parse_channel_about_metadata({'title': 'New'})
         self.assertEqual(ch.title, 'Already set')
@@ -612,7 +611,7 @@ class TestParseChannelAboutMetadata(unittest.TestCase):
 
 class TestParseChannelAboutData(unittest.TestCase):
     def test_parses_joined_date(self) -> None:
-        ch = YouTubeChannel(name='Test')
+        ch = YouTubeChannel(channel_handle='Test')
         about = {
             'joinedDateText': {'content': 'Joined Aug 2, 2015'},
         }
@@ -620,7 +619,7 @@ class TestParseChannelAboutData(unittest.TestCase):
         self.assertEqual(ch.joined_date, datetime(2015, 8, 2, tzinfo=UTC))
 
     def test_parses_view_count(self) -> None:
-        ch = YouTubeChannel(name='Test')
+        ch = YouTubeChannel(channel_handle='Test')
         about = {
             'viewCountText': {'simpleText': '1,234,567 views'},
         }
@@ -634,7 +633,7 @@ class TestParseChannelAboutData(unittest.TestCase):
 
 class TestFindAboutRenderer(unittest.TestCase):
     def test_finds_about_view_model(self) -> None:
-        ch = YouTubeChannel(name='Test')
+        ch = YouTubeChannel(channel_handle='Test')
         data = {
             'onResponseReceivedEndpoints': [
                 {
@@ -675,7 +674,7 @@ class TestFindAboutRenderer(unittest.TestCase):
         self.assertIn('joinedDateText', result)
 
     def test_returns_none_when_missing(self) -> None:
-        ch = YouTubeChannel(name='Test')
+        ch = YouTubeChannel(channel_handle='Test')
         ch.url = 'https://www.youtube.com/@Test'
         self.assertIsNone(
             ch._find_about_renderer(
@@ -684,7 +683,7 @@ class TestFindAboutRenderer(unittest.TestCase):
         )
 
     def test_returns_none_when_no_endpoints(self) -> None:
-        ch = YouTubeChannel(name='Test')
+        ch = YouTubeChannel(channel_handle='Test')
         ch.url = 'https://www.youtube.com/@Test'
         self.assertIsNone(ch._find_about_renderer({}))
 
@@ -695,7 +694,7 @@ class TestFindAboutRenderer(unittest.TestCase):
 
 class TestParseChannelVideoData(unittest.TestCase):
     def test_parses_channel_info(self) -> None:
-        ch = YouTubeChannel(name='Test')
+        ch = YouTubeChannel(channel_handle='Test')
 
         page_data = {
             'metadata': {
@@ -764,7 +763,7 @@ class TestParseChannelVideoData(unittest.TestCase):
         self.assertGreaterEqual(len(ch.channel_thumbnails), 1)
 
     def test_raises_on_missing_metadata(self) -> None:
-        ch = YouTubeChannel(name='Test')
+        ch = YouTubeChannel(channel_handle='Test')
         page_data = {
             'metadata': {},
             'header': {
@@ -785,7 +784,7 @@ class TestParseChannelVideoData(unittest.TestCase):
 
 class TestSetChannelVideoThumbnail(unittest.TestCase):
     def test_picks_smallest(self) -> None:
-        ch = YouTubeChannel(name='Test')
+        ch = YouTubeChannel(channel_handle='Test')
         ch.channel_thumbnails = {
             YouTubeThumbnail(
                 {'url': 'https://big.jpg', 'width': 800, 'height': 800}
@@ -798,7 +797,7 @@ class TestSetChannelVideoThumbnail(unittest.TestCase):
         self.assertIsNotNone(ch.channel_thumbnail)
 
     def test_no_thumbnails(self) -> None:
-        ch = YouTubeChannel(name='Test')
+        ch = YouTubeChannel(channel_handle='Test')
         ch._set_channel_video_thumbnail()
         self.assertIsNone(ch.channel_thumbnail)
 
@@ -809,7 +808,7 @@ class TestSetChannelVideoThumbnail(unittest.TestCase):
 
 class TestParseThumbnailsBanners(unittest.TestCase):
     def test_parses_metadata_avatar(self) -> None:
-        ch = YouTubeChannel(name='Test')
+        ch = YouTubeChannel(channel_handle='Test')
         metadata = {
             'avatar': {
                 'thumbnails': [
@@ -822,7 +821,7 @@ class TestParseThumbnailsBanners(unittest.TestCase):
         self.assertGreaterEqual(len(ch.channel_thumbnails), 1)
 
     def test_parses_banner_from_header(self) -> None:
-        ch = YouTubeChannel(name='Test')
+        ch = YouTubeChannel(channel_handle='Test')
         page_data = {
             'header': {
                 'pageHeaderRenderer': {
@@ -850,7 +849,7 @@ class TestParseThumbnailsBanners(unittest.TestCase):
         self.assertGreaterEqual(len(ch.banners), 1)
 
     def test_fallback_banner_from_c4_tabbed_header(self) -> None:
-        ch = YouTubeChannel(name='Test')
+        ch = YouTubeChannel(channel_handle='Test')
         page_data = {
             'header': {
                 'c4TabbedHeaderRenderer': {
@@ -1471,13 +1470,13 @@ class TestToDictSchemaValidation(unittest.TestCase):
 
     def test_minimal_channel_validates(self) -> None:
         '''A freshly-constructed channel with only a name should pass.'''
-        ch = YouTubeChannel(name='TestChannel')
+        ch = YouTubeChannel(channel_handle='TestChannel')
         self._validate(ch.to_dict())
 
     # -- channel with video_ids --------------------------------------------
 
     def test_to_dict_with_video_ids_validates(self) -> None:
-        ch = YouTubeChannel(name='TestChannel')
+        ch = YouTubeChannel(channel_handle='TestChannel')
         ch.video_ids = {'abc123', 'def456'}
         self._validate(ch.to_dict(with_video_ids=True))
 
@@ -1485,12 +1484,11 @@ class TestToDictSchemaValidation(unittest.TestCase):
 
     def test_fully_populated_channel_validates(self) -> None:
         '''A channel with every field populated should still pass.'''
-        ch = YouTubeChannel(name='FullChannel')
+        ch = YouTubeChannel(channel_handle='FullChannel')
         ch.channel_id = 'UC_FAKE_ID_1234'
         ch.title = 'Full Channel Title'
         ch.description = 'A test description.'
         ch.keywords = {'keyword1', 'keyword2'}
-        ch.categories = {'Education', 'Science'}
         ch.is_family_safe = True
         ch.country = 'US'
         ch.available_country_codes = {'US', 'GB', 'DE'}
@@ -1578,7 +1576,7 @@ class TestToDictSchemaValidation(unittest.TestCase):
 
     def test_round_trip_validates(self) -> None:
         '''from_dict(to_dict(ch)).to_dict() should still validate.'''
-        ch = YouTubeChannel(name='RoundTrip')
+        ch = YouTubeChannel(channel_handle='RoundTrip')
         ch.channel_id = 'UC_RT'
         ch.title = 'Round Trip Channel'
         ch.subscriber_count = 100
@@ -1608,7 +1606,7 @@ class TestCanonicalHandleAttribute(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as save_dir:
             channel: YouTubeChannel = YouTubeChannel(
-                name='input_casing',
+                channel_handle='input_casing',
             )
             channel.channel_id = 'UC1234567890abcdefghij'
 
@@ -1642,14 +1640,16 @@ class TestCanonicalHandleAttribute(unittest.IsolatedAsyncioTestCase):
                     )
 
             self.assertEqual(
-                channel.canonical_handle, 'HistoryMatters',
+                channel.channel_handle, 'HistoryMatters',
             )
 
-    async def test_canonical_handle_none_when_no_vanity(self) -> None:
+    async def test_channel_handle_kept_when_no_vanity(self) -> None:
+        '''When InnerTube returns no vanity URL, the constructor-supplied
+        handle is preserved (no canonical override).'''
         import tempfile
 
         with tempfile.TemporaryDirectory() as save_dir:
-            channel: YouTubeChannel = YouTubeChannel(name='legacy')
+            channel: YouTubeChannel = YouTubeChannel(channel_handle='legacy')
             channel.channel_id = 'UC1234567890abcdefghij'
 
             with patch(
@@ -1671,7 +1671,7 @@ class TestCanonicalHandleAttribute(unittest.IsolatedAsyncioTestCase):
                         save_dir=save_dir,
                     )
 
-            self.assertIsNone(channel.canonical_handle)
+            self.assertEqual(channel.channel_handle, 'legacy')
 
 
 if __name__ == '__main__':

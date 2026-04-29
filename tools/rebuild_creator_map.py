@@ -10,7 +10,7 @@ channel count.
 For every ``channel-<handle>.json.br`` file found in the
 ``channel_data_directory`` (and its ``uploaded/`` sub-directory),
 the tool extracts ``channel_id`` and derives the handle via
-``fallback_handle(channel.name)`` — the same helper
+``fallback_handle(channel.channel_handle)`` — the same helper
 ``resolve_channel_upload_handle`` uses when no canonical handle is
 available. Mappings are batched and flushed to Redis in groups of
 500.
@@ -177,13 +177,13 @@ async def _scrape_channel(
     except ValueError:
         logging.warning(
             'Channel not found on YouTube',
-            extra={'handle': channel.name},
+            extra={'handle': channel.channel_handle},
         )
         return None
     except Exception as exc:
         logging.warning(
             'Failed to scrape YouTube about page for handle',
-            exc=exc, extra={'handle': channel.name},
+            exc=exc, extra={'handle': channel.channel_handle},
         )
         return None
     finally:
@@ -198,7 +198,7 @@ async def _scrape_channel(
         logging.warning(
             'Failed to serialize scraped channel',
             exc=exc,
-            extra={'handle': channel.name},
+            extra={'handle': channel.channel_handle},
         )
         return None
 
@@ -252,7 +252,7 @@ async def _extract_mapping(
     is_wrapped: bool = channel_payload is not data
     channel_id: str | None = channel_payload.get('channel_id')
     channel_handle: str | None = channel_payload.get(
-        'channel', channel_payload.get('channel_name')
+        'channel', channel_payload.get('channel_handle')
     )
 
     if not channel_id:
@@ -288,8 +288,8 @@ async def _extract_mapping(
         )
         if not channel.channel_id and channel_id:
             channel.channel_id = channel_id
-        if not channel.name and channel_handle:
-            channel.name = channel_handle
+        if not channel.channel_handle and channel_handle:
+            channel.channel_handle = channel_handle
     except Exception as exc:
         logging.warning(
             'Failed to parse channel payload',
@@ -323,15 +323,15 @@ async def _resolve_via_youtube(
         logging.warning(
             'Channel file missing channel_id and resolution '
             'disabled',
-            extra={'handle': channel.name},
+            extra={'handle': channel.channel_handle},
         )
         return None, None, 'skipped', None
 
-    if channel.name and channel.name in handle_cache:
-        scraped: dict | None = handle_cache[channel.name]
+    if channel.channel_handle and channel.channel_handle in handle_cache:
+        scraped: dict | None = handle_cache[channel.channel_handle]
     else:
         scraped = await _scrape_channel(channel, proxies)
-        handle_cache[channel.name] = scraped
+        handle_cache[channel.channel_handle] = scraped
 
     if not scraped:
         return None, None, 'skipped', None
@@ -355,7 +355,7 @@ async def _resolve_via_youtube(
     if is_wrapped:
         envelope['data'] = scraped
         update_payload = envelope
-    return resolved_cid, channel.name, 'resolved', update_payload
+    return resolved_cid, channel.channel_handle, 'resolved', update_payload
 
 
 async def _post_channel_id_update(

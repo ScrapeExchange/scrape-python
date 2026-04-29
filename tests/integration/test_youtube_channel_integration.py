@@ -69,12 +69,12 @@ class TestIntegration(unittest.IsolatedAsyncioTestCase):
     async def test_youtube_channel(self) -> None:
         '''Scrape channel metadata via InnerTube (no about page).'''
         channel: YouTubeChannel = YouTubeChannel(
-            name=YOUTUBE_HISTORYMATTERS_CHANNEL, deno_path=DENO_PATH,
+            channel_handle=YOUTUBE_HISTORYMATTERS_CHANNEL, deno_path=DENO_PATH,
             po_token_url=PO_TOKEN_URL, debug=True, save_dir=self.temp_dir
         )
         channel.channel_id = YOUTUBE_HISTORYMATTERS_CHANNEL_ID
         await channel.scrape()
-        self.assertEqual(channel.name, YOUTUBE_HISTORYMATTERS_CHANNEL)
+        self.assertEqual(channel.channel_handle, YOUTUBE_HISTORYMATTERS_CHANNEL)
         self.assertEqual(channel.channel_id, YOUTUBE_HISTORYMATTERS_CHANNEL_ID)
         self.assertEqual(channel.title, 'History Matters')
         self.assertGreaterEqual(channel.subscriber_count, 1880000)
@@ -118,11 +118,11 @@ class TestIntegration(unittest.IsolatedAsyncioTestCase):
     async def test_youtube_channel_about_page(self) -> None:
         '''Scrape channel with the about page for HTML-only fields.'''
         channel: YouTubeChannel = YouTubeChannel(
-            name=YOUTUBE_HISTORYMATTERS_CHANNEL, deno_path=DENO_PATH,
+            channel_handle=YOUTUBE_HISTORYMATTERS_CHANNEL, deno_path=DENO_PATH,
             po_token_url=PO_TOKEN_URL, debug=True, save_dir=self.temp_dir
         )
         await channel.scrape(with_about_page=True)
-        self.assertEqual(channel.name, YOUTUBE_HISTORYMATTERS_CHANNEL)
+        self.assertEqual(channel.channel_handle, YOUTUBE_HISTORYMATTERS_CHANNEL)
         self.assertEqual(channel.channel_id, YOUTUBE_HISTORYMATTERS_CHANNEL_ID)
         self.assertEqual(channel.title, 'History Matters')
         self.assertEqual(channel.joined_date, datetime(2015, 8, 2, tzinfo=UTC))
@@ -143,12 +143,12 @@ class TestIntegration(unittest.IsolatedAsyncioTestCase):
     async def test_scrape_channel(self) -> None:
         '''Scrape channel content via InnerTube (no about page).'''
         channel: YouTubeChannel = YouTubeChannel(
-            name=YOUTUBE_HISTORYMATTERS_CHANNEL, deno_path=DENO_PATH,
+            channel_handle=YOUTUBE_HISTORYMATTERS_CHANNEL, deno_path=DENO_PATH,
             po_token_url=PO_TOKEN_URL, debug=True, save_dir=self.temp_dir
         )
         channel.channel_id = YOUTUBE_HISTORYMATTERS_CHANNEL_ID
         await channel.scrape()
-        self.assertEqual(channel.name, YOUTUBE_HISTORYMATTERS_CHANNEL)
+        self.assertEqual(channel.channel_handle, YOUTUBE_HISTORYMATTERS_CHANNEL)
         self.assertEqual(channel.channel_id, YOUTUBE_HISTORYMATTERS_CHANNEL_ID)
         self.assertEqual(channel.title, 'History Matters')
         self.assertGreaterEqual(channel.subscriber_count, 1880000)
@@ -174,14 +174,14 @@ class TestIntegration(unittest.IsolatedAsyncioTestCase):
 
     async def test_channel_links(self) -> None:
         channel: YouTubeChannel = YouTubeChannel(
-            name='ComedyCentral', deno_path=DENO_PATH,
+            channel_handle='ComedyCentral', deno_path=DENO_PATH,
             po_token_url=PO_TOKEN_URL, debug=True, save_dir=self.temp_dir
         )
         await channel.scrape_about_page()
         self.assertGreaterEqual(len(channel.channel_links), 10)
         link: YouTubeChannelLink
         for link in channel.channel_links:
-            self.assertIsNotNone(link.channel_name)
+            self.assertIsNotNone(link.channel_handle)
             self.assertIsNotNone(link.subscriber_count)
 
     async def test_youtube_channel_tabs_scrape(self) -> None:

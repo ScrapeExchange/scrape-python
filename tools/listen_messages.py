@@ -65,7 +65,7 @@ def _parse_args() -> argparse.Namespace:
         '--schema-version',
         default=None,
         help=(
-            'Filter by schema version, e.g. 0.0.1 '
+            'Filter by schema version, e.g. 0.0.2 '
             '(client-side, matched against data_url)'
         ),
     )

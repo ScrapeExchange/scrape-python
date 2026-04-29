@@ -21,7 +21,7 @@ from tools.yt_video_scrape import _video_has_formats_on_server
 _GET_DATA_PARAM: str = '/api/v1/data/param'
 _EXCHANGE_URL: str = 'https://scrape.exchange'
 _SCHEMA_OWNER: str = 'testuser'
-_SCHEMA_VERSION: str = '0.0.1'
+_SCHEMA_VERSION: str = '0.0.2'
 _VIDEO_ID: str = 'dQw4w9WgXcQ'
 _DATA_URL: str = 'https://data.scrape.exchange/payload/abc123'
 

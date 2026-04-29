@@ -1174,7 +1174,7 @@
       "targets": [
         {
           "expr": "sum by (reason) (rate(yt_rss_feed_download_failures_total{job=~\"$job\", instance=~\"$instance\"}[5m]))",
-          "legendFormat": "rss feed failures — {{reason}}",
+          "legendFormat": "rss feed failures \u2014 {{reason}}",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
@@ -1183,7 +1183,7 @@
         },
         {
           "expr": "sum by (entity) (rate(yt_rss_innertube_call_failures_total{job=~\"$job\", instance=~\"$instance\"}[5m]))",
-          "legendFormat": "innertube failures — {{entity}}",
+          "legendFormat": "innertube failures \u2014 {{entity}}",
           "refId": "B",
           "datasource": {
             "type": "prometheus",
@@ -3413,8 +3413,8 @@
     {
       "id": 63,
       "type": "timeseries",
-      "title": "Video watcher — files detected / skipped / enqueued",
-      "description": "Upload-only watcher KPIs for the video scraper. detected − skipped should equal enqueued.",
+      "title": "Video watcher \u2014 files detected / skipped / enqueued",
+      "description": "Upload-only watcher KPIs for the video scraper. detected \u2212 skipped should equal enqueued.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -3496,8 +3496,8 @@
     {
       "id": 64,
       "type": "timeseries",
-      "title": "Channel watcher — files detected / skipped / enqueued",
-      "description": "Upload-only watcher KPIs for the channel scraper. detected − skipped should equal enqueued.",
+      "title": "Channel watcher \u2014 files detected / skipped / enqueued",
+      "description": "Upload-only watcher KPIs for the channel scraper. detected \u2212 skipped should equal enqueued.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -3597,9 +3597,18 @@
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 100 },
-              { "color": "red", "value": 1000 }
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 100
+              },
+              {
+                "color": "red",
+                "value": 1000
+              }
             ]
           }
         },
@@ -3607,7 +3616,9 @@
       },
       "options": {
         "reduceOptions": {
-          "calcs": ["lastNotNull"]
+          "calcs": [
+            "lastNotNull"
+          ]
         },
         "colorMode": "background",
         "graphMode": "none",
@@ -3657,7 +3668,7 @@
       "id": 66,
       "type": "timeseries",
       "title": "RSS tier orphans (drift)",
-      "description": "Creator ids in rss:<platform>:tiers that are not in any queue, not claimed, and not flagged no_feeds. Nonzero means the scheduler cannot see those channels — they will never be polled. Alert-worthy when sustained.",
+      "description": "Creator ids in rss:<platform>:tiers that are not in any queue, not claimed, and not flagged no_feeds. Nonzero means the scheduler cannot see those channels \u2014 they will never be polled. Alert-worthy when sustained.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -3843,11 +3854,12 @@
           }
         }
       ]
+<<<<<<< Updated upstream
     },
     {
       "id": 69,
       "type": "timeseries",
-      "title": "RSS circuit breaker — trips by proxy network (rate)",
+      "title": "RSS circuit breaker \u2014 trips by proxy network (rate)",
       "description": "Rate at which the per-proxy RSS circuit breaker opens due to consecutive HTTP 404 (soft-ban) signals. A sustained nonzero rate on a specific proxy means that VPN tunnel or IP is being flagged by YouTube; rotate or wait out the cooldown.",
       "datasource": {
         "type": "prometheus",
@@ -3904,7 +3916,7 @@
     {
       "id": 70,
       "type": "timeseries",
-      "title": "RSS circuit breaker — currently open (per proxy network)",
+      "title": "RSS circuit breaker \u2014 currently open (per proxy network)",
       "description": "1 while the RSS circuit is open for this proxy, 0 otherwise. A stuck '1' means every retry for that tunnel is landing inside the exponential cooldown; when all proxies are simultaneously at 1, acquire() is sleeping until the earliest reopens.",
       "datasource": {
         "type": "prometheus",
@@ -4020,7 +4032,7 @@
     {
       "id": 72,
       "type": "timeseries",
-      "title": "RSS InnerTube — success vs failure rate",
+      "title": "RSS InnerTube \u2014 success vs failure rate",
       "description": "InnerTube call rate split into successes and failures. A persistent failure:success ratio well above 1:5 suggests YouTube is degrading InnerTube for the scraping IPs, not just the RSS feed endpoint.",
       "datasource": {
         "type": "prometheus",
@@ -4065,7 +4077,7 @@
       "targets": [
         {
           "expr": "sum by (entity) (rate(yt_rss_innertube_success_total{job=~\"$job\", instance=~\"$instance\"}[5m]))",
-          "legendFormat": "success — {{entity}}",
+          "legendFormat": "success \u2014 {{entity}}",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
@@ -4074,7 +4086,7 @@
         },
         {
           "expr": "sum by (entity) (rate(yt_rss_innertube_call_failures_total{job=~\"$job\", instance=~\"$instance\"}[5m]))",
-          "legendFormat": "failure — {{entity}}",
+          "legendFormat": "failure \u2014 {{entity}}",
           "refId": "B",
           "datasource": {
             "type": "prometheus",
@@ -4082,6 +4094,277 @@
           }
         }
       ]
+    },
+    {
+      "id": 73,
+      "type": "row",
+      "title": "Scheduled bulk uploads",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 197,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 74,
+      "type": "timeseries",
+      "title": "Video bulk uploads \u2014 success / failed / missing (per second)",
+      "gridPos": {
+        "x": 0,
+        "y": 198,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(yt_video_bulk_uploaded_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "success"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(yt_video_bulk_failed_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "failed"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(yt_video_bulk_missing_result_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "missing"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "none"
+            },
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "sum"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 75,
+      "type": "timeseries",
+      "title": "Channel bulk uploads \u2014 success / failed / missing (per second)",
+      "gridPos": {
+        "x": 12,
+        "y": 198,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(yt_channel_bulk_uploaded_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "success"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(yt_channel_bulk_failed_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "failed"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(yt_channel_bulk_missing_result_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "missing"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "none"
+            },
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "sum"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 76,
+      "type": "timeseries",
+      "title": "Video bulk batches by outcome (per second)",
+      "gridPos": {
+        "x": 0,
+        "y": 206,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (outcome) (rate(yt_video_bulk_batches_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "none"
+            },
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "sum"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 77,
+      "type": "timeseries",
+      "title": "Channel bulk batches by outcome (per second)",
+      "gridPos": {
+        "x": 12,
+        "y": 206,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (outcome) (rate(yt_channel_bulk_batches_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "none"
+            },
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "sum"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+=======
+>>>>>>> Stashed changes
     }
   ]
 }

@@ -206,16 +206,16 @@ class TestFileCreatorQueuePopulate(
         with tempfile.TemporaryDirectory() as tmp:
             q: FileCreatorQueue = _make_queue(tmp)
             fm: AssetFileManagement = _make_fm(tmp)
-            channel_name: str = 'mychannel'
+            channel_handle: str = 'mychannel'
             marker: str = (
                 f'{CHANNEL_FILENAME_PREFIX}'
-                f'{channel_name}.not_found'
+                f'{channel_handle}.not_found'
             )
             open(
                 os.path.join(tmp, marker), 'w',
             ).close()
             creators: dict[str, str] = {
-                'UCaaa': channel_name,
+                'UCaaa': channel_handle,
             }
             added: int = await q.populate(
                 creators, fm, DEFAULT_TIERS, {},

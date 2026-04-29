@@ -37,6 +37,11 @@ from scrape_exchange.creator_map import (
     FileCreatorMap,
     RedisCreatorMap,
 )
+from scrape_exchange.name_map import (
+    NameMap,
+    NullNameMap,
+    RedisNameMap,
+)
 from scrape_exchange.logging import configure_logging
 from scrape_exchange.settings import ScraperSettings
 from scrape_exchange.youtube.youtube_rate_limiter import (
@@ -150,6 +155,27 @@ def parse_channel_id(data: dict) -> str | None:
         ], data, str,
     )
     return channel_id
+
+
+def parse_channel_title(data: dict) -> str | None:
+    '''
+    Parse the human-readable channel title from ytInitialData.
+    Tries ``channelMetadataRenderer.title`` first (matches what
+    the production scrapers write to the NameMap), then the new
+    ``pageHeaderRenderer.pageTitle`` and the legacy
+    ``c4TabbedHeaderRenderer.title`` header paths.
+    '''
+
+    paths: list[list[str]] = [
+        ['metadata', 'channelMetadataRenderer', 'title'],
+        ['header', 'pageHeaderRenderer', 'pageTitle'],
+        ['header', 'c4TabbedHeaderRenderer', 'title'],
+    ]
+    for path in paths:
+        title: str | None = parse_nested_dicts(path, data, str)
+        if title:
+            return title
+    return None
 
 
 def parse_subscriber_count(data: dict) -> int | None:
@@ -271,26 +297,29 @@ def _collect_video_authors(node: any,
 
 class DiscoveredChannel:
     def __init__(
-        self, channel_name: str,
+        self, channel_handle: str,
         page_links: set[tuple[str, int | None]],
         description: str | None,
         subs: int | None,
         channel_id: str | None,
+        title: str | None = None,
     ) -> None:
-        self.channel_name: str = channel_name
+        self.channel_handle: str = channel_handle
         self.page_links: set[tuple[str, int | None]] = (
             page_links
         )
         self.description: str | None = description
         self.subs: int | None = subs
         self.channel_id: str | None = channel_id
+        self.title: str | None = title
 
     @staticmethod
-    def parse_channel_page(channel_name: str,
+    def parse_channel_page(channel_handle: str,
                            page_data: dict[str, any]) -> Self:
         page_links: set[tuple[str, int | None]] = set()
 
         channel_id: str | None = parse_channel_id(page_data)
+        title: str | None = parse_channel_title(page_data)
         subs_count: int | None = parse_subscriber_count(page_data)
 
         description: str | None = parse_nested_dicts(
@@ -371,8 +400,8 @@ class DiscoveredChannel:
         _collect_video_authors(page_data, page_links)
 
         return DiscoveredChannel(
-            channel_name, page_links, description,
-            subs_count, channel_id,
+            channel_handle, page_links, description,
+            subs_count, channel_id, title,
         )
 
 
@@ -573,18 +602,68 @@ async def update_creator_map(
         )
 
 
+async def update_name_map(
+    name_map: NameMap | None,
+    title: str | None,
+    channel_id: str | None,
+) -> None:
+    '''
+    Record ``title → channel_id`` in the shared name_map so that
+    downstream tools (notably the re-ingest tool and the channel
+    list cleanup script) can recover a channel id from a legacy
+    display-name reference. Mirrors the writes that
+    ``yt_channel_scrape.py`` and ``yt_rss_scrape.py`` perform.
+
+    Silent no-op when the map is not configured or either field
+    is missing. Backend errors are logged as a warning and never
+    propagated, so a transient storage outage cannot derail the
+    discovery BFS.
+    '''
+    if name_map is None or not title or not channel_id:
+        return
+    try:
+        await name_map.put(asset_title=title, asset_id=channel_id)
+    except Exception as exc:
+        _LOGGER.warning(
+            'Failed to update name_map',
+            exc=exc,
+            extra={
+                'title': title,
+                'channel_id': channel_id,
+            },
+        )
+
+
+async def _append_jsonl(out_path: str, payload: dict) -> None:
+    '''
+    Append *payload* as a single JSONL record to *out_path*. The
+    file is opened in append mode for this one write and closed
+    again immediately so a crash leaves a consistent, flushed file
+    behind and concurrent readers always see whole records.
+    '''
+
+    line: str = orjson.dumps(payload).decode('utf-8') + '\n'
+    async with aiofiles.open(out_path, 'a') as fd:
+        await fd.write(line)
+
+
 async def record_discovered(
     channel: str, subs: int | None, source: str,
     discovered: dict[str, int | None],
-    out_fd,
+    out_path: str,
     channel_id: str | None = None,
     creator_map: CreatorMap | None = None,
+    title: str | None = None,
+    name_map: NameMap | None = None,
 ) -> None:
-    '''Update in-memory dict and append one JSONL record to out_fd.
+    '''Update in-memory dict and append one JSONL record to
+    *out_path*.
 
     When both *channel_id* and *creator_map* are supplied, the
     shared creator_map (file- or Redis-backed) is also updated
-    via :func:`update_creator_map`.
+    via :func:`update_creator_map`. Likewise, when *title*,
+    *channel_id*, and *name_map* are all supplied, the shared
+    name_map is updated via :func:`update_name_map`.
     '''
 
     discovered[channel] = subs
@@ -593,9 +672,10 @@ async def record_discovered(
     }
     if channel_id:
         payload['channel_id'] = channel_id
+    if title:
+        payload['channel_title'] = title
     try:
-        await out_fd.write(orjson.dumps(payload).decode('utf-8') + '\n')
-        await out_fd.flush()
+        await _append_jsonl(out_path, payload)
     except OSError as exc:
         _LOGGER.warning(
             'Failed to persist discovered record',
@@ -605,18 +685,20 @@ async def record_discovered(
     await update_creator_map(
         creator_map, channel, channel_id,
     )
+    await update_name_map(name_map, title, channel_id)
 
 
 async def record_failed(channel: str, info: dict,
-                        failed: dict[str, dict], out_fd) -> None:
-    '''Update in-memory dict and append one JSONL record to out_fd.'''
+                        failed: dict[str, dict],
+                        out_path: str) -> None:
+    '''Update in-memory dict and append one JSONL record to
+    *out_path*.'''
 
     payload: dict = {'channel': channel}
     payload.update(info)
     failed[channel] = payload
     try:
-        await out_fd.write(orjson.dumps(payload).decode('utf-8') + '\n')
-        await out_fd.flush()
+        await _append_jsonl(out_path, payload)
     except OSError as exc:
         _LOGGER.warning(
             'Failed to persist failed record',
@@ -651,22 +733,33 @@ async def _scrape_channel(
             name, with_download_client=False,
         )
     )
-    await yt_channel.scrape_about_page(proxies=proxies)
+    try:
+        await yt_channel.scrape_about_page(proxies=proxies)
 
-    page_links: set[tuple[str, int | None]] = set()
-    for link in yt_channel.channel_links:
-        page_links.add((
-            link.channel_name,
-            link.subscriber_count,
-        ))
+        page_links: set[tuple[str, int | None]] = set()
+        for link in yt_channel.channel_links:
+            page_links.add((
+                link.channel_handle,
+                link.subscriber_count,
+            ))
 
-    return DiscoveredChannel(
-        channel_name=target,
-        page_links=page_links,
-        description=yt_channel.description,
-        subs=yt_channel.subscriber_count,
-        channel_id=yt_channel.channel_id,
-    )
+        return DiscoveredChannel(
+            channel_handle=target,
+            page_links=page_links,
+            description=yt_channel.description,
+            subs=yt_channel.subscriber_count,
+            channel_id=yt_channel.channel_id,
+            title=yt_channel.title,
+        )
+    finally:
+        # Mirrors yt_channel_scrape.py:938. Without this, every
+        # iteration of the discover BFS leaks an httpx connection
+        # pool and we eventually exhaust file descriptors — which
+        # surfaces as "Too many open files" inside the cookie
+        # renewal loop's lock-file open, not here.
+        if yt_channel.browse_client is not None:
+            await yt_channel.browse_client.aclose()
+            yt_channel.browse_client = None
 
 
 async def fetch(client: AsyncYouTubeClient, url: str
@@ -800,12 +893,13 @@ async def _enqueue_links(
     channel: DiscoveredChannel,
     min_subs: int,
     known_channels: set[str],
+    creator_handles: set[str],
     discovered: dict[str, int | None],
     fully_scraped: set[str],
     failed: dict[str, dict],
     in_queue: set[str],
     to_scrape: deque[str],
-    discovered_fd,
+    discovered_path: str,
 ) -> None:
     '''Record discovered links and enqueue new ones.'''
 
@@ -814,13 +908,15 @@ async def _enqueue_links(
             continue
         if link_name.lower() in known_channels:
             continue
+        if link_name.lower() in creator_handles:
+            continue
         if link_name.lower() in IGNORE_CHANNELS:
             continue
         if link_subs is not None and link_subs < min_subs:
             continue
         await record_discovered(
             link_name, link_subs, 'link',
-            discovered, discovered_fd,
+            discovered, discovered_path,
         )
         if (link_name not in fully_scraped
                 and link_name not in failed
@@ -834,6 +930,7 @@ def _build_initial_queue(
     fully_scraped: set[str],
     failed: dict[str, dict],
     known_channels: set[str],
+    creator_handles: set[str],
 ) -> deque[str]:
     '''Seed the BFS queue with YOUTUBE_URLS and
     orphan channels from a previous run.'''
@@ -848,6 +945,7 @@ def _build_initial_queue(
         - fully_scraped
         - set(failed.keys())
         - known_channels
+        - creator_handles
         - set(seeds)
     )
     to_scrape.extend(orphans)
@@ -862,12 +960,14 @@ def _build_initial_queue(
 
 async def discover(client: AsyncYouTubeClient,
                    creator_map: CreatorMap | None,
+                   name_map: NameMap | None,
                    known_channels: set[str],
+                   creator_handles: set[str],
                    discovered: dict[str, int | None],
                    fully_scraped: set[str],
                    failed: dict[str, dict],
-                   discovered_fd,
-                   failed_fd,
+                   discovered_path: str,
+                   failed_path: str,
                    min_subs: int,
                    proxies: list[str] | None = None,
                    ) -> None:
@@ -875,7 +975,7 @@ async def discover(client: AsyncYouTubeClient,
 
     to_scrape: deque[str] = _build_initial_queue(
         discovered, fully_scraped, failed,
-        known_channels,
+        known_channels, creator_handles,
     )
     in_queue: set[str] = set(to_scrape)
 
@@ -914,7 +1014,7 @@ async def discover(client: AsyncYouTubeClient,
                         'reason': str(exc),
                         'status_code': None,
                     },
-                    failed, failed_fd,
+                    failed, failed_path,
                 )
             continue
 
@@ -925,9 +1025,11 @@ async def discover(client: AsyncYouTubeClient,
                     or channel.subs >= min_subs):
                 await record_discovered(
                     target, channel.subs, 'scrape',
-                    discovered, discovered_fd,
+                    discovered, discovered_path,
                     channel_id=channel.channel_id,
                     creator_map=creator_map,
+                    title=channel.title,
+                    name_map=name_map,
                 )
             else:
                 _LOGGER.info(
@@ -939,12 +1041,32 @@ async def discover(client: AsyncYouTubeClient,
                 )
 
         await _enqueue_links(
-            channel, min_subs, known_channels,
+            channel, min_subs, known_channels, creator_handles,
             discovered, fully_scraped, failed,
-            in_queue, to_scrape, discovered_fd,
+            in_queue, to_scrape, discovered_path,
         )
 
     _LOGGER.info('BFS queue empty, discovery complete')
+
+
+async def load_creator_handles(
+    creator_map: CreatorMap,
+) -> set[str]:
+    '''
+    Return a lowercased set of every handle stored in
+    *creator_map*. Used by the discovery BFS when
+    ``skip_known_creators`` is enabled, to avoid re-scraping
+    channels whose ``UC-id → handle`` mapping is already known.
+    The CreatorMap interface is keyed by ``creator_id`` and has
+    no reverse lookup, so the full mapping must be loaded once
+    at startup and cached in memory.
+    '''
+    mapping: dict[str, str] = await creator_map.get_all()
+    return {
+        handle.lower().lstrip('@')
+        for handle in mapping.values()
+        if handle
+    }
 
 
 async def build_creator_map(
@@ -994,6 +1116,30 @@ async def build_creator_map(
         },
     )
     return fmap
+
+
+def build_name_map(
+    settings: 'DiscoverSettings',
+) -> NameMap:
+    '''
+    Construct the name_map backend from *settings*. Returns
+    :class:`RedisNameMap` when ``REDIS_DSN`` is set, otherwise a
+    :class:`NullNameMap` (writes are silently dropped). The
+    creator_map probe in :func:`build_creator_map` already covers
+    Redis connectivity, so no extra probe is performed here.
+    '''
+    if settings.redis_dsn:
+        _LOGGER.info(
+            'Using Redis name_map',
+            extra={'redis_dsn': settings.redis_dsn},
+        )
+        return RedisNameMap(
+            settings.redis_dsn, platform='youtube',
+        )
+    _LOGGER.info(
+        'REDIS_DSN not set; name_map writes will be discarded',
+    )
+    return NullNameMap()
 
 
 class DiscoverSettings(ScraperSettings):
@@ -1052,6 +1198,19 @@ class DiscoverSettings(ScraperSettings):
             'Minimum subscriber count to keep a channel'
         ),
     )
+    skip_known_creators: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            'YOUTUBE_SKIP_KNOWN_CREATORS',
+            'skip_known_creators',
+        ),
+        description=(
+            'Skip channels whose handle is already in the '
+            'creator_map. Useful for resumed runs that aim '
+            'to discover new channels rather than refresh '
+            'known ones.'
+        ),
+    )
 
 
 async def main() -> None:
@@ -1086,6 +1245,15 @@ async def main() -> None:
     creator_map: CreatorMap = await build_creator_map(
         settings,
     )
+    name_map: NameMap = build_name_map(settings)
+
+    creator_handles: set[str] = set()
+    if settings.skip_known_creators:
+        creator_handles = await load_creator_handles(creator_map)
+        _LOGGER.info(
+            'Loaded creator_map handles for skip-list',
+            extra={'count': len(creator_handles)},
+        )
 
     rate_limiter: YouTubeRateLimiter = (
         YouTubeRateLimiter.get(
@@ -1097,24 +1265,20 @@ async def main() -> None:
 
     disc_channels: str = settings.discovered_channels
     fail_channels: str = settings.failed_channels
-    async with (
-        aiofiles.open(disc_channels, 'a') as discovered_fd,
-        aiofiles.open(fail_channels, 'a') as failed_fd,
-    ):
-        async with AsyncYouTubeClient() as client:
-            proxies: list[str] | None = (
-                settings.proxies.split(',')
-                if settings.proxies
-                else None
-            )
-            await discover(
-                client, creator_map,
-                known_channels,
-                discovered, fully_scraped, failed,
-                discovered_fd, failed_fd,
-                settings.min_subs,
-                proxies=proxies,
-            )
+    async with AsyncYouTubeClient() as client:
+        proxies: list[str] | None = (
+            settings.proxies.split(',')
+            if settings.proxies
+            else None
+        )
+        await discover(
+            client, creator_map, name_map,
+            known_channels, creator_handles,
+            discovered, fully_scraped, failed,
+            disc_channels, fail_channels,
+            settings.min_subs,
+            proxies=proxies,
+        )
 
 
 if __name__ == '__main__':

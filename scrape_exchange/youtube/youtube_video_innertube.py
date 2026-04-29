@@ -1,6 +1,6 @@
 '''
-Uses InnerTube to parse data about a video. It is separate from YouTubeVideo class
-to keep the source files to a managable length
+Uses InnerTube to parse data about a video. It is separate from YouTubeVideo
+class to keep the source files to a managable length
 
 :author     : boinko <boinko@scrape.exchange>
 :copyright  : Copyright 2026
@@ -31,7 +31,6 @@ from .youtube_videochapter import YouTubeVideoChapter
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .youtube_video import YouTubeVideo
-
 
 
 def _safe_int(value: str) -> int | None:
@@ -234,8 +233,8 @@ class InnerTubeVideoParser:
 
         video.duration = _safe_int(video_details.get('lengthSeconds'))
 
-        if microformat.get('category'):
-            video.categories.add(microformat['category'])
+        if microformat.get('category') and not video.category:
+            video.category = microformat['category']
 
         video.published_timestamp = _safe_timestamp(
             microformat.get('publishDate')
@@ -245,7 +244,9 @@ class InnerTubeVideoParser:
         )
 
         video.channel_id = video_details.get('channelId', video.channel_id)
-        video.channel_name = video_details.get('author', video.channel_name)
+        video.channel_handle = video_details.get(
+            'author', video.channel_handle
+        )
         video.channel_url = microformat.get(
             'ownerProfileUrl', video.channel_url
         )
@@ -513,7 +514,10 @@ class InnerTubeVideoParser:
         '''
 
         def _find(contents: list[dict], key: str) -> dict | None:
-            '''Return the value for key in the first item of contents that has it.'''
+            '''
+            Return the value for key in the first item of contents that has it.
+            '''
+    
             for item in contents:
                 if key in item:
                     return item[key]
@@ -551,8 +555,9 @@ class InnerTubeVideoParser:
                 if 'categor' in (_text(r.get('title')) or '').lower():
                     for content in r.get('contents', []):
                         cat: str | None = _text(content)
-                        if cat:
-                            self.video.categories.add(cat)
+                        if cat and not self.video.category:
+                            self.video.category = cat
+                            break
         self.video.comment_count = \
             _extract_comment_count(next_data) or self.video.comment_count
         self.video.chapters = InnerTubeVideoParser._parse_chapters_from_next(
