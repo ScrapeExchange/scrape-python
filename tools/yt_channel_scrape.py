@@ -476,6 +476,25 @@ async def _run_worker(
         )
 
 
+def _build_channel_rate_limiter(
+    s: 'ChannelSettings',
+) -> YouTubeRateLimiter:
+    '''
+    Construct (or fetch) the per-process YouTubeRateLimiter
+    singleton. In ``--channel-upload-only`` mode the worker only
+    reads existing files from disk and POSTs them to
+    scrape.exchange — there is no YouTube traffic — so the
+    proactive cookie warm-up + renewal loop is disabled. Outside
+    that mode the warm-up runs as before.
+    '''
+    rl: YouTubeRateLimiter = YouTubeRateLimiter.get(
+        state_dir=s.rate_limiter_state_dir,
+        redis_dsn=s.redis_dsn,
+    )
+    rl.set_auto_warm_cookies(not s.channel_upload_only)
+    return rl
+
+
 def main() -> None:
     '''
     Top-level entry point. Reads settings and dispatches to
@@ -502,11 +521,7 @@ def main() -> None:
         metrics_port=settings.metrics_port,
         log_file=settings.channel_log_file,
         log_level=settings.channel_log_level,
-        rate_limiter_factory=lambda s: (
-            YouTubeRateLimiter.get(
-                state_dir=s.rate_limiter_state_dir, redis_dsn=s.redis_dsn
-            )
-        ),
+        rate_limiter_factory=_build_channel_rate_limiter,
     )
     sys.exit(runner.run_sync(_run_worker))
 
