@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://scrape.exchange/schemas/boinko-tiktok-video-0.0.1",
+  "title": "TikTok Video Metadata",
+  "description": "Schema representing a TikTok video or photo carousel post.",
+  "type": "object",
+  "properties": {
+    "video_id": {
+      "type": "string",
+      "x-scrape-field": "platform_content_id"
+    },
+    "username": {
+      "type": "string",
+      "x-scrape-field": "platform_creator_id"
+    },
+    "sec_uid": { "type": "string" },
+    "description": { "type": ["string", "null"] },
+    "created_timestamp": {
+      "type": "string", "format": "date-time"
+    },
+    "duration": {
+      "type": ["integer", "null"], "minimum": 0
+    },
+    "aspect_ratio": { "type": ["number", "null"] },
+    "is_photo_post": { "type": "boolean" },
+    "image_count": {
+      "type": ["integer", "null"], "minimum": 0
+    },
+    "view_count": {
+      "type": "integer", "minimum": 0,
+      "x-scrape-gauge": true
+    },
+    "like_count": {
+      "type": "integer", "minimum": 0,
+      "x-scrape-gauge": true
+    },
+    "comment_count": {
+      "type": "integer", "minimum": 0,
+      "x-scrape-gauge": true
+    },
+    "share_count": {
+      "type": "integer", "minimum": 0,
+      "x-scrape-gauge": true
+    },
+    "collect_count": {
+      "type": "integer", "minimum": 0,
+      "x-scrape-gauge": true
+    },
+    "thumbnails": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/thumbnail" },
+      "x-scrape-field": "platform_content_thumbnail_url"
+    },
+    "sound": { "$ref": "#/$defs/sound" },
+    "hashtags": {
+      "type": "array", "items": { "type": "string" }
+    },
+    "mentions": {
+      "type": "array", "items": { "type": "string" }
+    },
+    "subtitles": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/caption" }
+    },
+    "url": {
+      "type": "string", "format": "uri",
+      "x-scrape-field": "source_url"
+    },
+    "availability": {
+      "type": ["string", "null"],
+      "enum": ["public", "private", "deleted", null]
+    },
+    "scraped_timestamp": {
+      "type": "string", "format": "date-time"
+    }
+  },
+  "required": ["video_id", "username", "url"],
+  "additionalProperties": false,
+  "$defs": {
+    "thumbnail": {
+      "type": "object",
+      "properties": {
+        "id": { "type": ["string", "null"] },
+        "url": { "type": "string", "format": "uri" },
+        "width": { "type": ["integer", "null"], "minimum": 0 },
+        "height": { "type": ["integer", "null"], "minimum": 0 },
+        "preference": { "type": ["string", "null"] },
+        "display_hint": { "type": ["string", "null"] }
+      },
+      "required": ["url"],
+      "additionalProperties": false
+    },
+    "caption": {
+      "type": "object",
+      "properties": {
+        "language_code": { "type": ["string", "null"] },
+        "url": { "type": ["string", "null"], "format": "uri" },
+        "extension": { "type": ["string", "null"] },
+        "protocol": { "type": ["string", "null"] }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "sound": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": ["string", "null"] },
+        "author_name": { "type": ["string", "null"] },
+        "original": { "type": ["boolean", "null"] },
+        "duration": { "type": ["integer", "null"], "minimum": 0 },
+        "play_url": { "type": ["string", "null"], "format": "uri" }
+      },
+      "required": ["id"],
+      "additionalProperties": false
+    }
+  }
+}

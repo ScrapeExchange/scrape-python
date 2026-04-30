@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://scrape.exchange/schemas/boinko-tiktok-hashtag-0.0.1",
+  "title": "TikTok Hashtag Metadata",
+  "description": "Schema representing a TikTok hashtag and its summary statistics.",
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Hashtag name without leading #"
+    },
+    "hashtag_id": {
+      "type": "string",
+      "x-scrape-field": "platform_content_id"
+    },
+    "description": { "type": ["string", "null"] },
+    "view_count": {
+      "type": "integer", "minimum": 0,
+      "x-scrape-gauge": true
+    },
+    "video_count": {
+      "type": "integer", "minimum": 0,
+      "x-scrape-gauge": true
+    },
+    "is_commerce": { "type": "boolean" },
+    "url": {
+      "type": "string", "format": "uri",
+      "x-scrape-field": "source_url"
+    },
+    "scraped_timestamp": {
+      "type": "string", "format": "date-time"
+    }
+  },
+  "required": ["name", "hashtag_id", "url"],
+  "additionalProperties": false
+}

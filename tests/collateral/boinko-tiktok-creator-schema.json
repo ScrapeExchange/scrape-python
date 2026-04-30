@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://scrape.exchange/schemas/boinko-tiktok-creator-0.0.1",
+  "title": "TikTok Creator Metadata",
+  "description": "Schema representing a TikTok user/creator profile and its summary statistics.",
+  "type": "object",
+  "properties": {
+    "username": {
+      "type": "string",
+      "description": "TikTok @username (uniqueId)",
+      "x-scrape-field": "platform_creator_id"
+    },
+    "sec_uid": {
+      "type": "string",
+      "description": "Stable opaque user id"
+    },
+    "user_id": {
+      "type": "string",
+      "description": "Numeric user id, kept as a string"
+    },
+    "nickname": { "type": ["string", "null"] },
+    "signature": { "type": ["string", "null"] },
+    "avatar_thumbnail": {
+      "$ref": "#/$defs/thumbnail",
+      "x-scrape-field": "platform_creator_thumbnail_url"
+    },
+    "verified": { "type": "boolean" },
+    "private_account": { "type": "boolean" },
+    "region": { "type": ["string", "null"] },
+    "language": { "type": ["string", "null"] },
+    "follower_count": {
+      "type": "integer", "minimum": 0,
+      "x-scrape-gauge": true
+    },
+    "following_count": {
+      "type": "integer", "minimum": 0,
+      "x-scrape-gauge": true
+    },
+    "heart_count": {
+      "type": "integer", "minimum": 0,
+      "x-scrape-gauge": true
+    },
+    "video_count": {
+      "type": "integer", "minimum": 0,
+      "x-scrape-gauge": true
+    },
+    "friend_count": {
+      "type": "integer", "minimum": 0,
+      "x-scrape-gauge": true
+    },
+    "url": {
+      "type": "string", "format": "uri",
+      "x-scrape-field": "source_url"
+    },
+    "scraped_timestamp": {
+      "type": "string", "format": "date-time"
+    }
+  },
+  "required": ["username", "sec_uid", "url"],
+  "additionalProperties": false,
+  "$defs": {
+    "thumbnail": {
+      "type": "object",
+      "properties": {
+        "id": { "type": ["string", "null"] },
+        "url": { "type": "string", "format": "uri" },
+        "width": { "type": ["integer", "null"], "minimum": 0 },
+        "height": { "type": ["integer", "null"], "minimum": 0 },
+        "preference": { "type": ["string", "null"] },
+        "display_hint": { "type": ["string", "null"] }
+      },
+      "required": ["url"],
+      "additionalProperties": false
+    }
+  }
+}
