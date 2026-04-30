@@ -64,13 +64,13 @@ METRIC_NUM_PROCESSES: Gauge = Gauge(
     'scraper_num_processes',
     'Number of child scraper processes configured for this '
     'scraper tree as seen from the current process.',
-    ['role', 'scraper', 'worker_id'],
+    ['platform', 'role', 'scraper', 'worker_id'],
 )
 METRIC_CONCURRENCY: Gauge = Gauge(
     'scraper_concurrency',
     'Number of concurrent async tasks per worker process as seen '
     'from the current process.',
-    ['role', 'scraper', 'worker_id'],
+    ['platform', 'role', 'scraper', 'worker_id'],
 )
 
 
@@ -170,11 +170,15 @@ def publish_config_metrics(
 
     worker_id: str = get_worker_id()
     METRIC_NUM_PROCESSES.labels(
-        role=role, scraper=scraper_label,
+        platform='youtube',
+        role=role,
+        scraper=scraper_label,
         worker_id=worker_id,
     ).set(num_processes)
     METRIC_CONCURRENCY.labels(
-        role=role, scraper=scraper_label,
+        platform='youtube',
+        role=role,
+        scraper=scraper_label,
         worker_id=worker_id,
     ).set(concurrency)
 

@@ -366,7 +366,12 @@ class TestScanAndRecoverLoop(
         # overwriting any earlier value).
         gauge_sample: float = (
             yt_rss_scrape.METRIC_TIER_POPULATION
-            .labels(tier='1', state='orphan')
+            .labels(
+                platform='youtube',
+                scraper='rss_scraper',
+                tier='1',
+                state='orphan',
+            )
             ._value.get()
         )
         self.assertEqual(gauge_sample, 3)
@@ -375,7 +380,11 @@ class TestScanAndRecoverLoop(
         # strictly greater than zero.
         counter_sample: float = (
             yt_rss_scrape.METRIC_ORPHANS_RECOVERED
-            .labels(tier='1')
+            .labels(
+                platform='youtube',
+                scraper='rss_scraper',
+                tier='1',
+            )
             ._value.get()
         )
         self.assertGreater(counter_sample, 0)

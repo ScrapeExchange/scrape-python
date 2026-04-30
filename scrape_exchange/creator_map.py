@@ -35,19 +35,19 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 CREATOR_MAP_LOOKUP_TOTAL: Counter = Counter(
     'creator_map_lookup_total',
     'CreatorMap lookups at upload time.',
-    labelnames=('scraper', 'outcome'),
+    labelnames=('platform', 'scraper', 'outcome'),
 )
 
 CREATOR_MAP_RESOLUTION_TOTAL: Counter = Counter(
     'creator_map_resolution_total',
     'Outcomes of handle resolution on CreatorMap miss.',
-    labelnames=('scraper', 'outcome'),
+    labelnames=('platform', 'scraper', 'outcome'),
 )
 
 CREATOR_HANDLE_MISMATCH_TOTAL: Counter = Counter(
     'creator_handle_mismatch_total',
     'Input channel name differed from canonical handle.',
-    labelnames=('scraper',),
+    labelnames=('platform', 'scraper'),
 )
 
 

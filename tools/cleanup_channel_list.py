@@ -42,14 +42,17 @@ file header; comments and blank lines elsewhere are dropped.
 
 import asyncio
 import logging
-import re
 import shutil
 import sys
 
 from pathlib import Path
 
-import orjson
-
+from scrape_exchange.channel_list_parsing import (
+    dedupe_preserving_case,
+    extract_url_canonical,
+    is_json_entry,
+    looks_like_display_name,
+)
 from scrape_exchange.creator_map import (
     CreatorMap,
     FileCreatorMap,
@@ -68,181 +71,6 @@ from scrape_exchange.youtube.youtube_channel import YouTubeChannel
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 
-# Channel URL forms that can appear in the wild as channels.lst
-# entries — copy-pasted from the YouTube web UI, browser address
-# bar, or search results. Only the path forms that point at a
-# canonical channel are matched; video / playlist / search URLs
-# are left alone (they don't dedup against a handle anyway).
-_YT_CHANNEL_URL_RE: re.Pattern[str] = re.compile(
-    r'^https?://'
-    r'(?:www\.|m\.|music\.)?'
-    r'youtube\.com/'
-    r'(?:@(?P<at>[A-Za-z0-9._-]+)'
-    r'|c/(?P<custom>[A-Za-z0-9._-]+)'
-    r'|user/(?P<user>[A-Za-z0-9._-]+)'
-    r'|channel/(?P<chan>UC[A-Za-z0-9_-]{22}))'
-    r'(?:[/?#].*)?$',
-    re.IGNORECASE,
-)
-
-
-def _extract_url_canonical(entry: str) -> str | None:
-    '''
-    When *entry* is a YouTube channel URL, return the bare
-    canonical form — the channel_id for ``/channel/UC...`` URLs,
-    or the handle (without leading ``@``) for ``/@h``, ``/c/h``,
-    and ``/user/h`` URLs. Returns ``None`` for anything that
-    isn't a recognised channel URL so dedup and classification
-    can fall back to the existing rules.
-    '''
-
-    match: re.Match[str] | None = _YT_CHANNEL_URL_RE.match(entry)
-    if match is None:
-        return None
-    chan: str | None = match.group('chan')
-    if chan:
-        return chan
-    return (
-        match.group('at')
-        or match.group('custom')
-        or match.group('user')
-    )
-
-
-def _is_json_entry(line: str) -> bool:
-    '''Return True if *line* parses as a JSON object or list.'''
-
-    if not (
-        (line.startswith('{') and line.endswith('}'))
-        or (line.startswith('[') and line.endswith(']'))
-    ):
-        return False
-    try:
-        orjson.loads(line)
-    except orjson.JSONDecodeError:
-        return False
-    return True
-
-
-def _jsonl_channel_field(entry: str) -> str | None:
-    '''
-    Return the value of the ``channel`` field when *entry* is a
-    JSON object containing a non-empty string ``channel`` value,
-    or ``None`` otherwise. Used so that a JSONL line and a plain
-    handle line that point at the same channel collapse to one
-    entry during dedup.
-    '''
-
-    if not (entry.startswith('{') and entry.endswith('}')):
-        return None
-    try:
-        data: object = orjson.loads(entry)
-    except orjson.JSONDecodeError:
-        return None
-    if not isinstance(data, dict):
-        return None
-    channel: object = data.get('channel')
-    if isinstance(channel, str) and channel:
-        return channel
-    return None
-
-
-def _entry_handle_part(entry: str) -> str | None:
-    '''
-    When *entry* is not a JSON line but contains a comma, return
-    the part before the first ``,`` (whitespace-stripped). Used
-    so dedup keys ``<handle>,<extra>`` lines on the leading
-    handle. Returns ``None`` when *entry* is JSON, has no comma,
-    or has an empty leading part.
-    '''
-
-    if _is_json_entry(entry):
-        return None
-    if ',' not in entry:
-        return None
-    head: str = entry.split(',', 1)[0].strip()
-    return head or None
-
-
-def _entry_dedupe_key(entry: str) -> str:
-    '''
-    Comparison key used by :func:`_dedupe_preserving_case`. A
-    JSONL entry with a ``channel`` field keys on that value
-    (lower-cased); a YouTube channel URL keys on the handle or
-    channel_id extracted from the path (lower-cased) so URL and
-    bare-handle variants of the same channel collapse; a plain
-    line containing a comma keys on the part before the first
-    comma (lower-cased); every other entry keys on its own
-    lower-cased text.
-    '''
-
-    channel: str | None = _jsonl_channel_field(entry)
-    if channel is not None:
-        return channel.lower()
-    url_canonical: str | None = _extract_url_canonical(entry)
-    if url_canonical is not None:
-        return url_canonical.lower()
-    head: str | None = _entry_handle_part(entry)
-    if head is not None:
-        return head.lower()
-    return entry.lower()
-
-
-def _entry_dedupe_rank(entry: str) -> int:
-    '''
-    Preference rank for :func:`_dedupe_preserving_case`. Higher
-    wins. ``2`` for a JSONL line with a ``channel`` field. For
-    plain lines (including ``<handle>,<extra>`` lines) the rank
-    is ``1`` when the handle part contains an upper-case
-    character and ``0`` when it is fully lower-case. URLs rank
-    ``-1`` so any non-URL form for the same channel always wins
-    the dedup.
-    '''
-
-    if _jsonl_channel_field(entry) is not None:
-        return 2
-    if _extract_url_canonical(entry) is not None:
-        return -1
-    head: str | None = _entry_handle_part(entry)
-    target: str = head if head is not None else entry
-    if target != target.lower():
-        return 1
-    return 0
-
-
-def _dedupe_preserving_case(entries: list[str]) -> list[str]:
-    '''
-    Group *entries* by :func:`_entry_dedupe_key` and keep the
-    highest-ranked variant per group (see
-    :func:`_entry_dedupe_rank`). Ties are broken by first
-    appearance, and the relative order of groups follows the
-    first appearance of each key in the input.
-    '''
-
-    chosen: dict[str, str] = {}
-    order: list[str] = []
-    duplicates_dropped: int = 0
-
-    for entry in entries:
-        key: str = _entry_dedupe_key(entry)
-        if key not in chosen:
-            chosen[key] = entry
-            order.append(key)
-            continue
-        duplicates_dropped += 1
-        existing: str = chosen[key]
-        if _entry_dedupe_rank(entry) > _entry_dedupe_rank(existing):
-            chosen[key] = entry
-
-    if duplicates_dropped:
-        _LOGGER.info(
-            'Dropped lower-case duplicates from channel list',
-            extra={'dropped_count': duplicates_dropped},
-        )
-
-    return [chosen[k] for k in order]
-
-
 def _resolve_named_entry(
     entry: str, name_map: dict[str, str],
     creator_map: dict[str, str],
@@ -259,17 +87,6 @@ def _resolve_named_entry(
         return None
     handle: str | None = creator_map.get(channel_id)
     return handle if handle else channel_id
-
-
-def _looks_like_display_name(entry: str) -> bool:
-    '''
-    Return True when *entry* should be looked up in the NameMap
-    rather than treated as a handle or channel id. Whitespace and
-    runs of four or more dots both indicate a free-text display
-    name rather than a YouTube handle.
-    '''
-
-    return any(c.isspace() for c in entry) or '....' in entry
 
 
 def _classify_named_entry(
@@ -315,7 +132,7 @@ def _classify_url_entry(
     handle-form URLs cannot be resolved further here).
     '''
 
-    canonical: str | None = _extract_url_canonical(entry)
+    canonical: str | None = extract_url_canonical(entry)
     assert canonical is not None  # caller guarantees URL match
     if YouTubeChannel.is_channel_id(canonical):
         handle: str | None = creator_map.get(canonical)
@@ -335,11 +152,11 @@ def _classify_entry(
     the entry should be dropped.
     '''
 
-    if _is_json_entry(entry):
+    if is_json_entry(entry):
         return entry, 'kept_json'
-    if _extract_url_canonical(entry) is not None:
+    if extract_url_canonical(entry) is not None:
         return _classify_url_entry(entry, creator_map)
-    if _looks_like_display_name(entry):
+    if looks_like_display_name(entry):
         return _classify_named_entry(entry, name_map, creator_map)
     if YouTubeChannel.is_channel_id(entry):
         return _classify_channel_id_entry(entry, creator_map)
@@ -499,13 +316,13 @@ async def _run_async(settings: YouTubeScraperSettings) -> int:
     header, entries = _split_header_and_entries(raw_lines)
     original_count: int = len(entries)
 
-    deduped: list[str] = _dedupe_preserving_case(entries)
+    deduped: list[str] = dedupe_preserving_case(entries)
     transformed: list[str]
     dropped: list[str]
     transformed, dropped = _process_entries(
         deduped, name_map, creator_map,
     )
-    final_entries: list[str] = _dedupe_preserving_case(transformed)
+    final_entries: list[str] = dedupe_preserving_case(transformed)
 
     backup: Path = list_path.with_suffix(
         list_path.suffix + '.bak',

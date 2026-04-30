@@ -57,15 +57,15 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 
 METRIC_RSS_CIRCUIT_OPENED: Counter = Counter(
-    'yt_rss_circuit_opened_total',
+    'rate_limit_circuit_trips_total',
     'Times the RSS circuit breaker tripped open for a proxy '
     'after consecutive soft-ban (404) signals',
-    ['proxy', 'proxy_network'],
+    ['platform', 'scraper', 'api', 'proxy', 'proxy_network'],
 )
 METRIC_RSS_CIRCUIT_STATE: Gauge = Gauge(
-    'yt_rss_circuit_open',
+    'rate_limit_circuit_open',
     '1 while the RSS circuit is open for this proxy, 0 otherwise',
-    ['proxy', 'proxy_network'],
+    ['platform', 'scraper', 'api', 'proxy', 'proxy_network'],
 )
 
 
@@ -313,10 +313,16 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
         state.consecutive_opens += 1
         state.consecutive_failures = 0
         METRIC_RSS_CIRCUIT_OPENED.labels(
+            platform='youtube',
+            scraper='rss_scraper',
+            api='rss',
             proxy=proxy or 'none',
             proxy_network=_rss_proxy_network(proxy),
         ).inc()
         METRIC_RSS_CIRCUIT_STATE.labels(
+            platform='youtube',
+            scraper='rss_scraper',
+            api='rss',
             proxy=proxy or 'none',
             proxy_network=_rss_proxy_network(proxy),
         ).set(1)
@@ -345,6 +351,9 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
         state.consecutive_opens = 0
         state.open_until = 0.0
         METRIC_RSS_CIRCUIT_STATE.labels(
+            platform='youtube',
+            scraper='rss_scraper',
+            api='rss',
             proxy=proxy or 'none',
             proxy_network=_rss_proxy_network(proxy),
         ).set(0)

@@ -37,33 +37,33 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 _SCRIPT_NAME: str = os.path.basename(sys.argv[0]) if sys.argv else 'unknown'
 
 _METRIC_LABELS: list[str] = [
-    'call_type', 'proxy', 'script', 'platform',
+    'api', 'proxy', 'script', 'platform',
     'worker_id',
 ]
 
 METRIC_REQUESTS_ACQUIRED: Counter = Counter(
-    'rate_limiter_requests_acquired_total',
+    'rate_limit_acquired_requests_total',
     'Total requests successfully acquired per call type',
     _METRIC_LABELS,
 )
 METRIC_WAIT_EVENTS: Counter = Counter(
-    'rate_limiter_wait_events_total',
+    'rate_limit_wait_events_total',
     'Total number of rate-limit sleep waits',
     _METRIC_LABELS,
 )
 METRIC_SLEEP_SECONDS: Histogram = Histogram(
-    'rate_limiter_sleep_seconds',
+    'rate_limit_sleep_seconds',
     'Duration of rate-limit sleep waits in seconds',
     _METRIC_LABELS,
     buckets=(.1, .25, .5, 1.0, 2.0, 3.0, 5.0, 10.0, 30.0, 60.0),
 )
 METRIC_BUCKET_TOKENS: Gauge = Gauge(
-    'rate_limiter_bucket_tokens',
+    'rate_limit_bucket_tokens',
     'Current token level in the per-type rate-limit bucket',
     _METRIC_LABELS,
 )
 METRIC_GLOBAL_BUCKET_TOKENS: Gauge = Gauge(
-    'rate_limiter_global_bucket_tokens',
+    'rate_limit_global_bucket_tokens',
     'Current token level in the global rate-limit bucket',
     ['proxy', 'proxy_network', 'script', 'platform', 'worker_id'],
 )
@@ -655,7 +655,7 @@ class _SharedFileBackend(_Backend[CallTypeT]):
 # ------------------------------------------------------------------
 
 METRIC_REDIS_OPS: Counter = Counter(
-    'rate_limiter_redis_ops_total',
+    'rate_limit_redis_ops_total',
     'Redis operations executed by the rate limiter backend.',
     ['operation', 'result', 'platform', 'worker_id'],
 )
@@ -1170,7 +1170,7 @@ class RateLimiter(ABC, Generic[CallTypeT]):
         self, call_type: CallTypeT, proxy: str | None,
     ) -> dict[str, str]:
         return {
-            'call_type': call_type.value,
+            'api': call_type.value,
             'proxy': proxy or 'none',
             'script': _SCRIPT_NAME,
             'platform': self._platform,

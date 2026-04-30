@@ -109,103 +109,75 @@ MAX_SLEEP_SECONDS: float = 4.5
 MSG_NO_RSS_FEED: str = 'RSS feed not found for channel'
 
 # Prometheus metrics
-METRIC_CHANNEL_MAP_SIZE = Gauge(
-    'yt_rss_channel_map_size',
+# Shared metric declarations (avoids duplicate-registration when
+# multiple tool modules are imported in the same process).
+from scrape_exchange.scraper_metrics import (
+    METRIC_SCRAPES_COMPLETED as METRIC_RSS_DOWNLOADED,
+    METRIC_SCRAPE_FAILURES as METRIC_RSS_FAILURES,
+    METRIC_SCRAPE_QUEUE_SIZE as METRIC_QUEUE_SIZE,
+    METRIC_WORKER_SLEEP_SECONDS as METRIC_SLEEP_SECONDS,
+)
+METRIC_CHANNEL_MAP_SIZE: Gauge = Gauge(
+    'channel_map_size',
     'Number of channels in the channel map',
-    ['worker_id'],
+    ['platform', 'scraper', 'worker_id'],
 )
-METRIC_QUEUE_SIZE = Gauge(
-    'yt_rss_queue_size',
-    'Number of channels in the processing queue',
-    ['tier', 'worker_id'],
-)
-METRIC_NO_FEED_LIMIT_HIT = Counter(
-    'yt_rss_no_feed_limit_hit_total',
+METRIC_NO_FEED_LIMIT_HIT: Counter = Counter(
+    'rss_no_feed_limit_hit_total',
     'Number of times a channel hit the no-feed failure limit',
-    ['worker_id', 'limit'],
+    ['platform', 'scraper', 'worker_id', 'limit'],
 )
-
-METRIC_VIDEOS_ENQUEUED = Counter(
-    'yt_rss_videos_enqueued_total',
-    'Total number of videos successfully enqueued for background '
-    'upload. Actual delivery is tracked by '
-    'exchange_client_background_uploads_total{entity="video"}.',
-    ['worker_id', 'proxy_ip', 'proxy_network'],
+# api_calls_total — exchange API calls for channel and video
+# entities, and InnerTube API calls (success/failed), all
+# collapsed into one counter with entity, api, and status labels.
+METRIC_API_CALLS: Counter = Counter(
+    'api_calls_total',
+    'Number of API calls made by the RSS scraper, labelled '
+    'by entity, api endpoint, and status.',
+    ['platform', 'scraper', 'entity', 'api', 'status',
+     'worker_id', 'proxy_ip', 'proxy_network'],
 )
-METRIC_API_CHANNEL_CALLS = Counter(
-    'yt_rss_post_data_api_channel_calls_total',
-    'Number of times the POST data API was called for a channel',
-    ['worker_id'],
-)
-METRIC_API_VIDEO_CALLS = Counter(
-    'yt_rss_post_data_api_video_calls_total',
-    'Number of times the POST data API was called for a video',
-    ['worker_id'],
-)
-METRIC_RSS_FAILURES = Counter(
-    'yt_rss_feed_download_failures_total',
-    'Number of times an RSS feed could not be downloaded',
-    ['worker_id', 'proxy_ip', 'proxy_network', 'reason'],
-)
-METRIC_RSS_DOWNLOADED = Counter(
-    'yt_rss_feeds_downloaded_total',
-    'Number of RSS feeds successfully downloaded',
-    ['worker_id', 'proxy_ip', 'proxy_network'],
-)
-METRIC_SLEEP_SECONDS = Gauge(
-    'yt_rss_sleep_seconds_before_next_channel',
-    'Seconds the worker will sleep before processing the next '
-    'channel batch',
-    ['worker_id'],
-)
-METRIC_CONCURRENCY = Gauge(
-    'yt_rss_concurrency_level',
+METRIC_API_CHANNEL_CALLS: Counter = METRIC_API_CALLS
+METRIC_INNERTUBE_SUCCESS: Counter = METRIC_API_CALLS
+METRIC_INNERTUBE_FAILURES: Counter = METRIC_API_CALLS
+METRIC_CONCURRENCY: Gauge = Gauge(
+    'worker_concurrency',
     'Number of channels being processed concurrently in the '
     'current batch',
-    ['worker_id'],
+    ['platform', 'scraper', 'worker_id'],
 )
-METRIC_INNERTUBE_SUCCESS = Counter(
-    'yt_rss_innertube_success_total',
-    'Number of times an Innertube API call succeeded',
-    ['worker_id', 'proxy_ip', 'proxy_network', 'entity'],
-)
-METRIC_INNERTUBE_FAILURES = Counter(
-    'yt_rss_innertube_call_failures_total',
-    'Number of times an Innertube API call failed',
-    ['worker_id', 'proxy_ip', 'proxy_network', 'entity'],
-)
-METRIC_CHANNEL_SECONDS_SINCE_LAST_PROCESSED = Gauge(
-    'yt_rss_channel_seconds_since_last_processed',
+METRIC_CHANNEL_SECONDS_SINCE_LAST_PROCESSED: Gauge = Gauge(
+    'channel_seconds_since_last_processed',
     'Seconds elapsed since the channel was last processed '
     '(only set for channels that have been processed before)',
-    ['worker_id'],
+    ['platform', 'scraper', 'worker_id'],
 )
-METRIC_TIER_ON_TIME = Counter(
-    'yt_rss_tier_on_time_total',
+METRIC_TIER_ON_TIME: Counter = Counter(
+    'channel_tier_on_time_total',
     'Channels processed within the tier interval',
-    ['tier', 'worker_id'],
+    ['platform', 'scraper', 'tier', 'worker_id'],
 )
-METRIC_TIER_OVERDUE = Counter(
-    'yt_rss_tier_overdue_total',
+METRIC_TIER_OVERDUE: Counter = Counter(
+    'channel_tier_overdue_total',
     'Channels processed after the tier interval expired',
-    ['tier', 'worker_id'],
+    ['platform', 'scraper', 'tier', 'worker_id'],
 )
-METRIC_TIER_POPULATION = Gauge(
-    'yt_rss_tier_population',
+METRIC_TIER_POPULATION: Gauge = Gauge(
+    'channel_tier_population',
     'Channels in the tiers hash broken down by state. '
     'state=orphan is the drift signal — nonzero means '
     'cids are in rss:<platform>:tiers but absent from '
     'every queue, not claimed, and not flagged '
     'no_feeds.',
-    ['tier', 'state'],
+    ['platform', 'scraper', 'tier', 'state'],
 )
-METRIC_ORPHANS_RECOVERED = Counter(
-    'yt_rss_orphans_recovered_total',
+METRIC_ORPHANS_RECOVERED: Counter = Counter(
+    'channel_orphans_recovered_total',
     'Creator ids re-enqueued by '
     'scan_and_recover_orphans because they were in '
     'the tiers hash but absent from every queue, not '
     'claimed, and not flagged no_feeds.',
-    ['tier'],
+    ['platform', 'scraper', 'tier'],
 )
 
 
@@ -466,9 +438,14 @@ def _record_rss_failure(
     reason: str, proxy_ip: str | None, proxy_network: str,
 ) -> None:
     METRIC_RSS_FAILURES.labels(
-        worker_id=get_worker_id(), proxy_ip=proxy_ip,
-        proxy_network=proxy_network,
+        platform='youtube',
+        scraper='rss_scraper',
+        entity='rss_feed',
+        api='rss',
         reason=reason,
+        worker_id=get_worker_id(),
+        proxy_ip=proxy_ip or 'none',
+        proxy_network=proxy_network,
     ).inc()
 
 
@@ -586,7 +563,12 @@ async def fetch_rss(
         raise RuntimeError(f'No data received from RSS feed {rss_url}')
 
     METRIC_RSS_DOWNLOADED.labels(
-        worker_id=get_worker_id(), proxy_ip=proxy_ip,
+        platform='youtube',
+        scraper='rss_scraper',
+        entity='rss_feed',
+        api='rss',
+        worker_id=get_worker_id(),
+        proxy_ip=proxy_ip or 'none',
         proxy_network=proxy_network,
     ).inc()
 
@@ -640,69 +622,6 @@ async def check_video_exists(
     )
 
 
-def enqueue_upload_video(
-    client: ExchangeClient, settings: RssSettings,
-    handle: str, video: YouTubeVideo,
-    validator: SchemaValidator,
-) -> bool:
-    '''
-    Fire-and-forget upload of an RSS-discovered video to Scrape
-    Exchange, gated by client-side schema validation.
-
-    RSS-sourced videos have no on-disk asset backing them (they
-    come straight out of the RSS feed), so a validation failure
-    is logged + dropped without ``mark_invalid`` (no file to mark).
-    The background worker just POSTs with retries and increments
-    the ``exchange_client_background_uploads_total`` counter on
-    success or failure. If the queue is full the job is dropped
-    and will be re-enqueued the next time the RSS feed is polled.
-
-    :param handle: Canonical channel handle to use as
-        platform_creator_id; must match the channel entity's handle.
-    :returns: ``True`` if the job was enqueued, ``False`` if
-        dropped or if schema validation failed.
-    '''
-
-    record_dict: dict = video.to_dict()
-    err: str | None = validator.validate(record_dict)
-    if err is not None:
-        logging.warning(
-            'RSS-derived video record failed schema validation, '
-            'skipping upload',
-            extra={
-                'video_id': video.video_id,
-                'channel_handle': handle,
-                'validation_error': err,
-            },
-        )
-        return False
-
-    # platform_content_id and platform_creator_id are intentionally
-    # omitted: the server derives them from the video schema's
-    # ``x-scrape-field`` markers (``video_id`` →
-    # ``platform_content_id``, ``channel_handle`` →
-    # ``platform_creator_id``) which are present in the data dict.
-    enqueued: bool = client.enqueue_upload(
-        f'{settings.exchange_url}{ExchangeClient.POST_DATA_API}',
-        json={
-            'username': settings.schema_owner,
-            'platform': 'youtube',
-            'entity': 'video',
-            'version': settings.schema_version,
-            'source_url': video.url,
-            'data': record_dict,
-        },
-        entity='video',
-        log_extra={
-            'video_id': video.video_id,
-            'channel_handle': handle,
-        },
-    )
-    if enqueued:
-        METRIC_API_VIDEO_CALLS.labels(worker_id=get_worker_id()).inc()
-    return enqueued
-
-
 MSG_PROCESSED_VIDEOS: str = 'Processed videos for channel'
 
 
@@ -728,20 +647,20 @@ async def _enrich_and_store_video(
     video: YouTubeVideo,
     innertube: InnerTube,
     proxy: str | None,
-    client: ExchangeClient,
     channel_handle: str,
-    handle: str,
     settings: RssSettings,
-    video_validator: SchemaValidator,
 ) -> str | None:
     '''
-    Enrich a single video via InnerTube, write it to
-    disk, and enqueue the upload.  Returns the filename
-    on success, ``None`` on failure.
+    Enrich a single video via InnerTube and write the resulting
+    ``video-min-`` file to ``settings.video_data_directory``.
+    Upload is the video scraper's responsibility — it sweeps the
+    same directory for both ``video-min-*`` and ``video-dlp-*``
+    files and pushes them through its bulk and watch upload
+    pipelines.  Returns the bare filename on success, ``None`` on
+    failure.
 
     :param channel_handle: Display name of the channel, used only
         for logging.
-    :param handle: Canonical handle used as platform_creator_id.
     '''
 
     proxy_ip: str = _extract_proxy_ip(proxy) if proxy else 'none'
@@ -760,13 +679,25 @@ async def _enrich_and_store_video(
             'Updated video using InnerTube data', extra=extra,
         )
         METRIC_INNERTUBE_SUCCESS.labels(
-            worker_id=get_worker_id(), proxy_ip=proxy_ip,
-            proxy_network=proxy_network, entity='video',
+            platform='youtube',
+            scraper='rss_scraper',
+            entity='video',
+            api='innertube',
+            status='success',
+            worker_id=get_worker_id(),
+            proxy_ip=proxy_ip,
+            proxy_network=proxy_network,
         ).inc()
     except Exception as exc:
         METRIC_INNERTUBE_FAILURES.labels(
-            worker_id=get_worker_id(), proxy_ip=proxy_ip,
-            proxy_network=proxy_network, entity='video',
+            platform='youtube',
+            scraper='rss_scraper',
+            entity='video',
+            api='innertube',
+            status='failed',
+            worker_id=get_worker_id(),
+            proxy_ip=proxy_ip,
+            proxy_network=proxy_network,
         ).inc()
         logging.warning(
             'Failed to get InnerTube video data, '
@@ -789,23 +720,17 @@ async def _enrich_and_store_video(
         )
         return None
 
+    # Upload is the video scraper's responsibility: its bulk and
+    # watch uploaders sweep ``video-min-*`` and ``video-dlp-*``
+    # files together (sharing the same ``boinko/youtube/video``
+    # schema) and move successfully-uploaded copies to
+    # ``uploaded_dir``.  Doing the upload here would race with
+    # that sweep and cause duplicate POSTs to the API.
     logging.debug(
-        'Stored the file, video not yet on '
-        'scrape.exchange, uploading',
-        extra=extra
+        'Stored video-min file; upload deferred to the '
+        'video scraper',
+        extra=extra,
     )
-    if enqueue_upload_video(
-        client, settings, handle, video, video_validator,
-    ):
-        METRIC_VIDEOS_ENQUEUED.labels(
-            worker_id=get_worker_id(), proxy_ip=proxy_ip,
-            proxy_network=proxy_network,
-        ).inc()
-        logging.debug(
-            'Video enqueued for upload',
-            extra=extra,
-        )
-
     return filename
 
 
@@ -814,7 +739,6 @@ async def process_channel(
     creator_queue: CreatorQueue, settings: RssSettings,
     creator_map_backend: CreatorMap,
     name_map_backend: NameMap,
-    video_validator: SchemaValidator,
     channel_validator: SchemaValidator,
 ) -> bool | None:
     '''
@@ -850,7 +774,9 @@ async def process_channel(
     if channel_id in CHANNEL_LAST_CHECKED:
         elapsed: float = monotonic() - CHANNEL_LAST_CHECKED[channel_id]
         METRIC_CHANNEL_SECONDS_SINCE_LAST_PROCESSED.labels(
-            worker_id=get_worker_id()
+            platform='youtube',
+            scraper='rss_scraper',
+            worker_id=get_worker_id(),
         ).set(elapsed)
         logging.debug(
             'Processing channel', extra=extra | {'elapsed': elapsed},
@@ -887,7 +813,10 @@ async def process_channel(
                 },
             )
             METRIC_NO_FEED_LIMIT_HIT.labels(
-                worker_id=get_worker_id(), limit='all',
+                platform='youtube',
+                scraper='rss_scraper',
+                worker_id=get_worker_id(),
+                limit='all',
             ).inc()
             return None
         logging.debug(
@@ -1081,8 +1010,7 @@ async def process_channel(
             *[
                 _enrich_and_store_video(
                     video, innertube, proxy,
-                    client, channel_handle, resolved_handle,
-                    settings, video_validator,
+                    channel_handle, settings,
                 )
                 for video in new_videos
             ],
@@ -1171,14 +1099,26 @@ async def update_channel(
             extra={'channel_handle': channel_handle, 'proxy': proxy},
         )
         METRIC_INNERTUBE_FAILURES.labels(
-            worker_id=get_worker_id(), proxy_ip=proxy_ip,
-            proxy_network=proxy_network, entity='channel',
+            platform='youtube',
+            scraper='rss_scraper',
+            entity='channel',
+            api='innertube',
+            status='failed',
+            worker_id=get_worker_id(),
+            proxy_ip=proxy_ip,
+            proxy_network=proxy_network,
         ).inc()
         return False, 0, None
 
     METRIC_INNERTUBE_SUCCESS.labels(
-        worker_id=get_worker_id(), proxy_ip=proxy_ip,
-        proxy_network=proxy_network, entity='channel',
+        platform='youtube',
+        scraper='rss_scraper',
+        entity='channel',
+        api='innertube',
+        status='success',
+        worker_id=get_worker_id(),
+        proxy_ip=proxy_ip,
+        proxy_network=proxy_network,
     ).inc()
 
     canonical: str | None = canonical_handle_from_browse(channel_data)
@@ -1186,16 +1126,22 @@ async def update_channel(
     if canonical:
         resolved_handle = canonical
         CREATOR_MAP_RESOLUTION_TOTAL.labels(
-            scraper='rss', outcome='canonical',
+            platform='youtube',
+            scraper='rss_scraper',
+            outcome='canonical',
         ).inc()
     else:
         resolved_handle = fallback_handle(channel_handle)
         CREATOR_MAP_RESOLUTION_TOTAL.labels(
-            scraper='rss', outcome='fallback',
+            platform='youtube',
+            scraper='rss_scraper',
+            outcome='fallback',
         ).inc()
 
     if channel_handle != resolved_handle:
-        CREATOR_HANDLE_MISMATCH_TOTAL.labels(scraper='rss').inc()
+        CREATOR_HANDLE_MISMATCH_TOTAL.labels(
+            platform='youtube', scraper='rss_scraper',
+        ).inc()
         logging.info(
             'RSS update_channel: canonicalising handle',
             extra={
@@ -1237,7 +1183,7 @@ async def update_channel(
     # Fire-and-forget: background worker inside ExchangeClient handles
     # the POST with retries. No file_manager is passed because an RSS
     # channel update has no on-disk asset backing it; success is
-    # tracked via exchange_client_background_uploads_total.
+    # tracked via uploads_completed_total.
     #
     # platform_content_id and platform_creator_id are intentionally
     # omitted: the server derives them from the channel schema's
@@ -1288,7 +1234,16 @@ async def update_channel(
         },
     )
     if enqueued:
-        METRIC_API_CHANNEL_CALLS.labels(worker_id=get_worker_id()).inc()
+        METRIC_API_CHANNEL_CALLS.labels(
+            platform='youtube',
+            scraper='rss_scraper',
+            entity='channel',
+            api='exchange',
+            status='success',
+            worker_id=get_worker_id(),
+            proxy_ip='none',
+            proxy_network='none',
+        ).inc()
 
     return True, subscriber_count, resolved_handle
 
@@ -1393,11 +1348,17 @@ def _record_tier_sla(
     if _is_on_time(scheduled_time, now,
                    interval_seconds, eligibility_fraction):
         METRIC_TIER_ON_TIME.labels(
-            tier=str(tier), worker_id=wid,
+            platform='youtube',
+            scraper='rss_scraper',
+            tier=str(tier),
+            worker_id=wid,
         ).inc()
     else:
         METRIC_TIER_OVERDUE.labels(
-            tier=str(tier), worker_id=wid,
+            platform='youtube',
+            scraper='rss_scraper',
+            tier=str(tier),
+            worker_id=wid,
         ).inc()
 
 
@@ -1412,7 +1373,11 @@ async def _publish_queue_sizes(
     )
     for tier, count in sizes.items():
         METRIC_QUEUE_SIZE.labels(
-            tier=str(tier), worker_id=wid,
+            platform='youtube',
+            scraper='rss_scraper',
+            entity='rss_feed',
+            tier=str(tier),
+            worker_id=wid,
         ).set(count)
 
 
@@ -1445,9 +1410,14 @@ async def _scan_and_recover_loop(
                 for state in states:
                     count: int = counts.get(state, 0)
                     METRIC_TIER_POPULATION.labels(
-                        tier=str(tier), state=state,
+                        platform='youtube',
+                        scraper='rss_scraper',
+                        tier=str(tier),
+                        state=state,
                     ).set(count)
                 METRIC_ORPHANS_RECOVERED.labels(
+                    platform='youtube',
+                    scraper='rss_scraper',
                     tier=str(tier),
                 ).inc(counts.get('orphan', 0))
         except Exception:
@@ -1653,7 +1623,6 @@ async def worker_loop(
     tiers: list[TierConfig],
     creator_map_backend: CreatorMap,
     name_map_backend: NameMap,
-    video_validator: SchemaValidator,
     channel_validator: SchemaValidator,
 ) -> None:
     '''
@@ -1716,7 +1685,9 @@ async def worker_loop(
         )
     queue_size: int = await creator_queue.queue_size()
     METRIC_CHANNEL_MAP_SIZE.labels(
-        worker_id=get_worker_id()
+        platform='youtube',
+        scraper='rss_scraper',
+        worker_id=get_worker_id(),
     ).set(len(channel_map_data))
     await _publish_queue_sizes(creator_queue)
 
@@ -1743,11 +1714,15 @@ async def worker_loop(
             )
             await _publish_queue_sizes(creator_queue)
             METRIC_SLEEP_SECONDS.labels(
-                worker_id=get_worker_id()
+                platform='youtube',
+                scraper='rss_scraper',
+                worker_id=get_worker_id(),
             ).set(settings.min_interval)
             await asyncio.sleep(settings.min_interval)
             METRIC_SLEEP_SECONDS.labels(
-                worker_id=get_worker_id()
+                platform='youtube',
+                scraper='rss_scraper',
+                worker_id=get_worker_id(),
             ).set(0)
             channel_map_data = (
                 await creator_map_backend.get_all()
@@ -1766,7 +1741,9 @@ async def worker_loop(
                 tiers, subscriber_counts,
             )
             METRIC_CHANNEL_MAP_SIZE.labels(
-                worker_id=get_worker_id()
+                platform='youtube',
+                scraper='rss_scraper',
+                worker_id=get_worker_id(),
             ).set(len(channel_map_data))
             await _publish_queue_sizes(creator_queue)
             continue
@@ -1796,7 +1773,9 @@ async def worker_loop(
                 claim_cutoff = next_time
             else:
                 METRIC_SLEEP_SECONDS.labels(
-                    worker_id=get_worker_id()
+                    platform='youtube',
+                    scraper='rss_scraper',
+                    worker_id=get_worker_id(),
                 ).set(sleep_secs)
                 logging.debug(
                     'Sleeping until next batch',
@@ -1804,7 +1783,9 @@ async def worker_loop(
                 )
                 await asyncio.sleep(sleep_secs)
         METRIC_SLEEP_SECONDS.labels(
-            worker_id=get_worker_id()
+            platform='youtube',
+            scraper='rss_scraper',
+            worker_id=get_worker_id(),
         ).set(0)
 
         batch: list[tuple[str, str]] = (
@@ -1820,7 +1801,9 @@ async def worker_loop(
 
         await _publish_queue_sizes(creator_queue)
         METRIC_CONCURRENCY.labels(
-            worker_id=get_worker_id()
+            platform='youtube',
+            scraper='rss_scraper',
+            worker_id=get_worker_id(),
         ).set(len(batch))
         logging.debug(
             'Batch prepared',
@@ -1841,7 +1824,7 @@ async def worker_loop(
                     name, cid, client,
                     creator_queue, settings,
                     creator_map_backend, name_map_backend,
-                    video_validator, channel_validator,
+                    channel_validator,
                 )
                 for cid, name, _ in batch
             ],
@@ -1881,7 +1864,9 @@ async def worker_loop(
 
         await _publish_queue_sizes(creator_queue)
         METRIC_CONCURRENCY.labels(
-            worker_id=get_worker_id()
+            platform='youtube',
+            scraper='rss_scraper',
+            worker_id=get_worker_id(),
         ).set(0)
 
 
@@ -1945,22 +1930,12 @@ async def _run_worker(
     )
 
     # Build the schema validators once at startup. The RSS scraper
-    # uploads two entity kinds — video records discovered from RSS
-    # feeds and channel-stat updates — so it needs one validator
-    # per entity. Records that don't conform to the relevant schema
-    # are logged at WARNING and dropped (RSS records have no
-    # on-disk asset to mark ``.invalid``).
-    video_schema_dict: dict = await fetch_schema_dict(
-        ctx.client,
-        settings.exchange_url,
-        settings.schema_owner,
-        'youtube',
-        'video',
-        settings.schema_version,
-    )
-    video_validator: SchemaValidator = SchemaValidator(
-        video_schema_dict,
-    )
+    # uploads only channel-stat updates — video-min files are
+    # written to disk but uploaded by the video scraper, which
+    # owns the boinko/youtube/video schema.  Records that don't
+    # conform to the channel schema are logged at WARNING and
+    # dropped (RSS records have no on-disk asset to mark
+    # ``.invalid``).
     channel_schema_dict: dict = await fetch_schema_dict(
         ctx.client,
         settings.exchange_url,
@@ -1977,7 +1952,7 @@ async def _run_worker(
         settings, ctx.client, channel_fm,
         creator_queue, tiers,
         creator_map_backend, name_map_backend,
-        video_validator, channel_validator,
+        channel_validator,
     )
 
 

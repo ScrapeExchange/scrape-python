@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import logging
 
-from typing import Any, Self, TYPE_CHECKING
+from typing import Any, Callable, Self, TYPE_CHECKING
 
 from httpx import AsyncClient, Response
 from prometheus_client import Counter, Gauge, Histogram
@@ -40,10 +40,10 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 # '5xx'/'error' where 'error' means the request raised an exception
 # before any response arrived).
 METRIC_REQUEST_DURATION: Histogram = Histogram(
-    'exchange_client_request_duration_seconds',
+    'exchange_api_request_duration_seconds',
     'Duration of HTTP requests to scrape.exchange, by method and '
     'HTTP status class.',
-    ['method', 'status_class', 'worker_id'],
+    ['platform', 'scraper', 'method', 'status_class', 'worker_id'],
     buckets=(0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0),
 )
 
@@ -51,39 +51,77 @@ METRIC_REQUEST_DURATION: Histogram = Histogram(
 # ``enqueue_upload`` path so the dashboard can alert on a stuck queue
 # or on sustained API failures.
 METRIC_UPLOAD_QUEUE_DEPTH: Gauge = Gauge(
-    'exchange_client_upload_queue_depth',
+    'upload_queue_depth',
     'Number of background upload jobs currently waiting in the '
     'ExchangeClient fire-and-forget upload queue.',
-    ['worker_id'],
+    ['platform', 'scraper', 'worker_id'],
 )
 METRIC_UPLOAD_QUEUE_DROPPED: Counter = Counter(
-    'exchange_client_upload_queue_dropped_total',
+    'upload_queue_dropped_total',
     'Background upload jobs dropped because the queue was full. The '
     'underlying asset file is left in the base directory and will be '
     'retried on the next scraper iteration.',
-    ['worker_id'],
+    ['platform', 'scraper', 'reason', 'worker_id'],
 )
 METRIC_BACKGROUND_UPLOADS: Counter = Counter(
-    'exchange_client_background_uploads_total',
+    'uploads_completed_total',
     'Background upload jobs processed, labelled by outcome '
     '(created/updated/failure) and entity type '
     '(video/channel). "created" = HTTP 201 (new data), '
     '"updated" = HTTP 200 (existing data refreshed).',
-    ['outcome', 'entity', 'worker_id'],
+    ['platform', 'scraper', 'entity', 'mode', 'status', 'worker_id'],
 )
 METRIC_429_RECEIVED: Counter = Counter(
-    'exchange_client_429_received_total',
+    'api_429_received_total',
     'Number of HTTP 429 responses received from the '
     'Scrape.Exchange API, by method.',
-    ['method', 'worker_id'],
+    ['platform', 'scraper', 'method', 'worker_id'],
 )
+
+
+def _classify_rejected_response(
+    status_code: int,
+) -> tuple[str, Callable[..., None]]:
+    '''
+    Map a non-2xx HTTP status from scrape.exchange to the
+    ``METRIC_BACKGROUND_UPLOADS`` ``status`` label and the right
+    logger level for the "Background upload rejected by API"
+    message.
+
+    - ``404``: ``not_found`` / INFO. The resource doesn't exist
+      on scrape.exchange — routine for GET lookups, not a
+      failure.
+    - ``5xx``: ``failure`` / ERROR. Server-side outage that the
+      retry loop in :meth:`ExchangeClient.post` couldn't mask;
+      operators should see it.
+    - other (``400``/``401``/``403``/``422``/...): ``failure`` /
+      WARNING. Client-side mismatch, typically a code or schema
+      bug, not a sustained server problem.
+    '''
+    if status_code == 404:
+        return 'not_found', _LOGGER.info
+    if 500 <= status_code < 600:
+        return 'failure', _LOGGER.error
+    return 'failure', _LOGGER.warning
 
 
 def _status_class(status_code: int | None) -> str:
-    '''Return a coarse ``'Nxx'`` status-class label or ``'error'``.'''
+    '''
+    Return a coarse status-class label for the request-duration
+    histogram. Returns ``'error'`` when no HTTP response was
+    obtained (transport failure / timeout). Returns
+    ``'not_found'`` for HTTP 404 specifically, since "the
+    resource doesn't exist on scrape.exchange" is a routine
+    answer for GET lookups (e.g. checking whether a channel is
+    already known) and shouldn't be aggregated as a failure on
+    dashboards alongside other 4xx codes. Everything else is
+    bucketed by the leading digit (``'1xx'``..``'5xx'``).
+    '''
 
     if status_code is None:
         return 'error'
+    if status_code == 404:
+        return 'not_found'
     return f'{status_code // 100}xx'
 
 
@@ -347,7 +385,10 @@ class ExchangeClient(AsyncClient):
                 (datetime.now(UTC) - start).total_seconds()
             )
             METRIC_REQUEST_DURATION.labels(
-                method='get', status_class='error',
+                platform='scrape_exchange',
+                scraper='exchange_client',
+                method='get',
+                status_class='error',
                 worker_id=get_worker_id(),
             ).observe(duration)
             if retries > 0:
@@ -379,6 +420,8 @@ class ExchangeClient(AsyncClient):
             (datetime.now(UTC) - start).total_seconds()
         )
         METRIC_REQUEST_DURATION.labels(
+            platform='scrape_exchange',
+            scraper='exchange_client',
             method='get',
             status_class=_status_class(result.status_code),
             worker_id=get_worker_id(),
@@ -386,6 +429,8 @@ class ExchangeClient(AsyncClient):
 
         if result.status_code == 429:
             METRIC_429_RECEIVED.labels(
+                platform='scrape_exchange',
+                scraper='exchange_client',
                 method='get',
                 worker_id=get_worker_id(),
             ).inc()
@@ -458,7 +503,10 @@ class ExchangeClient(AsyncClient):
                 (datetime.now(UTC) - start).total_seconds()
             )
             METRIC_REQUEST_DURATION.labels(
-                method='post', status_class='error',
+                platform='scrape_exchange',
+                scraper='exchange_client',
+                method='post',
+                status_class='error',
                 worker_id=get_worker_id(),
             ).observe(duration)
             if retries > 0:
@@ -490,6 +538,8 @@ class ExchangeClient(AsyncClient):
             (datetime.now(UTC) - start).total_seconds()
         )
         METRIC_REQUEST_DURATION.labels(
+            platform='scrape_exchange',
+            scraper='exchange_client',
             method='post',
             status_class=_status_class(result.status_code),
             worker_id=get_worker_id(),
@@ -497,6 +547,8 @@ class ExchangeClient(AsyncClient):
 
         if result.status_code == 429:
             METRIC_429_RECEIVED.labels(
+                platform='scrape_exchange',
+                scraper='exchange_client',
                 method='post',
                 worker_id=get_worker_id(),
             ).inc()
@@ -566,7 +618,7 @@ class ExchangeClient(AsyncClient):
         The caller never blocks and never sees a failure: if the
         upload queue is full (i.e. the API is down and retries are
         backing up), the enqueue is dropped, counted via the
-        ``exchange_client_upload_queue_dropped_total`` counter, and
+        ``upload_queue_dropped_total`` counter, and
         the file stays in ``base_dir`` for a later retry.
 
         :param url: Full URL of the upload endpoint.
@@ -598,6 +650,9 @@ class ExchangeClient(AsyncClient):
             self._upload_queue.put_nowait(job)
         except asyncio.QueueFull:
             METRIC_UPLOAD_QUEUE_DROPPED.labels(
+                platform='scrape_exchange',
+                scraper='exchange_client',
+                reason='queue_full',
                 worker_id=get_worker_id(),
             ).inc()
             _LOGGER.warning(
@@ -611,6 +666,8 @@ class ExchangeClient(AsyncClient):
             return False
 
         METRIC_UPLOAD_QUEUE_DEPTH.labels(
+            platform='scrape_exchange',
+            scraper='exchange_client',
             worker_id=get_worker_id(),
         ).set(self._upload_queue.qsize())
         return True
@@ -659,13 +716,18 @@ class ExchangeClient(AsyncClient):
                     },
                 )
                 METRIC_BACKGROUND_UPLOADS.labels(
-                    outcome='failure',
+                    platform='youtube',
+                    scraper='exchange_client',
                     entity=job.entity,
+                    mode='background',
+                    status='failure',
                     worker_id=get_worker_id(),
                 ).inc()
             finally:
                 self._upload_queue.task_done()
                 METRIC_UPLOAD_QUEUE_DEPTH.labels(
+                    platform='scrape_exchange',
+                    scraper='exchange_client',
                     worker_id=get_worker_id(),
                 ).set(self._upload_queue.qsize())
 
@@ -695,8 +757,11 @@ class ExchangeClient(AsyncClient):
             )
         except Exception as exc:
             METRIC_BACKGROUND_UPLOADS.labels(
-                outcome='failure',
+                platform='youtube',
+                scraper='exchange_client',
                 entity=job.entity,
+                mode='background',
+                status='failure',
                 worker_id=get_worker_id(),
             ).inc()
             _LOGGER.warning(
@@ -722,11 +787,19 @@ class ExchangeClient(AsyncClient):
                     )
                 except OSError as exc:
                     METRIC_BACKGROUND_UPLOADS.labels(
-                        outcome='failure',
+                        platform='youtube',
+                        scraper='exchange_client',
                         entity=job.entity,
+                        mode='background',
+                        status='failure',
                         worker_id=get_worker_id(),
                     ).inc()
-                    _LOGGER.warning(
+                    # ERROR (not WARNING): the API accepted the
+                    # record but local bookkeeping broke. The file
+                    # will be re-uploaded next sweep and the API
+                    # will dedupe, but local disk is misbehaving
+                    # and an operator should investigate.
+                    _LOGGER.error(
                         'Upload succeeded but '
                         'mark_uploaded failed',
                         exc=exc,
@@ -737,8 +810,11 @@ class ExchangeClient(AsyncClient):
                     )
                     return
             METRIC_BACKGROUND_UPLOADS.labels(
-                outcome=outcome,
+                platform='youtube',
+                scraper='exchange_client',
                 entity=job.entity,
+                mode='background',
+                status=outcome,
                 worker_id=get_worker_id(),
             ).inc()
             _LOGGER.debug(
@@ -769,6 +845,9 @@ class ExchangeClient(AsyncClient):
                 self._upload_queue.put_nowait(job)
             except asyncio.QueueFull:
                 METRIC_UPLOAD_QUEUE_DROPPED.labels(
+                    platform='scrape_exchange',
+                    scraper='exchange_client',
+                    reason='queue_full',
                     worker_id=get_worker_id(),
                 ).inc()
                 _LOGGER.warning(
@@ -781,12 +860,18 @@ class ExchangeClient(AsyncClient):
                 )
             return
 
+        status, log_fn = _classify_rejected_response(
+            resp.status_code,
+        )
         METRIC_BACKGROUND_UPLOADS.labels(
-            outcome='failure',
+            platform='youtube',
+            scraper='exchange_client',
             entity=job.entity,
+            mode='background',
+            status=status,
             worker_id=get_worker_id(),
         ).inc()
-        _LOGGER.warning(
+        log_fn(
             'Background upload rejected by API',
             extra={
                 'filename': job.filename,
@@ -850,6 +935,8 @@ class ExchangeClient(AsyncClient):
         self._upload_tasks.clear()
         self._upload_queue = None
         METRIC_UPLOAD_QUEUE_DEPTH.labels(
+            platform='scrape_exchange',
+            scraper='exchange_client',
             worker_id=get_worker_id(),
         ).set(0)
 

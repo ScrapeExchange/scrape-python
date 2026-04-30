@@ -21,19 +21,22 @@ import logging
 from asyncio import Task, Queue
 from pathlib import Path
 from random import shuffle
+from typing import NamedTuple
 
 import brotli
 import orjson
 
 from httpx import Response
 
-from prometheus_client import Counter, Gauge, Histogram
+from prometheus_client import Counter, Gauge
 
 from pydantic import AliasChoices, Field, field_validator
 from yt_dlp.YoutubeDL import YoutubeDL
 
 from scrape_exchange.bulk_upload import (
     BulkBatchOutcome,
+    record_bulk_filter_skip,
+    resume_pending_bulk_uploads,
     upload_bulk_batch,
 )
 from scrape_exchange.exchange_client import ExchangeClient
@@ -77,6 +80,22 @@ from scrape_exchange.youtube.settings import YouTubeScraperSettings
 
 VIDEO_MIN_PREFIX = 'video-min-'
 VIDEO_YTDLP_PREFIX = 'video-dlp-'
+
+
+class WorkItem(NamedTuple):
+    '''
+    Queue entry for the video scraper's worker pool.
+
+    *filename* is the bare filename (no directory component) of a
+    ``video-min-*`` or ``video-dlp-*`` file.  *from_uploaded* is
+    ``True`` when the file currently lives in ``uploaded_dir`` —
+    only possible for ``video-min-*`` files that the bulk or watch
+    uploader already pushed to scrape.exchange.  When ``False`` the
+    file is in ``base_dir`` and follows the legacy code path.
+    '''
+
+    filename: str
+    from_uploaded: bool
 # Exponential backoff window after a rate-limit-flavoured failure:
 # the first failure produces a FAILURE_SLEEP_MIN-second sleep, each
 # subsequent consecutive failure doubles the previous sleep, capped
@@ -162,7 +181,7 @@ for _reason, _patterns in _ERROR_PATTERNS:
 def _classify_yt_dlp_error(error_str: str) -> str:
     '''
     Classify a yt-dlp error message into one of the reason buckets
-    used by ``yt_video_proxy_scrape_failures_total``.
+    used by ``scrape_failures_total``.
 
     Pure function: no I/O, no metric updates, no logging.
     Returns the matching reason name from :data:`_ERROR_PATTERNS`,
@@ -192,104 +211,58 @@ def _proxy_network(proxy: str | None) -> str:
         return 'other'
 
 
-# Prometheus metrics
-METRIC_VIDEOS_SCRAPED = Counter(
-    'yt_video_proxy_videos_scraped_total',
-    'Number of videos successfully scraped with yt-dlp',
-    ['proxy', 'proxy_network', 'worker_id'],
+# Prometheus metrics — shared declarations live in scraper_metrics to
+# avoid duplicate-registration errors when multiple tool modules are
+# imported in the same process (e.g. test runners).
+from scrape_exchange.scraper_metrics import (
+    METRIC_SCRAPES_COMPLETED as METRIC_VIDEOS_SCRAPED,
+    METRIC_SCRAPE_FAILURES,
+    METRIC_SCRAPE_DURATION,
+    METRIC_UPLOADS_ENQUEUED as METRIC_VIDEOS_ENQUEUED,
+    METRIC_UPLOADS_SKIPPED as METRIC_VIDEOS_ALREADY_UPLOADED,
+    METRIC_UPLOADS_FAILED as METRIC_VIDEOS_BULK_FAILED,
+    METRIC_UPLOADS_MISSING_RESULT as METRIC_VIDEOS_BULK_MISSING_RESULT,
+    METRIC_UPLOAD_BATCHES as METRIC_VIDEO_BULK_BATCHES,
+    METRIC_SCRAPE_QUEUE_SIZE as METRIC_QUEUE_SIZE,
+    METRIC_WORKER_SLEEP_SECONDS as METRIC_SLEEP_SECONDS,
+    METRIC_WATCHER_FILES_DETECTED,
+    METRIC_WATCHER_FILES_SKIPPED,
+    METRIC_WATCHER_BATCHES,
 )
-METRIC_SCRAPE_FAILURES = Counter(
-    'yt_video_proxy_scrape_failures_total',
-    'Number of times video scraping failed, labelled by reason '
-    '(rate_limit, unavailable, premiere, transient, missing_data, '
-    'other) and by proxy.',
-    ['proxy', 'proxy_network', 'reason', 'worker_id'],
-)
-METRIC_SCRAPE_DURATION = Histogram(
-    'yt_video_proxy_scrape_duration_seconds',
-    'Duration of the yt-dlp / InnerTube scrape call for a single '
-    'video, labelled by outcome (success/failure).',
-    ['outcome', 'worker_id'],
-    buckets=(0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0),
-)
+# Alias so existing call sites for "has_formats" skips use the same
+# underlying counter with reason="has_formats".
+METRIC_VIDEOS_SKIPPED_HAS_FORMATS = METRIC_VIDEOS_ALREADY_UPLOADED
+
+
+def _record_bulk_filter_skip(reason: str) -> None:
+    '''
+    Thin video-scoped wrapper around
+    :func:`scrape_exchange.bulk_upload.record_bulk_filter_skip`.
+    Pre-fills ``platform="youtube"``, ``scraper="video_scraper"``,
+    ``entity="video"`` so the bulk-sweep skip sites stay terse;
+    the underlying counter is shared across all scrapers, so
+    Grafana panels aggregate fleet-wide by ``reason`` regardless
+    of which scraper recorded the skip.
+    '''
+    record_bulk_filter_skip(
+        platform='youtube',
+        scraper='video_scraper',
+        entity='video',
+        reason=reason,
+    )
 METRIC_RATE_LIMIT_HITS = Counter(
-    'yt_video_proxy_rate_limit_hits_total',
+    'rate_limit_hits_total',
     'Number of times a proxy was rate-limited by YouTube',
-    ['proxy', 'proxy_network', 'worker_id'],
-)
-METRIC_VIDEOS_ENQUEUED = Counter(
-    'yt_video_proxy_videos_enqueued_total',
-    'Number of videos successfully enqueued for background upload. '
-    'Actual delivery is tracked by '
-    'exchange_client_background_uploads_total{entity="video"}.',
-    ['worker_id'],
-)
-METRIC_VIDEOS_ALREADY_UPLOADED = Counter(
-    'yt_video_proxy_videos_already_uploaded_total',
-    'Number of videos skipped because they were already uploaded',
-    ['worker_id'],
-)
-METRIC_QUEUE_SIZE = Gauge(
-    'yt_video_proxy_queue_size',
-    'Number of video files pending processing in the queue',
-    ['worker_id'],
-)
-METRIC_SLEEP_SECONDS = Gauge(
-    'yt_video_proxy_sleep_seconds',
-    'Seconds the worker will sleep before processing the next video',
-    ['proxy', 'proxy_network', 'worker_id'],
-)
-METRIC_VIDEOS_SKIPPED_HAS_FORMATS = Counter(
-    'yt_video_proxy_videos_skipped_has_formats_total',
-    'Number of videos skipped because the server already '
-    'has data with a non-empty formats list',
-    ['worker_id'],
+    ['platform', 'scraper', 'entity', 'api',
+     'proxy_ip', 'proxy_network', 'worker_id'],
 )
 
 # -- scheduled bulk-upload metrics --
-METRIC_VIDEOS_BULK_UPLOADED = Counter(
-    'yt_video_bulk_uploaded_total',
-    'Video records confirmed uploaded via the bulk API '
-    '(per-record success in the job results).',
-    ['worker_id'],
-)
-METRIC_VIDEOS_BULK_FAILED = Counter(
-    'yt_video_bulk_failed_total',
-    'Video records that the bulk worker reported as failed. '
-    'Source files are left in base_dir for the next iteration.',
-    ['worker_id'],
-)
-METRIC_VIDEOS_BULK_MISSING_RESULT = Counter(
-    'yt_video_bulk_missing_result_total',
-    'Video records that were submitted in a bulk batch but did '
-    'not appear in the job results. Source files are left in '
-    'base_dir for the next iteration.',
-    ['worker_id'],
-)
-METRIC_VIDEO_BULK_BATCHES = Counter(
-    'yt_video_bulk_batches_total',
-    'Bulk-upload batches dispatched by the scheduled video '
-    'upload sweep.',
-    ['worker_id', 'outcome'],
-)
-
-# -- upload-only watcher metrics --
-METRIC_WATCHER_FILES_DETECTED = Counter(
-    'yt_video_watcher_files_detected_total',
-    'Files detected by the upload-only file watcher',
-    ['worker_id'],
-)
-METRIC_WATCHER_FILES_SKIPPED = Counter(
-    'yt_video_watcher_files_skipped_total',
-    'Files skipped by the watcher (already uploaded '
-    'or superseded)',
-    ['worker_id'],
-)
-METRIC_WATCHER_BATCHES = Counter(
-    'yt_video_watcher_batches_total',
-    'Number of change batches yielded by the file '
-    'watcher',
-    ['worker_id'],
+# Re-use the exchange_client counter (same metric name, registered
+# once in that module) so Prometheus doesn't see a duplicate
+# registration when exchange_client is imported in this process.
+from scrape_exchange.exchange_client import (
+    METRIC_BACKGROUND_UPLOADS as METRIC_VIDEOS_BULK_UPLOADED,
 )
 
 
@@ -572,6 +545,16 @@ async def _run_worker(
         not settings.video_no_upload
         and ctx.client is not None
     ):
+        # Reconcile any in-flight bulk jobs that the previous
+        # process left behind in ``<base_dir>/.bulk/``. The
+        # helper queries scrape.exchange for each persisted
+        # job_id, applies the per-record results, and removes
+        # the state file. Must run before ``upload_videos`` so
+        # the same source files don't enter a fresh batch while
+        # a prior batch is still pending server-side.
+        await resume_pending_bulk_uploads(
+            video_fm, ctx.client, settings.exchange_url,
+        )
         await upload_videos(
             settings, ctx.client, video_fm, creator_map_backend,
             video_validator,
@@ -608,6 +591,46 @@ async def video_needs_uploading(video_fm: AssetFileManagement,
     return False
 
 
+async def _dedup_video_min(
+    video_fm: AssetFileManagement,
+    entries: list[str],
+    dlp_ids: set[str],
+    *,
+    from_uploaded: bool,
+) -> list[str]:
+    '''
+    Drop ``video-min-*`` filenames whose video ID already has a
+    ``video-dlp-*`` counterpart in *dlp_ids* — the upgrade has
+    happened and the ``video-min-*`` copy is stale.  When
+    ``from_uploaded`` is True the stale file is removed via
+    :meth:`AssetFileManagement.delete_uploaded`; otherwise via
+    :meth:`AssetFileManagement.delete`.
+    '''
+    kept: list[str] = []
+    for entry in entries:
+        vid: str = entry[
+            len(VIDEO_MIN_PREFIX):-len(FILE_EXTENSION)
+        ]
+        if vid not in dlp_ids:
+            kept.append(entry)
+            continue
+        if from_uploaded:
+            await video_fm.delete_uploaded(entry, fail_ok=False)
+            logging.debug(
+                'Deleted uploaded video-min file '
+                'superseded by video-dlp',
+                extra={'video_id': vid},
+            )
+        else:
+            await video_fm.delete(entry, fail_ok=False)
+            logging.debug(
+                'Deleted video-min file superseded '
+                'by video-dlp',
+                extra={'video_id': vid},
+            )
+    return kept
+
+
 async def prepare_workload(settings: VideoSettings,
                            video_fm: AssetFileManagement) -> Queue:
     '''
@@ -621,73 +644,88 @@ async def prepare_workload(settings: VideoSettings,
     :raises: (none)
     '''
 
-    dlp_files: list[str] = video_fm.list_base(
+    dlp_base: list[str] = video_fm.list_base(
         prefix=VIDEO_YTDLP_PREFIX, suffix=FILE_EXTENSION,
+    )
+    # Set of video IDs that already have a video-dlp variant
+    # somewhere (base_dir OR uploaded_dir).  Any video-min for
+    # the same ID is stale — drop it from both directories.
+    dlp_ids: set[str] = {
+        f[len(VIDEO_YTDLP_PREFIX):-len(FILE_EXTENSION)]
+        for f in dlp_base
+    } | {
+        f[len(VIDEO_YTDLP_PREFIX):-len(FILE_EXTENSION)]
+        for f in video_fm.list_uploaded(
+            prefix=VIDEO_YTDLP_PREFIX, suffix=FILE_EXTENSION,
+        )
+    }
+
+    deduped_min_base: list[str] = await _dedup_video_min(
+        video_fm,
+        video_fm.list_base(
+            prefix=VIDEO_MIN_PREFIX, suffix=FILE_EXTENSION,
+        ),
+        dlp_ids,
+        from_uploaded=False,
     )
 
     if settings.video_upload_only:
-        # Upload-only mode: only process already-scraped
-        # video-dlp files; video-min files are excluded
-        # because they always require scraping.
-        candidates: list[str] = dlp_files
+        # Upload-only: queue every leftover file in base_dir for
+        # the watch-uploader path.  No scraping happens here, so
+        # video-min files in uploaded_dir aren't relevant — they
+        # would only be candidates for the yt-dlp scrape pipeline.
+        items: list[WorkItem] = [
+            WorkItem(f, False)
+            for f in deduped_min_base + dlp_base
+        ]
         logging.info(
-            'Upload-only mode: queuing video-dlp '
-            'files, skipping video-min files',
-            extra={'dlp_files_count': len(dlp_files)},
+            'Upload-only mode: queuing leftover files '
+            'from base_dir',
+            extra={
+                'dlp_files_count': len(dlp_base),
+                'min_files_count': len(deduped_min_base),
+            },
         )
     else:
-        min_files: list[str] = video_fm.list_base(
-            prefix=VIDEO_MIN_PREFIX,
-            suffix=FILE_EXTENSION,
+        deduped_min_uploaded: list[str] = await _dedup_video_min(
+            video_fm,
+            video_fm.list_uploaded(
+                prefix=VIDEO_MIN_PREFIX, suffix=FILE_EXTENSION,
+            ),
+            dlp_ids,
+            from_uploaded=True,
         )
-
-        # Build a set of video IDs that already have a
-        # video-dlp file.  When both video-min and
-        # video-dlp exist for the same ID the video-min
-        # file is stale (the video was already scraped)
-        # — delete it and only queue the video-dlp entry
-        # for upload.
-        dlp_ids: set[str] = {
-            f[len(VIDEO_YTDLP_PREFIX):-len(
-                FILE_EXTENSION
-            )]
-            for f in dlp_files
-        }
-        deduped_min: list[str] = []
-        for entry in min_files:
-            vid: str = entry[
-                len(VIDEO_MIN_PREFIX):-len(
-                    FILE_EXTENSION
-                )
-            ]
-            if vid in dlp_ids:
-                await video_fm.delete(
-                    entry, fail_ok=False,
-                )
-                logging.debug(
-                    'Deleted video-min file superseded '
-                    'by video-dlp',
-                    extra={'video_id': vid},
-                )
-            else:
-                deduped_min.append(entry)
-
-        candidates = deduped_min + dlp_files
-    files: list[str] = []
-    for entry in candidates:
-        if await video_needs_uploading(video_fm, entry):
-            files.append(entry)
-    shuffle(files)
+        items = (
+            [WorkItem(f, False) for f in deduped_min_base]
+            + [WorkItem(f, True) for f in deduped_min_uploaded]
+            + [WorkItem(f, False) for f in dlp_base]
+        )
+    queued: list[WorkItem] = []
+    for item in items:
+        # Files in uploaded_dir are already past the supersede
+        # check (it operates on base_dir paths); the dedup
+        # against video-dlp above is the only filter that
+        # applies.
+        if (
+            item.from_uploaded
+            or await video_needs_uploading(video_fm, item.filename)
+        ):
+            queued.append(item)
+    shuffle(queued)
     queue: Queue = Queue()
-    for file in files:
-        await queue.put(file)
+    for item in queued:
+        await queue.put(item)
 
     METRIC_QUEUE_SIZE.labels(
+        platform='youtube',
+        scraper='video_scraper',
+        entity='video',
+        tier='none',
         worker_id=get_worker_id(),
-    ).set(len(files))
+    ).set(len(queued))
     logging.debug(
         'Prepared workload',
-        extra={'files_length': len(files)},
+        extra={'files_length': len(queued)},
     )
     return queue
 
@@ -793,10 +831,17 @@ async def worker_loop(
             await exchange_client.drain_uploads(timeout=10.0)
 
 
-def _is_video_dlp_file(filename: str) -> bool:
-    '''Check if a filename is an uploadable video-dlp file.'''
+def _is_video_upload_file(filename: str) -> bool:
+    '''Check if a filename is an uploadable video file.
+
+    Both ``video-min-*`` (RSS-discovered) and ``video-dlp-*``
+    (yt-dlp-enriched) variants are eligible for upload.
+    '''
     return (
-        filename.startswith(VIDEO_YTDLP_PREFIX)
+        (
+            filename.startswith(VIDEO_YTDLP_PREFIX)
+            or filename.startswith(VIDEO_MIN_PREFIX)
+        )
         and filename.endswith(FILE_EXTENSION)
     )
 
@@ -809,8 +854,9 @@ async def _watch_and_upload(
     '''
     Upload-only watcher loop.  Waits for the initial queue
     to drain, then watches ``video_data_directory`` for new
-    or modified ``video-dlp-*.json.br`` files and feeds them
-    into *queue* so the existing workers can upload them.
+    or modified ``video-min-*.json.br`` and ``video-dlp-*.json.br``
+    files and feeds them into *queue* so the existing workers
+    can upload them.
 
     Runs until cancelled by SIGINT / SIGTERM.
     '''
@@ -831,21 +877,30 @@ async def _watch_and_upload(
         base,
         watch_filter=lambda change, path: (
             change in (Change.added, Change.modified)
-            and _is_video_dlp_file(Path(path).name)
+            and _is_video_upload_file(Path(path).name)
         ),
     ):
         METRIC_WATCHER_BATCHES.labels(
+            platform='youtube',
+            scraper='video_scraper',
+            entity='video',
             worker_id=wid,
         ).inc()
         for _change, path in changes:
             filename: str = Path(path).name
             METRIC_WATCHER_FILES_DETECTED.labels(
+                platform='youtube',
+                scraper='video_scraper',
+                entity='video',
                 worker_id=wid,
             ).inc()
             if not await video_needs_uploading(
                 video_fm, filename,
             ):
                 METRIC_WATCHER_FILES_SKIPPED.labels(
+                    platform='youtube',
+                    scraper='video_scraper',
+                    entity='video',
                     worker_id=wid,
                 ).inc()
                 continue
@@ -853,7 +908,7 @@ async def _watch_and_upload(
                 'Upload-only: new video file detected',
                 extra={'filename': filename},
             )
-            await queue.put(filename)
+            await queue.put(WorkItem(filename, False))
         # Wait for the batch to be consumed before
         # accepting more watcher events.
         await queue.join()
@@ -935,6 +990,25 @@ async def _load_video_file(
         return None
 
 
+async def _delete_source(
+    video_fm: AssetFileManagement,
+    entry: str,
+    from_uploaded: bool,
+    *,
+    fail_ok: bool = False,
+) -> None:
+    '''
+    Remove *entry* from whichever directory it was queued from
+    (``uploaded_dir`` when *from_uploaded* is True, otherwise
+    ``base_dir``).  Centralises the choice so callers don't have
+    to spell it out at every deletion site.
+    '''
+    if from_uploaded:
+        await video_fm.delete_uploaded(entry, fail_ok=fail_ok)
+    else:
+        await video_fm.delete(entry, fail_ok=fail_ok)
+
+
 async def _scrape_and_save(
     entry: str,
     video_id: str,
@@ -944,6 +1018,7 @@ async def _scrape_and_save(
     video_fm: AssetFileManagement,
     proxy: str,
     sleep: int,
+    from_uploaded: bool = False,
 ) -> tuple[YouTubeVideo | None, int]:
     '''
     Scrape a video with yt-dlp, persist the result to
@@ -962,6 +1037,10 @@ async def _scrape_and_save(
     :param video_fm: File manager owning the data dir.
     :param proxy: Proxy URL used for this worker.
     :param sleep: Current backoff sleep value.
+    :param from_uploaded: When True the source ``video-min-`` file
+        lives in ``uploaded_dir`` (already uploaded by the bulk or
+        watch path); after a successful scrape it is deleted from
+        there instead of from ``base_dir``.
     :returns: ``(video, sleep)`` — video is ``None`` on
         any failure.
     '''
@@ -979,19 +1058,35 @@ async def _scrape_and_save(
             exc=exc,
             extra={'video_id': video_id, 'proxy': proxy},
         )
+        _proxy_ip: str = (
+            extract_proxy_ip(proxy) if proxy else 'none'
+        )
         METRIC_SCRAPE_FAILURES.labels(
-            proxy=proxy, proxy_network=_proxy_network(proxy),
+            platform='youtube',
+            scraper='video_scraper',
+            entity='video',
+            api='ytdlp',
             reason='other',
             worker_id=get_worker_id(),
+            proxy_ip=_proxy_ip,
+            proxy_network=_proxy_network(proxy),
         ).inc()
         try:
-            await video_fm.mark_failed(entry)
+            # mark_failed renames the file in place; for sources in
+            # uploaded_dir we instead delete (no recovery path) so
+            # the failure marker doesn't poison the uploaded copy.
+            if from_uploaded:
+                await video_fm.delete_uploaded(
+                    entry, fail_ok=True,
+                )
+            else:
+                await video_fm.mark_failed(entry)
         except OSError:
             pass
         if sleep:
             METRIC_SLEEP_SECONDS.labels(
-                proxy=proxy,
-                proxy_network=_proxy_network(proxy),
+                platform='youtube',
+                scraper='video_scraper',
                 worker_id=get_worker_id(),
             ).set(sleep)
         return None, sleep
@@ -1008,8 +1103,8 @@ async def _scrape_and_save(
         # cleanup; explicitly remove the original
         # entry (e.g. the video-min-{id} file we
         # just upgraded to video-dlp-).
-        await video_fm.delete(
-            entry, fail_ok=False,
+        await _delete_source(
+            video_fm, entry, from_uploaded, fail_ok=False,
         )
     except OSError as exc:
         logging.warning(
@@ -1021,6 +1116,320 @@ async def _scrape_and_save(
         return None, sleep
 
     return video, sleep
+
+
+async def _resolve_and_enqueue(
+    video: YouTubeVideo,
+    exchange_client: ExchangeClient,
+    settings: VideoSettings,
+    video_fm: AssetFileManagement,
+    creator_map_backend: CreatorMap,
+    validator: SchemaValidator,
+    proxy: str,
+    filename_prefix: str,
+) -> bool:
+    '''
+    Resolve the canonical channel handle for *video* and hand the
+    record to ``enqueue_upload_video``.  Returns ``True`` only when
+    the upload was actually enqueued so the caller can keep its
+    files-uploaded counter and Prometheus metric in step.
+
+    Pulled out of the worker loop to keep ``worker``'s control
+    flow readable.
+    '''
+    handle: str | None = await resolve_video_upload_handle(
+        video, creator_map_backend, proxy,
+    )
+    if handle is None:
+        logging.info(
+            'Video upload skipped: handle unresolved; '
+            'file remains for retry',
+            extra={
+                'video_id': video.video_id,
+                'channel_id': video.channel_id,
+            },
+        )
+        return False
+    enqueued: bool = await enqueue_upload_video(
+        exchange_client, settings,
+        video_fm, handle, video, validator,
+        filename_prefix=filename_prefix,
+    )
+    if enqueued:
+        METRIC_VIDEOS_ENQUEUED.labels(
+            platform='youtube',
+            scraper='video_scraper',
+            entity='video',
+            mode='single',
+            worker_id=get_worker_id(),
+        ).inc()
+    return enqueued
+
+
+async def _maybe_skip_already_scraped(
+    video_id: str,
+    entry: str,
+    from_uploaded: bool,
+    settings: VideoSettings,
+    video_fm: AssetFileManagement,
+    exchange_client: ExchangeClient | None,
+) -> bool:
+    '''
+    Check whether the server already has a video-dlp record for
+    *video_id*; if so, discard the local source file and return
+    ``True`` so the caller can skip the scrape.  Only relevant for
+    files that would otherwise trigger a yt-dlp scrape.
+    '''
+    if (
+        settings.video_no_upload
+        or exchange_client is None
+        or not await _video_has_formats_on_server(
+            exchange_client, settings, video_id,
+        )
+    ):
+        return False
+    logging.info(
+        'Video already has formats on server, skipping scrape',
+        extra={'video_id': video_id},
+    )
+    METRIC_VIDEOS_SKIPPED_HAS_FORMATS.labels(
+        platform='youtube',
+        scraper='video_scraper',
+        entity='video',
+        reason='has_formats',
+        worker_id=get_worker_id(),
+    ).inc()
+    await _delete_source(
+        video_fm, entry, from_uploaded, fail_ok=False,
+    )
+    return True
+
+
+async def _scrape_with_claim(
+    entry: str,
+    video_id: str,
+    channel_handle: str,
+    download_client: YoutubeDL,
+    settings: VideoSettings,
+    video_fm: AssetFileManagement,
+    proxy: str,
+    sleep: int,
+    from_uploaded: bool,
+    claim: ContentClaim,
+) -> tuple[YouTubeVideo | None, int, bool]:
+    '''
+    Acquire the per-video claim, run ``_scrape_and_save``, and
+    release the claim.  Returns ``(video, sleep, scraped)`` where
+    *scraped* is ``True`` when the yt-dlp pipeline produced a new
+    file (so the worker can bump its ``files_scraped`` counter).
+    Both ``video`` and ``scraped`` are ``False``-y when another
+    worker holds the claim or the scrape failed.
+    '''
+    acquired: bool = await claim.acquire(video_id)
+    if not acquired:
+        logging.debug(
+            'Video claimed by another process, skipping',
+            extra={'video_id': video_id},
+        )
+        return None, sleep, False
+    try:
+        video, sleep = await _scrape_and_save(
+            entry, video_id, channel_handle,
+            download_client, settings,
+            video_fm, proxy, sleep,
+            from_uploaded=from_uploaded,
+        )
+    finally:
+        await claim.release(video_id)
+    if video is None:
+        return None, sleep, False
+    return video, sleep, True
+
+
+class _ItemOutcome(NamedTuple):
+    '''
+    Result of processing one ``WorkItem`` inside :func:`worker`.
+
+    *scraped* is True when yt-dlp produced a fresh ``video-dlp-``
+    file; *uploaded* is True when ``enqueue_upload_video`` accepted
+    the record into its background queue.  *sleep* carries the
+    updated exponential-backoff value.
+    '''
+
+    sleep: int
+    scraped: bool
+    uploaded: bool
+
+
+async def _load_for_processing(
+    video_id: str,
+    entry: str,
+    prefix: str,
+    from_uploaded: bool,
+    settings: VideoSettings,
+    video_fm: AssetFileManagement,
+) -> YouTubeVideo | None:
+    '''
+    Load the on-disk record for processing.  Returns ``None`` when
+    the file is missing/corrupt or when the defence-in-depth
+    superseded check (base_dir entries only) decides the upload
+    has already happened.
+    '''
+    data_dir: str = (
+        str(video_fm.uploaded_dir)
+        if from_uploaded
+        else settings.video_data_directory
+    )
+    video: YouTubeVideo | None = await _load_video_file(
+        video_id, data_dir, prefix, entry, video_fm,
+    )
+    if video is None:
+        return None
+    # is_superseded only operates on base_dir and the video-dlp
+    # dedup in prepare_workload already rejected stale entries
+    # for uploaded-dir sources, so the check is base-only.
+    if (
+        from_uploaded
+        or await video_needs_uploading(video_fm, entry)
+    ):
+        return video
+    logging.debug(
+        'Video was already uploaded, skipping',
+        extra={'video_id': video_id},
+    )
+    METRIC_VIDEOS_ALREADY_UPLOADED.labels(
+        platform='youtube',
+        scraper='video_scraper',
+        entity='video',
+        reason='already_uploaded',
+        worker_id=get_worker_id(),
+    ).inc()
+    return None
+
+
+async def _scrape_and_track(
+    entry: str,
+    video_id: str,
+    video: YouTubeVideo,
+    from_uploaded: bool,
+    download_client: YoutubeDL,
+    settings: VideoSettings,
+    video_fm: AssetFileManagement,
+    proxy: str,
+    sleep: int,
+    claim: ContentClaim,
+) -> tuple[YouTubeVideo | None, int, bool]:
+    '''
+    Run :func:`_scrape_with_claim`, sleep on failure if backoff was
+    set, and emit the ``videos_scraped`` metric on success.  Returns
+    ``(video, sleep, scraped)`` where *scraped* is ``True`` only when
+    a fresh ``video-dlp-`` file was produced.
+    '''
+    fresh, sleep, scraped = await _scrape_with_claim(
+        entry, video_id, video.channel_handle,
+        download_client, settings,
+        video_fm, proxy, sleep,
+        from_uploaded, claim,
+    )
+    if not scraped:
+        if fresh is None and sleep:
+            logging.info(
+                'Sleeping before next attempt',
+                extra={'video_id': video_id, 'sleep': sleep},
+            )
+            await asyncio.sleep(sleep)
+        return None, sleep, False
+    METRIC_VIDEOS_SCRAPED.labels(
+        platform='youtube',
+        scraper='video_scraper',
+        entity='video',
+        api='ytdlp',
+        worker_id=get_worker_id(),
+        proxy_ip=extract_proxy_ip(proxy) if proxy else 'none',
+        proxy_network=_proxy_network(proxy),
+    ).inc()
+    return fresh, sleep, True
+
+
+async def _process_work_item(
+    item: WorkItem,
+    proxy: str,
+    settings: VideoSettings,
+    video_fm: AssetFileManagement,
+    exchange_client: ExchangeClient | None,
+    claim: ContentClaim,
+    creator_map_backend: CreatorMap,
+    validator: SchemaValidator,
+    download_client: YoutubeDL,
+    sleep: int,
+) -> _ItemOutcome:
+    '''
+    Per-iteration body of :func:`worker`, factored out so the
+    surrounding loop only deals with setup, counters, and the
+    yt-dlp client refresh cadence.
+
+    Returns an :class:`_ItemOutcome` describing what happened.
+    '''
+    entry: str = item.filename
+    from_uploaded: bool = item.from_uploaded
+    logging.debug(
+        'Worker processing file',
+        extra={
+            'proxy': proxy,
+            'entry': entry,
+            'from_uploaded': from_uploaded,
+        },
+    )
+
+    parsed: tuple[str, str, bool] | None = _parse_entry(entry)
+    if parsed is None:
+        return _ItemOutcome(sleep, False, False)
+    video_id: str
+    prefix: str
+    parsed_needs: bool
+    video_id, prefix, parsed_needs = parsed
+    # In upload-only mode never run yt-dlp; the file is uploaded
+    # with whatever fidelity it currently has.
+    needs_scraping: bool = (
+        parsed_needs and not settings.video_upload_only
+    )
+
+    if needs_scraping and await _maybe_skip_already_scraped(
+        video_id, entry, from_uploaded,
+        settings, video_fm, exchange_client,
+    ):
+        return _ItemOutcome(sleep, False, False)
+
+    video: YouTubeVideo | None = await _load_for_processing(
+        video_id, entry, prefix, from_uploaded,
+        settings, video_fm,
+    )
+    if video is None:
+        return _ItemOutcome(sleep, False, False)
+
+    upload_prefix: str = prefix
+    scraped: bool = False
+    if needs_scraping:
+        video, sleep, scraped = await _scrape_and_track(
+            entry, video_id, video, from_uploaded,
+            download_client, settings, video_fm,
+            proxy, sleep, claim,
+        )
+        if not scraped:
+            return _ItemOutcome(sleep, False, False)
+        upload_prefix = VIDEO_YTDLP_PREFIX
+
+    uploaded: bool = (
+        video is not None
+        and not settings.video_no_upload
+        and exchange_client is not None
+        and await _resolve_and_enqueue(
+            video, exchange_client, settings,
+            video_fm, creator_map_backend,
+            validator, proxy, upload_prefix,
+        )
+    )
+    return _ItemOutcome(sleep, scraped, uploaded)
 
 
 async def worker(
@@ -1090,151 +1499,19 @@ async def worker(
     files_uploaded: int = 0
     scrapes_since_refresh: int = 0
     while True:
-        entry: str = await queue.get()
-        video: YouTubeVideo | None = None
+        item: WorkItem = await queue.get()
         try:
-            logging.debug(
-                'Worker processing file',
-                extra={
-                    'proxy': proxy,
-                    'entry': entry,
-                },
+            outcome: _ItemOutcome = await _process_work_item(
+                item, proxy, settings, video_fm,
+                exchange_client, claim, creator_map_backend,
+                validator, download_client, sleep,
             )
-
-            parsed: tuple[str, str, bool] | None = (
-                _parse_entry(entry)
-            )
-            if parsed is None:
-                continue
-            video_id: str = parsed[0]
-            prefix: str = parsed[1]
-            needs_scraping: bool = parsed[2]
-
-            # For video-min files, check if the server
-            # already has this video with formats before
-            # spending a yt-dlp scrape slot.  Skipped in
-            # no-upload mode since we won't upload anyway.
-            if (needs_scraping
-                    and not settings.video_no_upload
-                    and exchange_client is not None):
-                has_formats: bool = (
-                    await _video_has_formats_on_server(
-                        exchange_client, settings,
-                        video_id,
-                    )
-                )
-                if has_formats:
-                    logging.info(
-                        'Video already has formats '
-                        'on server, skipping scrape',
-                        extra={
-                            'video_id': video_id,
-                        },
-                    )
-                    METRIC_VIDEOS_SKIPPED_HAS_FORMATS.labels(
-                        worker_id=get_worker_id(),
-                    ).inc()
-                    await video_fm.delete(
-                        entry, fail_ok=False,
-                    )
-                    continue
-
-            video = await _load_video_file(
-                video_id,
-                settings.video_data_directory,
-                prefix, entry, video_fm,
-            )
-            if video is None:
-                continue
-
-            # Defence-in-depth: prepare_workload already
-            # filtered superseded files, but state may
-            # have changed between then and now.
-            if not await video_needs_uploading(
-                video_fm, entry,
-            ):
-                logging.debug(
-                    'Video was already uploaded, '
-                    'skipping',
-                    extra={'video_id': video_id, 'proxy': proxy},
-                )
-                METRIC_VIDEOS_ALREADY_UPLOADED.labels(
-                    worker_id=get_worker_id(),
-                ).inc()
-                continue
-
-            if needs_scraping:
-                acquired: bool = await claim.acquire(
-                    video_id,
-                )
-                if not acquired:
-                    logging.debug(
-                        'Video claimed by another '
-                        'process, skipping',
-                        extra={
-                            'video_id': video_id,
-                        },
-                    )
-                    continue
-                try:
-                    video, sleep = (
-                        await _scrape_and_save(
-                            entry, video_id,
-                            video.channel_handle,
-                            download_client, settings,
-                            video_fm, proxy, sleep,
-                        )
-                    )
-                finally:
-                    await claim.release(video_id)
-                if video is None:
-                    if sleep:
-                        logging.info(
-                            'Sleeping before next '
-                            'attempt',
-                            extra={
-                                'video_id': video_id,
-                                'sleep': sleep,
-                            },
-                        )
-                        await asyncio.sleep(sleep)
-                    continue
+            sleep = outcome.sleep
+            if outcome.scraped:
                 files_scraped += 1
                 scrapes_since_refresh += 1
-                METRIC_VIDEOS_SCRAPED.labels(
-                    proxy=proxy,
-                    proxy_network=_proxy_network(proxy),
-                    worker_id=get_worker_id(),
-                ).inc()
-
-            if (video is not None
-                    and not settings.video_no_upload
-                    and exchange_client is not None):
-                handle: str | None = (
-                    await resolve_video_upload_handle(
-                        video, creator_map_backend, proxy,
-                    )
-                )
-                if handle is None:
-                    logging.info(
-                        'Video upload skipped: handle '
-                        'unresolved; file remains for retry',
-                        extra={
-                            'video_id': video.video_id,
-                            'channel_id': video.channel_id,
-                        },
-                    )
-                else:
-                    enqueued: bool = await enqueue_upload_video(
-                        exchange_client, settings,
-                        video_fm, handle, video, validator,
-                    )
-                    if enqueued:
-                        files_uploaded += 1
-                        METRIC_VIDEOS_ENQUEUED.labels(
-                            worker_id=get_worker_id(),
-                        ).inc()
-
+            if outcome.uploaded:
+                files_uploaded += 1
             logging.debug(
                 'Worker progress',
                 extra={
@@ -1244,11 +1521,6 @@ async def worker(
                 },
             )
         finally:
-            # Free the YouTubeVideo (formats,
-            # thumbnails, captions, etc.) immediately
-            # rather than keeping it alive until the
-            # next iteration's assignment.
-            video = None
             queue.task_done()
 
             # Periodically recreate the yt-dlp client
@@ -1327,14 +1599,28 @@ async def _handle_scrape_failure(
 
     reason: str = _classify_yt_dlp_error(str(exc))
     proxy_net: str = _proxy_network(proxy)
+    proxy_ip_val: str = (
+        extract_proxy_ip(proxy) if proxy else 'none'
+    )
     METRIC_SCRAPE_FAILURES.labels(
-        proxy=proxy, proxy_network=proxy_net, reason=reason,
+        platform='youtube',
+        scraper='video_scraper',
+        entity='video',
+        api='ytdlp',
+        reason=reason,
         worker_id=get_worker_id(),
+        proxy_ip=proxy_ip_val,
+        proxy_network=proxy_net,
     ).inc()
 
     if reason == 'rate_limit':
         METRIC_RATE_LIMIT_HITS.labels(
-            proxy=proxy, proxy_network=proxy_net,
+            platform='youtube',
+            scraper='video_scraper',
+            entity='video',
+            api='ytdlp',
+            proxy_ip=proxy_ip_val,
+            proxy_network=proxy_net,
             worker_id=get_worker_id(),
         ).inc()
         logging.warning(
@@ -1483,6 +1769,10 @@ async def _scrape(entry: str, video_id: str, channel_handle: str,
             proxies=[proxy]
         )
         METRIC_SCRAPE_DURATION.labels(
+            platform='youtube',
+            scraper='video_scraper',
+            entity='video',
+            api='ytdlp',
             outcome='success',
             worker_id=get_worker_id(),
         ).observe(time.monotonic() - scrape_start)
@@ -1493,6 +1783,10 @@ async def _scrape(entry: str, video_id: str, channel_handle: str,
         )
     except Exception as exc:
         METRIC_SCRAPE_DURATION.labels(
+            platform='youtube',
+            scraper='video_scraper',
+            entity='video',
+            api='ytdlp',
             outcome='failure',
             worker_id=get_worker_id(),
         ).observe(time.monotonic() - scrape_start)
@@ -1520,28 +1814,50 @@ async def resolve_video_upload_handle(
            fallback_handle(video.channel_handle) and write to map.
         4. On InnerTube failure, return None — caller must skip the
            upload. Do NOT write to the map; the next tick retries.
+        5. When neither channel_id nor channel_handle are populated
+           (degenerate record from RSS or a corrupt write) there is
+           nothing to fall back to, so return None and let the caller
+           skip the upload.
 
     :returns: The handle to use, or None when the upload should be
         skipped.
     '''
 
     if not video.channel_id:
+        if not video.channel_handle:
+            logging.warning(
+                'Video has neither channel_id nor channel_handle; '
+                'cannot resolve upload handle, skipping',
+                extra={'video_id': video.video_id},
+            )
+            CREATOR_MAP_RESOLUTION_TOTAL.labels(
+                platform='youtube',
+                scraper='video_scraper',
+                outcome='error',
+            ).inc()
+            return None
         CREATOR_MAP_RESOLUTION_TOTAL.labels(
-            scraper='video', outcome='fallback',
+            platform='youtube',
+            scraper='video_scraper',
+            outcome='fallback',
         ).inc()
-        return fallback_handle(video.channel_handle or '')
+        return fallback_handle(video.channel_handle)
 
     cached: str | None = await creator_map_backend.get(
         video.channel_id,
     )
     if cached:
         CREATOR_MAP_LOOKUP_TOTAL.labels(
-            scraper='video', outcome='hit',
+            platform='youtube',
+            scraper='video_scraper',
+            outcome='hit',
         ).inc()
         return cached
 
     CREATOR_MAP_LOOKUP_TOTAL.labels(
-        scraper='video', outcome='miss',
+        platform='youtube',
+        scraper='video_scraper',
+        outcome='miss',
     ).inc()
 
     try:
@@ -1560,7 +1876,9 @@ async def resolve_video_upload_handle(
             },
         )
         CREATOR_MAP_RESOLUTION_TOTAL.labels(
-            scraper='video', outcome='error',
+            platform='youtube',
+            scraper='video_scraper',
+            outcome='error',
         ).inc()
         return None
 
@@ -1568,14 +1886,18 @@ async def resolve_video_upload_handle(
     if resolved:
         handle = resolved
         CREATOR_MAP_RESOLUTION_TOTAL.labels(
-            scraper='video', outcome='canonical',
+            platform='youtube',
+            scraper='video_scraper',
+            outcome='canonical',
         ).inc()
     else:
         handle = fallback_handle(
             video.channel_handle or video.channel_id,
         )
         CREATOR_MAP_RESOLUTION_TOTAL.labels(
-            scraper='video', outcome='fallback',
+            platform='youtube',
+            scraper='video_scraper',
+            outcome='fallback',
         ).inc()
 
     await creator_map_backend.put(video.channel_id, handle)
@@ -1587,6 +1909,8 @@ async def enqueue_upload_video(
     video_fm: AssetFileManagement, handle: str,
     video: YouTubeVideo,
     validator: SchemaValidator,
+    *,
+    filename_prefix: str = VIDEO_YTDLP_PREFIX,
 ) -> bool:
     '''
     Fire-and-forget upload of a scraped video to Scrape Exchange,
@@ -1604,12 +1928,17 @@ async def enqueue_upload_video(
 
     :param handle: Canonical channel handle to use as
         platform_creator_id; must match the channel entity's handle.
+    :param filename_prefix: On-disk filename prefix for the asset
+        being uploaded.  Defaults to ``video-dlp-`` (the post-scrape
+        artefact) but can be ``video-min-`` when upload-only mode
+        ships RSS-discovered records straight to the API without
+        running yt-dlp.
     :returns: ``True`` if the job was enqueued, ``False`` if
         dropped or if schema validation failed.
     '''
 
     filename: str = (
-        f'{VIDEO_YTDLP_PREFIX}{video.video_id}{FILE_EXTENSION}'
+        f'{filename_prefix}{video.video_id}{FILE_EXTENSION}'
     )
     record_dict: dict = video.to_dict()
     err: str | None = validator.validate(record_dict)
@@ -1678,6 +2007,7 @@ async def _collect_video_record(
             'Skipping unrecognised video filename',
             extra={'filename': filename},
         )
+        _record_bulk_filter_skip('unrecognised_filename')
         return None
     video_id_from_name: str
     prefix: str
@@ -1689,6 +2019,7 @@ async def _collect_video_record(
         prefix, filename, video_fm,
     )
     if video is None:
+        _record_bulk_filter_skip('read_failed')
         return None
 
     handle: str | None = await resolve_video_upload_handle(
@@ -1705,6 +2036,7 @@ async def _collect_video_record(
                 'video_id': video.video_id,
             },
         )
+        _record_bulk_filter_skip('no_handle')
         return None
     video.channel_handle = handle
 
@@ -1713,6 +2045,7 @@ async def _collect_video_record(
             'Video has no video_id, skipping bulk upload',
             extra={'filename': filename},
         )
+        _record_bulk_filter_skip('missing_video_id')
         return None
 
     record_dict: dict = video.to_dict()
@@ -1735,6 +2068,7 @@ async def _collect_video_record(
                 exc=exc,
                 extra={'filename': filename},
             )
+        _record_bulk_filter_skip('schema_invalid')
         return None
 
     logging.debug(
@@ -1777,6 +2111,7 @@ async def _prepare_video_line(
             'Video file superseded, skipping',
             extra={'filename': filename},
         )
+        _record_bulk_filter_skip('superseded')
         return None
 
     record: tuple[str, dict] | None = (
@@ -1833,18 +2168,36 @@ async def _upload_one_video_batch(
         filename_prefix='videos',
     )
     METRIC_VIDEO_BULK_BATCHES.labels(
-        worker_id=get_worker_id(), outcome=outcome.status,
+        platform='youtube',
+        scraper='video_scraper',
+        entity='video',
+        mode='bulk',
+        worker_id=get_worker_id(),
+        outcome=outcome.status,
     ).inc()
     if outcome.success:
         METRIC_VIDEOS_BULK_UPLOADED.labels(
+            platform='youtube',
+            scraper='video_scraper',
+            entity='video',
+            mode='bulk',
+            status='success',
             worker_id=get_worker_id(),
         ).inc(outcome.success)
     if outcome.failed:
         METRIC_VIDEOS_BULK_FAILED.labels(
+            platform='youtube',
+            scraper='video_scraper',
+            entity='video',
+            mode='bulk',
             worker_id=get_worker_id(),
         ).inc(outcome.failed)
     if outcome.missing:
         METRIC_VIDEOS_BULK_MISSING_RESULT.labels(
+            platform='youtube',
+            scraper='video_scraper',
+            entity='video',
+            mode='bulk',
             worker_id=get_worker_id(),
         ).inc(outcome.missing)
 
@@ -1857,13 +2210,18 @@ async def upload_videos(
     validator: SchemaValidator,
 ) -> None:
     '''
-    Sweep ``base_dir`` for already-scraped ``video-dlp-*`` files
-    and upload them via the bulk API in batches of up to
-    ``settings.bulk_batch_size`` records (or
-    ``settings.bulk_max_batch_bytes`` bytes, whichever is hit
-    first). Per-record success in the job results promotes the
-    matching source file to ``uploaded_dir``; failed and missing
-    records are left in ``base_dir`` for the next iteration.
+    Sweep ``base_dir`` for ``video-min-*`` (RSS-discovered) and
+    ``video-dlp-*`` (yt-dlp-enriched) files and upload them via
+    the bulk API in batches of up to ``settings.bulk_batch_size``
+    records (or ``settings.bulk_max_batch_bytes`` bytes, whichever
+    is hit first).  Both prefixes share the same
+    ``boinko/youtube/video`` schema — the only required fields
+    (video_id, url, channel_id|channel_handle) are populated by
+    the RSS scraper before the file ever lands here, so a single
+    bulk batch can carry mixed prefixes.  Per-record success in
+    the job results promotes the matching source file to
+    ``uploaded_dir``; failed and missing records are left in
+    ``base_dir`` for the next iteration.
 
     The live-scrape worker keeps using the per-video POST path at
     :func:`enqueue_upload_video` because it processes videos as
@@ -1872,6 +2230,8 @@ async def upload_videos(
     '''
     files: list[str] = video_fm.list_base(
         prefix=VIDEO_YTDLP_PREFIX, suffix=FILE_EXTENSION,
+    ) + video_fm.list_base(
+        prefix=VIDEO_MIN_PREFIX, suffix=FILE_EXTENSION,
     )
     files = [f for f in files if not f.endswith('failed')]
     logging.info(
