@@ -41,7 +41,7 @@ import asyncio
 import logging
 import sys
 
-from httpx import Response
+from httpx import Response, Timeout
 from pydantic import AliasChoices, Field
 
 from scrape_exchange.exchange_client import ExchangeClient
@@ -58,6 +58,15 @@ FILTER_API_PATH: str = '/api/v1/filter'
 # ``ABSOLUTE_DELETE_MAX_RECORDS`` in
 # ``../scrape-api/server/routers/filter.py``.
 ABSOLUTE_MAX_ITEMS: int = 100_000
+
+# httpx defaults to a 5 s read timeout, which is shorter than the
+# server takes to count + list (and optionally delete) tens of
+# thousands of records. Use a generous cap so a single
+# ``--max-items 100000`` call can complete; the API itself caps the
+# work at ABSOLUTE_MAX_ITEMS, so the wait is bounded.
+_DELETE_TIMEOUT: Timeout = Timeout(
+    connect=30.0, read=600.0, write=30.0, pool=60.0,
+)
 
 
 class DeleteItemsSettings(ScraperSettings):
@@ -217,6 +226,7 @@ async def delete_items(
     try:
         resp: Response = await client.request(
             'DELETE', url, json=body, params=params,
+            timeout=_DELETE_TIMEOUT,
         )
     except Exception as exc:
         logging.error(
