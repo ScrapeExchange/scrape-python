@@ -1,0 +1,32 @@
+{
+  "id": "7000000000000000001",
+  "desc": "loving #fyp content with friends @bestie #foryou",
+  "createTime": 1700000000,
+  "author": {
+    "uniqueId": "charlidamelio",
+    "secUid": "MS4wLjABAAAA-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  },
+  "video": {
+    "duration": 28,
+    "ratio": "720p",
+    "cover": "https://p16-sign.tiktokcdn-us.com/sample-cover.jpeg",
+    "originCover": "https://p16-sign.tiktokcdn-us.com/sample-origin.jpeg",
+    "dynamicCover": "https://p16-sign.tiktokcdn-us.com/sample-dyn.webp",
+    "subtitleInfos": []
+  },
+  "music": {
+    "id": "7100000000000000001",
+    "title": "Original Sound",
+    "authorName": "charlidamelio",
+    "original": true,
+    "duration": 28,
+    "playUrl": "https://sf16-ies-music-va.tiktokcdn.com/sample.m4a"
+  },
+  "stats": {
+    "playCount": 12000000,
+    "diggCount": 950000,
+    "commentCount": 8200,
+    "shareCount": 41000,
+    "collectCount": 17000
+  }
+}
