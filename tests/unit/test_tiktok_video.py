@@ -127,6 +127,36 @@ class TestTikTokVideo(unittest.TestCase):
         with self.assertRaises(ValidationError):
             TikTokVideo.from_api({}, scraped_timestamp=None)
 
+    def test_music_without_id_raises_validation_error(
+        self,
+    ) -> None:
+        '''A music block present but with no id should raise
+        ValidationError, not KeyError, per the from_api
+        contract.'''
+        payload: dict = {
+            'id': '999',
+            'desc': 'no music id',
+            'createTime': 1700000000,
+            'author': {
+                'uniqueId': 'someuser',
+                'secUid': 'sec_x',
+            },
+            'video': {'duration': 10, 'subtitleInfos': []},
+            'music': {'title': 'no id here'},
+            'stats': {
+                'playCount': 1, 'diggCount': 0,
+                'commentCount': 0, 'shareCount': 0,
+                'collectCount': 0,
+            },
+        }
+        with self.assertRaises(ValidationError):
+            TikTokVideo.from_api(
+                payload,
+                scraped_timestamp=datetime(
+                    2026, 4, 30, tzinfo=timezone.utc,
+                ),
+            )
+
 
 if __name__ == '__main__':
     unittest.main()

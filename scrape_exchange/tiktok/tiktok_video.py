@@ -101,8 +101,12 @@ class TikTokVideo(BaseModel):
 
         sound_obj: Sound | None = None
         if music:
+            music_id_raw: object = music.get('id')
+            music_id: str | None = (
+                str(music_id_raw) if music_id_raw is not None else None
+            )
             sound_obj = Sound(
-                id=str(music['id']),
+                id=music_id,
                 title=music.get('title'),
                 author_name=music.get('authorName'),
                 original=music.get('original'),
