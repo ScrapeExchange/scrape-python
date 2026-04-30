@@ -20,7 +20,6 @@ YouTube's.
 '''
 
 import os
-from typing import ClassVar
 
 from scrape_exchange.rate_limiter import (
     RateLimiter,
@@ -54,8 +53,6 @@ class TikTokRateLimiter(RateLimiter[TikTokCallType]):
             TikTokCallType.API, proxy='http://p:8080',
         )
     '''
-
-    _instance: ClassVar['TikTokRateLimiter | None'] = None
 
     def __init__(
         self, state_dir: str | None = None,
@@ -102,7 +99,3 @@ class TikTokRateLimiter(RateLimiter[TikTokCallType]):
             jitter_min=0.0,
             jitter_max=0.0,
         )
-
-    @classmethod
-    def reset(cls) -> None:
-        cls._instance = None

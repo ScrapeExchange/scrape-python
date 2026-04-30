@@ -37,6 +37,10 @@ SESSION_ACQUIRE_WAIT_SECONDS: Histogram = Histogram(
     ),
 )
 
+# Incremented by the periodic ms_token refresh coroutine. That
+# coroutine is deferred to the first scraper-tool spec (it needs
+# an event-loop owner to schedule it), so this counter reads 0
+# until that lands.
 MS_TOKEN_REFRESH_TOTAL: Counter = Counter(
     'tiktok_ms_token_refresh_total',
     'Total ms_token refresh attempts',

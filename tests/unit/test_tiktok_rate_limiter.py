@@ -10,6 +10,7 @@ import asyncio
 import unittest
 from unittest.mock import patch
 
+from scrape_exchange.rate_limiter import _BucketConfig
 from scrape_exchange.tiktok.tiktok_rate_limiter import (
     TikTokRateLimiter,
 )
@@ -26,7 +27,7 @@ class TestTikTokRateLimiter(unittest.TestCase):
 
     def test_default_bucket_rates(self) -> None:
         rl: TikTokRateLimiter = TikTokRateLimiter()
-        configs = rl.default_configs
+        configs: dict[TikTokCallType, _BucketConfig] = rl.default_configs
         self.assertIn(TikTokCallType.API, configs)
         self.assertIn(TikTokCallType.BOOTSTRAP, configs)
         # 30 rpm = 0.5 per second
@@ -49,7 +50,7 @@ class TestTikTokRateLimiter(unittest.TestCase):
             },
         ):
             rl: TikTokRateLimiter = TikTokRateLimiter()
-            configs = rl.default_configs
+            configs: dict[TikTokCallType, _BucketConfig] = rl.default_configs
             self.assertAlmostEqual(
                 configs[TikTokCallType.API].refill_rate, 1.0,
             )
