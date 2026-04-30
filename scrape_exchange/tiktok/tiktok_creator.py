@@ -50,7 +50,7 @@ class TikTokCreator(BaseModel):
         Required keys: ``uniqueId``, ``secUid``, ``id``.
         Missing required keys raise pydantic ValidationError.
         '''
-        username: str = payload['uniqueId']
+        username: str | None = payload.get('uniqueId')
         stats: dict = payload.get('stats', {})
         avatar_url: str | None = payload.get('avatarLarger')
         avatar: Thumbnail | None = None
@@ -62,8 +62,8 @@ class TikTokCreator(BaseModel):
         )
         return cls(
             username=username,
-            sec_uid=payload['secUid'],
-            user_id=payload['id'],
+            sec_uid=payload.get('secUid'),
+            user_id=payload.get('id'),
             nickname=payload.get('nickname'),
             signature=payload.get('signature'),
             avatar_thumbnail=avatar,
@@ -80,7 +80,10 @@ class TikTokCreator(BaseModel):
             heart_count=int(stats.get('heartCount', 0)),
             video_count=int(stats.get('videoCount', 0)),
             friend_count=int(stats.get('friendCount', 0)),
-            url=f'https://www.tiktok.com/@{username}',
+            url=(
+                f'https://www.tiktok.com/@{username}'
+                if username else None
+            ),
             scraped_timestamp=when,
         )
 

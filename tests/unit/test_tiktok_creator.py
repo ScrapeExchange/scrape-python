@@ -84,7 +84,8 @@ class TestTikTokCreator(unittest.TestCase):
         Draft202012Validator(schema).validate(record)
 
     def test_required_fields_enforced(self) -> None:
-        with self.assertRaises(Exception):
+        from pydantic import ValidationError
+        with self.assertRaises(ValidationError):
             TikTokCreator.from_api({}, scraped_timestamp=None)
 
 
