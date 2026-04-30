@@ -9,6 +9,7 @@ Manages connections to YouTube for data import.
 import asyncio
 import base64
 import os
+import sys
 import time
 
 import random
@@ -32,6 +33,23 @@ from .youtube_rate_limiter import YouTubeRateLimiter, YouTubeCallType
 
 _LOGGER: Logger = getLogger(__name__)
 
+_SCRIPT_NAME: str = (
+    os.path.basename(sys.argv[0]) if sys.argv else 'unknown'
+)
+
+_SCRAPER_BY_SCRIPT: dict[str, str] = {
+    'yt_video_scrape.py': 'video_scraper',
+    'yt_channel_scrape.py': 'channel_scraper',
+    'yt_rss_scrape.py': 'rss_scraper',
+    'rebuild_creator_map.py': 'channel_scraper',
+    'yt_discover_channels.py': 'discover',
+}
+
+
+def _get_scraper() -> str:
+    '''Return the scraper label for the current script.'''
+    return _SCRAPER_BY_SCRIPT.get(_SCRIPT_NAME, 'unknown')
+
 
 # HTTP / InnerTube latency histogram for calls to YouTube. ``kind`` is
 # ``'http'`` for plain HTTP GETs via this client and ``'innertube'`` for
@@ -40,11 +58,15 @@ _LOGGER: Logger = getLogger(__name__)
 # ``'error'`` when no HTTP response arrived (timeout, connection error,
 # raised exception).
 METRIC_YT_REQUEST_DURATION: Histogram = Histogram(
-    'youtube_client_request_duration_seconds',
-    'Duration of requests to YouTube, by kind '
-    '(http/innertube), HTTP status class, and the '
+    'api_request_duration_seconds',
+    'Duration of requests to YouTube, by api type '
+    '(html/innertube), HTTP status class, and the '
     'outbound proxy IP used.',
-    ['kind', 'status_class', 'worker_id', 'proxy_ip', 'proxy_network'],
+    [
+        'platform', 'scraper', 'api',
+        'status_class', 'worker_id',
+        'proxy_ip', 'proxy_network',
+    ],
     buckets=(
         0.1, 0.25, 0.5, 1.0, 2.5,
         5.0, 10.0, 30.0, 60.0,
@@ -196,7 +218,10 @@ class AsyncYouTubeClient(AsyncClient):
             resp: Response = await super().get(url, **kwargs)
         except asyncio.CancelledError as exc:
             METRIC_YT_REQUEST_DURATION.labels(
-                kind='http', status_class='error',
+                platform='youtube',
+                scraper=_get_scraper(),
+                api='html',
+                status_class='error',
                 worker_id=get_worker_id(),
                 proxy_ip=proxy_ip,
                 proxy_network=proxy_network,
@@ -222,7 +247,10 @@ class AsyncYouTubeClient(AsyncClient):
                 ConnectTimeout, ConnectionResetError,
                 ConnectionRefusedError) as exc:
             METRIC_YT_REQUEST_DURATION.labels(
-                kind='http', status_class='error',
+                platform='youtube',
+                scraper=_get_scraper(),
+                api='html',
+                status_class='error',
                 worker_id=get_worker_id(),
                 proxy_ip=proxy_ip,
                 proxy_network=proxy_network,
@@ -241,7 +269,10 @@ class AsyncYouTubeClient(AsyncClient):
             raise RuntimeError(f'Timeout fetching URL {url}') from exc
         except RequestError as exc:
             METRIC_YT_REQUEST_DURATION.labels(
-                kind='http', status_class='error',
+                platform='youtube',
+                scraper=_get_scraper(),
+                api='html',
+                status_class='error',
                 worker_id=get_worker_id(),
                 proxy_ip=proxy_ip,
                 proxy_network=proxy_network,
@@ -250,7 +281,10 @@ class AsyncYouTubeClient(AsyncClient):
             raise
         except Exception as exc:
             METRIC_YT_REQUEST_DURATION.labels(
-                kind='http', status_class='error',
+                platform='youtube',
+                scraper=_get_scraper(),
+                api='html',
+                status_class='error',
                 worker_id=get_worker_id(),
                 proxy_ip=proxy_ip,
                 proxy_network=proxy_network,
@@ -269,7 +303,9 @@ class AsyncYouTubeClient(AsyncClient):
             raise RuntimeError(f'Timeout fetching URL {url}') from exc
 
         METRIC_YT_REQUEST_DURATION.labels(
-            kind='http',
+            platform='youtube',
+            scraper=_get_scraper(),
+            api='html',
             status_class=_yt_status_class(resp.status_code),
             worker_id=get_worker_id(),
             proxy_ip=proxy_ip,

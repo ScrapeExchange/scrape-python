@@ -121,11 +121,13 @@ class TestPublishConfigMetrics(unittest.TestCase):
         )
         wid: str = get_worker_id()
         np_val: float = METRIC_NUM_PROCESSES.labels(
+            platform='youtube',
             role='supervisor',
             scraper=self.scraper_label,
             worker_id=wid,
         )._value.get()
         conc_val: float = METRIC_CONCURRENCY.labels(
+            platform='youtube',
             role='supervisor',
             scraper=self.scraper_label,
             worker_id=wid,
@@ -146,11 +148,13 @@ class TestPublishConfigMetrics(unittest.TestCase):
         )
         wid: str = get_worker_id()
         sup_np: float = METRIC_NUM_PROCESSES.labels(
+            platform='youtube',
             role='supervisor',
             scraper=self.scraper_label,
             worker_id=wid,
         )._value.get()
         w_np: float = METRIC_NUM_PROCESSES.labels(
+            platform='youtube',
             role='worker',
             scraper=self.scraper_label,
             worker_id=wid,

@@ -88,6 +88,55 @@ class TestResolveVideoUploadHandle(
         self.assertIsNone(result)
         cm.put.assert_not_awaited()
 
+    async def test_empty_channel_id_and_handle_returns_none(
+        self,
+    ) -> None:
+        '''
+        A degenerate record from the RSS path (or a corrupt write)
+        with neither channel_id nor channel_handle must NOT cause
+        ``fallback_handle('')`` to raise — the resolver returns
+        ``None`` so the caller skips the upload, exactly like an
+        InnerTube failure.
+        '''
+        from scrape_exchange.creator_map import NullCreatorMap
+
+        cm: NullCreatorMap = NullCreatorMap()
+        cm.get = AsyncMock(return_value=None)
+        cm.put = AsyncMock()
+
+        video = self._make_video('', '')
+        with self.assertLogs(level='WARNING'):
+            result: str | None = await resolve_video_upload_handle(
+                video, cm, proxy=None,
+            )
+
+        self.assertIsNone(result)
+        cm.get.assert_not_awaited()
+        cm.put.assert_not_awaited()
+
+    async def test_empty_channel_id_falls_back_to_handle(
+        self,
+    ) -> None:
+        '''
+        When channel_id is empty but channel_handle is set,
+        fall back to ``fallback_handle(channel_handle)`` rather
+        than returning None — this is the legacy/no-id case.
+        '''
+        from scrape_exchange.creator_map import NullCreatorMap
+
+        cm: NullCreatorMap = NullCreatorMap()
+        cm.get = AsyncMock(return_value=None)
+        cm.put = AsyncMock()
+
+        video = self._make_video('', '@SomeChannel')
+        result: str | None = await resolve_video_upload_handle(
+            video, cm, proxy=None,
+        )
+
+        self.assertEqual(result, 'somechannel')
+        cm.get.assert_not_awaited()
+        cm.put.assert_not_awaited()
+
     async def test_handle_less_channel_uses_fallback(self) -> None:
         from scrape_exchange.creator_map import NullCreatorMap
 

@@ -13,8 +13,8 @@ to Scrape Exchange and moves the file to an "uploaded" sub-directory.
 '''
 
 import os
+import shutil
 import sys
-import json
 import asyncio
 import logging
 import resource
@@ -43,12 +43,20 @@ from scrape_exchange.name_map import (
 )
 from scrape_exchange.bulk_upload import (
     BulkBatchOutcome,
+    resume_pending_bulk_uploads,
     upload_bulk_batch,
+)
+from scrape_exchange.channel_list_parsing import (
+    dedupe_preserving_case,
+    parse_channel_handle,
 )
 from scrape_exchange.exchange_client import ExchangeClient
 
-from scrape_exchange.file_management import AssetFileManagement
-from scrape_exchange.file_management import CHANNEL_FILE_PREFIX
+from scrape_exchange.file_management import (
+    AssetFileManagement,
+    CHANNEL_FILE_PREFIX,
+    atomic_write_bytes,
+)
 from scrape_exchange.scraper_runner import (
     ScraperRunContext,
     ScraperRunner,
@@ -218,119 +226,68 @@ class ChannelSettings(YouTubeScraperSettings):
         return normalize_log_level(v)
 
 
-# Prometheus metrics
+# Prometheus metrics — shared declarations live in scraper_metrics to
+# avoid duplicate-registration errors when multiple tool modules are
+# imported in the same process (e.g. test runners).
+# channel_exists_total — found/not_found/failed collapsed into one
+# counter with outcome label per the new naming convention.
 METRIC_CHANNEL_EXISTS_FOUND = Counter(
-    'yt_channel_exists_found_total',
-    'Number of times a channel was found to already exist on Scrape Exchange',
-    ['worker_id'],
+    'channel_exists_total',
+    'Results of channel-existence checks on Scrape Exchange, '
+    'labelled by outcome (found / not_found / failed).',
+    ['platform', 'scraper', 'entity', 'outcome', 'worker_id'],
 )
-METRIC_CHANNEL_EXISTS_NOT_FOUND = Counter(
-    'yt_channel_exists_not_found_total',
-    'Number of times a channel was found to not exist on Scrape Exchange',
-    ['worker_id'],
-)
-METRIC_CHANNEL_EXISTS_FAILURES = Counter(
-    'yt_channel_exists_check_failures_total',
-    'Number of times the channel existence check call failed',
-    ['worker_id'],
-)
+METRIC_CHANNEL_EXISTS_NOT_FOUND = METRIC_CHANNEL_EXISTS_FOUND
+METRIC_CHANNEL_EXISTS_FAILURES = METRIC_CHANNEL_EXISTS_FOUND
 METRIC_UNIQUE_CHANNELS_READ = Gauge(
-    'yt_channel_unique_channels_read',
+    'unique_channels_read',
     'Number of unique channel names read from the channel list',
-    ['worker_id'],
+    ['platform', 'scraper', 'entity', 'worker_id'],
 )
 METRIC_FILES_PENDING_UPLOAD = Gauge(
-    'yt_channel_files_pending_upload',
+    'files_pending_upload',
     'Number of channel files found that may need to be uploaded',
-    ['worker_id'],
+    ['platform', 'scraper', 'entity', 'worker_id'],
 )
-METRIC_UPLOADED_FILE_EXISTS = Counter(
-    'yt_channel_uploaded_file_exists_total',
-    'Number of channels skipped because an uploaded file already exists',
-    ['worker_id'],
-)
-METRIC_CHANNELS_SCRAPED = Counter(
-    'yt_channel_scraped_total',
-    'Number of channels successfully scraped',
-    ['worker_id', 'proxy_ip', 'proxy_network'],
-)
-METRIC_CHANNELS_ENQUEUED = Counter(
-    'yt_channel_enqueued_total',
-    'Number of channels successfully enqueued for background '
-    'upload. Actual delivery is tracked by '
-    'exchange_client_background_uploads_total{entity="channel"}.',
-    ['worker_id'],
-)
-METRIC_SCRAPE_FAILURES = Counter(
-    'yt_channel_scrape_failures_total',
-    'Number of times channel scraping failed',
-    ['worker_id', 'proxy_ip', 'proxy_network'],
+from scrape_exchange.scraper_metrics import (
+    METRIC_SCRAPES_COMPLETED as METRIC_CHANNELS_SCRAPED,
+    METRIC_SCRAPE_FAILURES,
+    METRIC_UPLOADS_ENQUEUED as METRIC_CHANNELS_ENQUEUED,
+    METRIC_UPLOADS_SKIPPED as METRIC_UPLOADED_FILE_EXISTS,
+    METRIC_UPLOADS_FAILED as METRIC_CHANNELS_BULK_FAILED,
+    METRIC_UPLOADS_MISSING_RESULT as METRIC_CHANNELS_BULK_MISSING_RESULT,
+    METRIC_UPLOAD_BATCHES as METRIC_BULK_BATCHES,
+    METRIC_WATCHER_FILES_DETECTED,
+    METRIC_WATCHER_FILES_SKIPPED,
+    METRIC_WATCHER_BATCHES,
 )
 METRIC_CHANNEL_IDS_TO_RESOLVE = Gauge(
-    'yt_channel_ids_to_resolve',
+    'pending_channel_id_resolutions',
     'Number of channel IDs that needed to be resolved to channel names',
-    ['worker_id'],
+    ['platform', 'scraper', 'entity', 'worker_id'],
 )
+# channel_id_resolutions_total — resolved/failed collapsed into one
+# counter with outcome label per the new naming convention.
 METRIC_CHANNEL_IDS_RESOLVED = Counter(
-    'yt_channel_ids_resolved_total',
-    'Number of channel IDs successfully resolved to channel names',
-    ['worker_id'],
+    'channel_id_resolutions_total',
+    'Channel ID resolution outcomes, labelled by outcome '
+    '(resolved / failed).',
+    ['platform', 'scraper', 'entity', 'outcome', 'worker_id'],
 )
-METRIC_CHANNEL_ID_RESOLUTION_FAILURES = Counter(
-    'yt_channel_id_resolution_failures_total',
-    'Number of channel IDs that failed to resolve to channel names',
-    ['worker_id'],
-)
+METRIC_CHANNEL_ID_RESOLUTION_FAILURES = METRIC_CHANNEL_IDS_RESOLVED
 METRIC_CHANNEL_NO_CONTENT_FOUND = Counter(
-    'yt_channel_no_content_found_total',
+    'channel_no_content_found_total',
     'Number of channels scraped that had no videos, playlists, courses, '
     'podcasts, or products',
-    ['worker_id', 'proxy_ip', 'proxy_network'],
+    ['platform', 'scraper', 'entity', 'worker_id', 'proxy_ip',
+     'proxy_network'],
 )
 
 # -- scheduled bulk-upload metrics --
-METRIC_CHANNELS_BULK_UPLOADED = Counter(
-    'yt_channel_bulk_uploaded_total',
-    'Channel records confirmed uploaded via the bulk API '
-    '(per-record success in the job results).',
-    ['worker_id'],
-)
-METRIC_CHANNELS_BULK_FAILED = Counter(
-    'yt_channel_bulk_failed_total',
-    'Channel records that the bulk worker reported as failed. '
-    'Source files are left in base_dir for the next iteration.',
-    ['worker_id'],
-)
-METRIC_CHANNELS_BULK_MISSING_RESULT = Counter(
-    'yt_channel_bulk_missing_result_total',
-    'Channel records that were submitted in a bulk batch but did '
-    'not appear in the job results. Source files are left in '
-    'base_dir for the next iteration.',
-    ['worker_id'],
-)
-METRIC_BULK_BATCHES = Counter(
-    'yt_channel_bulk_batches_total',
-    'Bulk-upload batches dispatched by the scheduled upload sweep.',
-    ['worker_id', 'outcome'],
-)
-
-# -- upload-only watcher metrics --
-METRIC_WATCHER_FILES_DETECTED = Counter(
-    'yt_channel_watcher_files_detected_total',
-    'Files detected by the upload-only file watcher',
-    ['worker_id'],
-)
-METRIC_WATCHER_FILES_SKIPPED = Counter(
-    'yt_channel_watcher_files_skipped_total',
-    'Files skipped by the watcher (already uploaded '
-    'or superseded)',
-    ['worker_id'],
-)
-METRIC_WATCHER_BATCHES = Counter(
-    'yt_channel_watcher_batches_total',
-    'Number of change batches yielded by the file '
-    'watcher',
-    ['worker_id'],
+# Re-use the exchange_client counter (same metric name) to avoid a
+# duplicate-registration collision when exchange_client is imported.
+from scrape_exchange.exchange_client import (
+    METRIC_BACKGROUND_UPLOADS as METRIC_CHANNELS_BULK_UPLOADED,
 )
 
 
@@ -453,6 +410,16 @@ async def _run_worker(
     validator: SchemaValidator = SchemaValidator(schema_dict)
 
     if not settings.channel_no_upload:
+        # Reconcile any in-flight bulk jobs that the previous
+        # process left behind in ``<base_dir>/.bulk/``. The
+        # helper queries scrape.exchange for each persisted
+        # job_id, applies the per-record results, and removes
+        # the state file. Must run before ``upload_channels``
+        # so the same source files don't enter a fresh batch
+        # while a prior batch is still pending server-side.
+        await resume_pending_bulk_uploads(
+            fm, ctx.client, settings.exchange_url,
+        )
         logging.info('Starting initial channel upload pass')
         await upload_channels(
             settings, ctx.client, fm,
@@ -543,7 +510,11 @@ async def channel_exists(client: ExchangeClient, channel_handle: str) -> bool:
         )
     except Exception as exc:
         METRIC_CHANNEL_EXISTS_FAILURES.labels(
-            worker_id=get_worker_id()
+            platform='youtube',
+            scraper='channel_scraper',
+            entity='channel',
+            outcome='failed',
+            worker_id=get_worker_id(),
         ).inc()
         logging.warning(
             'Network error checking channel existence',
@@ -556,17 +527,39 @@ async def channel_exists(client: ExchangeClient, channel_handle: str) -> bool:
         data: dict = resp.json()
         exists: bool = data.get('exists', False)
         if exists:
-            METRIC_CHANNEL_EXISTS_FOUND.labels(worker_id=get_worker_id()).inc()
+            METRIC_CHANNEL_EXISTS_FOUND.labels(
+                platform='youtube',
+                scraper='channel_scraper',
+                entity='channel',
+                outcome='found',
+                worker_id=get_worker_id(),
+            ).inc()
         else:
             METRIC_CHANNEL_EXISTS_NOT_FOUND.labels(
-                worker_id=get_worker_id()
+                platform='youtube',
+                scraper='channel_scraper',
+                entity='channel',
+                outcome='not_found',
+                worker_id=get_worker_id(),
             ).inc()
         return exists
     elif resp.status_code == 404:
-        METRIC_CHANNEL_EXISTS_NOT_FOUND.labels(worker_id=get_worker_id()).inc()
+        METRIC_CHANNEL_EXISTS_NOT_FOUND.labels(
+            platform='youtube',
+            scraper='channel_scraper',
+            entity='channel',
+            outcome='not_found',
+            worker_id=get_worker_id(),
+        ).inc()
         return False
     else:
-        METRIC_CHANNEL_EXISTS_FAILURES.labels(worker_id=get_worker_id()).inc()
+        METRIC_CHANNEL_EXISTS_FAILURES.labels(
+            platform='youtube',
+            scraper='channel_scraper',
+            entity='channel',
+            outcome='failed',
+            worker_id=get_worker_id(),
+        ).inc()
         logging.warning(
             'Failed to check existence of channel',
             extra={
@@ -789,6 +782,10 @@ async def _prepare_channel_line(
             extra={'filename': filename},
         )
         METRIC_UPLOADED_FILE_EXISTS.labels(
+            platform='youtube',
+            scraper='channel_scraper',
+            entity='channel',
+            reason='already_uploaded',
             worker_id=get_worker_id(),
         ).inc()
         try:
@@ -859,18 +856,36 @@ async def _upload_one_channel_batch(
         filename_prefix='channels',
     )
     METRIC_BULK_BATCHES.labels(
-        worker_id=get_worker_id(), outcome=outcome.status,
+        platform='youtube',
+        scraper='channel_scraper',
+        entity='channel',
+        mode='bulk',
+        worker_id=get_worker_id(),
+        outcome=outcome.status,
     ).inc()
     if outcome.success:
         METRIC_CHANNELS_BULK_UPLOADED.labels(
+            platform='youtube',
+            scraper='channel_scraper',
+            entity='channel',
+            mode='bulk',
+            status='success',
             worker_id=get_worker_id(),
         ).inc(outcome.success)
     if outcome.failed:
         METRIC_CHANNELS_BULK_FAILED.labels(
+            platform='youtube',
+            scraper='channel_scraper',
+            entity='channel',
+            mode='bulk',
             worker_id=get_worker_id(),
         ).inc(outcome.failed)
     if outcome.missing:
         METRIC_CHANNELS_BULK_MISSING_RESULT.labels(
+            platform='youtube',
+            scraper='channel_scraper',
+            entity='channel',
+            mode='bulk',
             worker_id=get_worker_id(),
         ).inc(outcome.missing)
 
@@ -907,7 +922,10 @@ async def upload_channels(
         if not f.endswith('failed')
     ]
     METRIC_FILES_PENDING_UPLOAD.labels(
-        worker_id=get_worker_id()
+        platform='youtube',
+        scraper='channel_scraper',
+        entity='channel',
+        worker_id=get_worker_id(),
     ).set(len(files))
     logging.info(
         'Found channel files for bulk upload',
@@ -1033,9 +1051,16 @@ async def _upload_single_channel(
 
     if fm.is_superseded(filename):
         METRIC_UPLOADED_FILE_EXISTS.labels(
+            platform='youtube',
+            scraper='channel_scraper',
+            entity='channel',
+            reason='already_uploaded',
             worker_id=get_worker_id(),
         ).inc()
         METRIC_WATCHER_FILES_SKIPPED.labels(
+            platform='youtube',
+            scraper='channel_scraper',
+            entity='channel',
             worker_id=get_worker_id(),
         ).inc()
         await fm.delete(filename, fail_ok=False)
@@ -1058,6 +1083,10 @@ async def _upload_single_channel(
             validator,
         ):
             METRIC_CHANNELS_ENQUEUED.labels(
+                platform='youtube',
+                scraper='channel_scraper',
+                entity='channel',
+                mode='single',
                 worker_id=get_worker_id(),
             ).inc()
     except FileNotFoundError:
@@ -1073,9 +1102,16 @@ async def _upload_single_channel(
         # copy, since that would be unexpected.
         if fm.is_superseded(filename):
             METRIC_UPLOADED_FILE_EXISTS.labels(
+                platform='youtube',
+                scraper='channel_scraper',
+                entity='channel',
+                reason='already_uploaded',
                 worker_id=get_worker_id(),
             ).inc()
             METRIC_WATCHER_FILES_SKIPPED.labels(
+                platform='youtube',
+                scraper='channel_scraper',
+                entity='channel',
                 worker_id=get_worker_id(),
             ).inc()
             logging.debug(
@@ -1127,11 +1163,17 @@ async def _watch_and_upload_channels(
         ),
     ):
         METRIC_WATCHER_BATCHES.labels(
+            platform='youtube',
+            scraper='channel_scraper',
+            entity='channel',
             worker_id=wid,
         ).inc()
         for _change, path in changes:
             filename: str = Path(path).name
             METRIC_WATCHER_FILES_DETECTED.labels(
+                platform='youtube',
+                scraper='channel_scraper',
+                entity='channel',
                 worker_id=wid,
             ).inc()
             logging.info(
@@ -1274,6 +1316,11 @@ def _record_scrape_failure(
         extract_proxy_ip(proxy_used) if proxy_used else 'none'
     )
     METRIC_SCRAPE_FAILURES.labels(
+        platform='youtube',
+        scraper='channel_scraper',
+        entity='channel',
+        api='html',
+        reason='other',
         worker_id=get_worker_id(),
         proxy_ip=proxy_used_ip,
         proxy_network=proxy_network_for(proxy_used_ip),
@@ -1368,6 +1415,9 @@ def _channel_has_no_content(
             extra={'channel_handle': channel_handle},
         )
     METRIC_CHANNEL_NO_CONTENT_FOUND.labels(
+        platform='youtube',
+        scraper='channel_scraper',
+        entity='channel',
         worker_id=get_worker_id(),
         proxy_ip=scrape_proxy_ip,
         proxy_network=scrape_proxy_network,
@@ -1501,6 +1551,10 @@ async def scrape_channel(
             return True
 
         METRIC_CHANNELS_SCRAPED.labels(
+            platform='youtube',
+            scraper='channel_scraper',
+            entity='channel',
+            api='html',
             worker_id=get_worker_id(),
             proxy_ip=scrape_proxy_ip,
             proxy_network=scrape_proxy_network,
@@ -1544,6 +1598,10 @@ async def scrape_channel(
         validator,
     ):
         METRIC_CHANNELS_ENQUEUED.labels(
+            platform='youtube',
+            scraper='channel_scraper',
+            entity='channel',
+            mode='single',
             worker_id=get_worker_id(),
         ).inc()
     return False
@@ -1575,7 +1633,9 @@ async def resolve_channel_upload_handle(
 
     handle: str = channel.channel_handle
     CREATOR_MAP_RESOLUTION_TOTAL.labels(
-        scraper='channel', outcome='canonical',
+        platform='youtube',
+        scraper='channel_scraper',
+        outcome='canonical',
     ).inc()
 
     # Issue the creator_map and name_map writes concurrently so the
@@ -1675,40 +1735,6 @@ async def enqueue_upload_channel(
     )
 
 
-def _normalize_channel_line(raw_line: str) -> str | None:
-    '''
-    Strip and normalize one raw line from the channel list file.
-
-    :returns: the normalized line, or ``None`` when the line should
-        be skipped (blank, comment, or contains whitespace).
-    '''
-
-    line: str = raw_line.strip()
-    if not line or line.startswith('#'):
-        return None
-    if ' ' in line:
-        logging.info(
-            'Skipping line with spaces, likely not a channel handle',
-            extra={'line': line},
-        )
-        return None
-
-    if line.startswith('channel/'):
-        line = line[len('channel/'):]
-    if line.startswith('uc'):
-        line = line[0].upper() + line[1].upper() + line[2:]
-    elif (line.startswith('{') and line.endswith('}')
-            and ('channel' in line)):
-        # JSONL, perhaps created with yt_discover_channels.py.
-        # The authoritative map write happens post-scrape in
-        # resolve_channel_upload_handle using YouTube's canonical
-        # handle; the user-supplied casing here is not written.
-        data: dict[str, str | int] = json.loads(line)
-        line = data.get('channel', line)
-
-    return line
-
-
 def _resolve_known_channel_id(
     channel_id: str, channel_map_data: dict[str, str],
     fm: AssetFileManagement,
@@ -1742,7 +1768,16 @@ def _parse_channel_line(
     fm: AssetFileManagement,
 ) -> tuple[str | None, str | None]:
     '''
-    Parse one line from the channel list file.
+    Parse one line from the channel list file. Delegates form
+    recognition to
+    :func:`scrape_exchange.channel_list_parsing.parse_channel_handle`
+    so the recognised URL forms, JSONL handling, comma-form
+    direction, and case-insensitive dedup match
+    ``cleanup_channel_list.py``. The only logic kept here is the
+    cross-reference against this scraper's CreatorMap snapshot
+    and ``.unresolved`` markers — :func:`_resolve_known_channel_id`
+    decides whether a bare channel ID is already known, queued
+    for resolution, or previously failed.
 
     :returns: a ``(channel_handle, unresolved_channel_id)`` tuple.
         Either or both may be ``None``. An ``unresolved_channel_id``
@@ -1750,30 +1785,16 @@ def _parse_channel_line(
         which the caller should submit to the resolution step.
     '''
 
-    line: str | None = _normalize_channel_line(raw_line)
-    if line is None:
-        return None, None
-
-    channel_handle: str | None = None
-    if ',' in line:
-        _: str
-        _, channel_handle = line.split(',', 1)
-        channel_handle = channel_handle.strip()
-
-    if not channel_handle and YouTubeChannel.is_channel_id(line):
-        return _resolve_known_channel_id(line, channel_map_data, fm)
-    elif line.startswith('https://www.youtube.com/@'):
-        channel_handle = line[len('https://www.youtube.com/@'):].strip()
-    elif line.startswith(('handle', 'custom', 'user', 'c/')):
-        parts: list[str] = line.split('\\')
-        if len(parts) >= 2:
-            channel_handle = parts[1].strip()
-    elif '\t' in line:
-        channel_handle = line.split('\t')[1].strip()
-    else:
-        channel_handle = line
-
-    return channel_handle, None
+    handle: str | None
+    channel_id: str | None
+    handle, channel_id = parse_channel_handle(raw_line)
+    if handle is not None:
+        return handle, None
+    if channel_id is not None:
+        return _resolve_known_channel_id(
+            channel_id, channel_map_data, fm,
+        )
+    return None, None
 
 
 def _filter_unscraped_candidates(
@@ -1848,6 +1869,96 @@ async def _select_new_channels(
     return selected
 
 
+async def _read_channel_list_file(
+    file_path: str,
+) -> tuple[list[str], list[str]]:
+    '''
+    Read the channel list file once and split it into ``(header,
+    entries)`` where *header* is the run of leading comment /
+    blank lines (preserved verbatim, without the trailing
+    newline) and *entries* is every other non-blank, non-comment
+    line stripped of whitespace.
+
+    The header is preserved separately so the write-back step
+    can re-emit it unchanged when the deduplicated entry list is
+    persisted, matching the layout convention used by
+    :mod:`tools.cleanup_channel_list`.
+    '''
+    header: list[str] = []
+    entries: list[str] = []
+    in_header: bool = True
+
+    line: str
+    async with aiofiles.open(file_path, 'r') as file_desc:
+        async for line in file_desc:
+            stripped: str = line.strip()
+            if not stripped or stripped.startswith('#'):
+                if in_header:
+                    header.append(line.rstrip('\n'))
+                continue
+            in_header = False
+            entries.append(stripped)
+
+    return header, entries
+
+
+async def _persist_deduped_channel_list(
+    file_path: str,
+    header: list[str],
+    deduped: list[str],
+) -> None:
+    '''
+    Write *deduped* back to *file_path*, preserving *header*
+    verbatim. Backs up the original to ``<file_path>.bak``
+    before writing so an operator can recover the prior content
+    if the dedup ever drops something it shouldn't. All errors
+    are logged at warning and swallowed — failure to write back
+    must never abort the scraper, since the in-memory dedup is
+    already correct.
+
+    Pattern matches :mod:`tools.cleanup_channel_list`'s
+    write-back so an operator running both gets consistent
+    on-disk shape.
+    '''
+    list_path: Path = Path(file_path)
+    backup: Path = list_path.with_suffix(
+        list_path.suffix + '.bak',
+    )
+    try:
+        shutil.copy2(list_path, backup)
+    except OSError as exc:
+        logging.warning(
+            'Failed to back up channel list before dedup '
+            'write; skipping write to avoid data loss',
+            exc=exc,
+            extra={'file_path': file_path},
+        )
+        return
+
+    body: str = '\n'.join(deduped) + '\n'
+    if header:
+        body = '\n'.join(header) + '\n' + body
+    payload: bytes = body.encode('utf-8')
+    try:
+        await atomic_write_bytes(list_path, payload)
+    except OSError as exc:
+        logging.warning(
+            'Failed to write deduplicated channel list back to '
+            'disk; in-memory dedup is still applied',
+            exc=exc,
+            extra={'file_path': file_path},
+        )
+        return
+    logging.info(
+        'Wrote deduplicated channel list back to disk',
+        extra={
+            'file_path': file_path,
+            'entries': len(deduped),
+            'backup': str(backup),
+        },
+    )
+
+
 async def read_channels(
     file_path: str, creator_map_backend: CreatorMap,
     fm: AssetFileManagement,
@@ -1877,18 +1988,43 @@ async def read_channels(
     new_channel_handles: set[str] = set()
     unresolved_ids: set[str] = set()
 
-    line: str
-    async with aiofiles.open(file_path, 'r') as file_desc:
-        async for line in file_desc:
-            channel_handle: str | None
-            unresolved_id: str | None
-            channel_handle, unresolved_id = _parse_channel_line(
-                line, channel_map_data, fm,
-            )
-            if channel_handle:
-                new_channel_handles.add(channel_handle)
-            if unresolved_id:
-                unresolved_ids.add(unresolved_id)
+    # Read every line first so we can run the same case-insensitive
+    # dedup the cleanup tool uses (``dedupe_preserving_case``) before
+    # per-line parsing. This keeps the scraper from queuing both
+    # ``MyChannel`` and ``mychannel`` as separate candidates, and
+    # makes URL / JSONL / comma-form variants for the same channel
+    # collapse to one entry — matching ``cleanup_channel_list.py``.
+    # The leading-comment header is captured separately so the
+    # write-back step below preserves it verbatim.
+    header: list[str]
+    raw_entries: list[str]
+    header, raw_entries = await _read_channel_list_file(file_path)
+
+    deduped: list[str] = dedupe_preserving_case(raw_entries)
+    duplicates_dropped: int = len(raw_entries) - len(deduped)
+    if duplicates_dropped:
+        logging.info(
+            'Collapsed lower-case duplicates from channel list',
+            extra={
+                'raw_lines': len(raw_entries),
+                'deduped_lines': len(deduped),
+                'dropped': duplicates_dropped,
+            },
+        )
+        await _persist_deduped_channel_list(
+            file_path, header, deduped,
+        )
+
+    for entry in deduped:
+        channel_handle: str | None
+        unresolved_id: str | None
+        channel_handle, unresolved_id = _parse_channel_line(
+            entry, channel_map_data, fm,
+        )
+        if channel_handle:
+            new_channel_handles.add(channel_handle)
+        if unresolved_id:
+            unresolved_ids.add(unresolved_id)
 
     logging.info(
         'Found unique channel handles in file', extra={
@@ -1908,7 +2044,10 @@ async def read_channels(
             },
         )
         METRIC_CHANNEL_IDS_TO_RESOLVE.labels(
-            worker_id=get_worker_id()
+            platform='youtube',
+            scraper='channel_scraper',
+            entity='channel',
+            worker_id=get_worker_id(),
         ).set(len(unresolved_ids))
         resolved_channels = await review_unresolved_ids(
             unresolved_ids, creator_map_backend, fm,
@@ -1930,7 +2069,10 @@ async def read_channels(
     )
 
     METRIC_UNIQUE_CHANNELS_READ.labels(
-        worker_id=get_worker_id()
+        platform='youtube',
+        scraper='channel_scraper',
+        entity='channel',
+        worker_id=get_worker_id(),
     ).set(len(checked_channel_handles))
     logging.info(
         'Read unique channel handles from file',
@@ -1999,7 +2141,11 @@ async def review_unresolved_ids(
                             content=f'{channel_id}\n',
                         )
                     METRIC_CHANNEL_ID_RESOLUTION_FAILURES.labels(
-                        worker_id=get_worker_id()
+                        platform='youtube',
+                        scraper='channel_scraper',
+                        entity='channel',
+                        outcome='failed',
+                        worker_id=get_worker_id(),
                     ).inc()
                     return None
                 elif ' ' in name:
@@ -2016,7 +2162,11 @@ async def review_unresolved_ids(
                         content=f'{channel_id}\t{name}\n',
                     )
                     METRIC_CHANNEL_ID_RESOLUTION_FAILURES.labels(
-                        worker_id=get_worker_id()
+                        platform='youtube',
+                        scraper='channel_scraper',
+                        entity='channel',
+                        outcome='failed',
+                        worker_id=get_worker_id(),
                     ).inc()
                     return None
                 await creator_map_backend.put(
@@ -2031,12 +2181,20 @@ async def review_unresolved_ids(
                     },
                 )
                 METRIC_CHANNEL_IDS_RESOLVED.labels(
-                    worker_id=get_worker_id()
+                    platform='youtube',
+                    scraper='channel_scraper',
+                    entity='channel',
+                    outcome='resolved',
+                    worker_id=get_worker_id(),
                 ).inc()
                 return name
             except Exception as e:
                 METRIC_CHANNEL_ID_RESOLUTION_FAILURES.labels(
-                    worker_id=get_worker_id()
+                    platform='youtube',
+                    scraper='channel_scraper',
+                    entity='channel',
+                    outcome='failed',
+                    worker_id=get_worker_id(),
                 ).inc()
                 logging.debug(
                     'Error while resolving channel ID',

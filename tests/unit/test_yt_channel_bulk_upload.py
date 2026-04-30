@@ -12,7 +12,9 @@ mocked WebSocket) so the WebSocket-driven progress channel has
 matching coverage.
 '''
 
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import orjson
@@ -20,9 +22,15 @@ import websockets.exceptions
 import websockets.frames
 
 from scrape_exchange.bulk_upload import (
+    BULK_STATE_DIR_NAME,
+    BulkUploadState,
     apply_bulk_results,
     bulk_progress_ws_url,
+    delete_bulk_state,
+    list_bulk_states,
+    resume_pending_bulk_uploads,
     stream_bulk_job_progress,
+    write_bulk_state,
 )
 
 
@@ -456,6 +464,192 @@ class TestEnqueueUploadChannelValidator(
         self.assertFalse(ok)
         client.enqueue_upload.assert_not_called()
         fm.mark_invalid.assert_awaited_once_with('foo.json.br')
+
+
+def _fake_state(job_id: str = 'abc123') -> BulkUploadState:
+    return BulkUploadState(
+        job_id=job_id,
+        batch_id='deadbeef',
+        schema_owner='boinko',
+        schema_version='0.0.2',
+        platform='youtube',
+        entity='channel',
+        upload_filename=f'channels-{job_id}.jsonl',
+        batch_records=[
+            ('UCabc', 'channel-UCabc.json.br'),
+            ('UCxyz', 'channel-UCxyz.json.br'),
+        ],
+        created_at='2026-04-29T12:34:56+00:00',
+    )
+
+
+def _fake_fm(base_dir: Path) -> MagicMock:
+    fm = MagicMock()
+    fm.base_dir = base_dir
+    fm.mark_uploaded = AsyncMock()
+    return fm
+
+
+class TestBulkUploadStatePersistence(
+    unittest.IsolatedAsyncioTestCase,
+):
+
+    async def test_write_and_list_round_trip(self) -> None:
+        '''A written state file can be loaded back identically.'''
+        with tempfile.TemporaryDirectory() as base:
+            fm = _fake_fm(Path(base))
+            state: BulkUploadState = _fake_state('jobaaa')
+            await write_bulk_state(fm, state)
+
+            state_dir: Path = Path(base) / BULK_STATE_DIR_NAME
+            self.assertTrue(state_dir.is_dir())
+            self.assertTrue(
+                (state_dir / 'jobaaa.json').is_file(),
+            )
+
+            loaded: list[BulkUploadState] = list_bulk_states(fm)
+            self.assertEqual(len(loaded), 1)
+            self.assertEqual(loaded[0], state)
+
+    async def test_delete_removes_file(self) -> None:
+        '''delete_bulk_state removes the matching state file.'''
+        with tempfile.TemporaryDirectory() as base:
+            fm = _fake_fm(Path(base))
+            state: BulkUploadState = _fake_state('jobzzz')
+            await write_bulk_state(fm, state)
+            self.assertEqual(len(list_bulk_states(fm)), 1)
+
+            await delete_bulk_state(fm, 'jobzzz')
+
+            self.assertEqual(list_bulk_states(fm), [])
+
+    async def test_delete_missing_is_no_op(self) -> None:
+        '''Deleting a non-existent state file does not raise.'''
+        with tempfile.TemporaryDirectory() as base:
+            fm = _fake_fm(Path(base))
+            await delete_bulk_state(fm, 'nope')  # must not raise
+
+    def test_corrupt_file_dropped_silently(self) -> None:
+        '''A malformed state file is removed and skipped on load.'''
+        with tempfile.TemporaryDirectory() as base:
+            fm = _fake_fm(Path(base))
+            state_dir: Path = Path(base) / BULK_STATE_DIR_NAME
+            state_dir.mkdir()
+            bad: Path = state_dir / 'bad.json'
+            bad.write_bytes(b'{not valid json')
+
+            loaded: list[BulkUploadState] = list_bulk_states(fm)
+
+            self.assertEqual(loaded, [])
+            self.assertFalse(bad.exists())
+
+    def test_list_no_directory_returns_empty(self) -> None:
+        '''Missing .bulk directory yields an empty list.'''
+        with tempfile.TemporaryDirectory() as base:
+            fm = _fake_fm(Path(base))
+            self.assertEqual(list_bulk_states(fm), [])
+
+
+def _resp(status_code: int, body: dict | None = None) -> MagicMock:
+    r = MagicMock()
+    r.status_code = status_code
+    r.json = MagicMock(return_value=body or {})
+    r.text = ''
+    return r
+
+
+class TestResumePendingBulkUploads(
+    unittest.IsolatedAsyncioTestCase,
+):
+
+    async def test_no_state_files_is_no_op(self) -> None:
+        '''Empty .bulk dir → resume returns without API calls.'''
+        with tempfile.TemporaryDirectory() as base:
+            fm = _fake_fm(Path(base))
+            client = MagicMock()
+            client.get = AsyncMock()
+            await resume_pending_bulk_uploads(
+                fm, client, 'http://test',
+            )
+            client.get.assert_not_called()
+
+    async def test_404_deletes_state(self) -> None:
+        '''API 404 on the job → state file is deleted.'''
+        with tempfile.TemporaryDirectory() as base:
+            fm = _fake_fm(Path(base))
+            await write_bulk_state(fm, _fake_state('orphan'))
+            client = MagicMock()
+            client.get = AsyncMock(return_value=_resp(404))
+
+            await resume_pending_bulk_uploads(
+                fm, client, 'http://test',
+            )
+
+            client.get.assert_awaited_once()
+            self.assertEqual(list_bulk_states(fm), [])
+
+    async def test_terminal_status_reconciles_and_deletes(
+        self,
+    ) -> None:
+        '''
+        API returns ``completed`` → fetch results, apply them,
+        delete state file.
+        '''
+        with tempfile.TemporaryDirectory() as base:
+            fm = _fake_fm(Path(base))
+            await write_bulk_state(fm, _fake_state('done'))
+            results: list[dict] = [
+                {
+                    'platform_content_id': 'UCabc',
+                    'status': 'success',
+                },
+                {
+                    'platform_content_id': 'UCxyz',
+                    'status': 'success',
+                },
+            ]
+            client = MagicMock()
+            client.get = AsyncMock(side_effect=[
+                _resp(200, {'status': 'completed'}),
+                _resp(200, {'results': results}),
+            ])
+
+            await resume_pending_bulk_uploads(
+                fm, client, 'http://test',
+            )
+
+            self.assertEqual(client.get.await_count, 2)
+            fm.mark_uploaded.assert_any_await('channel-UCabc.json.br')
+            fm.mark_uploaded.assert_any_await('channel-UCxyz.json.br')
+            self.assertEqual(list_bulk_states(fm), [])
+
+    async def test_non_200_non_404_leaves_state(self) -> None:
+        '''Server-side hiccups → state file kept for next start.'''
+        with tempfile.TemporaryDirectory() as base:
+            fm = _fake_fm(Path(base))
+            await write_bulk_state(fm, _fake_state('hiccup'))
+            client = MagicMock()
+            client.get = AsyncMock(return_value=_resp(503))
+
+            await resume_pending_bulk_uploads(
+                fm, client, 'http://test',
+            )
+
+            self.assertEqual(len(list_bulk_states(fm)), 1)
+
+    async def test_transport_failure_leaves_state(self) -> None:
+        '''Transport-level error during status fetch → keep state.'''
+        with tempfile.TemporaryDirectory() as base:
+            fm = _fake_fm(Path(base))
+            await write_bulk_state(fm, _fake_state('netfail'))
+            client = MagicMock()
+            client.get = AsyncMock(side_effect=RuntimeError('boom'))
+
+            await resume_pending_bulk_uploads(
+                fm, client, 'http://test',
+            )
+
+            self.assertEqual(len(list_bulk_states(fm)), 1)
 
 
 if __name__ == '__main__':

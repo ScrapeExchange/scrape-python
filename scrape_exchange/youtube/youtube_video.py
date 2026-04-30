@@ -36,6 +36,13 @@ from scrape_exchange.worker_id import get_worker_id
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
 
+# Intentionally no ``from .youtube_channel import YouTubeChannel`` at
+# module scope: youtube_channel.py imports YouTubeVideo at its top
+# level, so a top-level import the other way forms a cycle that
+# breaks ``tools/yt_rss_scrape.py`` (which loads youtube_channel
+# before youtube_video).  If a callable here ever needs a YouTubeChannel
+# class attribute, do the import lazily inside the function body.
+
 from ..file_management import atomic_write_bytes
 from ..util import convert_number_string
 
@@ -56,14 +63,14 @@ YTDLP_CACHE_DIR: str = '/var/tmp/yt_dlp_cache'
 # Number of yt-dlp ``extract_info`` calls currently running in the
 # default ThreadPoolExecutor, labelled by proxy.  Used to detect
 # thread-pool starvation: if this gauge stays pinned at the executor
-# size while ``yt_video_proxy_videos_scraped_total`` rate is low, the
+# size while ``scrapes_completed_total`` rate is low, the
 # scraper is bottlenecked by the executor (or the GIL) rather than by
 # the rate limiter or YouTube.
 METRIC_EXTRACT_INFO_ACTIVE: Gauge = Gauge(
-    'youtube_extract_info_active',
+    'extract_info_active',
     'Number of yt-dlp extract_info calls currently running in '
     'the thread pool, labelled by proxy.',
-    ['proxy', 'worker_id'],
+    ['platform', 'scraper', 'entity', 'api', 'proxy', 'worker_id'],
 )
 
 
@@ -445,7 +452,14 @@ class YouTubeVideo:
         try:
             video.channel_url = entry.author.uri.cdata
         except AttributeError:
-            pass
+            # Lazy import: a top-level import would close the
+            # youtube_channel ↔ youtube_video cycle.
+            from scrape_exchange.youtube.youtube_channel import (
+                YouTubeChannel,
+            )
+            video.channel_url = YouTubeChannel.CHANNEL_URL_WITH_AT.format(
+                channel_handle=channel_handle
+            )
 
         try:
             video.published_timestamp = dateutil_parser.parse(
@@ -552,7 +566,8 @@ class YouTubeVideo:
         video_id: str, channel_handle: str | None,
         channel_thumbnail: YouTubeThumbnail | None,
         deno_path: str = DENO_PATH, po_token_url: str = PO_TOKEN_URL,
-        ytdlp_cache_dir: str = YTDLP_CACHE_DIR, download_client: YoutubeDL | None = None,
+        ytdlp_cache_dir: str = YTDLP_CACHE_DIR,
+        download_client: YoutubeDL | None = None,
         debug: bool = False, save_dir: str | None = None,
         filename_prefix: str = '', with_formats: bool = True,
         proxies: list[str] = []
@@ -592,6 +607,11 @@ class YouTubeVideo:
         await self.from_innertube(proxy=proxy)
 
         if with_formats:
+            # This invokes yt-dlp to get additional metadata but requires a
+            # lot of InnerTube calls. The additional metadata we get from
+            # yt-dlp includes: formats, availability, media_type,
+            # aspect_ratio, heatmaps, embedable, license,
+            # default_audio_language
             await self._scrape_video(proxy=proxy)
 
         if save_dir:
@@ -1015,7 +1035,12 @@ class YouTubeVideo:
             proxy_label: str = proxy or 'none'
             wid: str = get_worker_id()
             METRIC_EXTRACT_INFO_ACTIVE.labels(
-                proxy=proxy_label, worker_id=wid,
+                platform='youtube',
+                scraper='video_scraper',
+                entity='video',
+                api='ytdlp',
+                proxy=proxy_label,
+                worker_id=wid,
             ).inc()
             try:
                 video_info: dict[str, any] = (
@@ -1028,7 +1053,12 @@ class YouTubeVideo:
                 )
             finally:
                 METRIC_EXTRACT_INFO_ACTIVE.labels(
-                    proxy=proxy_label, worker_id=wid,
+                    platform='youtube',
+                    scraper='video_scraper',
+                    entity='video',
+                    api='ytdlp',
+                    proxy=proxy_label,
+                    worker_id=wid,
                 ).dec()
             if video_info:
                 _LOGGER.debug(

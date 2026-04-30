@@ -24,6 +24,7 @@ from .youtube_client import (
     INNERTUBE_CLIENT_NAME,
     INNERTUBE_CLIENT_VERSION,
     METRIC_YT_REQUEST_DURATION,
+    _get_scraper,
     generate_visitor_info,
 )
 from scrape_exchange.worker_id import get_worker_id
@@ -542,7 +543,9 @@ class YouTubeChannelTabs:
                 else:
                     result = self.client.browse(self.channel_id, params=params)
                 METRIC_YT_REQUEST_DURATION.labels(
-                    kind='innertube',
+                    platform='youtube',
+                    scraper=_get_scraper(),
+                    api='innertube',
                     status_class='2xx',
                     worker_id=get_worker_id(),
                     proxy_ip=proxy_ip,
@@ -551,8 +554,12 @@ class YouTubeChannelTabs:
                 return result
             except InnerTubeRequestError as exc:
                 METRIC_YT_REQUEST_DURATION.labels(
-                    kind='innertube',
-                    status_class=('4xx' if exc.error.code == 429 else 'error'),
+                    platform='youtube',
+                    scraper=_get_scraper(),
+                    api='innertube',
+                    status_class=(
+                        '4xx' if exc.error.code == 429 else 'error'
+                    ),
                     worker_id=get_worker_id(),
                     proxy_ip=proxy_ip,
                     proxy_network=proxy_network,
@@ -597,7 +604,9 @@ class YouTubeChannelTabs:
                     penalty = min(penalty * 2, _PENALTY_MAX)
             except Exception as exc:
                 METRIC_YT_REQUEST_DURATION.labels(
-                    kind='innertube',
+                    platform='youtube',
+                    scraper=_get_scraper(),
+                    api='innertube',
                     status_class='error',
                     worker_id=get_worker_id(),
                     proxy_ip=proxy_ip,

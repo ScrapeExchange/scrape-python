@@ -200,7 +200,13 @@ class TestFromRssEntryMinimal(unittest.TestCase):
         self.assertIsNone(video.channel_id)
         # channel_handle is required and is always set.
         self.assertEqual(video.channel_handle, _TEST_HANDLE)
-        self.assertIsNone(video.channel_url)
+        # When the entry has no <author> block we synthesise the
+        # channel_url from the canonical ``/@<handle>`` URL so
+        # downstream consumers always have a usable creator URL.
+        self.assertEqual(
+            video.channel_url,
+            f'https://www.youtube.com/@{_TEST_HANDLE}',
+        )
         self.assertIsNone(video.published_timestamp)
         self.assertIsNone(video.uploaded_timestamp)
         self.assertIsNone(video.description)
@@ -385,8 +391,9 @@ class TestFromRssEntryChannelHandle(unittest.TestCase):
 
     def test_handle_set_when_author_missing(self) -> None:
         '''When the entry has no <author> block, channel_handle
-        is still set from the parameter and channel_url stays
-        unset.'''
+        is still set from the parameter and channel_url is
+        synthesised from the canonical ``/@<handle>`` URL so
+        downstream consumers always have a usable creator URL.'''
         entry: untangle.Element = _parse_entries(
             _ENTRY_WITHOUT_AUTHOR_XML,
         )[0]
@@ -396,7 +403,10 @@ class TestFromRssEntryChannelHandle(unittest.TestCase):
         self.assertEqual(
             video.channel_handle, 'CanonicalHandle',
         )
-        self.assertIsNone(video.channel_url)
+        self.assertEqual(
+            video.channel_url,
+            'https://www.youtube.com/@CanonicalHandle',
+        )
 
 
 if __name__ == '__main__':

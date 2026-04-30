@@ -4,7 +4,7 @@
 One-shot tool that rebuilds the Redis creator map (hash
 ``youtube:creator_map``) from the locally stored channel scrape
 files. Use this after a Redis wipe or when
-``yt_rss_channel_map_size`` has dropped far below the on-disk
+``channel_map_size`` has dropped far below the on-disk
 channel count.
 
 For every ``channel-<handle>.json.br`` file found in the

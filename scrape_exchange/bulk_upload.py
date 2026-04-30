@@ -21,24 +21,349 @@ record builder that turns a source file into ``(content_id, line)``.
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, UTC
+from pathlib import Path
 from uuid import uuid4
 
+import aiofiles.os
 import orjson
 import websockets
 from httpx import Response, Timeout
 
 from .exchange_client import ExchangeClient
-from .file_management import AssetFileManagement
+from .file_management import AssetFileManagement, atomic_write_bytes
+from .scraper_metrics import METRIC_UPLOADS_SKIPPED
+from .worker_id import get_worker_id
 
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
+
+
+def record_bulk_filter_skip(
+    *,
+    platform: str,
+    scraper: str,
+    entity: str,
+    reason: str,
+) -> None:
+    '''
+    Bump ``uploads_skipped_total`` for one record dropped by the
+    bulk-sweep filter (the per-file pipeline that runs before
+    each batch is built). Tagging by *reason* lets dashboards
+    attribute the gap between files-on-disk and files-uploaded
+    to a specific cause — e.g. ``superseded``, ``read_failed``,
+    ``no_handle``, ``missing_video_id``, ``schema_invalid``,
+    ``unrecognised_filename`` — so an operator can tell whether
+    the backlog is recoverable, permanent, or just stale.
+
+    Generic across scrapers: callers pass *platform*, *scraper*,
+    *entity* explicitly so the same counter covers video, channel,
+    and any future entity types.
+    '''
+    METRIC_UPLOADS_SKIPPED.labels(
+        platform=platform,
+        scraper=scraper,
+        entity=entity,
+        reason=reason,
+        worker_id=get_worker_id(),
+    ).inc()
 
 
 BULK_API_PATH: str = '/api/v1/bulk'
 TERMINAL_BULK_STATUSES: frozenset[str] = frozenset({
     'completed', 'failed',
 })
+# Subdirectory of ``base_dir`` where in-flight bulk uploads
+# persist their state. Each accepted ``POST /api/v1/bulk``
+# writes ``<base_dir>/.bulk/<job_id>.json`` so that a crashed
+# scraper can ask the API on next startup whether each job
+# eventually finished, fetch the results, and reconcile the
+# source files instead of re-uploading the whole batch.
+BULK_STATE_DIR_NAME: str = '.bulk'
+# Wall-clock budget for the resume helper to wait for one
+# pending job to reach terminal status before giving up and
+# leaving the state file for the next startup attempt.
+_RESUME_POLL_TIMEOUT_SECONDS: float = 300.0
+
+
+@dataclass
+class BulkUploadState:
+    '''
+    Persistent record of an accepted ``POST /api/v1/bulk`` that
+    has not yet been reconciled. Written to
+    ``<base_dir>/.bulk/<job_id>.json`` immediately after the
+    server returns ``job_id`` and removed once
+    :func:`apply_bulk_results` has run, so a crashed scraper can
+    resume mid-flight bulk jobs without re-uploading.
+    '''
+    job_id: str
+    batch_id: str
+    schema_owner: str
+    schema_version: str
+    platform: str
+    entity: str
+    upload_filename: str
+    batch_records: list[tuple[str, str]] = field(
+        default_factory=list,
+    )
+    created_at: str = ''
+
+    def to_dict(self) -> dict:
+        '''Serialise to a JSON-friendly dict.'''
+        return {
+            'job_id': self.job_id,
+            'batch_id': self.batch_id,
+            'schema_owner': self.schema_owner,
+            'schema_version': self.schema_version,
+            'platform': self.platform,
+            'entity': self.entity,
+            'upload_filename': self.upload_filename,
+            'batch_records': [
+                list(r) for r in self.batch_records
+            ],
+            'created_at': self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> 'BulkUploadState':
+        '''Inverse of :meth:`to_dict`.'''
+        return cls(
+            job_id=data['job_id'],
+            batch_id=data['batch_id'],
+            schema_owner=data['schema_owner'],
+            schema_version=data['schema_version'],
+            platform=data['platform'],
+            entity=data['entity'],
+            upload_filename=data['upload_filename'],
+            batch_records=[
+                (r[0], r[1]) for r in data.get('batch_records', [])
+            ],
+            created_at=data.get('created_at', ''),
+        )
+
+
+def _bulk_state_dir(fm: AssetFileManagement) -> Path:
+    return fm.base_dir / BULK_STATE_DIR_NAME
+
+
+def _bulk_state_path(
+    fm: AssetFileManagement, job_id: str,
+) -> Path:
+    return _bulk_state_dir(fm) / f'{job_id}.json'
+
+
+async def write_bulk_state(
+    fm: AssetFileManagement, state: BulkUploadState,
+) -> None:
+    '''
+    Atomically persist *state* to ``<base_dir>/.bulk/<job_id>.json``.
+    Best-effort: any OSError is logged at warning and swallowed —
+    a missing state file just means the resume path won't be able
+    to recover this particular job, which is the same outcome as
+    today's "no persistence at all".
+    '''
+    try:
+        state_dir: Path = _bulk_state_dir(fm)
+        state_dir.mkdir(parents=True, exist_ok=True)
+        path: Path = state_dir / f'{state.job_id}.json'
+        payload: bytes = orjson.dumps(
+            state.to_dict(), option=orjson.OPT_INDENT_2,
+        )
+        await atomic_write_bytes(path, payload)
+    except OSError as exc:
+        _LOGGER.warning(
+            'Failed to write bulk-upload state file',
+            exc=exc,
+            extra={'job_id': state.job_id},
+        )
+
+
+async def delete_bulk_state(
+    fm: AssetFileManagement, job_id: str,
+) -> None:
+    '''
+    Best-effort delete of a bulk-upload state file. ``FileNotFoundError``
+    is treated as a success (the file may have been cleaned up by
+    a parallel worker that handled the same job).
+    '''
+    path: Path = _bulk_state_path(fm, job_id)
+    try:
+        await aiofiles.os.remove(path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        _LOGGER.warning(
+            'Failed to delete bulk-upload state file',
+            exc=exc,
+            extra={'job_id': job_id, 'path': str(path)},
+        )
+
+
+def list_bulk_states(
+    fm: AssetFileManagement,
+) -> list[BulkUploadState]:
+    '''
+    Load every persisted bulk-upload state from
+    ``<base_dir>/.bulk``. Corrupt or unreadable files are
+    deleted (so a malformed entry can't wedge resume on every
+    startup) and skipped. Returns an empty list when the
+    directory does not exist.
+    '''
+    state_dir: Path = _bulk_state_dir(fm)
+    if not state_dir.is_dir():
+        return []
+    states: list[BulkUploadState] = []
+    for entry in state_dir.iterdir():
+        if not entry.is_file() or entry.suffix != '.json':
+            continue
+        try:
+            data: dict = orjson.loads(entry.read_bytes())
+            states.append(BulkUploadState.from_dict(data))
+        except (
+            OSError,
+            orjson.JSONDecodeError,
+            KeyError,
+            TypeError,
+        ) as exc:
+            _LOGGER.warning(
+                'Discarding unreadable bulk state file',
+                exc=exc,
+                extra={'path': str(entry)},
+            )
+            try:
+                entry.unlink()
+            except OSError:
+                pass
+    return states
+
+
+async def resume_pending_bulk_uploads(
+    fm: AssetFileManagement,
+    client: ExchangeClient,
+    exchange_url: str,
+    poll_timeout_seconds: float = _RESUME_POLL_TIMEOUT_SECONDS,
+) -> None:
+    '''
+    Read ``<base_dir>/.bulk/`` on startup and reconcile every
+    persisted bulk job against the API:
+
+    * The API returns 404 → the job was never queued (or has
+      been cleaned up by retention). Delete the state file; the
+      source files stay in ``base_dir`` to be re-uploaded by
+      the next sweep.
+    * The API returns a non-terminal status → poll until the
+      job hits ``completed``/``failed`` (bounded by
+      *poll_timeout_seconds*). On terminal: fetch results,
+      apply them via :func:`apply_bulk_results`, delete the
+      state file. On timeout: leave the state file for the next
+      startup attempt.
+    * The API returns a terminal status → fetch + apply +
+      delete immediately.
+    * Any transport / non-200 / non-404 response → log and
+      leave the state file alone for retry next startup.
+
+    Call this from each scraper's startup *after* the
+    ``ExchangeClient`` is connected and *before* the live
+    scrape / upload loop begins.
+    '''
+    states: list[BulkUploadState] = list_bulk_states(fm)
+    if not states:
+        return
+    _LOGGER.info(
+        'Resuming pending bulk uploads from state files',
+        extra={'count': len(states)},
+    )
+    for state in states:
+        try:
+            await _resume_one_bulk_state(
+                fm, client, exchange_url, state,
+                poll_timeout_seconds,
+            )
+        except Exception as exc:
+            _LOGGER.warning(
+                'Bulk-upload resume failed for job, '
+                'leaving state for retry',
+                exc=exc,
+                extra={'job_id': state.job_id},
+            )
+
+
+async def _resume_one_bulk_state(
+    fm: AssetFileManagement,
+    client: ExchangeClient,
+    exchange_url: str,
+    state: BulkUploadState,
+    poll_timeout_seconds: float,
+) -> None:
+    '''
+    Drive one persisted ``BulkUploadState`` through to a
+    terminal verdict. See :func:`resume_pending_bulk_uploads`
+    for the matrix of API responses and outcomes.
+    '''
+    status_url: str = f'{exchange_url}{BULK_API_PATH}'
+    try:
+        resp: Response = await client.get(
+            status_url, params={'job_id': state.job_id},
+        )
+    except Exception as exc:
+        _LOGGER.warning(
+            'Bulk-upload status fetch failed during resume',
+            exc=exc,
+            extra={'job_id': state.job_id},
+        )
+        return
+    if resp.status_code == 404:
+        _LOGGER.info(
+            'Bulk job not found on API, removing stale state',
+            extra={'job_id': state.job_id},
+        )
+        await delete_bulk_state(fm, state.job_id)
+        return
+    if resp.status_code != 200:
+        _LOGGER.warning(
+            'Unexpected status from bulk-status endpoint',
+            extra={
+                'job_id': state.job_id,
+                'status_code': resp.status_code,
+            },
+        )
+        return
+    body: dict = resp.json()
+    job_status: str = body.get('status', '')
+    if job_status not in TERMINAL_BULK_STATUSES:
+        deadline: float = (
+            asyncio.get_running_loop().time()
+            + poll_timeout_seconds
+        )
+        if not await _poll_status_until_terminal(
+            state.job_id, exchange_url, client, deadline,
+        ):
+            _LOGGER.info(
+                'Bulk job still pending after resume poll, '
+                'leaving state for next startup',
+                extra={
+                    'job_id': state.job_id,
+                    'status': job_status,
+                },
+            )
+            return
+    results: list[dict] = await fetch_bulk_results(
+        state.job_id, exchange_url, client,
+    )
+    await apply_bulk_results(
+        state.batch_records, results, fm,
+        state.batch_id, state.job_id,
+    )
+    await delete_bulk_state(fm, state.job_id)
+    _LOGGER.info(
+        'Resumed bulk job reconciled',
+        extra={
+            'job_id': state.job_id,
+            'batch_id': state.batch_id,
+            'records': len(state.batch_records),
+        },
+    )
 
 
 @dataclass
@@ -624,6 +949,26 @@ async def upload_bulk_batch(
             success=0, failed=0, missing=0,
         )
 
+    # Persist state immediately after the API accepts the upload.
+    # If the scraper crashes between here and ``apply_bulk_results``
+    # below, the next startup's ``resume_pending_bulk_uploads``
+    # picks up the state file and reconciles the job from the API's
+    # results endpoint instead of re-uploading the whole batch.
+    await write_bulk_state(
+        fm,
+        BulkUploadState(
+            job_id=job_id,
+            batch_id=batch_id,
+            schema_owner=schema_owner,
+            schema_version=schema_version,
+            platform=platform,
+            entity=entity,
+            upload_filename=upload_filename,
+            batch_records=list(batch_records),
+            created_at=datetime.now(UTC).isoformat(),
+        ),
+    )
+
     if not await stream_bulk_job_progress(
         job_id, exchange_url, client, progress_timeout_seconds,
     ):
@@ -634,6 +979,9 @@ async def upload_bulk_batch(
                 'batch_id': batch_id, 'job_id': job_id,
             },
         )
+        # Keep the state file: a future startup will resume the
+        # job via the status endpoint and reconcile its results
+        # rather than re-uploading the whole batch.
         return BulkBatchOutcome(
             status='progress_failed', job_id=job_id,
             success=0, failed=0, missing=0,
@@ -648,6 +996,9 @@ async def upload_bulk_batch(
     success, failed, missing = await apply_bulk_results(
         batch_records, results, fm, batch_id, job_id,
     )
+    # Reconciliation done — drop the state file so resume on the
+    # next startup doesn't re-process a job we've already handled.
+    await delete_bulk_state(fm, job_id)
     return BulkBatchOutcome(
         status='completed', job_id=job_id,
         success=success, failed=failed, missing=missing,
