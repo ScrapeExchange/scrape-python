@@ -306,6 +306,11 @@ class YouTubeVideo:
                 for format_id, fmt in self.formats.items()
             }
 
+        if self.chapters:
+            data['chapters'] = [
+                chapter.to_dict() for chapter in self.chapters
+            ]
+
         return data
 
     @staticmethod
@@ -406,7 +411,156 @@ class YouTubeVideo:
             for format_id, fmt_data in data.get('formats', {}).items()
         }
 
+        video.chapters = [
+            YouTubeVideoChapter.from_dict(chapter_data)
+            for chapter_data in data.get('chapters', [])
+        ]
+
         return video
+
+    @staticmethod
+    def from_yt_dlp(info: dict) -> Self:
+        '''
+        Factory for YouTubeVideo from a yt-dlp ``info_dict``
+        (the payload of a ``yt-dlp --write-info-json`` file or
+        the value returned by
+        ``yt_dlp.YoutubeDL.extract_info(...)`` on a single
+        video URL). Mirrors the field-by-field assignment
+        performed inside :meth:`_scrape_video` so callers can
+        reuse the same mapping logic from offline imports
+        without going through the rate limiter, executor, or
+        network layer.
+
+        Does not validate the resulting record against the
+        JSON schema — callers that need validation should call
+        :meth:`to_dict` on the returned video and validate the
+        dict themselves.
+
+        :raises ValueError: if *info* lacks a string ``id``.
+        '''
+        video_id = info.get('id')
+        if not isinstance(video_id, str) or not video_id:
+            raise ValueError(
+                "yt-dlp info_dict missing required 'id'"
+            )
+        uploader_id: str = info.get('uploader_id') or ''
+        channel_handle: str | None = (
+            uploader_id.lstrip('@') or None
+        )
+        video: Self = YouTubeVideo(
+            video_id=video_id,
+            channel_handle=channel_handle,
+        )
+
+        video.url = info.get('webpage_url') or video.url
+        video.channel_id = info.get('channel_id')
+        video.channel_url = info.get('channel_url')
+        video.channel_is_verified = info.get(
+            'channel_is_verified',
+        )
+        video.channel_follower_count = info.get(
+            'channel_follower_count',
+        )
+        video.embedable = info.get('playable_in_embed', True)
+        video.media_type = YouTubeVideo._yt_dlp_media_type(
+            info.get('media_type'),
+        )
+        video.description = info.get('description')
+        video.title = info.get('title')
+        video.long_title = info.get('fulltitle')
+        video.view_count = info.get('view_count')
+        video.like_count = info.get('like_count')
+        video.comment_count = info.get('comment_count')
+        video.is_live = bool(info.get('is_live', False))
+        video.was_live = bool(info.get('was_live', False))
+        video.availability = info.get('availability')
+        video.duration = info.get('duration')
+        video.tags = set(info.get('tags', []) or [])
+        cats: list = info.get('categories', []) or []
+        if cats:
+            video.category = cats[0]
+        video.default_audio_language = info.get('language')
+        video.age_limit = info.get('age_limit', 0)
+        video.heatmaps = info.get('heatmap', []) or []
+        video.aspect_ratio = float(
+            info.get('aspect_ratio') or 0,
+        )
+
+        YouTubeVideo._yt_dlp_collect_captions(
+            video.automatic_captions,
+            info.get('automatic_captions'),
+        )
+        YouTubeVideo._yt_dlp_collect_captions(
+            video.subtitles, info.get('subtitles'),
+        )
+        YouTubeVideo._yt_dlp_set_timestamps(video, info)
+
+        video.thumbnails = YouTubeVideo._parse_thumbnails(
+            None, info.get('thumbnails') or [],
+        )
+        for chapter_data in info.get('chapters') or []:
+            video.chapters.append(
+                YouTubeVideoChapter(chapter_data),
+            )
+        video.formats = YouTubeVideo._parse_formats(
+            info.get('formats') or [],
+        )
+        return video
+
+    @staticmethod
+    def _yt_dlp_media_type(
+        raw: object,
+    ) -> 'YouTubeMediaType | None':
+        if not isinstance(raw, str) or not raw:
+            return None
+        try:
+            return YouTubeMediaType(raw.lower())
+        except (KeyError, ValueError):
+            return None
+
+    @staticmethod
+    def _yt_dlp_collect_captions(
+        target: dict[str, YouTubeCaption],
+        src: dict | None,
+    ) -> None:
+        '''yt-dlp groups captions per language as a list of
+        dicts; collapse to one caption per language (last
+        wins).'''
+        if not isinstance(src, dict):
+            return
+        for language_code, captions in src.items():
+            if not isinstance(captions, list):
+                continue
+            for caption in captions:
+                target[language_code] = YouTubeCaption(
+                    language_code, caption,
+                )
+
+    @staticmethod
+    def _yt_dlp_set_timestamps(
+        video: 'YouTubeVideo', info: dict,
+    ) -> None:
+        '''yt-dlp does not differentiate created / uploaded /
+        published timestamps. Use ``upload_date`` (YYYYMMDD)
+        if present, else fall back to ``timestamp`` (epoch).
+        ``created_timestamp`` is left at the constructor
+        default since yt-dlp does not emit a creation time.'''
+        upload_date = info.get('upload_date')
+        if isinstance(upload_date, str) and upload_date:
+            try:
+                ts: datetime = dateutil_parser.parse(
+                    upload_date,
+                )
+                video.published_timestamp = ts
+                video.uploaded_timestamp = ts
+                return
+            except (ValueError, TypeError):
+                pass
+        epoch = info.get('timestamp')
+        if isinstance(epoch, (int, float)):
+            ts = datetime.fromtimestamp(epoch, tz=timezone.utc)
+            video.published_timestamp = ts
+            video.uploaded_timestamp = ts
 
     @staticmethod
     def from_rss_entry(entry: untangle.Element, channel_handle: str) -> Self:
