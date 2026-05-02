@@ -26,28 +26,39 @@ class YouTubeVideoChapter:
             and self.title == other.title
         )
 
-    def to_dict(self) -> dict[str, str, float]:
+    def to_dict(self) -> dict[str, str | float | None]:
         '''
-        Returns a dict representation of the chapter
+        Returns a dict representation of the chapter that
+        round-trips through :meth:`from_dict`. ``thumb_url`` is
+        only emitted when set so files without chapter
+        thumbnails stay compact.
         '''
 
-        return {
-            'start': self.start_time,
-            'end': self.end_time,
-            'title': self.title
+        data: dict[str, str | float | None] = {
+            'start_time': self.start_time,
+            'end_time': self.end_time,
+            'title': self.title,
         }
+        if self.thumb_url:
+            data['thumb_url'] = self.thumb_url
+        return data
 
     @staticmethod
     def from_dict(data: dict[str, str | int | float]) -> Self:
         '''
-        Factory for YouTubeVideoChapter, parses data are provided
-        by yt-dlp
+        Factory for YouTubeVideoChapter. Accepts both the
+        on-disk shape produced by :meth:`to_dict` (``thumb_url``)
+        and the raw yt-dlp shape (``thumbnail_url``).
         '''
 
+        thumbnail_url: str | None = (
+            data.get('thumb_url') or data.get('thumbnail_url')
+        )
         return YouTubeVideoChapter(
             {
                 'start_time': data.get('start_time'),
                 'end_time': data.get('end_time'),
-                'title': data.get('title')
+                'title': data.get('title'),
+                'thumbnail_url': thumbnail_url,
             }
         )

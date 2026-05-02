@@ -2,6 +2,8 @@
 
 '''
 Export or import the channel map between Redis and CSV.
+Useful for backup, migration, or bulk updates, or switching between both
+backends.
 
 Export (Redis to CSV):
     python tools/export_channel_map.py --output map.csv

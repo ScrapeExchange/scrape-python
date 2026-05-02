@@ -264,7 +264,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (entity) (scrape_queue_size{job=~\"$job\",instance=~\"$instance\"})",
+          "expr": "sum by (entity) (max by (entity, tier) (scrape_queue_size{job=~\"$job\",instance=~\"$instance\"}))",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
@@ -654,12 +654,207 @@
       ]
     },
     {
+      "id": 43,
+      "type": "timeseries",
+      "title": "RSS fetch success / failure rate by proxy_network",
+      "description": "Per-proxy_network success and failure rate (5m) of RSS feed fetches by the RSS scraper. Use this to spot networks where the RSS path is degrading. Compare with the YouTube scraper's circuit-breaker panel to see whether degradation tripped the limiter.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 31,
+        "w": 24,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (proxy_network) (rate(scrapes_completed_total{scraper=\"rss_scraper\",api=\"rss\",job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "ok {{proxy_network}}"
+        },
+        {
+          "expr": "sum by (proxy_network) (rate(scrape_failures_total{scraper=\"rss_scraper\",api=\"rss\",job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "fail {{proxy_network}}"
+        }
+      ]
+    },
+    {
+      "id": 44,
+      "type": "timeseries",
+      "title": "InnerTube Channel call success / failure rate by proxy_network",
+      "description": "Per-proxy_network success and failure rate (5m) of InnerTube channel.info calls made by the RSS scraper. Use to spot networks where InnerTube channel resolution is degrading.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 39,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (proxy_network) (rate(api_calls_total{scraper=\"rss_scraper\",api=\"innertube\",entity=\"channel\",status=\"success\",job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "ok {{proxy_network}}"
+        },
+        {
+          "expr": "sum by (proxy_network) (rate(api_calls_total{scraper=\"rss_scraper\",api=\"innertube\",entity=\"channel\",status=\"failed\",job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "fail {{proxy_network}}"
+        }
+      ]
+    },
+    {
+      "id": 45,
+      "type": "timeseries",
+      "title": "InnerTube Video call success / failure rate by proxy_network",
+      "description": "Per-proxy_network success and failure rate (5m) of InnerTube video.info calls made by the RSS scraper. Use to spot networks where InnerTube video resolution is degrading.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 39,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (proxy_network) (rate(api_calls_total{scraper=\"rss_scraper\",api=\"innertube\",entity=\"video\",status=\"success\",job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "ok {{proxy_network}}"
+        },
+        {
+          "expr": "sum by (proxy_network) (rate(api_calls_total{scraper=\"rss_scraper\",api=\"innertube\",entity=\"video\",status=\"failed\",job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "fail {{proxy_network}}"
+        }
+      ]
+    },
+    {
       "id": 13,
       "type": "row",
       "title": "Latency",
       "gridPos": {
         "x": 0,
-        "y": 31,
+        "y": 47,
         "w": 24,
         "h": 1
       },
@@ -677,7 +872,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 32,
+        "y": 48,
         "w": 12,
         "h": 8
       },
@@ -751,7 +946,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 32,
+        "y": 48,
         "w": 12,
         "h": 8
       },
@@ -807,7 +1002,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 40,
+        "y": 56,
         "w": 12,
         "h": 8
       },
@@ -863,7 +1058,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 40,
+        "y": 56,
         "w": 12,
         "h": 8
       },
@@ -909,12 +1104,68 @@
       ]
     },
     {
+      "id": 42,
+      "type": "timeseries",
+      "title": "Top 10 slowest proxies (p95 request duration)",
+      "description": "Per-proxy_ip p95 request duration over a 10m window, split by api (html = RSS feed download, innertube = InnerTube call). Top 10 slowest proxy + api combinations. Use this to identify which proxies are dragging the timeout rate.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 64,
+        "w": 24,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "topk(10, histogram_quantile(0.95, sum by (le, api, proxy_ip) (rate(api_request_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\"}[10m]))))",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "{{api}} {{proxy_ip}}"
+        }
+      ]
+    },
+    {
       "id": 18,
       "type": "row",
       "title": "Queues & back-pressure",
       "gridPos": {
         "x": 0,
-        "y": 48,
+        "y": 72,
         "w": 24,
         "h": 1
       },
@@ -932,7 +1183,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 49,
+        "y": 73,
         "w": 12,
         "h": 8
       },
@@ -967,7 +1218,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (entity) (scrape_queue_size{job=~\"$job\",instance=~\"$instance\"})",
+          "expr": "sum by (entity) (max by (entity, tier) (scrape_queue_size{job=~\"$job\",instance=~\"$instance\"}))",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
@@ -1006,7 +1257,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 49,
+        "y": 73,
         "w": 12,
         "h": 8
       },
@@ -1062,7 +1313,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 57,
+        "y": 81,
         "w": 12,
         "h": 8
       },
@@ -1127,7 +1378,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 57,
+        "y": 81,
         "w": 12,
         "h": 8
       },
@@ -1178,7 +1429,7 @@
       "title": "RSS priority queue",
       "gridPos": {
         "x": 0,
-        "y": 65,
+        "y": 89,
         "w": 24,
         "h": 1
       },
@@ -1196,7 +1447,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 66,
+        "y": 90,
         "w": 12,
         "h": 8
       },
@@ -1252,7 +1503,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 66,
+        "y": 90,
         "w": 12,
         "h": 8
       },
@@ -1317,7 +1568,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 74,
+        "y": 98,
         "w": 12,
         "h": 8
       },
@@ -1373,7 +1624,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 74,
+        "y": 98,
         "w": 12,
         "h": 8
       },
@@ -1451,7 +1702,7 @@
       "title": "Rate limiter",
       "gridPos": {
         "x": 0,
-        "y": 82,
+        "y": 106,
         "w": 24,
         "h": 1
       },
@@ -1469,7 +1720,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 83,
+        "y": 107,
         "w": 12,
         "h": 8
       },
@@ -1525,7 +1776,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 83,
+        "y": 107,
         "w": 12,
         "h": 8
       },
@@ -1581,7 +1832,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 91,
+        "y": 115,
         "w": 12,
         "h": 8
       },
@@ -1637,7 +1888,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 91,
+        "y": 115,
         "w": 12,
         "h": 8
       },
@@ -1688,7 +1939,7 @@
       "title": "Bulk uploads",
       "gridPos": {
         "x": 0,
-        "y": 99,
+        "y": 123,
         "w": 24,
         "h": 1
       },
@@ -1706,7 +1957,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 100,
+        "y": 124,
         "w": 12,
         "h": 8
       },
@@ -1780,7 +2031,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 100,
+        "y": 124,
         "w": 12,
         "h": 8
       },
@@ -1831,7 +2082,7 @@
       "title": "Watcher",
       "gridPos": {
         "x": 0,
-        "y": 108,
+        "y": 132,
         "w": 24,
         "h": 1
       },
@@ -1849,7 +2100,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 109,
+        "y": 133,
         "w": 12,
         "h": 8
       },
@@ -1923,7 +2174,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 109,
+        "y": 133,
         "w": 12,
         "h": 8
       },
@@ -1974,7 +2225,7 @@
       "title": "Fleet",
       "gridPos": {
         "x": 0,
-        "y": 117,
+        "y": 141,
         "w": 24,
         "h": 1
       },
@@ -1992,7 +2243,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 118,
+        "y": 142,
         "w": 12,
         "h": 8
       },
@@ -2048,7 +2299,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 118,
+        "y": 142,
         "w": 12,
         "h": 8
       },

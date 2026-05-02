@@ -532,7 +532,7 @@ async def fetch_rss(
         async with httpx.AsyncClient(proxies=proxy) as http:
             response: Response = await http.get(
                 rss_url,
-                timeout=httpx.Timeout(10.0, connect=2.0),
+                timeout=httpx.Timeout(20.0, connect=2.0),
             )
             response.raise_for_status()
             data: str = response.text

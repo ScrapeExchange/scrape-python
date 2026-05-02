@@ -75,6 +75,7 @@
     "aspect_ratio": { "type": ["number", "null"] },
     "duration": { "type": ["integer", "null"], "minimum": 0, "description": "Duration in seconds" },
     "heatmaps": { "type": "array", "items": { "type": "object", "additionalProperties": { "type": "number" } } },
+    "chapters": { "type": "array", "items": { "$ref": "#/$defs/chapter" } },
     "license": { "type": ["string", "null"] },
     "locale": { "type": ["string", "null"] },
     "default_audio_language": { "type": ["string", "null"] },
@@ -138,6 +139,17 @@
         "duration": { "type": ["number", "null"], "minimum": 0 },
         "path": { "type": ["string", "null"] }
       },
+      "additionalProperties": false
+    },
+    "chapter": {
+      "type": "object",
+      "properties": {
+        "start_time": { "type": ["number", "null"], "minimum": 0 },
+        "end_time": { "type": ["number", "null"], "minimum": 0 },
+        "title": { "type": ["string", "null"] },
+        "thumb_url": { "type": ["string", "null"], "format": "uri" }
+      },
+      "required": ["start_time", "end_time", "title"],
       "additionalProperties": false
     },
     "format": {
