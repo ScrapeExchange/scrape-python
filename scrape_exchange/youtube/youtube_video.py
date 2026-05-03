@@ -364,7 +364,8 @@ class YouTubeVideo:
         video.keywords = set(data.get('keywords', []))
         video.privacy_status = data.get('privacy_status', 'public')
         if isinstance(video.privacy_status, bool):
-            video.privacy_status = 'public' if video.privacy_status else 'private'
+            video.privacy_status = 'public' \
+                if video.privacy_status else 'private'
 
         if 'created_timestamp' in data:
             try:
@@ -1154,7 +1155,7 @@ class YouTubeVideo:
 
     async def _scrape_video(self, proxy: str | None = None) -> None:
         '''
-        Collects data about a video by scraping the webpage for the video.
+        Collects data about a video by scraping the webpage with YT-DLP.
 
         :param proxy: proxy to acquire the rate-limit token for; when None
             the limiter auto-selects from the registered pool.
@@ -1182,8 +1183,7 @@ class YouTubeVideo:
 
         try:
             _LOGGER.debug(
-                'Scraping YouTube video',
-                extra={'video_id': self.video_id}
+                'Scraping YouTube video', extra={'video_id': self.video_id}
             )
             loop: asyncio.AbstractEventLoop = asyncio.get_event_loop()
             proxy_label: str = proxy or 'none'
@@ -1241,7 +1241,8 @@ class YouTubeVideo:
             ) from exc
 
         self.channel_id = video_info.get('channel_id')
-        self.channel_handle: str = self.channel_handle or video_info.get('channel')
+        self.channel_handle: str = \
+            self.channel_handle or video_info.get('channel')
         self.channel_url: str = video_info.get('channel_url')
         self.channel_is_verified: bool = video_info.get('channel_is_verified')
         self.channel_follower_count: int = video_info.get(
@@ -1327,3 +1328,52 @@ class YouTubeVideo:
         await InnerTubeVideoParser.scrape(
             self, innertube, proxy=proxy
         )
+
+    def classify(self) -> str | None:
+        '''
+        Classify this video by how completely it has been scraped.
+
+        Mirrors the on-disk filename convention used by the video
+        scraper:
+
+        * ``'video-dlp'`` — every ``video-min`` field below is
+          populated *and* one or more entries exist in
+          :attr:`formats` (yt-dlp has enriched the record on top
+          of the InnerTube pass).
+        * ``'video-min'`` — every field that
+          ``YouTubeVideo.scrape(with_formats=False)`` produces on
+          a public, available video is populated:
+
+            - ``title`` (non-empty)
+            - at least one entry in ``thumbnails``
+            - ``channel_handle`` or ``channel_id`` (either is fine)
+            - ``view_count`` is not None
+            - ``like_count`` is not None
+            - ``url`` (non-empty)
+            - ``embed_url`` (non-empty)
+            - ``description`` (non-empty)
+            - at least one entry in ``keywords``
+            - at least one entry in ``tags``
+
+        * ``None`` — any required field above is missing; the
+          instance is below the ``video-min`` bar.
+        '''
+        if not self.title:
+            return None
+        if not self.thumbnails:
+            return None
+        if not (self.channel_handle or self.channel_id):
+            return None
+        if self.view_count is None or self.like_count is None:
+            return None
+        if not self.url or not self.embed_url:
+            return None
+        if not self.description:
+            return None
+        if not self.keywords:
+            return None
+        if not self.tags:
+            return None
+        if self.formats:
+            return 'video-dlp'
+        return 'video-min'

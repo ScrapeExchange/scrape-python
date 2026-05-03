@@ -26,6 +26,7 @@ from scrape_exchange.scrape_exchange_rate_limiter import (
 from scrape_exchange.worker_id import get_worker_id
 
 if TYPE_CHECKING:
+    from pathlib import Path
     from scrape_exchange.file_management import AssetFileManagement
 
 TOKEN_ENDPOINT: str = '/api/v1/account/token'
@@ -153,12 +154,19 @@ class _UploadJob:
     on HTTP 201, which atomically moves the on-disk asset from the
     base directory into the uploaded directory. This is what encodes
     "request completed successfully" for the rest of the scraper.
+
+    When ``move_source_dir`` is also set, the worker calls
+    ``file_manager.mark_uploaded_from(filename, move_source_dir)``
+    instead — used by the priority-directory pipeline so the
+    source file moves from an external staging directory into
+    ``uploaded_dir`` rather than from ``base_dir``.
     '''
 
     url: str
     json: dict[str, Any]
     file_manager: 'AssetFileManagement | None' = None
     filename: str | None = None
+    move_source_dir: 'Path | None' = None
     entity: str = 'unknown'
     log_extra: dict[str, Any] = field(default_factory=dict)
 
@@ -601,6 +609,7 @@ class ExchangeClient(AsyncClient):
         json: dict[str, Any],
         file_manager: 'AssetFileManagement | None' = None,
         filename: str | None = None,
+        move_source_dir: 'Path | None' = None,
         entity: str = 'unknown',
         log_extra: dict[str, Any] | None = None,
     ) -> bool:
@@ -643,6 +652,7 @@ class ExchangeClient(AsyncClient):
             json=json,
             file_manager=file_manager,
             filename=filename,
+            move_source_dir=move_source_dir,
             entity=entity,
             log_extra=dict(log_extra or {}),
         )
@@ -731,6 +741,22 @@ class ExchangeClient(AsyncClient):
                     worker_id=get_worker_id(),
                 ).set(self._upload_queue.qsize())
 
+    @staticmethod
+    async def _mark_job_uploaded(job: _UploadJob) -> None:
+        '''
+        Dispatch to the right ``mark_uploaded*`` flavour for *job*.
+        When ``job.move_source_dir`` is set the source file lives
+        outside ``base_dir`` (the priority-directory pipeline) and
+        we move it into ``uploaded_dir`` from there; otherwise the
+        regular base-dir path applies.
+        '''
+        if job.move_source_dir is not None:
+            await job.file_manager.mark_uploaded_from(
+                job.filename, job.move_source_dir,
+            )
+        else:
+            await job.file_manager.mark_uploaded(job.filename)
+
     async def _perform_background_upload(
         self, job: _UploadJob,
     ) -> None:
@@ -782,9 +808,7 @@ class ExchangeClient(AsyncClient):
             if (job.file_manager is not None
                     and job.filename is not None):
                 try:
-                    await job.file_manager.mark_uploaded(
-                        job.filename,
-                    )
+                    await self._mark_job_uploaded(job)
                 except OSError as exc:
                     METRIC_BACKGROUND_UPLOADS.labels(
                         platform='youtube',
