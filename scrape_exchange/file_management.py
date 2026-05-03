@@ -15,6 +15,7 @@ Responsibilities:
 :license    : GPLv3
 '''
 
+import os
 import logging
 import secrets
 
@@ -492,12 +493,24 @@ class AssetFileManagement:
     @staticmethod
     def _list_dir(directory: Path, prefix: str | None,
                   suffix: str | None) -> list[str]:
-        return [
-            entry.name for entry in directory.iterdir()
-            if entry.is_file()
-            and (prefix is None or entry.name.startswith(prefix))
-            and (suffix is None or entry.name.endswith(suffix))
-        ]
+        # os.scandir avoids per-entry Path object allocation and
+        # uses the readdir d_type to answer is_file() without a
+        # separate stat() call on filesystems that report it
+        # (ext4, xfs). On directories with millions of files this
+        # is materially cheaper in both syscalls and memory than
+        # Path.iterdir() + Path.is_file().
+        result: list[str] = []
+        with os.scandir(directory) as it:
+            for entry in it:
+                name: str = entry.name
+                if prefix is not None and not name.startswith(prefix):
+                    continue
+                if suffix is not None and not name.endswith(suffix):
+                    continue
+                if not entry.is_file():
+                    continue
+                result.append(name)
+        return result
 
     async def read_file(self, filename: str) -> dict:
         '''
@@ -723,6 +736,48 @@ class AssetFileManagement:
             raise
         logger.debug(
             'Marked src as uploaded',
+            extra={'src': src, 'dst': dst},
+        )
+        return dst
+
+    async def mark_uploaded_from(
+        self, filename: str, source_dir: Path,
+    ) -> Path:
+        '''
+        Move *filename* from *source_dir* into :attr:`uploaded_dir`.
+
+        Same idempotent semantics as :meth:`mark_uploaded` (a
+        prior mover that already placed the destination wins),
+        but the source directory is caller-supplied rather than
+        :attr:`base_dir`. Used by callers that stage assets in
+        an external "priority" directory: after the upload to
+        scrape.exchange returns 201 the bg upload worker calls
+        this method to retire the source file into
+        ``uploaded_dir`` alongside the regular ``base_dir``
+        assets.
+
+        :param filename: Bare filename (no directory component)
+            present in *source_dir* to move.
+        :param source_dir: Directory the file currently lives in.
+        :returns: The new path inside :attr:`uploaded_dir`.
+        :raises OSError: For any rename failure other than the
+            already-marked race described above.
+        '''
+        src: Path = source_dir / filename
+        dst: Path = self.uploaded_dir / filename
+        try:
+            await aiofiles.os.rename(src, dst)
+        except FileNotFoundError:
+            if dst.exists():
+                logger.debug(
+                    'Source already moved to uploaded dir by '
+                    'another process; treating as success',
+                    extra={'src': str(src), 'dst': str(dst)},
+                )
+                return dst
+            raise
+        logger.debug(
+            'Marked src as uploaded (custom source)',
             extra={'src': src, 'dst': dst},
         )
         return dst

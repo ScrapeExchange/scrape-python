@@ -150,7 +150,7 @@ METRIC_CHANNEL_SECONDS_SINCE_LAST_PROCESSED: Gauge = Gauge(
     'channel_seconds_since_last_processed',
     'Seconds elapsed since the channel was last processed '
     '(only set for channels that have been processed before)',
-    ['platform', 'scraper', 'worker_id'],
+    ['platform', 'scraper', 'tier', 'worker_id'],
 )
 METRIC_TIER_ON_TIME: Counter = Counter(
     'channel_tier_on_time_total',
@@ -740,6 +740,7 @@ async def process_channel(
     creator_map_backend: CreatorMap,
     name_map_backend: NameMap,
     channel_validator: SchemaValidator,
+    tier: int,
 ) -> bool | None:
     '''
     Fetches the RSS feed for one channel and checks or stores each video.
@@ -757,6 +758,9 @@ async def process_channel(
     :param client: The authenticated Scrape Exchange API client.
     :param creator_queue: Queue backend (file or Redis).
     :param settings: Worker settings.
+    :param tier: Priority tier the channel was claimed from; used
+        as a Prometheus label on the
+        ``channel_seconds_since_last_processed`` gauge.
     :returns: bool if the channel should be scheduled again
     :raises: httpx.HTTPError if the RSS feed cannot be retrieved.
     :raises: RuntimeError if one or more videos could not be stored.
@@ -776,6 +780,7 @@ async def process_channel(
         METRIC_CHANNEL_SECONDS_SINCE_LAST_PROCESSED.labels(
             platform='youtube',
             scraper='rss_scraper',
+            tier=str(tier),
             worker_id=get_worker_id(),
         ).set(elapsed)
         logging.debug(
@@ -1818,6 +1823,15 @@ async def worker_loop(
         process_now: float = (
             datetime.now(UTC).timestamp()
         )
+        # Pre-fetch the tier for each claimed channel so it can be
+        # passed into ``process_channel`` for the
+        # ``channel_seconds_since_last_processed`` gauge label.
+        # ``process_channel`` may call ``update_tier`` mid-flight,
+        # so the post-call SLA logic re-fetches; the pre-call
+        # value is the tier the channel was claimed from.
+        claim_tiers: list[int] = await asyncio.gather(
+            *[creator_queue.get_tier(cid) for cid, _, _ in batch]
+        )
         results: list = await asyncio.gather(
             *[
                 process_channel(
@@ -1825,8 +1839,11 @@ async def worker_loop(
                     creator_queue, settings,
                     creator_map_backend, name_map_backend,
                     channel_validator,
+                    claim_tier,
                 )
-                for cid, name, _ in batch
+                for (cid, name, _), claim_tier in zip(
+                    batch, claim_tiers,
+                )
             ],
             return_exceptions=True,
         )
