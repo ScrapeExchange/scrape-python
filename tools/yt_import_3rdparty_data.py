@@ -75,6 +75,10 @@ except ImportError:
     _KH_INTERNALS_AVAILABLE = False
 
 from kagglehub.handle import DatasetHandle
+
+from huggingface_hub import HfApi, snapshot_download
+from huggingface_hub.errors import LocalEntryNotFoundError
+
 import pyarrow.parquet as pq
 
 from dateutil import parser as dateutil_parser
@@ -103,6 +107,7 @@ DEFAULT_KAGGLE_DATASETS: list[str] = [
     'shebilmsp/youtube-trending-dataset-updated-daily',
     'senthil03/popular-youtube-videos-and-comments',
     'davidmarkawad/youtube-popularity-dataset',
+    'asaniczka/trending-youtube-videos-113-countries'
 ]
 
 
@@ -208,6 +213,62 @@ class ImportKaggleTrendingSettings(BaseSettings):
             'Local cache directory for kagglehub downloads. '
             'Exported as ``KAGGLEHUB_CACHE`` so kagglehub reads '
             'and writes there instead of its built-in default.'
+        ),
+    )
+    hf_datasets: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices(
+            'HF_DATASETS', 'hf_datasets',
+        ),
+        description=(
+            'Hugging Face dataset repo IDs (``org/name``) to '
+            'download via ``huggingface_hub.snapshot_download`` '
+            'and import. Repeat the flag or set the env var to '
+            'a JSON list. Empty by default — opt-in.'
+        ),
+    )
+    hf_cache_dir: str = Field(
+        default=str(
+            Path.home() / '.cache' / 'huggingface' / 'hub',
+        ),
+        validation_alias=AliasChoices(
+            'HF_CACHE_DIR', 'hf_cache_dir',
+        ),
+        description=(
+            'Local cache directory for huggingface_hub '
+            'downloads. Exported as ``HF_HUB_CACHE`` so '
+            'huggingface_hub reads and writes there instead of '
+            'its built-in default.'
+        ),
+    )
+    kaggle_dataset: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            'KAGGLE_DATASET', 'kaggle_dataset',
+        ),
+        description=(
+            'Ad-hoc single Kaggle dataset to process (slug or '
+            'full dataset URL). When set, the configured '
+            'defaults in ``kaggle_datasets`` AND ``hf_datasets`` '
+            'are skipped — only the ad-hoc selection(s) are '
+            'downloaded and imported. Useful for one-off '
+            'backfills without editing the .env file. May be '
+            'combined with ``--hf-dataset`` to back-fill one '
+            'dataset from each provider in a single run.'
+        ),
+    )
+    hf_dataset: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            'HF_DATASET', 'hf_dataset',
+        ),
+        description=(
+            'Ad-hoc single Hugging Face dataset (repo ID '
+            '``org/name``) to process. Same precedence as '
+            '``--kaggle-dataset``: when either ad-hoc flag is '
+            'set, both default lists (``kaggle_datasets`` and '
+            '``hf_datasets``) are skipped and only the ad-hoc '
+            'selection(s) run.'
         ),
     )
     csv_file: str | None = Field(
@@ -363,8 +424,12 @@ def _extract_channel(
     '''
     channel_id: str = _pick(row, 'channel_id')
     handle: str = _pick(row, 'channel_handle').lstrip('@')
+    if not handle and row.get('channel') and row.get('channel')[0] == '@':
+        handle = str(row.get('channel')).lstrip('@').strip()
+
     if not channel_id and not handle:
         return None, None
+
     record: dict = {
         'channel_id': channel_id or None,
         'channel': handle or None,
@@ -681,6 +746,121 @@ def _dataset_is_cached(slug: str) -> bool | None:
         return None
 
 
+def _dataset_is_cached_hf(repo_id: str) -> bool | None:
+    '''
+    Hugging Face counterpart to :func:`_dataset_is_cached`.
+
+    Asks the Hub API for *repo_id*'s current commit ``sha``, then
+    asks ``huggingface_hub.snapshot_download`` whether the local
+    cache already has that exact revision (via
+    ``local_files_only=True``).
+
+    * ``True``  → the next ``snapshot_download`` will be a cache
+      hit (no new data).
+    * ``False`` → a download will happen.
+    * ``None``  → the pre-check failed (network error, missing
+      auth, repo gone) and the cache state is unknown; the
+      caller falls through to the regular download path.
+    '''
+    try:
+        info = HfApi().dataset_info(repo_id)
+    except Exception as exc:
+        _LOGGER.debug(
+            'HF dataset_info failed; cannot determine cache '
+            'state',
+            exc=exc, extra={'repo_id': repo_id},
+        )
+        return None
+    if info.sha is None:
+        return None
+    try:
+        snapshot_download(
+            repo_id=repo_id,
+            repo_type='dataset',
+            revision=info.sha,
+            local_files_only=True,
+        )
+        return True
+    except LocalEntryNotFoundError:
+        return False
+    except Exception as exc:
+        _LOGGER.debug(
+            'HF cache pre-check failed; falling back to '
+            'default download path',
+            exc=exc, extra={'repo_id': repo_id},
+        )
+        return None
+
+
+async def _walk_and_import(
+    report: DatasetReport,
+    local_path: Path,
+    third_party_save_dir: Path,
+    channels_file: Path,
+    seen_channels: set[str],
+) -> None:
+    '''
+    Walk *local_path* for supported data files, run each through
+    :func:`import_file`, and flush newly-discovered channels.
+    Updates *report* in place.
+
+    Shared by :func:`import_dataset` (Kaggle) and
+    :func:`import_hf_dataset` (Hugging Face) — once the dataset's
+    files are on disk, the downstream processing is identical.
+    '''
+    files: list[Path] = _find_data_files(local_path)
+    if not files:
+        _LOGGER.warning(
+            'No supported data files found in dataset',
+            extra={
+                'slug': report.slug,
+                'local_path': str(local_path),
+                'supported_suffixes': list(_SUPPORTED_SUFFIXES),
+            },
+        )
+        return
+    report.files = files
+
+    discovered: dict[str, dict] = {}
+    for data_path in files:
+        _LOGGER.info(
+            'Processing data file',
+            extra={
+                'slug': report.slug,
+                'data_path': str(data_path),
+            },
+        )
+        stats: ImportStats = await import_file(
+            data_path, third_party_save_dir,
+            discovered, seen_channels,
+        )
+        _LOGGER.info(
+            'Data file complete',
+            extra={
+                'slug': report.slug,
+                'data_file': data_path.name,
+                'written': stats.written,
+                'skipped': stats.skipped,
+                'errors': stats.errors,
+            },
+        )
+        report.stats.merge(stats)
+
+    if discovered:
+        _append_channels_jsonl(
+            channels_file, list(discovered.values()),
+        )
+        seen_channels.update(discovered.keys())
+        _LOGGER.info(
+            'Appended new channels to channels file',
+            extra={
+                'slug': report.slug,
+                'new_channels': len(discovered),
+                'channels_file': str(channels_file),
+            },
+        )
+
+
 async def import_dataset(
     slug: str, third_party_save_dir: Path,
     channels_file: Path, seen_channels: set[str],
@@ -739,56 +919,75 @@ async def import_dataset(
         'Dataset not cached, scanning for data files',
         extra={'slug': slug, 'local_path': str(local_path)},
     )
-    files: list[Path] = _find_data_files(local_path)
-    if not files:
-        _LOGGER.warning(
-            'No supported data files found in dataset',
+    await _walk_and_import(
+        report, local_path, third_party_save_dir,
+        channels_file, seen_channels,
+    )
+    return report
+
+
+async def import_hf_dataset(
+    repo_id: str, third_party_save_dir: Path,
+    channels_file: Path, seen_channels: set[str],
+) -> DatasetReport:
+    '''
+    Hugging Face counterpart to :func:`import_dataset`.
+
+    Downloads *repo_id* via
+    :func:`huggingface_hub.snapshot_download` (``repo_type=
+    'dataset'``) and runs :func:`_walk_and_import` over the
+    resulting snapshot directory.
+
+    Before downloading, :func:`_dataset_is_cached_hf` checks
+    whether the current revision is already on disk; on a hit
+    the file walk is skipped (mirrors the Kaggle path).
+    '''
+
+    report: DatasetReport = DatasetReport(slug=repo_id)
+    report.cached = _dataset_is_cached_hf(repo_id)
+    _LOGGER.info(
+        'Downloading dataset via huggingface_hub',
+        extra={'repo_id': repo_id, 'cached': report.cached},
+    )
+    try:
+        local_path: Path = Path(snapshot_download(
+            repo_id=repo_id, repo_type='dataset',
+        ))
+    except Exception as exc:
+        report.download_error = (
+            f'{type(exc).__name__}: {exc}'
+        )
+        report.stats.errors += 1
+        _LOGGER.error(
+            'Failed to download HF dataset', exc=exc,
             extra={
-                'slug': slug,
-                'local_path': str(local_path),
-                'supported_suffixes': list(_SUPPORTED_SUFFIXES),
+                'repo_id': repo_id,
+                'download_error': report.download_error,
             },
         )
         return report
-    report.files = files
 
-    discovered: dict[str, dict] = {}
-    for data_path in files:
+    if report.cached is True:
         _LOGGER.info(
-            'Processing data file',
+            'HF dataset already cached; skipping file walk',
             extra={
-                'slug': slug,
-                'data_path': str(data_path),
+                'repo_id': repo_id,
+                'local_path': str(local_path),
             },
         )
-        stats: ImportStats = await import_file(
-            data_path, third_party_save_dir, discovered, seen_channels,
-        )
-        _LOGGER.info(
-            'Data file complete',
-            extra={
-                'slug': slug,
-                'data_file': data_path.name,
-                'written': stats.written,
-                'skipped': stats.skipped,
-                'errors': stats.errors,
-            },
-        )
-        report.stats.merge(stats)
+        return report
 
-    if discovered:
-        _append_channels_jsonl(
-            channels_file, list(discovered.values()),
-        )
-        seen_channels.update(discovered.keys())
-        _LOGGER.info(
-            'Appended new channels to channels file',
-            extra={
-                'slug': slug,
-                'new_channels': len(discovered),
-                'channels_file': str(channels_file),
-            },
-        )
+    _LOGGER.info(
+        'HF dataset not cached, scanning for data files',
+        extra={
+            'repo_id': repo_id,
+            'local_path': str(local_path),
+        },
+    )
+    await _walk_and_import(
+        report, local_path, third_party_save_dir,
+        channels_file, seen_channels,
+    )
     return report
 
 
@@ -865,33 +1064,21 @@ async def _run_manual_file(
     return 0 if stats.errors == 0 else 1
 
 
-async def _run_kaggle(
-    settings: ImportKaggleTrendingSettings,
+async def _import_kaggle_datasets(
+    raw_slugs: list[str],
     third_party_save_dir: Path,
-) -> int:
+    channels_file: Path,
+    seen_channels: set[str],
+    grand: ImportStats,
+    reports: list[DatasetReport],
+) -> None:
     '''
-    Default mode: download every configured dataset and
-    import all supported data files within.
+    Iterate *raw_slugs* and import each via
+    :func:`import_dataset`. Caller owns *seen_channels*,
+    *grand*, and *reports* and shares them across providers.
     '''
-
-    cache_dir: Path = Path(settings.kaggle_cache_dir).expanduser()
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    # kagglehub reads this env var lazily on each call, so
-    # exporting it before any download is sufficient. The
-    # explicit ``KAGGLEHUB_CACHE`` name is what the library
-    # documents; we don't reuse the legacy ``KAGGLE_CONFIG_DIR``
-    # which controls credential location, not download cache.
-    os.environ['KAGGLEHUB_CACHE'] = str(cache_dir)
-
-    channels_file: Path = _resolve_channels_file(
-        settings, third_party_save_dir
-    )
-    seen_channels: set[str] = set()
     seen_slugs: set[str] = set()
-    grand: ImportStats = ImportStats()
-    reports: list[DatasetReport] = []
-    for raw in settings.kaggle_datasets:
+    for raw in raw_slugs:
         try:
             slug: str = _parse_slug(raw)
         except ValueError as exc:
@@ -909,10 +1096,126 @@ async def _run_kaggle(
             continue
         seen_slugs.add(slug)
         report: DatasetReport = await import_dataset(
-            slug, third_party_save_dir, channels_file, seen_channels,
+            slug, third_party_save_dir,
+            channels_file, seen_channels,
         )
         reports.append(report)
         grand.merge(report.stats)
+
+
+async def _import_hf_datasets(
+    raw_repo_ids: list[str],
+    third_party_save_dir: Path,
+    channels_file: Path,
+    seen_channels: set[str],
+    grand: ImportStats,
+    reports: list[DatasetReport],
+) -> None:
+    '''
+    Iterate *raw_repo_ids* and import each via
+    :func:`import_hf_dataset`. Symmetric with
+    :func:`_import_kaggle_datasets`.
+    '''
+    seen_repo_ids: set[str] = set()
+    for repo_id in raw_repo_ids:
+        repo_id = repo_id.strip()
+        if not repo_id:
+            continue
+        if repo_id in seen_repo_ids:
+            _LOGGER.info(
+                'Skipping duplicate dataset',
+                extra={'repo_id': repo_id},
+            )
+            continue
+        seen_repo_ids.add(repo_id)
+        report: DatasetReport = await import_hf_dataset(
+            repo_id, third_party_save_dir,
+            channels_file, seen_channels,
+        )
+        reports.append(report)
+        grand.merge(report.stats)
+
+
+async def _run_3rd_party(
+    settings: ImportKaggleTrendingSettings,
+    third_party_save_dir: Path,
+) -> int:
+    '''
+    Default mode: download every configured Kaggle and Hugging
+    Face dataset and import all supported data files within.
+    Both providers share a single ``seen_channels`` set so a
+    channel discovered in (e.g.) a Kaggle slug isn't re-flushed
+    when it also appears in an HF repo.
+    '''
+
+    kaggle_cache_dir: Path = Path(
+        settings.kaggle_cache_dir,
+    ).expanduser()
+    kaggle_cache_dir.mkdir(parents=True, exist_ok=True)
+    # kagglehub reads this env var lazily on each call, so
+    # exporting it before any download is sufficient. The
+    # explicit ``KAGGLEHUB_CACHE`` name is what the library
+    # documents; we don't reuse the legacy ``KAGGLE_CONFIG_DIR``
+    # which controls credential location, not download cache.
+    os.environ['KAGGLEHUB_CACHE'] = str(kaggle_cache_dir)
+
+    hf_cache_dir: Path = Path(
+        settings.hf_cache_dir,
+    ).expanduser()
+    hf_cache_dir.mkdir(parents=True, exist_ok=True)
+    # ``HF_HUB_CACHE`` is the modern, narrowly-scoped env var
+    # for the Hub download cache (``HF_HOME`` is the broader
+    # config root). We point only the hub cache so other HF
+    # state lives wherever the user has it configured.
+    os.environ['HF_HUB_CACHE'] = str(hf_cache_dir)
+
+    channels_file: Path = _resolve_channels_file(
+        settings, third_party_save_dir,
+    )
+    seen_channels: set[str] = set()
+    grand: ImportStats = ImportStats()
+    reports: list[DatasetReport] = []
+
+    # ``--kaggle-dataset`` and ``--hf-dataset`` are ad-hoc,
+    # single-shot overrides: when either is set, process only
+    # the ad-hoc selection(s) and skip every default list. Both
+    # may be set together to back-fill one dataset from each
+    # provider in a single run.
+    kaggle_slugs: list[str]
+    hf_repo_ids: list[str]
+    if settings.kaggle_dataset or settings.hf_dataset:
+        _LOGGER.info(
+            'Ad-hoc dataset specified; skipping the default '
+            'Kaggle and HF dataset lists',
+            extra={
+                'kaggle_dataset': settings.kaggle_dataset,
+                'hf_dataset': settings.hf_dataset,
+                'skipped_kaggle_count': len(
+                    settings.kaggle_datasets,
+                ),
+                'skipped_hf_count': len(settings.hf_datasets),
+            },
+        )
+        kaggle_slugs = (
+            [settings.kaggle_dataset]
+            if settings.kaggle_dataset else []
+        )
+        hf_repo_ids = (
+            [settings.hf_dataset]
+            if settings.hf_dataset else []
+        )
+    else:
+        kaggle_slugs = settings.kaggle_datasets
+        hf_repo_ids = settings.hf_datasets
+
+    await _import_kaggle_datasets(
+        kaggle_slugs, third_party_save_dir, channels_file,
+        seen_channels, grand, reports,
+    )
+    await _import_hf_datasets(
+        hf_repo_ids, third_party_save_dir, channels_file,
+        seen_channels, grand, reports,
+    )
 
     _emit_summary(reports, grand)
     return 0 if grand.errors == 0 else 1
@@ -967,7 +1270,7 @@ async def main() -> int:
     if settings.csv_file:
         return await _run_manual_file(settings, third_party_save_dir)
 
-    return await _run_kaggle(settings, third_party_save_dir)
+    return await _run_3rd_party(settings, third_party_save_dir)
 
 
 if __name__ == '__main__':
