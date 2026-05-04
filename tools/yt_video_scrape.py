@@ -2173,24 +2173,37 @@ async def _video_has_formats_on_server(
         this video with one or more format entries.
     '''
 
-    url: str = (
+    uploader: str | None = exchange_client.authenticated_username
+    if not uploader:
+        return False
+
+    filter_url: str = (
         f'{settings.exchange_url}'
-        f'{ExchangeClient.GET_DATA_PARAM}'
-        f'/{settings.schema_owner}'
-        f'/youtube/video'
-        f'/{settings.schema_version}'
-        f'/{video_id}'
+        f'{ExchangeClient.GET_FILTER_API}'
     )
+    body: dict[str, any] = {
+        'username': uploader,
+        'platform': 'youtube',
+        'entity': 'video',
+        'platform_content_id': video_id,
+        'first': 1,
+    }
     try:
-        resp: Response = await exchange_client.get(url)
+        resp: Response = await exchange_client.post(
+            filter_url, json=body,
+        )
     except Exception:
         return False
     if resp.status_code != 200:
         return False
     try:
-        metadata: dict[str, any] = resp.json()
+        payload: dict[str, any] = resp.json()
     except Exception:
         return False
+    edges: list[dict[str, any]] = payload.get('edges') or []
+    if not edges:
+        return False
+    metadata: dict[str, any] = edges[0].get('node') or {}
     data_url: str | None = metadata.get('data_url')
     if not data_url:
         return False

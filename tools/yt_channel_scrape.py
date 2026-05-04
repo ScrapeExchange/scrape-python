@@ -21,9 +21,11 @@ import resource
 
 from random import shuffle
 from pathlib import Path
+from typing import Any
 
 import aiofiles
 import orjson
+import redis.asyncio as aioredis
 
 from httpx import Response
 from watchfiles import awatch, Change
@@ -64,22 +66,24 @@ from scrape_exchange.scraper_runner import (
 from scrape_exchange.settings import normalize_log_level
 from scrape_exchange.util import extract_proxy_ip, proxy_network_for
 
-from scrape_exchange.youtube.youtube_channel import YouTubeChannel
-from scrape_exchange.youtube.youtube_rate_limiter import YouTubeRateLimiter
-from scrape_exchange.youtube.youtube_video import DENO_PATH, PO_TOKEN_URL
-from scrape_exchange.worker_id import get_worker_id
-
+from scrape_exchange.redis_claim import RedisClaim
 from scrape_exchange.schema_validator import (
     SchemaValidator,
     fetch_schema_dict,
 )
+from scrape_exchange.worker_id import get_worker_id
+from scrape_exchange.youtube.exchange_channels_set import (
+    RedisExchangeChannelsSet,
+)
 from scrape_exchange.youtube.settings import YouTubeScraperSettings
+from scrape_exchange.youtube.youtube_channel import YouTubeChannel
+from scrape_exchange.youtube.youtube_rate_limiter import YouTubeRateLimiter
+from scrape_exchange.youtube.youtube_video import DENO_PATH, PO_TOKEN_URL
 
 CHANNEL_FILE_POSTFIX = '.json.br'
 
 MAX_NEW_CHANNELS: int = 1000
 MAX_RESOLVED_CHANNELS: int = 100
-
 
 
 class ChannelSettings(YouTubeScraperSettings):
@@ -282,6 +286,33 @@ METRIC_CHANNEL_NO_CONTENT_FOUND = Counter(
     ['platform', 'scraper', 'entity', 'worker_id', 'proxy_ip',
      'proxy_network'],
 )
+METRIC_CHANNEL_RESOLVE_CLAIM: Counter = Counter(
+    'channel_resolve_claim_total',
+    'Per-id resolution-claim outcomes for cross-fleet '
+    'deduplication of channel_id resolutions',
+    [
+        'platform', 'scraper', 'entity', 'outcome',
+        'worker_id',
+    ],
+)
+METRIC_CHANNEL_EXCHANGE_SET_LOOKUP: Counter = Counter(
+    'channel_exchange_set_lookups_total',
+    'Per-handle lookups against youtube:exchange_channels — '
+    'replaces per-candidate channel_exists HTTP calls',
+    [
+        'platform', 'scraper', 'entity', 'outcome',
+        'worker_id',
+    ],
+)
+METRIC_CHANNEL_SCRAPE_CLAIM: Counter = Counter(
+    'channel_scrape_claim_total',
+    'Per-handle scrape-claim outcomes for cross-host '
+    'deduplication of channel scrapes',
+    [
+        'platform', 'scraper', 'entity', 'outcome',
+        'worker_id',
+    ],
+)
 
 # -- scheduled bulk-upload metrics --
 # Re-use the exchange_client counter (same metric name) to avoid a
@@ -417,8 +448,17 @@ async def _run_worker(
         # the state file. Must run before ``upload_channels``
         # so the same source files don't enter a fresh batch
         # while a prior batch is still pending server-side.
+        resume_redis: aioredis.Redis | None = (
+            creator_map_backend.redis_client
+        )
+        resume_exchange_set: RedisExchangeChannelsSet | None = (
+            RedisExchangeChannelsSet(resume_redis)
+            if resume_redis is not None else None
+        )
         await resume_pending_bulk_uploads(
             fm, ctx.client, settings.exchange_url,
+            exchange_set=resume_exchange_set,
+            handle_from_filename=_handle_from_channel_filename,
         )
         logging.info('Starting initial channel upload pass')
         await upload_channels(
@@ -495,19 +535,51 @@ def main() -> None:
 
 async def channel_exists(client: ExchangeClient, channel_handle: str) -> bool:
     '''
-    Checks if a channel with the given name already exists on Scrape Exchange.
+    Check if the authenticated account has already uploaded a
+    YouTube channel record matching ``channel_handle``, across
+    any schema version.
+
+    Implemented with ``POST /api/v1/filter`` using
+    ``username=<authenticated>`` so the answer is scoped to this
+    uploader's records — peer accounts uploading the same handle
+    do not mask a fresh scrape on this account.
 
     :param client: The Scrape Exchange client instance.
-    :param channel_handle: The name of the YouTube channel to check.
-    :returns: True if the channel exists, False otherwise.
-    :raises: (none)
+    :param channel_handle: The handle of the YouTube channel to
+        check.
+    :returns: True if at least one matching record exists for
+        this uploader, False on no match or any error
+        (fail-open).
     '''
 
-    try:
-        resp: Response = await client.get(
-            f'{client.exchange_url}{ExchangeClient.GET_CONTENT_API}'
-            f'/youtube/channel/{channel_handle}'
+    uploader: str | None = client.authenticated_username
+    if not uploader:
+        METRIC_CHANNEL_EXISTS_FAILURES.labels(
+            platform='youtube',
+            scraper='channel_scraper',
+            entity='channel',
+            outcome='failed',
+            worker_id=get_worker_id(),
+        ).inc()
+        logging.warning(
+            'No authenticated username on ExchangeClient; cannot '
+            'scope channel-exists check to this uploader',
+            extra={'channel_handle': channel_handle},
         )
+        return False
+
+    url: str = (
+        f'{client.exchange_url}{ExchangeClient.GET_FILTER_API}'
+    )
+    body: dict[str, Any] = {
+        'username': uploader,
+        'platform': 'youtube',
+        'entity': 'channel',
+        'platform_content_id': channel_handle,
+        'first': 1,
+    }
+    try:
+        resp: Response = await client.post(url, json=body)
     except Exception as exc:
         METRIC_CHANNEL_EXISTS_FAILURES.labels(
             platform='youtube',
@@ -523,36 +595,7 @@ async def channel_exists(client: ExchangeClient, channel_handle: str) -> bool:
         )
         return False
 
-    if resp.status_code == 200:
-        data: dict = resp.json()
-        exists: bool = data.get('exists', False)
-        if exists:
-            METRIC_CHANNEL_EXISTS_FOUND.labels(
-                platform='youtube',
-                scraper='channel_scraper',
-                entity='channel',
-                outcome='found',
-                worker_id=get_worker_id(),
-            ).inc()
-        else:
-            METRIC_CHANNEL_EXISTS_NOT_FOUND.labels(
-                platform='youtube',
-                scraper='channel_scraper',
-                entity='channel',
-                outcome='not_found',
-                worker_id=get_worker_id(),
-            ).inc()
-        return exists
-    elif resp.status_code == 404:
-        METRIC_CHANNEL_EXISTS_NOT_FOUND.labels(
-            platform='youtube',
-            scraper='channel_scraper',
-            entity='channel',
-            outcome='not_found',
-            worker_id=get_worker_id(),
-        ).inc()
-        return False
-    else:
+    if resp.status_code != 200:
         METRIC_CHANNEL_EXISTS_FAILURES.labels(
             platform='youtube',
             scraper='channel_scraper',
@@ -566,11 +609,21 @@ async def channel_exists(client: ExchangeClient, channel_handle: str) -> bool:
                 'channel_handle': channel_handle,
                 'status_code': resp.status_code,
                 'response_text': resp.text,
-            }
+            },
         )
-        # Assume the channel does not exist if there was
-        # an error checking
         return False
+
+    payload: dict = resp.json()
+    edges: list[dict] = payload.get('edges') or []
+    exists: bool = len(edges) > 0
+    METRIC_CHANNEL_EXISTS_FOUND.labels(
+        platform='youtube',
+        scraper='channel_scraper',
+        entity='channel',
+        outcome='found' if exists else 'not_found',
+        worker_id=get_worker_id(),
+    ).inc()
+    return exists
 
 
 async def scrape_channels(
@@ -829,6 +882,7 @@ async def _upload_one_channel_batch(
     settings: ChannelSettings,
     client: ExchangeClient,
     fm: AssetFileManagement,
+    exchange_set: RedisExchangeChannelsSet | None = None,
 ) -> None:
     '''
     Dispatch one prepared batch of channel records via the shared
@@ -854,6 +908,8 @@ async def _upload_one_channel_batch(
             settings.bulk_progress_timeout_seconds
         ),
         filename_prefix='channels',
+        exchange_set=exchange_set,
+        handle_from_filename=_handle_from_channel_filename,
     )
     METRIC_BULK_BATCHES.labels(
         platform='youtube',
@@ -939,6 +995,13 @@ async def upload_channels(
     max_records: int = settings.bulk_batch_size
     max_bytes: int = settings.bulk_max_batch_bytes
     concurrency: int = max(settings.channel_concurrency, 1)
+    redis_for_set: aioredis.Redis | None = (
+        creator_map_backend.redis_client
+    )
+    exchange_set: RedisExchangeChannelsSet | None = (
+        RedisExchangeChannelsSet(redis_for_set)
+        if redis_for_set is not None else None
+    )
 
     # Process files in concurrent chunks of *concurrency* size.
     # Each task does the per-file I/O (read+decompress, creator_map
@@ -1006,6 +1069,7 @@ async def upload_channels(
                 await _upload_one_channel_batch(
                     bytes(batch_buf), batch_records,
                     settings, client, fm,
+                    exchange_set=exchange_set,
                 )
                 batch_buf = bytearray()
                 batch_records = []
@@ -1229,6 +1293,18 @@ def normalize_channel_name(channel_handle: str) -> str:
 
 def get_channel_filename(channel_handle: str) -> str:
     return f'{CHANNEL_FILE_PREFIX}{channel_handle}{CHANNEL_FILE_POSTFIX}'
+
+
+def _handle_from_channel_filename(filename: str) -> str:
+    '''Strip ``channel-`` prefix and ``.json.br`` suffix to recover
+    the bare handle, the inverse of :func:`get_channel_filename`.
+
+    Used by the bulk-upload write-back into
+    ``youtube:exchange_channels`` so apply_bulk_results doesn't need
+    to know channel-specific filename conventions.'''
+    return filename.removeprefix(
+        CHANNEL_FILE_PREFIX,
+    ).removesuffix(CHANNEL_FILE_POSTFIX)
 
 
 def _failed_marker_is_stale(
@@ -1482,6 +1558,168 @@ async def _load_channel_from_disk(
         return None
 
 
+async def _try_acquire_scrape_claim(
+    channel_handle: str,
+    creator_map_backend: CreatorMap,
+) -> tuple['RedisClaim | None', str]:
+    '''Try to acquire ``youtube:scraping:<channel_handle>`` on the
+    Redis behind ``creator_map_backend``. The claim coordinates
+    cross-host scrape work so two hosts running the same channel
+    list don't both burn an InnerTube ``BROWSE`` budget on the
+    same handle.
+
+    Returns ``(claim, status)`` where ``status`` is one of:
+
+    * ``'won'``: claim is held; caller must call
+      ``RedisClaim.release(channel_handle)`` on terminal outcome.
+    * ``'lost'``: a peer host holds the claim; caller should
+      skip the scrape.
+    * ``'no_redis'``: ``creator_map_backend`` has no Redis
+      backend; ``claim`` is ``None`` and the caller should
+      proceed without cross-host coordination.
+
+    Emits ``channel_scrape_claim_total`` on won/lost so the
+    caller doesn't have to repeat the labels. TTL is 5 minutes
+    — channel scrapes typically finish in seconds, so the TTL
+    is the crash-recovery floor, not the expected hold time.
+    '''
+    redis_for_claim: aioredis.Redis | None = (
+        creator_map_backend.redis_client
+    )
+    if redis_for_claim is None:
+        return None, 'no_redis'
+    claim: RedisClaim = RedisClaim(
+        redis_for_claim,
+        key_prefix='youtube:scraping:',
+        ttl_seconds=300,
+        owner=get_worker_id(),
+    )
+    won: bool = await claim.try_claim(channel_handle)
+    METRIC_CHANNEL_SCRAPE_CLAIM.labels(
+        platform='youtube',
+        scraper='channel_scraper',
+        entity='channel',
+        outcome='won' if won else 'lost',
+        worker_id=get_worker_id(),
+    ).inc()
+    if not won:
+        return None, 'lost'
+    return claim, 'won'
+
+
+async def _scrape_channel_to_disk(
+    settings: ChannelSettings,
+    fm: AssetFileManagement,
+    channel_handle: str,
+    filename: str,
+    creator_map_backend: CreatorMap,
+    extra: dict[str, str],
+) -> tuple[bool, bool | None, YouTubeChannel | None]:
+    '''Acquire the cross-host scrape claim, run InnerTube, persist
+    on success. Returns
+    ``(should_continue, early_return, channel)``:
+
+    * ``(True, None, channel)`` — file is on disk; caller should
+      fall through to the upload step. The freshly-scraped
+      ``YouTubeChannel`` is returned so the upload path doesn't
+      need a redundant disk reload.
+    * ``(False, False, None)`` — claim lost, scrape failed, or
+      channel had no content; caller should ``return False``.
+    * ``(False, True, None)`` — persist failed; caller should
+      ``return True``.
+
+    The claim is held only across the InnerTube scrape + persist;
+    upload doesn't need it (the bulk-upload write-back to
+    ``youtube:exchange_channels`` covers steady-state dedup).
+    '''
+    scrape_claim: RedisClaim | None
+    claim_status: str
+    scrape_claim, claim_status = (
+        await _try_acquire_scrape_claim(
+            channel_handle, creator_map_backend,
+        )
+    )
+    if claim_status == 'lost':
+        logging.debug(
+            'Channel scrape claim held by peer host, skipping',
+            extra=extra,
+        )
+        return False, False, None
+
+    try:
+        return await _do_scrape_channel_to_disk(
+            settings, fm, channel_handle, filename, extra,
+        )
+    finally:
+        if scrape_claim is not None:
+            await scrape_claim.release(channel_handle)
+
+
+async def _do_scrape_channel_to_disk(
+    settings: ChannelSettings,
+    fm: AssetFileManagement,
+    channel_handle: str,
+    filename: str,
+    extra: dict[str, str],
+) -> tuple[bool, bool | None, YouTubeChannel | None]:
+    '''Inner half of :func:`_scrape_channel_to_disk` — runs while
+    the cross-host scrape claim is held. Same return contract.'''
+    logging.debug(
+        'Channel not scraped, scraping now', extra=extra,
+    )
+    channel: YouTubeChannel = YouTubeChannel(
+        channel_handle=channel_handle, deno_path=DENO_PATH,
+        po_token_url=PO_TOKEN_URL, debug=True,
+        save_dir=settings.channel_data_directory,
+        with_download_client=False,
+    )
+    ok: bool
+    scrape_proxy: str | None
+    ok, scrape_proxy = await _try_scrape_channel(
+        channel, settings, fm, channel_handle, extra,
+    )
+    if not ok:
+        return False, False, None
+
+    scrape_proxy_ip: str = (
+        extract_proxy_ip(scrape_proxy)
+        if scrape_proxy else 'none'
+    )
+    scrape_proxy_network: str = proxy_network_for(
+        scrape_proxy_ip,
+    )
+
+    if _channel_has_no_content(
+        channel, scrape_proxy_ip,
+        scrape_proxy_network, channel_handle,
+    ):
+        return False, False, None
+
+    if not await _persist_scraped_channel(
+        fm, filename, channel, channel_handle,
+    ):
+        return False, True, None
+
+    METRIC_CHANNELS_SCRAPED.labels(
+        platform='youtube',
+        scraper='channel_scraper',
+        entity='channel',
+        api='html',
+        worker_id=get_worker_id(),
+        proxy_ip=scrape_proxy_ip,
+        proxy_network=scrape_proxy_network,
+    ).inc()
+    logging.info(
+        'Downloaded channel',
+        extra={
+            'channel_handle': channel_handle,
+            'proxy_ip': scrape_proxy_ip,
+            'proxy_network': scrape_proxy_network,
+        },
+    )
+    return True, None, channel
+
+
 async def scrape_channel(
     settings: ChannelSettings,
     client: ExchangeClient,
@@ -1518,55 +1756,16 @@ async def scrape_channel(
     channel: YouTubeChannel | None = None
 
     if not base_path.exists():
-        logging.debug(
-            'Channel not scraped, scraping now', extra=extra,
+        proceed: bool
+        early: bool | None
+        proceed, early, channel = (
+            await _scrape_channel_to_disk(
+                settings, fm, channel_handle, filename,
+                creator_map_backend, extra,
+            )
         )
-        channel = YouTubeChannel(
-            channel_handle=channel_handle, deno_path=DENO_PATH,
-            po_token_url=PO_TOKEN_URL, debug=True,
-            save_dir=settings.channel_data_directory,
-            with_download_client=False,
-        )
-        ok: bool
-        scrape_proxy: str | None
-        ok, scrape_proxy = await _try_scrape_channel(
-            channel, settings, fm, channel_handle, extra,
-        )
-        if not ok:
-            return False
-
-        scrape_proxy_ip: str = (
-            extract_proxy_ip(scrape_proxy) if scrape_proxy else 'none'
-        )
-        scrape_proxy_network: str = proxy_network_for(scrape_proxy_ip)
-
-        if _channel_has_no_content(
-            channel, scrape_proxy_ip, scrape_proxy_network, channel_handle,
-        ):
-            return False
-
-        if not await _persist_scraped_channel(
-            fm, filename, channel, channel_handle,
-        ):
-            return True
-
-        METRIC_CHANNELS_SCRAPED.labels(
-            platform='youtube',
-            scraper='channel_scraper',
-            entity='channel',
-            api='html',
-            worker_id=get_worker_id(),
-            proxy_ip=scrape_proxy_ip,
-            proxy_network=scrape_proxy_network,
-        ).inc()
-        logging.info(
-            'Downloaded channel',
-            extra={
-                'channel_handle': channel_handle,
-                'proxy_ip': scrape_proxy_ip,
-                'proxy_network': scrape_proxy_network,
-            },
-        )
+        if not proceed:
+            return bool(early)
 
     if settings.channel_no_upload:
         logging.debug(
@@ -1869,6 +2068,52 @@ async def _select_new_channels(
     return selected
 
 
+async def _select_new_channels_via_set(
+    candidates: list[str],
+    exchange_channels: RedisExchangeChannelsSet,
+    max_new_channels: int,
+    already_resolved_count: int,
+) -> set[str]:
+    '''Same contract as :func:`_select_new_channels` but uses
+    a single batched ``SISMEMBER`` call instead of per-candidate
+    ``channel_exists`` HTTP roundtrips.'''
+    capped: list[str] = candidates[:max_new_channels]
+    membership: dict[str, bool] = (
+        await exchange_channels.contains_many(capped)
+    )
+    selected: set[str] = set()
+    for handle in capped:
+        if membership.get(handle, False):
+            METRIC_CHANNEL_EXCHANGE_SET_LOOKUP.labels(
+                platform='youtube',
+                scraper='channel_scraper',
+                entity='channel',
+                outcome='hit',
+                worker_id=get_worker_id(),
+            ).inc()
+            continue
+        METRIC_CHANNEL_EXCHANGE_SET_LOOKUP.labels(
+            platform='youtube',
+            scraper='channel_scraper',
+            entity='channel',
+            outcome='miss',
+            worker_id=get_worker_id(),
+        ).inc()
+        selected.add(handle)
+        if (
+            len(selected) + already_resolved_count
+        ) >= max_new_channels:
+            logging.info(
+                'Reached maximum new channels to scrape, '
+                'stopping read',
+                extra={
+                    'max_new_channels': max_new_channels,
+                },
+            )
+            break
+    return selected
+
+
 async def _read_channel_list_file(
     file_path: str,
 ) -> tuple[list[str], list[str]]:
@@ -2049,9 +2294,19 @@ async def read_channels(
             entity='channel',
             worker_id=get_worker_id(),
         ).set(len(unresolved_ids))
+        resolve_claim: RedisClaim | None = None
+        redis_client = creator_map_backend.redis_client
+        if redis_client is not None:
+            resolve_claim = RedisClaim(
+                redis_client=redis_client,
+                key_prefix='youtube:resolving:',
+                ttl_seconds=60,
+                owner=get_worker_id(),
+            )
         resolved_channels = await review_unresolved_ids(
             unresolved_ids, creator_map_backend, fm,
-            concurrency, max_resolved_channels
+            concurrency, max_resolved_channels,
+            claim=resolve_claim,
         )
         new_channel_handles.update(resolved_channels)
 
@@ -2063,10 +2318,28 @@ async def read_channels(
         'Checking existence of channel handles on Scrape Exchange',
         extra={'max_new_channels': max_new_channels},
     )
-    checked_channel_handles: set[str] = await _select_new_channels(
-        candidates, exchange_client, max_new_channels,
-        len(resolved_channels),
+    checked_channel_handles: set[str]
+    redis_client_for_set: aioredis.Redis | None = (
+        creator_map_backend.redis_client
     )
+    if redis_client_for_set is not None:
+        exchange_set: RedisExchangeChannelsSet = (
+            RedisExchangeChannelsSet(redis_client_for_set)
+        )
+        checked_channel_handles = (
+            await _select_new_channels_via_set(
+                candidates, exchange_set,
+                max_new_channels, len(resolved_channels),
+            )
+        )
+    else:
+        checked_channel_handles = (
+            await _select_new_channels(
+                candidates, exchange_client,
+                max_new_channels,
+                len(resolved_channels),
+            )
+        )
 
     METRIC_UNIQUE_CHANNELS_READ.labels(
         platform='youtube',
@@ -2086,23 +2359,129 @@ async def read_channels(
     return checked_channel_handles
 
 
+async def _innertube_resolve(
+    channel_id: str,
+    creator_map_backend: CreatorMap,
+    fm: AssetFileManagement,
+) -> str | None:
+    '''Call YouTube InnerTube and update creator_map.
+
+    Returns the resolved handle, or None on any failure.
+    Owns all metric increments for the resolved/failed
+    outcomes.
+    '''
+    try:
+        name: str = (
+            await YouTubeChannel.resolve_channel_id(channel_id)
+        )
+    except Exception as e:
+        METRIC_CHANNEL_ID_RESOLUTION_FAILURES.labels(
+            platform='youtube',
+            scraper='channel_scraper',
+            entity='channel',
+            outcome='failed',
+            worker_id=get_worker_id(),
+        ).inc()
+        logging.debug(
+            'Error while resolving channel ID',
+            exc=e,
+            extra={'channel_id': channel_id},
+        )
+        return None
+
+    if not name:
+        unresolved_file_path: Path = fm.marker_path(
+            f'{CHANNEL_FILE_PREFIX}{channel_id}',
+            '.unresolved',
+        )
+        if unresolved_file_path.exists():
+            logging.debug(
+                'Channel ID previously failed to '
+                'resolve, skipping',
+                extra={'channel_id': channel_id},
+            )
+        else:
+            logging.info(
+                'Failed to resolve channel ID, '
+                'touching unresolved file',
+                extra={
+                    'channel_id': channel_id,
+                    'unresolved_file_path':
+                        unresolved_file_path,
+                },
+            )
+            await fm.mark_unresolved(
+                f'{CHANNEL_FILE_PREFIX}{channel_id}',
+                content=f'{channel_id}\n',
+            )
+        METRIC_CHANNEL_ID_RESOLUTION_FAILURES.labels(
+            platform='youtube',
+            scraper='channel_scraper',
+            entity='channel',
+            outcome='failed',
+            worker_id=get_worker_id(),
+        ).inc()
+        return None
+
+    if ' ' in name:
+        logging.info(
+            'Resolved channel ID to name with spaces; '
+            'marking unresolved to avoid re-querying',
+            extra={'channel_id': channel_id, 'name': name},
+        )
+        await fm.mark_unresolved(
+            f'{CHANNEL_FILE_PREFIX}{channel_id}',
+            content=f'{channel_id}\t{name}\n',
+        )
+        METRIC_CHANNEL_ID_RESOLUTION_FAILURES.labels(
+            platform='youtube',
+            scraper='channel_scraper',
+            entity='channel',
+            outcome='failed',
+            worker_id=get_worker_id(),
+        ).inc()
+        return None
+
+    await creator_map_backend.put(channel_id, name)
+    logging.debug(
+        'Resolved channel ID to name',
+        extra={'channel_id': channel_id, 'name': name},
+    )
+    METRIC_CHANNEL_IDS_RESOLVED.labels(
+        platform='youtube',
+        scraper='channel_scraper',
+        entity='channel',
+        outcome='resolved',
+        worker_id=get_worker_id(),
+    ).inc()
+    return name
+
+
 async def review_unresolved_ids(
     unresolved_ids: set[str],
     creator_map_backend: CreatorMap,
     fm: AssetFileManagement,
     concurrency: int, max_resolved_channels: int,
+    claim: RedisClaim | None = None,
 ) -> set[str]:
     '''
     See if we can resolve a channel ID to a channel handle
 
-    :param unresolved_ids: Set of channel IDs that need to be resolved to
-    channel names.
-    :param channel_map_file: Path to the CSV file where resolved
-    channel ID-name pairs should be saved.
-    :param fm: AssetFileManagement instance owning the channel data directory.
-    :param concurrency: Number of channel ID resolutions to run concurrently.
-    :returns: Set of resolved channel names corresponding to the input
-    channel IDs.
+    :param unresolved_ids: Set of channel IDs that need to be
+    resolved to channel names.
+    :param creator_map_backend: Backend for storing resolved
+    channel ID-name pairs.
+    :param fm: AssetFileManagement instance owning the channel
+    data directory.
+    :param concurrency: Number of channel ID resolutions to run
+    concurrently.
+    :param max_resolved_channels: Cap on how many ids to resolve
+    per call.
+    :param claim: Optional RedisClaim for cross-fleet per-id
+    deduplication. When set, only one worker per id fires an
+    InnerTube call.
+    :returns: Set of resolved channel names corresponding to the
+    input channel IDs.
     :raises: (none)
     '''
 
@@ -2111,97 +2490,53 @@ async def review_unresolved_ids(
 
     async def resolve(channel_id: str) -> str | None:
         async with semaphore:
-            try:
-                name: str = await YouTubeChannel.resolve_channel_id(
-                    channel_id
-                )
-                if not name:
-                    unresolved_file_path: Path = fm.marker_path(
-                        f'{CHANNEL_FILE_PREFIX}{channel_id}',
-                        '.unresolved',
-                    )
-                    if unresolved_file_path.exists():
-                        logging.debug(
-                            'Channel ID previously failed to '
-                            'resolve, skipping',
-                            extra={'channel_id': channel_id},
-                        )
-                    else:
-                        logging.info(
-                            'Failed to resolve channel ID, '
-                            'touching unresolved file',
-                            extra={
-                                'channel_id': channel_id,
-                                'unresolved_file_path':
-                                    unresolved_file_path,
-                            },
-                        )
-                        await fm.mark_unresolved(
-                            f'{CHANNEL_FILE_PREFIX}{channel_id}',
-                            content=f'{channel_id}\n',
-                        )
-                    METRIC_CHANNEL_ID_RESOLUTION_FAILURES.labels(
-                        platform='youtube',
-                        scraper='channel_scraper',
-                        entity='channel',
-                        outcome='failed',
-                        worker_id=get_worker_id(),
-                    ).inc()
-                    return None
-                elif ' ' in name:
-                    logging.info(
-                        'Resolved channel ID to name with spaces; '
-                        'marking unresolved to avoid re-querying',
-                        extra={
-                            'channel_id': channel_id,
-                            'name': name,
-                        },
-                    )
-                    await fm.mark_unresolved(
-                        f'{CHANNEL_FILE_PREFIX}{channel_id}',
-                        content=f'{channel_id}\t{name}\n',
-                    )
-                    METRIC_CHANNEL_ID_RESOLUTION_FAILURES.labels(
-                        platform='youtube',
-                        scraper='channel_scraper',
-                        entity='channel',
-                        outcome='failed',
-                        worker_id=get_worker_id(),
-                    ).inc()
-                    return None
-                await creator_map_backend.put(
-                    channel_id, name,
-                )
-
-                logging.debug(
-                    'Resolved channel ID to name',
-                    extra={
-                        'channel_id': channel_id,
-                        'name': name,
-                    },
-                )
+            # Per-id recheck: a peer worker may have resolved
+            # this id since the snapshot in read_channels was
+            # taken. Cheap HGET avoids a redundant browse call.
+            existing: str | None = (
+                await creator_map_backend.get(channel_id)
+            )
+            if existing:
                 METRIC_CHANNEL_IDS_RESOLVED.labels(
                     platform='youtube',
                     scraper='channel_scraper',
                     entity='channel',
-                    outcome='resolved',
+                    outcome='resolved_by_peer',
                     worker_id=get_worker_id(),
                 ).inc()
-                return name
-            except Exception as e:
-                METRIC_CHANNEL_ID_RESOLUTION_FAILURES.labels(
+                return existing
+
+            # Cross-fleet claim: if a peer wins, we skip and
+            # rely on the next read_channels pass to pick up
+            # the resolved handle from creator_map.
+            if claim is not None:
+                won: bool = await claim.try_claim(channel_id)
+                if not won:
+                    METRIC_CHANNEL_RESOLVE_CLAIM.labels(
+                        platform='youtube',
+                        scraper='channel_scraper',
+                        entity='channel',
+                        outcome='lost',
+                        worker_id=get_worker_id(),
+                    ).inc()
+                    return None
+                METRIC_CHANNEL_RESOLVE_CLAIM.labels(
                     platform='youtube',
                     scraper='channel_scraper',
                     entity='channel',
-                    outcome='failed',
+                    outcome='won',
                     worker_id=get_worker_id(),
                 ).inc()
-                logging.debug(
-                    'Error while resolving channel ID',
-                    exc=e,
-                    extra={'channel_id': channel_id},
+
+            try:
+                return await _innertube_resolve(
+                    channel_id,
+                    creator_map_backend,
+                    fm,
                 )
-                return None
+            finally:
+                if claim is not None:
+                    await claim.release(channel_id)
 
     ids: list[str] = list(unresolved_ids)
     shuffle(ids)
@@ -2221,7 +2556,8 @@ async def review_unresolved_ids(
         *(resolve(cid) for cid in ids)
     )
     for name in results:
-        resolved_channel_names.add(name)
+        if name is not None:
+            resolved_channel_names.add(name)
 
     logging.info(
         'Completed resolution of channel IDs',

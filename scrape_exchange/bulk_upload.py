@@ -24,6 +24,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, UTC
 from pathlib import Path
+from typing import TYPE_CHECKING, Callable
 from uuid import uuid4
 
 import aiofiles.os
@@ -35,6 +36,11 @@ from .exchange_client import ExchangeClient
 from .file_management import AssetFileManagement, atomic_write_bytes
 from .scraper_metrics import METRIC_UPLOADS_SKIPPED
 from .worker_id import get_worker_id
+
+if TYPE_CHECKING:
+    from .youtube.exchange_channels_set import (
+        RedisExchangeChannelsSet,
+    )
 
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
@@ -243,6 +249,8 @@ async def resume_pending_bulk_uploads(
     client: ExchangeClient,
     exchange_url: str,
     poll_timeout_seconds: float = _RESUME_POLL_TIMEOUT_SECONDS,
+    exchange_set: 'RedisExchangeChannelsSet | None' = None,
+    handle_from_filename: Callable[[str], str] | None = None,
 ) -> None:
     '''
     Read ``<base_dir>/.bulk/`` on startup and reconcile every
@@ -279,6 +287,8 @@ async def resume_pending_bulk_uploads(
             await _resume_one_bulk_state(
                 fm, client, exchange_url, state,
                 poll_timeout_seconds,
+                exchange_set=exchange_set,
+                handle_from_filename=handle_from_filename,
             )
         except Exception as exc:
             _LOGGER.warning(
@@ -295,6 +305,8 @@ async def _resume_one_bulk_state(
     exchange_url: str,
     state: BulkUploadState,
     poll_timeout_seconds: float,
+    exchange_set: 'RedisExchangeChannelsSet | None' = None,
+    handle_from_filename: Callable[[str], str] | None = None,
 ) -> None:
     '''
     Drive one persisted ``BulkUploadState`` through to a
@@ -354,6 +366,8 @@ async def _resume_one_bulk_state(
     await apply_bulk_results(
         state.batch_records, results, fm,
         state.batch_id, state.job_id,
+        exchange_set=exchange_set,
+        handle_from_filename=handle_from_filename,
     )
     await delete_bulk_state(fm, state.job_id)
     _LOGGER.info(
@@ -716,6 +730,8 @@ async def apply_bulk_results(
     fm: AssetFileManagement,
     batch_id: str,
     job_id: str,
+    exchange_set: 'RedisExchangeChannelsSet | None' = None,
+    handle_from_filename: Callable[[str], str] | None = None,
 ) -> tuple[int, int, int]:
     '''
     Reconcile per-record results against the source files we sent.
@@ -728,6 +744,12 @@ async def apply_bulk_results(
     submitted ``.jsonl``. The order is what enables the
     ``record_index`` fallback when a result entry lacks
     ``platform_content_id``.
+
+    When *exchange_set* and *handle_from_filename* are supplied, the
+    handles derived from successful filenames are SADDed into the
+    set in a single trailing batch. The channel scraper uses this
+    to keep ``youtube:exchange_channels`` in step with the upload
+    pipeline; other callers can omit both arguments.
 
     Returns ``(success, failed, missing)`` — counts the caller
     can turn into Prometheus metrics under whatever label scheme
@@ -750,6 +772,7 @@ async def apply_bulk_results(
     seen: set[str] = set()
     success_count: int = 0
     failure_count: int = 0
+    handles_to_add: set[str] = set()
     for entry in results:
         status: str = entry.get('status', '')
         cid: str | None = entry.get('platform_content_id')
@@ -778,6 +801,13 @@ async def apply_bulk_results(
             try:
                 await fm.mark_uploaded(filename)
                 success_count += 1
+                if (
+                    exchange_set is not None
+                    and handle_from_filename is not None
+                ):
+                    handles_to_add.add(
+                        handle_from_filename(filename),
+                    )
             except OSError as exc:
                 logging.warning(
                     'Bulk record succeeded but mark_uploaded '
@@ -798,6 +828,9 @@ async def apply_bulk_results(
                     'reason': entry.get('reason'),
                 },
             )
+
+    if exchange_set is not None and handles_to_add:
+        await exchange_set.add_many(handles_to_add)
 
     missing_count: int = len(batch_records) - len(seen)
     logging.info(
@@ -827,6 +860,8 @@ async def upload_bulk_batch(
     fm: AssetFileManagement,
     progress_timeout_seconds: float,
     filename_prefix: str,
+    exchange_set: 'RedisExchangeChannelsSet | None' = None,
+    handle_from_filename: Callable[[str], str] | None = None,
 ) -> BulkBatchOutcome:
     '''
     Dispatch one prepared batch through the full bulk pipeline:
@@ -995,6 +1030,8 @@ async def upload_bulk_batch(
     missing: int
     success, failed, missing = await apply_bulk_results(
         batch_records, results, fm, batch_id, job_id,
+        exchange_set=exchange_set,
+        handle_from_filename=handle_from_filename,
     )
     # Reconciliation done — drop the state file so resume on the
     # next startup doesn't re-process a job we've already handled.

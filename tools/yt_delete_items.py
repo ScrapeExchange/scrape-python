@@ -166,6 +166,21 @@ class DeleteItemsSettings(ScraperSettings):
             'delete the matched records.'
         ),
     )
+    deleted_item_ids_file: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            'DELETED_ITEM_IDS_FILE', 'deleted_item_ids_file',
+        ),
+        description=(
+            'When set, opt in to ``include_item_ids=true`` on '
+            'the DELETE call so the server returns each '
+            'matched record id, and append those ids to this '
+            'file, one per line. Both preview and ``--confirm`` '
+            'runs append (preview captures the ids that *would* '
+            'be deleted). The file is opened in append mode so '
+            'repeated runs accumulate.'
+        ),
+    )
 
 
 def _build_filter_body(
@@ -201,6 +216,7 @@ async def delete_items(
     prints a summary of the response. Returns the process exit
     code (0 on success, non-zero on a request-level failure).
     '''
+    
     body: dict[str, str] = _build_filter_body(settings)
     if not body and not settings.confirm:
         logging.info(
@@ -213,6 +229,8 @@ async def delete_items(
         'confirm': 'true' if settings.confirm else 'false',
         'max_records': str(settings.max_items),
     }
+    if settings.deleted_item_ids_file is not None:
+        params['include_item_ids'] = 'true'
     logging.info(
         'Requesting bulk delete',
         extra={
@@ -280,6 +298,25 @@ async def delete_items(
             print(f'  {item_id}')
         if len(item_ids) > len(sample):
             print(f'  ... ({len(item_ids) - len(sample)} more)')
+
+    if (
+        settings.deleted_item_ids_file is not None
+        and item_ids
+    ):
+        with open(
+            settings.deleted_item_ids_file, 'a',
+            encoding='utf-8',
+        ) as f:
+            for item_id in item_ids:
+                f.write(f'{item_id}\n')
+        logging.info(
+            'Appended item_ids to file',
+            extra={
+                'file': settings.deleted_item_ids_file,
+                'count': len(item_ids),
+                'confirm': settings.confirm,
+            },
+        )
 
     return 0
 
