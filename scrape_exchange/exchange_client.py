@@ -8,6 +8,8 @@ Scrape.Exchange client used for uploading content
 
 
 import asyncio
+import base64
+import json
 import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -228,6 +230,33 @@ class ExchangeClient(AsyncClient):
         super().__init__(
             trust_env=False,
         )
+
+    @property
+    def authenticated_username(self) -> str | None:
+        '''Return the username (``sub`` claim) embedded in the
+        cached JWT, or ``None`` if no JWT is set or the token is
+        unparseable. Used by callers that need to scope queries
+        to records this client uploaded — the JWT issued by
+        ``POST /api/v1/account/token`` carries the account
+        username in ``sub``, so no extra HTTP call is needed.'''
+        header: str | None = self.jwt_header
+        if not header:
+            return None
+        token: str = header.removeprefix('Bearer ').strip()
+        parts: list[str] = token.split('.')
+        if len(parts) != 3:
+            return None
+        try:
+            payload_b64: str = (
+                parts[1] + '=' * (-len(parts[1]) % 4)
+            )
+            payload: dict = json.loads(
+                base64.urlsafe_b64decode(payload_b64),
+            )
+        except (ValueError, TypeError):
+            return None
+        sub: Any = payload.get('sub')
+        return sub if isinstance(sub, str) else None
 
     @staticmethod
     async def setup(

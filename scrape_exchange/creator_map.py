@@ -26,6 +26,7 @@ import os
 from abc import ABC, abstractmethod
 
 import aiofiles
+import redis.asyncio as aioredis
 
 from prometheus_client import Counter
 
@@ -85,6 +86,14 @@ class CreatorMap(ABC):
     @abstractmethod
     async def size(self) -> int:
         '''Return the number of entries.'''
+
+    @property
+    def redis_client(self) -> 'aioredis.Redis | None':
+        '''Underlying Redis client, or None if this backend
+        is not Redis-backed. Used by callers that need to
+        construct adjacent Redis-backed primitives (claims,
+        sets) tied to the same Redis.'''
+        return None
 
 
 class FileCreatorMap(CreatorMap):
@@ -183,13 +192,16 @@ class RedisCreatorMap(CreatorMap):
     def __init__(
         self, redis_dsn: str, platform: str,
     ) -> None:
-        import redis.asyncio as aioredis
         self._redis: aioredis.Redis = (
             aioredis.from_url(
                 redis_dsn, decode_responses=True,
             )
         )
         self._key: str = f'{platform}:creator_map'
+
+    @property
+    def redis_client(self) -> aioredis.Redis:
+        return self._redis
 
     async def get(
         self, creator_id: str,
