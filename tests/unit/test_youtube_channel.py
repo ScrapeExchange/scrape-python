@@ -1674,5 +1674,75 @@ class TestCanonicalHandleAttribute(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(channel.channel_handle, 'legacy')
 
 
+class TestScrapeAboutPageViewCountFallback(
+    unittest.IsolatedAsyncioTestCase,
+):
+    '''When the AboutTab response lacks viewCountText, scrape_about_page
+    must fall back to parse_view_count(page_data) so we don't silently
+    persist 0 for channels whose view count lives in pageHeaderRenderer.
+    '''
+
+    async def test_view_count_falls_back_to_page_header(
+        self,
+    ) -> None:
+        about_renderer: dict = {
+            'videoCountText': {'simpleText': '100 videos'},
+            # viewCountText deliberately omitted
+        }
+        page_data: dict = {
+            'header': {
+                'pageHeaderRenderer': {
+                    'content': {
+                        'pageHeaderViewModel': {
+                            'metadata': {
+                                'contentMetadataViewModel': {
+                                    'metadataRows': [
+                                        {
+                                            'metadataParts': [
+                                                {
+                                                    'text': {
+                                                        'content':
+                                                            '1,234,567'
+                                                            ' views',
+                                                    },
+                                                },
+                                            ],
+                                        },
+                                    ],
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        }
+
+        ch: YouTubeChannel = YouTubeChannel(channel_handle='Test')
+        ch.url = 'https://www.youtube.com/@Test'
+        mock_client: AsyncMock = AsyncMock()
+        mock_client.get = AsyncMock(return_value='<html/>')
+        mock_client.proxy = None
+        ch.browse_client = mock_client
+
+        with patch.object(
+            ch, '_extract_initial_data', return_value=page_data,
+        ), patch.object(
+            ch, '_find_about_renderer', return_value=about_renderer,
+        ), patch.object(
+            ch, '_parse_thumbnails_banners',
+        ), patch.object(
+            YouTubeChannel,
+            'extract_linked_channels',
+            return_value=set(),
+        ), patch.object(
+            YouTubeChannel,
+            'extract_channel_id',
+            return_value='UC1234567890abcdefghij',
+        ):
+            await ch.scrape_about_page()
+
+        self.assertEqual(ch.view_count, 1234567)
+
+
 if __name__ == '__main__':
     unittest.main()

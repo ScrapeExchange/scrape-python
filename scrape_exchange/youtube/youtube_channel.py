@@ -651,6 +651,11 @@ class YouTubeChannel:
 
         self._parse_channel_about_data(about_data)
 
+        # AboutTab sometimes omits viewCountText for channels whose
+        # view count lives in pageHeaderRenderer.
+        if self.view_count is None:
+            self.view_count = YouTubeChannel.parse_view_count(page_data)
+
         self._parse_thumbnails_banners(metadata, page_data)
 
         self.channel_links = YouTubeChannel.extract_linked_channels(page_data)
