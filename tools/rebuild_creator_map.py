@@ -157,7 +157,7 @@ def _validate_settings(settings: RebuildSettings) -> None:
 
 
 async def _scrape_channel(
-    channel: YouTubeChannel, proxies: str | None,
+    channel: YouTubeChannel, proxies: list[str] | None,
 ) -> dict | None:
     '''
     Scrape YouTube's about page for *handle* and return the
@@ -187,8 +187,11 @@ async def _scrape_channel(
         )
         return None
     finally:
-        if channel.browse_client is not None:
-            await channel.browse_client.aclose()
+        # browse_client is a long-lived per-proxy entry in the
+        # pool returned by ``pooled_youtube_client_for_entry``;
+        # do NOT call aclose() on it here. The pool is closed once
+        # at process shutdown.
+        channel.browse_client = None
 
     if not channel.channel_id:
         return None
@@ -206,7 +209,7 @@ async def _scrape_channel(
 async def _extract_mapping(
     path: Path,
     known_ids: set[str],
-    proxies: str | None,
+    proxies: list[str] | None,
     handle_cache: dict[str, dict | None],
 ) -> tuple[str | None, str | None, str, dict | None]:
     '''
@@ -310,7 +313,7 @@ async def _resolve_via_youtube(
     envelope: dict,
     is_wrapped: bool,
     known_ids: set[str],
-    proxies: str | None,
+    proxies: list[str] | None,
     handle_cache: dict[str, dict | None],
 ) -> tuple[str | None, str | None, str, dict | None]:
     '''
@@ -464,7 +467,7 @@ async def _flush_to_redis(
 async def _process_file(
     path_str: str,
     known_ids: set[str],
-    resolve_proxies: str | None,
+    resolve_proxies: list[str] | None,
     handle_cache: dict[str, str | None],
     mappings: dict[str, str],
     exchange_client: ExchangeClient | None,
@@ -510,7 +513,7 @@ async def _worker_run(
     redis_dsn: str,
     platform: str,
     dry_run: bool,
-    proxies: str | None,
+    proxies: list[str] | None,
     resolve_missing: bool,
     exchange_url: str,
     api_key_id: str | None,
@@ -552,7 +555,7 @@ async def _worker_run(
         redis_dsn, platform,
     )
     handle_cache: dict[str, str | None] = {}
-    resolve_proxies: str | None = (
+    resolve_proxies: list[str] | None = (
         proxies if (resolve_missing and proxies) else None
     )
 
@@ -603,7 +606,7 @@ def _worker_entrypoint(
     log_level: str,
     log_file: str,
     log_format: str,
-    proxies: str | None,
+    proxies: list[str] | None,
     resolve_missing: bool,
     exchange_url: str,
     api_key_id: str | None,

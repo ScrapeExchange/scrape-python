@@ -38,6 +38,57 @@ class TestFallbackHandle(unittest.TestCase):
         with self.assertRaises(ValueError):
             fallback_handle('@')
 
+    def test_replaces_forward_slash(self) -> None:
+        '''``/`` is the POSIX path separator and turns a
+        handle into a sub-path when used as a filename. Replace
+        with ``_`` so the value still round-trips through Path
+        and identifies the channel.'''
+        self.assertEqual(
+            fallback_handle('FAIR/PLAY'), 'fair_play',
+        )
+
+    def test_replaces_multiple_slashes(self) -> None:
+        self.assertEqual(
+            fallback_handle('A/B/C'), 'a_b_c',
+        )
+
+    def test_strips_nul_bytes(self) -> None:
+        '''POSIX file APIs reject embedded NULs outright.'''
+        self.assertEqual(
+            fallback_handle('foo\x00bar'), 'foobar',
+        )
+        self.assertEqual(
+            fallback_handle('\x00foo'), 'foo',
+        )
+
+    def test_strips_leading_dots(self) -> None:
+        '''Leading ``.`` turns the file into a Unix hidden
+        file — easy to miss in directory listings and globs.'''
+        self.assertEqual(
+            fallback_handle('.history'), 'history',
+        )
+        self.assertEqual(
+            fallback_handle('..history'), 'history',
+        )
+
+    def test_strips_leading_dot_after_at(self) -> None:
+        '''``@`` strip happens first, then ``.`` so ``@.foo``
+        and ``.@foo`` both collapse to ``foo``.'''
+        self.assertEqual(
+            fallback_handle('@.foo'), 'foo',
+        )
+
+    def test_only_dots_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            fallback_handle('...')
+
+    def test_slash_only_raises(self) -> None:
+        '''``/`` becomes ``_`` but the result is still
+        meaningless — must not crash, but ``'_'`` is a valid
+        non-empty result, so this returns it rather than
+        raising. Documenting current behavior.'''
+        self.assertEqual(fallback_handle('/'), '_')
+
 
 class TestCanonicalHandleFromBrowse(unittest.TestCase):
     def _browse_data(self, vanity_url: str | None) -> dict:

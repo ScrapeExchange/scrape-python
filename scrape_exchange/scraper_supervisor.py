@@ -30,9 +30,12 @@ import time
 
 from dataclasses import dataclass
 
-from prometheus_client import Gauge, start_http_server
+from prometheus_client import Gauge
+
+from scrape_exchange.metrics_server import start_metrics_server
 
 from scrape_exchange.exchange_client import ExchangeClient
+from scrape_exchange.scraper_metrics import METRIC_SUPERVISOR_RESPAWNS
 from scrape_exchange.worker_id import get_worker_id
 
 # Environment variable the supervisor writes the pre-fetched JWT
@@ -83,6 +86,68 @@ _NON_FILE_LOG_TARGETS: frozenset[str] = frozenset({
 })
 
 
+# Per-child respawn backoff parameters. The supervisor doubles a
+# slot's backoff on each consecutive crash, caps at _BACKOFF_MAX_SECONDS,
+# and resets to the initial value if the previous run was stable.
+#
+# _BACKOFF_MAX_SECONDS and _BACKOFF_STABLE_THRESHOLD_SECONDS happen to
+# share the value 60.0, but they are independent knobs:
+#   - _BACKOFF_MAX_SECONDS caps the wait between respawns.
+#   - _BACKOFF_STABLE_THRESHOLD_SECONDS decides what counts as a
+#     "healthy" run (long enough to reset the backoff on the next crash).
+# Changing one does not imply changing the other.
+_BACKOFF_INITIAL_SECONDS: float = 1.0
+_BACKOFF_MAX_SECONDS: float = 60.0
+_BACKOFF_STABLE_THRESHOLD_SECONDS: float = 60.0
+
+
+# Smooth the worker spawn burst at startup. Without this, N workers
+# all open their initial Redis (rate-limit + scrape-exchange-rate-
+# limit) connections simultaneously, which can swamp upstream
+# accept queues / userspace docker-proxy / NAT and cause SYN drops
+# that crash workers at startup. With ``N=12`` and a 0.2s stagger,
+# total startup overhead is ~2.4s.
+_SPAWN_STAGGER_SECONDS: float = 0.2
+
+
+def _compute_next_backoff(
+    prev_backoff: float, ran_seconds: float,
+) -> float:
+    '''Return the next backoff for a slot whose previous run
+    lasted ``ran_seconds`` before crashing. Resets to
+    ``_BACKOFF_INITIAL_SECONDS`` when the run was stable
+    (``ran_seconds >= _BACKOFF_STABLE_THRESHOLD_SECONDS``);
+    otherwise doubles the backoff capped at
+    ``_BACKOFF_MAX_SECONDS``.
+
+    Caller is required to pass
+    ``prev_backoff >= _BACKOFF_INITIAL_SECONDS``; the function
+    does not normalise zero or negative inputs.
+    '''
+
+    if ran_seconds >= _BACKOFF_STABLE_THRESHOLD_SECONDS:
+        return _BACKOFF_INITIAL_SECONDS
+    return min(prev_backoff * 2, _BACKOFF_MAX_SECONDS)
+
+
+@dataclass
+class _ChildSlot:
+    '''Per-child supervisor state.
+
+    Holds everything the supervisor needs to respawn this slot
+    without re-deriving env / chunk / log-file / port from the
+    parent config. ``process`` is ``None`` while a slot is
+    waiting to respawn.'''
+
+    instance: int
+    spawn_env: dict[str, str]
+    spawn_argv: list[str]
+    process: subprocess.Popen | None = None
+    backoff: float = _BACKOFF_INITIAL_SECONDS
+    spawn_time: float | None = None
+    respawn_at: float | None = None
+
+
 @dataclass
 class SupervisorConfig:
     '''
@@ -101,10 +166,10 @@ class SupervisorConfig:
     :param concurrency: Per-child async-task concurrency. Only
         used for metric publication (the supervisor does not run
         async tasks itself).
-    :param proxies: Raw comma-separated proxy URL string as read
-        from settings. May be ``None`` or empty — the supervisor
-        rejects this case because multi-process mode is pointless
-        without proxies to split.
+    :param proxies: Proxy URL list as read from settings. May be
+        ``None`` or empty — the supervisor rejects this case
+        because multi-process mode is pointless without proxies
+        to split.
     :param metrics_port: Base Prometheus port. The supervisor
         binds this port itself; children bind
         ``metrics_port + worker_instance`` where ``worker_instance``
@@ -138,7 +203,7 @@ class SupervisorConfig:
     num_processes_env_var: str
     num_processes: int
     concurrency: int
-    proxies: str | None
+    proxies: list[str]
     metrics_port: int
     log_file: str | None
     log_file_env_var: str | None = None
@@ -242,41 +307,36 @@ def chunks_are_disjoint_cover(
     return True
 
 
+def _spawn_one_slot(slot: _ChildSlot) -> None:
+    '''Launch the subprocess for *slot* and record its handle and
+    spawn timestamp. Used both at startup and on respawn so the
+    Popen invocation lives in exactly one place.'''
+
+    slot.process = subprocess.Popen(
+        slot.spawn_argv, env=slot.spawn_env,
+    )
+    slot.spawn_time = time.monotonic()
+    slot.respawn_at = None
+
+
 def spawn_children(
     config: SupervisorConfig, chunks: list[list[str]],
     jwt_header: str | None = None,
-) -> list[subprocess.Popen]:
-    '''
-    Spawn one child subprocess per chunk in *chunks*.
-
-    Each child inherits the parent environment with these
-    overrides:
-
-    * ``<config.num_processes_env_var>=1`` — prevents recursion
-      into another supervisor.
-    * ``PROXIES=<chunk>`` — scopes the child's rate limiter and
-      per-proxy metrics to its own slice.
-    * ``METRICS_PORT=<base + worker_instance>`` where
-      ``worker_instance = index + 1`` — the base port is reserved
-      for the supervisor. When *config.metrics_port_env_var* is
-      set, the same value is also written to that variable (e.g.
-      ``RSS_METRICS_PORT``) so the child's pydantic settings
-      resolves its scraper-specific alias.
-    * ``LOG_FILE=<root>-<worker_instance><ext>`` (only when
-      *config.log_file* is non-empty) — each child writes to its
-      own file so they don't tear up a shared log.
-    * ``EXCHANGE_JWT=<jwt_header>`` (only when *jwt_header* is
-      provided) — the pre-fetched JWT so children skip the
-      token endpoint call.
-    '''
+) -> list[_ChildSlot]:
+    '''Spawn one child subprocess per chunk in *chunks*, returning
+    one ``_ChildSlot`` per child. The slot captures the spawn
+    env so the supervise loop can re-launch the same child later
+    without re-deriving its config.'''
 
     script_path: str = os.path.abspath(sys.argv[0])
-    children: list[subprocess.Popen] = []
+    slots: list[_ChildSlot] = []
     suffixable: bool = bool(
         config.log_file
         and config.log_file not in _NON_FILE_LOG_TARGETS
     )
     for index, chunk in enumerate(chunks):
+        if index > 0:
+            time.sleep(_SPAWN_STAGGER_SECONDS)
         worker_instance: int = index + 1
         child_env: dict[str, str] = os.environ.copy()
         child_env[config.num_processes_env_var] = '1'
@@ -310,23 +370,14 @@ def spawn_children(
                 'log_file': child_log_file,
             },
         )
-        children.append(subprocess.Popen(
-            [sys.executable, script_path], env=child_env,
-        ))
-    return children
-
-
-def terminate_children(
-    children: list[subprocess.Popen],
-) -> None:
-    '''Send SIGTERM to every still-running child.'''
-
-    for child in children:
-        if child.poll() is None:
-            try:
-                child.terminate()
-            except ProcessLookupError:
-                pass
+        slot: _ChildSlot = _ChildSlot(
+            instance=worker_instance,
+            spawn_env=child_env,
+            spawn_argv=[sys.executable, script_path],
+        )
+        _spawn_one_slot(slot)
+        slots.append(slot)
+    return slots
 
 
 def _should_escalate(
@@ -365,98 +416,239 @@ def _kill_children(
                 pass
 
 
-def _handle_child_exit(
-    scraper_label: str,
-    child: subprocess.Popen,
-    rc: int,
-    pending: list[subprocess.Popen],
-) -> int:
-    '''
-    Log a child exit and return a non-zero exit code if the
-    child failed. Terminates siblings on first failure.
-    '''
+_POLL_INTERVAL_SECONDS: float = 0.5
 
-    _LOGGER.info(
-        'Scraper child exited',
+
+def _is_shutting_down(
+    shutdown_state: dict[str, float | None] | None,
+) -> bool:
+    '''True once a shutdown signal has been received (or
+    ``shutdown_state`` was constructed with a deadline already
+    set).'''
+
+    if shutdown_state is None:
+        return False
+    return shutdown_state.get('deadline') is not None
+
+
+def _record_crash(
+    scraper_label: str, slot: _ChildSlot, rc: int,
+    ran_seconds: float, now: float,
+) -> None:
+    '''Apply the per-slot crash bookkeeping: compute next
+    backoff, schedule respawn, log, bump metric.'''
+
+    prev_backoff: float = slot.backoff
+    slot.backoff = _compute_next_backoff(
+        prev_backoff, ran_seconds,
+    )
+    slot.respawn_at = now + slot.backoff
+    _LOGGER.warning(
+        'Child crashed; will respawn',
         extra={
             'scraper': scraper_label,
-            'pid': child.pid,
+            'instance': slot.instance,
+            'pid': slot.process.pid if slot.process else None,
             'returncode': rc,
+            'ran_seconds': ran_seconds,
+            'backoff_seconds': slot.backoff,
+            'respawn_at': slot.respawn_at,
         },
     )
-    if rc == 0:
-        return 0
-    _LOGGER.error(
-        'Child failed; terminating siblings',
-        extra={'pid': child.pid, 'returncode': rc},
+    if (slot.backoff == _BACKOFF_INITIAL_SECONDS
+            and prev_backoff != _BACKOFF_INITIAL_SECONDS):
+        _LOGGER.info(
+            'Worker stable; backoff reset',
+            extra={
+                'scraper': scraper_label,
+                'instance': slot.instance,
+                'prev_backoff': prev_backoff,
+                'ran_seconds': ran_seconds,
+            },
+        )
+    METRIC_SUPERVISOR_RESPAWNS.labels(
+        scraper=scraper_label,
+        instance=str(slot.instance),
+    ).inc()
+    slot.process = None
+
+
+def _retire_slot(
+    scraper_label: str, slot: _ChildSlot, rc: int,
+    shutting_down: bool,
+) -> None:
+    '''Mark a slot retired (no respawn). Called for clean exits
+    and for any exit observed during shutdown.'''
+
+    pid: int | None = (
+        slot.process.pid if slot.process else None
     )
-    terminate_children(pending)
-    return rc or 1
+    if shutting_down:
+        _LOGGER.info(
+            'Child exited during shutdown; not respawning',
+            extra={
+                'scraper': scraper_label,
+                'instance': slot.instance,
+                'pid': pid,
+                'returncode': rc,
+            },
+        )
+    else:
+        _LOGGER.info(
+            'Child exited cleanly; not respawning',
+            extra={
+                'scraper': scraper_label,
+                'instance': slot.instance,
+                'pid': pid,
+            },
+        )
+    slot.process = None
+    slot.respawn_at = None
 
 
-def wait_for_children(
-    scraper_label: str, children: list[subprocess.Popen],
+def _log_respawn(scraper_label: str, slot: _ChildSlot) -> None:
+    '''Emit the INFO "Respawning child" line after a successful
+    ``_spawn_one_slot`` call so ``new_pid`` is available.'''
+
+    proxies_val: str = slot.spawn_env.get('PROXIES', '')
+    proxies_count: int = (
+        len(proxies_val.split(',')) if proxies_val else 0
+    )
+    _LOGGER.info(
+        'Respawning child',
+        extra={
+            'scraper': scraper_label,
+            'instance': slot.instance,
+            'new_pid': (
+                slot.process.pid if slot.process else None
+            ),
+            'proxies_count': proxies_count,
+        },
+    )
+
+
+def supervise_children(
+    scraper_label: str, slots: list[_ChildSlot],
     shutdown_state: dict[str, float | None] | None = None,
 ) -> int:
-    '''
-    Block until every child has exited. Returns ``0`` when every
-    child exits cleanly, otherwise the non-zero exit code of the
-    first failing child — at which point the surviving siblings
-    are sent SIGTERM so the supervisor doesn't keep partial work
-    running.
+    '''Supervise *slots* until every slot is retired.
 
-    When *shutdown_state* is provided and contains a
-    ``'deadline'`` key set by :func:`install_signal_forwarders`,
-    any children still running after that deadline are sent
-    SIGKILL so the supervisor does not hang indefinitely on
-    stuck processes (e.g. yt-dlp threads blocking
-    ``asyncio.run()`` cleanup).
-    '''
+    Per-tick (default ``_POLL_INTERVAL_SECONDS``):
 
-    exit_code: int = 0
-    pending: list[subprocess.Popen] = list(children)
+    1. For each slot with ``process is not None``: poll. On exit,
+       classify the rc and (a) schedule respawn with backoff, or
+       (b) retire the slot.
+    2. For each slot with ``process is None and
+       respawn_at is not None``: when ``now >= respawn_at`` and
+       the supervisor isn't shutting down, call
+       ``_spawn_one_slot(slot)``.
+    3. When ``_should_escalate(shutdown_state)`` becomes true,
+       SIGKILL all still-running children.
+    4. Return ``0`` once no slot has a running process and none
+       has a pending respawn.
+
+    Returns ``0`` in all normal cases — failures self-heal via
+    respawn, and clean exits are absorbed silently.'''
+
     escalated: bool = False
-    while pending:
+    was_shutting_down: bool = False
+    while True:
+        now: float = time.monotonic()
+        shutting_down: bool = _is_shutting_down(shutdown_state)
+
+        if shutting_down and not was_shutting_down:
+            pending_respawns: int = sum(
+                1 for s in slots
+                if s.respawn_at is not None
+                and s.process is None
+            )
+            _LOGGER.info(
+                'Shutdown received; no further respawns',
+                extra={
+                    'scraper': scraper_label,
+                    'pending_respawns': pending_respawns,
+                },
+            )
+            was_shutting_down = True
+
         if not escalated and _should_escalate(shutdown_state):
             escalated = True
-            _kill_children(scraper_label, pending)
+            running: list[subprocess.Popen] = [
+                s.process for s in slots
+                if s.process is not None
+                and s.process.poll() is None
+            ]
+            if running:
+                _kill_children(scraper_label, running)
 
-        for child in list(pending):
-            try:
-                rc: int | None = child.wait(timeout=1.0)
-            except subprocess.TimeoutExpired:
+        for slot in slots:
+            if slot.process is None:
                 continue
-            pending.remove(child)
-            result: int = _handle_child_exit(
-                scraper_label, child, rc, pending,
+            rc: int | None = slot.process.poll()
+            if rc is None:
+                continue
+            ran_seconds: float = (
+                now - slot.spawn_time
+                if slot.spawn_time is not None else 0.0
             )
-            if exit_code == 0:
-                exit_code = result
-    return exit_code
+            if shutting_down or rc == 0:
+                _retire_slot(
+                    scraper_label, slot, rc, shutting_down,
+                )
+                continue
+            _record_crash(
+                scraper_label, slot, rc,
+                ran_seconds=ran_seconds, now=now,
+            )
+
+        if not shutting_down:
+            for slot in slots:
+                if (slot.process is None
+                        and slot.respawn_at is not None
+                        and now >= slot.respawn_at):
+                    _spawn_one_slot(slot)
+                    _log_respawn(scraper_label, slot)
+
+        running_count: int = sum(
+            1 for s in slots if s.process is not None
+        )
+        pending_respawn_count: int = sum(
+            1 for s in slots
+            if s.process is None and s.respawn_at is not None
+            and not shutting_down
+        )
+        if running_count == 0 and pending_respawn_count == 0:
+            return 0
+
+        time.sleep(_POLL_INTERVAL_SECONDS)
 
 
 def install_signal_forwarders(
-    children: list[subprocess.Popen],
+    slots: list[_ChildSlot],
     shutdown_state: dict[str, float | None] | None = None,
     grace_seconds: int = 30,
 ) -> None:
-    '''
-    Install SIGINT and SIGTERM handlers that forward the received
-    signal to every still-running child.
+    '''Install SIGINT/SIGTERM handlers that forward the received
+    signal to every still-running child across the slot list.
+    Slot processes are looked up at signal-delivery time so
+    children spawned by a respawn after install also receive
+    forwarded signals.
 
     When *shutdown_state* is provided, the first signal sets
     ``shutdown_state['deadline']`` to
-    ``time.monotonic() + grace_seconds`` so that
-    :func:`wait_for_children` can escalate to SIGKILL after the
-    grace period.
-    '''
+    ``time.monotonic() + grace_seconds``.'''
 
     def _forward_signal(signum: int, _frame: object) -> None:
+        running: list[subprocess.Popen] = [
+            s.process for s in slots
+            if s.process is not None
+            and s.process.poll() is None
+        ]
         _LOGGER.info(
             'Supervisor forwarding signal to children',
             extra={
                 'signum': signum,
-                'children_count': len(children),
+                'children_count': len(running),
             },
         )
         if (shutdown_state is not None
@@ -464,12 +656,11 @@ def install_signal_forwarders(
             shutdown_state['deadline'] = (
                 time.monotonic() + grace_seconds
             )
-        for child in children:
-            if child.poll() is None:
-                try:
-                    child.send_signal(signum)
-                except ProcessLookupError:
-                    pass
+        for child in running:
+            try:
+                child.send_signal(signum)
+            except ProcessLookupError:
+                pass
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, _forward_signal)
@@ -482,7 +673,8 @@ def run_supervisor(config: SupervisorConfig) -> int:
     Prometheus HTTP server on ``config.metrics_port``, publishes
     the config gauges, spawns one child per chunk via
     :func:`spawn_children`, installs signal forwarders, and blocks
-    on :func:`wait_for_children`. Returns the exit code.
+    on :func:`supervise_children`, which respawns crashed children
+    until a shutdown signal is received. Returns the exit code.
 
     The caller is responsible for calling ``configure_logging``
     before invoking this function — the supervisor only handles
@@ -496,9 +688,7 @@ def run_supervisor(config: SupervisorConfig) -> int:
         )
         return 1
 
-    proxies: list[str] = [
-        p.strip() for p in config.proxies.split(',') if p.strip()
-    ]
+    proxies: list[str] = list(config.proxies)
     if not proxies:
         _LOGGER.error(
             'Scraper PROXIES is empty after parsing',
@@ -552,7 +742,7 @@ def run_supervisor(config: SupervisorConfig) -> int:
                 time.sleep(delay)
                 delay *= 2
 
-    start_http_server(config.metrics_port)
+    start_metrics_server(config.metrics_port)
     _LOGGER.info(
         'Supervisor metrics server started',
         extra={
@@ -567,24 +757,24 @@ def run_supervisor(config: SupervisorConfig) -> int:
         concurrency=config.concurrency,
     )
 
-    children: list[subprocess.Popen] = spawn_children(
+    slots: list[_ChildSlot] = spawn_children(
         config, chunks, jwt_header=jwt_header,
     )
     shutdown_state: dict[str, float | None] = {
         'deadline': None,
     }
     install_signal_forwarders(
-        children, shutdown_state,
+        slots, shutdown_state,
         grace_seconds=config.shutdown_grace_seconds,
     )
 
     try:
-        return wait_for_children(
-            config.scraper_label, children,
-            shutdown_state,
+        return supervise_children(
+            config.scraper_label, slots, shutdown_state,
         )
     finally:
-        for child in children:
-            if child.poll() is None:
-                child.kill()
-                child.wait()
+        for slot in slots:
+            if (slot.process is not None
+                    and slot.process.poll() is None):
+                slot.process.kill()
+                slot.process.wait()

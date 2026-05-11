@@ -784,15 +784,37 @@ class _RedisBackend(_Backend[CallTypeT]):
         super().__init__(default_configs, global_config)
         try:
             import redis.asyncio as aioredis
+            from redis.asyncio.retry import Retry
+            from redis.backoff import ExponentialBackoff
+            from redis.exceptions import (
+                ConnectionError as RedisConnectionError,
+                TimeoutError as RedisTimeoutError,
+            )
         except ImportError:
             raise ImportError(
                 'redis package is required for the Redis '
                 'rate-limiter backend. Install it with: '
                 'pip install "redis[hiredis]>=5.0.0"'
             ) from None
+        # Bound the connect/socket timeouts so a dropped SYN
+        # surfaces as a fast retry instead of waiting on the
+        # kernel's ~120s default. Auto-retry transient
+        # connection errors so a single dropped SYN under
+        # bursty startup load doesn't crash the worker.
         self._redis: aioredis.Redis = (
             aioredis.from_url(
-                redis_dsn, decode_responses=True,
+                redis_dsn,
+                decode_responses=True,
+                socket_connect_timeout=5.0,
+                socket_timeout=10.0,
+                retry=Retry(
+                    ExponentialBackoff(cap=2.0, base=0.1),
+                    retries=5,
+                ),
+                retry_on_error=[
+                    RedisConnectionError,
+                    RedisTimeoutError,
+                ],
             )
         )
         self._platform: str = platform
@@ -1101,14 +1123,10 @@ class RateLimiter(ABC, Generic[CallTypeT]):
         '''Global (cross-type) aggregate bucket configuration.'''
 
     def set_proxies(
-        self, proxies: list[str] | str | None,
+        self, proxies: list[str] | None,
     ) -> None:
         '''Register the proxy pool used by :meth:`acquire` when no
         explicit *proxy* is given.'''
-        if isinstance(proxies, str):
-            proxies = [
-                p.strip() for p in proxies.split(',') if p.strip()
-            ]
         self._proxies = proxies or None
 
     def _get_lock(self, proxy: str | None) -> asyncio.Lock:

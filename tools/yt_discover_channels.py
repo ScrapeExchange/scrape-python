@@ -752,14 +752,13 @@ async def _scrape_channel(
             title=yt_channel.title,
         )
     finally:
-        # Mirrors yt_channel_scrape.py:938. Without this, every
-        # iteration of the discover BFS leaks an httpx connection
-        # pool and we eventually exhaust file descriptors — which
-        # surfaces as "Too many open files" inside the cookie
-        # renewal loop's lock-file open, not here.
-        if yt_channel.browse_client is not None:
-            await yt_channel.browse_client.aclose()
-            yt_channel.browse_client = None
+        # browse_client is a long-lived per-proxy entry in the
+        # pool returned by ``pooled_youtube_client_for_entry``;
+        # do NOT call aclose() on it here. Closing the pool entry
+        # makes every subsequent caller hit "Cannot send a request,
+        # as the client has been closed." The pool is closed once
+        # at process shutdown by ``aclose_pooled_youtube_clients``.
+        yt_channel.browse_client = None
 
 
 async def fetch(client: AsyncYouTubeClient, url: str
@@ -1267,9 +1266,7 @@ async def main() -> None:
     fail_channels: str = settings.failed_channels
     async with AsyncYouTubeClient() as client:
         proxies: list[str] | None = (
-            settings.proxies.split(',')
-            if settings.proxies
-            else None
+            settings.proxies or None
         )
         await discover(
             client, creator_map, name_map,

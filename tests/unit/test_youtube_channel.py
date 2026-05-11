@@ -1744,5 +1744,295 @@ class TestScrapeAboutPageViewCountFallback(
         self.assertEqual(ch.view_count, 1234567)
 
 
+class TestResolveChannelIdViaInnerTube(unittest.IsolatedAsyncioTestCase):
+    '''
+    Tests for ``YouTubeChannel._resolve_channel_id_via_innertube``,
+    the InnerTube-backed handle→channel_id fallback used when /about
+    HTML cannot supply ``channel_id``.
+    '''
+
+    def _make_channel(
+        self,
+        *,
+        channel_handle: str | None = 'MrBeast',
+        channel_id: str | None = None,
+    ) -> 'YouTubeChannel':
+        from scrape_exchange.youtube.youtube_channel import (
+            YouTubeChannel,
+        )
+        ch = YouTubeChannel(channel_handle=channel_handle)
+        ch.channel_id = channel_id
+        return ch
+
+    def _outcome_count(self, strategy: str, outcome: str) -> float:
+        from scrape_exchange.youtube.youtube_channel import (
+            METRIC_CHANNEL_HANDLE_RESOLVER_OUTCOMES,
+        )
+        total: float = 0.0
+        for metric in (
+            METRIC_CHANNEL_HANDLE_RESOLVER_OUTCOMES.collect()
+        ):
+            for sample in metric.samples:
+                if sample.name.endswith('_total') and (
+                    sample.labels.get('strategy') == strategy
+                    and sample.labels.get('outcome') == outcome
+                ):
+                    total += sample.value
+        return total
+
+    async def test_noop_when_channel_id_already_set(self) -> None:
+        ch = self._make_channel(
+            channel_id='UCX6OQ3DkcsbYNE6H8uQQuVA',
+        )
+        from unittest.mock import patch
+        with patch(
+            'scrape_exchange.youtube.youtube_channel.'
+            'pooled_innertube_for_entry',
+        ) as mock_pool:
+            ok = await ch._resolve_channel_id_via_innertube()
+        self.assertTrue(ok)
+        mock_pool.assert_not_called()
+
+    async def test_noop_when_channel_handle_missing(self) -> None:
+        ch = self._make_channel(channel_handle=None)
+        from unittest.mock import patch
+        with patch(
+            'scrape_exchange.youtube.youtube_channel.'
+            'pooled_innertube_for_entry',
+        ) as mock_pool:
+            ok = await ch._resolve_channel_id_via_innertube()
+        self.assertFalse(ok)
+        mock_pool.assert_not_called()
+
+    async def test_handle_is_already_channel_id(self) -> None:
+        ch = self._make_channel(
+            channel_handle='UCX6OQ3DkcsbYNE6H8uQQuVA',
+        )
+        from unittest.mock import patch
+        with patch(
+            'scrape_exchange.youtube.youtube_channel.'
+            'pooled_innertube_for_entry',
+        ) as mock_pool:
+            ok = await ch._resolve_channel_id_via_innertube()
+        self.assertTrue(ok)
+        self.assertEqual(
+            ch.channel_id, 'UCX6OQ3DkcsbYNE6H8uQQuVA',
+        )
+        mock_pool.assert_not_called()
+
+    async def test_resolves_via_browse(self) -> None:
+        '''Strategy 1 (browse with handle) succeeds.'''
+        ch = self._make_channel()
+        from unittest.mock import patch, MagicMock, AsyncMock
+        fake_client = MagicMock()
+        fake_client.browse.return_value = {
+            'metadata': {
+                'channelMetadataRenderer': {
+                    'externalId': 'UCX6OQ3DkcsbYNE6H8uQQuVA',
+                },
+            },
+        }
+        fake_limiter = MagicMock()
+        fake_limiter.acquire = AsyncMock()
+        before_hit = self._outcome_count('browse', 'hit')
+        before_resolve_hit = self._outcome_count('resolve_url', 'hit')
+        with patch(
+            'scrape_exchange.youtube.youtube_channel.'
+            'pooled_innertube_for_entry',
+            return_value=fake_client,
+        ), patch(
+            'scrape_exchange.youtube.youtube_channel.'
+            'YouTubeRateLimiter.get',
+            return_value=fake_limiter,
+        ):
+            ok = await ch._resolve_channel_id_via_innertube()
+
+        self.assertTrue(ok)
+        self.assertEqual(
+            ch.channel_id, 'UCX6OQ3DkcsbYNE6H8uQQuVA',
+        )
+        fake_client.browse.assert_called_once_with('@MrBeast')
+        # navigation/resolve_url should not be called when browse
+        # already supplied a usable channel_id.
+        fake_client.adaptor.dispatch.assert_not_called()
+        # Metric: browse strategy ticked 'hit' once; resolve_url
+        # never ticked.
+        self.assertEqual(
+            self._outcome_count('browse', 'hit') - before_hit,
+            1.0,
+        )
+        self.assertEqual(
+            self._outcome_count('resolve_url', 'hit')
+            - before_resolve_hit,
+            0.0,
+        )
+
+    async def test_falls_back_to_resolve_url(self) -> None:
+        '''Strategy 1 fails or returns no externalId; strategy 2
+        (navigation/resolve_url) succeeds.'''
+        ch = self._make_channel()
+        from unittest.mock import patch, MagicMock, AsyncMock
+        fake_client = MagicMock()
+        # browse returns an empty/unhelpful response.
+        fake_client.browse.return_value = {}
+        fake_client.adaptor.dispatch.return_value = {
+            'endpoint': {
+                'browseEndpoint': {
+                    'browseId': 'UCX6OQ3DkcsbYNE6H8uQQuVA',
+                },
+            },
+        }
+        fake_limiter = MagicMock()
+        fake_limiter.acquire = AsyncMock()
+        before_browse_miss = self._outcome_count('browse', 'miss')
+        before_resolve_hit = self._outcome_count(
+            'resolve_url', 'hit',
+        )
+        with patch(
+            'scrape_exchange.youtube.youtube_channel.'
+            'pooled_innertube_for_entry',
+            return_value=fake_client,
+        ), patch(
+            'scrape_exchange.youtube.youtube_channel.'
+            'YouTubeRateLimiter.get',
+            return_value=fake_limiter,
+        ):
+            ok = await ch._resolve_channel_id_via_innertube()
+
+        self.assertTrue(ok)
+        self.assertEqual(
+            ch.channel_id, 'UCX6OQ3DkcsbYNE6H8uQQuVA',
+        )
+        fake_client.browse.assert_called_once()
+        fake_client.adaptor.dispatch.assert_called_once_with(
+            'navigation/resolve_url',
+            body={'url': 'https://www.youtube.com/@MrBeast'},
+        )
+        # Metric: browse miss ticked once; resolve_url hit ticked
+        # once.
+        self.assertEqual(
+            self._outcome_count('browse', 'miss')
+            - before_browse_miss,
+            1.0,
+        )
+        self.assertEqual(
+            self._outcome_count('resolve_url', 'hit')
+            - before_resolve_hit,
+            1.0,
+        )
+
+    async def test_browse_raises_then_resolve_url_succeeds(self) -> None:
+        ch = self._make_channel()
+        from unittest.mock import patch, MagicMock, AsyncMock
+        fake_client = MagicMock()
+        fake_client.browse.side_effect = RuntimeError('browse boom')
+        fake_client.adaptor.dispatch.return_value = {
+            'endpoint': {
+                'browseEndpoint': {
+                    'browseId': 'UCX6OQ3DkcsbYNE6H8uQQuVA',
+                },
+            },
+        }
+        fake_limiter = MagicMock()
+        fake_limiter.acquire = AsyncMock()
+        before_browse_err = self._outcome_count('browse', 'error')
+        before_resolve_hit = self._outcome_count(
+            'resolve_url', 'hit',
+        )
+        with patch(
+            'scrape_exchange.youtube.youtube_channel.'
+            'pooled_innertube_for_entry',
+            return_value=fake_client,
+        ), patch(
+            'scrape_exchange.youtube.youtube_channel.'
+            'YouTubeRateLimiter.get',
+            return_value=fake_limiter,
+        ):
+            ok = await ch._resolve_channel_id_via_innertube()
+
+        self.assertTrue(ok)
+        self.assertEqual(
+            ch.channel_id, 'UCX6OQ3DkcsbYNE6H8uQQuVA',
+        )
+        # Metric: browse 'error' ticked, resolve_url 'hit' ticked.
+        self.assertEqual(
+            self._outcome_count('browse', 'error')
+            - before_browse_err,
+            1.0,
+        )
+        self.assertEqual(
+            self._outcome_count('resolve_url', 'hit')
+            - before_resolve_hit,
+            1.0,
+        )
+
+    async def test_both_strategies_fail(self) -> None:
+        ch = self._make_channel()
+        from unittest.mock import patch, MagicMock, AsyncMock
+        fake_client = MagicMock()
+        fake_client.browse.return_value = {}
+        fake_client.adaptor.dispatch.return_value = {}
+        fake_limiter = MagicMock()
+        fake_limiter.acquire = AsyncMock()
+        before_browse_miss = self._outcome_count('browse', 'miss')
+        before_resolve_miss = self._outcome_count(
+            'resolve_url', 'miss',
+        )
+        with patch(
+            'scrape_exchange.youtube.youtube_channel.'
+            'pooled_innertube_for_entry',
+            return_value=fake_client,
+        ), patch(
+            'scrape_exchange.youtube.youtube_channel.'
+            'YouTubeRateLimiter.get',
+            return_value=fake_limiter,
+        ):
+            ok = await ch._resolve_channel_id_via_innertube()
+
+        self.assertFalse(ok)
+        self.assertIsNone(ch.channel_id)
+        # Metric: both strategies ticked 'miss' once.
+        self.assertEqual(
+            self._outcome_count('browse', 'miss')
+            - before_browse_miss,
+            1.0,
+        )
+        self.assertEqual(
+            self._outcome_count('resolve_url', 'miss')
+            - before_resolve_miss,
+            1.0,
+        )
+
+    async def test_handle_with_at_prefix_normalized(self) -> None:
+        '''Handles already prefixed with @ should not be doubled.'''
+        ch = self._make_channel(channel_handle='@MrBeast')
+        # YouTubeChannel.__init__ strips leading '@', so the
+        # stored handle is 'MrBeast'; this is just a sanity check
+        # that the resolver builds a single-@ URL/browse_id.
+        self.assertEqual(ch.channel_handle, 'MrBeast')
+        from unittest.mock import patch, MagicMock, AsyncMock
+        fake_client = MagicMock()
+        fake_client.browse.return_value = {
+            'metadata': {
+                'channelMetadataRenderer': {
+                    'externalId': 'UCX6OQ3DkcsbYNE6H8uQQuVA',
+                },
+            },
+        }
+        fake_limiter = MagicMock()
+        fake_limiter.acquire = AsyncMock()
+        with patch(
+            'scrape_exchange.youtube.youtube_channel.'
+            'pooled_innertube_for_entry',
+            return_value=fake_client,
+        ), patch(
+            'scrape_exchange.youtube.youtube_channel.'
+            'YouTubeRateLimiter.get',
+            return_value=fake_limiter,
+        ):
+            await ch._resolve_channel_id_via_innertube()
+        fake_client.browse.assert_called_once_with('@MrBeast')
+
+
 if __name__ == '__main__':
     unittest.main()

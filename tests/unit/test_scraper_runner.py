@@ -132,7 +132,7 @@ class TestScraperRunnerWorker(
 
     @patch(
         'scrape_exchange.scraper_runner'
-        '.start_http_server',
+        '.start_metrics_server',
     )
     @patch(
         'scrape_exchange.scraper_runner'
@@ -195,7 +195,7 @@ class TestScraperRunnerWorker(
 
     @patch(
         'scrape_exchange.scraper_runner'
-        '.start_http_server',
+        '.start_metrics_server',
     )
     @patch(
         'scrape_exchange.scraper_runner'
@@ -253,7 +253,7 @@ class TestScraperRunnerWorker(
 
     @patch(
         'scrape_exchange.scraper_runner'
-        '.start_http_server',
+        '.start_metrics_server',
     )
     @patch(
         'scrape_exchange.scraper_runner'

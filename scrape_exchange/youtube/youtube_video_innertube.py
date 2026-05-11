@@ -16,14 +16,18 @@ from datetime import datetime
 from innertube import InnerTube
 from innertube.errors import RequestError as InnerTubeRequestError
 
+from scrape_exchange.youtube.youtube_channel_tabs import (
+    pooled_innertube_for_entry,
+)
+
 from dateutil import parser as dateutil_parser
 
 from .youtube_caption import YouTubeCaption
 from scrape_exchange.worker_id import get_worker_id
+from scrape_exchange.proxy_loader import proxy_file_label
 from scrape_exchange.util import extract_proxy_ip, proxy_network_for
 from .youtube_client import METRIC_YT_REQUEST_DURATION, _get_scraper
 from .youtube_format import YouTubeFormat
-from .youtube_cookiejar import YouTubeCookieJar
 from .youtube_rate_limiter import YouTubeRateLimiter, YouTubeCallType
 from .youtube_thumbnail import YouTubeThumbnail
 from .youtube_videochapter import YouTubeVideoChapter
@@ -128,10 +132,7 @@ class InnerTubeVideoParser:
                 logging.warning(
                     'No proxy configured, proceeding without proxy'
                 )
-            self.innertube = InnerTube('WEB', proxies=proxy)
-            YouTubeCookieJar.get().load_into_session(
-                self.innertube.adaptor.session, proxy
-            )
+            self.innertube = pooled_innertube_for_entry(proxy)
 
     @staticmethod
     async def scrape(video: YouTubeVideo, innertube: InnerTube | None = None,
@@ -153,6 +154,7 @@ class InnerTubeVideoParser:
                 extract_proxy_ip(proxy) if proxy else 'none'
             )
             proxy_network: str = proxy_network_for(proxy_ip)
+            proxy_file: str = proxy_file_label(proxy or '')
             start: float = time.monotonic()
             try:
                 player_data = self.innertube.player(video.video_id)
@@ -164,6 +166,7 @@ class InnerTubeVideoParser:
                     worker_id=get_worker_id(),
                     proxy_ip=proxy_ip,
                     proxy_network=proxy_network,
+                    proxy_file=proxy_file,
                 ).observe(time.monotonic() - start)
                 break
             except InnerTubeRequestError as exc:
@@ -179,6 +182,7 @@ class InnerTubeVideoParser:
                     worker_id=get_worker_id(),
                     proxy_ip=proxy_ip,
                     proxy_network=proxy_network,
+                    proxy_file=proxy_file,
                 ).observe(time.monotonic() - start)
                 if exc.error.code == 429:
                     await limiter.penalise(
@@ -217,6 +221,7 @@ class InnerTubeVideoParser:
                     worker_id=get_worker_id(),
                     proxy_ip=proxy_ip,
                     proxy_network=proxy_network,
+                    proxy_file=proxy_file,
                 ).observe(time.monotonic() - start)
                 raise RuntimeError(f'InnerTube API call failed: {exc}')
 
@@ -238,6 +243,7 @@ class InnerTubeVideoParser:
                     worker_id=get_worker_id(),
                     proxy_ip=proxy_ip,
                     proxy_network=proxy_network,
+                    proxy_file=proxy_file,
                 ).observe(time.monotonic() - next_start)
                 self._parse_next_data(next_data)
                 break
@@ -254,6 +260,7 @@ class InnerTubeVideoParser:
                     worker_id=get_worker_id(),
                     proxy_ip=proxy_ip,
                     proxy_network=proxy_network,
+                    proxy_file=proxy_file,
                 ).observe(time.monotonic() - next_start)
                 if exc.error.code == 429:
                     await limiter.penalise(
@@ -289,6 +296,7 @@ class InnerTubeVideoParser:
                     worker_id=get_worker_id(),
                     proxy_ip=proxy_ip,
                     proxy_network=proxy_network,
+                    proxy_file=proxy_file,
                 ).observe(time.monotonic() - next_start)
                 break  # NEXT is best-effort; never fail the whole scrape
 
@@ -389,6 +397,15 @@ class InnerTubeVideoParser:
         ).get('thumbnails', [])
         for thumbnail_data in thumbnails_data:
             thumbnail = YouTubeThumbnail(thumbnail_data)
+            # YouTube occasionally returns a thumbnail entry with
+            # width/height but no url; without this guard the
+            # video gets persisted with ``url: null`` in the
+            # output JSON. Mirrors the same guard already present
+            # in YouTubeVideo._parse_thumbnails (the yt-dlp/RSS
+            # path) which is why the bug only surfaced once
+            # innertube became the default backend.
+            if not thumbnail.url:
+                continue
             label: str = (
                 thumbnail.id or f'{thumbnail.width}x{thumbnail.height}'
             )
@@ -599,6 +616,31 @@ class InnerTubeVideoParser:
                         if cat and not self.video.category:
                             self.video.category = cat
                             break
+
+            # Channel thumbnail lives on the owner renderer of the
+            # secondary info block — the same place the web client
+            # reads the channel avatar from. Take the largest
+            # thumbnail with a real url; the unfiltered list can
+            # contain ones without a url, see Bug #1 guard above.
+            owner_thumbs: list[dict] = (
+                secondary
+                .get('owner', {})
+                .get('videoOwnerRenderer', {})
+                .get('thumbnail', {})
+                .get('thumbnails', [])
+            )
+            best: YouTubeThumbnail | None = None
+            for t in owner_thumbs:
+                if not t.get('url'):
+                    continue
+                cand = YouTubeThumbnail(t)
+                if best is None or (
+                    (cand.width or 0) > (best.width or 0)
+                ):
+                    best = cand
+            if best is not None:
+                self.video.channel_thumbnail_asset = best
+                self.video.channel_thumbnail_url = best.url
         self.video.comment_count = \
             _extract_comment_count(next_data) or self.video.comment_count
         self.video.chapters = InnerTubeVideoParser._parse_chapters_from_next(

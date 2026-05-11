@@ -16,6 +16,7 @@ import time
 from innertube import InnerTube
 from innertube.errors import RequestError as InnerTubeRequestError
 
+from scrape_exchange._lazy_async_pool import _LazyAsyncPool
 from scrape_exchange.datatypes import MAX_KEEPALIVE_REQUESTS
 from scrape_exchange.youtube.youtube_types import YouTubeChannelPageType
 
@@ -28,6 +29,7 @@ from .youtube_client import (
     generate_visitor_info,
 )
 from scrape_exchange.worker_id import get_worker_id
+from scrape_exchange.proxy_loader import proxy_file_label
 from scrape_exchange.util import extract_proxy_ip, proxy_network_for
 from .youtube_cookiejar import YouTubeCookieJar
 from .youtube_rate_limiter import YouTubeRateLimiter, YouTubeCallType
@@ -53,51 +55,24 @@ class YouTubeChannelTabs:
 
     def get_innertube_client(self) -> InnerTube:
         '''
-        Gets the Innertube client for browsing/scraping data.  The client is
-        created lazily on the first call to this method.  Uses ``self.proxy``
-        when set.
-        ---
+        Return the pooled Innertube client for ``self.proxy``.
+
+        The pool factory in this module handles cookie-jar load and
+        a single VISITOR_INFO1_LIVE per proxy at first creation, so
+        repeated calls reuse the warmed-up TCP/TLS session — the
+        keep-alive ``MAX_KEEPALIVE_REQUESTS`` rotation that this
+        method previously performed is intentionally collapsed
+        (see the design spec for the trade-off discussion).
+
         :returns: An instance of the Innertube client.
         '''
-
-        _LOGGER.debug('Creating new Innertube client')
-        try:
-            if self.client:
-                self.client.adaptor.session.close()
-        except AttributeError:
-            # this happens when we are called by the constructor
-            pass
 
         self.client_request_count = 0
         if not self.proxy:
             _LOGGER.warning(
                 'No proxies configured, proceeding without proxies'
             )
-
-        client: InnerTube = InnerTube(
-            'WEB', INNERTUBE_CLIENT_VERSION, proxies=self.proxy
-        )
-
-        # Load cached session cookies (YSC, PREF, SOCS, etc.) from the
-        # per-proxy cookie jar first, then overwrite VISITOR_INFO1_LIVE with a
-        # freshly-generated value so every rotated client gets a new identity.
-        YouTubeCookieJar.get().load_into_session(
-            client.adaptor.session, self.proxy
-        )
-        self.visitor_id: str = generate_visitor_info()
-        client.adaptor.session.cookies.set(
-            'VISITOR_INFO1_LIVE', self.visitor_id,
-            domain='.youtube.com', path='/'
-        )
-
-        # Align the X-YouTube-Client-Name / Version headers with what
-        # the WEB client sends in a real browser session.
-        client.adaptor.session.headers['X-YouTube-Client-Name'] = \
-            INNERTUBE_CLIENT_NAME
-        client.adaptor.session.headers['X-YouTube-Client-Version'] = \
-            INNERTUBE_CLIENT_VERSION
-
-        return client
+        return pooled_innertube_for_entry(self.proxy)
 
     async def browse_channel(self) -> dict[str, any]:
         '''
@@ -508,11 +483,13 @@ class YouTubeChannelTabs:
             extract_proxy_ip(self.proxy) if self.proxy else 'none'
         )
         proxy_network: str = proxy_network_for(proxy_ip)
+        proxy_file: str = proxy_file_label(self.proxy or '')
         extra: dict[str, str] = {
             'channel_id': self.channel_id,
             'proxy': self.proxy or 'none',
             'proxy_ip': proxy_ip,
             'proxy_network': proxy_network,
+            'proxy_file': proxy_file,
         }
         for attempt in range(1, max_retries + 1):
             self.client_request_count += 1
@@ -550,6 +527,7 @@ class YouTubeChannelTabs:
                     worker_id=get_worker_id(),
                     proxy_ip=proxy_ip,
                     proxy_network=proxy_network,
+                    proxy_file=proxy_file,
                 ).observe(time.monotonic() - start)
                 return result
             except InnerTubeRequestError as exc:
@@ -563,6 +541,7 @@ class YouTubeChannelTabs:
                     worker_id=get_worker_id(),
                     proxy_ip=proxy_ip,
                     proxy_network=proxy_network,
+                    proxy_file=proxy_file,
                 ).observe(time.monotonic() - start)
                 if exc.error.code == 429:
                     await limiter.penalise(
@@ -611,6 +590,7 @@ class YouTubeChannelTabs:
                     worker_id=get_worker_id(),
                     proxy_ip=proxy_ip,
                     proxy_network=proxy_network,
+                    proxy_file=proxy_file,
                 ).observe(time.monotonic() - start)
                 _LOGGER.error(
                     'InnerTube BROWSE error',
@@ -733,3 +713,61 @@ class YouTubeChannelTabs:
         raise RuntimeError(
             f'Channel {self.channel_id} does not have a {title} tab'
         )
+
+
+def _make_pooled_innertube_for_entry(
+    entry: str | None,
+) -> InnerTube:
+    '''Pool factory for the third-party InnerTube library. Cookie-
+    jar warm-up and a single (stable) VISITOR_INFO1_LIVE happen
+    once per entry. Subsequent calls reuse the cached session.'''
+
+    client: InnerTube = InnerTube(
+        'WEB', INNERTUBE_CLIENT_VERSION, proxies=entry,
+    )
+    YouTubeCookieJar.get().load_into_session(
+        client.adaptor.session, entry,
+    )
+    visitor_id: str = generate_visitor_info()
+    client.adaptor.session.cookies.set(
+        'VISITOR_INFO1_LIVE', visitor_id,
+        domain='.youtube.com', path='/',
+    )
+    client.adaptor.session.headers[
+        'X-YouTube-Client-Name'
+    ] = INNERTUBE_CLIENT_NAME
+    client.adaptor.session.headers[
+        'X-YouTube-Client-Version'
+    ] = INNERTUBE_CLIENT_VERSION
+    return client
+
+
+_INNERTUBE_POOL: _LazyAsyncPool[
+    str | None, InnerTube,
+] = _LazyAsyncPool(
+    factory=_make_pooled_innertube_for_entry,
+    aclose_attr='close',
+)
+
+
+def pooled_innertube_for_entry(entry: str | None) -> InnerTube:
+    '''Return the long-lived, keep-alive-pooled
+    :class:`innertube.InnerTube` for ``entry``. Same instance
+    across calls for the same key. Cookie-jar and visitor_id
+    setup happen once at first creation.'''
+
+    return _INNERTUBE_POOL.get(entry)
+
+
+async def aclose_pooled_innertube() -> None:
+    '''Close every pooled InnerTube session and empty the pool.
+    Called from the scraper shutdown drain.'''
+
+    await _INNERTUBE_POOL.aclose_all()
+
+
+def _reset_pool_for_tests() -> None:
+    '''Drop cached pooled InnerTube sessions without calling
+    aclose. Tests only.'''
+
+    _INNERTUBE_POOL.reset_for_tests()

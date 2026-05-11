@@ -177,5 +177,209 @@ class TestApplyPlayerDataIdentityFieldsNotClobbered(
         )
 
 
+class TestVideoThumbnailFiltering(unittest.TestCase):
+    '''Bug #1: thumbnail entries from YouTube without a ``url``
+    field were silently persisted with ``url=None``. The yt-dlp /
+    RSS path filters them via YouTubeVideo._parse_thumbnails;
+    the InnerTube path did not. Since innertube is the default
+    backend, every video scrape was vulnerable.
+    '''
+
+    def test_thumbnails_without_url_are_skipped(self) -> None:
+        video: YouTubeVideo = _video_with_rss_data()
+        # Two valid + one missing-url thumbnail.
+        player_data: dict = {
+            'videoDetails': {
+                'thumbnail': {
+                    'thumbnails': [
+                        {
+                            'url': (
+                                'https://i.ytimg.com/vi/'
+                                'vid/default.jpg'
+                            ),
+                            'width': 120, 'height': 90,
+                        },
+                        {
+                            'width': 320, 'height': 180,
+                        },  # no url
+                        {
+                            'url': (
+                                'https://i.ytimg.com/vi/'
+                                'vid/hq.jpg'
+                            ),
+                            'width': 480, 'height': 360,
+                        },
+                    ],
+                },
+            },
+            'microformat': {'playerMicroformatRenderer': {}},
+        }
+        InnerTubeVideoParser._apply_player_data(
+            video, player_data,
+        )
+        # Only the two with a real url should land on the video.
+        self.assertEqual(len(video.thumbnails), 2)
+        for thumb in video.thumbnails.values():
+            self.assertIsNotNone(thumb.url)
+
+
+class TestNextDataSetsChannelThumbnail(unittest.TestCase):
+    '''Bug #2: callers pass ``channel_thumbnail=None`` because they
+    don't have it; the InnerTube parser must extract it from the
+    ``next`` response so the persisted video has a populated
+    channel avatar.'''
+
+    def _build_parser_with_video(self) -> InnerTubeVideoParser:
+        video: YouTubeVideo = YouTubeVideo(
+            video_id='vid', channel_handle='OriginalHandle',
+        )
+        # Bypass the live-network constructor; the parser's
+        # ``_parse_next_data`` is a method on the instance and
+        # only needs ``self.video`` and proper subclass routing.
+        parser: InnerTubeVideoParser = (
+            InnerTubeVideoParser.__new__(InnerTubeVideoParser)
+        )
+        parser.video = video
+        return parser
+
+    def test_largest_owner_thumbnail_wins(self) -> None:
+        parser = self._build_parser_with_video()
+        next_data: dict = {
+            'contents': {
+                'twoColumnWatchNextResults': {
+                    'results': {
+                        'results': {
+                            'contents': [
+                                {'videoSecondaryInfoRenderer': {
+                                    'owner': {
+                                        'videoOwnerRenderer': {
+                                            'thumbnail': {
+                                                'thumbnails': [
+                                                    {
+                                                        'url': (
+                                                            'https://x/'
+                                                            's48'
+                                                        ),
+                                                        'width': 48,
+                                                        'height': 48,
+                                                    },
+                                                    {
+                                                        'url': (
+                                                            'https://x/'
+                                                            's176'
+                                                        ),
+                                                        'width': 176,
+                                                        'height': 176,
+                                                    },
+                                                    {
+                                                        'url': (
+                                                            'https://x/'
+                                                            's88'
+                                                        ),
+                                                        'width': 88,
+                                                        'height': 88,
+                                                    },
+                                                ],
+                                            },
+                                        },
+                                    },
+                                }},
+                            ],
+                        },
+                    },
+                },
+            },
+        }
+        parser._parse_next_data(next_data)
+        self.assertIsNotNone(
+            parser.video.channel_thumbnail_asset,
+        )
+        self.assertEqual(
+            parser.video.channel_thumbnail_asset.width, 176,
+        )
+        self.assertEqual(
+            parser.video.channel_thumbnail_url,
+            'https://x/s176',
+        )
+
+    def test_url_less_owner_thumbnails_filtered(self) -> None:
+        parser = self._build_parser_with_video()
+        next_data: dict = {
+            'contents': {
+                'twoColumnWatchNextResults': {
+                    'results': {
+                        'results': {
+                            'contents': [
+                                {'videoSecondaryInfoRenderer': {
+                                    'owner': {
+                                        'videoOwnerRenderer': {
+                                            'thumbnail': {
+                                                'thumbnails': [
+                                                    {
+                                                        'width': 999,
+                                                        'height': 999,
+                                                    },  # no url
+                                                    {
+                                                        'url': (
+                                                            'https://x/'
+                                                            'real'
+                                                        ),
+                                                        'width': 88,
+                                                        'height': 88,
+                                                    },
+                                                ],
+                                            },
+                                        },
+                                    },
+                                }},
+                            ],
+                        },
+                    },
+                },
+            },
+        }
+        parser._parse_next_data(next_data)
+        self.assertEqual(
+            parser.video.channel_thumbnail_asset.width, 88,
+        )
+        self.assertEqual(
+            parser.video.channel_thumbnail_url,
+            'https://x/real',
+        )
+
+    def test_missing_owner_renderer_keeps_existing_value(
+        self,
+    ) -> None:
+        parser = self._build_parser_with_video()
+        # A pre-existing channel_thumbnail (e.g. passed by caller)
+        # must not be wiped out when the InnerTube response lacks
+        # videoOwnerRenderer.
+        from scrape_exchange.youtube.youtube_thumbnail import (
+            YouTubeThumbnail,
+        )
+        existing: YouTubeThumbnail = YouTubeThumbnail({
+            'url': 'https://existing/thumb', 'width': 100,
+            'height': 100,
+        })
+        parser.video.channel_thumbnail_asset = existing
+        parser.video.channel_thumbnail_url = existing.url
+
+        next_data: dict = {
+            'contents': {
+                'twoColumnWatchNextResults': {
+                    'results': {
+                        'results': {
+                            'contents': [],  # nothing useful
+                        },
+                    },
+                },
+            },
+        }
+        parser._parse_next_data(next_data)
+        self.assertIs(
+            parser.video.channel_thumbnail_asset, existing,
+        )
+
+
 if __name__ == '__main__':
     unittest.main()

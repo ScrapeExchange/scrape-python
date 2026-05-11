@@ -23,6 +23,7 @@ import asyncio
 import fcntl
 import hashlib
 import os
+import random
 import time
 import logging
 import tempfile
@@ -33,7 +34,11 @@ from dataclasses import dataclass, field
 
 import httpx
 
-from .youtube_client import AsyncYouTubeClient, CONSENT_COOKIES
+from .youtube_client import (
+    AsyncYouTubeClient,
+    CONSENT_COOKIES,
+    pooled_youtube_client_for_entry,
+)
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -60,6 +65,71 @@ _WARM_CONCURRENCY: int = 8
 
 # Shared cookie directory. All processes on the host cooperate here.
 _SHARED_DIR_NAME: str = 'scrape_exchange_yt_cookies'
+
+
+# ---------------------------------------------------------------
+# First-fetch jitter
+#
+# When N worker processes start within ~1s of each other and each
+# proactively acquires cookies for ~133 proxies, every first call
+# fires a fresh CONNECT-and-fetch through the same proxy fleet at
+# the same moment. That stampede saturates the proxy
+# infrastructure and produces the TLS-handshake / connection
+# timeout failures observed in production logs ("Failed to acquire
+# cookies for proxy" with curl error 28/35 causes).
+#
+# ``jitter_first_cookie_fetch(proxy)`` sleeps a uniform-random
+# 0..COOKIE_FETCH_JITTER_MAX_SECONDS the first time it is awaited
+# for *proxy* in this process; subsequent calls are no-ops. The
+# acquisition timestamps that result then anchor each entry's
+# 4 h TTL, so the renewal cycles after the first one stay
+# spread out for the lifetime of the process.
+#
+# Mirrors ``scrape_exchange.proxy_loader.jitter_pool_warmup`` so
+# the two herd-breaking helpers behave consistently.
+# ---------------------------------------------------------------
+
+COOKIE_FETCH_JITTER_MAX_SECONDS: float = 30.0
+
+_FETCH_JITTER_SEEN: set[str | None] = set()
+_FETCH_JITTER_LOCK: 'asyncio.Lock | None' = None
+
+
+def _reset_jitter_for_tests() -> None:
+    '''Drop the per-process jitter dedup set. Test-only.'''
+    _FETCH_JITTER_SEEN.clear()
+    global _FETCH_JITTER_LOCK
+    _FETCH_JITTER_LOCK = None
+
+
+async def jitter_first_cookie_fetch(proxy: str | None) -> None:
+    '''Stagger the first cookie-acquisition fetch through *proxy*.
+
+    Sleeps a uniform-random duration in
+    ``[0, COOKIE_FETCH_JITTER_MAX_SECONDS)`` the first time this
+    is called for *proxy* in the current process; no-ops on every
+    subsequent call. Used to spread fleet-wide cookie-fetch
+    bursts at worker startup so the proxy infrastructure does
+    not saturate on coincident TLS handshakes to YouTube.
+
+    Safe to call from any worker; the per-process dedup set is
+    guarded by an asyncio.Lock so concurrent first-use across
+    coroutines serialises correctly.
+    '''
+    if proxy in _FETCH_JITTER_SEEN:
+        return
+    global _FETCH_JITTER_LOCK
+    if _FETCH_JITTER_LOCK is None:
+        _FETCH_JITTER_LOCK = asyncio.Lock()
+    async with _FETCH_JITTER_LOCK:
+        if proxy in _FETCH_JITTER_SEEN:
+            return
+        _FETCH_JITTER_SEEN.add(proxy)
+        delay: float = random.uniform(
+            0, COOKIE_FETCH_JITTER_MAX_SECONDS,
+        )
+        if delay > 0:
+            await asyncio.sleep(delay)
 
 
 def _shared_cookie_dir() -> str:
@@ -338,15 +408,25 @@ class YouTubeCookieJar:
         *path* so other processes see a valid file at all times.
         Concurrent fetches across the process are bounded by
         :attr:`_fetch_semaphore`.
+
+        The first fetch through any given *proxy* in this process
+        is jittered 0..COOKIE_FETCH_JITTER_MAX_SECONDS to break
+        the fleet-wide stampede that otherwise saturates the
+        proxy infrastructure when N worker processes boot
+        together. Sleeping outside the semaphore so the jitter
+        does not consume one of the 8 fetch slots.
         '''
+        await jitter_first_cookie_fetch(proxy)
         async with self._fetch_semaphore:
             try:
-                client: AsyncYouTubeClient = AsyncYouTubeClient(
-                    proxy=proxy, timeout=_COOKIE_FETCH_TIMEOUT,
+                client: AsyncYouTubeClient = (
+                    pooled_youtube_client_for_entry(proxy)
                 )
-                async with client:
-                    await client.get(AsyncYouTubeClient.SCRAPE_URL)
-                    cookies = list(client.cookies.jar)
+                await client.get(
+                    AsyncYouTubeClient.SCRAPE_URL,
+                    timeout=_COOKIE_FETCH_TIMEOUT,
+                )
+                cookies = list(client.cookies.jar)
 
                 await asyncio.to_thread(
                     _write_cookie_file, path, cookies,

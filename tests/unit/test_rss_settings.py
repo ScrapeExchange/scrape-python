@@ -101,3 +101,102 @@ class TestEligibilityFractionSetting(unittest.TestCase):
                 del os.environ[
                     'RSS_ELIGIBILITY_FRACTION'
                 ]
+
+
+class TestRssProxyFilesOverride(unittest.TestCase):
+    '''``RSS_PROXY_FILES`` must override ``PROXY_FILES`` for the
+    RSS scraper's proxy catalog without affecting the base
+    ``proxy_files`` / inherited fields. The video and channel
+    scrapers, which read ``settings.proxies`` via
+    ``ScraperSettings._load_proxy_catalog``, are unaffected
+    because they don't read ``rss_proxy_files``.'''
+
+    def setUp(self) -> None:
+        for key in (
+            'RSS_PROXY_FILES', 'rss_proxy_files',
+            'PROXY_FILES', 'proxy_files',
+        ):
+            os.environ.pop(key, None)
+        import tempfile
+        self._tmp: Path = Path(
+            tempfile.mkdtemp(prefix='rss_proxy_files_'),
+        )
+        self._base_file: Path = (
+            self._tmp / 'base.proxies.lst'
+        )
+        self._base_file.write_text(
+            'http://baseuser:basepass@10.0.0.1:8080\n'
+            'http://baseuser:basepass@10.0.0.2:8080\n'
+        )
+        self._rss_file: Path = (
+            self._tmp / 'rss.proxies.lst'
+        )
+        self._rss_file.write_text(
+            'http://rssuser:rsspass@10.1.0.1:8080\n'
+        )
+
+    def tearDown(self) -> None:
+        for key in (
+            'RSS_PROXY_FILES', 'rss_proxy_files',
+            'PROXY_FILES', 'proxy_files',
+        ):
+            os.environ.pop(key, None)
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_default_is_none(self) -> None:
+        s: RssSettings = RssSettings(
+            _env_file=None, _cli_parse_args=[],
+        )
+        self.assertIsNone(s.rss_proxy_files)
+
+    def test_inherits_proxy_files_when_unset(self) -> None:
+        os.environ['PROXY_FILES'] = str(self._base_file)
+        s: RssSettings = RssSettings(
+            _env_file=None, _cli_parse_args=[],
+        )
+        self.assertEqual(len(s.proxies), 2)
+        self.assertIn(
+            'http://baseuser:basepass@10.0.0.1:8080',
+            s.proxies,
+        )
+
+    def test_override_replaces_proxy_catalog(self) -> None:
+        os.environ['PROXY_FILES'] = str(self._base_file)
+        os.environ['RSS_PROXY_FILES'] = str(self._rss_file)
+        s: RssSettings = RssSettings(
+            _env_file=None, _cli_parse_args=[],
+        )
+        self.assertEqual(len(s.proxies), 1)
+        self.assertIn(
+            'http://rssuser:rsspass@10.1.0.1:8080',
+            s.proxies,
+        )
+        self.assertNotIn(
+            'http://baseuser:basepass@10.0.0.1:8080',
+            s.proxies,
+        )
+
+    def test_override_with_no_base_proxy_files(self) -> None:
+        os.environ['RSS_PROXY_FILES'] = str(self._rss_file)
+        s: RssSettings = RssSettings(
+            _env_file=None, _cli_parse_args=[],
+        )
+        self.assertEqual(len(s.proxies), 1)
+        self.assertIn(
+            'http://rssuser:rsspass@10.1.0.1:8080',
+            s.proxies,
+        )
+
+    def test_override_supports_comma_separated(self) -> None:
+        second: Path = self._tmp / 'rss2.proxies.lst'
+        second.write_text(
+            'http://rssuser:rsspass@10.1.0.2:8080\n',
+        )
+        os.environ['RSS_PROXY_FILES'] = (
+            f'{self._rss_file},{second}'
+        )
+        s: RssSettings = RssSettings(
+            _env_file=None, _cli_parse_args=[],
+        )
+        self.assertEqual(len(s.proxies), 2)

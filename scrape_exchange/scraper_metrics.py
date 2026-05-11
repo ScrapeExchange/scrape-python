@@ -36,10 +36,10 @@ METRIC_SCRAPES_COMPLETED: Counter = Counter(
     'scrapes_completed_total',
     'Number of entities successfully scraped, labelled by scraper, '
     'entity type, api (ytdlp/html/rss/innertube), proxy IP, '
-    'and proxy network.',
+    'proxy network, and proxy file.',
     [
         'platform', 'scraper', 'entity', 'api',
-        'worker_id', 'proxy_ip', 'proxy_network',
+        'worker_id', 'proxy_ip', 'proxy_network', 'proxy_file',
     ],
 )
 
@@ -51,10 +51,11 @@ METRIC_SCRAPES_COMPLETED: Counter = Counter(
 METRIC_SCRAPE_FAILURES: Counter = Counter(
     'scrape_failures_total',
     'Number of failed scrape attempts, labelled by scraper, entity '
-    'type, api, proxy, and failure reason.',
+    'type, api, proxy, failure reason, and proxy file.',
     [
         'platform', 'scraper', 'entity', 'api',
         'reason', 'worker_id', 'proxy_ip', 'proxy_network',
+        'proxy_file',
     ],
 )
 
@@ -86,11 +87,16 @@ METRIC_UPLOADS_SKIPPED: Counter = Counter(
 # scrape_queue_size
 #   Current number of items pending in the scrape queue. Use tier='none'
 #   for scrapers that do not partition their queue by tier.
+#
+#   Queue size is shared state (Redis ZCARD or a per-process queue snapshot
+#   at startup); it is NOT per-async-worker. Earlier versions added a
+#   ``worker_id`` label which caused ``sum()`` aggregations across workers
+#   to multiply the actual value by N. Removed.
 # ---------------------------------------------------------------------------
 METRIC_SCRAPE_QUEUE_SIZE: Gauge = Gauge(
     'scrape_queue_size',
     'Number of items pending processing in the scrape queue.',
-    ['platform', 'scraper', 'entity', 'tier', 'worker_id'],
+    ['platform', 'scraper', 'entity', 'tier'],
 )
 
 # ---------------------------------------------------------------------------
@@ -118,8 +124,8 @@ METRIC_SCRAPE_DURATION: Histogram = Histogram(
         'outcome', 'worker_id',
     ],
     buckets=(
-        0.5, 1.0, 2.5, 5.0, 10.0,
-        30.0, 60.0, 120.0, 300.0,
+        0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+        10.0, 30.0, 60.0, 120.0, 300.0,
     ),
 )
 
@@ -133,6 +139,51 @@ METRIC_UPLOADS_FAILED: Counter = Counter(
     'Bulk-upload records reported as failed. Source files are left '
     'in base_dir for the next iteration.',
     ['platform', 'scraper', 'entity', 'mode', 'worker_id'],
+)
+
+# ---------------------------------------------------------------------------
+# channel_priority_writes_total
+#   Incremented each time the RSS scraper writes a channel-stat record
+#   to YOUTUBE_CHANNEL_PRIORITY_DIRECTORY instead of POSTing it via
+#   enqueue_upload.
+# ---------------------------------------------------------------------------
+METRIC_CHANNEL_PRIORITY_WRITES: Counter = Counter(
+    'channel_priority_writes_total',
+    'Channel-stat records written to '
+    'YOUTUBE_CHANNEL_PRIORITY_DIRECTORY by the RSS '
+    'scraper. Replaces the in-process enqueue_upload path '
+    'that previously POSTed channel updates directly.',
+    ['platform', 'scraper', 'worker_id'],
+)
+
+# ---------------------------------------------------------------------------
+# channel_priority_uploads_total
+#   Incremented each time the channel-upload-only container POSTs a
+#   channel-priority record to scrape.exchange.
+# ---------------------------------------------------------------------------
+METRIC_CHANNEL_PRIORITY_UPLOADS: Counter = Counter(
+    'channel_priority_uploads_total',
+    'Channel-priority records POSTed to scrape.exchange '
+    'by the channel-upload-only container, broken down by '
+    'outcome.',
+    ['platform', 'scraper', 'result', 'worker_id'],
+    # result is one of: success, retried, failed_permanently
+)
+
+# ---------------------------------------------------------------------------
+# channel_priority_queue_age_seconds
+#   Age of the oldest file in YOUTUBE_CHANNEL_PRIORITY_DIRECTORY.
+#   A monotonically growing value indicates the consumer is falling
+#   behind the producer.
+# ---------------------------------------------------------------------------
+METRIC_CHANNEL_PRIORITY_QUEUE_AGE: Gauge = Gauge(
+    'channel_priority_queue_age_seconds',
+    'Age of the oldest file currently in '
+    'YOUTUBE_CHANNEL_PRIORITY_DIRECTORY. Sampled per '
+    'channel-upload-only sweep. A monotonically growing '
+    'value indicates the consumer is falling behind the '
+    'producer.',
+    ['platform', 'scraper', 'worker_id'],
 )
 
 # ---------------------------------------------------------------------------
@@ -177,4 +228,17 @@ METRIC_WATCHER_BATCHES: Counter = Counter(
     'watcher_batches_total',
     'Number of change batches yielded by the file watcher.',
     ['platform', 'scraper', 'entity', 'worker_id'],
+)
+
+# ---------------------------------------------------------------------------
+# supervisor_respawns_total
+#   Incremented once per respawn scheduled by the scraper supervisor
+#   when a child process exits with a non-zero return code. The
+#   ``instance`` label is the worker_instance (1..N) so dashboards
+#   can flag a single slot that's flapping versus a fleet-wide event.
+# ---------------------------------------------------------------------------
+METRIC_SUPERVISOR_RESPAWNS: Counter = Counter(
+    'supervisor_respawns_total',
+    'Number of times the supervisor has respawned a crashed child.',
+    ['scraper', 'instance'],
 )
