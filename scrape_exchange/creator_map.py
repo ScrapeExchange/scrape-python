@@ -62,6 +62,17 @@ class CreatorMap(ABC):
         '''Return the creator_handle for *creator_id*, or None.'''
 
     @abstractmethod
+    async def get_many(
+        self, creator_ids: list[str],
+    ) -> dict[str, str | None]:
+        '''Return creator_id -> creator_handle (or None) for
+        many ids in one batched call. Implementations must
+        avoid fan-out over the connection pool — callers may
+        pass hundreds of thousands of ids and unbatched
+        ``gather(*(get(i) for i in ids))`` exhausts the
+        process fd table.'''
+
+    @abstractmethod
     async def get_all(self) -> dict[str, str]:
         '''Return all creator_id to creator_handle mappings.'''
 
@@ -114,6 +125,18 @@ class FileCreatorMap(CreatorMap):
         if not self._cache:
             await self.get_all()
         return self._cache.get(creator_id)
+
+    async def get_many(
+        self, creator_ids: list[str],
+    ) -> dict[str, str | None]:
+        if not creator_ids:
+            return {}
+        if not self._cache:
+            await self.get_all()
+        return {
+            cid: self._cache.get(cid)
+            for cid in creator_ids
+        }
 
     async def get_all(self) -> dict[str, str]:
         self._cache = {}
@@ -189,6 +212,12 @@ class RedisCreatorMap(CreatorMap):
     with field=creator_id, value=creator_handle.
     '''
 
+    # Per-HMGET cap. Keeps a single Redis command bounded so a
+    # ~200k id input completes in a handful of round-trips
+    # instead of one giant command (and without fanning out
+    # one connection per id).
+    _GET_MANY_CHUNK_SIZE: int = 10000
+
     def __init__(
         self, redis_dsn: str, platform: str,
     ) -> None:
@@ -210,6 +239,24 @@ class RedisCreatorMap(CreatorMap):
             self._key, creator_id,
         )
         return result
+
+    async def get_many(
+        self, creator_ids: list[str],
+    ) -> dict[str, str | None]:
+        if not creator_ids:
+            return {}
+        out: dict[str, str | None] = {}
+        chunk_size: int = type(self)._GET_MANY_CHUNK_SIZE
+        for start in range(0, len(creator_ids), chunk_size):
+            chunk: list[str] = (
+                creator_ids[start:start + chunk_size]
+            )
+            values: list[str | None] = (
+                await self._redis.hmget(self._key, chunk)
+            )
+            for cid, val in zip(chunk, values):
+                out[cid] = val
+        return out
 
     async def get_all(self) -> dict[str, str]:
         result: dict[str, str] = (
@@ -251,6 +298,11 @@ class NullCreatorMap(CreatorMap):
         self, creator_id: str,
     ) -> str | None:
         return None
+
+    async def get_many(
+        self, creator_ids: list[str],
+    ) -> dict[str, str | None]:
+        return dict.fromkeys(creator_ids)
 
     async def get_all(self) -> dict[str, str]:
         return {}

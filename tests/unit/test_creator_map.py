@@ -109,6 +109,37 @@ class TestFileCreatorMap(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(lines[0], 'UC111,Existing')
         self.assertEqual(lines[1], 'UC222,New')
 
+    async def test_get_many_mixed_hit_miss(self) -> None:
+        cm: FileCreatorMap = FileCreatorMap(
+            self.csv_path,
+        )
+        await cm.put_many({
+            'UC111': 'Alpha',
+            'UC222': 'Beta',
+        })
+        result: dict[str, str | None] = (
+            await cm.get_many(
+                ['UC111', 'UC222', 'UC999'],
+            )
+        )
+        self.assertEqual(
+            result,
+            {
+                'UC111': 'Alpha',
+                'UC222': 'Beta',
+                'UC999': None,
+            },
+        )
+
+    async def test_get_many_empty(self) -> None:
+        cm: FileCreatorMap = FileCreatorMap(
+            self.csv_path,
+        )
+        result: dict[str, str | None] = (
+            await cm.get_many([])
+        )
+        self.assertEqual(result, {})
+
 
 class TestRedisCreatorMap(
     unittest.IsolatedAsyncioTestCase,
@@ -177,6 +208,61 @@ class TestRedisCreatorMap(
         result: str | None = await self.cm.get('UC123')
         self.assertEqual(result, 'Second')
 
+    async def test_get_many_mixed_hit_miss(self) -> None:
+        await self.cm.put_many({
+            'UC111': 'Alpha',
+            'UC222': 'Beta',
+        })
+        result: dict[str, str | None] = (
+            await self.cm.get_many(
+                ['UC111', 'UC222', 'UC999'],
+            )
+        )
+        self.assertEqual(
+            result,
+            {
+                'UC111': 'Alpha',
+                'UC222': 'Beta',
+                'UC999': None,
+            },
+        )
+
+    async def test_get_many_empty(self) -> None:
+        result: dict[str, str | None] = (
+            await self.cm.get_many([])
+        )
+        self.assertEqual(result, {})
+
+    async def test_get_many_chunks_large_input(
+        self,
+    ) -> None:
+        '''Chunking keeps Redis command size bounded. With
+        100 ids spanning two ``_get_many_chunk_size``-sized
+        chunks, the result must still be complete.'''
+        mapping: dict[str, str] = {
+            f'UC{i:05d}': f'name{i}' for i in range(100)
+        }
+        await self.cm.put_many(mapping)
+        original_chunk_size: int = (
+            RedisCreatorMap._GET_MANY_CHUNK_SIZE
+        )
+        RedisCreatorMap._GET_MANY_CHUNK_SIZE = 30
+        try:
+            ids: list[str] = list(mapping.keys()) + [
+                'UC99999',
+            ]
+            result: dict[str, str | None] = (
+                await self.cm.get_many(ids)
+            )
+        finally:
+            RedisCreatorMap._GET_MANY_CHUNK_SIZE = (
+                original_chunk_size
+            )
+        self.assertEqual(len(result), 101)
+        self.assertIsNone(result['UC99999'])
+        for cid, handle in mapping.items():
+            self.assertEqual(result[cid], handle)
+
 
 class TestNullCreatorMap(
     unittest.IsolatedAsyncioTestCase,
@@ -199,6 +285,18 @@ class TestNullCreatorMap(
     async def test_size_always_zero(self) -> None:
         cm: NullCreatorMap = NullCreatorMap()
         self.assertEqual(await cm.size(), 0)
+
+    async def test_get_many_returns_none_for_all(
+        self,
+    ) -> None:
+        cm: NullCreatorMap = NullCreatorMap()
+        result: dict[str, str | None] = (
+            await cm.get_many(['UC1', 'UC2', 'UC3'])
+        )
+        self.assertEqual(
+            result,
+            {'UC1': None, 'UC2': None, 'UC3': None},
+        )
 
 
 class TestExportImportRoundTrip(

@@ -25,7 +25,11 @@ class YouTubeThumbnailSize(Enum):
 class YouTubeThumbnail:
     def __init__(self, data: dict, display_hint: str | None = None
                  ) -> None:
-        self.url: str = data.get('url')
+        # url is optional: YouTube occasionally returns thumbnail
+        # entries with width/height but no url. Callers must guard
+        # before persisting; otherwise the serialized payload ends
+        # up with null url fields downstream.
+        self.url: str | None = data.get('url')
         self.width: int | None = data.get('width')
         self.height: int | None = data.get('height')
         self.id: str | None = data.get('id')

@@ -8,6 +8,7 @@ Model a Youtube channel
 
 import os
 import re
+import time
 
 from typing import Self
 from logging import Logger
@@ -23,7 +24,28 @@ from yt_dlp import YoutubeDL
 from ..datatypes import IngestStatus
 from ..datatypes import SocialNetworks
 
-from .youtube_client import AsyncYouTubeClient, CONSENT_COOKIES
+import random
+
+from prometheus_client import Counter
+
+from scrape_exchange.worker_id import get_worker_id
+from scrape_exchange.proxy_loader import proxy_file_label
+from scrape_exchange.util import (
+    extract_proxy_ip as _extract_proxy_ip,
+    proxy_network_for as _proxy_network_for,
+)
+
+from .youtube_client import (
+    AsyncYouTubeClient,
+    CONSENT_COOKIES,
+    METRIC_YT_REQUEST_DURATION,
+    _get_scraper,
+    pooled_youtube_client_for_entry,
+)
+from .youtube_rate_limiter import (
+    YouTubeCallType,
+    YouTubeRateLimiter,
+)
 
 from .youtube_video import YouTubeVideo
 from .youtube_video import DENO_PATH
@@ -37,6 +59,7 @@ from .youtube_types import YouTubeChannelLink
 from .youtube_product import YouTubeProduct
 from .youtube_external_link import YouTubeExternalLink
 from .youtube_channel_tabs import YouTubeChannelTabs
+from .youtube_channel_tabs import pooled_innertube_for_entry
 
 from ..util import split_quoted_string, convert_number_string
 from ..util import get_imported_assets
@@ -51,6 +74,29 @@ MAX_CHANNEL_VIDEOS_PER_RUN: int = 40
 
 HTTP_PREFIX: str = 'http://'
 HTTPS_PREFIX: str = 'https://'
+
+# Outcomes from
+# :meth:`YouTubeChannel._resolve_channel_id_via_innertube`. Labels:
+#
+# - ``strategy`` is ``"browse"`` (InnerTube ``browse('@handle')``)
+#   or ``"resolve_url"`` (``adaptor.dispatch('navigation/resolve_url',
+#   ...)``). Together they answer "does B actually work in
+#   practice?" — non-zero counts on both rows would mean B is
+#   unreliable enough that C fires regularly.
+# - ``outcome`` is ``"hit"`` (channel_id obtained), ``"miss"`` (call
+#   succeeded but no usable browseId/externalId in response), or
+#   ``"error"`` (call raised an exception).
+METRIC_CHANNEL_HANDLE_RESOLVER_OUTCOMES: Counter = Counter(
+    'channel_handle_resolver_outcomes_total',
+    'Outcomes of the InnerTube handle->channel_id resolver, '
+    'used as a fallback when /about HTML did not supply a '
+    'channel_id.',
+    [
+        'platform', 'scraper', 'entity',
+        'strategy', 'outcome', 'worker_id',
+        'proxy_ip', 'proxy_network', 'proxy_file',
+    ],
+)
 
 
 def canonical_handle_from_browse(channel_data: dict) -> str | None:
@@ -80,16 +126,22 @@ def canonical_handle_from_browse(channel_data: dict) -> str | None:
 def fallback_handle(name: str) -> str:
     '''
     Deterministic fallback for channels with no canonical handle.
-    Strips leading '@' and whitespace, then lowercases. Used only
-    when YouTube returns no vanityChannelUrl for a channel. Never
+    Strips leading '@' and whitespace, lowercases, then makes
+    the result safe to use as a filename: '/' becomes '_'
+    (otherwise Path would treat the handle as a sub-path),
+    NULs are removed (POSIX rejects them), and leading '.' is
+    stripped (would create a hidden file). Used only when
+    YouTube returns no vanityChannelUrl for a channel. Never
     used to paper over InnerTube failures.
 
     :param name: The channel name or title to normalise.
-    :returns: Lowercased, stripped name.
+    :returns: Lowercased, stripped, filesystem-safe name.
     :raises ValueError: When the result would be empty.
     '''
 
-    result: str = name.strip().lstrip('@').strip().lower()
+    cleaned: str = name.replace('\x00', '')
+    result: str = cleaned.strip().lstrip('@').strip().lower()
+    result = result.replace('/', '_').lstrip('.')
     if not result:
         raise ValueError(
             f'fallback_handle produced empty result from {name!r}'
@@ -155,6 +207,13 @@ class YouTubeChannel:
         self.browse_client: AsyncYouTubeClient | None = None
 
         self.browse_request_count: int = 0
+
+        # Set True by ``scrape_about_page`` on success; consumed by
+        # the scraper tool to label the ``api`` dimension on the
+        # ``scrapes_completed_total`` metric (``html`` if /about
+        # succeeded, ``innertube`` if only the InnerTube fallback
+        # produced the data).
+        self.about_page_succeeded: bool = False
 
         if with_download_client:
             self.download_client: YoutubeDL = \
@@ -222,8 +281,14 @@ class YouTubeChannel:
         :returns: the YouTube client for browsing/scraping data
         '''
 
-        self.browse_client = AsyncYouTubeClient(
-            consent_cookies=self.consent_cookies, proxies=proxies,
+        selected_proxy: str | None = (
+            YouTubeRateLimiter.get().select_proxy(
+                YouTubeCallType.HTML,
+            )
+            or (random.choice(proxies) if proxies else None)
+        )
+        self.browse_client = pooled_youtube_client_for_entry(
+            selected_proxy,
         )
         self.proxies: list[str] | None = proxies
         self.browse_request_count: int = 0
@@ -570,7 +635,36 @@ class YouTubeChannel:
             save_dir = self.save_dir
 
         if with_about_page:
-            await self.scrape_about_page(proxies=proxies)
+            try:
+                await self.scrape_about_page(proxies=proxies)
+                self.about_page_succeeded = True
+            except Exception as exc:
+                # /about is best-effort: the InnerTube call below
+                # populates most channel metadata (thumbnails,
+                # banners, subscriber_count, video_count,
+                # description, keywords) so a failed /about should
+                # not abort the scrape. Catching ``Exception`` here
+                # (rather than just ``ValueError, RuntimeError``)
+                # also covers proxy/curl errors (``RequestError``,
+                # ``ProxyError``) and parser KeyErrors that would
+                # otherwise propagate and bypass the InnerTube
+                # fallback.
+                _LOGGER.warning(
+                    'About page scrape failed; '
+                    'continuing with InnerTube',
+                    extra={
+                        'channel_handle': self.channel_handle,
+                        'exc': str(exc),
+                    },
+                )
+
+        # When /about did not yield ``channel_id`` (most commonly
+        # because /about failed), resolve it from ``channel_handle``
+        # via InnerTube so :meth:`scrape_channel_content` can run
+        # on the InnerTube path. No-op when ``channel_id`` is
+        # already known.
+        if not self.channel_id and self.channel_handle:
+            await self._resolve_channel_id_via_innertube()
 
         try:
             await self.scrape_channel_content(
@@ -1060,6 +1154,206 @@ class YouTubeChannel:
             return False
 
         return bool(YouTubeChannel.CHANNEL_ID_REGEX_MATCH.match(name))
+
+    async def _resolve_channel_id_via_innertube(self) -> bool:
+        '''
+        Resolve ``self.channel_id`` from ``self.channel_handle`` via
+        InnerTube. Used as a fallback when /about HTML did not
+        supply a ``channel_id`` (e.g. /about timed out or the page
+        was blocked by the WAF) so that
+        :meth:`scrape_channel_content` can still run via the
+        InnerTube ``browse`` endpoint.
+
+        Resolution strategy:
+
+        1. **InnerTube ``browse('@<handle>')``** — YouTube's browse
+           endpoint accepts a handle in place of a UC-prefixed
+           ``browseId`` and returns the full channel browse
+           response, from which the canonical ``externalId`` is
+           read. One call, and the same response would be needed
+           by :meth:`scrape_channel_content` anyway.
+        2. **Fallback to ``navigation/resolve_url``** — calls
+           ``adaptor.dispatch('navigation/resolve_url',
+           body={'url': '...'})`` directly through the InnerTube
+           library's session, mirroring what the YouTube web
+           client does on every ``/@handle`` navigation.
+
+        Reuses the per-proxy pooled InnerTube client tied to
+        ``self.browse_client.proxy`` so the call is rate-limited
+        and proxied identically to the rest of the channel scrape.
+
+        :returns: ``True`` if ``self.channel_id`` was set,
+            ``False`` otherwise.
+        '''
+        if self.channel_id:
+            return True
+        if not self.channel_handle:
+            return False
+
+        # If the handle is itself a channel_id (some callers pass
+        # ``UC...`` as a handle), use it directly with no API call.
+        if YouTubeChannel.is_channel_id(self.channel_handle):
+            self.channel_id = self.channel_handle
+            return True
+
+        handle: str = self.channel_handle
+        if not handle.startswith('@'):
+            handle = f'@{handle}'
+
+        proxy: str | None = getattr(self.browse_client, 'proxy', None)
+        proxy_ip: str = (
+            _extract_proxy_ip(proxy) if proxy else 'none'
+        )
+        proxy_network: str = _proxy_network_for(proxy_ip)
+        proxy_file: str = proxy_file_label(proxy or '')
+        scraper: str = _get_scraper()
+        worker_id: str = get_worker_id()
+        metric_labels: dict[str, str] = {
+            'platform': 'youtube',
+            'scraper': scraper,
+            'entity': 'channel',
+            'worker_id': worker_id,
+            'proxy_ip': proxy_ip,
+            'proxy_network': proxy_network,
+            'proxy_file': proxy_file,
+        }
+        extra: dict[str, str] = {
+            'channel_handle': self.channel_handle,
+            'proxy': proxy or 'none',
+        }
+
+        limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
+
+        # Strategy 1: browse with the handle as browse_id.
+        outcome: str
+        start: float = time.monotonic()
+        try:
+            client = pooled_innertube_for_entry(proxy)
+            await limiter.acquire(
+                YouTubeCallType.BROWSE, proxy=proxy,
+            )
+            result: dict = client.browse(handle)
+            external_id: str | None = (
+                result.get('metadata', {})
+                      .get('channelMetadataRenderer', {})
+                      .get('externalId')
+            )
+            if external_id and YouTubeChannel.is_channel_id(
+                external_id
+            ):
+                self.channel_id = external_id
+                outcome = 'hit'
+                _LOGGER.debug(
+                    'Resolved channel_id via InnerTube browse',
+                    extra=extra | {'channel_id': external_id},
+                )
+                METRIC_CHANNEL_HANDLE_RESOLVER_OUTCOMES.labels(
+                    strategy='browse', outcome=outcome,
+                    **metric_labels,
+                ).inc()
+                METRIC_YT_REQUEST_DURATION.labels(
+                    platform='youtube', scraper=scraper,
+                    api='innertube_resolver',
+                    status_class='2xx', worker_id=worker_id,
+                    proxy_ip=proxy_ip, proxy_network=proxy_network,
+                    proxy_file=proxy_file,
+                ).observe(time.monotonic() - start)
+                return True
+            outcome = 'miss'
+            METRIC_YT_REQUEST_DURATION.labels(
+                platform='youtube', scraper=scraper,
+                api='innertube_resolver',
+                status_class='2xx', worker_id=worker_id,
+                proxy_ip=proxy_ip, proxy_network=proxy_network,
+                proxy_file=proxy_file,
+            ).observe(time.monotonic() - start)
+        except Exception as exc:
+            outcome = 'error'
+            METRIC_YT_REQUEST_DURATION.labels(
+                platform='youtube', scraper=scraper,
+                api='innertube_resolver',
+                status_class='error', worker_id=worker_id,
+                proxy_ip=proxy_ip, proxy_network=proxy_network,
+                proxy_file=proxy_file,
+            ).observe(time.monotonic() - start)
+            _LOGGER.debug(
+                'InnerTube browse-by-handle failed; '
+                'falling back to navigation/resolve_url',
+                exc=exc, extra=extra,
+            )
+        METRIC_CHANNEL_HANDLE_RESOLVER_OUTCOMES.labels(
+            strategy='browse', outcome=outcome, **metric_labels,
+        ).inc()
+
+        # Strategy 2: navigation/resolve_url.
+        start = time.monotonic()
+        try:
+            client = pooled_innertube_for_entry(proxy)
+            await limiter.acquire(
+                YouTubeCallType.BROWSE, proxy=proxy,
+            )
+            result = client.adaptor.dispatch(
+                'navigation/resolve_url',
+                body={
+                    'url': f'https://www.youtube.com/{handle}',
+                },
+            )
+            browse_id: str | None = (
+                result.get('endpoint', {})
+                      .get('browseEndpoint', {})
+                      .get('browseId')
+            )
+            if browse_id and YouTubeChannel.is_channel_id(browse_id):
+                self.channel_id = browse_id
+                outcome = 'hit'
+                _LOGGER.debug(
+                    'Resolved channel_id via navigation/resolve_url',
+                    extra=extra | {'channel_id': browse_id},
+                )
+                METRIC_CHANNEL_HANDLE_RESOLVER_OUTCOMES.labels(
+                    strategy='resolve_url', outcome=outcome,
+                    **metric_labels,
+                ).inc()
+                METRIC_YT_REQUEST_DURATION.labels(
+                    platform='youtube', scraper=scraper,
+                    api='innertube_resolver',
+                    status_class='2xx', worker_id=worker_id,
+                    proxy_ip=proxy_ip, proxy_network=proxy_network,
+                    proxy_file=proxy_file,
+                ).observe(time.monotonic() - start)
+                return True
+            outcome = 'miss'
+            METRIC_YT_REQUEST_DURATION.labels(
+                platform='youtube', scraper=scraper,
+                api='innertube_resolver',
+                status_class='2xx', worker_id=worker_id,
+                proxy_ip=proxy_ip, proxy_network=proxy_network,
+                proxy_file=proxy_file,
+            ).observe(time.monotonic() - start)
+            _LOGGER.warning(
+                'InnerTube channel_id resolver returned '
+                'no usable result',
+                extra=extra,
+            )
+        except Exception as exc:
+            outcome = 'error'
+            METRIC_YT_REQUEST_DURATION.labels(
+                platform='youtube', scraper=scraper,
+                api='innertube_resolver',
+                status_class='error', worker_id=worker_id,
+                proxy_ip=proxy_ip, proxy_network=proxy_network,
+                proxy_file=proxy_file,
+            ).observe(time.monotonic() - start)
+            _LOGGER.warning(
+                'InnerTube channel_id resolver failed '
+                '(both browse and navigation/resolve_url)',
+                exc=exc, extra=extra,
+            )
+        METRIC_CHANNEL_HANDLE_RESOLVER_OUTCOMES.labels(
+            strategy='resolve_url', outcome=outcome,
+            **metric_labels,
+        ).inc()
+        return False
 
     @staticmethod
     async def resolve_channel_id(channel_id: str,

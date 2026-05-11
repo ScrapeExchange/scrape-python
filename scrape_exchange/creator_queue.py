@@ -391,6 +391,20 @@ class CreatorQueue(ABC):
         '''Per-tier creator counts: ``{tier: count}``.'''
 
     @abstractmethod
+    async def tier_population_summary(
+        self,
+    ) -> dict[int, int]:
+        '''Per-tier total cid count from the tiers HASH:
+        ``{tier: count}``.
+
+        Counts every cid assigned to each tier regardless of
+        whether it is currently queued, claimed, no-feeds, or
+        orphan. Cheap by design (single HSCAN traversal, no
+        per-cid pipelined ZSCORE) so it can drive a metric
+        loop on a tight cadence.
+        '''
+
+    @abstractmethod
     async def cleanup_stale_claims(self) -> int:
         '''
         Re-enqueue creators whose claims expired
@@ -1056,6 +1070,14 @@ class FileCreatorQueue(CreatorQueue):
             for t, h in self._heaps.items()
         }
 
+    async def tier_population_summary(
+        self,
+    ) -> dict[int, int]:
+        # File backend keeps tier membership in the heaps
+        # themselves; population == queue size since orphan
+        # / claimed / no-feeds states are not tracked.
+        return await self.queue_sizes_by_tier()
+
     async def cleanup_stale_claims(self) -> int:
         # File backend is single-process; claims
         # are in-memory and never stale.
@@ -1109,28 +1131,47 @@ local remaining = tonumber(ARGV[2])
 local out = {}
 for q = 1, num_tiers do
     if remaining <= 0 then break end
-    local due = redis.call(
-        'ZRANGEBYSCORE', KEYS[q],
-        '-inf', ARGV[1],
-        'WITHSCORES',
-        'LIMIT', 0, remaining)
-    for i = 1, #due, 2 do
-        local cid = due[i]
-        local score = due[i + 1]
-        local key = ARGV[5] .. cid
-        local ok = redis.call(
-            'SET', key, ARGV[3],
-            'NX', 'EX', tonumber(ARGV[4]))
-        if ok then
-            redis.call('ZREM', KEYS[q], cid)
-            local name = redis.call(
-                'HGET', KEYS[num_tiers + 1],
-                cid) or ''
-            out[#out + 1] = cid
-            out[#out + 1] = name
-            out[#out + 1] = score
-            remaining = remaining - 1
+    -- Loop fetching candidates until we have ``remaining``
+    -- successful claims or the tier is exhausted. Cids whose
+    -- claim key already exists (stale claim from a worker that
+    -- crashed without releasing) are skipped over via an
+    -- advancing offset so the returned batch is filled, not
+    -- short by the number of stale heads.
+    local skipped = 0
+    while remaining > 0 do
+        local fetch_count = remaining * 2
+        local due = redis.call(
+            'ZRANGEBYSCORE', KEYS[q],
+            '-inf', ARGV[1],
+            'WITHSCORES',
+            'LIMIT', skipped, fetch_count)
+        if #due == 0 then break end
+        local skipped_in_chunk = 0
+        for i = 1, #due, 2 do
+            if remaining <= 0 then break end
+            local cid = due[i]
+            local score = due[i + 1]
+            local key = ARGV[5] .. cid
+            local ok = redis.call(
+                'SET', key, ARGV[3],
+                'NX', 'EX', tonumber(ARGV[4]))
+            if ok then
+                redis.call('ZREM', KEYS[q], cid)
+                local name = redis.call(
+                    'HGET', KEYS[num_tiers + 1],
+                    cid) or ''
+                out[#out + 1] = cid
+                out[#out + 1] = name
+                out[#out + 1] = score
+                remaining = remaining - 1
+            else
+                skipped_in_chunk = skipped_in_chunk + 1
+            end
         end
+        skipped = skipped + skipped_in_chunk
+        -- If the chunk returned fewer items than we asked, this
+        -- tier has no more due cids; stop iterating it.
+        if #due < fetch_count * 2 then break end
     end
 end
 return out
@@ -1799,6 +1840,35 @@ class RedisCreatorQueue(CreatorQueue):
                 await self._redis.zcard(key)
             )
         return sizes
+
+    async def tier_population_summary(
+        self,
+    ) -> dict[int, int]:
+        '''Single-pass HSCAN over the tiers hash, counting
+        cids by their assigned tier value. Yields control
+        between batches so other coroutines run.
+        '''
+        counts: dict[int, int] = {
+            tc.tier: 0 for tc in self._tiers
+        }
+        valid_tiers: set[int] = set(counts.keys())
+        cursor: int = 0
+        while True:
+            cursor, data = await self._redis.hscan(
+                self._key_tiers,
+                cursor,
+                count=1000,
+            )
+            for tier_str in data.values():
+                try:
+                    tier: int = int(tier_str)
+                except (TypeError, ValueError):
+                    continue
+                if tier in valid_tiers:
+                    counts[tier] += 1
+            if cursor == 0:
+                break
+        return counts
 
     async def cleanup_stale_claims(self) -> int:
         self._ensure_lua_scripts()

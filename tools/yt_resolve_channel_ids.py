@@ -202,21 +202,20 @@ async def _filter_unresolved(
 ) -> set[str]:
     '''Keep only ids that creator_map does not already know.
 
-    Uses per-id ``get`` so the call works for both
-    ``RedisCreatorMap`` and ``FileCreatorMap``. Pipelines
-    via ``asyncio.gather`` so the wall-clock cost is
-    one Redis round-trip total when the backend pipelines
-    internally — fine for the typical 50k input.'''
+    Uses :meth:`CreatorMap.get_many` so the lookup is a few
+    chunked round-trips rather than ``len(ids)`` concurrent
+    ``HGET`` calls. The previous ``asyncio.gather`` over
+    individual ``get(i)`` calls grabbed one connection per
+    id from the redis-py pool, which on a 189k input
+    exhausted the process fd table.'''
     if not ids:
         return set()
     items: list[str] = list(ids)
-    results: list[str | None] = await asyncio.gather(*(
-        creator_map_backend.get(i) for i in items
-    ))
+    results: dict[str, str | None] = (
+        await creator_map_backend.get_many(items)
+    )
     return {
-        items[i]
-        for i in range(len(items))
-        if not results[i]
+        cid for cid in items if not results.get(cid)
     }
 
 

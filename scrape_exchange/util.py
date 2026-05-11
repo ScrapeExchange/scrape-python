@@ -279,6 +279,7 @@ def extract_proxy_ip(proxy: str) -> str:
         extract_proxy_ip('http://user:pass@127.0.0.1:8080')  -> '127.0.0.1'
         extract_proxy_ip('http://user:pass@127.0.0.1')       -> '127.0.0.1'
         extract_proxy_ip('socks5://proxy.example:1080')      -> 'proxy.example'
+        extract_proxy_ip('local://192.0.2.5')                -> '192.0.2.5'
 
     :param proxy: The proxy URL.
     :returns: Host portion of the URL.
@@ -286,6 +287,16 @@ def extract_proxy_ip(proxy: str) -> str:
         unparseable URL, or a host portion that doesn't look like a
         valid hostname or IPv4 address.
     '''
+
+    if proxy.startswith('local://'):
+        payload: str = proxy[len('local://'):]
+        try:
+            IPv4Address(payload)
+        except ValueError:
+            raise ValueError(
+                f'local:// payload is not a valid IPv4: {proxy!r}'
+            )
+        return payload
 
     if proxy.count(':') > 3 or '[' in proxy:
         raise ValueError(f'IPv6 addresses are not supported: {proxy}')

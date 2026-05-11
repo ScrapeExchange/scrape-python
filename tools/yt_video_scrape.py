@@ -12,6 +12,7 @@ to Scrape Exchange and moves the file to an "uploaded" sub-directory.
 :license    : GPLv3
 '''
 
+import errno
 import os
 import re
 import sys
@@ -50,6 +51,7 @@ from scrape_exchange.content_claim import (
 )
 from scrape_exchange.worker_id import get_worker_id
 from scrape_exchange.util import extract_proxy_ip, proxy_network_for
+from scrape_exchange.proxy_loader import proxy_file_label
 from scrape_exchange.settings import normalize_log_level
 from scrape_exchange.scraper_runner import (
     ScraperRunContext,
@@ -245,6 +247,40 @@ def _classify_yt_dlp_error(error_str: str) -> str:
     return 'other'
 
 
+def _is_bind_failure(exc: BaseException) -> bool:
+    '''
+    True when the exception (or anything in its cause/context chain)
+    is an OSError(EADDRNOTAVAIL). Signals the kernel refused a
+    local_address bind for a ``local://`` egress entry.
+    '''
+
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if (
+            isinstance(cur, OSError)
+            and cur.errno == errno.EADDRNOTAVAIL
+        ):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def _classify_scrape_error(exc: BaseException) -> str:
+    '''
+    Top-level classifier for video scrape failures. Returns
+    ``'bind_failed'`` for an OSError(EADDRNOTAVAIL) anywhere in the
+    cause chain (a local:// IP that isn't bound on this host),
+    otherwise delegates to :func:`_classify_yt_dlp_error` on the
+    message string.
+    '''
+
+    if _is_bind_failure(exc):
+        return 'bind_failed'
+    return _classify_yt_dlp_error(str(exc))
+
+
 def _proxy_network(proxy: str | None) -> str:
     '''
     Derive the proxy_network label (CIDR string, 'other',
@@ -364,10 +400,10 @@ class VideoSettings(YouTubeScraperSettings):
         ),
     )
     video_priority_directory: str | None = Field(
-        default=None,
+        default='priority',
         validation_alias=AliasChoices(
-            'VIDEO_PRIORITY_DIRECTORY',
-            'video_priority_directory',
+            'YOUTUBE_VIDEO_PRIORITY_DIRECTORY',
+            'youtube_video_priority_directory',
         ),
         description=(
             'Optional staging directory of '
@@ -463,20 +499,6 @@ class VideoSettings(YouTubeScraperSettings):
             'scraper-specific var is unset.'
         ),
     )
-    # overrdide the base ScraperSettings proxies field with an RSS-specific one
-    # pydantic-settings takes the value of the first matching alias
-    proxies: str | None = Field(
-        default=None,
-        validation_alias=AliasChoices(
-            'VIDEO_PROXIES', 'video_proxies', 'PROXIES', 'proxies'
-        ),
-        description=(
-            'Comma-separated list of proxy URLs to use for scraping (e.g. '
-            '"http://proxy1:port,http://proxy2:port"). If not set, no '
-            'proxy will be used.'
-        )
-    )
-
     @field_validator('video_log_level', mode='before')
     @classmethod
     def _normalize_video_log_level(cls, v: str) -> str:
@@ -1116,10 +1138,7 @@ async def worker_loop(
     :raises: (none)
     '''
 
-    proxies: list[str] = (
-        [p.strip() for p in settings.proxies.split(',') if p.strip()]
-        if settings.proxies else []
-    )
+    proxies: list[str] = settings.proxies
     priority_items: list[WorkItem]
     shuffled_items: list[str]
     priority_items, shuffled_items = await prepare_workload(
@@ -1133,7 +1152,6 @@ async def worker_loop(
         scraper='video_scraper',
         entity='video',
         tier='none',
-        worker_id=get_worker_id(),
     ).set(len(priority_items) + len(shuffled_items))
 
     producer_task: Task = asyncio.create_task(
@@ -1492,15 +1510,19 @@ async def _scrape_and_save(
         _proxy_ip: str = (
             extract_proxy_ip(proxy) if proxy else 'none'
         )
+        api: str = (
+            'ytdlp' if settings.video_use_yt_dlp else 'innertube'
+        )
         METRIC_SCRAPE_FAILURES.labels(
             platform='youtube',
             scraper='video_scraper',
             entity='video',
-            api='ytdlp',
+            api=api,
             reason='other',
             worker_id=get_worker_id(),
             proxy_ip=_proxy_ip,
             proxy_network=_proxy_network(proxy),
+            proxy_file=proxy_file_label(proxy or ''),
         ).inc()
         await _retire_failed_source(
             video_fm, entry, from_uploaded, from_priority,
@@ -1785,14 +1807,22 @@ async def _scrape_and_track(
             )
             await asyncio.sleep(sleep)
         return None, sleep, False
+    # Reflect the actual backend used. ``_scrape`` branches on the
+    # same setting; hardcoding 'ytdlp' here meant innertube
+    # successes were silently mislabeled, so the per-network
+    # success view in Prometheus didn't match the real workload.
+    api: str = (
+        'ytdlp' if settings.video_use_yt_dlp else 'innertube'
+    )
     METRIC_VIDEOS_SCRAPED.labels(
         platform='youtube',
         scraper='video_scraper',
         entity='video',
-        api='ytdlp',
+        api=api,
         worker_id=get_worker_id(),
         proxy_ip=extract_proxy_ip(proxy) if proxy else 'none',
         proxy_network=_proxy_network(proxy),
+        proxy_file=proxy_file_label(proxy or ''),
     ).inc()
     return fresh, sleep, True
 
@@ -2054,7 +2084,7 @@ def _next_failure_sleep(current_sleep: int) -> int:
 
 async def _handle_scrape_failure(
     exc: BaseException, proxy: str, video_id: str, entry: str,
-    video_fm: AssetFileManagement, sleep: int,
+    video_fm: AssetFileManagement, sleep: int, api: str,
 ) -> int:
     '''
     Classify a yt-dlp failure, update metrics, log it at the right
@@ -2077,7 +2107,7 @@ async def _handle_scrape_failure(
       as a conservative default.
     '''
 
-    reason: str = _classify_yt_dlp_error(str(exc))
+    reason: str = _classify_scrape_error(exc)
     proxy_net: str = _proxy_network(proxy)
     proxy_ip_val: str = (
         extract_proxy_ip(proxy) if proxy else 'none'
@@ -2086,11 +2116,12 @@ async def _handle_scrape_failure(
         platform='youtube',
         scraper='video_scraper',
         entity='video',
-        api='ytdlp',
+        api=api,
         reason=reason,
         worker_id=get_worker_id(),
         proxy_ip=proxy_ip_val,
         proxy_network=proxy_net,
+        proxy_file=proxy_file_label(proxy or ''),
     ).inc()
 
     if reason == 'rate_limit':
@@ -2139,6 +2170,17 @@ async def _handle_scrape_failure(
         # failure shouldn't trigger a YouTube-style backoff.
         logging.info(
             'Transient failure during scraping',
+            exc=exc,
+            extra={'video_id': video_id, 'proxy': proxy},
+        )
+        return sleep
+    if reason == 'bind_failed':
+        # Local IP not bound on this host — operator misconfig,
+        # not a YouTube signal. Bumping sleep would punish the
+        # rotation; return current sleep unchanged so the worker
+        # moves on without backoff.
+        logging.warning(
+            'Local IP not bound on this host',
             exc=exc,
             extra={'video_id': video_id, 'proxy': proxy},
         )
@@ -2252,6 +2294,9 @@ async def _scrape(entry: str, video_id: str, channel_handle: str,
 
     video: YouTubeVideo | None = None
     scrape_start: float = time.monotonic()
+    api: str = (
+        'ytdlp' if settings.video_use_yt_dlp else 'innertube'
+    )
     # Priority items intentionally skip the on-disk
     # ``video-dlp-`` artifact: their source ``video-min-`` file
     # in the priority directory is what gets moved to
@@ -2276,7 +2321,7 @@ async def _scrape(entry: str, video_id: str, channel_handle: str,
             platform='youtube',
             scraper='video_scraper',
             entity='video',
-            api='ytdlp',
+            api=api,
             outcome='success',
             worker_id=get_worker_id(),
         ).observe(time.monotonic() - scrape_start)
@@ -2290,13 +2335,14 @@ async def _scrape(entry: str, video_id: str, channel_handle: str,
             platform='youtube',
             scraper='video_scraper',
             entity='video',
-            api='ytdlp',
+            api=api,
             outcome='failure',
             worker_id=get_worker_id(),
         ).observe(time.monotonic() - scrape_start)
         sleep = await _handle_scrape_failure(
             exc=exc, proxy=proxy, video_id=video_id,
             entry=entry, video_fm=video_fm, sleep=sleep,
+            api=api,
         )
 
     return video, sleep
@@ -2750,10 +2796,7 @@ async def upload_videos(
     # Pick the first proxy for handle resolution on creator_map
     # misses. ``resolve_video_upload_handle`` only needs a proxy
     # for InnerTube fallback; cache hits don't touch the network.
-    proxies: list[str] = (
-        [p.strip() for p in settings.proxies.split(',') if p.strip()]
-        if settings.proxies else []
-    )
+    proxies: list[str] = settings.proxies
     proxy: str | None = proxies[0] if proxies else None
 
     batch_buf: bytearray = bytearray()

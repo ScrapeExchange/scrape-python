@@ -12,18 +12,21 @@ to Scrape Exchange and moves the file to an "uploaded" sub-directory.
 :license    : GPLv3
 '''
 
+import asyncio
+import contextlib
+import logging
 import os
+import resource
 import shutil
 import sys
-import asyncio
-import logging
-import resource
+import time
 
 from random import shuffle
 from pathlib import Path
 from typing import Any
 
 import aiofiles
+import brotli
 import orjson
 import redis.asyncio as aioredis
 
@@ -63,6 +66,7 @@ from scrape_exchange.scraper_runner import (
     ScraperRunContext,
     ScraperRunner,
 )
+from scrape_exchange.proxy_loader import proxy_file_label
 from scrape_exchange.settings import normalize_log_level
 from scrape_exchange.util import extract_proxy_ip, proxy_network_for
 
@@ -81,6 +85,15 @@ from scrape_exchange.youtube.youtube_rate_limiter import YouTubeRateLimiter
 from scrape_exchange.youtube.youtube_video import DENO_PATH, PO_TOKEN_URL
 
 CHANNEL_FILE_POSTFIX = '.json.br'
+
+PRIORITY_MAX_RETRIES: int = 5
+PRIORITY_RETRYABLE_STATUS_CODES: frozenset[int] = (
+    frozenset({429, 500, 502, 503, 504})
+)
+PRIORITY_CHANNEL_SCHEMA_OWNER: str = 'boinko'
+PRIORITY_CHANNEL_SCHEMA_PLATFORM: str = 'youtube'
+PRIORITY_CHANNEL_SCHEMA_ENTITY: str = 'channel'
+PRIORITY_CHANNEL_SCHEMA_VERSION: str = '0.0.2'
 
 MAX_NEW_CHANNELS: int = 1000
 MAX_RESOLVED_CHANNELS: int = 100
@@ -210,19 +223,6 @@ class ChannelSettings(YouTubeScraperSettings):
             'scraper-specific var is unset.'
         ),
     )
-    # overrdide the base ScraperSettings proxies field with an RSS-specific one
-    # pydantic-settings takes the value of the first matching alias
-    proxies: str | None = Field(
-        default=None,
-        validation_alias=AliasChoices(
-            'CHANNEL_PROXIES', 'channel_proxies', 'PROXIES', 'proxies'
-        ),
-        description=(
-            'Comma-separated list of proxy URLs to use for scraping (e.g. '
-            '"http://proxy1:port,http://proxy2:port"). If not set, no '
-            'proxy will be used.'
-        )
-    )
 
     @field_validator('channel_log_level', mode='before')
     @classmethod
@@ -255,6 +255,7 @@ METRIC_FILES_PENDING_UPLOAD = Gauge(
 )
 from scrape_exchange.scraper_metrics import (
     METRIC_SCRAPES_COMPLETED as METRIC_CHANNELS_SCRAPED,
+    METRIC_SCRAPE_DURATION,
     METRIC_SCRAPE_FAILURES,
     METRIC_UPLOADS_ENQUEUED as METRIC_CHANNELS_ENQUEUED,
     METRIC_UPLOADS_SKIPPED as METRIC_UPLOADED_FILE_EXISTS,
@@ -264,6 +265,8 @@ from scrape_exchange.scraper_metrics import (
     METRIC_WATCHER_FILES_DETECTED,
     METRIC_WATCHER_FILES_SKIPPED,
     METRIC_WATCHER_BATCHES,
+    METRIC_CHANNEL_PRIORITY_UPLOADS,
+    METRIC_CHANNEL_PRIORITY_QUEUE_AGE,
 )
 METRIC_CHANNEL_IDS_TO_RESOLVE = Gauge(
     'pending_channel_id_resolutions',
@@ -284,7 +287,7 @@ METRIC_CHANNEL_NO_CONTENT_FOUND = Counter(
     'Number of channels scraped that had no videos, playlists, courses, '
     'podcasts, or products',
     ['platform', 'scraper', 'entity', 'worker_id', 'proxy_ip',
-     'proxy_network'],
+     'proxy_network', 'proxy_file'],
 )
 METRIC_CHANNEL_RESOLVE_CLAIM: Counter = Counter(
     'channel_resolve_claim_total',
@@ -946,7 +949,6 @@ async def _upload_one_channel_batch(
         ).inc(outcome.missing)
 
 
-
 async def upload_channels(
     settings: ChannelSettings,
     client: ExchangeClient,
@@ -1196,6 +1198,226 @@ async def _upload_single_channel(
         )
 
 
+def _priority_channel_work_items(
+    priority_dir: str,
+) -> list[Path]:
+    '''List ``channel-rss-*.json.br`` files in
+    *priority_dir* sorted oldest-mtime-first. Files
+    ending in ``.failed`` (e.g.
+    ``channel-rss-<handle>.json.br.failed``) are
+    excluded — they're dead-letter markers that
+    operators can re-arm by stripping the ``.failed``
+    suffix.
+
+    Returns an empty list if *priority_dir* does not
+    exist; the producer creates it, but the consumer
+    must tolerate a brief startup race where the
+    directory is missing.
+    '''
+    p: Path = Path(priority_dir)
+    if not p.is_dir():
+        return []
+    candidates: list[Path] = [
+        f for f in p.iterdir()
+        if f.name.startswith('channel-rss-')
+        and f.name.endswith('.json.br')
+    ]
+    candidates.sort(key=lambda f: f.stat().st_mtime)
+    return candidates
+
+
+async def _process_priority_file(
+    path: Path,
+    client: ExchangeClient,
+    validator: SchemaValidator,
+    uploaded_dir: str,
+    retries: dict[str, int],
+) -> None:
+    '''Process one priority-directory file.
+
+    Order of operations:
+    1. Decode → record_dict.
+    2. Validate. Failure → rename to ``.json.br.failed``.
+    3. POST to scrape.exchange.
+    4. On 201 → move to ``<uploaded_dir>/<basename>``.
+    5. On retryable status / network error →
+       increment retry counter; if it now reaches
+       ``PRIORITY_MAX_RETRIES``, rename to
+       ``.json.br.failed`` and reset the counter.
+    6. On non-retryable 4xx → rename immediately.
+    '''
+
+    handle: str = (
+        path.name
+        .removeprefix('channel-rss-')
+        .removesuffix('.json.br')
+    )
+
+    def _rename_failed(reason: str) -> None:
+        failed: Path = path.with_suffix(
+            path.suffix + '.failed',
+        )
+        path.rename(failed)
+        retries[handle] = 0
+        METRIC_CHANNEL_PRIORITY_UPLOADS.labels(
+            platform='youtube',
+            scraper='channel_scraper',
+            result='failed_permanently',
+            worker_id=get_worker_id(),
+        ).inc()
+        logging.error(
+            'Channel-priority upload failed permanently',
+            extra={
+                'path': str(path), 'handle': handle,
+                'reason': reason,
+            },
+        )
+
+    try:
+        compressed: bytes = await asyncio.to_thread(
+            path.read_bytes,
+        )
+        record_dict: dict = orjson.loads(
+            brotli.decompress(compressed),
+        )
+    except Exception as exc:
+        _rename_failed(f'decode error: {exc!r}')
+        return
+
+    err: str | None = validator.validate(record_dict)
+    if err is not None:
+        _rename_failed(f'schema validation: {err}')
+        return
+
+    payload: dict = {
+        'username': PRIORITY_CHANNEL_SCHEMA_OWNER,
+        'platform': PRIORITY_CHANNEL_SCHEMA_PLATFORM,
+        'entity': PRIORITY_CHANNEL_SCHEMA_ENTITY,
+        'version': PRIORITY_CHANNEL_SCHEMA_VERSION,
+        'source_url': record_dict.get('url', ''),
+        'data': record_dict,
+    }
+
+    try:
+        response = await client.post(
+            f'{client.exchange_url}'
+            f'{ExchangeClient.POST_DATA_API}',
+            json=payload,
+        )
+        status_code: int = response.status_code
+    except Exception as exc:
+        # Treat any network/IO error as retryable.
+        retries[handle] = retries.get(handle, 0) + 1
+        if retries[handle] >= PRIORITY_MAX_RETRIES:
+            _rename_failed(f'network: {exc!r}')
+            return
+        METRIC_CHANNEL_PRIORITY_UPLOADS.labels(
+            platform='youtube',
+            scraper='channel_scraper',
+            result='retried',
+            worker_id=get_worker_id(),
+        ).inc()
+        logging.warning(
+            'Channel-priority upload retryable failure',
+            extra={
+                'path': str(path), 'handle': handle,
+                'attempt': retries[handle],
+                'error': repr(exc),
+            },
+        )
+        return
+
+    if 200 <= status_code < 300:
+        target: Path = Path(uploaded_dir) / path.name
+        await asyncio.to_thread(path.rename, target)
+        retries.pop(handle, None)
+        METRIC_CHANNEL_PRIORITY_UPLOADS.labels(
+            platform='youtube',
+            scraper='channel_scraper',
+            result='success',
+            worker_id=get_worker_id(),
+        ).inc()
+        return
+
+    if status_code in PRIORITY_RETRYABLE_STATUS_CODES:
+        retries[handle] = retries.get(handle, 0) + 1
+        if retries[handle] >= PRIORITY_MAX_RETRIES:
+            _rename_failed(
+                f'retried {PRIORITY_MAX_RETRIES} times '
+                f'(last status {status_code})'
+            )
+            return
+        METRIC_CHANNEL_PRIORITY_UPLOADS.labels(
+            platform='youtube',
+            scraper='channel_scraper',
+            result='retried',
+            worker_id=get_worker_id(),
+        ).inc()
+        logging.warning(
+            'Channel-priority upload retryable status',
+            extra={
+                'path': str(path), 'handle': handle,
+                'status_code': status_code,
+                'attempt': retries[handle],
+            },
+        )
+        return
+
+    # Non-retryable status (4xx other than 429).
+    _rename_failed(f'non-retryable status {status_code}')
+
+
+async def _priority_sweep_loop(
+    priority_dir: str,
+    uploaded_dir: str,
+    client: ExchangeClient,
+    validator: SchemaValidator,
+    interval_seconds: float = 1.0,
+) -> None:
+    '''Drain ``priority_dir`` continuously.  Each
+    iteration:
+
+    1. Enumerate work items (oldest first).
+    2. Sample ``channel_priority_queue_age_seconds``
+       from the oldest item.
+    3. Process every item.
+    4. Sleep ``interval_seconds`` before the next pass.
+
+    Retry counters persist for the lifetime of this task
+    (not across process restarts).
+    '''
+    retries: dict[str, int] = {}
+    os.makedirs(priority_dir, exist_ok=True)
+    os.makedirs(uploaded_dir, exist_ok=True)
+    while True:
+        try:
+            items: list[Path] = (
+                _priority_channel_work_items(priority_dir)
+            )
+            if items:
+                oldest_age: float = (
+                    time.time()
+                    - items[0].stat().st_mtime
+                )
+            else:
+                oldest_age = 0.0
+            METRIC_CHANNEL_PRIORITY_QUEUE_AGE.labels(
+                platform='youtube',
+                scraper='channel_scraper',
+                worker_id=get_worker_id(),
+            ).set(oldest_age)
+            for item in items:
+                await _process_priority_file(
+                    item, client, validator,
+                    uploaded_dir, retries,
+                )
+        except Exception:
+            logging.exception(
+                'priority sweep loop iteration failed',
+            )
+        await asyncio.sleep(interval_seconds)
+
+
 async def _watch_and_upload_channels(
     settings: ChannelSettings,
     client: ExchangeClient,
@@ -1213,43 +1435,69 @@ async def _watch_and_upload_channels(
     '''
 
     base: Path = fm.base_dir
+    priority_dir: str = (
+        settings.channel_priority_directory_path
+    )
+    uploaded_dir: str = str(fm.uploaded_dir)
     logging.info(
         'Upload-only: watching for new channel files',
-        extra={'watch_dir': str(base)},
+        extra={
+            'watch_dir': str(base),
+            'priority_dir': priority_dir,
+        },
+    )
+
+    # Spawn the priority sweep loop as a background task
+    # so the priority directory is drained continuously
+    # while the awatch loop responds to base-dir events.
+    priority_task: asyncio.Task[None] = (
+        asyncio.create_task(
+            _priority_sweep_loop(
+                priority_dir=priority_dir,
+                uploaded_dir=uploaded_dir,
+                client=client,
+                validator=validator,
+            ),
+        )
     )
 
     wid: str = get_worker_id()
-    async for changes in awatch(
-        base,
-        watch_filter=lambda change, path: (
-            change in (Change.added, Change.modified)
-            and _is_channel_file(Path(path).name)
-        ),
-    ):
-        METRIC_WATCHER_BATCHES.labels(
-            platform='youtube',
-            scraper='channel_scraper',
-            entity='channel',
-            worker_id=wid,
-        ).inc()
-        for _change, path in changes:
-            filename: str = Path(path).name
-            METRIC_WATCHER_FILES_DETECTED.labels(
+    try:
+        async for changes in awatch(
+            base,
+            watch_filter=lambda change, path: (
+                change in (Change.added, Change.modified)
+                and _is_channel_file(Path(path).name)
+            ),
+        ):
+            METRIC_WATCHER_BATCHES.labels(
                 platform='youtube',
                 scraper='channel_scraper',
                 entity='channel',
                 worker_id=wid,
             ).inc()
-            logging.info(
-                'Upload-only: new channel file '
-                'detected',
-                extra={'filename': filename},
-            )
-            await _upload_single_channel(
-                filename, settings, client, fm,
-                creator_map_backend, name_map_backend,
-                validator,
-            )
+            for _change, path in changes:
+                filename: str = Path(path).name
+                METRIC_WATCHER_FILES_DETECTED.labels(
+                    platform='youtube',
+                    scraper='channel_scraper',
+                    entity='channel',
+                    worker_id=wid,
+                ).inc()
+                logging.info(
+                    'Upload-only: new channel file '
+                    'detected',
+                    extra={'filename': filename},
+                )
+                await _upload_single_channel(
+                    filename, settings, client, fm,
+                    creator_map_backend, name_map_backend,
+                    validator,
+                )
+    finally:
+        priority_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await priority_task
 
 
 def normalize_channel_name(channel_handle: str) -> str:
@@ -1400,6 +1648,7 @@ def _record_scrape_failure(
         worker_id=get_worker_id(),
         proxy_ip=proxy_used_ip,
         proxy_network=proxy_network_for(proxy_used_ip),
+        proxy_file=proxy_file_label(proxy_used or ''),
     ).inc()
     logging.warning(
         message, exc=exc, extra=extra | {
@@ -1457,24 +1706,26 @@ async def _try_scrape_channel(
         )
         return False, None
     finally:
-        # Capture the proxy used *before* we close the browse client
-        # so downstream metric emissions (CHANNEL_NO_CONTENT_FOUND,
-        # CHANNELS_SCRAPED) can still label by proxy_ip.
+        # Capture the proxy used so downstream metric emissions
+        # (CHANNEL_NO_CONTENT_FOUND, CHANNELS_SCRAPED) can still
+        # label by proxy_ip. Do NOT call aclose() on browse_client:
+        # it is a long-lived, per-proxy entry in the pool returned
+        # by ``pooled_youtube_client_for_entry``. Closing it here
+        # makes every subsequent worker reusing the same proxy hit
+        # "Cannot send a request, as the client has been closed."
+        # The pool is closed once at scraper shutdown by
+        # ``aclose_pooled_youtube_clients``.
         scrape_proxy: str | None = getattr(
             channel.browse_client, 'proxy', None,
         )
-        # Close the browse client so its curl transport releases
-        # sockets and buffers immediately rather than waiting for GC.
-        if channel.browse_client is not None:
-            await channel.browse_client.aclose()
-            channel.browse_client = None
 
     return True, scrape_proxy
 
 
 def _channel_has_no_content(
     channel: YouTubeChannel, scrape_proxy_ip: str,
-    scrape_proxy_network: str, channel_handle: str,
+    scrape_proxy_network: str, scrape_proxy: str | None,
+    channel_handle: str,
 ) -> bool:
     '''
     Return True (and emit the no-content metric) when *channel* has no
@@ -1497,6 +1748,7 @@ def _channel_has_no_content(
         worker_id=get_worker_id(),
         proxy_ip=scrape_proxy_ip,
         proxy_network=scrape_proxy_network,
+        proxy_file=proxy_file_label(scrape_proxy or ''),
     ).inc()
     logging.info(
         'YouTube channel content counts',
@@ -1664,6 +1916,7 @@ async def _do_scrape_channel_to_disk(
 ) -> tuple[bool, bool | None, YouTubeChannel | None]:
     '''Inner half of :func:`_scrape_channel_to_disk` — runs while
     the cross-host scrape claim is held. Same return contract.'''
+    scrape_start: float = time.monotonic()
     logging.debug(
         'Channel not scraped, scraping now', extra=extra,
     )
@@ -1679,6 +1932,14 @@ async def _do_scrape_channel_to_disk(
         channel, settings, fm, channel_handle, extra,
     )
     if not ok:
+        METRIC_SCRAPE_DURATION.labels(
+            platform='youtube',
+            scraper='channel_scraper',
+            entity='channel',
+            api='html',
+            outcome='failure',
+            worker_id=get_worker_id(),
+        ).observe(time.monotonic() - scrape_start)
         return False, False, None
 
     scrape_proxy_ip: str = (
@@ -1691,7 +1952,7 @@ async def _do_scrape_channel_to_disk(
 
     if _channel_has_no_content(
         channel, scrape_proxy_ip,
-        scrape_proxy_network, channel_handle,
+        scrape_proxy_network, scrape_proxy, channel_handle,
     ):
         return False, False, None
 
@@ -1700,15 +1961,32 @@ async def _do_scrape_channel_to_disk(
     ):
         return False, True, None
 
+    # ``api`` reflects which path produced the scrape:
+    # - ``html`` if /about succeeded (the InnerTube call below it
+    #   ran too, but /about supplied the channel-only fields)
+    # - ``innertube`` if /about failed and only the InnerTube
+    #   fallback produced data (Fix #2; quantifies its share)
+    success_api: str = (
+        'html' if channel.about_page_succeeded else 'innertube'
+    )
     METRIC_CHANNELS_SCRAPED.labels(
         platform='youtube',
         scraper='channel_scraper',
         entity='channel',
-        api='html',
+        api=success_api,
         worker_id=get_worker_id(),
         proxy_ip=scrape_proxy_ip,
         proxy_network=scrape_proxy_network,
+        proxy_file=proxy_file_label(scrape_proxy or ''),
     ).inc()
+    METRIC_SCRAPE_DURATION.labels(
+        platform='youtube',
+        scraper='channel_scraper',
+        entity='channel',
+        api=success_api,
+        outcome='success',
+        worker_id=get_worker_id(),
+    ).observe(time.monotonic() - scrape_start)
     logging.info(
         'Downloaded channel',
         extra={

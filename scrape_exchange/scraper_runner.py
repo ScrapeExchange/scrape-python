@@ -23,7 +23,7 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
-from prometheus_client import start_http_server
+from scrape_exchange.metrics_server import start_metrics_server
 
 from scrape_exchange.exchange_client import (
     ExchangeClient,
@@ -37,6 +37,15 @@ from scrape_exchange.scraper_supervisor import (
     SupervisorConfig,
     publish_config_metrics,
     run_supervisor,
+)
+from scrape_exchange.proxy_loader import (
+    aclose_pooled_httpx_clients,
+)
+from scrape_exchange.youtube.youtube_client import (
+    aclose_pooled_youtube_clients,
+)
+from scrape_exchange.youtube.youtube_channel_tabs import (
+    aclose_pooled_innertube,
 )
 from scrape_exchange.settings import ScraperSettings
 
@@ -166,11 +175,7 @@ class ScraperRunner:
         ``worker_func(context)``.  Drains uploads on
         exit.
         '''
-        proxies: list[str] = [
-            p.strip()
-            for p in self._settings.proxies.split(',')
-            if p.strip()
-        ] if self._settings.proxies else []
+        proxies: list[str] = self._settings.proxies
 
         logging.info(
             'Scraper worker started',
@@ -189,7 +194,7 @@ class ScraperRunner:
         )
 
         try:
-            start_http_server(self._metrics_port)
+            start_metrics_server(self._metrics_port)
             logging.info(
                 'Prometheus metrics available',
                 extra={'metrics_port': (self._metrics_port)}
@@ -263,3 +268,6 @@ class ScraperRunner:
         finally:
             if client is not None:
                 await client.drain_uploads(timeout=10.0)
+            await aclose_pooled_httpx_clients()
+            await aclose_pooled_youtube_clients()
+            await aclose_pooled_innertube()

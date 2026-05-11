@@ -16,11 +16,11 @@ import unittest
 from unittest.mock import patch, MagicMock
 
 from scrape_exchange.worker_id import get_worker_id
+import scrape_exchange.scraper_supervisor as scraper_supervisor
 from scrape_exchange.scraper_supervisor import (
     METRIC_CONCURRENCY,
     METRIC_NUM_PROCESSES,
     SupervisorConfig,
-    _handle_child_exit,
     _kill_children,
     _should_escalate,
     chunks_are_disjoint_cover,
@@ -28,7 +28,6 @@ from scrape_exchange.scraper_supervisor import (
     publish_config_metrics,
     spawn_children,
     split_proxies,
-    wait_for_children,
 )
 
 
@@ -179,7 +178,7 @@ class TestSpawnChildrenEnv(unittest.TestCase):
             num_processes_env_var='CHANNEL_NUM_PROCESSES',
             num_processes=3,
             concurrency=5,
-            proxies='http://a,http://b,http://c',
+            proxies=['http://a', 'http://b', 'http://c'],
             metrics_port=9600,
             log_file=log_file,
             log_file_env_var=log_file_env_var,
@@ -434,99 +433,6 @@ class TestKillChildren(unittest.TestCase):
         child.kill.assert_called_once()
 
 
-class TestHandleChildExit(unittest.TestCase):
-
-    def test_success_returns_zero(self) -> None:
-        child: MagicMock = MagicMock()
-        child.pid = 1
-        result: int = _handle_child_exit(
-            'test', child, 0, [],
-        )
-        self.assertEqual(result, 0)
-
-    def test_failure_returns_code_and_terminates(
-        self,
-    ) -> None:
-        child: MagicMock = MagicMock()
-        child.pid = 1
-        sibling: MagicMock = MagicMock()
-        sibling.poll.return_value = None
-        pending: list[MagicMock] = [sibling]
-
-        with self.assertLogs(
-            'scrape_exchange.scraper_supervisor', level='ERROR',
-        ):
-            result: int = _handle_child_exit(
-                'test', child, 2, pending,
-            )
-        self.assertEqual(result, 2)
-        sibling.terminate.assert_called_once()
-
-    def test_none_rc_treated_as_one(self) -> None:
-        '''rc=0 from kill is normalised to 1.'''
-        child: MagicMock = MagicMock()
-        child.pid = 1
-        result: int = _handle_child_exit(
-            'test', child, 0, [],
-        )
-        self.assertEqual(result, 0)
-
-
-class TestWaitForChildren(unittest.TestCase):
-
-    def test_all_exit_cleanly(self) -> None:
-        child: MagicMock = MagicMock()
-        child.wait.return_value = 0
-        child.pid = 1
-
-        rc: int = wait_for_children('test', [child])
-        self.assertEqual(rc, 0)
-
-    def test_escalates_after_deadline(self) -> None:
-        '''
-        Children that don't exit before the deadline get
-        SIGKILL.
-        '''
-        call_count: int = 0
-
-        def slow_wait(timeout: float = None) -> int:
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise subprocess.TimeoutExpired(
-                    'test', timeout,
-                )
-            return -9
-
-        child: MagicMock = MagicMock()
-        child.wait.side_effect = slow_wait
-        child.poll.return_value = None
-        child.pid = 1
-
-        shutdown_state: dict[str, float | None] = {
-            'deadline': time.monotonic() - 1,
-        }
-        with self.assertLogs(
-            'scrape_exchange.scraper_supervisor', level='ERROR',
-        ):
-            wait_for_children('test', [child], shutdown_state)
-        child.kill.assert_called_once()
-
-    def test_no_escalation_without_deadline(self) -> None:
-        child: MagicMock = MagicMock()
-        child.wait.return_value = 0
-        child.pid = 1
-
-        shutdown_state: dict[str, float | None] = {
-            'deadline': None,
-        }
-        result: int = wait_for_children(
-            'test', [child], shutdown_state,
-        )
-        self.assertEqual(result, 0)
-        child.kill.assert_not_called()
-
-
 class TestInstallSignalForwarders(unittest.TestCase):
 
     def test_sets_deadline_on_first_signal(self) -> None:
@@ -534,6 +440,7 @@ class TestInstallSignalForwarders(unittest.TestCase):
         Simulates a SIGTERM by capturing the handler
         installed via signal.signal and invoking it directly.
         '''
+        from scrape_exchange.scraper_supervisor import _ChildSlot
         shutdown_state: dict[str, float | None] = {
             'deadline': None,
         }
@@ -546,13 +453,20 @@ class TestInstallSignalForwarders(unittest.TestCase):
 
         child: MagicMock = MagicMock()
         child.poll.return_value = None
+        slot: _ChildSlot = _ChildSlot(
+            instance=1,
+            spawn_env={},
+            spawn_argv=[],
+            process=child,
+            spawn_time=time.monotonic(),
+        )
 
         with patch(
             'scrape_exchange.scraper_supervisor.signal.signal',
             side_effect=fake_signal,
         ):
             install_signal_forwarders(
-                [child], shutdown_state, grace_seconds=10,
+                [slot], shutdown_state, grace_seconds=10,
             )
 
         import signal
@@ -565,6 +479,7 @@ class TestInstallSignalForwarders(unittest.TestCase):
         )
 
     def test_deadline_set_only_once(self) -> None:
+        from scrape_exchange.scraper_supervisor import _ChildSlot
         shutdown_state: dict[str, float | None] = {
             'deadline': None,
         }
@@ -577,13 +492,20 @@ class TestInstallSignalForwarders(unittest.TestCase):
 
         child: MagicMock = MagicMock()
         child.poll.return_value = None
+        slot: _ChildSlot = _ChildSlot(
+            instance=1,
+            spawn_env={},
+            spawn_argv=[],
+            process=child,
+            spawn_time=time.monotonic(),
+        )
 
         with patch(
             'scrape_exchange.scraper_supervisor.signal.signal',
             side_effect=fake_signal,
         ):
             install_signal_forwarders(
-                [child], shutdown_state, grace_seconds=10,
+                [slot], shutdown_state, grace_seconds=10,
             )
 
         import signal
@@ -595,6 +517,569 @@ class TestInstallSignalForwarders(unittest.TestCase):
         self.assertEqual(
             shutdown_state['deadline'], first_deadline,
         )
+
+
+class TestComputeNextBackoff(unittest.TestCase):
+    '''Per-child backoff: doubles on consecutive crashes,
+    caps at 60s, resets to 1s when the previous run was
+    stable for >= 60s.'''
+
+    def test_doubles_below_cap(self) -> None:
+        from scrape_exchange.scraper_supervisor import (
+            _compute_next_backoff,
+        )
+        seq: list[float] = []
+        b: float = 1.0
+        for _ in range(8):
+            b = _compute_next_backoff(b, ran_seconds=0.0)
+            seq.append(b)
+        self.assertEqual(
+            seq,
+            [2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0, 60.0],
+        )
+
+    def test_holds_at_cap(self) -> None:
+        from scrape_exchange.scraper_supervisor import (
+            _compute_next_backoff,
+        )
+        self.assertEqual(
+            _compute_next_backoff(60.0, ran_seconds=5.0), 60.0,
+        )
+
+    def test_resets_when_ran_at_threshold(self) -> None:
+        from scrape_exchange.scraper_supervisor import (
+            _compute_next_backoff,
+        )
+        self.assertEqual(
+            _compute_next_backoff(32.0, ran_seconds=60.0), 1.0,
+        )
+
+    def test_resets_when_ran_well_past_threshold(self) -> None:
+        from scrape_exchange.scraper_supervisor import (
+            _compute_next_backoff,
+        )
+        self.assertEqual(
+            _compute_next_backoff(32.0, ran_seconds=600.0), 1.0,
+        )
+
+    def test_just_below_threshold_still_doubles(self) -> None:
+        from scrape_exchange.scraper_supervisor import (
+            _compute_next_backoff,
+        )
+        self.assertEqual(
+            _compute_next_backoff(32.0, ran_seconds=59.999),
+            60.0,
+        )
+
+
+class TestSupervisorRespawnsMetric(unittest.TestCase):
+    '''METRIC_SUPERVISOR_RESPAWNS must carry scraper and
+    instance labels so the dashboard can per-slot flap-rate.'''
+
+    def test_metric_has_expected_labelnames(self) -> None:
+        from scrape_exchange.scraper_metrics import (
+            METRIC_SUPERVISOR_RESPAWNS,
+        )
+        self.assertEqual(
+            METRIC_SUPERVISOR_RESPAWNS._labelnames,
+            ('scraper', 'instance'),
+        )
+
+    def test_metric_can_be_incremented(self) -> None:
+        from scrape_exchange.scraper_metrics import (
+            METRIC_SUPERVISOR_RESPAWNS,
+        )
+        METRIC_SUPERVISOR_RESPAWNS.labels(
+            scraper='unit-test', instance='99',
+        ).inc()  # smoke
+
+
+class TestChildSlotConstruction(unittest.TestCase):
+    '''spawn_children returns one _ChildSlot per chunk with the
+    spawn args needed to relaunch the child later.'''
+
+    def test_returns_one_slot_per_chunk(self) -> None:
+        from scrape_exchange.scraper_supervisor import (
+            SupervisorConfig, _ChildSlot, spawn_children,
+        )
+        config: SupervisorConfig = SupervisorConfig(
+            scraper_label='test',
+            num_processes_env_var='TEST_NUM_PROCESSES',
+            num_processes=2,
+            concurrency=4,
+            proxies=['http://1:1', 'http://2:2'],
+            metrics_port=9000,
+            log_file=None,
+        )
+        with patch.object(
+            scraper_supervisor.subprocess, 'Popen',
+        ) as fake_popen:
+            fake_popen.return_value = MagicMock(pid=42)
+            slots: list[_ChildSlot] = spawn_children(
+                config,
+                [['http://1:1'], ['http://2:2']],
+            )
+        self.assertEqual(len(slots), 2)
+        for slot in slots:
+            self.assertIsNotNone(slot.process)
+            self.assertEqual(slot.backoff, 1.0)
+            self.assertIsNotNone(slot.spawn_time)
+            self.assertIsNone(slot.respawn_at)
+        self.assertEqual(
+            [s.instance for s in slots], [1, 2],
+        )
+
+    def test_slot_captures_spawn_env(self) -> None:
+        '''The slot must remember the env it was spawned with so a
+        respawn can replay it without re-deriving.'''
+        from scrape_exchange.scraper_supervisor import (
+            SupervisorConfig, spawn_children,
+        )
+        config: SupervisorConfig = SupervisorConfig(
+            scraper_label='test',
+            num_processes_env_var='TEST_NUM_PROCESSES',
+            num_processes=1,
+            concurrency=1,
+            proxies=['http://only:1'],
+            metrics_port=9000,
+            log_file=None,
+        )
+        with patch.object(
+            scraper_supervisor.subprocess, 'Popen',
+        ) as fake_popen:
+            fake_popen.return_value = MagicMock(pid=1)
+            slots = spawn_children(
+                config, [['http://only:1']],
+            )
+        self.assertEqual(len(slots), 1)
+        slot = slots[0]
+        self.assertEqual(
+            slot.spawn_env['PROXIES'], 'http://only:1',
+        )
+        self.assertEqual(
+            slot.spawn_env['METRICS_PORT'], '9001',
+        )
+        self.assertEqual(
+            slot.spawn_env['TEST_NUM_PROCESSES'], '1',
+        )
+
+    def test_slot_captures_spawn_argv(self) -> None:
+        '''The slot must capture spawn_argv so _spawn_one_slot
+        can replay the exact command on respawn without
+        re-deriving it.'''
+        import sys
+        from scrape_exchange.scraper_supervisor import (
+            SupervisorConfig, spawn_children,
+        )
+        config: SupervisorConfig = SupervisorConfig(
+            scraper_label='test',
+            num_processes_env_var='TEST_NUM_PROCESSES',
+            num_processes=1,
+            concurrency=1,
+            proxies=['http://only:1'],
+            metrics_port=9000,
+            log_file=None,
+        )
+        with patch.object(
+            scraper_supervisor.subprocess, 'Popen',
+        ) as fake_popen:
+            fake_popen.return_value = MagicMock(pid=1)
+            slots = spawn_children(
+                config, [['http://only:1']],
+            )
+        self.assertEqual(len(slots), 1)
+        slot = slots[0]
+        # spawn_argv[0] must be the current Python interpreter so
+        # respawned children use the same venv.
+        self.assertEqual(slot.spawn_argv[0], sys.executable)
+        # spawn_argv[1] is the resolved absolute path to the
+        # calling script (os.path.abspath(sys.argv[0])).
+        self.assertEqual(
+            slot.spawn_argv[1], os.path.abspath(sys.argv[0]),
+        )
+
+
+class TestInstallSignalForwardersLiveLookup(unittest.TestCase):
+
+    def test_replaced_process_receives_signal(self) -> None:
+        '''Respawning a slot's process AFTER install must still
+        cause the new process to receive forwarded signals.
+        Pins the central correctness claim of the refactor.'''
+        import signal
+        from scrape_exchange.scraper_supervisor import (
+            _ChildSlot, install_signal_forwarders,
+        )
+        handlers: dict[int, object] = {}
+
+        def fake_signal(signum: int, handler: object) -> None:
+            handlers[signum] = handler
+
+        initial_proc: MagicMock = MagicMock()
+        initial_proc.poll.return_value = None
+        slot: _ChildSlot = _ChildSlot(
+            instance=1, spawn_env={}, spawn_argv=[],
+            process=initial_proc,
+            spawn_time=time.monotonic(),
+        )
+        shutdown_state: dict[str, float | None] = {
+            'deadline': None,
+        }
+
+        with patch.object(
+            scraper_supervisor.signal, 'signal', fake_signal,
+        ):
+            install_signal_forwarders([slot], shutdown_state)
+
+        # Replace the slot's process AFTER install — simulates a
+        # respawn cycle where the old child died and a new one was
+        # spawned to take its place.
+        new_proc: MagicMock = MagicMock()
+        new_proc.poll.return_value = None
+        slot.process = new_proc
+
+        # Trigger the SIGTERM handler.
+        handlers[signal.SIGTERM](signal.SIGTERM, None)
+
+        # The handler must have signalled the NEW process, not the
+        # initial one.
+        new_proc.send_signal.assert_called_once_with(signal.SIGTERM)
+        initial_proc.send_signal.assert_not_called()
+
+
+class _FakeProcess:
+    '''Minimal Popen-like stub. Tests drive ``poll_returns`` (a
+    list of values returned in order on consecutive .poll() calls).
+    .pid is fixed; .terminate / .kill record their calls.'''
+
+    def __init__(
+        self, pid: int, poll_returns: list[int | None],
+    ) -> None:
+        self.pid: int = pid
+        self._poll_returns: list[int | None] = list(poll_returns)
+        self.kill_calls: int = 0
+        self.terminate_calls: int = 0
+
+    def poll(self) -> int | None:
+        if not self._poll_returns:
+            return 0  # final call: report a clean exit
+        return self._poll_returns.pop(0)
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+
+
+class TestSuperviseChildren(unittest.TestCase):
+    '''supervise_children: per-slot respawn with backoff and reset.
+
+    Each test drives a controllable monotonic clock so backoff
+    timings are deterministic.'''
+
+    def setUp(self) -> None:
+        self._now: float = 1_000.0
+
+    def _clock(self) -> float:
+        return self._now
+
+    def _advance(self, seconds: float) -> None:
+        self._now += seconds
+
+    def _make_slot(
+        self,
+        instance: int,
+        process: _FakeProcess,
+        spawn_time: float | None = None,
+    ) -> '_ChildSlot':
+        from scrape_exchange.scraper_supervisor import _ChildSlot
+        return _ChildSlot(
+            instance=instance,
+            spawn_env={},
+            spawn_argv=['/bin/true'],
+            process=process,
+            spawn_time=spawn_time
+            if spawn_time is not None else self._now,
+        )
+
+    def test_sibling_isolation_one_crash_one_respawn(
+        self,
+    ) -> None:
+        '''A single crash schedules one respawn; sibling
+        untouched.'''
+        from scrape_exchange.scraper_supervisor import (
+            supervise_children,
+        )
+        crashed_proc: _FakeProcess = _FakeProcess(
+            pid=1, poll_returns=[1],
+        )
+        live_proc: _FakeProcess = _FakeProcess(
+            pid=2, poll_returns=[None] * 50,
+        )
+        crashed_slot = self._make_slot(1, crashed_proc)
+        live_slot = self._make_slot(2, live_proc)
+
+        spawn_calls: list[int] = []
+
+        def fake_spawn(slot: object) -> None:
+            spawn_calls.append(slot.instance)
+            slot.process = _FakeProcess(
+                pid=99, poll_returns=[None] * 50,
+            )
+            slot.spawn_time = self._now
+
+        # Run the loop for ~3 seconds of fake time, enough for the
+        # 1s backoff to elapse and respawn to fire.
+        with patch.object(
+            scraper_supervisor.time, 'monotonic',
+            side_effect=lambda: self._now,
+        ), patch.object(
+            scraper_supervisor, '_spawn_one_slot', fake_spawn,
+        ):
+            # Drive clock forward in 0.6s ticks until respawn fires
+            # plus one extra tick. Use a per-iteration shutdown hook
+            # to break out cleanly.
+            shutdown_state: dict[str, float | None] = {
+                'deadline': None,
+            }
+            ticks: list[float] = []
+
+            def fake_sleep(secs: float) -> None:
+                ticks.append(secs)
+                self._advance(secs)
+                if len(ticks) >= 5:
+                    shutdown_state['deadline'] = self._now
+
+            with patch.object(
+                scraper_supervisor.time, 'sleep', fake_sleep,
+            ):
+                rc: int = supervise_children(
+                    'test', [crashed_slot, live_slot],
+                    shutdown_state,
+                )
+        self.assertEqual(rc, 0)
+        self.assertIn(1, spawn_calls)
+        self.assertNotIn(2, spawn_calls)
+
+    def test_clean_exit_does_not_respawn(self) -> None:
+        from scrape_exchange.scraper_supervisor import (
+            supervise_children,
+        )
+        clean_proc: _FakeProcess = _FakeProcess(
+            pid=1, poll_returns=[0],
+        )
+        slot = self._make_slot(1, clean_proc)
+
+        spawn_calls: list[int] = []
+
+        def fake_spawn(s: object) -> None:
+            spawn_calls.append(s.instance)
+
+        with patch.object(
+            scraper_supervisor.time, 'monotonic',
+            side_effect=lambda: self._now,
+        ), patch.object(
+            scraper_supervisor, '_spawn_one_slot', fake_spawn,
+        ), patch.object(
+            scraper_supervisor.time, 'sleep',
+            side_effect=lambda s: self._advance(s),
+        ):
+            rc: int = supervise_children(
+                'test', [slot], {'deadline': None},
+            )
+        self.assertEqual(rc, 0)
+        self.assertEqual(spawn_calls, [])
+
+    def test_shutdown_skips_respawn(self) -> None:
+        '''A crash that arrives after shutdown is requested must
+        not schedule a respawn.'''
+        from scrape_exchange.scraper_supervisor import (
+            supervise_children,
+        )
+        crashed_proc: _FakeProcess = _FakeProcess(
+            pid=1, poll_returns=[1],
+        )
+        slot = self._make_slot(1, crashed_proc)
+
+        spawn_calls: list[int] = []
+
+        def fake_spawn(s: object) -> None:
+            spawn_calls.append(s.instance)
+
+        shutdown_state: dict[str, float | None] = {
+            'deadline': self._now + 30.0,
+        }
+
+        with patch.object(
+            scraper_supervisor.time, 'monotonic',
+            side_effect=lambda: self._now,
+        ), patch.object(
+            scraper_supervisor, '_spawn_one_slot', fake_spawn,
+        ), patch.object(
+            scraper_supervisor.time, 'sleep',
+            side_effect=lambda s: self._advance(s),
+        ):
+            rc: int = supervise_children(
+                'test', [slot], shutdown_state,
+            )
+        self.assertEqual(rc, 0)
+        self.assertEqual(spawn_calls, [])
+
+    def test_repeated_crashes_double_backoff(self) -> None:
+        '''Two crashes within the stable threshold double the
+        backoff.'''
+        from scrape_exchange.scraper_supervisor import (
+            supervise_children, _ChildSlot,
+        )
+        # First process crashes immediately; respawn produces a
+        # second process that also crashes immediately.
+        first: _FakeProcess = _FakeProcess(
+            pid=1, poll_returns=[1],
+        )
+        slot: _ChildSlot = self._make_slot(1, first)
+        observed_backoffs: list[float] = []
+
+        def fake_spawn(s: _ChildSlot) -> None:
+            observed_backoffs.append(s.backoff)
+            s.process = _FakeProcess(pid=99, poll_returns=[1])
+            s.spawn_time = self._now
+
+        with patch.object(
+            scraper_supervisor.time, 'monotonic',
+            side_effect=lambda: self._now,
+        ), patch.object(
+            scraper_supervisor, '_spawn_one_slot', fake_spawn,
+        ):
+            shutdown_state: dict[str, float | None] = {
+                'deadline': None,
+            }
+            ticks: int = 0
+
+            def fake_sleep(secs: float) -> None:
+                nonlocal ticks
+                ticks += 1
+                self._advance(secs)
+                # 40 ticks * 0.5s = 20s, enough for backoffs
+                # 2s + 4s + 8s = 14s before the 3rd respawn
+                # fires, with headroom before shutdown.
+                if ticks >= 40:
+                    shutdown_state['deadline'] = self._now
+
+            with patch.object(
+                scraper_supervisor.time, 'sleep', fake_sleep,
+            ):
+                supervise_children(
+                    'test', [slot], shutdown_state,
+                )
+        # First respawn fires with backoff=2 (doubled from 1).
+        # Second respawn — also a crash within the threshold —
+        # uses backoff=4. Etc.
+        self.assertEqual(
+            observed_backoffs[:3], [2.0, 4.0, 8.0],
+        )
+
+    def test_stable_run_resets_backoff(self) -> None:
+        '''A respawned process that runs for >= 60s before crashing
+        resets the slot's backoff to 1.'''
+        from scrape_exchange.scraper_supervisor import (
+            supervise_children, _ChildSlot,
+        )
+        # Set the initial slot to look like it has already crashed
+        # several times: backoff = 32.
+        crashed: _FakeProcess = _FakeProcess(
+            pid=1, poll_returns=[1],
+        )
+        slot: _ChildSlot = self._make_slot(
+            1, crashed, spawn_time=self._now - 120.0,
+        )
+        slot.backoff = 32.0
+        observed_backoffs: list[float] = []
+
+        def fake_spawn(s: _ChildSlot) -> None:
+            observed_backoffs.append(s.backoff)
+            s.process = _FakeProcess(pid=99, poll_returns=[1])
+            s.spawn_time = self._now
+
+        shutdown_state: dict[str, float | None] = {
+            'deadline': None,
+        }
+        ticks: int = 0
+
+        def fake_sleep(secs: float) -> None:
+            nonlocal ticks
+            ticks += 1
+            self._advance(secs)
+            if ticks >= 5:
+                shutdown_state['deadline'] = self._now
+
+        with patch.object(
+            scraper_supervisor.time, 'monotonic',
+            side_effect=lambda: self._now,
+        ), patch.object(
+            scraper_supervisor, '_spawn_one_slot', fake_spawn,
+        ), patch.object(
+            scraper_supervisor.time, 'sleep', fake_sleep,
+        ):
+            supervise_children(
+                'test', [slot], shutdown_state,
+            )
+        # Initial run lasted 120s >= 60s, so respawn after this
+        # crash uses backoff=1 (reset), not 64.
+        self.assertEqual(observed_backoffs[0], 1.0)
+
+    def test_independent_slot_state(self) -> None:
+        '''Two slots crashing simultaneously each get their own
+        backoff progression — slot A's flap doesn't affect slot
+        B.'''
+        from scrape_exchange.scraper_supervisor import (
+            supervise_children, _ChildSlot,
+        )
+        proc_a: _FakeProcess = _FakeProcess(
+            pid=1, poll_returns=[1],
+        )
+        proc_b: _FakeProcess = _FakeProcess(
+            pid=2, poll_returns=[None] * 50,
+        )
+        slot_a: _ChildSlot = self._make_slot(1, proc_a)
+        slot_b: _ChildSlot = self._make_slot(2, proc_b)
+        per_instance_backoffs: dict[int, list[float]] = {
+            1: [], 2: [],
+        }
+
+        def fake_spawn(s: _ChildSlot) -> None:
+            per_instance_backoffs[s.instance].append(s.backoff)
+            s.process = _FakeProcess(
+                pid=99, poll_returns=[None] * 50,
+            )
+            s.spawn_time = self._now
+
+        shutdown_state: dict[str, float | None] = {
+            'deadline': None,
+        }
+        ticks: int = 0
+
+        def fake_sleep(secs: float) -> None:
+            nonlocal ticks
+            ticks += 1
+            self._advance(secs)
+            if ticks >= 10:
+                shutdown_state['deadline'] = self._now
+
+        with patch.object(
+            scraper_supervisor.time, 'monotonic',
+            side_effect=lambda: self._now,
+        ), patch.object(
+            scraper_supervisor, '_spawn_one_slot', fake_spawn,
+        ), patch.object(
+            scraper_supervisor.time, 'sleep', fake_sleep,
+        ):
+            supervise_children(
+                'test', [slot_a, slot_b], shutdown_state,
+            )
+        # Slot A crashed once -> exactly one respawn at backoff 2.
+        # Slot B never crashed -> no respawn.
+        self.assertEqual(per_instance_backoffs[1], [2.0])
+        self.assertEqual(per_instance_backoffs[2], [])
 
 
 if __name__ == '__main__':

@@ -8,9 +8,14 @@ scrape_exchange tools.
 '''
 
 from pathlib import Path
-from typing import Literal
-from pydantic import AliasChoices, Field, field_validator
+from typing import ClassVar, Literal
+from pydantic import (
+    AliasChoices, Field, field_validator, model_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from scrape_exchange.proxy_loader import (
+    load_proxy_catalog, set_active_catalog,
+)
 
 
 _VALID_LOG_LEVELS: set[str] = {
@@ -84,15 +89,22 @@ class ScraperSettings(BaseSettings):
         validation_alias=AliasChoices('LOG_FORMAT', 'log_format'),
         description='Log record format: "json" (structured) or "text"',
     )
-    proxies: str | None = Field(
+    proxy_files: str | None = Field(
         default=None,
-        validation_alias=AliasChoices('PROXIES', 'proxies'),
+        validation_alias=AliasChoices(
+            'PROXY_FILES', 'proxy_files',
+        ),
         description=(
-            'Comma-separated list of proxy URLs to use for scraping (e.g. '
-            '"http://proxy1:port,http://proxy2:port"). If not set, no '
-            'proxy will be used.'
-        )
+            'Comma-separated list of files; each line is a proxy '
+            'URL (http://host:port[:user:pass] or '
+            'http://user:pass@host:port) or a local egress IP '
+            '(local://x.x.x.x). Replaces the legacy PROXIES env '
+            'var.'
+        ),
     )
+    # ClassVar: not a pydantic/env field. Instance value is
+    # set by _load_proxy_catalog, shadowing the class default.
+    proxies: ClassVar[tuple[str, ...]] = ()
     rate_limiter_state_dir: str = Field(
         default='/tmp/scrape_exchange',
         validation_alias=AliasChoices(
@@ -143,3 +155,31 @@ class ScraperSettings(BaseSettings):
     @classmethod
     def uppercase_log_level(cls, v: str) -> str:
         return normalize_log_level(v)
+
+    @field_validator('proxy_files', mode='before')
+    @classmethod
+    def _coerce_proxy_files(cls, v: object) -> object:
+        if v is None or isinstance(v, str):
+            return v
+        if isinstance(v, Path):
+            return str(v)
+        if isinstance(v, (list, tuple)):
+            return ','.join(str(p) for p in v)
+        return v
+
+    @model_validator(mode='after')
+    def _load_proxy_catalog(self) -> 'ScraperSettings':
+        paths: list[Path] = []
+        if self.proxy_files:
+            paths = [
+                Path(p.strip())
+                for p in self.proxy_files.split(',')
+                if p.strip()
+            ]
+        catalog = load_proxy_catalog(paths)
+        # ClassVar attrs aren't in model_fields; write to instance
+        # __dict__ directly to avoid pydantic's __setattr__ guard
+        # rejecting an unknown field.
+        object.__setattr__(self, 'proxies', catalog.entries)
+        set_active_catalog(catalog)
+        return self
