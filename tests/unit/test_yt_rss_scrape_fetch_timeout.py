@@ -76,8 +76,11 @@ class TestFetchRssTimeout(unittest.IsolatedAsyncioTestCase):
 
         timeout = captured.get('timeout')
         self.assertIsNotNone(timeout)
-        self.assertEqual(timeout.read, 5.0)
-        self.assertEqual(timeout.connect, 3.0)
+        # Defaults from scrape_exchange.http_timeouts:
+        # RSS_REQUEST_TIMEOUT=30s, RSS_CONNECT_TIMEOUT=5s,
+        # overridable per scraper via env vars.
+        self.assertEqual(timeout.read, 30.0)
+        self.assertEqual(timeout.connect, 5.0)
 
 
 import httpx

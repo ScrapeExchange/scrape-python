@@ -67,6 +67,43 @@ class TestChannelScraperHandleResolution(
         cm.put.assert_not_awaited()
         nm.put.assert_not_awaited()
 
+    async def test_none_handle_does_not_write_to_creator_map(
+        self,
+    ) -> None:
+        '''Channel files written by an earlier code path can have
+        ``channel_handle=None``. Redis rejects None on hset; we must
+        skip the put rather than crash the bulk upload sweep.'''
+        from scrape_exchange.youtube.youtube_channel import (
+            YouTubeChannel,
+        )
+        from tools.yt_channel_scrape import (
+            resolve_channel_upload_handle,
+        )
+
+        channel: YouTubeChannel = YouTubeChannel(
+            channel_handle=None,
+        )
+        channel.channel_id = 'UC1234567890abcdefghij'
+        channel.title = 'Some Title'
+
+        cm: NullCreatorMap = NullCreatorMap()
+        cm.put = AsyncMock()
+        nm: NullNameMap = NullNameMap()
+        nm.put = AsyncMock()
+
+        result: str | None = (
+            await resolve_channel_upload_handle(
+                channel, cm, nm,
+            )
+        )
+
+        self.assertIsNone(result)
+        cm.put.assert_not_awaited()
+        # name_map write is still safe — it has both title and id —
+        # but skipping it avoids a partial write on a record that
+        # downstream schema validation will reject anyway.
+        nm.put.assert_not_awaited()
+
 
 class TestChannelListWriteBack(unittest.IsolatedAsyncioTestCase):
     '''

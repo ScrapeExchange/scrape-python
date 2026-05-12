@@ -24,14 +24,14 @@ import time
 from random import shuffle
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import aiofiles
 import brotli
 import orjson
 import redis.asyncio as aioredis
 
-from httpx import Response
-from watchfiles import awatch, Change
+from httpx import Response, Timeout
 from prometheus_client import Counter, Gauge
 from pydantic import AliasChoices, Field, field_validator
 
@@ -47,8 +47,11 @@ from scrape_exchange.name_map import (
     RedisNameMap,
 )
 from scrape_exchange.bulk_upload import (
+    BULK_API_PATH,
     BulkBatchOutcome,
+    fetch_bulk_results,
     resume_pending_bulk_uploads,
+    stream_bulk_job_progress,
     upload_bulk_batch,
 )
 from scrape_exchange.channel_list_parsing import (
@@ -87,13 +90,6 @@ from scrape_exchange.youtube.youtube_video import DENO_PATH, PO_TOKEN_URL
 CHANNEL_FILE_POSTFIX = '.json.br'
 
 PRIORITY_MAX_RETRIES: int = 5
-PRIORITY_RETRYABLE_STATUS_CODES: frozenset[int] = (
-    frozenset({429, 500, 502, 503, 504})
-)
-PRIORITY_CHANNEL_SCHEMA_OWNER: str = 'boinko'
-PRIORITY_CHANNEL_SCHEMA_PLATFORM: str = 'youtube'
-PRIORITY_CHANNEL_SCHEMA_ENTITY: str = 'channel'
-PRIORITY_CHANNEL_SCHEMA_VERSION: str = '0.0.2'
 
 MAX_NEW_CHANNELS: int = 1000
 MAX_RESOLVED_CHANNELS: int = 100
@@ -262,9 +258,6 @@ from scrape_exchange.scraper_metrics import (
     METRIC_UPLOADS_FAILED as METRIC_CHANNELS_BULK_FAILED,
     METRIC_UPLOADS_MISSING_RESULT as METRIC_CHANNELS_BULK_MISSING_RESULT,
     METRIC_UPLOAD_BATCHES as METRIC_BULK_BATCHES,
-    METRIC_WATCHER_FILES_DETECTED,
-    METRIC_WATCHER_FILES_SKIPPED,
-    METRIC_WATCHER_BATCHES,
     METRIC_CHANNEL_PRIORITY_UPLOADS,
     METRIC_CHANNEL_PRIORITY_QUEUE_AGE,
 )
@@ -287,7 +280,7 @@ METRIC_CHANNEL_NO_CONTENT_FOUND = Counter(
     'Number of channels scraped that had no videos, playlists, courses, '
     'podcasts, or products',
     ['platform', 'scraper', 'entity', 'worker_id', 'proxy_ip',
-     'proxy_network', 'proxy_file'],
+     'proxy_file'],
 )
 METRIC_CHANNEL_RESOLVE_CLAIM: Counter = Counter(
     'channel_resolve_claim_total',
@@ -473,9 +466,7 @@ async def _run_worker(
     if settings.channel_upload_only:
         logging.info('Starting watching for uploads')
         await _watch_and_upload_channels(
-            settings, ctx.client, fm,
-            creator_map_backend, name_map_backend,
-            validator,
+            settings, ctx.client, fm, validator,
         )
     else:
         logging.info('Starting scraping channels')
@@ -760,7 +751,7 @@ async def _collect_channel_record(
         )
         return None
 
-    handle: str = await resolve_channel_upload_handle(
+    handle: str | None = await resolve_channel_upload_handle(
         channel, creator_map_backend, name_map_backend,
     )
     channel.channel_handle = handle
@@ -966,10 +957,9 @@ async def upload_channels(
     matching source file to ``uploaded_dir``; failed and missing
     records are left in ``base_dir`` for the next iteration.
 
-    The watcher loop ``_watch_and_upload_channels`` keeps using
-    the per-channel POST path because it processes files as they
-    arrive and bulk batching offers no benefit for single-file
-    arrivals.
+    Used by the scrape-and-upload pass to flush whatever the
+    scraper produced this iteration; upload-only mode uses
+    :func:`_unified_bulk_upload_loop` instead.
     '''
 
     files: list[str] = [
@@ -1093,111 +1083,6 @@ async def upload_channels(
         )
 
 
-def _is_channel_file(filename: str) -> bool:
-    '''Check if a filename is an uploadable channel file.'''
-    return (
-        filename.startswith(CHANNEL_FILE_PREFIX)
-        and filename.endswith(CHANNEL_FILE_POSTFIX)
-        and not filename.endswith('failed')
-    )
-
-
-async def _upload_single_channel(
-    filename: str,
-    settings: ChannelSettings,
-    client: ExchangeClient,
-    fm: AssetFileManagement,
-    creator_map_backend: CreatorMap,
-    name_map_backend: NameMap,
-    validator: SchemaValidator,
-) -> None:
-    '''
-    Upload a single channel file if it needs uploading.
-    '''
-
-    if fm.is_superseded(filename):
-        METRIC_UPLOADED_FILE_EXISTS.labels(
-            platform='youtube',
-            scraper='channel_scraper',
-            entity='channel',
-            reason='already_uploaded',
-            worker_id=get_worker_id(),
-        ).inc()
-        METRIC_WATCHER_FILES_SKIPPED.labels(
-            platform='youtube',
-            scraper='channel_scraper',
-            entity='channel',
-            worker_id=get_worker_id(),
-        ).inc()
-        await fm.delete(filename, fail_ok=False)
-        return
-
-    try:
-        channel_data: dict = await fm.read_file(
-            filename,
-        )
-        channel: YouTubeChannel = (
-            YouTubeChannel.from_dict(channel_data)
-        )
-        if await channel_exists(client, channel.channel_handle):
-            await fm.delete(filename, fail_ok=False)
-            return
-
-        if await enqueue_upload_channel(
-            settings, client, fm, filename, channel,
-            creator_map_backend, name_map_backend,
-            validator,
-        ):
-            METRIC_CHANNELS_ENQUEUED.labels(
-                platform='youtube',
-                scraper='channel_scraper',
-                entity='channel',
-                mode='single',
-                worker_id=get_worker_id(),
-            ).inc()
-    except FileNotFoundError:
-        # Race with the parallel scraper worker that runs on the
-        # same data dir (per CLAUDE.md, ``yt_channel_scrape.py``
-        # and ``yt_channel_scrape.py --channel-upload-only`` share
-        # ``channel_data_directory``): the other worker beat us to
-        # ``mark_uploaded`` between our ``is_superseded`` check
-        # above and the read/delete call inside the try block. If
-        # the file is now superseded, treat it as a clean win for
-        # the other worker and bump the same skip metrics. Only
-        # warn if the file genuinely vanished without an uploaded
-        # copy, since that would be unexpected.
-        if fm.is_superseded(filename):
-            METRIC_UPLOADED_FILE_EXISTS.labels(
-                platform='youtube',
-                scraper='channel_scraper',
-                entity='channel',
-                reason='already_uploaded',
-                worker_id=get_worker_id(),
-            ).inc()
-            METRIC_WATCHER_FILES_SKIPPED.labels(
-                platform='youtube',
-                scraper='channel_scraper',
-                entity='channel',
-                worker_id=get_worker_id(),
-            ).inc()
-            logging.debug(
-                'Channel file already uploaded by parallel '
-                'worker; treating as superseded',
-                extra={'filename': filename},
-            )
-            return
-        logging.warning(
-            'Channel file disappeared with no uploaded copy',
-            extra={'filename': filename},
-        )
-    except Exception as exc:
-        logging.error(
-            'Error processing channel file',
-            exc=exc,
-            extra={'filename': filename},
-        )
-
-
 def _priority_channel_work_items(
     priority_dir: str,
 ) -> list[Path]:
@@ -1226,278 +1111,432 @@ def _priority_channel_work_items(
     return candidates
 
 
-async def _process_priority_file(
-    path: Path,
+async def _unified_bulk_upload_loop(
+    settings: 'ChannelSettings',
     client: ExchangeClient,
-    validator: SchemaValidator,
-    uploaded_dir: str,
-    retries: dict[str, int],
+    fm: 'AssetFileManagement',
+    validator: 'SchemaValidator',
+    sleep_seconds: float = 5.0,
 ) -> None:
-    '''Process one priority-directory file.
+    '''Single bulk-batched upload loop for upload-only
+    mode. Drains ``channel_priority_directory_path``
+    first, then tops up each batch with regular files
+    from ``fm.base_dir`` until ``bulk_batch_size`` is
+    reached.
 
-    Order of operations:
-    1. Decode → record_dict.
-    2. Validate. Failure → rename to ``.json.br.failed``.
-    3. POST to scrape.exchange.
-    4. On 201 → move to ``<uploaded_dir>/<basename>``.
-    5. On retryable status / network error →
-       increment retry counter; if it now reaches
-       ``PRIORITY_MAX_RETRIES``, rename to
-       ``.json.br.failed`` and reset the counter.
-    6. On non-retryable 4xx → rename immediately.
-    '''
+    Each iteration:
+    1. Collect up to ``bulk_batch_size`` priority paths
+       (oldest mtime first).
+    2. Top up with regular channel files sorted by mtime
+       if the priority batch is smaller than
+       ``bulk_batch_size``.
+    3. If the combined batch is empty, sleep and retry.
+    4. Decode + validate each file; rename priority
+       files to ``.failed`` on error; skip bad base
+       files without renaming.
+    5. POST the batch to ``BULK_API_PATH`` as multipart
+       ndjson.
+    6. On batch-level POST/progress failure, bump retry
+       counters for priority files; base files are left
+       for the next sweep.
+    7. On success, reconcile per-record results:
+       priority files go to ``fm.uploaded_dir`` via a
+       direct rename; base files via
+       ``fm.mark_uploaded``.
+    8. Sleep ``sleep_seconds`` at the end of every
+       iteration.
 
-    handle: str = (
-        path.name
-        .removeprefix('channel-rss-')
-        .removesuffix('.json.br')
-    )
-
-    def _rename_failed(reason: str) -> None:
-        failed: Path = path.with_suffix(
-            path.suffix + '.failed',
-        )
-        path.rename(failed)
-        retries[handle] = 0
-        METRIC_CHANNEL_PRIORITY_UPLOADS.labels(
-            platform='youtube',
-            scraper='channel_scraper',
-            result='failed_permanently',
-            worker_id=get_worker_id(),
-        ).inc()
-        logging.error(
-            'Channel-priority upload failed permanently',
-            extra={
-                'path': str(path), 'handle': handle,
-                'reason': reason,
-            },
-        )
-
-    try:
-        compressed: bytes = await asyncio.to_thread(
-            path.read_bytes,
-        )
-        record_dict: dict = orjson.loads(
-            brotli.decompress(compressed),
-        )
-    except Exception as exc:
-        _rename_failed(f'decode error: {exc!r}')
-        return
-
-    err: str | None = validator.validate(record_dict)
-    if err is not None:
-        _rename_failed(f'schema validation: {err}')
-        return
-
-    payload: dict = {
-        'username': PRIORITY_CHANNEL_SCHEMA_OWNER,
-        'platform': PRIORITY_CHANNEL_SCHEMA_PLATFORM,
-        'entity': PRIORITY_CHANNEL_SCHEMA_ENTITY,
-        'version': PRIORITY_CHANNEL_SCHEMA_VERSION,
-        'source_url': record_dict.get('url', ''),
-        'data': record_dict,
-    }
-
-    try:
-        response = await client.post(
-            f'{client.exchange_url}'
-            f'{ExchangeClient.POST_DATA_API}',
-            json=payload,
-        )
-        status_code: int = response.status_code
-    except Exception as exc:
-        # Treat any network/IO error as retryable.
-        retries[handle] = retries.get(handle, 0) + 1
-        if retries[handle] >= PRIORITY_MAX_RETRIES:
-            _rename_failed(f'network: {exc!r}')
-            return
-        METRIC_CHANNEL_PRIORITY_UPLOADS.labels(
-            platform='youtube',
-            scraper='channel_scraper',
-            result='retried',
-            worker_id=get_worker_id(),
-        ).inc()
-        logging.warning(
-            'Channel-priority upload retryable failure',
-            extra={
-                'path': str(path), 'handle': handle,
-                'attempt': retries[handle],
-                'error': repr(exc),
-            },
-        )
-        return
-
-    if 200 <= status_code < 300:
-        target: Path = Path(uploaded_dir) / path.name
-        await asyncio.to_thread(path.rename, target)
-        retries.pop(handle, None)
-        METRIC_CHANNEL_PRIORITY_UPLOADS.labels(
-            platform='youtube',
-            scraper='channel_scraper',
-            result='success',
-            worker_id=get_worker_id(),
-        ).inc()
-        return
-
-    if status_code in PRIORITY_RETRYABLE_STATUS_CODES:
-        retries[handle] = retries.get(handle, 0) + 1
-        if retries[handle] >= PRIORITY_MAX_RETRIES:
-            _rename_failed(
-                f'retried {PRIORITY_MAX_RETRIES} times '
-                f'(last status {status_code})'
-            )
-            return
-        METRIC_CHANNEL_PRIORITY_UPLOADS.labels(
-            platform='youtube',
-            scraper='channel_scraper',
-            result='retried',
-            worker_id=get_worker_id(),
-        ).inc()
-        logging.warning(
-            'Channel-priority upload retryable status',
-            extra={
-                'path': str(path), 'handle': handle,
-                'status_code': status_code,
-                'attempt': retries[handle],
-            },
-        )
-        return
-
-    # Non-retryable status (4xx other than 429).
-    _rename_failed(f'non-retryable status {status_code}')
-
-
-async def _priority_sweep_loop(
-    priority_dir: str,
-    uploaded_dir: str,
-    client: ExchangeClient,
-    validator: SchemaValidator,
-    interval_seconds: float = 1.0,
-) -> None:
-    '''Drain ``priority_dir`` continuously.  Each
-    iteration:
-
-    1. Enumerate work items (oldest first).
-    2. Sample ``channel_priority_queue_age_seconds``
-       from the oldest item.
-    3. Process every item.
-    4. Sleep ``interval_seconds`` before the next pass.
-
-    Retry counters persist for the lifetime of this task
-    (not across process restarts).
+    Retry counters (keyed by ``channel_id``) are local
+    to this coroutine and are not persisted across
+    restarts.
     '''
     retries: dict[str, int] = {}
+    priority_dir: str = (
+        settings.channel_priority_directory_path
+    )
     os.makedirs(priority_dir, exist_ok=True)
-    os.makedirs(uploaded_dir, exist_ok=True)
+
     while True:
+        batch_size: int = settings.bulk_batch_size
+
+        # --- Step 1: priority paths ---
+        priority_paths: list[Path] = (
+            _priority_channel_work_items(priority_dir)
+        )[:batch_size]
+
+        # --- Step 2: top up from base dir ---
+        base_entries: list[tuple[Path, str]] = []
+        remaining: int = batch_size - len(priority_paths)
+        if remaining > 0:
+            base_names: list[str] = [
+                n for n in fm.list_base(
+                    prefix=CHANNEL_FILE_PREFIX,
+                    suffix=CHANNEL_FILE_POSTFIX,
+                )
+                if not n.startswith('channel-rss-')
+                and not n.endswith('failed')
+            ]
+            # Sort by mtime, oldest first
+            base_names.sort(
+                key=lambda n: (
+                    fm.base_dir / n
+                ).stat().st_mtime,
+            )
+            base_entries = [
+                (fm.base_dir / n, 'base')
+                for n in base_names[:remaining]
+            ]
+
+        all_entries: list[tuple[Path, str]] = (
+            [(p, 'priority') for p in priority_paths]
+            + base_entries
+        )
+
+        # --- Step 3: empty batch → sleep ---
+        if not all_entries:
+            await asyncio.sleep(sleep_seconds)
+            continue
+
+        # --- Step 4: decode + validate ---
+        valid_records: list[dict] = []
+        batch_records: list[tuple[str, Path, str]] = []
+
+        for path, kind in all_entries:
+            try:
+                compressed: bytes = path.read_bytes()
+                record_dict: dict = orjson.loads(
+                    brotli.decompress(compressed),
+                )
+            except Exception as exc:
+                logging.warning(
+                    'Failed to decode channel file',
+                    extra={
+                        'path': str(path),
+                        'kind': kind,
+                        'error': repr(exc),
+                    },
+                )
+                if kind == 'priority':
+                    failed: Path = path.with_suffix(
+                        path.suffix + '.failed',
+                    )
+                    path.rename(failed)
+                    METRIC_CHANNEL_PRIORITY_UPLOADS.labels(
+                        platform='youtube',
+                        scraper='channel_scraper',
+                        result='failed_permanently',
+                        worker_id=get_worker_id(),
+                    ).inc()
+                continue
+
+            err: str | None = validator.validate(
+                record_dict,
+            )
+            if err is not None:
+                logging.warning(
+                    'Channel file failed schema '
+                    'validation',
+                    extra={
+                        'path': str(path),
+                        'kind': kind,
+                        'error': err,
+                    },
+                )
+                if kind == 'priority':
+                    failed = path.with_suffix(
+                        path.suffix + '.failed',
+                    )
+                    path.rename(failed)
+                    METRIC_CHANNEL_PRIORITY_UPLOADS.labels(
+                        platform='youtube',
+                        scraper='channel_scraper',
+                        result='failed_permanently',
+                        worker_id=get_worker_id(),
+                    ).inc()
+                continue
+
+            channel_id: str = record_dict['channel_id']
+            valid_records.append(record_dict)
+            batch_records.append(
+                (channel_id, path, kind),
+            )
+
+        if not batch_records:
+            await asyncio.sleep(sleep_seconds)
+            continue
+
+        # --- Step 5: build batch buffer ---
+        batch_buf: bytes = b''.join(
+            orjson.dumps(rd) + b'\n'
+            for rd in valid_records
+        )
+        upload_filename: str = (
+            f'priority-channels-{uuid4().hex[:8]}.jsonl'
+        )
+        bulk_url: str = (
+            f'{settings.exchange_url}{BULK_API_PATH}'
+        )
+
+        # --- Step 6: POST ---
+        def _handle_batch_failure(
+            reason: str,
+        ) -> None:
+            '''Bump priority retries; rename at MAX.
+            Base entries are left for the next sweep.'''
+            for cid, fpath, fkind in batch_records:
+                if fkind != 'priority':
+                    continue
+                retries[cid] = retries.get(cid, 0) + 1
+                if retries[cid] >= PRIORITY_MAX_RETRIES:
+                    failed_path: Path = (
+                        fpath.with_suffix(
+                            fpath.suffix + '.failed',
+                        )
+                    )
+                    fpath.rename(failed_path)
+                    retries[cid] = 0
+                    METRIC_CHANNEL_PRIORITY_UPLOADS.labels(
+                        platform='youtube',
+                        scraper='channel_scraper',
+                        result='failed_permanently',
+                        worker_id=get_worker_id(),
+                    ).inc()
+                    logging.error(
+                        'Channel-priority bulk upload '
+                        'permanently failed',
+                        extra={
+                            'channel_id': cid,
+                            'path': str(fpath),
+                            'reason': reason,
+                        },
+                    )
+                else:
+                    METRIC_CHANNEL_PRIORITY_UPLOADS.labels(
+                        platform='youtube',
+                        scraper='channel_scraper',
+                        result='retried',
+                        worker_id=get_worker_id(),
+                    ).inc()
+
         try:
-            items: list[Path] = (
-                _priority_channel_work_items(priority_dir)
+            post_resp: Response = await client.post(
+                bulk_url,
+                data={
+                    'username': settings.schema_owner,
+                    'platform': 'youtube',
+                    'entity': 'channel',
+                    'version': settings.schema_version,
+                },
+                files={
+                    'file': (
+                        upload_filename,
+                        batch_buf,
+                        'application/x-ndjson',
+                    ),
+                },
+                timeout=Timeout(
+                    connect=30.0,
+                    write=3600.0,
+                    read=3600.0,
+                    pool=60.0,
+                ),
             )
-            if items:
-                oldest_age: float = (
-                    time.time()
-                    - items[0].stat().st_mtime
+        except Exception as exc:
+            logging.warning(
+                'Priority bulk batch POST failed',
+                extra={
+                    'error': repr(exc),
+                    'records': len(batch_records),
+                },
+            )
+            _handle_batch_failure(f'post error: {exc!r}')
+            await asyncio.sleep(sleep_seconds)
+            continue
+
+        if post_resp.status_code != 201:
+            logging.warning(
+                'Priority bulk batch rejected',
+                extra={
+                    'status_code': (
+                        post_resp.status_code
+                    ),
+                    'records': len(batch_records),
+                },
+            )
+            _handle_batch_failure(
+                f'post status {post_resp.status_code}',
+            )
+            await asyncio.sleep(sleep_seconds)
+            continue
+
+        job_id: str = post_resp.json().get('job_id', '')
+        if not job_id:
+            logging.warning(
+                'Priority bulk batch: missing job_id',
+            )
+            _handle_batch_failure('missing job_id')
+            await asyncio.sleep(sleep_seconds)
+            continue
+
+        # --- Step 8: stream progress ---
+        if not await stream_bulk_job_progress(
+            job_id,
+            settings.exchange_url,
+            client,
+            settings.bulk_progress_timeout_seconds,
+        ):
+            logging.warning(
+                'Priority bulk batch: progress failed',
+                extra={'job_id': job_id},
+            )
+            _handle_batch_failure('progress failed')
+            await asyncio.sleep(sleep_seconds)
+            continue
+
+        # --- Step 9: reconcile per-record results ---
+        results: list[dict] = await fetch_bulk_results(
+            job_id, settings.exchange_url, client,
+        )
+        by_id: dict[str, tuple[Path, str]] = {
+            cid: (fpath, fkind)
+            for cid, fpath, fkind in batch_records
+        }
+        by_index: dict[int, tuple[str, Path, str]] = {
+            idx: (cid, fpath, fkind)
+            for idx, (cid, fpath, fkind) in enumerate(
+                batch_records,
+            )
+        }
+
+        for entry in results:
+            status: str = entry.get('status', '')
+            cid_r: str | None = entry.get(
+                'platform_content_id',
+            )
+            ridx: int | None = entry.get('record_index')
+
+            resolved: tuple[str, Path, str] | None = None
+            if cid_r and cid_r in by_id:
+                fp, fk = by_id[cid_r]
+                resolved = (cid_r, fp, fk)
+            elif ridx is not None and ridx in by_index:
+                resolved = by_index[ridx]
+
+            if resolved is None:
+                logging.warning(
+                    'Bulk result has no matchable '
+                    'identifier',
+                    extra={
+                        'job_id': job_id,
+                        'entry': entry,
+                    },
                 )
+                continue
+
+            rec_cid, rec_path, rec_kind = resolved
+
+            if status == 'success':
+                if rec_kind == 'priority':
+                    dst: Path = (
+                        fm.uploaded_dir / rec_path.name
+                    )
+                    rec_path.rename(dst)
+                    retries.pop(rec_cid, None)
+                    METRIC_CHANNEL_PRIORITY_UPLOADS.labels(
+                        platform='youtube',
+                        scraper='channel_scraper',
+                        result='success',
+                        worker_id=get_worker_id(),
+                    ).inc()
+                else:
+                    try:
+                        await fm.mark_uploaded(
+                            rec_path.name,
+                        )
+                        METRIC_CHANNELS_BULK_UPLOADED\
+                            .labels(
+                            platform='youtube',
+                            scraper='channel_scraper',
+                            entity='channel',
+                            mode='bulk',
+                            status='success',
+                            worker_id=get_worker_id(),
+                        ).inc()
+                    except OSError as exc:
+                        logging.warning(
+                            'mark_uploaded failed for '
+                            'base file',
+                            extra={
+                                'path': str(rec_path),
+                                'error': repr(exc),
+                            },
+                        )
             else:
-                oldest_age = 0.0
-            METRIC_CHANNEL_PRIORITY_QUEUE_AGE.labels(
-                platform='youtube',
-                scraper='channel_scraper',
-                worker_id=get_worker_id(),
-            ).set(oldest_age)
-            for item in items:
-                await _process_priority_file(
-                    item, client, validator,
-                    uploaded_dir, retries,
-                )
-        except Exception:
-            logging.exception(
-                'priority sweep loop iteration failed',
-            )
-        await asyncio.sleep(interval_seconds)
+                if rec_kind == 'priority':
+                    retries[rec_cid] = (
+                        retries.get(rec_cid, 0) + 1
+                    )
+                    if (
+                        retries[rec_cid]
+                        >= PRIORITY_MAX_RETRIES
+                    ):
+                        failed_p: Path = (
+                            rec_path.with_suffix(
+                                rec_path.suffix
+                                + '.failed',
+                            )
+                        )
+                        rec_path.rename(failed_p)
+                        retries[rec_cid] = 0
+                        METRIC_CHANNEL_PRIORITY_UPLOADS\
+                            .labels(
+                            platform='youtube',
+                            scraper='channel_scraper',
+                            result='failed_permanently',
+                            worker_id=get_worker_id(),
+                        ).inc()
+                    else:
+                        METRIC_CHANNEL_PRIORITY_UPLOADS\
+                            .labels(
+                            platform='youtube',
+                            scraper='channel_scraper',
+                            result='retried',
+                            worker_id=get_worker_id(),
+                        ).inc()
+                # base-kind: leave file in place for
+                # next sweep (existing semantics)
+
+        await asyncio.sleep(sleep_seconds)
 
 
 async def _watch_and_upload_channels(
     settings: ChannelSettings,
     client: ExchangeClient,
     fm: AssetFileManagement,
-    creator_map_backend: CreatorMap,
-    name_map_backend: NameMap,
     validator: SchemaValidator,
 ) -> None:
     '''
-    Upload-only watcher loop.  Watches
-    ``channel_data_directory`` for new or modified
-    channel files and uploads them as they appear.
+    Upload-only loop. Drains
+    ``channel_priority_directory_path`` and
+    ``fm.base_dir`` via a single bulk-batched sweep,
+    preferring priority files and topping up from
+    the regular directory when the priority queue is
+    smaller than ``bulk_batch_size``.
 
     Runs until cancelled by SIGINT / SIGTERM.
     '''
-
-    base: Path = fm.base_dir
-    priority_dir: str = (
-        settings.channel_priority_directory_path
-    )
-    uploaded_dir: str = str(fm.uploaded_dir)
     logging.info(
-        'Upload-only: watching for new channel files',
+        'Upload-only: starting unified bulk upload loop',
         extra={
-            'watch_dir': str(base),
-            'priority_dir': priority_dir,
+            'base_dir': str(fm.base_dir),
+            'priority_dir': (
+                settings.channel_priority_directory_path
+            ),
         },
     )
-
-    # Spawn the priority sweep loop as a background task
-    # so the priority directory is drained continuously
-    # while the awatch loop responds to base-dir events.
-    priority_task: asyncio.Task[None] = (
-        asyncio.create_task(
-            _priority_sweep_loop(
-                priority_dir=priority_dir,
-                uploaded_dir=uploaded_dir,
-                client=client,
-                validator=validator,
-            ),
-        )
+    await _unified_bulk_upload_loop(
+        settings, client, fm, validator,
     )
-
-    wid: str = get_worker_id()
-    try:
-        async for changes in awatch(
-            base,
-            watch_filter=lambda change, path: (
-                change in (Change.added, Change.modified)
-                and _is_channel_file(Path(path).name)
-            ),
-        ):
-            METRIC_WATCHER_BATCHES.labels(
-                platform='youtube',
-                scraper='channel_scraper',
-                entity='channel',
-                worker_id=wid,
-            ).inc()
-            for _change, path in changes:
-                filename: str = Path(path).name
-                METRIC_WATCHER_FILES_DETECTED.labels(
-                    platform='youtube',
-                    scraper='channel_scraper',
-                    entity='channel',
-                    worker_id=wid,
-                ).inc()
-                logging.info(
-                    'Upload-only: new channel file '
-                    'detected',
-                    extra={'filename': filename},
-                )
-                await _upload_single_channel(
-                    filename, settings, client, fm,
-                    creator_map_backend, name_map_backend,
-                    validator,
-                )
-    finally:
-        priority_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await priority_task
 
 
 def normalize_channel_name(channel_handle: str) -> str:
@@ -1647,7 +1686,6 @@ def _record_scrape_failure(
         reason='other',
         worker_id=get_worker_id(),
         proxy_ip=proxy_used_ip,
-        proxy_network=proxy_network_for(proxy_used_ip),
         proxy_file=proxy_file_label(proxy_used or ''),
     ).inc()
     logging.warning(
@@ -1747,7 +1785,6 @@ def _channel_has_no_content(
         entity='channel',
         worker_id=get_worker_id(),
         proxy_ip=scrape_proxy_ip,
-        proxy_network=scrape_proxy_network,
         proxy_file=proxy_file_label(scrape_proxy or ''),
     ).inc()
     logging.info(
@@ -1976,7 +2013,6 @@ async def _do_scrape_channel_to_disk(
         api=success_api,
         worker_id=get_worker_id(),
         proxy_ip=scrape_proxy_ip,
-        proxy_network=scrape_proxy_network,
         proxy_file=proxy_file_label(scrape_proxy or ''),
     ).inc()
     METRIC_SCRAPE_DURATION.labels(
@@ -2088,7 +2124,7 @@ async def resolve_channel_upload_handle(
     channel: YouTubeChannel,
     creator_map_backend: CreatorMap,
     name_map_backend: NameMap,
-) -> str:
+) -> str | None:
     '''
     Resolve the handle to use for uploading *channel*.
 
@@ -2105,31 +2141,39 @@ async def resolve_channel_upload_handle(
     :param creator_map_backend: Shared creator map backend.
     :param name_map_backend: Shared name map backend
         (channel_title → channel_id).
-    :returns: The handle to use for the upload.
+    :returns: The handle to use for the upload, or ``None`` when
+        the channel file on disk had no handle. Callers must
+        tolerate ``None`` — downstream schema validation rejects
+        such records.
     '''
 
-    handle: str = channel.channel_handle
+    handle: str | None = channel.channel_handle
     CREATOR_MAP_RESOLUTION_TOTAL.labels(
         platform='youtube',
         scraper='channel_scraper',
         outcome='canonical',
     ).inc()
 
+    # Redis cannot encode None, and a handle-less record is
+    # rejected by the schema validator anyway. Skip both writes
+    # and let the caller mark the file invalid.
+    if not channel.channel_id or handle is None:
+        return handle
+
     # Issue the creator_map and name_map writes concurrently so the
     # bulk-upload sweep pays one round-trip of Redis latency per
     # channel instead of two.
-    if channel.channel_id:
-        writes: list = [
-            creator_map_backend.put(channel.channel_id, handle),
-        ]
-        if channel.title:
-            writes.append(
-                name_map_backend.put(
-                    asset_title=channel.title,
-                    asset_id=channel.channel_id,
-                )
+    writes: list = [
+        creator_map_backend.put(channel.channel_id, handle),
+    ]
+    if channel.title:
+        writes.append(
+            name_map_backend.put(
+                asset_title=channel.title,
+                asset_id=channel.channel_id,
             )
-        await asyncio.gather(*writes)
+        )
+    await asyncio.gather(*writes)
     return handle
 
 
@@ -2155,7 +2199,7 @@ async def enqueue_upload_channel(
         or if schema validation failed.
     '''
 
-    handle: str = await resolve_channel_upload_handle(
+    handle: str | None = await resolve_channel_upload_handle(
         channel, creator_map_backend, name_map_backend,
     )
     channel.channel_handle = handle

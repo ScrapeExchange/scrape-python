@@ -341,7 +341,7 @@ METRIC_RATE_LIMIT_HITS = Counter(
     'rate_limit_hits_total',
     'Number of times a proxy was rate-limited by YouTube',
     ['platform', 'scraper', 'entity', 'api',
-     'proxy_ip', 'proxy_network', 'worker_id'],
+     'proxy_ip', 'worker_id'],
 )
 
 # -- scheduled bulk-upload metrics --
@@ -1521,7 +1521,6 @@ async def _scrape_and_save(
             reason='other',
             worker_id=get_worker_id(),
             proxy_ip=_proxy_ip,
-            proxy_network=_proxy_network(proxy),
             proxy_file=proxy_file_label(proxy or ''),
         ).inc()
         await _retire_failed_source(
@@ -1821,7 +1820,6 @@ async def _scrape_and_track(
         api=api,
         worker_id=get_worker_id(),
         proxy_ip=extract_proxy_ip(proxy) if proxy else 'none',
-        proxy_network=_proxy_network(proxy),
         proxy_file=proxy_file_label(proxy or ''),
     ).inc()
     return fresh, sleep, True
@@ -2120,7 +2118,6 @@ async def _handle_scrape_failure(
         reason=reason,
         worker_id=get_worker_id(),
         proxy_ip=proxy_ip_val,
-        proxy_network=proxy_net,
         proxy_file=proxy_file_label(proxy or ''),
     ).inc()
 
@@ -2131,7 +2128,6 @@ async def _handle_scrape_failure(
             entity='video',
             api='ytdlp',
             proxy_ip=proxy_ip_val,
-            proxy_network=proxy_net,
             worker_id=get_worker_id(),
         ).inc()
         logging.warning(

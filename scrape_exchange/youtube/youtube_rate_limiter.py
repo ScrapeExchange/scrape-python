@@ -51,7 +51,9 @@ from typing import ClassVar
 from prometheus_client import Counter, Gauge
 
 from scrape_exchange.rate_limiter import RateLimiter, _BucketConfig
-from scrape_exchange.util import extract_proxy_ip, proxy_network_for
+from scrape_exchange.youtube.rate_limit_settings import (
+    YT_RATE_LIMITS,
+)
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -62,27 +64,14 @@ METRIC_RSS_CIRCUIT_OPENED: Counter = Counter(
     'reason="4xx_5xx" indicates the 4xx/5xx soft-ban path; '
     'reason="timeout" indicates the connect-timeout path.',
     [
-        'platform', 'scraper', 'api', 'proxy', 'proxy_network',
-        'reason',
+        'platform', 'scraper', 'api', 'proxy', 'reason',
     ],
 )
 METRIC_RSS_CIRCUIT_STATE: Gauge = Gauge(
     'rate_limit_circuit_open',
     '1 while the RSS circuit is open for this proxy, 0 otherwise',
-    ['platform', 'scraper', 'api', 'proxy', 'proxy_network'],
+    ['platform', 'scraper', 'api', 'proxy'],
 )
-
-
-def _rss_proxy_network(proxy: str | None) -> str:
-    '''Derive the proxy_network label for an RSS-circuit
-    metric emission, tolerating malformed proxy URLs so
-    metric code never raises.'''
-    if not proxy:
-        return 'none'
-    try:
-        return proxy_network_for(extract_proxy_ip(proxy))
-    except ValueError:
-        return 'other'
 
 
 @dataclass
@@ -128,45 +117,52 @@ class YouTubeCallType(str, Enum):
     RSS = 'rss'
 
 
-# Per-type defaults — tuned to ~50% of the with-cookies soft limits from the
-# README rate-limit table (assumes unauthenticated browser session cookies
-# acquired via YouTubeCookieJar).
+# Per-type defaults — refill rates come from
+# YT_RATE_LIMITS (pydantic-settings, env-var-overridable
+# without a code change). Burst caps are intentionally
+# kept hardcoded: lowering them was the 2026-05-09
+# remediation for simultaneous-CONNECT SYN drops (commit
+# 21aa54a) and accidentally raising them again would
+# re-introduce that failure mode.
 _DEFAULT_CONFIGS: dict[YouTubeCallType, _BucketConfig] = {
-    # ~150 req/min
     YouTubeCallType.BROWSE: _BucketConfig(
-        burst=20, refill_rate=150 / 60,
+        burst=20,
+        refill_rate=YT_RATE_LIMITS.browse_refill_per_min / 60,
         jitter_min=0.3, jitter_max=1.2,
     ),
     YouTubeCallType.PLAYER: _BucketConfig(
-        burst=2, refill_rate=10 / 60,
+        burst=2,
+        refill_rate=YT_RATE_LIMITS.player_refill_per_min / 60,
         jitter_min=1.0, jitter_max=3.0,
     ),
-    # ~150 req/min
     YouTubeCallType.NEXT: _BucketConfig(
-        burst=20, refill_rate=150 / 60,
+        burst=20,
+        refill_rate=YT_RATE_LIMITS.next_refill_per_min / 60,
         jitter_min=0.3, jitter_max=1.0,
     ),
-    # ~9 req/min — cut another 80% from 45/min after the WAF
-    # diagnosis: HTML path was failing at ~99.8% under fleet load
-    # because real browsers fetch youtube.com/ first to acquire
-    # session cookies before navigating to a channel page. The
-    # client now warms the session via _warm_session() AND we hold
-    # the per-proxy HTML cadence well under YouTube's anti-bot
-    # threshold. Combined, these should pull the HTML success rate
-    # toward parity with InnerTube (~90%).
+    # HTML cadence was set to ~9 req/min after the WAF
+    # diagnosis: the path was failing at ~99.8% under fleet
+    # load because real browsers fetch youtube.com/ first to
+    # acquire session cookies before navigating to a channel
+    # page. The client now warms the session via
+    # ``_warm_session()`` AND we hold the per-proxy HTML
+    # cadence well under YouTube's anti-bot threshold.
     YouTubeCallType.HTML: _BucketConfig(
-        burst=10, refill_rate=9 / 60,
+        burst=10,
+        refill_rate=YT_RATE_LIMITS.html_refill_per_min / 60,
         jitter_min=1.5, jitter_max=4.0,
     ),
-    # ~9.6 req/min per proxy. Burst dropped from 8 to 2 on
-    # 2026-05-09 to cap simultaneous CONNECT tunnels per proxy
-    # at warm-up. With 8 tokens, the first 8 fleet-wide requests
-    # to a proxy fired instantaneously across 8 worker processes
-    # → 8 simultaneous CONNECTs + WAN router SYN drops. With
-    # burst=2 the worst-case instantaneous SYN-to-one-proxy is 2,
-    # and the per-proxy attempt rate is unchanged at 0.16 req/s.
+    # RSS burst dropped from 8 to 2 on 2026-05-09 to cap
+    # simultaneous CONNECT tunnels per proxy at warm-up. With
+    # 8 tokens, the first 8 fleet-wide requests to a proxy
+    # fired instantaneously across 8 worker processes →
+    # 8 simultaneous CONNECTs + WAN router SYN drops. With
+    # burst=2 the worst-case instantaneous SYN-to-one-proxy
+    # is 2. Refill rate is now settings-driven (default
+    # 30/min, raised from 9.6/min on 2026-05-12).
     YouTubeCallType.RSS: _BucketConfig(
-        burst=2, refill_rate=0.16,
+        burst=2,
+        refill_rate=YT_RATE_LIMITS.rss_refill_per_min / 60,
         jitter_min=0.2, jitter_max=0.8,
     ),
 }
@@ -381,7 +377,6 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
             scraper='rss_scraper',
             api='rss',
             proxy=proxy or 'none',
-            proxy_network=_rss_proxy_network(proxy),
             reason=reason,
         ).inc()
         METRIC_RSS_CIRCUIT_STATE.labels(
@@ -389,7 +384,6 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
             scraper='rss_scraper',
             api='rss',
             proxy=proxy or 'none',
-            proxy_network=_rss_proxy_network(proxy),
         ).set(1)
         _LOGGER.warning(
             'RSS circuit breaker opened for proxy',
@@ -422,7 +416,6 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
             scraper='rss_scraper',
             api='rss',
             proxy=proxy or 'none',
-            proxy_network=_rss_proxy_network(proxy),
         ).set(0)
         if had_state:
             _LOGGER.info(
