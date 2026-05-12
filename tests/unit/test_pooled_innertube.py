@@ -25,6 +25,9 @@ class TestPooledInnerTube(unittest.IsolatedAsyncioTestCase):
                 session=MagicMock(),
             )),
         ), patch.object(
+            youtube_channel_tabs.httpx, 'Client',
+            return_value=MagicMock(),
+        ), patch.object(
             youtube_channel_tabs.YouTubeCookieJar, 'get',
             return_value=MagicMock(load_into_session=MagicMock()),
         ), patch.object(
@@ -50,6 +53,9 @@ class TestPooledInnerTube(unittest.IsolatedAsyncioTestCase):
                 session=MagicMock(),
             )),
         ), patch.object(
+            youtube_channel_tabs.httpx, 'Client',
+            return_value=MagicMock(),
+        ), patch.object(
             youtube_channel_tabs.YouTubeCookieJar, 'get',
             return_value=MagicMock(
                 load_into_session=load_into_session,
@@ -73,6 +79,9 @@ class TestPooledInnerTube(unittest.IsolatedAsyncioTestCase):
             return_value=MagicMock(adaptor=MagicMock(
                 session=MagicMock(),
             )),
+        ), patch.object(
+            youtube_channel_tabs.httpx, 'Client',
+            return_value=MagicMock(),
         ), patch.object(
             youtube_channel_tabs.YouTubeCookieJar, 'get',
             return_value=MagicMock(

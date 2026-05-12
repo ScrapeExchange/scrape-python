@@ -54,7 +54,7 @@ COOKIE_TTL: float = 4 * 3600.0
 # Use a longer timeout for this path; cookies are acquired once per
 # proxy fleet-wide, so the extra latency cost is bounded.
 _COOKIE_FETCH_TIMEOUT: httpx.Timeout = httpx.Timeout(
-    5.0, connect=5.0,
+    10.0, connect=5.0,
 )
 
 # Cap the number of in-flight cookie fetches per process. With shared

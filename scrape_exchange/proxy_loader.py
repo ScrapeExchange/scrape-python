@@ -264,7 +264,7 @@ from scrape_exchange._lazy_async_pool import _LazyAsyncPool
 
 
 _POOLED_HTTPX_LIMITS: Final[httpx.Limits] = httpx.Limits(
-    max_keepalive_connections=20,
+    max_keepalive_connections=100,
     max_connections=40,
     # 120s keepalive (httpx default is 5s). Each closed-then-
     # reopened tunnel is a fresh CONNECT SYN through the WAN
@@ -274,7 +274,7 @@ _POOLED_HTTPX_LIMITS: Final[httpx.Limits] = httpx.Limits(
     # holds the tunnel through ordinary token-wait jitter
     # without keeping it open so long that the upstream proxy
     # closes it from its side.
-    keepalive_expiry=120.0,
+    keepalive_expiry=600.0,
 )
 _POOLED_HTTPX_DEFAULT_TIMEOUT: Final[httpx.Timeout] = httpx.Timeout(
     10.0, connect=5.0,

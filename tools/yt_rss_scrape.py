@@ -53,6 +53,14 @@ from scrape_exchange.scraper_runner import (
     ScraperRunner,
 )
 from scrape_exchange.settings import normalize_log_level
+from scrape_exchange.http_timeouts import (
+    HTTP_CONNECT_TIMEOUT,
+    HTTP_REQUEST_TIMEOUT,
+)
+from scrape_exchange.proxy_phase_metrics import (
+    install_innertube_phase_tracing,
+    make_rss_phase_trace,
+)
 from scrape_exchange.proxy_loader import (
     httpx_client_for_entry,
     jitter_pool_warmup,
@@ -67,7 +75,10 @@ from scrape_exchange.youtube.youtube_channel import (
     canonical_handle_from_browse,
     fallback_handle,
 )
-from scrape_exchange.youtube.youtube_channel_tabs import YouTubeChannelTabs
+from scrape_exchange.youtube.youtube_channel_tabs import (
+    YouTubeChannelTabs,
+    build_innertube_with_pool_limits,
+)
 from scrape_exchange.youtube.youtube_rate_limiter import (
     YouTubeRateLimiter, YouTubeCallType
 )
@@ -155,7 +166,7 @@ METRIC_API_CALLS: Counter = Counter(
     'Number of API calls made by the RSS scraper, labelled '
     'by entity, api endpoint, and status.',
     ['platform', 'scraper', 'entity', 'api', 'status',
-     'worker_id', 'proxy_ip', 'proxy_network', 'proxy_file'],
+     'worker_id', 'proxy_ip', 'proxy_file'],
 )
 METRIC_API_CHANNEL_CALLS: Counter = METRIC_API_CALLS
 METRIC_INNERTUBE_SUCCESS: Counter = METRIC_API_CALLS
@@ -223,6 +234,25 @@ METRIC_ORPHANS_RECOVERED: Counter = Counter(
     'the tiers hash but absent from every queue, not '
     'claimed, and not flagged no_feeds.',
     ['platform', 'scraper', 'tier'],
+)
+# Per-fetch RSS feed download duration. Companion to
+# METRIC_PHASE_DURATION{phase="fetch_rss"} but split by
+# status (success / not_found / server_error / timeout_* /
+# network / bind_failed / no_data / unknown / setup_failed)
+# and proxy_network so per-proxy success/fail rates and
+# latency distributions can be sliced directly.
+METRIC_RSS_FETCH_DURATION: Histogram = Histogram(
+    'rss_feed_fetch_duration_seconds',
+    'Duration of a single /feeds/videos.xml HTTP GET, '
+    'split by outcome status. The proxy_network label was '
+    'dropped to reduce series cardinality; use '
+    'scrape_failures_total / proxy_file to recover the '
+    'per-network view.',
+    ['platform', 'scraper', 'worker_id', 'status'],
+    buckets=(
+        0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0,
+        8.0, 13.0, 21.0, 34.0, 55.0, 89.0,
+    ),
 )
 
 
@@ -555,7 +585,6 @@ def _record_rss_failure(
         reason=reason,
         worker_id=get_worker_id(),
         proxy_ip=proxy_ip or 'none',
-        proxy_network=proxy_network,
         proxy_file=proxy_file,
     ).inc()
 
@@ -627,6 +656,12 @@ async def fetch_rss(
     '''
 
     scrape_start: float = monotonic()
+    # Tracked for METRIC_RSS_FETCH_DURATION (set in the finally
+    # block below). The proxy is acquired inside the outer try
+    # so these are initialised conservatively in case acquisition
+    # or proxy_ip parsing itself raises.
+    fetch_status: str = 'setup_failed'
+    fetch_proxy_network: str = 'unknown'
     try:
         extra: dict[str, str] = {'rss_url': rss_url}
 
@@ -646,6 +681,7 @@ async def fetch_rss(
             )
             proxy_ip = None
         proxy_network: str = proxy_network_for(proxy_ip)
+        fetch_proxy_network = proxy_network
         extra['proxy_ip'] = proxy_ip or 'none'
         extra['proxy_network'] = proxy_network
         extra['proxy'] = proxy or 'none'
@@ -661,7 +697,15 @@ async def fetch_rss(
             await jitter_pool_warmup(proxy)
             response: Response = await http.get(
                 rss_url,
-                timeout=httpx.Timeout(5.0, connect=3.0),
+                timeout=httpx.Timeout(
+                    HTTP_REQUEST_TIMEOUT,
+                    connect=HTTP_CONNECT_TIMEOUT,
+                ),
+                extensions={
+                    'trace': make_rss_phase_trace(
+                        proxy_file=pfl,
+                    ),
+                },
             )
             response.raise_for_status()
             data: str = response.text
@@ -670,6 +714,13 @@ async def fetch_rss(
             )
             YouTubeRateLimiter.get().report_rss_success(proxy)
         except httpx.HTTPStatusError as exc:
+            status_code: int = exc.response.status_code
+            if status_code == 404:
+                fetch_status = 'not_found'
+            elif 500 <= status_code < 600:
+                fetch_status = 'server_error'
+            else:
+                fetch_status = f'http_{status_code}'
             _handle_http_status_error(
                 exc, rss_url, proxy, proxy_ip, proxy_network, extra,
             )
@@ -687,6 +738,7 @@ async def fetch_rss(
                 timeout_kind = 'timeout_pool'
             else:
                 timeout_kind = 'timeout_other'
+            fetch_status = timeout_kind
             _record_rss_failure(
                 timeout_kind, proxy_ip, proxy_network, pfl,
             )
@@ -704,6 +756,7 @@ async def fetch_rss(
                 isinstance(cause, OSError)
                 and cause.errno == errno.EADDRNOTAVAIL
             ):
+                fetch_status = 'bind_failed'
                 _record_rss_failure(
                     'bind_failed', proxy_ip, proxy_network, pfl,
                 )
@@ -712,6 +765,7 @@ async def fetch_rss(
                     exc=exc, extra=extra,
                 )
             else:
+                fetch_status = 'network'
                 _record_rss_failure(
                     'network', proxy_ip, proxy_network, pfl,
                 )
@@ -721,6 +775,7 @@ async def fetch_rss(
                 )
             raise
         except Exception as exc:
+            fetch_status = 'unknown'
             _record_rss_failure(
                 'unknown', proxy_ip, proxy_network, pfl,
             )
@@ -730,6 +785,7 @@ async def fetch_rss(
             raise
 
         if not data:
+            fetch_status = 'no_data'
             _record_rss_failure(
                 'no_data', proxy_ip, proxy_network, pfl,
             )
@@ -745,7 +801,6 @@ async def fetch_rss(
             api='rss',
             worker_id=get_worker_id(),
             proxy_ip=proxy_ip or 'none',
-            proxy_network=proxy_network,
             proxy_file=pfl,
         ).inc()
 
@@ -767,6 +822,7 @@ async def fetch_rss(
                     'Skipping malformed RSS entry', exc=exc, extra=extra
                 )
 
+        fetch_status = 'success'
         METRIC_SCRAPE_DURATION.labels(
             platform='youtube',
             scraper='rss_scraper',
@@ -786,6 +842,13 @@ async def fetch_rss(
             worker_id=get_worker_id(),
         ).observe(monotonic() - scrape_start)
         raise
+    finally:
+        METRIC_RSS_FETCH_DURATION.labels(
+            platform='youtube',
+            scraper='rss_scraper',
+            worker_id=get_worker_id(),
+            status=fetch_status,
+        ).observe(monotonic() - scrape_start)
 
 
 async def check_video_exists(
@@ -881,7 +944,6 @@ async def _enrich_and_store_video(
             status='success',
             worker_id=get_worker_id(),
             proxy_ip=proxy_ip,
-            proxy_network=proxy_network,
             proxy_file=proxy_file_label(proxy or ''),
         ).inc()
     except Exception as exc:
@@ -893,7 +955,6 @@ async def _enrich_and_store_video(
             status='failed',
             worker_id=get_worker_id(),
             proxy_ip=proxy_ip,
-            proxy_network=proxy_network,
             proxy_file=proxy_file_label(proxy or ''),
         ).inc()
         logging.warning(
@@ -1217,7 +1278,17 @@ async def process_channel(
 
     # --- Phase 3: enrich + upload new videos in
     #     parallel ---
-    innertube: InnerTube = InnerTube('WEB', proxies=proxy,)
+    # Use the same session-swap helper the pool factory uses,
+    # so this one-off InnerTube carries the same 120s keepalive
+    # the rest of the fleet does instead of the library's
+    # default 5s.
+    innertube: InnerTube = build_innertube_with_pool_limits(
+        proxy,
+    )
+    install_innertube_phase_tracing(
+        innertube.adaptor.session,
+        proxy_file=proxy_file_label(proxy or ''),
+    )
 
     def _close_innertube() -> None:
         '''Close the InnerTube httpx session.'''
@@ -1405,7 +1476,6 @@ async def update_channel(
             status='failed',
             worker_id=get_worker_id(),
             proxy_ip=proxy_ip,
-            proxy_network=proxy_network,
             proxy_file=proxy_file_label(proxy or ''),
         ).inc()
         return False, 0, None
@@ -1418,7 +1488,6 @@ async def update_channel(
         status='success',
         worker_id=get_worker_id(),
         proxy_ip=proxy_ip,
-        proxy_network=proxy_network,
         proxy_file=proxy_file_label(proxy or ''),
     ).inc()
 

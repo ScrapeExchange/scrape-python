@@ -29,9 +29,17 @@ from httpx_curl_cffi import AsyncCurlTransport
 from prometheus_client import Histogram
 
 from scrape_exchange.worker_id import get_worker_id
+from scrape_exchange.http_timeouts import (
+    HTTP_CONNECT_TIMEOUT,
+    HTTP_REQUEST_TIMEOUT,
+)
 from scrape_exchange.proxy_loader import proxy_file_label
 from scrape_exchange.util import extract_proxy_ip, proxy_network_for
 from .youtube_rate_limiter import YouTubeRateLimiter, YouTubeCallType
+from scrape_exchange.proxy_phase_metrics import (
+    HTML_CURL_INFOS,
+    record_html_phase_metrics,
+)
 from scrape_exchange._lazy_async_pool import _LazyAsyncPool
 
 _LOGGER: Logger = getLogger(__name__)
@@ -64,11 +72,17 @@ METRIC_YT_REQUEST_DURATION: Histogram = Histogram(
     'api_request_duration_seconds',
     'Duration of requests to YouTube, by api type '
     '(html/innertube), HTTP status class, and the '
-    'outbound proxy IP used.',
+    'outbound proxy network/file. The previously-present '
+    '``proxy_ip`` label was dropped because its ~108 '
+    'unique values multiplied series cardinality enough '
+    'to contribute materially to worker memory. The '
+    'per-proxy_ip view is recoverable from scrape-failure '
+    'and rate-limit metrics that still carry the label; '
+    'this histogram aggregates by network/file only.',
     [
         'platform', 'scraper', 'api',
         'status_class', 'worker_id',
-        'proxy_ip', 'proxy_network', 'proxy_file',
+        'proxy_file',
     ],
     buckets=(
         0.1, 0.25, 0.5, 1.0, 2.5,
@@ -169,6 +183,10 @@ class AsyncYouTubeClient(AsyncClient):
                 impersonate='chrome',
                 default_headers=True,
                 proxy=self.proxy,
+                # Ask curl to populate per-phase timings on
+                # every response so :func:`record_html_phase_metrics`
+                # can emit TCP/TLS phase histograms.
+                curl_infos=list(HTML_CURL_INFOS),
             ), **kwargs
         )
 
@@ -231,7 +249,10 @@ class AsyncYouTubeClient(AsyncClient):
                 # acquire an HTML token and recurse into _warm.
                 await super().get(
                     self.SCRAPE_URL,
-                    timeout=Timeout(10.0, connect=3.0),
+                    timeout=Timeout(
+                        HTTP_REQUEST_TIMEOUT,
+                        connect=HTTP_CONNECT_TIMEOUT,
+                    ),
                     follow_redirects=True,
                 )
             except Exception as exc:
@@ -294,7 +315,10 @@ class AsyncYouTubeClient(AsyncClient):
         # even after a successful 3s connect. 10s read budget
         # leaves headroom; caller can override via kwargs.
         kwargs.setdefault(
-            'timeout', Timeout(10.0, connect=3.0),
+            'timeout', Timeout(
+                HTTP_REQUEST_TIMEOUT,
+                connect=HTTP_CONNECT_TIMEOUT,
+            ),
         )
         try:
             resp: Response = await super().get(url, **kwargs)
@@ -305,8 +329,6 @@ class AsyncYouTubeClient(AsyncClient):
                 api='html',
                 status_class='error',
                 worker_id=get_worker_id(),
-                proxy_ip=proxy_ip,
-                proxy_network=proxy_network,
                 proxy_file=proxy_file,
             ).observe(time.monotonic() - start)
             # curl_cffi can raise CancelledError from its internal stream task
@@ -335,8 +357,6 @@ class AsyncYouTubeClient(AsyncClient):
                 api='html',
                 status_class='error',
                 worker_id=get_worker_id(),
-                proxy_ip=proxy_ip,
-                proxy_network=proxy_network,
                 proxy_file=proxy_file,
             ).observe(time.monotonic() - start)
             _LOGGER.debug('HTTP GET timeout', exc=exc, extra=extra)
@@ -358,8 +378,6 @@ class AsyncYouTubeClient(AsyncClient):
                 api='html',
                 status_class='error',
                 worker_id=get_worker_id(),
-                proxy_ip=proxy_ip,
-                proxy_network=proxy_network,
                 proxy_file=proxy_file,
             ).observe(time.monotonic() - start)
             _LOGGER.debug('HTTP GET request error', exc=exc, extra=extra)
@@ -371,8 +389,6 @@ class AsyncYouTubeClient(AsyncClient):
                 api='html',
                 status_class='error',
                 worker_id=get_worker_id(),
-                proxy_ip=proxy_ip,
-                proxy_network=proxy_network,
                 proxy_file=proxy_file,
             ).observe(time.monotonic() - start)
             _LOGGER.debug('HTTP GET error', exc=exc, extra=extra)
@@ -394,10 +410,11 @@ class AsyncYouTubeClient(AsyncClient):
             api='html',
             status_class=_yt_status_class(resp.status_code),
             worker_id=get_worker_id(),
-            proxy_ip=proxy_ip,
-            proxy_network=proxy_network,
             proxy_file=proxy_file,
         ).observe(time.monotonic() - start)
+        record_html_phase_metrics(
+            resp, proxy_file=proxy_file,
+        )
 
         if (resp.status_code == 303
                 and 'youtube.com' in resp.headers.get('Location', '')):

@@ -13,11 +13,17 @@ from logging import getLogger
 import logging
 import time
 
+import httpx
+
 from innertube import InnerTube
 from innertube.errors import RequestError as InnerTubeRequestError
 
 from scrape_exchange._lazy_async_pool import _LazyAsyncPool
 from scrape_exchange.datatypes import MAX_KEEPALIVE_REQUESTS
+from scrape_exchange.proxy_loader import (
+    _POOLED_HTTPX_DEFAULT_TIMEOUT,
+    _POOLED_HTTPX_LIMITS,
+)
 from scrape_exchange.youtube.youtube_types import YouTubeChannelPageType
 
 from .youtube_client import (
@@ -30,6 +36,9 @@ from .youtube_client import (
 )
 from scrape_exchange.worker_id import get_worker_id
 from scrape_exchange.proxy_loader import proxy_file_label
+from scrape_exchange.proxy_phase_metrics import (
+    install_innertube_phase_tracing,
+)
 from scrape_exchange.util import extract_proxy_ip, proxy_network_for
 from .youtube_cookiejar import YouTubeCookieJar
 from .youtube_rate_limiter import YouTubeRateLimiter, YouTubeCallType
@@ -525,8 +534,6 @@ class YouTubeChannelTabs:
                     api='innertube',
                     status_class='2xx',
                     worker_id=get_worker_id(),
-                    proxy_ip=proxy_ip,
-                    proxy_network=proxy_network,
                     proxy_file=proxy_file,
                 ).observe(time.monotonic() - start)
                 return result
@@ -539,8 +546,6 @@ class YouTubeChannelTabs:
                         '4xx' if exc.error.code == 429 else 'error'
                     ),
                     worker_id=get_worker_id(),
-                    proxy_ip=proxy_ip,
-                    proxy_network=proxy_network,
                     proxy_file=proxy_file,
                 ).observe(time.monotonic() - start)
                 if exc.error.code == 429:
@@ -588,8 +593,6 @@ class YouTubeChannelTabs:
                     api='innertube',
                     status_class='error',
                     worker_id=get_worker_id(),
-                    proxy_ip=proxy_ip,
-                    proxy_network=proxy_network,
                     proxy_file=proxy_file,
                 ).observe(time.monotonic() - start)
                 _LOGGER.error(
@@ -715,16 +718,52 @@ class YouTubeChannelTabs:
         )
 
 
+def build_innertube_with_pool_limits(
+    entry: str | None,
+) -> InnerTube:
+    '''Construct an :class:`InnerTube` whose underlying
+    ``httpx.Client`` carries our shared pool limits
+    (:data:`_POOLED_HTTPX_LIMITS` — max_keepalive 100,
+    keepalive_expiry 120s) rather than the third-party
+    library's defaults (5s keepalive_expiry, which evicts
+    connections between consecutive calls under our
+    cadence).
+
+    Cookie loading, visitor_id, header setup, and phase-
+    tracing are NOT applied here; callers do that
+    themselves because the pooled and one-off lifecycles
+    diverge after construction (pooled lives forever
+    across requests; one-off lives one enrichment cycle
+    then closes).
+    '''
+
+    client: InnerTube = InnerTube(
+        'WEB', INNERTUBE_CLIENT_VERSION, proxies=entry,
+    )
+    old_session: httpx.Client = client.adaptor.session
+    client.adaptor.session = httpx.Client(
+        base_url=old_session.base_url,
+        limits=_POOLED_HTTPX_LIMITS,
+        timeout=_POOLED_HTTPX_DEFAULT_TIMEOUT,
+        proxies=entry,
+    )
+    old_session.close()
+    return client
+
+
 def _make_pooled_innertube_for_entry(
     entry: str | None,
 ) -> InnerTube:
     '''Pool factory for the third-party InnerTube library. Cookie-
     jar warm-up and a single (stable) VISITOR_INFO1_LIVE happen
-    once per entry. Subsequent calls reuse the cached session.'''
+    once per entry. Subsequent calls reuse the cached session.
 
-    client: InnerTube = InnerTube(
-        'WEB', INNERTUBE_CLIENT_VERSION, proxies=entry,
-    )
+    Uses :func:`build_innertube_with_pool_limits` so the underlying
+    session carries our keep-alive settings instead of the library
+    defaults (5s expiry).
+    '''
+
+    client: InnerTube = build_innertube_with_pool_limits(entry)
     YouTubeCookieJar.get().load_into_session(
         client.adaptor.session, entry,
     )
@@ -739,6 +778,10 @@ def _make_pooled_innertube_for_entry(
     client.adaptor.session.headers[
         'X-YouTube-Client-Version'
     ] = INNERTUBE_CLIENT_VERSION
+    install_innertube_phase_tracing(
+        client.adaptor.session,
+        proxy_file=proxy_file_label(entry or ''),
+    )
     return client
 
 

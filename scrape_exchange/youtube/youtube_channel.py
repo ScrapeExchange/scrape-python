@@ -94,7 +94,7 @@ METRIC_CHANNEL_HANDLE_RESOLVER_OUTCOMES: Counter = Counter(
     [
         'platform', 'scraper', 'entity',
         'strategy', 'outcome', 'worker_id',
-        'proxy_ip', 'proxy_network', 'proxy_file',
+        'proxy_ip', 'proxy_file',
     ],
 )
 
@@ -1214,7 +1214,6 @@ class YouTubeChannel:
             'entity': 'channel',
             'worker_id': worker_id,
             'proxy_ip': proxy_ip,
-            'proxy_network': proxy_network,
             'proxy_file': proxy_file,
         }
         extra: dict[str, str] = {
@@ -1255,8 +1254,7 @@ class YouTubeChannel:
                     platform='youtube', scraper=scraper,
                     api='innertube_resolver',
                     status_class='2xx', worker_id=worker_id,
-                    proxy_ip=proxy_ip, proxy_network=proxy_network,
-                    proxy_file=proxy_file,
+                        proxy_file=proxy_file,
                 ).observe(time.monotonic() - start)
                 return True
             outcome = 'miss'
@@ -1264,7 +1262,6 @@ class YouTubeChannel:
                 platform='youtube', scraper=scraper,
                 api='innertube_resolver',
                 status_class='2xx', worker_id=worker_id,
-                proxy_ip=proxy_ip, proxy_network=proxy_network,
                 proxy_file=proxy_file,
             ).observe(time.monotonic() - start)
         except Exception as exc:
@@ -1273,7 +1270,6 @@ class YouTubeChannel:
                 platform='youtube', scraper=scraper,
                 api='innertube_resolver',
                 status_class='error', worker_id=worker_id,
-                proxy_ip=proxy_ip, proxy_network=proxy_network,
                 proxy_file=proxy_file,
             ).observe(time.monotonic() - start)
             _LOGGER.debug(
@@ -1318,8 +1314,7 @@ class YouTubeChannel:
                     platform='youtube', scraper=scraper,
                     api='innertube_resolver',
                     status_class='2xx', worker_id=worker_id,
-                    proxy_ip=proxy_ip, proxy_network=proxy_network,
-                    proxy_file=proxy_file,
+                        proxy_file=proxy_file,
                 ).observe(time.monotonic() - start)
                 return True
             outcome = 'miss'
@@ -1327,7 +1322,6 @@ class YouTubeChannel:
                 platform='youtube', scraper=scraper,
                 api='innertube_resolver',
                 status_class='2xx', worker_id=worker_id,
-                proxy_ip=proxy_ip, proxy_network=proxy_network,
                 proxy_file=proxy_file,
             ).observe(time.monotonic() - start)
             _LOGGER.warning(
@@ -1341,7 +1335,6 @@ class YouTubeChannel:
                 platform='youtube', scraper=scraper,
                 api='innertube_resolver',
                 status_class='error', worker_id=worker_id,
-                proxy_ip=proxy_ip, proxy_network=proxy_network,
                 proxy_file=proxy_file,
             ).observe(time.monotonic() - start)
             _LOGGER.warning(

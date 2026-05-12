@@ -682,7 +682,12 @@ class TestRssDefaultRate(unittest.TestCase):
     def test_rss_bucket_refill_rate(self) -> None:
         cfg = _DEFAULT_CONFIGS[YouTubeCallType.RSS]
         self.assertEqual(cfg.burst, 2)
-        self.assertEqual(cfg.refill_rate, 0.16)
+        # Default refill raised from 9.6/min to 30/min on
+        # 2026-05-12 (see rate_limit_settings.py). Burst
+        # stays at 2 to preserve the SYN-flood remediation.
+        self.assertAlmostEqual(
+            cfg.refill_rate, 30 / 60, places=6,
+        )
 
 
 class TestHtmlDefaultRate(unittest.TestCase):
@@ -714,7 +719,12 @@ class TestPlayerDefaultRate(unittest.TestCase):
     def test_player_bucket_is_halved(self) -> None:
         cfg = _DEFAULT_CONFIGS[YouTubeCallType.PLAYER]
         self.assertEqual(cfg.burst, 2)
-        self.assertEqual(cfg.refill_rate, 10 / 60)
+        # Default refill raised from 10/min to 30/min on
+        # 2026-05-12 (see rate_limit_settings.py). Burst
+        # stays at 2.
+        self.assertAlmostEqual(
+            cfg.refill_rate, 30 / 60, places=6,
+        )
 
 
 class TestRssCircuitMetricReasonLabel(_InProcessTestBase):
@@ -731,7 +741,6 @@ class TestRssCircuitMetricReasonLabel(_InProcessTestBase):
             'scraper': 'rss_scraper',
             'api': 'rss',
             'proxy': proxy,
-            'proxy_network': 'other',
             'reason': '4xx_5xx',
         }
         before: float = METRIC_RSS_CIRCUIT_OPENED.labels(
@@ -836,7 +845,6 @@ class TestRssCircuitTimeoutBreaker(_InProcessTestBase):
             'scraper': 'rss_scraper',
             'api': 'rss',
             'proxy': proxy,
-            'proxy_network': 'other',
             'reason': 'timeout',
         }
         before: float = METRIC_RSS_CIRCUIT_OPENED.labels(

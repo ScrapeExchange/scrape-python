@@ -521,12 +521,19 @@ class TestPooledHttpxKeepaliveExpiry(unittest.TestCase):
     and breaker cooldowns do not force every request to open a
     new CONNECT tunnel.'''
 
-    def test_keepalive_expiry_is_120_seconds(self) -> None:
+    def test_keepalive_expiry_is_600_seconds(self) -> None:
+        '''Raised from 120s on 2026-05-12 after analysing per-
+        worker per-proxy call density: workers with 5-minute
+        average gaps to the same proxy were aging out
+        connections before reuse. 600s gives reuse a chance
+        on the long tail while keeping connections fresh
+        enough that the proxy provider doesn't close them
+        first.'''
         from scrape_exchange.proxy_loader import (
             _POOLED_HTTPX_LIMITS,
         )
         self.assertEqual(
-            _POOLED_HTTPX_LIMITS.keepalive_expiry, 120.0,
+            _POOLED_HTTPX_LIMITS.keepalive_expiry, 600.0,
         )
 
 

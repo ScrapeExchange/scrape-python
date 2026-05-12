@@ -36,10 +36,12 @@ METRIC_SCRAPES_COMPLETED: Counter = Counter(
     'scrapes_completed_total',
     'Number of entities successfully scraped, labelled by scraper, '
     'entity type, api (ytdlp/html/rss/innertube), proxy IP, '
-    'proxy network, and proxy file.',
+    'and proxy file. The proxy_network label was dropped to reduce '
+    'series cardinality; recover the per-network view by joining '
+    'proxy_file (which is 1:1 with network in production).',
     [
         'platform', 'scraper', 'entity', 'api',
-        'worker_id', 'proxy_ip', 'proxy_network', 'proxy_file',
+        'worker_id', 'proxy_ip', 'proxy_file',
     ],
 )
 
@@ -51,10 +53,11 @@ METRIC_SCRAPES_COMPLETED: Counter = Counter(
 METRIC_SCRAPE_FAILURES: Counter = Counter(
     'scrape_failures_total',
     'Number of failed scrape attempts, labelled by scraper, entity '
-    'type, api, proxy, failure reason, and proxy file.',
+    'type, api, proxy, failure reason, and proxy file. The '
+    'proxy_network label was dropped to reduce series cardinality.',
     [
         'platform', 'scraper', 'entity', 'api',
-        'reason', 'worker_id', 'proxy_ip', 'proxy_network',
+        'reason', 'worker_id', 'proxy_ip',
         'proxy_file',
     ],
 )
