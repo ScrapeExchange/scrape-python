@@ -32,7 +32,11 @@ import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 
+from scrape_exchange.datatypes import Platform, PlatformEntityType
+
 _LOGGER: logging.Logger = logging.getLogger(__name__)
+
+Entity = PlatformEntityType
 
 # Default TTL for claims (1 hour).  Filesystem claims
 # that are older than this are treated as stale and
@@ -55,6 +59,41 @@ class ContentClaim(ABC):
         # ... scrape ...
         await claim.release(content_id)
     '''
+
+    @staticmethod
+    def claim_key(
+        platform: Platform,
+        entity: Entity,
+        entity_id: str,
+    ) -> str:
+        return f'claim:{platform.value}:{entity.value}:{entity_id}'
+
+    async def set_claim(
+        self,
+        platform: Platform,
+        entity: Entity,
+        entity_id: str,
+    ) -> bool:
+        '''
+        Attempt to claim an entity using the canonical claim key:
+        ``claim:<platform>:<entity>:<entity_id>``.
+        '''
+        return await self.acquire(
+            self.claim_key(platform, entity, entity_id),
+        )
+
+    async def release_claim(
+        self,
+        platform: Platform,
+        entity: Entity,
+        entity_id: str,
+    ) -> None:
+        '''
+        Release a claim created by :meth:`set_claim`.
+        '''
+        await self.release(
+            self.claim_key(platform, entity, entity_id),
+        )
 
     @abstractmethod
     async def acquire(self, content_id: str) -> bool:
@@ -228,9 +267,11 @@ class RedisContentClaim(ContentClaim):
         )
         self._ttl: int = ttl
         self._pid: str = str(os.getpid())
-        self._key_prefix: str = f'{platform}:claim:'
+        self._key_prefix: str = f'claim:{platform}:'
 
     def _key(self, content_id: str) -> str:
+        if content_id.startswith('claim:'):
+            return content_id
         return f'{self._key_prefix}{content_id}'
 
     async def acquire(self, content_id: str) -> bool:

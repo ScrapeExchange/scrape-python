@@ -18,7 +18,9 @@ class YouTubeScraperSettings(ScraperSettings):
     channel_data_directory: str | None = Field(
         default=None,
         validation_alias=AliasChoices(
-            'YOUTUBE_CHANNEL_DATA_DIR', 'channel_data_directory'
+            'YOUTUBE_CHANNEL_DATA_DIR',
+            'YOUTUBE_CHANNELS_DATA_DIR',
+            'channel_data_directory',
         ),
         description='Directory to save the scraped data',
     )
@@ -33,15 +35,15 @@ class YouTubeScraperSettings(ScraperSettings):
             'channel-stat records (channel_id, '
             'channel_handle, url, title, '
             'subscriber_count, video_count, view_count, '
-            'description) for the --channel-upload-only '
-            'container to pick up and POST to '
+            'description) for tools/yt_channel_upload.py '
+            'to pick up and POST to '
             'scrape.exchange. Defaults to "priority" '
             'which is resolved relative to '
             'YOUTUBE_CHANNEL_DATA_DIR; an absolute path '
             'is taken as-is.'
         ),
     )
-    
+
     @property
     def channel_priority_directory_path(self) -> str:
         '''Return the fully-resolved channel priority
@@ -105,7 +107,7 @@ class YouTubeScraperSettings(ScraperSettings):
             'Optional staging directory where the RSS '
             'scraper writes newly-discovered '
             'video-min-*.json.br files so the '
-            '--video-upload-only container uploads them '
+            'tools/yt_video_upload.py uploads them '
             'ahead of the bulk-archive backlog. When '
             'unset, files fall back to '
             'video_data_directory (legacy behaviour).'
@@ -143,5 +145,84 @@ class YouTubeScraperSettings(ScraperSettings):
             'Maximum seconds to wait on the bulk-upload progress '
             'WebSocket for a terminal status before giving up. '
             'Source files are left in base_dir for the next run.'
+        ),
+    )
+    rss_circuit_fail_threshold: int = Field(
+        default=8,
+        validation_alias=AliasChoices(
+            'RSS_CIRCUIT_FAIL_THRESHOLD',
+            'rss_circuit_fail_threshold',
+        ),
+        description=(
+            'F: number of 404s in the last T attempts on '
+            'previously-scraped channels that trips the RSS '
+            'circuit.'
+        ),
+    )
+    rss_circuit_window_size: int = Field(
+        default=10,
+        validation_alias=AliasChoices(
+            'RSS_CIRCUIT_WINDOW_SIZE',
+            'rss_circuit_window_size',
+        ),
+        description=(
+            'T: size of the rolling attempt window evaluated '
+            'against rss_circuit_fail_threshold.'
+        ),
+    )
+    rss_circuit_initial_open_seconds: int = Field(
+        default=60,
+        validation_alias=AliasChoices(
+            'RSS_CIRCUIT_INITIAL_OPEN_SECONDS',
+            'rss_circuit_initial_open_seconds',
+        ),
+        description=(
+            'S: initial cooldown in seconds when the RSS '
+            'circuit first trips.'
+        ),
+    )
+    rss_circuit_max_open_seconds: int = Field(
+        default=7200,
+        validation_alias=AliasChoices(
+            'RSS_CIRCUIT_MAX_OPEN_SECONDS',
+            'rss_circuit_max_open_seconds',
+        ),
+        description=(
+            'Ceiling for the doubled S in impaired mode '
+            '(2 h by default).'
+        ),
+    )
+    rss_circuit_impaired_reopen_threshold: int = Field(
+        default=3,
+        validation_alias=AliasChoices(
+            'RSS_CIRCUIT_IMPAIRED_REOPEN_THRESHOLD',
+            'rss_circuit_impaired_reopen_threshold',
+        ),
+        description=(
+            'C: consecutive 404s while in impaired-closed that '
+            're-open the circuit at the doubled cooldown.'
+        ),
+    )
+    rss_circuit_recovery_threshold: int = Field(
+        default=50,
+        validation_alias=AliasChoices(
+            'RSS_CIRCUIT_RECOVERY_THRESHOLD',
+            'rss_circuit_recovery_threshold',
+        ),
+        description=(
+            'N: consecutive successes while in impaired-closed '
+            'that return the circuit to regular mode.'
+        ),
+    )
+    rss_circuit_wait_jitter_seconds: float = Field(
+        default=30.0,
+        validation_alias=AliasChoices(
+            'RSS_CIRCUIT_WAIT_JITTER_SECONDS',
+            'rss_circuit_wait_jitter_seconds',
+        ),
+        description=(
+            'Maximum random jitter (seconds) added to every '
+            'circuit-breaker wait. Spreads worker wake-ups so '
+            'only one probe leaks per recovery window.'
         ),
     )

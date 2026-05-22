@@ -19,8 +19,9 @@ def _load_yt_rss_scrape() -> ModuleType:
     name ``yt_rss_scrape``. Checks sys.modules first so
     that repeated test runs within the same process do not
     trigger prometheus duplicate-registry errors.'''
-    if 'yt_rss_scrape' in sys.modules:
-        return sys.modules['yt_rss_scrape']
+    for _key in ('yt_rss_scrape', 'tools.yt_rss_scrape'):
+        if _key in sys.modules:
+            return sys.modules[_key]
     repo_root: Path = (
         Path(__file__).resolve().parents[2]
     )
@@ -34,6 +35,7 @@ def _load_yt_rss_scrape() -> ModuleType:
         importlib.util.module_from_spec(spec)
     )
     sys.modules['yt_rss_scrape'] = module
+    sys.modules['tools.yt_rss_scrape'] = module
     spec.loader.exec_module(module)
     return module
 
@@ -44,23 +46,20 @@ yt_rss_scrape: ModuleType = _load_yt_rss_scrape()
 class TestWriteChannelPriority(
     unittest.IsolatedAsyncioTestCase,
 ):
-    '''_write_channel_priority writes a brotli-compressed
-    JSON file under the resolved priority directory with the
+    '''_write_channel writes a brotli-compressed
+    JSON file under the channel data directory with the
     canonical channel-rss-<handle>.json.br filename.'''
 
     async def asyncSetUp(self) -> None:
         self.tmp: str = tempfile.mkdtemp()
-        self.priority: str = os.path.join(
-            self.tmp, 'priority',
-        )
-        os.makedirs(self.priority, exist_ok=True)
+        self.base_dir: str = self.tmp
 
     async def asyncTearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _settings(self) -> mock.MagicMock:
         s: mock.MagicMock = mock.MagicMock()
-        s.channel_priority_directory_path = self.priority
+        s.channel_data_directory = self.base_dir
         return s
 
     async def test_writes_correct_filename(self) -> None:
@@ -76,11 +75,11 @@ class TestWriteChannelPriority(
             'view_count': 12345,
             'description': '',
         }
-        await yt_rss_scrape._write_channel_priority(
+        await yt_rss_scrape._write_channel(
             record, self._settings(),
         )
         path: Path = (
-            Path(self.priority)
+            Path(self.base_dir)
             / 'channel-rss-somehandle.json.br'
         )
         self.assertTrue(path.exists(), msg=str(path))
@@ -98,11 +97,11 @@ class TestWriteChannelPriority(
             'view_count': 0,
             'description': '',
         }
-        await yt_rss_scrape._write_channel_priority(
+        await yt_rss_scrape._write_channel(
             record, self._settings(),
         )
         path: Path = (
-            Path(self.priority)
+            Path(self.base_dir)
             / 'channel-rss-abc.json.br'
         )
         raw: bytes = path.read_bytes()
@@ -116,7 +115,7 @@ class TestWriteChannelPriority(
         deleted between mkdir-check and write), the OSError
         propagates so the supervisor respawns the worker.'''
         s: mock.MagicMock = self._settings()
-        s.channel_priority_directory_path = (
+        s.channel_data_directory = (
             '/nonexistent/path/that/cannot/be/written'
         )
         record: dict = {
@@ -130,7 +129,7 @@ class TestWriteChannelPriority(
             'description': '',
         }
         with self.assertRaises(OSError):
-            await yt_rss_scrape._write_channel_priority(
+            await yt_rss_scrape._write_channel(
                 record, s,
             )
 
@@ -187,7 +186,7 @@ class TestUpdateChannelWritesPriority(
     unittest.IsolatedAsyncioTestCase,
 ):
     '''After the refactor, update_channel must call
-    _write_channel_priority instead of
+    _write_channel instead of
     client.enqueue_upload for the channel record. The
     METRIC_CHANNEL_PRIORITY_WRITES counter must
     increment on success.'''
@@ -202,14 +201,12 @@ class TestUpdateChannelWritesPriority(
     async def test_update_channel_writes_to_priority(
         self,
     ) -> None:
-        '''Verify _write_channel_priority is invoked
+        '''Verify _write_channel is invoked
         when update_channel's validator passes. The
         record_dict argument carries the expected lite
         fields.'''
         settings: mock.MagicMock = mock.MagicMock()
-        settings.channel_priority_directory_path = self.tmp
-        client: mock.MagicMock = mock.MagicMock()
-        client.enqueue_upload = mock.MagicMock()
+        settings.channel_data_directory = self.tmp
         creator_map: mock.AsyncMock = mock.AsyncMock()
         name_map: mock.AsyncMock = mock.AsyncMock()
         validator: mock.MagicMock = mock.MagicMock()
@@ -247,7 +244,6 @@ class TestUpdateChannelWritesPriority(
             )
             ok, subs, resolved = (
                 await self.module.update_channel(
-                    client=client,
                     channel_handle='inputhandle',
                     channel_id='UC_xyz',
                     creator_map_backend=creator_map,
@@ -265,7 +261,6 @@ class TestUpdateChannelWritesPriority(
             / 'channel-rss-canonhandle.json.br'
         )
         self.assertTrue(path.exists())
-        client.enqueue_upload.assert_not_called()
 
     async def test_view_count_omitted_when_unparseable(
         self,
@@ -279,8 +274,7 @@ class TestUpdateChannelWritesPriority(
         legitimately zero-view channel and would clobber the
         last-known value on the server).'''
         settings: mock.MagicMock = mock.MagicMock()
-        settings.channel_priority_directory_path = self.tmp
-        client: mock.MagicMock = mock.MagicMock()
+        settings.channel_data_directory = self.tmp
         creator_map: mock.AsyncMock = mock.AsyncMock()
         name_map: mock.AsyncMock = mock.AsyncMock()
         validator: mock.MagicMock = mock.MagicMock()
@@ -318,7 +312,6 @@ class TestUpdateChannelWritesPriority(
             )
             ok, _subs, _resolved = (
                 await self.module.update_channel(
-                    client=client,
                     channel_handle='noviews',
                     channel_id='UC_nv',
                     creator_map_backend=creator_map,

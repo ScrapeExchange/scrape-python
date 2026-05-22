@@ -516,24 +516,23 @@ class TestJitterPoolWarmup(unittest.IsolatedAsyncioTestCase):
 
 
 class TestPooledHttpxKeepaliveExpiry(unittest.TestCase):
-    '''The pooled httpx client uses a 120s keep-alive expiry
+    '''The pooled httpx client uses a long keep-alive expiry
     (httpx default is 5s) so idle gaps from rate-limit waiting
     and breaker cooldowns do not force every request to open a
     new CONNECT tunnel.'''
 
-    def test_keepalive_expiry_is_600_seconds(self) -> None:
-        '''Raised from 120s on 2026-05-12 after analysing per-
-        worker per-proxy call density: workers with 5-minute
-        average gaps to the same proxy were aging out
-        connections before reuse. 600s gives reuse a chance
-        on the long tail while keeping connections fresh
-        enough that the proxy provider doesn't close them
-        first.'''
+    def test_keepalive_expiry_is_300_seconds(self) -> None:
+        '''Empirical probe on 2026-05-12 confirmed YouTube keeps
+        a single connection alive across 1000 sequential requests
+        with 300s gaps. The pool window is sized to that tested
+        ceiling (raised from 120s, then trimmed back from 600s
+        to stay safely under what the proxy provider is willing
+        to hold open).'''
         from scrape_exchange.proxy_loader import (
             _POOLED_HTTPX_LIMITS,
         )
         self.assertEqual(
-            _POOLED_HTTPX_LIMITS.keepalive_expiry, 600.0,
+            _POOLED_HTTPX_LIMITS.keepalive_expiry, 300.0,
         )
 
 

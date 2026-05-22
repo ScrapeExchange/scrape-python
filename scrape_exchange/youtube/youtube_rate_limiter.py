@@ -71,26 +71,24 @@ METRIC_RSS_CIRCUIT_STATE: Gauge = Gauge(
     'rate_limit_circuit_open',
     '1 while the RSS circuit is open for this proxy, 0 otherwise',
     ['platform', 'scraper', 'api', 'proxy'],
+    multiprocess_mode='max',
 )
 
 
 @dataclass
-class _RssCircuitState:
-    '''Per-proxy circuit-breaker state for RSS fetches.
+class _ProxyTimeoutState:
+    '''Per-proxy circuit-breaker state for connect-timeout
+    failures on RSS fetches.
 
-    :param consecutive_failures: running count of consecutive
-        4xx/5xx (circuit-tripping) failures since the last success
-        or trip.
     :param consecutive_timeouts: running count of consecutive
         ``timeout_connect`` failures since the last success or
-        trip. Tripped against a separate threshold than 4xx/5xx.
+        trip.
     :param open_until: wall-clock time at which the circuit
         reopens. ``0.0`` means closed.
     :param consecutive_opens: number of times the circuit has
-        opened without an intervening success. Used to compute the
-        exponential cooldown.
+        opened without an intervening success. Used to compute
+        the exponential cooldown.
     '''
-    consecutive_failures: int = 0
     consecutive_timeouts: int = 0
     open_until: float = 0.0
     consecutive_opens: int = 0
@@ -219,18 +217,16 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
         # ``https://www.youtube.com`` time out and pollute the logs).
         # The ``yt-dlp`` cookie file is still acquired lazily on
         # demand for any scraper path that does call YouTube
-        # (e.g. video-upload-only's ``resolve_video_upload_handle``
+        # (e.g. yt_video_upload's ``resolve_video_upload_handle``
         # InnerTube fallback through one proxy).
         self._auto_warm_cookies: bool = auto_warm_cookies
-        # RSS circuit-breaker state. Keyed by the same proxy URL
-        # passed to :meth:`acquire` so that each VPN tunnel /
-        # direct-connection endpoint gets its own breaker.
-        self._rss_circuit: dict[str | None, _RssCircuitState] = {}
-        self._rss_circuit_threshold: int = int(
-            os.environ.get(
-                'YOUTUBE_RSS_CIRCUIT_THRESHOLD', '5',
-            )
-        )
+        # Per-proxy timeout circuit-breaker state. Keyed by the
+        # same proxy URL passed to :meth:`acquire`. Tracks
+        # connect-timeout failures only; 4xx/5xx failures are
+        # now handled by the fleet-wide RssCircuitBreaker.
+        self._proxy_timeout_circuit: (
+            dict[str | None, _ProxyTimeoutState]
+        ) = {}
         self._rss_circuit_timeout_threshold: int = int(
             os.environ.get(
                 'YOUTUBE_RSS_TIMEOUT_THRESHOLD', '20',
@@ -292,42 +288,21 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
                 task.cancel()
         super().reset()
 
-    def _rss_circuit_open_until(
+    def _proxy_timeout_open_until(
         self, proxy: str | None,
     ) -> float:
-        state: _RssCircuitState | None = self._rss_circuit.get(proxy)
+        state: _ProxyTimeoutState | None = (
+            self._proxy_timeout_circuit.get(proxy)
+        )
         return state.open_until if state is not None else 0.0
 
     def is_rss_circuit_open(self, proxy: str | None) -> bool:
-        '''Return True while the RSS circuit breaker is open for
-        *proxy* (i.e. further RSS requests should be withheld).'''
-        return self._rss_circuit_open_until(proxy) > time.time()
-
-    def report_rss_failure(
-        self, proxy: str | None,
-        is_circuit_tripping: bool = True,
-    ) -> None:
-        '''
-        Record an RSS failure for *proxy* and trip the circuit
-        breaker if the consecutive-failure threshold has been
-        reached.
-
-        :param is_circuit_tripping: ``True`` for failures that
-            indicate YouTube is soft-banning this IP (HTTP 404 on
-            the RSS feed URL). Connect timeouts go through
-            :meth:`report_rss_timeout`; pass ``False`` here for
-            any other failure that should be recorded but not
-            counted toward this counter.
-        '''
-        if not is_circuit_tripping:
-            return
-        state: _RssCircuitState = self._rss_circuit.setdefault(
-            proxy, _RssCircuitState(),
+        '''Return True while the per-proxy timeout circuit is
+        open for *proxy* (i.e. further RSS requests from that
+        proxy should be withheld due to connect timeouts).'''
+        return (
+            self._proxy_timeout_open_until(proxy) > time.time()
         )
-        state.consecutive_failures += 1
-        if state.consecutive_failures < self._rss_circuit_threshold:
-            return
-        self._open_circuit(proxy, state, reason='4xx_5xx')
 
     def report_rss_timeout(self, proxy: str | None) -> None:
         '''
@@ -340,8 +315,10 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
         signals of an RSS-banned proxy and do not affect the
         breaker.
         '''
-        state: _RssCircuitState = self._rss_circuit.setdefault(
-            proxy, _RssCircuitState(),
+        state: _ProxyTimeoutState = (
+            self._proxy_timeout_circuit.setdefault(
+                proxy, _ProxyTimeoutState(),
+            )
         )
         state.consecutive_timeouts += 1
         if (
@@ -352,16 +329,16 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
         self._open_circuit(proxy, state, reason='timeout')
 
     def _open_circuit(
-        self, proxy: str | None, state: _RssCircuitState,
+        self, proxy: str | None, state: _ProxyTimeoutState,
         reason: str,
     ) -> None:
         '''
         Open *proxy*'s circuit for the next exponential-backoff
         cooldown window and record the trip on the metrics.
 
-        Resets both consecutive counters so that, when the circuit
-        reopens after the cooldown, the trip eligibility starts
-        from a clean slate on both signals.
+        Resets the consecutive-timeout counter so that, when the
+        circuit reopens after the cooldown, the trip eligibility
+        starts from a clean slate.
         '''
         cooldown: float = min(
             self._rss_circuit_min_cooldown_s
@@ -370,7 +347,6 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
         )
         state.open_until = time.time() + cooldown
         state.consecutive_opens += 1
-        state.consecutive_failures = 0
         state.consecutive_timeouts = 0
         METRIC_RSS_CIRCUIT_OPENED.labels(
             platform='youtube',
@@ -396,18 +372,18 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
         )
 
     def report_rss_success(self, proxy: str | None) -> None:
-        '''Reset the RSS circuit breaker state for *proxy* on a
-        successful RSS fetch.'''
-        state: _RssCircuitState | None = self._rss_circuit.get(proxy)
+        '''Reset the per-proxy timeout circuit state for *proxy*
+        on a successful RSS fetch.'''
+        state: _ProxyTimeoutState | None = (
+            self._proxy_timeout_circuit.get(proxy)
+        )
         if state is None:
             return
         had_state: bool = (
-            state.consecutive_failures > 0
-            or state.consecutive_timeouts > 0
+            state.consecutive_timeouts > 0
             or state.consecutive_opens > 0
             or state.open_until > 0.0
         )
-        state.consecutive_failures = 0
         state.consecutive_timeouts = 0
         state.consecutive_opens = 0
         state.open_until = 0.0
@@ -439,12 +415,12 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
         now: float = time.time()
         candidates: list[str] = [
             p for p in self._proxies
-            if self._rss_circuit_open_until(p) <= now
+            if self._proxy_timeout_open_until(p) <= now
         ]
         if not candidates:
             return min(
                 self._proxies,
-                key=self._rss_circuit_open_until,
+                key=self._proxy_timeout_open_until,
             )
         best_tokens: float = -float('inf')
         best: list[str] = []
@@ -480,7 +456,9 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
         ):
             while True:
                 proxy = self.select_proxy(call_type)
-                open_until: float = self._rss_circuit_open_until(proxy)
+                open_until: float = (
+                    self._proxy_timeout_open_until(proxy)
+                )
                 wait: float = open_until - time.time()
                 if wait <= 0:
                     break

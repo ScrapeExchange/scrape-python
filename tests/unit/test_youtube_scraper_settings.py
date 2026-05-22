@@ -49,6 +49,27 @@ class TestChannelPriorityDirectorySetting(
         )
 
 
+class TestChannelDataDirectorySetting(unittest.TestCase):
+    '''channel_data_directory accepts the canonical env var
+    and the legacy plural alias.'''
+
+    def _settings(self, env: dict) -> YouTubeScraperSettings:
+        with mock.patch.dict(os.environ, env, clear=True):
+            return YouTubeScraperSettings(
+                _env_file=None,
+                _cli_parse_args=[],
+            )
+
+    def test_youtube_channels_dir_alias(self) -> None:
+        s: YouTubeScraperSettings = self._settings({
+            'YOUTUBE_CHANNELS_DATA_DIR': '/data/channels',
+        })
+        self.assertEqual(
+            s.channel_data_directory,
+            '/data/channels',
+        )
+
+
 class TestChannelPriorityDirectoryPath(
     unittest.TestCase,
 ):

@@ -266,7 +266,7 @@ class TestReadRecord(unittest.TestCase):
         import brotli
         import orjson
         return brotli.compress(
-            orjson.dumps(payload), quality=11,
+            orjson.dumps(payload), quality=9,
             mode=brotli.MODE_TEXT,
         )
 
@@ -380,7 +380,7 @@ class TestBuildWorkloadRepair(unittest.TestCase):
         import brotli
         import orjson
         return brotli.compress(
-            orjson.dumps(payload), quality=11,
+            orjson.dumps(payload), quality=9,
             mode=brotli.MODE_TEXT,
         )
 

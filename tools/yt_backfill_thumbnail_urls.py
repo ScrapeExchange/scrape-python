@@ -27,8 +27,11 @@ What it does
    with the freshly-scraped thumbnail dict (so yt-dlp-only fields
    like ``formats`` are preserved). Validates the merged record
    against the live schema before writing.
-5. POSTs the merged record synchronously to
-   ``/api/v1/data`` (server-side upsert by ``platform_content_id``).
+5. Files that lived under ``<video_data_directory>/uploaded/``
+   are moved back to the base directory so the regular upload
+   worker (``yt_video_upload``) re-uploads the corrected record
+   on its next sweep. Files already in the base directory are
+   simply rewritten in place.
 6. Appends the video_id to a JSONL "processed" file. Failures are
    appended to a separate "failed" JSONL with reason and message,
    AND added to the processed list so the tool does not re-attempt
@@ -89,11 +92,10 @@ import aiofiles
 import brotli
 import orjson
 
-from httpx import Response
 from pydantic import AliasChoices, Field
 
+from scrape_exchange.brotli import brotli_write, brotli_write_async
 from scrape_exchange.exchange_client import ExchangeClient
-from scrape_exchange.file_management import atomic_write_bytes
 from scrape_exchange.scraper_runner import (
     ScraperRunContext,
     ScraperRunner,
@@ -450,7 +452,7 @@ def _repair_brotli_in_place(
     the strict path. Best-effort: a write failure is logged and
     swallowed because the in-memory record is still usable.'''
     try:
-        path.write_bytes(_serialize_record(record))
+        brotli_write(path, record)
     except OSError as exc:
         _LOGGER.warning(
             'Failed to repair brotli wrapper on disk',
@@ -460,16 +462,6 @@ def _repair_brotli_in_place(
     _LOGGER.info(
         'Repaired brotli wrapper on disk',
         extra={'path': str(path)},
-    )
-
-
-def _serialize_record(record: dict[str, Any]) -> bytes:
-    '''Encode *record* to brotli-compressed JSON in the same
-    format the live scraper produces.'''
-    return brotli.compress(
-        orjson.dumps(record, option=orjson.OPT_INDENT_2),
-        quality=11,
-        mode=brotli.MODE_TEXT,
     )
 
 
@@ -524,14 +516,16 @@ async def _process_video(
     video_id: str,
     paths: list[Path],
     rate_limiter: YouTubeRateLimiter,
-    client: ExchangeClient,
     validator: SchemaValidator,
     settings: BackfillSettings,
 ) -> tuple[str, str | None]:
     '''Run the full per-video pipeline. Returns
     ``(status, message)`` where status is ``'ok'`` or one of
     ``'innertube_error'``, ``'still_urlless'``,
-    ``'schema_invalid'``, ``'http_error'``, ``'write_error'``.'''
+    ``'schema_invalid'``, ``'write_error'``. The corrected
+    record is written back to each on-disk path; files that
+    lived under ``<base>/uploaded/`` are moved back to the base
+    directory so the upload worker re-uploads them.'''
     video, exc_msg = await _rescrape_thumbnails(
         video_id, rate_limiter,
     )
@@ -559,8 +553,10 @@ async def _process_video(
 
     # Patch each on-disk file individually so that
     # video-dlp-only fields (formats, etc.) are preserved.
-    last_record: dict[str, Any] | None = None
-    last_source_url: str | None = None
+    # Files that were in <base>/uploaded/ are moved back to the
+    # base directory after a successful patch so the upload
+    # worker re-uploads the corrected record on its next sweep.
+    any_written: bool = False
     for path in paths:
         existing, _needs_rewrite = _read_record(path)
         if existing is None:
@@ -572,52 +568,41 @@ async def _process_video(
         if err is not None:
             return 'schema_invalid', f'{path.name}: {err}'
 
-        if not settings.backfill_dry_run:
+        if settings.backfill_dry_run:
+            any_written = True
+            continue
+
+        try:
+            await brotli_write_async(path, patched)
+        except OSError as exc:
+            return (
+                'write_error',
+                f'{path.name}: {exc}',
+            )
+        any_written = True
+
+        # If the file lived under ``uploaded/`` it had already
+        # been ingested by the API; the corrected version needs
+        # to round-trip through the uploader again, so move it
+        # back to the base directory. The uploader's normal sweep
+        # (yt_video_upload) picks it up and re-POSTs / re-moves.
+        if path.parent.name == 'uploaded':
+            target: Path = path.parent.parent / path.name
             try:
-                await atomic_write_bytes(
-                    path, _serialize_record(patched),
-                )
+                path.replace(target)
             except OSError as exc:
                 return (
                     'write_error',
-                    f'{path.name}: {exc}',
+                    f'move-back failed {path} -> {target}: '
+                    f'{exc}',
                 )
-        last_record = patched
-        last_source_url = patched.get('url') or last_source_url
 
-    if last_record is None:
+    if not any_written:
         return (
             'still_urlless',
             'no on-disk record could be read after rescrape',
         )
 
-    if settings.backfill_dry_run:
-        return 'ok', None
-
-    post_url: str = (
-        f'{settings.exchange_url}'
-        f'{ExchangeClient.POST_DATA_API}'
-    )
-    body: dict[str, Any] = {
-        'username': settings.schema_owner,
-        'platform': 'youtube',
-        'entity': 'video',
-        'version': settings.schema_version,
-        'source_url': last_source_url or video.url,
-        'data': last_record,
-    }
-    try:
-        resp: Response = await client.post(post_url, json=body)
-    except Exception as exc:
-        return (
-            'http_error',
-            f'{type(exc).__name__}: {exc}',
-        )
-    if resp.status_code not in (200, 201):
-        return (
-            'http_error',
-            f'http_{resp.status_code}: {resp.text[:200]}',
-        )
     return 'ok', None
 
 
@@ -695,7 +680,7 @@ def _build_workload(
             record, needs_rewrite = _read_record(path)
             if record is not None:
                 if needs_rewrite and repair_in_place:
-                    _repair_brotli_in_place(path, record)
+                    brotli_write(path, record)
                     files_repaired += 1
                 if _has_urlless_thumbnail(record):
                     paths_for_vid = work[vid]
@@ -745,7 +730,6 @@ def _build_workload(
 async def _drain_queue(
     work: dict[str, list[Path]],
     settings: BackfillSettings,
-    client: ExchangeClient,
     rate_limiter: YouTubeRateLimiter,
     validator: SchemaValidator,
     processed_path: Path,
@@ -803,7 +787,7 @@ async def _drain_queue(
             )
             try:
                 status, message = await _process_video(
-                    video_id, paths, rate_limiter, client,
+                    video_id, paths, rate_limiter,
                     validator, settings,
                 )
                 if status == 'ok':
@@ -906,8 +890,8 @@ async def _run_worker(ctx: ScraperRunContext) -> None:
     )
     if client is None:
         raise RuntimeError(
-            'Backfill tool requires an ExchangeClient '
-            '(POST /api/v1/data is mandatory).'
+            'Backfill tool requires an ExchangeClient to '
+            'fetch the schema for validation.'
         )
 
     base_dir: Path = Path(settings.video_data_directory or '.')
@@ -964,7 +948,7 @@ async def _run_worker(ctx: ScraperRunContext) -> None:
         return
 
     await _drain_queue(
-        work, settings, client, rate_limiter, validator,
+        work, settings, rate_limiter, validator,
         processed_path, failed_path,
     )
 

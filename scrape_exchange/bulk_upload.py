@@ -21,10 +21,11 @@ record builder that turns a source file into ``(content_id, line)``.
 
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, UTC
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, AsyncIterator, Callable
 from uuid import uuid4
 
 import aiofiles.os
@@ -91,6 +92,9 @@ BULK_STATE_DIR_NAME: str = '.bulk'
 # pending job to reach terminal status before giving up and
 # leaving the state file for the next startup attempt.
 _RESUME_POLL_TIMEOUT_SECONDS: float = 300.0
+_SLOT_WAIT_SLEEP_SECONDS: float = 5.0
+_SLOT_RESERVATIONS: dict[Path, int] = {}
+_SLOT_CONDITION: asyncio.Condition = asyncio.Condition()
 
 
 @dataclass
@@ -299,6 +303,124 @@ async def resume_pending_bulk_uploads(
             )
 
 
+async def wait_for_bulk_upload_slot(
+    fm: AssetFileManagement,
+    client: ExchangeClient,
+    exchange_url: str,
+    *,
+    max_active_jobs: int,
+    poll_timeout_seconds: float = _RESUME_POLL_TIMEOUT_SECONDS,
+    sleep_seconds: float = _SLOT_WAIT_SLEEP_SECONDS,
+    exchange_set: 'RedisExchangeChannelsSet | None' = None,
+    handle_from_filename: Callable[[str], str] | None = None,
+) -> None:
+    '''
+    Block until this file manager has capacity to start another
+    accepted bulk job.
+
+    The durable ``.bulk`` state directory is the source of truth:
+    a job counts as active after ``POST /api/v1/bulk`` returns a
+    ``job_id`` and stops counting only after results are reconciled
+    and the state file is deleted. This keeps callers from starting
+    unbounded replacement jobs when a progress WebSocket fails while
+    the server-side job is still running.
+    '''
+    max_active: int = max(max_active_jobs, 1)
+    while True:
+        state_dir: Path = _bulk_state_dir(fm).resolve()
+        pending_count: int = (
+            len(list_bulk_states(fm))
+            + _SLOT_RESERVATIONS.get(state_dir, 0)
+        )
+        if pending_count < max_active:
+            return
+
+        _LOGGER.info(
+            'Waiting for bulk-upload slot',
+            extra={
+                'pending_jobs': pending_count,
+                'max_active_jobs': max_active,
+            },
+        )
+        await resume_pending_bulk_uploads(
+            fm, client, exchange_url,
+            poll_timeout_seconds=poll_timeout_seconds,
+            exchange_set=exchange_set,
+            handle_from_filename=handle_from_filename,
+        )
+        pending_count = (
+            len(list_bulk_states(fm))
+            + _SLOT_RESERVATIONS.get(state_dir, 0)
+        )
+        if pending_count < max_active:
+            return
+        await asyncio.sleep(sleep_seconds)
+
+
+@asynccontextmanager
+async def reserve_bulk_upload_slot(
+    fm: AssetFileManagement,
+    client: ExchangeClient,
+    exchange_url: str,
+    *,
+    max_active_jobs: int,
+    poll_timeout_seconds: float = _RESUME_POLL_TIMEOUT_SECONDS,
+    sleep_seconds: float = _SLOT_WAIT_SLEEP_SECONDS,
+    exchange_set: 'RedisExchangeChannelsSet | None' = None,
+    handle_from_filename: Callable[[str], str] | None = None,
+) -> AsyncIterator[None]:
+    '''
+    Reserve one bulk-upload slot for a caller that is about to
+    POST a batch.
+
+    ``wait_for_bulk_upload_slot`` handles durable accepted jobs;
+    this context manager also accounts for local tasks that have
+    passed the gate but have not yet received and persisted a
+    ``job_id``. The reservation is held for the caller's whole
+    batch lifecycle, so progress failures hand capacity back only
+    if the durable state file continues to represent the still
+    pending server-side job.
+    '''
+    max_active: int = max(max_active_jobs, 1)
+    state_dir: Path = _bulk_state_dir(fm).resolve()
+    reserved: bool = False
+    try:
+        while True:
+            async with _SLOT_CONDITION:
+                pending_count: int = (
+                    len(list_bulk_states(fm))
+                    + _SLOT_RESERVATIONS.get(state_dir, 0)
+                )
+                if pending_count < max_active:
+                    _SLOT_RESERVATIONS[state_dir] = (
+                        _SLOT_RESERVATIONS.get(state_dir, 0) + 1
+                    )
+                    reserved = True
+                    break
+
+            await wait_for_bulk_upload_slot(
+                fm, client, exchange_url,
+                max_active_jobs=max_active,
+                poll_timeout_seconds=poll_timeout_seconds,
+                sleep_seconds=sleep_seconds,
+                exchange_set=exchange_set,
+                handle_from_filename=handle_from_filename,
+            )
+
+        yield
+    finally:
+        if reserved:
+            async with _SLOT_CONDITION:
+                remaining: int = _SLOT_RESERVATIONS.get(
+                    state_dir, 0,
+                ) - 1
+                if remaining > 0:
+                    _SLOT_RESERVATIONS[state_dir] = remaining
+                else:
+                    _SLOT_RESERVATIONS.pop(state_dir, None)
+                _SLOT_CONDITION.notify_all()
+
+
 async def _resume_one_bulk_state(
     fm: AssetFileManagement,
     client: ExchangeClient,
@@ -345,8 +467,7 @@ async def _resume_one_bulk_state(
     job_status: str = body.get('status', '')
     if job_status not in TERMINAL_BULK_STATUSES:
         deadline: float = (
-            asyncio.get_running_loop().time()
-            + poll_timeout_seconds
+            asyncio.get_running_loop().time() + poll_timeout_seconds
         )
         if not await _poll_status_until_terminal(
             state.job_id, exchange_url, client, deadline,
@@ -409,6 +530,7 @@ class BulkBatchOutcome:
     success: int
     failed: int
     missing: int
+    success_ids: set[str] = field(default_factory=set)
 
 
 def bulk_progress_ws_url(exchange_url: str, job_id: str) -> str:
@@ -732,7 +854,7 @@ async def apply_bulk_results(
     job_id: str,
     exchange_set: 'RedisExchangeChannelsSet | None' = None,
     handle_from_filename: Callable[[str], str] | None = None,
-) -> tuple[int, int, int]:
+) -> tuple[int, int, int, set[str]]:
     '''
     Reconcile per-record results against the source files we sent.
     Successful records are moved to ``uploaded_dir`` via
@@ -773,15 +895,21 @@ async def apply_bulk_results(
     success_count: int = 0
     failure_count: int = 0
     handles_to_add: set[str] = set()
+    success_ids: set[str] = set()
+    by_index_id: dict[int, str] = {
+        idx: cid for idx, (cid, _) in enumerate(batch_records)
+    }
     for entry in results:
         status: str = entry.get('status', '')
         cid: str | None = entry.get('platform_content_id')
         record_index: int | None = entry.get('record_index')
         filename: str | None = None
+        content_id: str | None = cid
         if cid:
             filename = by_id.get(cid)
         if filename is None and record_index is not None:
             filename = by_index.get(record_index)
+            content_id = by_index_id.get(record_index)
         if filename is None:
             logging.warning(
                 'Bulk result has no matchable identifier',
@@ -801,6 +929,8 @@ async def apply_bulk_results(
             try:
                 await fm.mark_uploaded(filename)
                 success_count += 1
+                if content_id is not None:
+                    success_ids.add(content_id)
                 if (
                     exchange_set is not None
                     and handle_from_filename is not None
@@ -844,7 +974,7 @@ async def apply_bulk_results(
             'total_sent': len(batch_records),
         },
     )
-    return success_count, failure_count, missing_count
+    return success_count, failure_count, missing_count, success_ids
 
 
 async def upload_bulk_batch(
@@ -1028,7 +1158,8 @@ async def upload_bulk_batch(
     success: int
     failed: int
     missing: int
-    success, failed, missing = await apply_bulk_results(
+    success_ids: set[str]
+    success, failed, missing, success_ids = await apply_bulk_results(
         batch_records, results, fm, batch_id, job_id,
         exchange_set=exchange_set,
         handle_from_filename=handle_from_filename,
@@ -1039,4 +1170,5 @@ async def upload_bulk_batch(
     return BulkBatchOutcome(
         status='completed', job_id=job_id,
         success=success, failed=failed, missing=missing,
+        success_ids=success_ids,
     )

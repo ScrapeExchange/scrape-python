@@ -87,19 +87,43 @@ METRIC_UPLOADS_SKIPPED: Counter = Counter(
 )
 
 # ---------------------------------------------------------------------------
+# uploaded_video_ids_lookups_total / uploaded_video_ids_adds_total
+#   Redis-backed uploaded-video-ID SET activity.
+# ---------------------------------------------------------------------------
+METRIC_UPLOADED_LOOKUPS: Counter = Counter(
+    'uploaded_video_ids_lookups_total',
+    'Lookups against the Redis uploaded-video-ids set.',
+    ['outcome'],
+)
+
+METRIC_UPLOADED_ADDS: Counter = Counter(
+    'uploaded_video_ids_adds_total',
+    'Adds to the Redis uploaded-video-ids set.',
+    ['outcome'],
+)
+
+# ---------------------------------------------------------------------------
 # scrape_queue_size
 #   Current number of items pending in the scrape queue. Use tier='none'
 #   for scrapers that do not partition their queue by tier.
 #
-#   Queue size is shared state (Redis ZCARD or a per-process queue snapshot
-#   at startup); it is NOT per-async-worker. Earlier versions added a
-#   ``worker_id`` label which caused ``sum()`` aggregations across workers
-#   to multiply the actual value by N. Removed.
+#   ``worker_id`` is present so per-process and shared-state callers can
+#   coexist without double-counting:
+#
+#   - Per-process callers (e.g. yt_video_scrape: asyncio.Queue per worker)
+#     pass ``worker_id=get_worker_id()``. Each worker writes its own series;
+#     ``sum by (entity, tier)`` gives the correct fleet total.
+#
+#   - Shared-state callers (e.g. yt_video_upload: directory listing,
+#     yt_rss_scrape: Redis-backed tier sizes) pass ``worker_id=''``. All
+#     workers collapse to one series and ``livemostrecent`` returns the
+#     correct shared value without N× inflation.
 # ---------------------------------------------------------------------------
 METRIC_SCRAPE_QUEUE_SIZE: Gauge = Gauge(
     'scrape_queue_size',
     'Number of items pending processing in the scrape queue.',
-    ['platform', 'scraper', 'entity', 'tier'],
+    ['platform', 'scraper', 'entity', 'tier', 'worker_id'],
+    multiprocess_mode='livemostrecent',
 )
 
 # ---------------------------------------------------------------------------
@@ -111,6 +135,7 @@ METRIC_WORKER_SLEEP_SECONDS: Gauge = Gauge(
     'worker_sleep_seconds',
     'Seconds the worker will sleep before processing the next batch.',
     ['platform', 'scraper', 'worker_id'],
+    multiprocess_mode='livemostrecent',
 )
 
 # ---------------------------------------------------------------------------
@@ -161,13 +186,13 @@ METRIC_CHANNEL_PRIORITY_WRITES: Counter = Counter(
 
 # ---------------------------------------------------------------------------
 # channel_priority_uploads_total
-#   Incremented each time the channel-upload-only container POSTs a
+#   Incremented each time the channel-upload service POSTs a
 #   channel-priority record to scrape.exchange.
 # ---------------------------------------------------------------------------
 METRIC_CHANNEL_PRIORITY_UPLOADS: Counter = Counter(
     'channel_priority_uploads_total',
     'Channel-priority records POSTed to scrape.exchange '
-    'by the channel-upload-only container, broken down by '
+    'by the channel-upload service, broken down by '
     'outcome.',
     ['platform', 'scraper', 'result', 'worker_id'],
     # result is one of: success, retried, failed_permanently
@@ -183,10 +208,30 @@ METRIC_CHANNEL_PRIORITY_QUEUE_AGE: Gauge = Gauge(
     'channel_priority_queue_age_seconds',
     'Age of the oldest file currently in '
     'YOUTUBE_CHANNEL_PRIORITY_DIRECTORY. Sampled per '
-    'channel-upload-only sweep. A monotonically growing '
+    'channel-upload sweep. A monotonically growing '
     'value indicates the consumer is falling behind the '
     'producer.',
     ['platform', 'scraper', 'worker_id'],
+    multiprocess_mode='max',
+)
+
+# ---------------------------------------------------------------------------
+# priority_directory_size
+#   Number of entries currently in the video scraper priority directory
+#   (YOUTUBE_VIDEO_PRIORITY_DIRECTORY). Sampled on every workload-prep
+#   cycle. A monotonically growing value indicates priority-write
+#   producers are outpacing the scraper workers. ``worker_id`` is left
+#   empty because the directory is shared across workers in a process;
+#   ``livemostrecent`` then returns the latest reading without N×
+#   inflation.
+# ---------------------------------------------------------------------------
+METRIC_PRIORITY_DIRECTORY_SIZE: Gauge = Gauge(
+    'priority_directory_size',
+    'Number of entries currently in the video scraper priority '
+    'directory (YOUTUBE_VIDEO_PRIORITY_DIRECTORY). Sampled on '
+    'every workload-prep cycle.',
+    ['platform', 'scraper', 'worker_id'],
+    multiprocess_mode='livemostrecent',
 )
 
 # ---------------------------------------------------------------------------
@@ -244,4 +289,63 @@ METRIC_SUPERVISOR_RESPAWNS: Counter = Counter(
     'supervisor_respawns_total',
     'Number of times the supervisor has respawned a crashed child.',
     ['scraper', 'instance'],
+)
+
+# ---------------------------------------------------------------------------
+# rss_circuit_transitions_total
+#   Incremented on every RSS circuit-breaker state transition. Labels
+#   capture the from/to state pair so dashboards can distinguish
+#   closed->open (trip), open->closed (recovery), and
+#   closed-regular->closed-impaired (degradation) events.
+# ---------------------------------------------------------------------------
+METRIC_RSS_CIRCUIT_TRANSITIONS: Counter = Counter(
+    'rss_circuit_transitions',
+    'RSS circuit-breaker state transitions, labelled by from/to '
+    'state names: closed-regular, open-regular, '
+    'closed-impaired, open-impaired.',
+    ['platform', 'from_state', 'to_state'],
+)
+
+# ---------------------------------------------------------------------------
+# rss_circuit_state
+#   Current RSS circuit-breaker state encoded as a one-hot gauge.
+#   One label combination is set to 1 at a time; the others are 0.
+#   Use sum() to detect multi-host disagreement.
+# ---------------------------------------------------------------------------
+METRIC_RSS_CIRCUIT_STATE: Gauge = Gauge(
+    'rss_circuit_state',
+    'Current RSS circuit-breaker state. One label combination '
+    'is set to 1 at a time; the others are 0. Use sum() to '
+    'detect multi-host disagreement.',
+    ['platform', 'state'],
+    multiprocess_mode='livemostrecent',
+)
+
+# ---------------------------------------------------------------------------
+# rss_circuit_current_open_seconds
+#   Current cooldown duration S for the RSS circuit breaker.
+#   Reflects doubling in impaired mode and reset to the initial
+#   value on recovery to regular mode.
+# ---------------------------------------------------------------------------
+METRIC_RSS_CIRCUIT_OPEN_SECONDS: Gauge = Gauge(
+    'rss_circuit_current_open_seconds',
+    'Current S (cooldown duration in seconds) for the RSS '
+    'circuit breaker. Reflects doubling in impaired mode '
+    'and reset to the initial value on recovery to regular '
+    'mode.',
+    ['platform'],
+    multiprocess_mode='livemostrecent',
+)
+
+# ---------------------------------------------------------------------------
+# rss_circuit_wait_seconds
+#   Seconds an RSS worker call to breaker.acquire() blocked
+#   because the circuit was open.
+# ---------------------------------------------------------------------------
+METRIC_RSS_CIRCUIT_WAIT_SECONDS: Histogram = Histogram(
+    'rss_circuit_wait_seconds',
+    'Seconds an RSS worker call to breaker.acquire() blocked '
+    'because the circuit was open.',
+    ['platform'],
+    buckets=(0, 1, 5, 15, 60, 300, 900, 3600, 7200),
 )

@@ -11,8 +11,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 def _load_yt_rss_scrape() -> ModuleType:
     import sys
-    if 'yt_rss_scrape' in sys.modules:
-        return sys.modules['yt_rss_scrape']
+    for _key in ('yt_rss_scrape', 'tools.yt_rss_scrape'):
+        if _key in sys.modules:
+            return sys.modules[_key]
 
     repo_root: Path = Path(__file__).resolve().parents[2]
     module_path: Path = repo_root / 'tools' / 'yt_rss_scrape.py'
@@ -22,6 +23,7 @@ def _load_yt_rss_scrape() -> ModuleType:
     assert spec is not None and spec.loader is not None
     module: ModuleType = importlib.util.module_from_spec(spec)
     sys.modules['yt_rss_scrape'] = module
+    sys.modules['tools.yt_rss_scrape'] = module
     spec.loader.exec_module(module)
     return module
 

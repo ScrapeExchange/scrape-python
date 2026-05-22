@@ -4,8 +4,8 @@ import unittest
 
 from unittest.mock import AsyncMock, patch
 
-from tools import yt_video_scrape
-from tools.yt_video_scrape import resolve_video_upload_handle
+from tools import yt_video_upload
+from tools.yt_video_upload import resolve_video_upload_handle
 
 
 class TestResolveVideoUploadHandle(
@@ -50,7 +50,7 @@ class TestResolveVideoUploadHandle(
             'UC1234567890abcdefghij', 'Display Title',
         )
         with patch.object(
-            yt_video_scrape.YouTubeChannel,
+            yt_video_upload.YouTubeChannel,
             'resolve_channel_id',
             new=AsyncMock(return_value='Canonical'),
         ):
@@ -74,7 +74,7 @@ class TestResolveVideoUploadHandle(
             'UC1234567890abcdefghij', 'Display Title',
         )
         with patch.object(
-            yt_video_scrape.YouTubeChannel,
+            yt_video_upload.YouTubeChannel,
             'resolve_channel_id',
             new=AsyncMock(side_effect=RuntimeError('innertube down')),
         ):
@@ -148,7 +148,7 @@ class TestResolveVideoUploadHandle(
             'UC1234567890abcdefghij', 'Legacy Title',
         )
         with patch.object(
-            yt_video_scrape.YouTubeChannel,
+            yt_video_upload.YouTubeChannel,
             'resolve_channel_id',
             new=AsyncMock(return_value=None),
         ):

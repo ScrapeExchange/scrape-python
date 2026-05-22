@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import logging
 
-from typing import Any, Callable, Self, TYPE_CHECKING
+from typing import Any, Awaitable, Callable, Self, TYPE_CHECKING
 
 from httpx import AsyncClient, Response
 from prometheus_client import Counter, Gauge, Histogram
@@ -58,6 +58,7 @@ METRIC_UPLOAD_QUEUE_DEPTH: Gauge = Gauge(
     'Number of background upload jobs currently waiting in the '
     'ExchangeClient fire-and-forget upload queue.',
     ['platform', 'scraper', 'worker_id'],
+    multiprocess_mode='livemostrecent',
 )
 METRIC_UPLOAD_QUEUE_DROPPED: Counter = Counter(
     'upload_queue_dropped_total',
@@ -171,6 +172,7 @@ class _UploadJob:
     move_source_dir: 'Path | None' = None
     entity: str = 'unknown'
     log_extra: dict[str, Any] = field(default_factory=dict)
+    on_success: Callable[[], Awaitable[None]] | None = None
 
 
 class ExchangeClient(AsyncClient):
@@ -418,16 +420,6 @@ class ExchangeClient(AsyncClient):
                 url, **kwargs,
             )
         except Exception as exc:
-            duration: float = (
-                (datetime.now(UTC) - start).total_seconds()
-            )
-            METRIC_REQUEST_DURATION.labels(
-                platform='scrape_exchange',
-                scraper='exchange_client',
-                method='get',
-                status_class='error',
-                worker_id=get_worker_id(),
-            ).observe(duration)
             if retries > 0:
                 await asyncio.sleep(delay)
                 _LOGGER.debug(
@@ -453,7 +445,7 @@ class ExchangeClient(AsyncClient):
             )
             raise exc
 
-        duration = (
+        duration: float = (
             (datetime.now(UTC) - start).total_seconds()
         )
         METRIC_REQUEST_DURATION.labels(
@@ -641,6 +633,7 @@ class ExchangeClient(AsyncClient):
         move_source_dir: 'Path | None' = None,
         entity: str = 'unknown',
         log_extra: dict[str, Any] | None = None,
+        on_success: Callable[[], Awaitable[None]] | None = None,
     ) -> bool:
         '''
         Fire-and-forget upload to the Scrape.Exchange data API.
@@ -684,6 +677,7 @@ class ExchangeClient(AsyncClient):
             move_source_dir=move_source_dir,
             entity=entity,
             log_extra=dict(log_extra or {}),
+            on_success=on_success,
         )
         try:
             self._upload_queue.put_nowait(job)
@@ -862,6 +856,8 @@ class ExchangeClient(AsyncClient):
                         },
                     )
                     return
+            if job.on_success is not None:
+                await job.on_success()
             METRIC_BACKGROUND_UPLOADS.labels(
                 platform='youtube',
                 scraper='exchange_client',

@@ -12,6 +12,7 @@ mocked WebSocket) so the WebSocket-driven progress channel has
 matching coverage.
 '''
 
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -28,8 +29,10 @@ from scrape_exchange.bulk_upload import (
     bulk_progress_ws_url,
     delete_bulk_state,
     list_bulk_states,
+    reserve_bulk_upload_slot,
     resume_pending_bulk_uploads,
     stream_bulk_job_progress,
+    wait_for_bulk_upload_slot,
     write_bulk_state,
 )
 
@@ -48,7 +51,7 @@ class TestApplyBulkResults(unittest.IsolatedAsyncioTestCase):
             {'platform_content_id': 'UCabc', 'status': 'success'},
             {'platform_content_id': 'UCxyz', 'status': 'success'},
         ]
-        await apply_bulk_results(
+        success, failed, missing, success_ids = await apply_bulk_results(
             batch_records, results, fm, 'batch1', 'job123',
         )
         marked: list[str] = [
@@ -58,6 +61,8 @@ class TestApplyBulkResults(unittest.IsolatedAsyncioTestCase):
             sorted(marked),
             ['channel-UCabc.json.br', 'channel-UCxyz.json.br'],
         )
+        self.assertEqual((success, failed, missing), (2, 0, 0))
+        self.assertEqual(success_ids, {'UCabc', 'UCxyz'})
 
     async def test_failed_records_left_for_retry(self) -> None:
         '''A failed result must not call mark_uploaded.'''
@@ -185,6 +190,83 @@ class TestBulkProgressWsUrl(unittest.TestCase):
         self.assertEqual(
             url, 'ws://test.local/api/v1/bulk/progress/abcdef',
         )
+
+
+class TestWaitForBulkUploadSlot(unittest.IsolatedAsyncioTestCase):
+
+    async def test_returns_immediately_below_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fm = MagicMock()
+            fm.base_dir = Path(tmp)
+            with patch(
+                'scrape_exchange.bulk_upload.resume_pending_bulk_uploads',
+                new=AsyncMock(),
+            ) as resume_mock:
+                await wait_for_bulk_upload_slot(
+                    fm, MagicMock(), 'http://test',
+                    max_active_jobs=1,
+                )
+            resume_mock.assert_not_called()
+
+    async def test_waits_on_persisted_pending_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fm = MagicMock()
+            fm.base_dir = Path(tmp)
+            await write_bulk_state(
+                fm,
+                BulkUploadState(
+                    job_id='job1',
+                    batch_id='batch1',
+                    schema_owner='boinko',
+                    schema_version='0.0.2',
+                    platform='youtube',
+                    entity='channel',
+                    upload_filename='channels-batch1.jsonl',
+                    batch_records=[('UCabc', 'channel-UCabc.json.br')],
+                ),
+            )
+
+            async def _resume(*_args, **_kwargs) -> None:
+                await delete_bulk_state(fm, 'job1')
+
+            with patch(
+                'scrape_exchange.bulk_upload.resume_pending_bulk_uploads',
+                new=AsyncMock(side_effect=_resume),
+            ) as resume_mock:
+                await wait_for_bulk_upload_slot(
+                    fm, MagicMock(), 'http://test',
+                    max_active_jobs=1,
+                    sleep_seconds=0,
+                )
+
+            resume_mock.assert_awaited_once()
+            self.assertEqual(list_bulk_states(fm), [])
+
+    async def test_reservation_counts_before_state_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fm = MagicMock()
+            fm.base_dir = Path(tmp)
+            resume_mock = AsyncMock()
+
+            with patch(
+                'scrape_exchange.bulk_upload.resume_pending_bulk_uploads',
+                new=resume_mock,
+            ):
+                async with reserve_bulk_upload_slot(
+                    fm, MagicMock(), 'http://test',
+                    max_active_jobs=1,
+                    sleep_seconds=0,
+                ):
+                    task = asyncio.create_task(wait_for_bulk_upload_slot(
+                        fm, MagicMock(), 'http://test',
+                        max_active_jobs=1,
+                        sleep_seconds=0,
+                    ))
+                    await asyncio.sleep(0)
+                    self.assertFalse(task.done())
+
+                await asyncio.wait_for(task, timeout=0.1)
+            resume_mock.assert_awaited()
 
 
 def _fake_client(
@@ -377,7 +459,7 @@ class TestCollectChannelRecordValidator(
     ) -> None:
         '''A record that fails the validator must not return a
         line; the file must be moved to ``<filename>.invalid``.'''
-        from tools.yt_channel_scrape import _collect_channel_record
+        from tools.yt_channel_upload import _collect_channel_record
 
         channel = MagicMock()
         channel.channel_id = 'UCabc'
@@ -400,10 +482,10 @@ class TestCollectChannelRecordValidator(
         )
 
         with patch(
-            'tools.yt_channel_scrape.YouTubeChannel.from_dict',
+            'tools.yt_channel_upload.YouTubeChannel.from_dict',
             return_value=channel,
         ), patch(
-            'tools.yt_channel_scrape.resolve_channel_upload_handle',
+            'tools.yt_channel_upload.resolve_channel_upload_handle',
             new=AsyncMock(return_value='somehandle'),
         ):
             result = await _collect_channel_record(
@@ -416,6 +498,62 @@ class TestCollectChannelRecordValidator(
         fm.mark_invalid.assert_awaited_once_with('foo.json.br')
 
 
+class TestUnifiedBulkUploadLoopValidator(
+    unittest.IsolatedAsyncioTestCase,
+):
+
+    async def test_invalid_record_marked_invalid_and_skipped(
+        self,
+    ) -> None:
+        '''A brotli'd record that fails the validator must be moved
+        to ``<filename>.invalid`` before the loop waits for more
+        work.'''
+        import brotli
+        from tools.yt_channel_upload import _unified_bulk_upload_loop
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            bad_file: Path = base_dir / 'channel-UCbad.json.br'
+            bad_file.write_bytes(
+                brotli.compress(orjson.dumps({'channel_id': 'UCbad'})),
+            )
+
+            fm = MagicMock()
+            fm.base_dir = base_dir
+            fm.list_base = MagicMock(return_value=[bad_file.name])
+            fm.mark_invalid = AsyncMock(
+                return_value=f'{bad_file.name}.invalid',
+            )
+
+            validator = MagicMock()
+            validator.validate = MagicMock(
+                return_value='/url: required field missing',
+            )
+
+            settings = MagicMock()
+            settings.bulk_batch_size = 100
+            settings.bulk_max_batch_bytes = 1_000_000
+            settings.max_active_bulk_jobs = 1
+
+            class _StopLoop(Exception):
+                pass
+
+            async def _stop(*_args, **_kwargs) -> None:
+                raise _StopLoop()
+
+            with patch(
+                'tools.yt_channel_upload._wait_for_channel_changes',
+                new=_stop,
+            ):
+                with self.assertRaises(_StopLoop):
+                    await _unified_bulk_upload_loop(
+                        settings, MagicMock(), fm, validator,
+                    )
+
+            validator.validate.assert_called_once()
+            fm.mark_invalid.assert_awaited_once_with(bad_file.name)
+
+
 class TestEnqueueUploadChannelValidator(
     unittest.IsolatedAsyncioTestCase,
 ):
@@ -423,7 +561,7 @@ class TestEnqueueUploadChannelValidator(
     async def test_invalid_record_not_enqueued_and_marked(
         self,
     ) -> None:
-        from tools.yt_channel_scrape import enqueue_upload_channel
+        from tools.yt_channel_upload import enqueue_upload_channel
 
         channel = MagicMock()
         channel.channel_id = 'UCabc'
@@ -452,7 +590,7 @@ class TestEnqueueUploadChannelValidator(
         settings.schema_version = '0.0.2'
 
         with patch(
-            'tools.yt_channel_scrape'
+            'tools.yt_channel_upload'
             '.resolve_channel_upload_handle',
             new=AsyncMock(return_value='somehandle'),
         ):

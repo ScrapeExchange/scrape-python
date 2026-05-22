@@ -332,6 +332,23 @@ class CreatorQueue(ABC):
         '''Create or update a no-feeds entry.'''
 
     @abstractmethod
+    async def rollback_no_feeds(
+        self,
+        creator_id: str,
+    ) -> None:
+        '''Decrement the no-feeds ``count`` for *creator_id*
+        by 1.
+
+        Used by the RSS circuit breaker to undo the
+        ``set_no_feeds(..., +1)`` increments applied by
+        the F-1 404 reports that preceded a trip. Clears
+        the entry entirely when the count reaches 0; clamps
+        at 0 if the count is already 0 (defensive — another
+        worker may have cleared it between the increment and
+        the rollback).
+        '''
+
+    @abstractmethod
     async def clear_no_feeds(
         self,
         creator_id: str,
@@ -1017,6 +1034,25 @@ class FileCreatorQueue(CreatorQueue):
         else:
             self._no_feeds[creator_id] = (
                 url, name, count,
+            )
+        await self._persist_no_feeds()
+
+    async def rollback_no_feeds(
+        self,
+        creator_id: str,
+    ) -> None:
+        if creator_id not in self._no_feeds:
+            return
+        url: str
+        name: str
+        count: int
+        url, name, count = self._no_feeds[creator_id]
+        new_count: int = count - 1
+        if new_count <= 0:
+            del self._no_feeds[creator_id]
+        else:
+            self._no_feeds[creator_id] = (
+                url, name, new_count,
             )
         await self._persist_no_feeds()
 
@@ -1781,6 +1817,30 @@ class RedisCreatorQueue(CreatorQueue):
             ),
             'count': str(prev_count + count),
         })
+        pipe.expire(key, _NO_FEEDS_TTL)
+        await pipe.execute()
+
+    async def rollback_no_feeds(
+        self,
+        creator_id: str,
+    ) -> None:
+        key: str = (
+            f'{self._no_feeds_prefix}{creator_id}'
+        )
+        existing: dict[str, str] = (
+            await self._redis.hgetall(key)
+        )
+        if not existing:
+            return
+        prev_count: int = int(
+            existing.get('count', '0')
+        )
+        new_count: int = prev_count - 1
+        if new_count <= 0:
+            await self._redis.delete(key)
+            return
+        pipe = self._redis.pipeline()
+        pipe.hset(key, 'count', str(new_count))
         pipe.expire(key, _NO_FEEDS_TTL)
         await pipe.execute()
 

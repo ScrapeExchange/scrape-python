@@ -2,7 +2,7 @@
 Integration tests for scrape_exchange.creator_queue.RedisCreatorQueue
 with the tier-aware interface.
 
-Requires a live Redis instance at redis://192.168.1.13:6379/1.
+Requires a live Redis instance at redis://localhost:6379/1.
 All keys use the 'test' platform prefix (rss:test:*) to avoid
 colliding with production data.
 '''
@@ -25,7 +25,7 @@ from scrape_exchange.creator_queue import (
     TierConfig,
 )
 
-REDIS_DSN: str = 'redis://192.168.1.13:6379/1'
+REDIS_DSN: str = 'redis://localhost:6379/1'
 TEST_PLATFORM: str = 'test'
 
 DEFAULT_TIERS: list[TierConfig] = [

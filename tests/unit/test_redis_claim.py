@@ -20,7 +20,7 @@ class TestRedisClaim(
         )
         self.claim: RedisClaim = RedisClaim(
             self.redis,
-            key_prefix='youtube:resolving:',
+            key_prefix='claim:youtube:channel:',
             ttl_seconds=60,
             owner='worker-1',
         )
@@ -77,7 +77,7 @@ class TestRedisClaim(
         )
         claim: RedisClaim = RedisClaim(
             r,
-            key_prefix='youtube:resolving:',
+            key_prefix='claim:youtube:channel:',
             ttl_seconds=1,
             owner='worker-1',
         )
@@ -97,7 +97,7 @@ class TestRedisClaim(
         '''A losing acquire must not delete the winner's key.'''
         other: RedisClaim = RedisClaim(
             self.redis,
-            key_prefix='youtube:resolving:',
+            key_prefix='claim:youtube:channel:',
             ttl_seconds=60,
             owner='worker-2',
         )

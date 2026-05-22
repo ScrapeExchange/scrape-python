@@ -14,10 +14,7 @@ import unittest
 
 from tools import yt_video_scrape
 from tools.yt_video_scrape import (
-    FAILURE_SLEEP_MAX,
-    FAILURE_SLEEP_MIN,
     _classify_yt_dlp_error as classify,
-    _next_failure_sleep as next_failure_sleep,
 )
 
 
@@ -309,56 +306,6 @@ class TestDeadPatternGuard(unittest.TestCase):
             reason for reason, _ in yt_video_scrape._ERROR_PATTERNS
         }
         self.assertEqual(actual, expected)
-
-
-class TestNextFailureSleep(unittest.TestCase):
-
-    def test_zero_starts_at_failure_sleep_min(self) -> None:
-        self.assertEqual(
-            next_failure_sleep(0), FAILURE_SLEEP_MIN,
-        )
-
-    def test_below_min_snaps_to_min(self) -> None:
-        self.assertEqual(
-            next_failure_sleep(FAILURE_SLEEP_MIN - 1),
-            FAILURE_SLEEP_MIN,
-        )
-
-    def test_at_min_doubles(self) -> None:
-        self.assertEqual(
-            next_failure_sleep(FAILURE_SLEEP_MIN),
-            min(FAILURE_SLEEP_MIN * 2, FAILURE_SLEEP_MAX),
-        )
-
-    def test_doubling_sequence(self) -> None:
-        # Pin the streak: 60 → 120 → 240 → 300 (capped).
-        seq: list[int] = []
-        s: int = 0
-        for _ in range(5):
-            s = next_failure_sleep(s)
-            seq.append(s)
-        self.assertEqual(seq, [60, 120, 240, 300, 300])
-
-    def test_clamps_at_failure_sleep_max(self) -> None:
-        self.assertEqual(
-            next_failure_sleep(FAILURE_SLEEP_MAX),
-            FAILURE_SLEEP_MAX,
-        )
-        self.assertEqual(
-            next_failure_sleep(FAILURE_SLEEP_MAX * 4),
-            FAILURE_SLEEP_MAX,
-        )
-
-    def test_reset_via_zero_restarts_streak(self) -> None:
-        '''A success / unavailable / premiere path that sets sleep=0
-        must reset the backoff — the next failure should start at
-        ``FAILURE_SLEEP_MIN`` again, not the mid-streak value.'''
-        mid: int = next_failure_sleep(next_failure_sleep(0))  # 120
-        self.assertEqual(mid, 120)
-        # Reset to 0 (simulating a success / unavailable result)
-        # and assert the next failure starts clean.
-        after_reset: int = next_failure_sleep(0)
-        self.assertEqual(after_reset, FAILURE_SLEEP_MIN)
 
 
 if __name__ == '__main__':

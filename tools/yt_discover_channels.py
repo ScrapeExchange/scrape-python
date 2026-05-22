@@ -37,6 +37,10 @@ from scrape_exchange.creator_map import (
     FileCreatorMap,
     RedisCreatorMap,
 )
+from scrape_exchange.handle_map import (
+    NullHandleMap,
+    RedisHandleMap,
+)
 from scrape_exchange.name_map import (
     NameMap,
     NullNameMap,
@@ -47,11 +51,17 @@ from scrape_exchange.settings import ScraperSettings
 from scrape_exchange.youtube.youtube_rate_limiter import (
     YouTubeRateLimiter,
 )
+from scrape_exchange.youtube.channel_identity import (
+    ChannelIdentityStore,
+    InconsistentIdentityError,
+)
 
 from scrape_exchange.youtube.youtube_channel import (
     YouTubeChannel as ScrapeYouTubeChannel,
 )
 from scrape_exchange.youtube.youtube_client import AsyncYouTubeClient
+
+from scrape_exchange.youtube.youtube_channel import YouTubeChannel
 
 # The underlying Redis hash name when the Redis backend is
 # active. Kept here for reference; RedisCreatorMap derives
@@ -61,14 +71,6 @@ REDIS_CHANNEL_MAP_KEY: str = 'youtube:creator_map'
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 CHANNEL_PREFIX: str = 'channel/'
-
-# Matches bare YouTube channel ids ("UC" + 22 id chars).
-# Used to avoid writing UC-id → UC-id rows into the
-# creator_map hash when a scrape target was given as a
-# channel/UC... URL rather than as a handle.
-_UC_ID_RE: re.Pattern = re.compile(
-    r'^UC[A-Za-z0-9_-]{22}$',
-)
 
 CHANNEL_RX: re.Pattern = re.compile(r'\"canonicalBaseUrl\":\"\/@(.*?)\"')
 CHANNEL_SCRAPE_REGEX_SHORT: re.Pattern[str] = re.compile(
@@ -560,37 +562,47 @@ def _handle_from_target(target: str) -> str | None:
     if handle.startswith(CHANNEL_PREFIX):
         handle = handle[len(CHANNEL_PREFIX):]
     handle = handle.lstrip('@')
-    if not handle or _UC_ID_RE.match(handle):
+    if not handle or YouTubeChannel.CHANNEL_ID_REGEX_MATCH.match(handle):
         return None
     return handle
 
 
 async def update_creator_map(
-    creator_map: CreatorMap | None,
+    identity_store: ChannelIdentityStore | None,
     channel: str,
     channel_id: str | None,
 ) -> None:
     '''
-    Record ``channel_id → handle`` in the shared
-    creator_map so that downstream scrapers can resolve
-    UC-ids to handles without re-scraping the channel
-    page. Backend-agnostic — works against both
-    :class:`FileCreatorMap` and :class:`RedisCreatorMap`.
+    Record ``channel_id → handle`` in both the creator_map
+    and handle_map via :meth:`ChannelIdentityStore.bind` so
+    that downstream scrapers can resolve UC-ids to handles
+    without re-scraping the channel page.
 
-    Silent no-op when no creator_map is configured, the
+    Silent no-op when no identity_store is configured, the
     channel_id is missing, or *channel* does not resolve
     to a handle (e.g. it was a ``channel/UC...`` URL form).
     Backend errors are logged as a warning; they never
     propagate so a transient storage outage cannot derail
-    the discovery BFS.
+    the discovery BFS. ``InconsistentIdentityError`` (handle
+    already bound to a different id) is also logged and
+    swallowed — the existing binding wins.
     '''
-    if creator_map is None or not channel_id:
+    if identity_store is None or not channel_id:
         return
     handle: str | None = _handle_from_target(channel)
     if handle is None:
         return
     try:
-        await creator_map.put(channel_id, handle)
+        await identity_store.bind(channel_id, handle)
+    except InconsistentIdentityError as exc:
+        _LOGGER.warning(
+            'Skipping creator_map update; handle conflict',
+            extra={
+                'channel_id': channel_id,
+                'handle': handle,
+                'reason': str(exc),
+            },
+        )
     except Exception as exc:
         _LOGGER.warning(
             'Failed to update creator_map',
@@ -652,16 +664,17 @@ async def record_discovered(
     discovered: dict[str, int | None],
     out_path: str,
     channel_id: str | None = None,
-    creator_map: CreatorMap | None = None,
+    identity_store: ChannelIdentityStore | None = None,
     title: str | None = None,
     name_map: NameMap | None = None,
 ) -> None:
     '''Update in-memory dict and append one JSONL record to
     *out_path*.
 
-    When both *channel_id* and *creator_map* are supplied, the
-    shared creator_map (file- or Redis-backed) is also updated
-    via :func:`update_creator_map`. Likewise, when *title*,
+    When both *channel_id* and *identity_store* are supplied,
+    the shared creator_map AND handle_map are updated via
+    :func:`update_creator_map` (which calls
+    :meth:`ChannelIdentityStore.bind`). Likewise, when *title*,
     *channel_id*, and *name_map* are all supplied, the shared
     name_map is updated via :func:`update_name_map`.
     '''
@@ -683,7 +696,7 @@ async def record_discovered(
             extra={'channel': channel},
         )
     await update_creator_map(
-        creator_map, channel, channel_id,
+        identity_store, channel, channel_id,
     )
     await update_name_map(name_map, title, channel_id)
 
@@ -959,6 +972,7 @@ def _build_initial_queue(
 
 async def discover(client: AsyncYouTubeClient,
                    creator_map: CreatorMap | None,
+                   identity_store: ChannelIdentityStore | None,
                    name_map: NameMap | None,
                    known_channels: set[str],
                    creator_handles: set[str],
@@ -1026,7 +1040,7 @@ async def discover(client: AsyncYouTubeClient,
                     target, channel.subs, 'scrape',
                     discovered, discovered_path,
                     channel_id=channel.channel_id,
-                    creator_map=creator_map,
+                    identity_store=identity_store,
                     title=channel.title,
                     name_map=name_map,
                 )
@@ -1115,6 +1129,34 @@ async def build_creator_map(
         },
     )
     return fmap
+
+
+def build_identity_store(
+    settings: 'DiscoverSettings',
+    creator_map: CreatorMap,
+) -> ChannelIdentityStore | None:
+    '''
+    Build a :class:`ChannelIdentityStore` pairing the
+    already-constructed *creator_map* with a fresh
+    :class:`RedisHandleMap` (when ``REDIS_DSN`` is set) or a
+    :class:`NullHandleMap` (file-mode fallback).
+
+    Returned ``None`` is reserved for future use; for now we
+    always return a store, but call sites tolerate ``None``
+    so they degrade to "no creator_map writes" if a future
+    settings flag disables identity persistence.
+    '''
+    handle_map_backend: NullHandleMap | RedisHandleMap
+    if settings.redis_dsn:
+        handle_map_backend = RedisHandleMap(
+            creator_map.redis_client, platform='youtube',
+        )
+    else:
+        handle_map_backend = NullHandleMap()
+    return ChannelIdentityStore(
+        creator_map=creator_map,
+        handle_map=handle_map_backend,
+    )
 
 
 def build_name_map(
@@ -1244,6 +1286,9 @@ async def main() -> None:
     creator_map: CreatorMap = await build_creator_map(
         settings,
     )
+    identity_store: ChannelIdentityStore | None = (
+        build_identity_store(settings, creator_map)
+    )
     name_map: NameMap = build_name_map(settings)
 
     creator_handles: set[str] = set()
@@ -1269,7 +1314,7 @@ async def main() -> None:
             settings.proxies or None
         )
         await discover(
-            client, creator_map, name_map,
+            client, creator_map, identity_store, name_map,
             known_channels, creator_handles,
             discovered, fully_scraped, failed,
             disc_channels, fail_channels,

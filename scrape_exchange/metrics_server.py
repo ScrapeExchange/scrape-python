@@ -19,6 +19,12 @@ the larger value (capped by ``/proc/sys/net/core/somaxconn``).
 :license    : GPLv3
 '''
 
+import os
+import shutil
+from pathlib import Path
+
+from prometheus_client import CollectorRegistry
+from prometheus_client import multiprocess
 from prometheus_client import (
     start_http_server as _start_http_server,
 )
@@ -37,3 +43,33 @@ def start_metrics_server(port: int, backlog: int = 128) -> None:
 
     ThreadingWSGIServer.request_queue_size = backlog
     _start_http_server(port)
+
+
+def start_aggregating_metrics_server(
+    port: int,
+    multiproc_dir: Path,
+    backlog: int = 128,
+) -> None:
+    '''Start a Prometheus HTTP server that aggregates metrics from
+    every worker process via mmap'd files in ``multiproc_dir``.
+
+    The supervisor calls this exactly once, before forking any
+    child. ``multiproc_dir`` is wiped (clears ghost pid files from
+    a prior run) and recreated; ``PROMETHEUS_MULTIPROC_DIR`` is
+    set in ``os.environ`` so children inherit it on fork. The HTTP
+    server is bound to ``port`` using a fresh
+    :class:`CollectorRegistry` whose only collector is
+    :class:`multiprocess.MultiProcessCollector`. The ``backlog``
+    value bumps the listen backlog identically to
+    :func:`start_metrics_server`.
+    '''
+
+    shutil.rmtree(multiproc_dir, ignore_errors=True)
+    multiproc_dir.mkdir(parents=True, exist_ok=True)
+    os.environ['PROMETHEUS_MULTIPROC_DIR'] = str(multiproc_dir)
+
+    registry: CollectorRegistry = CollectorRegistry()
+    multiprocess.MultiProcessCollector(registry)
+
+    ThreadingWSGIServer.request_queue_size = backlog
+    _start_http_server(port, registry=registry)

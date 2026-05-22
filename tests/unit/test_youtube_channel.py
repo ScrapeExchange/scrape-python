@@ -6,7 +6,9 @@ Unit tests for YouTubeChannel class and related functions.
 :license: GPLv3
 '''
 
+import asyncio
 import logging
+import inspect
 import unittest
 import unittest.mock
 
@@ -1356,6 +1358,18 @@ class TestParseThumbnailsBannersHeaderFallback(unittest.TestCase):
         self.assertIn('avatar.jpg', thumb.url)
 
 
+class TestResolveChannelIdSignature(unittest.TestCase):
+    def test_yt_client_parameter_removed(self) -> None:
+        params: list[str] = list(
+            inspect.signature(
+                YouTubeChannel.resolve_channel_id,
+            ).parameters,
+        )
+
+        self.assertEqual(params, ['channel_id', 'proxy'])
+        self.assertNotIn('yt_client', params)
+
+
 class TestExtractLinkedChannelsSkipsEmpty(unittest.TestCase):
     """Cover line 790 where gridChannelRenderer is empty dict."""
 
@@ -1425,6 +1439,43 @@ class TestScrapeValidation(unittest.IsolatedAsyncioTestCase):
                 save_dir='/tmp',
                 max_videos_per_channel=unittest.mock.ANY
             )
+
+    async def test_known_channel_scrapes_about_and_content_together(
+        self,
+    ) -> None:
+        ch = YouTubeChannel('TestCh', channel_id='UCknown')
+        ch.save_dir = '/tmp'
+        about_started = asyncio.Event()
+        content_started = asyncio.Event()
+        unblock = asyncio.Event()
+
+        async def scrape_about_page(*args, **kwargs) -> None:
+            about_started.set()
+            await unblock.wait()
+
+        async def scrape_channel_content(*args, **kwargs) -> int:
+            content_started.set()
+            await unblock.wait()
+            return 0
+
+        with patch.object(
+            ch, 'scrape_about_page',
+            side_effect=scrape_about_page,
+        ), patch.object(
+            ch, 'scrape_channel_content',
+            side_effect=scrape_channel_content,
+        ):
+            task = asyncio.create_task(
+                ch.scrape(with_about_page=True),
+            )
+            await asyncio.wait_for(
+                about_started.wait(), timeout=0.1,
+            )
+            await asyncio.wait_for(
+                content_started.wait(), timeout=0.1,
+            )
+            unblock.set()
+            await task
 
 
 class TestScrapeVideo(unittest.IsolatedAsyncioTestCase):
@@ -1672,6 +1723,41 @@ class TestCanonicalHandleAttribute(unittest.IsolatedAsyncioTestCase):
                     )
 
             self.assertEqual(channel.channel_handle, 'legacy')
+
+    async def test_channel_content_reuses_browse_client_proxy(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as save_dir:
+            channel: YouTubeChannel = YouTubeChannel(
+                channel_handle='input',
+            )
+            channel.channel_id = 'UC1234567890abcdefghij'
+            channel.browse_client = MagicMock()
+            channel.browse_client.proxy = 'http://proxy-one:8080'
+
+            with patch(
+                'scrape_exchange.youtube.youtube_channel'
+                '.YouTubeChannelTabs',
+            ) as tabs_cls:
+                tabs_cls.return_value.browse_channel = AsyncMock(
+                    return_value={'metadata': {}},
+                )
+                tabs_cls.return_value.scrape_loaded_tabs = AsyncMock(
+                    return_value=(
+                        set(), set(), set(), set(), set(), set(),
+                    ),
+                )
+                with patch.object(
+                    channel, 'parse_channel_video_data',
+                ):
+                    await channel.scrape_channel_content(
+                        save_dir=save_dir,
+                    )
+
+            tabs_cls.assert_called_once_with(
+                'UC1234567890abcdefghij',
+                'http://proxy-one:8080',
+            )
 
 
 class TestScrapeAboutPageViewCountFallback(

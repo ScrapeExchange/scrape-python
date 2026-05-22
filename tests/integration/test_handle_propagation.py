@@ -7,7 +7,7 @@ import unittest
 from scrape_exchange.creator_map import FileCreatorMap
 from scrape_exchange.youtube.youtube_video import YouTubeVideo
 
-from tools.yt_video_scrape import resolve_video_upload_handle
+from tools.yt_video_upload import resolve_video_upload_handle
 
 
 class TestHandlePropagation(unittest.IsolatedAsyncioTestCase):

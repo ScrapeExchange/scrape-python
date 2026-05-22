@@ -53,7 +53,7 @@ from scrape_exchange.creator_queue import (
 from scrape_exchange.settings import ScraperSettings
 
 
-DEFAULT_PRIORITY_QUEUES: str = (
+RSS_PRIORITY_QUEUES: str = (
     '1:10000000,4:1000000,12:100000,24:10000,48:0'
 )
 
@@ -66,7 +66,7 @@ class ReconcileSettings(ScraperSettings):
         description='Platform prefix for the Redis keys',
     )
     priority_queues: str = Field(
-        default=DEFAULT_PRIORITY_QUEUES,
+        default=RSS_PRIORITY_QUEUES,
         description=(
             'Tier spec matching the RSS scraper '
             '(interval_hours:min_subscribers pairs)'

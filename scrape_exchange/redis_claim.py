@@ -16,7 +16,7 @@ class RedisClaim:
 
     :param redis_client: shared async Redis client.
     :param key_prefix: prefix applied to every key
-        (e.g. ``youtube:resolving:``).
+        (e.g. ``claim:youtube:channel:``).
     :param ttl_seconds: claim lifetime; recovers from crashed
         owners.
     :param owner: identifier stored as the key value, useful for

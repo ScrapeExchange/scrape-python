@@ -1,5 +1,9 @@
 .vscode/
 
+report.md
+
+docker-compose.override.yml
+
 tests/collateral/youtube_videos
 tests/collateral/local
 
@@ -9,12 +13,15 @@ tests/collateral/local
 
 *.swp
 
-docker-compose.override.yml
-
 .claude/
 .claudeignore
 CLAUDE.md
+AGENTS.md
+docs/adr
+docs/agents
+docs/operator
 docs/superpowers/
+.codex
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -17,30 +17,42 @@ Responsibilities:
 
 import os
 import logging
+import re
 import secrets
 
 import aiofiles
 import aiofiles.os
-import brotli
-import orjson
 
 from collections.abc import Iterator
 from pathlib import Path
 
+from .brotli import brotli_read_async, brotli_write_async, TMP_SUBDIR_NAME
+
 VIDEO_FILE_PREFIX: str = 'video-'
+VIDEO_MIN_FILE_PREFIX: str = 'video-min-'
+VIDEO_YTDLP_FILE_PREFIX: str = 'video-dlp-'
 CHANNEL_FILE_PREFIX: str = 'channel-'
+VIDEO_ID_FILE_PREFIX: str = '<video-id>'
+VIDEO_ID_RE: re.Pattern[str] = re.compile(r'^[A-Za-z0-9_-]{11}$')
 
 
 async def atomic_write_bytes(
     path: Path | str, data: bytes,
 ) -> None:
     '''
-    Write *data* to *path* atomically: write to a temp file in
-    the same directory, then ``os.rename`` onto *path*. The
-    rename is atomic on POSIX same-filesystem operations, so a
-    crash mid-write leaves either the previous version of the
-    file or no file at all — never a half-written file that
-    fails to decompress.
+    Write *data* to *path* atomically: write to a temp file in a
+    hidden ``.tmp/`` sub-directory of the target's parent, then
+    ``os.rename`` onto *path*. The rename is atomic on POSIX
+    same-filesystem operations, so a crash mid-write leaves
+    either the previous version of the file or no file at all —
+    never a half-written file that fails to decompress.
+
+    The temp file lives in ``<target.parent>/.tmp/`` rather than
+    next to *target* so that callers iterating the parent
+    directory (e.g. ``AssetFileManagement.list_base``) never see
+    temp files alongside finished assets. ``.tmp/`` is a
+    sub-directory of the target's parent, so the rename is still
+    on the same filesystem and remains atomic.
 
     Used by every scraper write path that produces brotli-
     compressed JSON so that an interrupted process does not
@@ -50,17 +62,23 @@ async def atomic_write_bytes(
     On any regular exception during the write, the temp file is
     removed best-effort before the exception is re-raised. A
     :class:`asyncio.CancelledError` skips cleanup so the cancel
-    is not delayed; orphan ``<path>.tmp.<hex>`` files can be
-    removed by an operator or a future periodic sweep.
+    is not delayed; orphan ``<name>.tmp.<hex>`` files in the
+    ``.tmp/`` sub-directory can be removed by an operator or a
+    future periodic sweep.
 
     :param path: Final destination path. The temp file is created
-        in the same directory so the rename is on the same
-        filesystem (a cross-device rename is not atomic).
+        in ``<path>.parent / '.tmp'``, kept on the same filesystem
+        so the rename remains atomic.
     :param data: Raw bytes to write.
     :raises OSError: If the temp-file write or the rename fails.
+    :raises FileNotFoundError: If the target's parent directory
+        does not exist (we do not silently create it; that would
+        mask configuration mistakes).
     '''
     target: Path = Path(path)
-    tmp: Path = Path(f'{target}.tmp.{secrets.token_hex(8)}')
+    tmp_dir: Path = target.parent / TMP_SUBDIR_NAME
+    tmp_dir.mkdir(exist_ok=True)
+    tmp: Path = tmp_dir / f'{target.name}.tmp.{secrets.token_hex(8)}'
     try:
         async with aiofiles.open(tmp, 'wb') as f:
             await f.write(data)
@@ -79,9 +97,17 @@ logger = logging.getLogger(__name__)
 # *most* preferred (last index).  Scrapers may supply their own rankings when
 # constructing AssetFileManagement.
 DEFAULT_PREFIX_RANKINGS: dict[str, list[str]] = {
-    'video': ['video-min-', 'video-dlp-'],
+    'video': [
+        VIDEO_ID_FILE_PREFIX,
+        VIDEO_MIN_FILE_PREFIX,
+        VIDEO_YTDLP_FILE_PREFIX,
+    ],
     'channel': ['channel-'],
 }
+
+FAILED_SUFFIX: str = '.failed'
+
+COMPRESSED_JSON_SUFFIX: str = '.json.br'
 
 # Suffixes that mark a file as a status indicator (failure, not-found,
 # unresolved, unavailable).  Marker files always have the lowest priority:
@@ -89,7 +115,7 @@ DEFAULT_PREFIX_RANKINGS: dict[str, list[str]] = {
 # regular write/cleanup logic does not consider marker files as variants of
 # any other file.
 MARKER_SUFFIXES: tuple[str, ...] = (
-    '.failed', '.not_found', '.unresolved', '.unavailable',
+    FAILED_SUFFIX, '.not_found', '.unresolved', '.unavailable',
     '.invalid',
 )
 
@@ -130,7 +156,11 @@ class AssetFileManagement:
         # Sort prefixes longest-first so that the most specific match wins
         # when prefixes share a common leading substring.
         self._sorted_prefixes: list[str] = sorted(
-            self._prefix_info, key=len, reverse=True
+            (
+                prefix for prefix in self._prefix_info
+                if prefix != VIDEO_ID_FILE_PREFIX
+            ),
+            key=len, reverse=True,
         )
 
     # ------------------------------------------------------------------
@@ -149,12 +179,55 @@ class AssetFileManagement:
 
         Returns ``(None, None, None)`` when no known prefix matches.
         '''
+        bare_video_id: str | None = self._bare_video_id(filename)
+        if (
+            bare_video_id is not None
+            and VIDEO_ID_FILE_PREFIX in self._prefix_info
+        ):
+            group, _ = self._prefix_info[VIDEO_ID_FILE_PREFIX]
+            return (
+                group,
+                VIDEO_ID_FILE_PREFIX,
+                f'{bare_video_id}.json.br',
+            )
+
         for prefix in self._sorted_prefixes:
             if filename.startswith(prefix):
                 group, _ = self._prefix_info[prefix]
                 identifier: str = filename[len(prefix):]
                 return group, prefix, identifier
         return None, None, None
+
+    @staticmethod
+    def _bare_video_id(filename: str) -> str | None:
+        '''
+        Return the 11-character YouTube video id represented by *filename*.
+
+        Bare video-id files have no extension. Marker files are accepted by
+        stripping one known marker suffix first, so
+        ``dQw4w9WgXcQ.failed`` is still recognized as the marker for
+        ``dQw4w9WgXcQ``.
+        '''
+        candidate: str = filename
+        for suffix in MARKER_SUFFIXES:
+            if filename.endswith(suffix):
+                candidate = filename[: -len(suffix)]
+                break
+        if VIDEO_ID_RE.fullmatch(candidate):
+            return candidate
+        return None
+
+    @staticmethod
+    def _filename_for_variant(prefix: str, identifier: str) -> str:
+        if prefix != VIDEO_ID_FILE_PREFIX:
+            return f'{prefix}{identifier}'
+        if identifier.endswith(COMPRESSED_JSON_SUFFIX):
+            candidate = identifier[: -len(COMPRESSED_JSON_SUFFIX)]
+        else:
+            candidate = identifier
+        if VIDEO_ID_RE.fullmatch(candidate):
+            return candidate
+        return f'{VIDEO_ID_FILE_PREFIX}{identifier}'
 
     @staticmethod
     def is_marker(filename: str) -> bool:
@@ -287,7 +360,10 @@ class AssetFileManagement:
             rank: int = self._prefix_info[p][1]
             if rank <= current_rank:
                 continue
-            candidate: Path = self.uploaded_dir / f'{p}{identifier}'
+            candidate: Path = (
+                self.uploaded_dir
+                / self._filename_for_variant(p, identifier)
+            )
             try:
                 if candidate.stat().st_mtime >= base_mtime:
                     return True
@@ -331,7 +407,9 @@ class AssetFileManagement:
         # Collect every existing variant: (prefix, dir_label) -> (Path, mtime)
         found: dict[tuple[str, str], tuple[Path, float]] = {}
         for p in group_prefixes:
-            candidate_name: str = p + identifier
+            candidate_name: str = self._filename_for_variant(
+                p, identifier,
+            )
             for dir_label, directory in (
                 ('base', self.base_dir),
                 ('uploaded', self.uploaded_dir),
@@ -430,8 +508,23 @@ class AssetFileManagement:
         '''
         return self._list_dir(self.uploaded_dir, prefix, suffix)
 
+    def video_scrape_output_exists(self, video_id: str) -> bool:
+        '''
+        True when a scraped YouTube video output already exists in
+        either the base directory or the uploaded directory.
+        '''
+        filenames: tuple[str, str] = (
+            f'{VIDEO_MIN_FILE_PREFIX}{video_id}.json.br',
+            f'{VIDEO_YTDLP_FILE_PREFIX}{video_id}.json.br',
+        )
+        return any(
+            (directory / filename).exists()
+            for directory in (self.base_dir, self.uploaded_dir)
+            for filename in filenames
+        )
+
     def iter_assets(
-        self, group: str, suffix: str = '.json.br',
+        self, group: str, suffix: str = COMPRESSED_JSON_SUFFIX,
     ) -> Iterator[tuple[str, bool, float]]:
         '''
         Yield every asset file belonging to *group* under the base and
@@ -474,7 +567,31 @@ class AssetFileManagement:
         Validate *entry* as a member of *group* with the given *suffix* and
         return ``(bare_identifier, mtime)`` if so, otherwise ``None``.
         '''
-        if not entry.is_file() or not entry.name.endswith(suffix):
+        if not entry.is_file():
+            return None
+
+        bare_video_id: str | None = self._bare_video_id(entry.name)
+        if (
+            group == 'video'
+            and suffix == COMPRESSED_JSON_SUFFIX
+            and bare_video_id is not None
+            and not self.is_marker(entry.name)
+            and VIDEO_ID_FILE_PREFIX in self.prefix_rankings.get(
+                group, (),
+            )
+        ):
+            try:
+                mtime: float = entry.stat().st_mtime
+            except OSError as exc:
+                logger.warning(
+                    'Could not stat entry',
+                    exc=exc,
+                    extra={'entry': entry},
+                )
+                return None
+            return bare_video_id, mtime
+
+        if not entry.name.endswith(suffix):
             return None
         parsed_group, _, identifier = self._parse_filename(entry.name)
         if parsed_group != group or identifier is None:
@@ -544,9 +661,7 @@ class AssetFileManagement:
 
     @staticmethod
     async def _read_path(path: Path) -> dict:
-        async with aiofiles.open(path, 'rb') as f:
-            data: bytes = await f.read()
-        return orjson.loads(brotli.decompress(data))
+        return await brotli_read_async(path)
 
     async def write_file(self, filename: str, data: dict) -> None:
         '''
@@ -563,12 +678,7 @@ class AssetFileManagement:
         :raises OSError: If the file cannot be written.
         '''
         path: Path = self.base_dir / filename
-        compressed: bytes = brotli.compress(
-            orjson.dumps(data, option=orjson.OPT_INDENT_2),
-            quality=11,
-            mode=brotli.MODE_TEXT,
-        )
-        await atomic_write_bytes(path, compressed)
+        await brotli_write_async(path, data)
         if self.is_marker(filename):
             # Marker files (.failed/.not_found/.unresolved) have the lowest
             # priority and must never trigger deletion of other files.
@@ -612,7 +722,9 @@ class AssetFileManagement:
 
         for p in self.prefix_rankings[group]:
             rank: int = self._prefix_info[p][1]
-            candidate_name: str = p + identifier
+            candidate_name: str = self._filename_for_variant(
+                p, identifier,
+            )
             for directory in (self.base_dir, self.uploaded_dir):
                 candidate: Path = directory / candidate_name
                 if candidate == written_path:
@@ -791,7 +903,7 @@ class AssetFileManagement:
         :returns: The new filename (``{filename}.failed``).
         :raises OSError: If the rename fails.
         '''
-        return await self._rename_with_suffix(filename, '.failed')
+        return await self._rename_with_suffix(filename, FAILED_SUFFIX)
 
     async def mark_unavailable(self, filename: str) -> str:
         '''

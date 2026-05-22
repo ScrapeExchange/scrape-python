@@ -1,6 +1,6 @@
 '''
 Unit tests for the video-min upload pipeline added to
-``tools/yt_video_scrape.py``.
+``tools/yt_video_upload.py``.
 
 The video scraper now sweeps both ``video-min-*`` (RSS-discovered)
 and ``video-dlp-*`` (yt-dlp-enriched) files through its bulk and
@@ -22,12 +22,13 @@ from pathlib import Path
 from types import ModuleType
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from tools.yt_video_scrape import (
+from tools.yt_video_upload import (
     FILE_EXTENSION,
     VIDEO_MIN_PREFIX,
     VIDEO_YTDLP_PREFIX,
     _is_video_upload_file,
     enqueue_upload_video,
+    main as video_upload_main,
     upload_videos,
 )
 
@@ -107,7 +108,7 @@ class TestUploadVideosEnumeratesBothPrefixes(
         settings.proxies = ''
         settings.bulk_batch_size = 100
         settings.bulk_max_batch_bytes = 200_000_000
-        settings.video_concurrency = 4
+        settings.video_upload_concurrency = 4
 
         client: MagicMock = MagicMock()
         video_fm: MagicMock = MagicMock()
@@ -120,6 +121,7 @@ class TestUploadVideosEnumeratesBothPrefixes(
 
         await upload_videos(
             settings, client, video_fm, creator_map, validator,
+            AsyncMock(),
         )
 
         called_prefixes: set[str] = {
@@ -203,11 +205,11 @@ class TestRssEnrichDoesNotUpload(
     unittest.IsolatedAsyncioTestCase,
 ):
     '''
-    The RSS scraper writes ``video-min-`` files but no longer
-    enqueues them for upload — that responsibility moved to the
-    video scraper's bulk and watch uploaders.  This test asserts
-    the RSS path stops short of enqueuing so we don't regress into
-    duplicate POSTs.
+    The RSS scraper enqueues video ids onto the Redis-backed scrape
+    queue but no longer enqueues them for upload — that
+    responsibility moved to the video scraper.  This test asserts
+    the RSS path stops short of enqueuing for upload so we don't
+    regress into duplicate POSTs.
     '''
 
     async def test_no_enqueue_upload_call(self) -> None:
@@ -218,9 +220,8 @@ class TestRssEnrichDoesNotUpload(
             return_value='video-min-abc.json.br',
         )
 
-        innertube: MagicMock = MagicMock()
-        settings: MagicMock = MagicMock()
-        settings.video_data_directory = '/tmp/test'
+        video_queue: AsyncMock = AsyncMock()
+        video_queue.enqueue = AsyncMock()
 
         # ``enqueue_upload_video`` no longer exists on yt_rss_scrape;
         # patching it would error.  Instead, monkey-patch the
@@ -233,18 +234,52 @@ class TestRssEnrichDoesNotUpload(
             new=MagicMock(return_value=True),
         ) as upload_mock:
             filename: str | None = (
-                await yt_rss_scrape._enrich_and_store_video(
-                    video, innertube, None,
+                await yt_rss_scrape._queue_video_for_scrape(
+                    video,
                     channel_handle='display-name',
-                    settings=settings,
+                    video_queue=video_queue,
                 )
             )
 
-        self.assertEqual(filename, 'video-min-abc.json.br')
+        self.assertEqual(filename, 'abc')
         upload_mock.assert_not_called()
+        video_queue.enqueue.assert_awaited_once_with(
+            'abc', source='rss',
+        )
+        video.from_innertube.assert_not_awaited()
+        video.to_file.assert_not_awaited()
         self.assertFalse(
             hasattr(yt_rss_scrape, 'enqueue_upload_video'),
         )
+
+
+class TestVideoUploadMain(unittest.TestCase):
+    def test_main_always_runs_single_process(self) -> None:
+        settings: MagicMock = MagicMock()
+        settings.video_upload_concurrency = 3
+        settings.proxies = ['http://proxy-1', 'http://proxy-2']
+        settings.metrics_port = 9399
+        settings.video_upload_log_file = '/dev/stdout'
+        settings.video_upload_log_level = 'INFO'
+
+        runner: MagicMock = MagicMock()
+        runner.run_sync.return_value = 0
+
+        with (
+            patch('tools.yt_video_upload.VideoUploadSettings',
+                  return_value=settings),
+            patch('tools.yt_video_upload.ScraperRunner',
+                  return_value=runner) as runner_cls,
+            patch('tools.yt_video_upload.sys.exit') as exit_mock,
+        ):
+            video_upload_main()
+
+        runner_cls.assert_called_once()
+        self.assertEqual(
+            runner_cls.call_args.kwargs['num_processes'],
+            1,
+        )
+        exit_mock.assert_called_once_with(0)
 
 
 if __name__ == '__main__':

@@ -266,15 +266,23 @@ from scrape_exchange._lazy_async_pool import _LazyAsyncPool
 _POOLED_HTTPX_LIMITS: Final[httpx.Limits] = httpx.Limits(
     max_keepalive_connections=100,
     max_connections=40,
-    # 120s keepalive (httpx default is 5s). Each closed-then-
-    # reopened tunnel is a fresh CONNECT SYN through the WAN
-    # router; idle gaps from rate-limit waiting and breaker
-    # cooldowns routinely exceed 5s, so the default forces
-    # excessive re-establishment under steady-state load. 120s
-    # holds the tunnel through ordinary token-wait jitter
-    # without keeping it open so long that the upstream proxy
-    # closes it from its side.
-    keepalive_expiry=600.0,
+    # Per-fetch idle window after which httpx evicts a
+    # keep-alive connection from the pool. The default 5s
+    # forced a fresh CONNECT on essentially every fetch
+    # under our request cadence — workers wait at least a
+    # few seconds at the rate limiter between requests, so
+    # 5s was below the typical per-(worker, proxy) gap.
+    #
+    # 300s sits comfortably inside YouTube's tolerance:
+    # empirical probe on 2026-05-12 showed YouTube keeps
+    # a single connection alive across 1000 sequential
+    # requests with 300s gaps between them. We hold a bit
+    # longer than the tested 300s gap because most of our
+    # actual gaps are shorter and the cost of being wrong
+    # (next request hits ConnectionResetError, httpx
+    # transparently retries on a fresh connection) is
+    # bounded.
+    keepalive_expiry=300.0,
 )
 _POOLED_HTTPX_DEFAULT_TIMEOUT: Final[httpx.Timeout] = httpx.Timeout(
     10.0, connect=5.0,

@@ -51,13 +51,13 @@ class TestReviewUnresolvedIdsDedup(
         self.cm._key = 'youtube:creator_map'
         self.claim_a: RedisClaim = RedisClaim(
             self.redis,
-            key_prefix='youtube:resolving:',
+            key_prefix='claim:youtube:channel:',
             ttl_seconds=60,
             owner='worker-A',
         )
         self.claim_b: RedisClaim = RedisClaim(
             self.redis,
-            key_prefix='youtube:resolving:',
+            key_prefix='claim:youtube:channel:',
             ttl_seconds=60,
             owner='worker-B',
         )

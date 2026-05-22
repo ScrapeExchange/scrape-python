@@ -14,8 +14,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 
 def _load_yt_rss_scrape() -> ModuleType:
-    if 'yt_rss_scrape' in sys.modules:
-        return sys.modules['yt_rss_scrape']
+    for _key in ('yt_rss_scrape', 'tools.yt_rss_scrape'):
+        if _key in sys.modules:
+            return sys.modules[_key]
     repo_root: Path = Path(__file__).resolve().parents[2]
     module_path: Path = repo_root / 'tools' / 'yt_rss_scrape.py'
     spec = importlib.util.spec_from_file_location(
@@ -24,6 +25,7 @@ def _load_yt_rss_scrape() -> ModuleType:
     assert spec is not None and spec.loader is not None
     module: ModuleType = importlib.util.module_from_spec(spec)
     sys.modules['yt_rss_scrape'] = module
+    sys.modules['tools.yt_rss_scrape'] = module
     spec.loader.exec_module(module)
     return module
 
@@ -91,6 +93,47 @@ class TestFetchRssLatency(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs['api'], 'rss')
         self.assertEqual(kwargs['platform'], 'youtube')
         duration.labels.return_value.observe.assert_called_once()
+
+    async def test_fetch_rss_sends_browser_headers_and_cookies(self) -> None:
+        captured: dict = {}
+
+        class _CapturingClient:
+            async def get(
+                self, url: str, **kwargs: object,
+            ) -> _StubResponse:
+                captured.update(kwargs)
+                return _StubResponse()
+
+        rate_limiter: MagicMock = MagicMock()
+        rate_limiter.acquire = AsyncMock(return_value='proxy-a')
+        rate_limiter.get_cookie_file_cached = MagicMock(return_value=None)
+        rate_limiter.report_rss_success = MagicMock()
+
+        with patch.object(
+            yt_rss_scrape,
+            'pooled_httpx_client_for_entry',
+            lambda entry: _CapturingClient(),
+        ), patch.object(
+            yt_rss_scrape.YouTubeRateLimiter,
+            'get', return_value=rate_limiter,
+        ):
+            await yt_rss_scrape.fetch_rss(
+                rss_url=(
+                    'https://example/feeds/videos.xml?'
+                    'channel_id=UC0'
+                ),
+                channel_handle='Test',
+                proxy='proxy-a',
+            )
+
+        headers = captured['headers']
+        cookies = captured['cookies']
+        self.assertIn('Chrome/', headers['User-Agent'])
+        self.assertEqual(headers['Sec-Fetch-Mode'], 'navigate')
+        self.assertEqual(headers['X-YouTube-Client-Name'], '1')
+        self.assertIn('CONSENT', cookies)
+        self.assertIn('SOCS', cookies)
+        self.assertIn('VISITOR_INFO1_LIVE', cookies)
 
     async def test_failure_path_records_observation(self) -> None:
         rate_limiter: MagicMock = MagicMock()
