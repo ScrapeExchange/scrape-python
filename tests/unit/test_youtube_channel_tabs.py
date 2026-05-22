@@ -5,6 +5,7 @@ These tests use mocked InnerTube responses to cover all code-paths
 without making real network calls.
 '''
 
+import asyncio
 import logging
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -903,6 +904,58 @@ class TestScrapeContent(unittest.IsolatedAsyncioTestCase):
                 await YouTubeChannelTabs.scrape_content(CHANNEL_ID)
 
         self.assertEqual(video_ids, {'vid1', 'vid2'})
+
+    async def test_scrape_tabs_starts_independent_tab_browses_together(
+        self,
+    ) -> None:
+        tabs = YouTubeChannelTabs(CHANNEL_ID)
+        browse_started = asyncio.Event()
+        unblock = asyncio.Event()
+        started: set[str] = set()
+        source_tabs = [
+            {
+                'tabRenderer': {
+                    'title': 'Videos',
+                    'endpoint': {
+                        'browseEndpoint': {'params': 'videos_p'},
+                    },
+                },
+            },
+            {
+                'tabRenderer': {
+                    'title': 'Shorts',
+                    'endpoint': {
+                        'browseEndpoint': {'params': 'shorts_p'},
+                    },
+                },
+            },
+        ]
+
+        async def browse(*, params='', continuation_token=''):
+            started.add(params)
+            if len(started) == 2:
+                browse_started.set()
+            await unblock.wait()
+            return {'contents': {}}
+
+        with patch.object(
+            tabs, '_browse', side_effect=browse,
+        ), patch.object(
+            tabs, 'get_tab',
+            return_value={
+                'content': {
+                    'richGridRenderer': {'contents': []},
+                },
+            },
+        ):
+            task = asyncio.create_task(tabs._scrape_tabs(source_tabs))
+            await asyncio.wait_for(
+                browse_started.wait(), timeout=0.1,
+            )
+            unblock.set()
+            await task
+
+        self.assertEqual(started, {'videos_p', 'shorts_p'})
 
     @patch(
         'scrape_exchange.youtube.youtube_channel_tabs.AsyncYouTubeClient._delay',

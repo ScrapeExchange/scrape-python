@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 
 '''
-Tool to import 3rd-party YouTube datasets into
-``video-min-<video_id>.json.br`` files compatible with the
-``YouTubeVideo`` model.
+Tool to import 3rd-party YouTube datasets by enqueueing every
+discovered ``video_id`` to the Redis video scrape queue and
+every newly-seen channel to the Redis channel scrape queue.
+The production scrapers then fetch the actual video and channel
+metadata directly from YouTube, so 3rd-party fields (title,
+view_count, channel_subs, …) are not preserved — the dataset
+serves only as a source of identifiers.
 
 Datasets are downloaded via :mod:`kagglehub` (default cache:
 ``~/.cache/kaggle``). Auth comes from ``~/.kaggle/kaggle.json``
@@ -11,11 +15,12 @@ or the ``KAGGLE_USERNAME`` / ``KAGGLE_KEY`` env vars (env vars
 override the file).
 
 Each dataset's directory is walked recursively for ``.csv``,
-``.jsonl`` (or ``.ndjson``) and ``.parquet`` files; rows are
-converted to ``YouTubeVideo`` instances via a column-alias
-mapping (different uploads use different column-name spellings).
-Rows missing a ``video_id`` are skipped, as are rows whose output
-``video-min-*.json.br`` file already exists in ``--save-dir``.
+``.jsonl`` (or ``.ndjson``) and ``.parquet`` files; for every
+row a video_id and (optional) channel handle/id are extracted
+via a column-alias mapping. Channel handles route to
+``enqueue_unresolved``; valid ``UC…`` channel_ids route to
+``enqueue_scheduled``. Re-running over the same dataset is a
+near-no-op thanks to Redis ZADD-NX dedup in both queues.
 
 The legacy ``--csv-file`` flag is preserved as a manual override
 for offline work; when set, no Kaggle download happens and the
@@ -24,14 +29,12 @@ dispatch applies — ``--csv-file foo.parquet`` works.
 
 Examples:
 
-  # Use the built-in dataset list and default cache:
-  python tools/import_kaggle_trending.py \\
-      --save-dir /tmp/kaggle-videos
+  # Use the built-in dataset list:
+  python tools/yt_import_3rdparty_data.py
 
-  # Process one local file (legacy mode):
-  python tools/import_kaggle_trending.py \\
-      --csv-file /path/to/dataset.parquet \\
-      --save-dir /tmp/kaggle-videos
+  # Process one local file (manual mode):
+  python tools/yt_import_3rdparty_data.py \\
+      --csv-file /path/to/dataset.parquet
 
 :author    : Boinko <boinko@scrape.exchange>
 :copyright : 2026 Boinko
@@ -50,6 +53,7 @@ from typing import Iterator, Literal
 from dataclasses import dataclass, field
 
 import kagglehub
+import redis.asyncio as aioredis
 
 # Private kagglehub helpers used by ``_dataset_is_cached`` to
 # determine whether ``dataset_download`` will hit the local cache
@@ -81,20 +85,43 @@ from huggingface_hub.errors import LocalEntryNotFoundError
 
 import pyarrow.parquet as pq
 
-from dateutil import parser as dateutil_parser
-
 from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from scrape_exchange.logging import configure_logging
 from scrape_exchange.settings import normalize_log_level
-from scrape_exchange.youtube.youtube_video import (
-    YouTubeMediaType,
-    YouTubeVideo,
+from scrape_exchange.video_scrape_queue import (
+    RedisVideoScrapeQueue,
+    VideoScrapeQueueSettings,
+)
+from scrape_exchange.channel_scrape_queue import (
+    RedisChannelScrapeQueue,
+    ChannelScrapeQueueSettings,
 )
 
+from scrape_exchange.youtube.youtube_channel import YouTubeChannel
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
+
+
+_VIDEO_ID_RE: re.Pattern[str] = re.compile(
+    r'^[A-Za-z0-9_-]{11}$',
+)
+
+# YouTube handles: 3-30 characters, applied after stripping any
+# leading "@". Allow letters / digits / combining marks from any
+# script (CJK, Cyrillic, Arabic, Devanagari, Thai, …) by using a
+# negative character class — reject only the characters that are
+# clearly junk: whitespace, slashes, URL separators, quote
+# marks, ``@``, backslash and ASCII control chars. The negative
+# class lets through combining marks (Devanagari vowel signs,
+# Arabic harakat, etc.) which ``\w`` excludes, so non-Latin
+# handles round-trip. YouTube itself rejects handles that
+# survive this filter but aren't real channels when the
+# scraper later resolves them.
+_CHANNEL_HANDLE_RE: re.Pattern[str] = re.compile(
+    r'^[^\s/\\?#&=<>"\'@]{3,30}$',
+)
 
 
 # Dataset slugs (``owner/name``) processed by default. URLs and
@@ -112,59 +139,20 @@ DEFAULT_KAGGLE_DATASETS: list[str] = [
 
 
 # Logical field name -> ordered list of column-name candidates.
-# Different Kaggle uploads use different spellings; we try each
-# candidate in order and pick the first non-empty value. New
-# datasets may need additional aliases here, but most files use
-# variants of the same handful of names.
+# Different uploads use different spellings; we try each candidate
+# in order and pick the first non-empty value. Only the fields
+# needed to identify videos and channels are kept — the rest of
+# the dataset's metadata is discarded since the production
+# scraper sources fresh data from YouTube.
 COLUMN_ALIASES: dict[str, list[str]] = {
     'video_id': [
         'video_id', 'videoId', 'video_ID', 'id', 'youtube_id',
     ],
-    'title': ['title', 'video_title', 'name'],
-    'description': ['description', 'video_description', 'desc'],
     'channel_id': ['channel_id', 'channelId', 'channel_ID'],
     'channel_handle': [
         'channel_handle', 'channelHandle', 'handle',
         'channel_username', 'channel_user',
     ],
-    'channel_subs': [
-        'channel_subs', 'channel_subscribers', 'subscriber_count',
-        'subscriberCount', 'subscribers', 'subs',
-    ],
-    'channel_name': [
-        'channel_name', 'channel_title', 'channelTitle',
-        'channel',
-    ],
-    'view_count': ['view_count', 'views', 'viewCount'],
-    'like_count': ['like_count', 'likes', 'likeCount'],
-    'comment_count': [
-        'comment_count', 'comments_count', 'comments',
-        'commentCount',
-    ],
-    'publish_date': [
-        'publish_date', 'published_at', 'publishedAt',
-        'publish_time', 'publishedAtSQL',
-    ],
-    'tags': ['video_tags', 'tags'],
-    'thumbnail_url': [
-        'thumbnail_url', 'thumbnail', 'thumbnail_link',
-    ],
-    'kind': ['kind', 'media_type', 'category'],
-    'country': ['country', 'region', 'region_code'],
-    'language': [
-        'langauge', 'language', 'lang', 'default_audio_language',
-    ],
-}
-
-
-MEDIA_TYPE_MAP: dict[str, YouTubeMediaType] = {
-    'video': YouTubeMediaType.VIDEO,
-    'short': YouTubeMediaType.SHORT,
-    'shorts': YouTubeMediaType.SHORT,
-    'playlist': YouTubeMediaType.PLAYLIST,
-    'channel': YouTubeMediaType.CHANNEL,
-    'live': YouTubeMediaType.LIVE,
-    'movie': YouTubeMediaType.MOVIE,
 }
 
 
@@ -281,30 +269,14 @@ class ImportKaggleTrendingSettings(BaseSettings):
             '(.csv, .jsonl/.ndjson, .parquet).'
         ),
     )
-    third_party_save_dir: str = Field(
-        default='/var/tmp/3rdparty-videos',
+    redis_dsn: str = Field(
+        default='redis://localhost:6379/0',
         validation_alias=AliasChoices(
-            'VIDEO_3RD_PARTY_SAVE_DIR', 'video_3rd_party_save_dir'
+            'REDIS_DSN', 'redis_dsn',
         ),
         description=(
-            'Directory to write video-min-<video_id>.json.br '
-            'files into.'
-        ),
-    )
-    channels_file: str | None = Field(
-        default='3rd-party-channels.jsonl',
-        validation_alias=AliasChoices(
-            'THIRD_PARTY_CHANNELS_FILE', 'channels_file',
-        ),
-        description=(
-            'JSONL file to which newly-discovered 3rd-party '
-            'channels are appended (one '
-            '{"channel_id", "channel", "channel_subs"} object '
-            'per line). Default: '
-            '<save_dir>/3rdparty_channels.jsonl. Channels are '
-            'deduped across all slugs in the same run; rows with '
-            'only a channel_handle are accepted and the handle '
-            'is used as the dedup key.'
+            'Redis DSN for the video and channel scrape queues. '
+            'Production: redis://localhost:6379/0.'
         ),
     )
     log_level: str = Field(
@@ -338,12 +310,14 @@ class ImportKaggleTrendingSettings(BaseSettings):
 
 @dataclass
 class ImportStats:
-    written: int = 0
+    enqueued_videos: int = 0
+    enqueued_channels: int = 0
     skipped: int = 0
     errors: int = 0
 
     def merge(self, other: 'ImportStats') -> None:
-        self.written += other.written
+        self.enqueued_videos += other.enqueued_videos
+        self.enqueued_channels += other.enqueued_channels
         self.skipped += other.skipped
         self.errors += other.errors
 
@@ -380,18 +354,6 @@ def _parse_slug(value: str) -> str:
     return match.group('slug')
 
 
-def _safe_int(value: object | None) -> int | None:
-    if value is None:
-        return None
-    text: str = str(value).strip()
-    if not text:
-        return None
-    try:
-        return int(float(text))
-    except (ValueError, TypeError):
-        return None
-
-
 def _pick(row: dict, field_name: str) -> str:
     '''
     Return the first non-empty trimmed value for *field_name*
@@ -410,104 +372,50 @@ def _pick(row: dict, field_name: str) -> str:
 
 def _extract_channel(
     row: dict,
-) -> tuple[str | None, dict | None]:
+) -> tuple[str | None, str | None, str | None]:
     '''
-    Return ``(dedup_key, channel_record)`` for the channel
-    represented by *row*, or ``(None, None)`` when the row
-    has neither a ``channel_id`` nor a ``channel_handle``.
+    Return ``(dedup_key, channel_id, handle)`` for the channel
+    represented by *row*, or ``(None, None, None)`` when neither
+    a well-formed ``UC…`` ``channel_id`` nor a well-formed
+    handle is present.
 
-    The handle is left-stripped of any leading ``@``. The
-    dedup key is the ``channel_id`` when present, otherwise the
-    bare handle — channel_ids and handles live in disjoint
-    namespaces in practice, so they share one ``seen`` set
-    without collision risk.
+    The handle is left-stripped of any leading ``@`` and
+    validated against :data:`_CHANNEL_HANDLE_RE`; the channel_id
+    is validated against :data:`YouTubeChannel.CHANNEL_ID_REGEX_MATCH`. Junk
+    values that fail validation are treated as absent so they never
+    reach the Redis queue.
+
+    The dedup key is the validated ``channel_id`` when present,
+    otherwise the validated handle — channel_ids and handles
+    live in disjoint namespaces in practice, so they share one
+    ``seen`` set without collision risk.
     '''
-    channel_id: str = _pick(row, 'channel_id')
-    handle: str = _pick(row, 'channel_handle').lstrip('@')
-    if not handle and row.get('channel') and row.get('channel')[0] == '@':
-        handle = str(row.get('channel')).lstrip('@').strip()
+    raw_channel_id: str = _pick(row, 'channel_id')
+    raw_handle: str = _pick(row, 'channel_handle').lstrip('@')
+    if (
+        not raw_handle
+        and row.get('channel')
+        and str(row.get('channel'))[0] == '@'
+    ):
+        raw_handle = (
+            str(row.get('channel')).lstrip('@').strip()
+        )
 
-    if not channel_id and not handle:
-        return None, None
-
-    record: dict = {
-        'channel_id': channel_id or None,
-        'channel': handle or None,
-        'channel_subs': _safe_int(_pick(row, 'channel_subs')),
-    }
-    key: str = channel_id or handle
-    return key, record
-
-
-def _append_channels_jsonl(
-    path: Path, records: list[dict],
-) -> None:
-    '''Append one JSON object per line to *path*. Creates the
-    parent directory and the file on first write.'''
-    if not records:
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open('a', encoding='utf-8') as f:
-        for record in records:
-            f.write(json.dumps(record, ensure_ascii=False))
-            f.write('\n')
-
-
-def row_to_video(row: dict) -> YouTubeVideo | None:
-    '''
-    Convert one parsed row into a populated :class:`YouTubeVideo`,
-    or ``None`` when the row has no recognisable video_id.
-    '''
-    video_id: str = _pick(row, 'video_id')
-    if not video_id:
-        return None
-
-    handle: str = _pick(row, 'channel_handle').lstrip('@')
-    video: YouTubeVideo = YouTubeVideo(
-        video_id=video_id,
-        channel_handle=handle or None,
+    channel_id: str | None = (
+        raw_channel_id
+        if YouTubeChannel.CHANNEL_ID_REGEX_MATCH.fullmatch(raw_channel_id)
+        else None
     )
-
-    video.title = _pick(row, 'title') or None
-    video.description = _pick(row, 'description') or None
-    video.channel_id = _pick(row, 'channel_id') or None
-    video.view_count = _safe_int(_pick(row, 'view_count'))
-    video.like_count = _safe_int(_pick(row, 'like_count'))
-    video.comment_count = _safe_int(_pick(row, 'comment_count'))
-    video.locale = _pick(row, 'country') or None
-    video.default_audio_language = _pick(row, 'language') or None
-
-    video.url = YouTubeVideo.VIDEO_URL.format(
-        video_id=video.video_id,
+    handle: str | None = (
+        raw_handle
+        if _CHANNEL_HANDLE_RE.fullmatch(raw_handle)
+        else None
     )
-    video.embed_url = YouTubeVideo.EMBED_URL.format(
-        video_id=video.video_id,
-    )
+    if channel_id is None and handle is None:
+        return None, None, None
 
-    raw_tags: str = _pick(row, 'tags')
-    if raw_tags and raw_tags != '[None]':
-        video.tags = {
-            t.strip() for t in raw_tags.split('|') if t.strip()
-        }
-
-    kind: str = _pick(row, 'kind').lower()
-    if kind:
-        video.media_type = MEDIA_TYPE_MAP.get(kind)
-
-    publish_date: str = _pick(row, 'publish_date')
-    if publish_date:
-        try:
-            video.published_timestamp = dateutil_parser.parse(
-                publish_date,
-            )
-        except (ValueError, TypeError):
-            pass
-
-    thumbnail: str = _pick(row, 'thumbnail_url')
-    if thumbnail:
-        video.channel_thumbnail_url = thumbnail
-
-    return video
+    key: str = channel_id or handle  # type: ignore[assignment]
+    return key, channel_id, handle
 
 
 def _find_data_files(root: Path) -> list[Path]:
@@ -574,55 +482,54 @@ def _iter_rows(path: Path) -> Iterator[dict]:
     raise ValueError(f'unsupported file format: {path}')
 
 
-def _existing_artefact(
-    third_party_save_dir: Path, video_id: str,
-) -> Path | None:
+async def _enqueue_channel(
+    channel_queue: RedisChannelScrapeQueue,
+    channel_id: str | None,
+    handle: str | None,
+    source: str,
+) -> bool:
     '''
-    Return the existing artefact path for *video_id* in
-    *third_party_save_dir*, or ``None`` when no artefact exists
-    yet. Recognised artefacts:
+    Enqueue one channel. Returns ``True`` when something was
+    enqueued, ``False`` when neither a validated channel_id nor
+    a validated handle is present.
 
-    * ``video-min-<video_id>.json.br`` — full InnerTube record
-    * ``video-dlp-<video_id>.json.br`` — InnerTube + yt-dlp record
-    * ``<video_id>`` (bare, no extension) — sentinel touched by
-      :func:`import_file` for rows that did not meet the
-      ``video-min`` bar; presence means "already evaluated, do
-      not re-process".
+    Inputs are expected to be pre-validated by
+    :func:`_extract_channel`: ``channel_id`` matches
+    :data:`YouTubeChannel.CHANNEL_ID_REGEX_MATCH`, ``handle`` matches
+    :data:`_CHANNEL_HANDLE_RE`. Validated ``channel_id``s route
+    to ``enqueue_scheduled``; validated handles route to
+    ``enqueue_unresolved``.
     '''
-    for candidate in (
-        third_party_save_dir / f'video-min-{video_id}.json.br',
-        third_party_save_dir / f'video-dlp-{video_id}.json.br',
-        third_party_save_dir / video_id,
-    ):
-        if candidate.exists():
-            return candidate
-    return None
+    if channel_id is not None:
+        await channel_queue.enqueue_scheduled(
+            channel_id, source=source,
+        )
+        return True
+    if handle is not None:
+        await channel_queue.enqueue_unresolved(
+            handle, source=source,
+        )
+        return True
+    return False
 
 
 async def import_file(
-    data_path: Path, third_party_save_dir: Path,
-    discovered: dict[str, dict], seen: set[str],
+    data_path: Path,
+    video_queue: RedisVideoScrapeQueue,
+    channel_queue: RedisChannelScrapeQueue,
+    source: str,
+    seen_channels: set[str],
 ) -> ImportStats:
     '''
-    Iterate every row of *data_path* and:
+    Iterate every row of *data_path* and enqueue each row's
+    ``video_id`` to *video_queue* (skipping rows with no
+    11-character video_id). For each newly-seen channel (deduped
+    against *seen_channels*) enqueue the channel handle or
+    channel_id to *channel_queue*.
 
-    * for each row, decide what to write based on
-      :meth:`YouTubeVideo.classify`:
-
-        - ``'video-dlp'`` → write
-          ``video-dlp-<video_id>.json.br``
-        - ``'video-min'`` → write
-          ``video-min-<video_id>.json.br``
-        - ``None`` → touch a bare ``<video_id>`` sentinel file in
-          *third_party_save_dir* so the row is not re-evaluated
-          on the next run.
-
-      Rows whose video_id already has any of the three artefacts
-      on disk are skipped without re-classifying.
-    * record any newly-seen channel into *discovered* (a
-      per-slug dict mutated in place) — keyed by channel_id, or
-      handle when channel_id is absent. Channels whose key is
-      already in *seen* (the run-wide dedup set) are not added.
+    Returns counts of videos enqueued, channels enqueued, rows
+    skipped (no video_id / malformed), and errors raised by the
+    Redis layer.
     '''
 
     stats: ImportStats = ImportStats()
@@ -640,56 +547,46 @@ async def import_file(
     try:
         for row_num, row in enumerate(rows, start=1):
             key: str | None
-            record: dict | None
-            key, record = _extract_channel(row)
-            if (
-                key is not None and record is not None
-                and key not in seen and key not in discovered
-            ):
-                discovered[key] = record
+            channel_id: str | None
+            handle: str | None
+            key, channel_id, handle = _extract_channel(row)
+            if key is not None and key not in seen_channels:
+                seen_channels.add(key)
+                try:
+                    enqueued: bool = await _enqueue_channel(
+                        channel_queue, channel_id, handle,
+                        source,
+                    )
+                except Exception as exc:
+                    _LOGGER.error(
+                        'Failed to enqueue channel', exc=exc,
+                        extra={
+                            'data_file': data_path.name,
+                            'row_num': row_num,
+                            'channel_id': channel_id,
+                            'handle': handle,
+                        },
+                    )
+                    stats.errors += 1
+                else:
+                    if enqueued:
+                        stats.enqueued_channels += 1
 
             video_id: str = _pick(row, 'video_id')
             if not video_id:
                 stats.skipped += 1
                 continue
-            if _existing_artefact(
-                third_party_save_dir, video_id,
-            ) is not None:
+            if not _VIDEO_ID_RE.fullmatch(video_id):
                 stats.skipped += 1
                 continue
             try:
-                video: YouTubeVideo | None = row_to_video(row)
-                if video is None:
-                    stats.skipped += 1
-                    continue
-
-                classification: str | None = video.classify()
-                if classification is None:
-                    # Below the video-min bar: touch a sentinel
-                    # file (bare video_id, no extension) so the
-                    # next run skips this row instead of
-                    # re-evaluating it.
-                    (third_party_save_dir / video_id).touch()
-                    stats.skipped += 1
-                    _LOGGER.debug(
-                        'Row classified below video-min; '
-                        'touched sentinel',
-                        extra={
-                            'video_id': video_id,
-                            'data_file': data_path.name,
-                            'row_num': row_num,
-                        },
-                    )
-                    continue
-
-                await video.to_file(
-                    str(third_party_save_dir),
-                    f'{classification}-',
+                await video_queue.enqueue(
+                    video_id, source=source,
                 )
-                stats.written += 1
+                stats.enqueued_videos += 1
             except Exception as exc:
                 _LOGGER.error(
-                    'Failed to process row', exc=exc,
+                    'Failed to enqueue video', exc=exc,
                     extra={
                         'data_file': data_path.name,
                         'row_num': row_num,
@@ -795,14 +692,14 @@ def _dataset_is_cached_hf(repo_id: str) -> bool | None:
 async def _walk_and_import(
     report: DatasetReport,
     local_path: Path,
-    third_party_save_dir: Path,
-    channels_file: Path,
+    video_queue: RedisVideoScrapeQueue,
+    channel_queue: RedisChannelScrapeQueue,
+    source: str,
     seen_channels: set[str],
 ) -> None:
     '''
-    Walk *local_path* for supported data files, run each through
-    :func:`import_file`, and flush newly-discovered channels.
-    Updates *report* in place.
+    Walk *local_path* for supported data files and run each
+    through :func:`import_file`. Updates *report* in place.
 
     Shared by :func:`import_dataset` (Kaggle) and
     :func:`import_hf_dataset` (Hugging Face) — once the dataset's
@@ -821,7 +718,6 @@ async def _walk_and_import(
         return
     report.files = files
 
-    discovered: dict[str, dict] = {}
     for data_path in files:
         _LOGGER.info(
             'Processing data file',
@@ -831,59 +727,41 @@ async def _walk_and_import(
             },
         )
         stats: ImportStats = await import_file(
-            data_path, third_party_save_dir,
-            discovered, seen_channels,
+            data_path, video_queue, channel_queue,
+            source, seen_channels,
         )
         _LOGGER.info(
             'Data file complete',
             extra={
                 'slug': report.slug,
                 'data_file': data_path.name,
-                'written': stats.written,
+                'enqueued_videos': stats.enqueued_videos,
+                'enqueued_channels': stats.enqueued_channels,
                 'skipped': stats.skipped,
                 'errors': stats.errors,
             },
         )
         report.stats.merge(stats)
 
-    if discovered:
-        _append_channels_jsonl(
-            channels_file, list(discovered.values()),
-        )
-        seen_channels.update(discovered.keys())
-        _LOGGER.info(
-            'Appended new channels to channels file',
-            extra={
-                'slug': report.slug,
-                'new_channels': len(discovered),
-                'channels_file': str(channels_file),
-            },
-        )
-
 
 async def import_dataset(
-    slug: str, third_party_save_dir: Path,
-    channels_file: Path, seen_channels: set[str],
+    slug: str,
+    video_queue: RedisVideoScrapeQueue,
+    channel_queue: RedisChannelScrapeQueue,
+    seen_channels: set[str],
 ) -> DatasetReport:
     '''
     Download *slug* via :func:`kagglehub.dataset_download` and
-    process every supported data file in the resulting cache
-    directory.
+    enqueue every recognised video_id / channel into the Redis
+    queues.
 
     Before calling kagglehub the resolved version is checked
     against the local cache via :func:`_dataset_is_cached`. When
     the dataset is already cached (no new data) the file walk is
-    skipped entirely — every row would be no-op'd by the
-    ``_existing_artefact`` row-level check anyway, so the walk
-    would only burn CPU and risk re-emitting duplicate channel
-    records to *channels_file*.  ``report.cached`` records the
-    outcome (True / False / None for unknown).
-
-    Newly-discovered channels (deduped against *seen_channels*
-    and within this slug) are flushed as JSONL to
-    *channels_file* once all files in the slug are processed,
-    and their keys are merged into *seen_channels* so they are
-    not re-emitted by later slugs in the same run.
+    skipped — Redis ZADD-NX would no-op anyway and skipping the
+    walk saves CPU and avoids re-enqueueing the same channel
+    keys.  ``report.cached`` records the outcome (True / False /
+    None for unknown).
     '''
 
     report: DatasetReport = DatasetReport(slug=slug)
@@ -919,16 +797,19 @@ async def import_dataset(
         'Dataset not cached, scanning for data files',
         extra={'slug': slug, 'local_path': str(local_path)},
     )
+    source: str = f'3rdparty:kaggle:{slug}'
     await _walk_and_import(
-        report, local_path, third_party_save_dir,
-        channels_file, seen_channels,
+        report, local_path, video_queue, channel_queue,
+        source, seen_channels,
     )
     return report
 
 
 async def import_hf_dataset(
-    repo_id: str, third_party_save_dir: Path,
-    channels_file: Path, seen_channels: set[str],
+    repo_id: str,
+    video_queue: RedisVideoScrapeQueue,
+    channel_queue: RedisChannelScrapeQueue,
+    seen_channels: set[str],
 ) -> DatasetReport:
     '''
     Hugging Face counterpart to :func:`import_dataset`.
@@ -984,34 +865,22 @@ async def import_hf_dataset(
             'local_path': str(local_path),
         },
     )
+    source: str = f'3rdparty:hf:{repo_id}'
     await _walk_and_import(
-        report, local_path, third_party_save_dir,
-        channels_file, seen_channels,
+        report, local_path, video_queue, channel_queue,
+        source, seen_channels,
     )
     return report
 
 
-def _resolve_channels_file(
-    settings: ImportKaggleTrendingSettings,
-    third_party_save_dir: Path,
-) -> Path:
-    '''
-    Return the JSONL path for newly-discovered channels —
-    either the explicit ``--channels-file`` setting or
-    ``<third_party_save_dir>/3rdparty_channels.jsonl``.
-    '''
-
-    if settings.channels_file:
-        return Path(settings.channels_file).expanduser()
-    return third_party_save_dir / '3rdparty_channels.jsonl'
-
-
 async def _run_manual_file(
     settings: ImportKaggleTrendingSettings,
-    third_party_save_dir: Path,
+    video_queue: RedisVideoScrapeQueue,
+    channel_queue: RedisChannelScrapeQueue,
 ) -> int:
     '''
-    Manual ``--csv-file`` mode: import a single local file.
+    Manual ``--csv-file`` mode: import a single local file
+    straight into the Redis queues.
     '''
 
     data_path: Path = Path(settings.csv_file or '')
@@ -1034,29 +903,17 @@ async def _run_manual_file(
     _LOGGER.info(
         'Manual file mode', extra={'csv_file': str(data_path)},
     )
-    channels_file: Path = _resolve_channels_file(
-        settings, third_party_save_dir,
-    )
-    discovered: dict[str, dict] = {}
     seen_channels: set[str] = set()
+    source: str = f'3rdparty:manual:{data_path.name}'
     stats: ImportStats = await import_file(
-        data_path, third_party_save_dir, discovered, seen_channels,
+        data_path, video_queue, channel_queue,
+        source, seen_channels,
     )
-    if discovered:
-        _append_channels_jsonl(
-            channels_file, list(discovered.values()),
-        )
-        _LOGGER.info(
-            'Appended new channels to channels file',
-            extra={
-                'new_channels': len(discovered),
-                'channels_file': str(channels_file),
-            },
-        )
     _LOGGER.info(
         'Manual file mode complete',
         extra={
-            'written': stats.written,
+            'enqueued_videos': stats.enqueued_videos,
+            'enqueued_channels': stats.enqueued_channels,
             'skipped': stats.skipped,
             'errors': stats.errors,
         },
@@ -1066,8 +923,8 @@ async def _run_manual_file(
 
 async def _import_kaggle_datasets(
     raw_slugs: list[str],
-    third_party_save_dir: Path,
-    channels_file: Path,
+    video_queue: RedisVideoScrapeQueue,
+    channel_queue: RedisChannelScrapeQueue,
     seen_channels: set[str],
     grand: ImportStats,
     reports: list[DatasetReport],
@@ -1096,8 +953,7 @@ async def _import_kaggle_datasets(
             continue
         seen_slugs.add(slug)
         report: DatasetReport = await import_dataset(
-            slug, third_party_save_dir,
-            channels_file, seen_channels,
+            slug, video_queue, channel_queue, seen_channels,
         )
         reports.append(report)
         grand.merge(report.stats)
@@ -1105,8 +961,8 @@ async def _import_kaggle_datasets(
 
 async def _import_hf_datasets(
     raw_repo_ids: list[str],
-    third_party_save_dir: Path,
-    channels_file: Path,
+    video_queue: RedisVideoScrapeQueue,
+    channel_queue: RedisChannelScrapeQueue,
     seen_channels: set[str],
     grand: ImportStats,
     reports: list[DatasetReport],
@@ -1129,8 +985,7 @@ async def _import_hf_datasets(
             continue
         seen_repo_ids.add(repo_id)
         report: DatasetReport = await import_hf_dataset(
-            repo_id, third_party_save_dir,
-            channels_file, seen_channels,
+            repo_id, video_queue, channel_queue, seen_channels,
         )
         reports.append(report)
         grand.merge(report.stats)
@@ -1138,14 +993,16 @@ async def _import_hf_datasets(
 
 async def _run_3rd_party(
     settings: ImportKaggleTrendingSettings,
-    third_party_save_dir: Path,
+    video_queue: RedisVideoScrapeQueue,
+    channel_queue: RedisChannelScrapeQueue,
 ) -> int:
     '''
     Default mode: download every configured Kaggle and Hugging
-    Face dataset and import all supported data files within.
-    Both providers share a single ``seen_channels`` set so a
-    channel discovered in (e.g.) a Kaggle slug isn't re-flushed
-    when it also appears in an HF repo.
+    Face dataset and enqueue every discovered video_id / channel
+    into the Redis queues. Both providers share a single
+    ``seen_channels`` set so a channel discovered in (e.g.) a
+    Kaggle slug isn't re-enqueued when it also appears in an HF
+    repo.
     '''
 
     kaggle_cache_dir: Path = Path(
@@ -1169,9 +1026,6 @@ async def _run_3rd_party(
     # state lives wherever the user has it configured.
     os.environ['HF_HUB_CACHE'] = str(hf_cache_dir)
 
-    channels_file: Path = _resolve_channels_file(
-        settings, third_party_save_dir,
-    )
     seen_channels: set[str] = set()
     grand: ImportStats = ImportStats()
     reports: list[DatasetReport] = []
@@ -1209,11 +1063,11 @@ async def _run_3rd_party(
         hf_repo_ids = settings.hf_datasets
 
     await _import_kaggle_datasets(
-        kaggle_slugs, third_party_save_dir, channels_file,
+        kaggle_slugs, video_queue, channel_queue,
         seen_channels, grand, reports,
     )
     await _import_hf_datasets(
-        hf_repo_ids, third_party_save_dir, channels_file,
+        hf_repo_ids, video_queue, channel_queue,
         seen_channels, grand, reports,
     )
 
@@ -1240,7 +1094,10 @@ def _emit_summary(
                 'slug': report.slug,
                 'cached': report.cached,
                 'files': len(report.files),
-                'written': report.stats.written,
+                'enqueued_videos': report.stats.enqueued_videos,
+                'enqueued_channels': (
+                    report.stats.enqueued_channels
+                ),
                 'skipped': report.stats.skipped,
                 'errors': report.stats.errors,
             },
@@ -1248,7 +1105,8 @@ def _emit_summary(
     _LOGGER.info(
         'All datasets complete',
         extra={
-            'written': grand.written,
+            'enqueued_videos': grand.enqueued_videos,
+            'enqueued_channels': grand.enqueued_channels,
             'skipped': grand.skipped,
             'errors': grand.errors,
         },
@@ -1264,13 +1122,28 @@ async def main() -> int:
         filename=settings.log_file,
         log_format=settings.log_format,
     )
-    third_party_save_dir: Path = Path(settings.third_party_save_dir)
-    third_party_save_dir.mkdir(parents=True, exist_ok=True)
 
-    if settings.csv_file:
-        return await _run_manual_file(settings, third_party_save_dir)
-
-    return await _run_3rd_party(settings, third_party_save_dir)
+    redis: aioredis.Redis = aioredis.from_url(
+        settings.redis_dsn, decode_responses=True,
+    )
+    video_queue: RedisVideoScrapeQueue = RedisVideoScrapeQueue(
+        redis, VideoScrapeQueueSettings(),
+    )
+    channel_queue: RedisChannelScrapeQueue = (
+        RedisChannelScrapeQueue(
+            redis, ChannelScrapeQueueSettings(),
+        )
+    )
+    try:
+        if settings.csv_file:
+            return await _run_manual_file(
+                settings, video_queue, channel_queue,
+            )
+        return await _run_3rd_party(
+            settings, video_queue, channel_queue,
+        )
+    finally:
+        await redis.aclose()
 
 
 if __name__ == '__main__':

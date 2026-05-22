@@ -25,7 +25,6 @@ import asyncio
 from asyncio import sleep
 
 import orjson
-import brotli
 import untangle
 from innertube import InnerTube
 
@@ -43,6 +42,7 @@ from yt_dlp.utils import DownloadError
 # before youtube_video).  If a callable here ever needs a YouTubeChannel
 # class attribute, do the import lazily inside the function body.
 
+from ..brotli import brotli_read_async, brotli_write_async
 from ..file_management import atomic_write_bytes
 from ..util import convert_number_string
 
@@ -71,6 +71,7 @@ METRIC_EXTRACT_INFO_ACTIVE: Gauge = Gauge(
     'Number of yt-dlp extract_info calls currently running in '
     'the thread pool, labelled by proxy.',
     ['platform', 'scraper', 'entity', 'api', 'proxy', 'worker_id'],
+    multiprocess_mode='livemostrecent',
 )
 
 
@@ -244,7 +245,10 @@ class YouTubeVideo:
             'dislike_count': self.dislike_count,
             'comment_count': self.comment_count,
             'available_country_codes': list(self.available_country_codes),
-            'url': self.url,
+            'url': self.url or (
+                self.VIDEO_URL.format(video_id=self.video_id)
+                if self.video_id else None
+            ),
             'is_live': self.is_live,
             'was_live': self.was_live,
             'media_type': self.media_type.value if self.media_type else None,
@@ -322,7 +326,7 @@ class YouTubeVideo:
         video = YouTubeVideo(
             video_id=data.get('video_id'),
             channel_handle=data.get('channel_handle'),
-            channel_thumbnail=YouTubeThumbnail.from_yt_dict(
+            channel_thumbnail=YouTubeThumbnail.from_dict(
                 data['channel_thumbnail']
             ) if data.get('channel_thumbnail') else None
         )
@@ -746,7 +750,7 @@ class YouTubeVideo:
             proxy = random.choice(proxies)
 
         instantiated_download_client: bool = False
-        if not download_client:
+        if with_formats and not download_client:
             download_client = YouTubeVideo._setup_download_client(
                 deno_path, po_token_url, ytdlp_cache_dir, debug, proxy=proxy,
             )
@@ -794,14 +798,16 @@ class YouTubeVideo:
             self.video_id, save_dir, filename_prefix, compressed
         )
 
-        data: bytes = orjson.dumps(self.to_dict(), option=orjson.OPT_INDENT_2)
-
-        if compressed:
-            data = brotli.compress(data, quality=11, mode=brotli.MODE_TEXT)
         if not overwrite and os.path.exists(filename):
             raise FileExistsError(f'File {filename} already exists')
 
-        await atomic_write_bytes(filename, data)
+        if compressed:
+            await brotli_write_async(filename, self.to_dict())
+        else:
+            data: bytes = orjson.dumps(
+                self.to_dict(), option=orjson.OPT_INDENT_2,
+            )
+            await atomic_write_bytes(filename, data)
 
         return filename
 
@@ -821,13 +827,12 @@ class YouTubeVideo:
             video_id, load_dir, filename_prefix, compressed
         )
 
-        async with aiofiles.open(filename, 'rb') as f:
-            data: bytes = await f.read()
-
         if compressed:
-            data = brotli.decompress(data)
-
-        video_data: dict[str, any] = orjson.loads(data)
+            video_data: dict[str, any] = await brotli_read_async(filename)
+        else:
+            async with aiofiles.open(filename, 'rb') as f:
+                data: bytes = await f.read()
+            video_data = orjson.loads(data)
         return YouTubeVideo.from_dict(video_data)
 
     @staticmethod

@@ -12,7 +12,10 @@ import logging
 import re
 import time
 
+from collections.abc import Callable
 from datetime import datetime
+from typing import Any
+
 from innertube import InnerTube
 from innertube.errors import RequestError as InnerTubeRequestError
 
@@ -35,6 +38,50 @@ from .youtube_videochapter import YouTubeVideoChapter
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .youtube_video import YouTubeVideo
+
+
+_INNERTUBE_CALL_LOCKS: dict[int, asyncio.Lock] = {}
+
+# Wall-clock safety net for a single innertube player/next call. The
+# inner sync HTTP stack (httpx + curl_cffi) is supposed to enforce its
+# own timeouts, but on 2026-05-17 both video scrapers (scraper001 +
+# scraper002) went silent within the same 30-second window at 09:17 UTC
+# with workers stuck inside the to_thread call, neither raising nor
+# returning. Without this outer cap the worker can hang indefinitely
+# and the supervisor's queue.join() blocks forever. 60s is far above
+# p99 so this only fires on a genuine hang, not on a slow-but-
+# progressing call.
+_INNERTUBE_CALL_HARD_TIMEOUT_SECONDS: float = 60.0
+
+
+async def _call_innertube(
+    client: InnerTube,
+    fn: Callable[..., dict[str, Any]],
+    *args: object,
+) -> dict[str, Any]:
+    '''
+    Run the synchronous innertube client call in a worker thread.
+
+    The innertube package exposes blocking methods. Calling them
+    directly from async scraper tasks serialises all concurrent
+    video workers on the event loop. Keep calls for the same pooled
+    client serialised, but allow different proxy/client pairs to
+    run concurrently in the executor.
+
+    The call is bounded by :data:`_INNERTUBE_CALL_HARD_TIMEOUT_SECONDS`
+    so that a hung sync HTTP request cannot wedge the worker
+    indefinitely; on timeout :class:`asyncio.TimeoutError` is raised
+    and caught by the generic exception handler in
+    :func:`InnerTubeVideoParser.scrape`.
+    '''
+    lock: asyncio.Lock = _INNERTUBE_CALL_LOCKS.setdefault(
+        id(client), asyncio.Lock(),
+    )
+    async with lock:
+        return await asyncio.wait_for(
+            asyncio.to_thread(fn, *args),
+            timeout=_INNERTUBE_CALL_HARD_TIMEOUT_SECONDS,
+        )
 
 
 def _safe_int(value: str) -> int | None:
@@ -156,7 +203,12 @@ class InnerTubeVideoParser:
             proxy_file: str = proxy_file_label(proxy or '')
             start: float = time.monotonic()
             try:
-                player_data = self.innertube.player(video.video_id)
+                player_data = await _call_innertube(
+                    self.innertube,
+                    self.innertube.player,
+                    video.video_id,
+                )
+                duration: float = time.monotonic() - start
                 METRIC_YT_REQUEST_DURATION.labels(
                     platform='youtube',
                     scraper=_get_scraper(),
@@ -164,21 +216,48 @@ class InnerTubeVideoParser:
                     status_class='2xx',
                     worker_id=get_worker_id(),
                     proxy_file=proxy_file,
-                ).observe(time.monotonic() - start)
+                ).observe(duration)
+                logging.debug(
+                    'InnerTube request completed',
+                    extra={
+                        'api': 'player',
+                        'video_id': video.video_id,
+                        'duration': duration,
+                        'proxy': proxy or 'none',
+                        'proxy_ip': proxy_ip,
+                        'proxy_file': proxy_file,
+                        'status_class': '2xx',
+                    },
+                )
                 break
             except InnerTubeRequestError as exc:
+                duration = time.monotonic() - start
+                status_class: str = (
+                    '4xx'
+                    if exc.error.code == 429
+                    else 'error'
+                )
                 METRIC_YT_REQUEST_DURATION.labels(
                     platform='youtube',
                     scraper=_get_scraper(),
                     api='innertube',
-                    status_class=(
-                        '4xx'
-                        if exc.error.code == 429
-                        else 'error'
-                    ),
+                    status_class=status_class,
                     worker_id=get_worker_id(),
                     proxy_file=proxy_file,
-                ).observe(time.monotonic() - start)
+                ).observe(duration)
+                logging.debug(
+                    'InnerTube request failed',
+                    exc=exc,
+                    extra={
+                        'api': 'player',
+                        'video_id': video.video_id,
+                        'duration': duration,
+                        'proxy': proxy or 'none',
+                        'proxy_ip': proxy_ip,
+                        'proxy_file': proxy_file,
+                        'status_class': status_class,
+                    },
+                )
                 if exc.error.code == 429:
                     await limiter.penalise(
                         YouTubeCallType.PLAYER, proxy, penalty
@@ -208,6 +287,7 @@ class InnerTubeVideoParser:
                         f'InnerTube API call failed: {exc}'
                     )
             except Exception as exc:
+                duration = time.monotonic() - start
                 METRIC_YT_REQUEST_DURATION.labels(
                     platform='youtube',
                     scraper=_get_scraper(),
@@ -215,7 +295,20 @@ class InnerTubeVideoParser:
                     status_class='error',
                     worker_id=get_worker_id(),
                     proxy_file=proxy_file,
-                ).observe(time.monotonic() - start)
+                ).observe(duration)
+                logging.debug(
+                    'InnerTube request failed',
+                    exc=exc,
+                    extra={
+                        'api': 'player',
+                        'video_id': video.video_id,
+                        'duration': duration,
+                        'proxy': proxy or 'none',
+                        'proxy_ip': proxy_ip,
+                        'proxy_file': proxy_file,
+                        'status_class': 'error',
+                    },
+                )
                 raise RuntimeError(f'InnerTube API call failed: {exc}')
 
         InnerTubeVideoParser._apply_player_data(video, player_data)
@@ -225,9 +318,12 @@ class InnerTubeVideoParser:
             await limiter.acquire(YouTubeCallType.NEXT, proxy=proxy)
             next_start: float = time.monotonic()
             try:
-                next_data: dict[str, any] = self.innertube.next(
-                    video.video_id
+                next_data: dict[str, Any] = await _call_innertube(
+                    self.innertube,
+                    self.innertube.next,
+                    video.video_id,
                 )
+                duration = time.monotonic() - next_start
                 METRIC_YT_REQUEST_DURATION.labels(
                     platform='youtube',
                     scraper=_get_scraper(),
@@ -235,22 +331,49 @@ class InnerTubeVideoParser:
                     status_class='2xx',
                     worker_id=get_worker_id(),
                     proxy_file=proxy_file,
-                ).observe(time.monotonic() - next_start)
+                ).observe(duration)
+                logging.debug(
+                    'InnerTube request completed',
+                    extra={
+                        'api': 'next',
+                        'video_id': video.video_id,
+                        'duration': duration,
+                        'proxy': proxy or 'none',
+                        'proxy_ip': proxy_ip,
+                        'proxy_file': proxy_file,
+                        'status_class': '2xx',
+                    },
+                )
                 self._parse_next_data(next_data)
                 break
             except InnerTubeRequestError as exc:
+                duration = time.monotonic() - next_start
+                status_class = (
+                    '4xx'
+                    if exc.error.code == 429
+                    else 'error'
+                )
                 METRIC_YT_REQUEST_DURATION.labels(
                     platform='youtube',
                     scraper=_get_scraper(),
                     api='innertube',
-                    status_class=(
-                        '4xx'
-                        if exc.error.code == 429
-                        else 'error'
-                    ),
+                    status_class=status_class,
                     worker_id=get_worker_id(),
                     proxy_file=proxy_file,
-                ).observe(time.monotonic() - next_start)
+                ).observe(duration)
+                logging.debug(
+                    'InnerTube request failed',
+                    exc=exc,
+                    extra={
+                        'api': 'next',
+                        'video_id': video.video_id,
+                        'duration': duration,
+                        'proxy': proxy or 'none',
+                        'proxy_ip': proxy_ip,
+                        'proxy_file': proxy_file,
+                        'status_class': status_class,
+                    },
+                )
                 if exc.error.code == 429:
                     await limiter.penalise(
                         YouTubeCallType.NEXT, proxy, _next_penalty
@@ -276,7 +399,8 @@ class InnerTubeVideoParser:
                         await asyncio.sleep(_next_penalty)
                 else:
                     break  # non-429 error on NEXT: skip silently
-            except Exception:
+            except Exception as exc:
+                duration = time.monotonic() - next_start
                 METRIC_YT_REQUEST_DURATION.labels(
                     platform='youtube',
                     scraper=_get_scraper(),
@@ -284,7 +408,20 @@ class InnerTubeVideoParser:
                     status_class='error',
                     worker_id=get_worker_id(),
                     proxy_file=proxy_file,
-                ).observe(time.monotonic() - next_start)
+                ).observe(duration)
+                logging.debug(
+                    'InnerTube request failed',
+                    exc=exc,
+                    extra={
+                        'api': 'next',
+                        'video_id': video.video_id,
+                        'duration': duration,
+                        'proxy': proxy or 'none',
+                        'proxy_ip': proxy_ip,
+                        'proxy_file': proxy_file,
+                        'status_class': 'error',
+                    },
+                )
                 break  # NEXT is best-effort; never fail the whole scrape
 
         return video
@@ -562,7 +699,7 @@ class InnerTubeVideoParser:
             '''
             Return the value for key in the first item of contents that has it.
             '''
-    
+
             for item in contents:
                 if key in item:
                     return item[key]

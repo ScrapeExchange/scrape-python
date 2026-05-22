@@ -61,11 +61,13 @@ METRIC_BUCKET_TOKENS: Gauge = Gauge(
     'rate_limit_bucket_tokens',
     'Current token level in the per-type rate-limit bucket',
     _METRIC_LABELS,
+    multiprocess_mode='livemostrecent',
 )
 METRIC_GLOBAL_BUCKET_TOKENS: Gauge = Gauge(
     'rate_limit_global_bucket_tokens',
     'Current token level in the global rate-limit bucket',
     ['proxy', 'script', 'platform', 'worker_id'],
+    multiprocess_mode='livemostrecent',
 )
 
 

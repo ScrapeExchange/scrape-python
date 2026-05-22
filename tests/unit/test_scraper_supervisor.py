@@ -26,6 +26,7 @@ from scrape_exchange.scraper_supervisor import (
     chunks_are_disjoint_cover,
     install_signal_forwarders,
     publish_config_metrics,
+    proxy_pool_for_children,
     spawn_children,
     split_proxies,
 )
@@ -102,6 +103,23 @@ class TestChunksAreDisjointCover(unittest.TestCase):
             self.assertFalse(
                 chunks_are_disjoint_cover(chunks, proxies),
             )
+
+
+class TestProxyPoolForChildren(unittest.TestCase):
+
+    def test_each_child_receives_full_proxy_pool(self) -> None:
+        proxies: list[str] = ['a', 'b', 'c']
+        chunks: list[list[str]] = proxy_pool_for_children(
+            proxies, 2,
+        )
+
+        self.assertEqual(chunks, [proxies, proxies])
+        self.assertIsNot(chunks[0], proxies)
+        self.assertIsNot(chunks[1], proxies)
+
+    def test_zero_or_negative_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            proxy_pool_for_children(['a'], 0)
 
 
 class TestPublishConfigMetrics(unittest.TestCase):
@@ -207,14 +225,16 @@ class TestSpawnChildrenEnv(unittest.TestCase):
             spawn_children(config, chunks)
 
         self.assertEqual(len(captured_envs), 3)
-        # Worker 1 → base + 1, log -1
+        # Worker 1 — check process count, proxies, log file
         self.assertEqual(
             captured_envs[0]['CHANNEL_NUM_PROCESSES'], '1',
         )
         self.assertEqual(captured_envs[0]['PROXIES'], 'http://a')
-        self.assertEqual(captured_envs[0]['METRICS_PORT'], '9601')
-        self.assertEqual(
-            captured_envs[0]['CHANNEL_METRICS_PORT'], '9601',
+        # Children no longer receive per-worker METRICS_PORT;
+        # they inherit PROMETHEUS_MULTIPROC_DIR instead.
+        self.assertNotIn('METRICS_PORT', captured_envs[0])
+        self.assertNotIn(
+            'CHANNEL_METRICS_PORT', captured_envs[0],
         )
         self.assertEqual(
             captured_envs[0]['LOG_FILE'],
@@ -228,13 +248,10 @@ class TestSpawnChildrenEnv(unittest.TestCase):
             captured_envs[0]['CHANNEL_LOG_FILE'],
             '/var/log/channel-1.log',
         )
-        # Worker 2 → base + 2, log -2
-        self.assertEqual(
-            captured_envs[1]['METRICS_PORT'], '9602',
-        )
-        self.assertEqual(
-            captured_envs[1]['CHANNEL_METRICS_PORT'],
-            '9602',
+        # Worker 2 — no METRICS_PORT, correct log file
+        self.assertNotIn('METRICS_PORT', captured_envs[1])
+        self.assertNotIn(
+            'CHANNEL_METRICS_PORT', captured_envs[1],
         )
         self.assertEqual(
             captured_envs[1]['LOG_FILE'],
@@ -244,13 +261,10 @@ class TestSpawnChildrenEnv(unittest.TestCase):
             captured_envs[1]['CHANNEL_LOG_FILE'],
             '/var/log/channel-2.log',
         )
-        # Worker 3 → base + 3, log -3
-        self.assertEqual(
-            captured_envs[2]['METRICS_PORT'], '9603',
-        )
-        self.assertEqual(
-            captured_envs[2]['CHANNEL_METRICS_PORT'],
-            '9603',
+        # Worker 3 — no METRICS_PORT, correct log file
+        self.assertNotIn('METRICS_PORT', captured_envs[2])
+        self.assertNotIn(
+            'CHANNEL_METRICS_PORT', captured_envs[2],
         )
         self.assertEqual(
             captured_envs[2]['LOG_FILE'],
@@ -656,9 +670,9 @@ class TestChildSlotConstruction(unittest.TestCase):
         self.assertEqual(
             slot.spawn_env['PROXIES'], 'http://only:1',
         )
-        self.assertEqual(
-            slot.spawn_env['METRICS_PORT'], '9001',
-        )
+        # Children no longer receive a per-worker METRICS_PORT;
+        # they write gauge files to PROMETHEUS_MULTIPROC_DIR.
+        self.assertNotIn('METRICS_PORT', slot.spawn_env)
         self.assertEqual(
             slot.spawn_env['TEST_NUM_PROCESSES'], '1',
         )
@@ -779,6 +793,15 @@ class TestSuperviseChildren(unittest.TestCase):
 
     def setUp(self) -> None:
         self._now: float = 1_000.0
+        # mark_process_dead requires PROMETHEUS_MULTIPROC_DIR to
+        # be set; patch it out so these unit tests don't depend
+        # on the filesystem or environment variable.
+        patcher = patch(
+            'scrape_exchange.scraper_supervisor'
+            '.multiprocess.mark_process_dead',
+        )
+        self._mock_mark_dead = patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _clock(self) -> float:
         return self._now

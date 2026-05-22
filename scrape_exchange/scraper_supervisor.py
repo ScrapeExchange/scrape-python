@@ -28,11 +28,14 @@ import subprocess
 import sys
 import time
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 
-from prometheus_client import Gauge
+from prometheus_client import Gauge, multiprocess
 
-from scrape_exchange.metrics_server import start_metrics_server
+from scrape_exchange.metrics_server import (
+    start_aggregating_metrics_server,
+)
 
 from scrape_exchange.exchange_client import ExchangeClient
 from scrape_exchange.scraper_metrics import METRIC_SUPERVISOR_RESPAWNS
@@ -68,12 +71,14 @@ METRIC_NUM_PROCESSES: Gauge = Gauge(
     'Number of child scraper processes configured for this '
     'scraper tree as seen from the current process.',
     ['platform', 'role', 'scraper', 'worker_id'],
+    multiprocess_mode='max',
 )
 METRIC_CONCURRENCY: Gauge = Gauge(
     'scraper_concurrency',
     'Number of concurrent async tasks per worker process as seen '
     'from the current process.',
     ['platform', 'role', 'scraper', 'worker_id'],
+    multiprocess_mode='max',
 )
 
 
@@ -170,10 +175,9 @@ class SupervisorConfig:
         ``None`` or empty — the supervisor rejects this case
         because multi-process mode is pointless without proxies
         to split.
-    :param metrics_port: Base Prometheus port. The supervisor
-        binds this port itself; children bind
-        ``metrics_port + worker_instance`` where ``worker_instance``
-        starts at 1.
+    :param metrics_port: Prometheus port the supervisor binds.
+        Children do not bind their own ports; they write metrics
+        files to ``multiproc_dir`` and the supervisor aggregates.
     :param log_file: The supervisor's log file path. When
         non-empty and not a stream target like ``/dev/stdout``,
         children's ``LOG_FILE`` env var is rewritten to
@@ -187,13 +191,10 @@ class SupervisorConfig:
         (which is higher priority) to the per-worker file. Set to
         ``None`` if the scraper doesn't use a scraper-specific
         log-file alias.
-    :param metrics_port_env_var: Name of the scraper-specific
-        metrics-port environment variable (for example
-        ``RSS_METRICS_PORT``). When set,
-        :func:`spawn_children` writes the computed child port
-        to **both** ``METRICS_PORT`` and this var so the
-        child's pydantic settings resolves the scraper-specific
-        alias to the per-worker port.
+    :param metrics_port_env_var: Unused. Retained for backwards
+        compatibility. Children no longer receive a per-worker
+        ``METRICS_PORT``; they inherit ``PROMETHEUS_MULTIPROC_DIR``
+        from the supervisor and write gauge files there instead.
     :param shutdown_grace_seconds: Seconds to wait after
         forwarding SIGTERM/SIGINT to children before escalating
         to SIGKILL. Defaults to 30.
@@ -212,6 +213,17 @@ class SupervisorConfig:
     api_key_secret: str | None = None
     exchange_url: str = 'https://scrape.exchange'
     shutdown_grace_seconds: int = 60
+    multiproc_dir: Path = field(
+        default_factory=lambda: Path(
+            '/run/scrape/_unset_/metrics',
+        ),
+    )
+
+    def __post_init__(self) -> None:
+        if '_unset_' in str(self.multiproc_dir):
+            self.multiproc_dir = Path(
+                f'/run/scrape/{self.scraper_label}/metrics',
+            )
 
 
 def publish_config_metrics(
@@ -307,6 +319,25 @@ def chunks_are_disjoint_cover(
     return True
 
 
+def proxy_pool_for_children(
+    proxies: list[str], n: int,
+) -> list[list[str]]:
+    '''
+    Return the proxy pool each child should receive.
+
+    Unlike :func:`split_proxies`, this intentionally gives every child the
+    full pool. The shared rate limiter owns per-proxy cadence across child
+    processes, so each child can safely choose any currently token-rich
+    outbound IP.
+    '''
+
+    if n <= 0:
+        raise ValueError(
+            f'num_processes must be >= 1, got {n}',
+        )
+    return [list(proxies) for _ in range(n)]
+
+
 def _spawn_one_slot(slot: _ChildSlot) -> None:
     '''Launch the subprocess for *slot* and record its handle and
     spawn timestamp. Used both at startup and on respawn so the
@@ -341,14 +372,6 @@ def spawn_children(
         child_env: dict[str, str] = os.environ.copy()
         child_env[config.num_processes_env_var] = '1'
         child_env['PROXIES'] = ','.join(chunk)
-        child_metrics_port: str = str(
-            config.metrics_port + worker_instance
-        )
-        child_env['METRICS_PORT'] = child_metrics_port
-        if config.metrics_port_env_var:
-            child_env[
-                config.metrics_port_env_var
-            ] = child_metrics_port
         child_env['WORKER_ID'] = str(worker_instance)
         if jwt_header is not None:
             child_env[EXCHANGE_JWT_ENV_VAR] = jwt_header
@@ -366,7 +389,6 @@ def spawn_children(
                 'scraper': config.scraper_label,
                 'worker_instance': worker_instance,
                 'proxies_count': len(chunk),
-                'metrics_port': child_env['METRICS_PORT'],
                 'log_file': child_log_file,
             },
         )
@@ -438,6 +460,11 @@ def _record_crash(
     '''Apply the per-slot crash bookkeeping: compute next
     backoff, schedule respawn, log, bump metric.'''
 
+    pid: int | None = (
+        slot.process.pid if slot.process else None
+    )
+    if pid is not None:
+        multiprocess.mark_process_dead(pid)
     prev_backoff: float = slot.backoff
     slot.backoff = _compute_next_backoff(
         prev_backoff, ran_seconds,
@@ -448,7 +475,7 @@ def _record_crash(
         extra={
             'scraper': scraper_label,
             'instance': slot.instance,
-            'pid': slot.process.pid if slot.process else None,
+            'pid': pid,
             'returncode': rc,
             'ran_seconds': ran_seconds,
             'backoff_seconds': slot.backoff,
@@ -483,6 +510,8 @@ def _retire_slot(
     pid: int | None = (
         slot.process.pid if slot.process else None
     )
+    if pid is not None:
+        multiprocess.mark_process_dead(pid)
     if shutting_down:
         _LOGGER.info(
             'Child exited during shutdown; not respawning',
@@ -697,9 +726,10 @@ def run_supervisor(config: SupervisorConfig) -> int:
         return 1
 
     n: int = min(config.num_processes, len(proxies))
-    chunks: list[list[str]] = split_proxies(proxies, n)
-    if not chunks_are_disjoint_cover(chunks, proxies):
-        return 1
+    # Every child receives the full proxy pool.  The YouTube rate limiter is
+    # shared across worker processes, so overlapping proxy visibility is safe
+    # and lets each child choose any currently token-rich outbound IP.
+    chunks: list[list[str]] = proxy_pool_for_children(proxies, n)
 
     # Fetch the JWT once so children don't each hit the token
     # endpoint independently at startup.  Retry with 1s → 2s →
@@ -742,7 +772,9 @@ def run_supervisor(config: SupervisorConfig) -> int:
                 time.sleep(delay)
                 delay *= 2
 
-    start_metrics_server(config.metrics_port)
+    start_aggregating_metrics_server(
+        config.metrics_port, config.multiproc_dir,
+    )
     _LOGGER.info(
         'Supervisor metrics server started',
         extra={

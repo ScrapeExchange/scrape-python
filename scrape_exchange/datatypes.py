@@ -6,7 +6,14 @@ from enum import Enum
 from typing import Self
 
 
-MAX_KEEPALIVE_REQUESTS: int = 80
+# Maximum number of requests served by a single InnerTube
+# keep-alive connection before the worker rotates to a fresh
+# session. Empirically validated against YouTube on
+# 2026-05-12: a single connection successfully served 1000
+# consecutive requests with 300s gaps between them. Setting
+# to 1000 matches the tested ceiling; raise further only
+# with new empirical evidence.
+MAX_KEEPALIVE_REQUESTS: int = 1000
 
 
 class IngestStatus(str, Enum):

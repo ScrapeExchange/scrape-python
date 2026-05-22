@@ -19,6 +19,10 @@ from scrape_exchange.creator_map import (
     FileCreatorMap,
     RedisCreatorMap,
 )
+from scrape_exchange.handle_map import NullHandleMap
+from scrape_exchange.youtube.channel_identity import (
+    ChannelIdentityStore,
+)
 
 from tools.yt_discover_channels import (
     DiscoverSettings,
@@ -94,12 +98,16 @@ class TestUpdateCreatorMap(
         self._cmap: FileCreatorMap = FileCreatorMap(
             self._map_path,
         )
+        self._store: ChannelIdentityStore = ChannelIdentityStore(
+            creator_map=self._cmap,
+            handle_map=NullHandleMap(),
+        )
 
     async def test_writes_handle_keyed_by_channel_id(
         self,
     ) -> None:
         await update_creator_map(
-            self._cmap,
+            self._store,
             'RickAstleyYT',
             'UCuAXFkgsw1L7xaCfnd5JJOw',
         )
@@ -112,7 +120,7 @@ class TestUpdateCreatorMap(
         self,
     ) -> None:
         await update_creator_map(
-            self._cmap,
+            self._store,
             '@RickAstleyYT',
             'UCuAXFkgsw1L7xaCfnd5JJOw',
         )
@@ -131,14 +139,14 @@ class TestUpdateCreatorMap(
 
     async def test_missing_channel_id_is_noop(self) -> None:
         await update_creator_map(
-            self._cmap, 'RickAstleyYT', None,
+            self._store, 'RickAstleyYT', None,
         )
         size: int = await self._cmap.size()
         self.assertEqual(size, 0)
 
     async def test_empty_channel_id_is_noop(self) -> None:
         await update_creator_map(
-            self._cmap, 'RickAstleyYT', '',
+            self._store, 'RickAstleyYT', '',
         )
         size: int = await self._cmap.size()
         self.assertEqual(size, 0)
@@ -146,7 +154,7 @@ class TestUpdateCreatorMap(
     async def test_bare_uc_id_target_is_noop(self) -> None:
         '''Writing UC-id → UC-id is never useful.'''
         await update_creator_map(
-            self._cmap,
+            self._store,
             'UCuAXFkgsw1L7xaCfnd5JJOw',
             'UCuAXFkgsw1L7xaCfnd5JJOw',
         )
@@ -160,7 +168,7 @@ class TestUpdateCreatorMap(
         the prefix we have a UC-id, which is not a
         handle.'''
         await update_creator_map(
-            self._cmap,
+            self._store,
             'channel/UCuAXFkgsw1L7xaCfnd5JJOw',
             'UCuAXFkgsw1L7xaCfnd5JJOw',
         )
@@ -171,11 +179,11 @@ class TestUpdateCreatorMap(
         '''If the handle changed (e.g. a rename), the next
         discovery overwrites the stored value.'''
         await update_creator_map(
-            self._cmap, 'OldHandle',
+            self._store, 'OldHandle',
             'UCxxxxxxxxxxxxxxxxxxxxxx',
         )
         await update_creator_map(
-            self._cmap, 'NewHandle',
+            self._store, 'NewHandle',
             'UCxxxxxxxxxxxxxxxxxxxxxx',
         )
         value: str | None = await self._cmap.get(

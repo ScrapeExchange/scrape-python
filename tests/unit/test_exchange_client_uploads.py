@@ -87,6 +87,33 @@ class EnqueueUploadTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await httpx.AsyncClient.aclose(client)
 
+    async def test_successful_upload_calls_success_callback(self) -> None:
+        called: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(201, json={'ok': True})
+
+        async def on_success() -> None:
+            called.append('ok')
+
+        client: ExchangeClient = _make_client(handler)
+        try:
+            fm: _FakeFileManager = _FakeFileManager()
+            enqueued: bool = client.enqueue_upload(
+                'https://fake.scrape.exchange/api/v1/data',
+                json={'entity': 'video', 'id': 'abc'},
+                file_manager=fm,
+                filename='video-dlp-abc.json.br',
+                on_success=on_success,
+            )
+            self.assertTrue(enqueued)
+
+            await client.drain_uploads(timeout=2.0)
+
+            self.assertEqual(called, ['ok'])
+        finally:
+            await httpx.AsyncClient.aclose(client)
+
     async def test_failed_upload_leaves_file_alone(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(500, text='boom')

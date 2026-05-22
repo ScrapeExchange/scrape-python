@@ -125,10 +125,10 @@ class TestProxyNetworkFor(unittest.TestCase):
             )
 
     def test_local_rfc1918_range(self) -> None:
-        with self._env('192.168.1.0/24'):
+        with self._env('localhost/24'):
             self.assertEqual(
                 proxy_network_for('192.168.1.16'),
-                '192.168.1.0/24',
+                'localhost/24',
             )
             self.assertEqual(
                 proxy_network_for('192.168.2.1'),

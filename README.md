@@ -14,14 +14,26 @@ In addition to the scraping tools, there is also a websocket listener tool that 
 
 # Quick start
 The fastest way to get started is using Docker Compose,
-which runs all three scrapers and their dependencies in
-containers:
+which runs all three scrapers, their uploaders and the
+YouTube PO token provider in containers. The scrapers
+require a Redis instance for the channel scrape queue,
+the video scrape queue, the identity maps, the no-feeds
+set, the rate limiter and the uploaded-video-ID set —
+all cross-tool coordination goes through Redis.
 
 1. Create an account on the
-   [scrape.exchange](https://scrape.exchange) and get your
-   API key from your account settings page.
-2. Log in to a Linux machine with Docker and Docker Compose
-   installed, then run:
+   [scrape.exchange](https://scrape.exchange) and get
+   your API key from your account settings page.
+2. Provision a Redis instance reachable from every host
+   that will run scrapers. Redis 6.2 or newer is
+   required (the rate limiter uses the `TIME` command
+   inside Lua and `ZADD ... GT`). For a single host
+   you can add the `redis` service in
+   `docker-compose.override.yml` (see below); for
+   multi-host setups run Redis on a dedicated machine
+   reachable on the host network.
+3. Log in to a Linux machine with Docker and Docker
+   Compose installed, then run:
 
 ```bash
 git clone https://github.com/scrape-python/scrape-python.git
@@ -30,30 +42,35 @@ cd scrape-python
 # Create host directories for scraped data and logs
 mkdir -p data/{channels,videos,logs}
 
-# Add channels to scrape (one per line: UC... or @...)
-echo "@channel_handle" >> data/channels.lst
-
 # Configure your credentials and settings
 cp .env-example .env
-# Edit .env: set USERNAME, API_KEY_ID and API_KEY_SECRET
-# to your Scrape.Exchange credentials. The data directory
-# settings in .env are overridden by the container paths
-# automatically, so you can leave them as-is.
+# Edit .env:
+#   - API_KEY_ID, API_KEY_SECRET   (your scrape.exchange credentials)
+#   - REDIS_DSN                    (e.g. redis://192.0.2.10:6379/0)
+# All other settings have sensible defaults — see the
+# comments in .env-example for what each one does.
 
 # Start all services
 docker compose up -d
 ```
 
-This starts five services defined in `docker-compose.yml`:
-- **po-token-provider** — generates tokens required by
-  yt-dlp for YouTube access
-- **channel** — scrapes channel metadata
-- **channel-upload-only** — uploads previously scraped
-  channel data
-- **rss** — scrapes RSS feeds and video metadata via
-  InnerTube
-- **video** — augments video metadata with yt-dlp and
-  uploads it
+This starts six services defined in `docker-compose.yml`:
+- **po-token-provider** — generates PO tokens used by
+  both InnerTube and yt-dlp to look like a real browser
+- **channel** — scrapes channel metadata (about page,
+  video/playlist/podcast/courses/store/community tabs)
+  via the InnerTube API
+- **channel-upload** — uploads previously scraped
+  channel data to scrape.exchange
+- **rss** — polls each channel's RSS feed for new
+  videos and writes lite channel-stat records for the
+  channel uploader
+- **video** — scrapes per-video metadata via InnerTube
+  by default. Set `VIDEO_USE_YT_DLP=true` to
+  additionally run yt-dlp for formats, captions,
+  heatmaps, etc.
+- **video-upload** — uploads previously scraped video
+  data to scrape.exchange
 
 You can start individual services instead of the full
 fleet:
@@ -65,78 +82,178 @@ docker compose up -d po-token-provider channel
 docker compose up -d rss
 ```
 
+Note: at first start the channel scrape queue is empty,
+so the channel scraper will sit idle. Continue with
+"Queueing channels for scraping" below to feed it work.
+
+## Queueing channels for scraping
+
+Channels enter the system through the Redis-backed
+channel scrape queue. The `tools/yt_channel_queue.py`
+CLI is the operator interface for that queue: add,
+remove, search, mark, count, and bulk-import channels.
+
+The tool reads `REDIS_DSN` from `.env`, so the same
+credentials and connection string used by the scrapers
+apply.
+
+### Add a single channel
+
+```bash
+# By handle (with or without the leading @)
+PYTHONPATH=. uv run tools/yt_channel_queue.py add @veritasium
+
+# By channel ID
+PYTHONPATH=. uv run tools/yt_channel_queue.py add UCHnyfMqiRRG1u-2MsSQLbXA
+
+# Multiple entries in one call
+PYTHONPATH=. uv run tools/yt_channel_queue.py add \
+    @veritasium @kurzgesagt UCHnyfMqiRRG1u-2MsSQLbXA
+```
+
+Resolvable inputs (a full `UC…` ID, or a handle whose
+`(creator_id, handle)` mapping is already in the
+identity store) are enqueued directly on the scheduled
+queue. Bare handles that the queue can't resolve yet
+are enqueued on the unresolved queue and the channel
+scraper resolves them lazily.
+
+### Bulk import from a file
+
+```bash
+PYTHONPATH=. uv run tools/yt_channel_queue.py import channels.lst
+```
+
+The file contains one entry per line — a `UC…` ID, an
+`@handle`, or a JSON object with `channel_id` and/or
+`channel_handle` fields. Pass `--merge` to add to the
+existing queue (the default) or `--replace` to wipe the
+queue first.
+
+### Read from stdin
+
+```bash
+cat channels.lst \
+  | PYTHONPATH=. uv run tools/yt_channel_queue.py add -
+```
+
+Useful for piping discovery output (see
+`tools/yt_discover_channels.py`) straight into the
+queue.
+
+### Inspect and manage the queue
+
+```bash
+# Counts across all states
+PYTHONPATH=. uv run tools/yt_channel_queue.py stats
+
+# How many channels in tier 0 (highest priority)?
+PYTHONPATH=. uv run tools/yt_channel_queue.py count --tier 0
+
+# Show metadata for one channel
+PYTHONPATH=. uv run tools/yt_channel_queue.py show @veritasium
+
+# Search by handle / channel_id / name
+PYTHONPATH=. uv run tools/yt_channel_queue.py search --by handle veri
+
+# Re-scrape a channel even if it was recently scraped
+PYTHONPATH=. uv run tools/yt_channel_queue.py rescrape @veritasium
+
+# Remove from the queue
+PYTHONPATH=. uv run tools/yt_channel_queue.py remove @veritasium
+
+# Mark / unmark a state (not_found, terminated, etc.)
+PYTHONPATH=. uv run tools/yt_channel_queue.py mark @veritasium not_found
+```
+
+Run `yt_channel_queue.py --help` for the full
+subcommand list.
+
+For bulk operator workflows, the channel scraper also drains its
+priority directory. Drop a bare `UC...` channel ID, `@handle`, or
+bare handle filename there to resolve and enqueue it at priority;
+Redis-mode drains rename accepted entries to `.processed` and
+resolution failures to `.failed` for audit.
+
+### Running the CLI in a container
+
+If you don't want to install `uv` on the host, run the
+CLI inside the existing `channel` image:
+```bash
+docker compose run --rm channel \
+    tools/yt_channel_queue.py add @veritasium
+```
+
 ## Mapping host directories into containers
 
 By default the containers store scraped data inside the
 container filesystem, which means data is lost when the
 container is removed. To persist data on your host, you
-need to mount host directories as volumes.
+need to mount host directories as volumes. All cross-
+tool coordination state (queues, identity maps, rate
+limiter, no-feeds, uploaded-video IDs) lives in Redis
+and does not need a host mount.
 
 The containers expect data in these paths:
 
 | Container path | Purpose |
 |---|---|
-| `/data/channels` | Scraped channel metadata |
-| `/data/videos` | Scraped video metadata |
-| `/data/channels.lst` | Channel list file |
-| `/data/channel_map.csv` | Channel ID to handle map |
-| `/data/rss-queue.json` | RSS scraper queue state |
-| `/data/rss-no-feeds.txt` | Channels with no RSS feed |
+| `/data/channels` | Scraped channel metadata (`channel-*.json.br`) |
+| `/data/videos` | Scraped video metadata (`video-min-*.json.br`, `video-dlp-*.json.br`) |
+| `/data/uploaded_channels.lst` | Channels already uploaded to scrape.exchange (read-side dedup; appended by the channel uploader) |
 | `/var/log/scrape/scraper` | Scraper log files |
-| `/var/tmp/yt_dlp_cache` | yt-dlp cache directory |
+| `/var/tmp/yt_dlp_cache` | yt-dlp cache directory (only relevant when `VIDEO_USE_YT_DLP=true`) |
 
-To map your own host directories to these paths, create a
-`docker-compose.override.yml` file in the repository root.
-Docker Compose automatically picks up this file alongside
-the base `docker-compose.yml`, so you just run
+To map your own host directories to these paths, create
+a `docker-compose.override.yml` file in the repository
+root. Docker Compose automatically picks up this file
+alongside the base `docker-compose.yml`, so you just run
 `docker compose up -d` as usual.
 
-For example, if your scraped data lives in `/srv/scrape`
-and you want logs in `/var/log/scrape`:
-
+The override file is also a good place to add a Redis
+service if you want everything self-contained on one
+host:
 ```yaml
 x-data-volumes: &data-volumes
-  - /srv/scrape/videos:/data/videos
-  - /srv/scrape/channels:/data/channels
-  - /srv/scrape/channels.lst:/data/channels.lst:ro
-  - /srv/scrape/channel_map.csv:/data/channel_map.csv
-  - /srv/scrape/rss-queue.json:/data/rss-queue.json
-  - /srv/scrape/rss-no-feeds.txt:/data/rss-no-feeds.txt
-  - /var/log/scrape/scraper:/var/log/scrape/scraper
+  - ./data/videos:/data/videos
+  - ./data/channels:/data/channels
+  - ./data/logs:/var/log/scrape/scraper
 
 services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    network_mode: host
+    command: ["redis-server", "--save", "60", "1000", "--appendonly", "yes"]
+    volumes:
+      - ./data/redis:/data
+
   video:
     volumes: *data-volumes
-  video-upload-only:
+  video-upload:
     volumes: *data-volumes
   channel:
     volumes: *data-volumes
-  channel-upload-only:
+  channel-upload:
     volumes: *data-volumes
   rss:
     volumes: *data-volumes
 ```
 
-If you just want to use the `data/` directory you created
-in the quick start steps above:
+With Redis on the same host, set
+`REDIS_DSN=redis://127.0.0.1:6379/0` in your `.env`.
+For a remote Redis, point `REDIS_DSN` at the host
+that runs it and drop the `redis` service from the
+override.
+
+If your scraped data lives elsewhere on the host (for
+example `/srv/scrape`), update the `x-data-volumes`
+section accordingly:
 ```yaml
 x-data-volumes: &data-volumes
-  - ./data/videos:/data/videos
-  - ./data/channels:/data/channels
-  - ./data/channels.lst:/data/channels.lst:ro
-  - ./data/logs:/var/log/scrape/scraper
-
-services:
-  video:
-    volumes: *data-volumes
-  video-upload-only:
-    volumes: *data-volumes
-  channel:
-    volumes: *data-volumes
-  channel-upload-only:
-    volumes: *data-volumes
-  rss:
-    volumes: *data-volumes
+  - /srv/scrape/videos:/data/videos
+  - /srv/scrape/channels:/data/channels
+  - /var/log/scrape/scraper:/var/log/scrape/scraper
 ```
 
 You can also use the override file to tune parallelism
@@ -152,17 +269,18 @@ services:
 As you can see from the contents of the `.env` file, there
 are many configuration options available for the scrapers,
 but you can get started with changing just a few of them.
-The most important ones to set up are the Scrape.Exchange
-API key. The data directories are handled by the container
-configuration automatically. The other settings can be left
-at their default values for now, and you can adjust them
-later as you become more familiar with the scrapers and
-based on your specific use case.
+The required settings are the Scrape.Exchange API key
+(`API_KEY_ID`, `API_KEY_SECRET`) and the Redis DSN
+(`REDIS_DSN`). The data directories are handled by the
+container configuration automatically. The other settings
+can be left at their default values for now, and you can
+adjust them later as you become more familiar with the
+scrapers and based on your specific use case.
 
 # Avoiding bot detection and rate limits
 The scraping tools in this directory maximize the number of scrapes that you can do while minimizing the risk of being blocked by the platform for making too many requests. To do this, the tools use a rate limiter to limit the number of requests that can be made in a given time period. The rate limits are based on the observed behavior of YouTube's bot detection mechanisms, but they may need to be adjusted over time as YouTube changes its algorithms. The tools also support using proxies to route requests through different IP addresses, which can help to avoid triggering bot detection. They use the [InnerTube](https://github.com/yt-dlp/yt-dlp/wiki/InnerTube) to interact with YouTube's internal API. Furthermore, it sets up the [yt-dlp](https://github.com/yt-dlp/yt-dlp) package with the appropriate cookies and headers to make the requests look like they are coming from a real browser session, which can also help to avoid triggering bot detection. Finally, as per the instructions of yt-dlp, it uses deno and the po-token-provider to generate the necessary tokens for making requests to YouTube, which can further help to avoid triggering bot detection. When a scraper receives a response from YouTube that indicates that it has been rate limited or blocked, it will back off and retry the request after a certain amount of time. The backoff time is increased exponentially with each subsequent failure, up to a maximum backoff time. This way, the scraper can recover from temporary blocks and continue scraping without getting permanently blocked.
 
-The scrapers share a common rate limiter so you can run multiple tools at the same time without worrying about them interfering with each other, exceeding the configured limits and causing you to get blocked. If you want to use the scrapers on multiple hosts, you can set up a Redis server and configure the scrapers to use Redis as a backend for the rate limiter. This way, the scrapers on different hosts can coordinate their requests and avoid exceeding the rate limits of the platforms.
+The scrapers share a common rate limiter through Redis, so you can run multiple scraper types on the same proxy pool — and across multiple hosts — without worrying about them interfering with each other, exceeding the configured per-IP limits, or causing you to get blocked. Every process that points at the same `REDIS_DSN` sees the same per-proxy token buckets, so YouTube sees aggregate traffic per IP and so does the limiter.
 
 # Process management and observability
 Each of the scrapers in this repo can be configured to either run as a single process or with multiple worker processes managed by a supervisor process. When running with multiple worker processes, the supervisor process will automatically restart any worker processes that crash or become unresponsive. The scrapers also expose Prometheus metrics about their performance and configuration, which can be used to monitor the scrapers and alert on any issues. The metrics include information about the number of channels and videos scraped, the number of requests made to YouTube, the number of requests that were rate limited, and the current configuration of the scraper. The metrics are exposed on a configurable port, and they can be scraped by a Prometheus server for monitoring and alerting. A Grafana dashboard is included in the repository as `grafana_dashboard.json` that can be imported into Grafana to visualize the metrics. There is also a configuration file included in the repository as `prometheus-alerts-youtube.yml` that can be used to configure a Prometheus AlertManager that can generate alerts.. Logs are emitted by default in a structured JSON format, which can be easily ingested by log management systems such as Elasticsearch or Splunk.
@@ -171,9 +289,17 @@ For more info about observability of the scrapers, see the [OBSERVABILITY.md](OB
 
 # Using a proxy
 
-To avoid more stringent bot checking to access content, you can use web proxies. To do this, set the `PROXIES` setting to one or more URLs of your proxy server, comma-separated. For example in your .env file:
+To avoid more stringent bot checking to access content, you can use web proxies. To do this, set the `PROXY_FILES` setting to a comma-separated list of files where each line is a proxy URL (or a `local://x.x.x.x` egress IP). For example in your .env file:
 ```env
-PROXIES=http://your-proxy-server:port,http://your-proxy-server:port2
+PROXY_FILES=./proxies.txt,./more_proxies.txt
+```
+
+Each line in those files looks like one of:
+```
+http://host:port
+http://user:pass@host:port
+http://host:port:user:pass
+local://203.0.113.7
 ```
 
 The rate limiter will apply the rate limits per proxy server, so using multiple proxy servers can help to increase the overall rate of scraping while still avoiding triggering bot detection. If you don't have a proxy server provider, but you do subscribe to a VPN service, you can use the VPN's proxy server. Check your VPN provider's documentation for the proxy server details.
@@ -238,24 +364,41 @@ PYTHONPATH=. uv run tools/listen_messages.py
 The first time you run one of the tools, or after you pull new changes from the repository, `uv` will automatically install any new dependencies specified in the `pyproject.toml` file. After that, it will run the tool using the installed dependencies.
 
 ## YouTube Scrapers
-There are three tools available in this repository for scraping YouTube content and uploading it to the [scrape.exchange](https://scrape.exchange). If you want to scrape one or more YouTube channels, you put them in the <YOUTUBE_CHANNEL_LIST> file. You can add either the channel-ID (a 24-character string starting with "UC") or the channel handle (a string starting with "@"). You can then run the `yt_channel_scrape.py` script to scrape the channel information and save it to the <YOUTUBE_CHANNEL_DATA_DIR> directory. It also writes to <CHANNEL_MAP_FILE> to store mappings from channel IDs to channel handle. You then run the `yt_rss_reader.py` script to scrape the latest videos from the channels and save them to the <YOUTUBE_VIDEO_DATA_DIR> directory, while also uploading the metadata to the Scrape.Exchange API. Finally, you run the `yt_video_upload.py` script to augment the video metadata with data collected with yt-dlp (such as available video streams, captions etc.) and upload it to the API.
+There are five tools available in this repository for scraping YouTube content and uploading it to the [scrape.exchange](https://scrape.exchange): three scrapers (`yt_channel_scrape.py`, `yt_rss_scrape.py`, `yt_video_scrape.py`) and two uploaders (`yt_channel_upload.py`, `yt_video_upload.py`).
 
-These tools share a directory structure:
+To scrape one or more YouTube channels, you enqueue them on the Redis-backed channel scrape queue with `tools/yt_channel_queue.py` (see "Queueing channels for scraping" above). Each entry is a `UC…` channel-ID, an `@handle`, or a JSON object combining both. The channel scraper pops entries off this queue, resolves identity through the shared Redis identity maps (`youtube:creator_map`, `youtube:handle_map`, `youtube:name_map`), and saves the scraped channel data to `YOUTUBE_CHANNEL_DATA_DIR`. The RSS scraper polls each known channel's RSS feed for newly published videos and enqueues their IDs onto the Redis video scrape queue. The video scraper consumes that queue and writes per-video JSON files to `YOUTUBE_VIDEO_DATA_DIR`. The channel and video uploaders then POST the scraped files to the Scrape.Exchange API.
+
+The data flow between the tools is:
 
 ```
-YOUTUBE_CHANNEL_LIST -> yt_channel_scrape.py -> YOUTUBE_CHANNEL_DATA_DIR
-YOUTUBE_CHANNEL_DATA_DIR -> yt_rss_scrape.py -> YOUTUBE_VIDEO_DATA_DIR
-YOUTUBE_VIDEO_DATA_DIR -> yt_video_scrape.py -> YOUTUBE_VIDEO_DATA_DIR
+yt_channel_queue.py  -> Redis channel scrape queue
+                                │
+                                ▼
+                       yt_channel_scrape.py -> YOUTUBE_CHANNEL_DATA_DIR
+                                                       │
+                                                       ▼
+                                              yt_channel_upload.py -> scrape.exchange
+
+RSS feeds  -> yt_rss_scrape.py  -> Redis video scrape queue
+                                          │
+                                          ▼
+                                  yt_video_scrape.py  -> YOUTUBE_VIDEO_DATA_DIR
+                                                                │
+                                                                ▼
+                                                       yt_video_upload.py -> scrape.exchange
 ```
 
-This directory structure acts as a pipeline for scraping and uploading YouTube content. The data directories store files after scraping. Upon succesfull upload of the data to the API, the files are moved to a subdirectory called "uploaded". This way, you can keep track of which data has been uploaded and which data is still pending upload. When you run the `yt_channel_scrape.py` and `yt_video_scrape.py` scripts, they will first attempt to upload any existing files in the data directories before scraping new data. This way, you can ensure that all scraped data is eventually uploaded to the API, even if there are temporary issues with the API or your internet connection.
+The data directories store files after scraping. Upon successful upload of the data to the API, the files are moved to a subdirectory called "uploaded", so you can keep track of which data has been uploaded and which is still pending. The uploaders also run in watch mode by default (`CHANNEL_UPLOAD_WATCH=true`, `VIDEO_UPLOAD_WATCH=true`), so any new files dropped into the data directories are picked up automatically.
 
-Data is stored in these directories in compressed JSON files with the .json.br extension. The files are compressed using Brotli to save disk space. Each file contains the metadata for a single channel or video, depending on the script that created it. The filename format is `channel-<channel_handle>.json.br` for channels and `video-min-<video_id>.json.br` and `video-dlp-<video_id.json.br` for videos, where `<channel_handle>` and `<video_id>` are the unique identifiers for the channel and video on YouTube. For the video files, the RSS scraper uses the InnerTube API and saves the file with the 'min' label. This InnerTube API provides a limited set of metadata. The video scraper uses the yt-dlp script to get additional metadata, hence the "min" and "dlp" in the filenames. The `yt_video_upload.py` script will read the "min" files and augment that data with the scraping functionality of the YT-DLP module and then rename the file from 'MIN' to 'DLP'. You will also see files in the data directory with extensions like .unresolved, .not_found, and _failed, which indicate channels or videos that could not be scraped successfully. T
+Data is stored in these directories in compressed JSON files with the .json.br extension. The files are compressed using Brotli to save disk space. Each file contains the metadata for a single channel or video. The filename format is `channel-<channel_handle>.json.br` for channels, `video-min-<video_id>.json.br` for InnerTube-only video records, and `video-dlp-<video_id>.json.br` for records augmented with yt-dlp. By default the video scraper produces "min" files only; set `VIDEO_USE_YT_DLP=true` to additionally run yt-dlp and produce "dlp" files (formats, captions, heatmaps, etc.). You will also see files in the data directory with extensions like `.unresolved`, `.not_found`, and `_failed`, which indicate channels or videos that could not be scraped successfully.
 
-These scripts share a set of command line arguments, which can also be set using environment variables. They also support `.env` files, which is easiest to use. A sample .env file is included in the repository as `.env.example`.
-- yt_channel_scrape.py: Scrapes channels and the information about their videos, shorts, playlists, merch etc. using the Innertube library, saves the scraped metadata as JSON files in the 'YOUTUBE_CHANNEL_DATA_DIR' directory and calls the Scrape.Exchange API to upload the channel metadata.
-- yt_rss_reader.py: reads the channels from the YOUTUBE_CHANNEL_DATA_DIR directory. For each channel, it does a quick scrape of the About page of the channel to get latest counters for subscribers, views, and videos, and calls the YouTube RSS feed to get the latest videos. For each video it collects additional data using the InnerTube API. It then uploads the channel- and video metadata to the Scrape.Exchange API and saves a copy of the scraped video metadata as JSON files in the 'YOUTUBE_VIDEO_DATA_DIR' directory.
-- yt_video_upload.py: reads the video metadata from the YOUTUBE_VIDEO_DATA_DIR directory, augments it with data scraped using yt-dlp, and uploads it to the API.
+These scripts share a set of command line arguments, which can also be set using environment variables. They also support `.env` files, which is easiest to use. A sample .env file is included in the repository as `.env-example`.
+- **yt_channel_queue.py** (operator CLI): Adds, removes, searches and inspects entries on the Redis channel scrape queue. This is how channels enter the system.
+- **yt_channel_scrape.py**: Pops channels from the Redis channel scrape queue, scrapes them (about page, video/playlist/community tabs, merch, etc.) using the InnerTube API, and saves the scraped metadata as JSON files in `YOUTUBE_CHANNEL_DATA_DIR`.
+- **yt_channel_upload.py**: Watches `YOUTUBE_CHANNEL_DATA_DIR` (and its priority sub-directory) and uploads channel files to the Scrape.Exchange API.
+- **yt_rss_scrape.py**: For each known channel, polls the YouTube RSS feed for newly published videos and enqueues their IDs onto the Redis video scrape queue. It also writes lite channel-stat records (subscriber/view/video counts) as `channel-rss-<handle>.json.br` into `YOUTUBE_CHANNEL_DATA_DIR` for the channel uploader to POST.
+- **yt_video_scrape.py**: Consumes the Redis video scrape queue and writes per-video JSON files to `YOUTUBE_VIDEO_DATA_DIR`. Uses InnerTube by default; opts in to yt-dlp via `VIDEO_USE_YT_DLP=true`.
+- **yt_video_upload.py**: Watches `YOUTUBE_VIDEO_DATA_DIR` (and its priority sub-directory) and uploads video files to the Scrape.Exchange API.
 
 These scripts use a rate limiter to avoid making too many requests to YouTube in a short period of time, which can trigger bot detection and lead to temporary or permanent bans. The rate limiter is implemented in the `YouTubeRateLimiter` class in the `youtube_rate_limiter.py` module. The rate limiter uses a token bucket algorithm to limit the number of requests that can be made in a given time period. The rate limits are based on the observed behavior of YouTube's bot detection mechanisms, but they may need to be adjusted over time as YouTube changes its algorithms.
 The rate limiter is tuned to comply with the soft-limits from this table:

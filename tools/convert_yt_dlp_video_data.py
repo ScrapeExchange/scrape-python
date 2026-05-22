@@ -23,13 +23,13 @@ ending in ``.json`` are considered.
 import argparse
 import json
 import os
-import secrets
 import sys
 import time
 from pathlib import Path
 
-import brotli
 from jsonschema import Draft202012Validator
+
+from scrape_exchange.brotli import brotli_write
 
 from scrape_exchange.youtube.youtube_video import YouTubeVideo
 
@@ -43,25 +43,6 @@ _OUTPUT_PREFIX: str = 'video-dlp-'
 _OUTPUT_SUFFIX: str = '.json.br'
 _PROGRESS_INTERVAL: int = 1000
 _PROGRESS_SECONDS: float = 60.0
-
-
-def _atomic_write_brotli(path: Path, data: bytes) -> None:
-    '''Write brotli-compressed *data* to *path* atomically.'''
-    tmp: Path = path.with_name(
-        f'.tmp-{secrets.token_hex(8)}{path.name}'
-    )
-    try:
-        with open(tmp, 'wb') as f:
-            f.write(brotli.compress(data))
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-        raise
 
 
 def _load_info(info_path: Path) -> dict | None:
@@ -99,11 +80,8 @@ def _validate_and_write(
         return 'error'
     if dry_run:
         return 'written'
-    encoded: bytes = json.dumps(
-        record, ensure_ascii=False,
-    ).encode('utf-8')
     try:
-        _atomic_write_brotli(output_path, encoded)
+        brotli_write(output_path, record, indent=None)
     except OSError as exc:
         print(
             f'write failed {output_path}: {exc}',

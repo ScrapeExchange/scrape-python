@@ -195,6 +195,49 @@ def _write_cookie_file(path: str, cookies: list) -> None:
     os.replace(tmp_path, path)
 
 
+_FLOCK_BACKOFF_INITIAL: float = 0.05
+_FLOCK_BACKOFF_MAX: float = 5.0
+_FLOCK_BACKOFF_JITTER: float = 0.2
+
+
+async def _acquire_flock_with_backoff(
+    lock_fd: int, lock_path: str,
+) -> None:
+    '''Acquire ``fcntl.LOCK_EX`` on *lock_fd* without blocking the
+    kernel.
+
+    Uses ``LOCK_NB`` plus jittered exponential backoff so two
+    processes contending for multiple cookie locks can never
+    enter an AB-BA deadlock: a blocked acquirer always sleeps,
+    so the kernel never has a chain of inter-process lock waits
+    that can deadlock. Backoff jitter desynchronises contending
+    processes so they don't livelock either.
+    '''
+    delay: float = _FLOCK_BACKOFF_INITIAL
+    attempts: int = 0
+    while True:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            attempts += 1
+            jitter: float = 1.0 + random.uniform(
+                -_FLOCK_BACKOFF_JITTER, _FLOCK_BACKOFF_JITTER,
+            )
+            sleep_for: float = delay * jitter
+            if attempts == 1 or attempts % 20 == 0:
+                _LOGGER.debug(
+                    'Waiting for cookie file lock',
+                    extra={
+                        'lock_path': lock_path,
+                        'attempt': attempts,
+                        'sleep_for': round(sleep_for, 3),
+                    },
+                )
+            await asyncio.sleep(sleep_for)
+            delay = min(delay * 2.0, _FLOCK_BACKOFF_MAX)
+
+
 @dataclass
 class _CookieEntry:
     '''Cached cookie file path and its (wall-clock) acquisition timestamp.
@@ -361,6 +404,11 @@ class YouTubeCookieJar:
         fresh cookies we adopt them instead of re-fetching (unless
         ``force`` is set, which only the renewal loop uses).
 
+        Lock acquisition uses ``fcntl.LOCK_NB`` with jittered
+        exponential backoff rather than a blocking wait. This avoids
+        AB-BA deadlocks between sibling processes (two workers each
+        holding a lock the other needs).
+
         :param proxy: Proxy URL, or ``None`` for a direct session.
         :param force: If True, always fetch — skip the adopt-from-disk
             check.  Used by :meth:`force_renew`.
@@ -372,9 +420,7 @@ class YouTubeCookieJar:
             os.open, lock_path, os.O_CREAT | os.O_RDWR, 0o600,
         )
         try:
-            await asyncio.to_thread(
-                fcntl.flock, lock_fd, fcntl.LOCK_EX,
-            )
+            await _acquire_flock_with_backoff(lock_fd, lock_path)
 
             if not force:
                 age: float | None = _file_age_seconds(path)

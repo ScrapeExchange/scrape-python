@@ -13,7 +13,9 @@ until the next polling interval.
 '''
 
 import errno
+import http.cookiejar
 import os
+import resource
 import sys
 import asyncio
 import logging
@@ -22,12 +24,14 @@ from datetime import UTC
 from datetime import datetime
 from typing import Awaitable, TypeVar
 
-import brotli
+from scrape_exchange.brotli import brotli_read, brotli_write_async
 import orjson
 import untangle
 
 import httpx
 from httpx import Response
+
+import redis.asyncio as aioredis
 
 from prometheus_client import Counter, Gauge, Histogram
 
@@ -37,12 +41,9 @@ from pydantic import (
     AliasChoices, Field, field_validator, model_validator,
 )
 
-from innertube import InnerTube
-
 from scrape_exchange.exchange_client import ExchangeClient
 from scrape_exchange.file_management import (
     AssetFileManagement,
-    atomic_write_bytes,
 )
 from scrape_exchange.schema_validator import (
     SchemaValidator,
@@ -58,11 +59,9 @@ from scrape_exchange.http_timeouts import (
     HTTP_REQUEST_TIMEOUT,
 )
 from scrape_exchange.proxy_phase_metrics import (
-    install_innertube_phase_tracing,
     make_rss_phase_trace,
 )
 from scrape_exchange.proxy_loader import (
-    httpx_client_for_entry,
     jitter_pool_warmup,
     load_proxy_catalog,
     pooled_httpx_client_for_entry,
@@ -77,10 +76,15 @@ from scrape_exchange.youtube.youtube_channel import (
 )
 from scrape_exchange.youtube.youtube_channel_tabs import (
     YouTubeChannelTabs,
-    build_innertube_with_pool_limits,
 )
 from scrape_exchange.youtube.youtube_rate_limiter import (
     YouTubeRateLimiter, YouTubeCallType
+)
+from scrape_exchange.youtube.youtube_client import (
+    CONSENT_COOKIES,
+    INNERTUBE_CLIENT_NAME,
+    INNERTUBE_CLIENT_VERSION,
+    generate_visitor_info,
 )
 from scrape_exchange.youtube.youtube_video import YouTubeVideo
 
@@ -105,9 +109,12 @@ from scrape_exchange.creator_queue import (
     TierConfig,
     parse_priority_queues,
 )
+from scrape_exchange.video_scrape_queue import (
+    RedisVideoScrapeQueue,
+    VideoScrapeQueueSettings,
+)
 
 
-VIDEO_FILENAME_PREFIX: str = 'video-min-'
 CHANNEL_FILENAME_PREFIX: str = 'channel-'
 UPLOADED_DIR: str = '/uploaded'
 
@@ -138,6 +145,38 @@ MAX_SLEEP_SECONDS: float = 4.5
 
 MSG_NO_RSS_FEED: str = 'RSS feed not found for channel'
 
+# Browser-navigation headers for YouTube RSS fetches. The endpoint returns
+# XML, but a real Chrome navigation to the URL presents a document-like
+# request shape rather than a bare library default.
+RSS_BROWSER_HEADERS: dict[str, str] = {
+    'User-Agent': (
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
+        '(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
+    ),
+    'Accept': (
+        'text/html,application/xhtml+xml,application/xml;q=0.9,'
+        'image/avif,image/webp,image/apng,*/*;q=0.8'
+    ),
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Cache-Control': 'max-age=0',
+    'Upgrade-Insecure-Requests': '1',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-User': '?1',
+    'sec-ch-ua': (
+        '"Chromium";v="125", "Google Chrome";v="125", '
+        '"Not.A/Brand";v="24"'
+    ),
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Linux"',
+    'X-YouTube-Client-Name': INNERTUBE_CLIENT_NAME,
+    'X-YouTube-Client-Version': INNERTUBE_CLIENT_VERSION,
+}
+
+_RSS_VISITOR_INFO_BY_PROXY: dict[str | None, str] = {}
+
 # Prometheus metrics
 # Shared metric declarations (avoids duplicate-registration when
 # multiple tool modules are imported in the same process).
@@ -147,11 +186,22 @@ from scrape_exchange.scraper_metrics import (
     METRIC_SCRAPE_DURATION,
     METRIC_SCRAPE_FAILURES as METRIC_RSS_FAILURES,
     METRIC_SCRAPE_QUEUE_SIZE as METRIC_QUEUE_SIZE,
+    METRIC_RSS_CIRCUIT_TRANSITIONS,
+    METRIC_RSS_CIRCUIT_WAIT_SECONDS,
+    METRIC_RSS_CIRCUIT_STATE,
+    METRIC_RSS_CIRCUIT_OPEN_SECONDS,
+)
+from scrape_exchange.youtube.rss_circuit_breaker import (
+    RssCircuitBreaker,
+)
+from scrape_exchange.youtube._rss_circuit_state import (
+    CircuitReport,
 )
 METRIC_CHANNEL_MAP_SIZE: Gauge = Gauge(
     'channel_map_size',
     'Number of channels in the channel map',
     ['platform', 'scraper', 'worker_id'],
+    multiprocess_mode='livemostrecent',
 )
 METRIC_NO_FEED_LIMIT_HIT: Counter = Counter(
     'rss_no_feed_limit_hit_total',
@@ -176,12 +226,14 @@ METRIC_CONCURRENCY: Gauge = Gauge(
     'Number of channels being processed concurrently in the '
     'current batch',
     ['platform', 'scraper', 'worker_id'],
+    multiprocess_mode='livemostrecent',
 )
 METRIC_CHANNEL_SECONDS_SINCE_LAST_PROCESSED: Gauge = Gauge(
     'channel_seconds_since_last_processed',
     'Seconds elapsed since the channel was last processed '
     '(only set for channels that have been processed before)',
     ['platform', 'scraper', 'tier', 'worker_id'],
+    multiprocess_mode='livemostrecent',
 )
 METRIC_TIER_ON_TIME: Counter = Counter(
     'channel_tier_on_time_total',
@@ -226,6 +278,7 @@ METRIC_TIER_POPULATION: Gauge = Gauge(
     'queue-metrics loop on a single worker per host; '
     'aggregate across instances with max by (tier), not sum.',
     ['platform', 'scraper', 'tier'],
+    multiprocess_mode='max',
 )
 METRIC_ORPHANS_RECOVERED: Counter = Counter(
     'channel_orphans_recovered_total',
@@ -468,7 +521,7 @@ class RssSettings(YouTubeScraperSettings):
     priority_queues: str = Field(
         default='1:10_000_000,4:1_000_000,12:100_000,72:10_000,168:0',
         validation_alias=AliasChoices(
-            'PRIORITY_QUEUES', 'priority_queues',
+            'RSS_PRIORITY_QUEUES', 'priority_queues',
         ),
         description=(
             'Comma-separated interval_hours:min_subscribers '
@@ -574,7 +627,6 @@ _extract_proxy_ip = extract_proxy_ip
 def _record_rss_failure(
     reason: str,
     proxy_ip: str | None,
-    proxy_network: str,
     proxy_file: str,
 ) -> None:
     METRIC_RSS_FAILURES.labels(
@@ -589,13 +641,50 @@ def _record_rss_failure(
     ).inc()
 
 
+def _rss_browser_headers() -> dict[str, str]:
+    return dict(RSS_BROWSER_HEADERS)
+
+
+def _rss_visitor_info(proxy: str | None) -> str:
+    visitor_id: str | None = _RSS_VISITOR_INFO_BY_PROXY.get(proxy)
+    if visitor_id is None:
+        visitor_id = generate_visitor_info()
+        _RSS_VISITOR_INFO_BY_PROXY[proxy] = visitor_id
+    return visitor_id
+
+
+def _load_cookie_file(path: str) -> dict[str, str]:
+    jar: http.cookiejar.MozillaCookieJar = (
+        http.cookiejar.MozillaCookieJar()
+    )
+    jar.load(path, ignore_discard=True, ignore_expires=True)
+    return {cookie.name: cookie.value for cookie in jar}
+
+
+def _rss_browser_cookies(proxy: str | None) -> dict[str, str]:
+    cookies: dict[str, str] = dict(CONSENT_COOKIES)
+    cookie_file: str | None = (
+        YouTubeRateLimiter.get().get_cookie_file_cached(proxy)
+    )
+    if isinstance(cookie_file, str) and cookie_file:
+        try:
+            cookies.update(_load_cookie_file(cookie_file))
+        except (OSError, http.cookiejar.LoadError) as exc:
+            logging.warning(
+                'Failed to load cached YouTube cookies for RSS fetch',
+                exc=exc,
+                extra={'cookie_file': cookie_file, 'proxy': proxy},
+            )
+    cookies.setdefault('VISITOR_INFO1_LIVE', _rss_visitor_info(proxy))
+    return cookies
+
+
 def _handle_http_status_error(
     exc: httpx.HTTPStatusError,
     rss_url: str,
     proxy: str | None,
     proxy_ip: str | None,
-    proxy_network: str,
-    extra: dict[str, str],
+    extra: dict[str, object],
 ) -> None:
     '''
     Classify an HTTP status error, bump the appropriate failure metric,
@@ -611,27 +700,12 @@ def _handle_http_status_error(
     pf: str = proxy_file_label(proxy or '')
     status_code: int = exc.response.status_code
     if status_code == 404:
-        _record_rss_failure('not_found', proxy_ip, proxy_network, pf)
-        YouTubeRateLimiter.get().report_rss_failure(
-            proxy, is_circuit_tripping=True,
-        )
+        _record_rss_failure('not_found', proxy_ip, pf)
         raise ValueError(
             f'RSS feed not found: {rss_url}'
         ) from exc
     if 500 <= status_code < 600:
-        # YouTube returns 5xx under per-IP rate-limit pressure
-        # (alongside 404s) when an aggressive scraper is hammering
-        # one of its endpoints. Treat as a soft-ban signal so the
-        # circuit breaker yanks the proxy off the rotation, the
-        # same as for 404. Without this the limiter keeps issuing
-        # tokens at full rate while every fetch from the IP is
-        # rejected.
-        _record_rss_failure(
-            'server_error', proxy_ip, proxy_network, pf,
-        )
-        YouTubeRateLimiter.get().report_rss_failure(
-            proxy, is_circuit_tripping=True,
-        )
+        _record_rss_failure('server_error', proxy_ip, pf)
         raise RuntimeError(
             f'Server error fetching RSS feed: {rss_url}'
         ) from exc
@@ -641,6 +715,7 @@ def _handle_http_status_error(
 async def fetch_rss(
     rss_url: str,
     channel_handle: str,
+    proxy: str | None = None,
 ) -> list[YouTubeVideo] | None:
     '''
     Fetches and parses the YouTube RSS feed for a channel.
@@ -649,7 +724,10 @@ async def fetch_rss(
     :param channel_handle: Canonical channel handle (typically from
         the creator map, falling back to the queue's stored handle)
         to stamp onto every YouTubeVideo parsed from the feed.
-    :param proxy: Optional proxy URL for the HTTP request.
+    :param proxy: Optional proxy URL for the HTTP request. When
+        supplied, the RSS limiter bucket for that same proxy is
+        acquired so all YouTube calls for the channel stay on one
+        outbound identity.
     :returns: A list of YouTubeVideo instances populated from the RSS feed.
     :raises: httpx.HTTPStatusError on non-2xx HTTP responses.
     :raises: httpx.RequestError on network-level failures.
@@ -661,27 +739,24 @@ async def fetch_rss(
     # so these are initialised conservatively in case acquisition
     # or proxy_ip parsing itself raises.
     fetch_status: str = 'setup_failed'
-    fetch_proxy_network: str = 'unknown'
     try:
-        extra: dict[str, str] = {'rss_url': rss_url}
+        extra: dict[str, object] = {'rss_url': rss_url}
 
         logging.debug('Fetching RSS feed', extra=extra)
-        proxy: str | None = (
+        proxy = (
             await YouTubeRateLimiter.get().acquire(
-                YouTubeCallType.RSS
+                YouTubeCallType.RSS, proxy=proxy,
             )
         )
         try:
             proxy_ip: str | None = _extract_proxy_ip(proxy) if proxy else None
         except ValueError as exc:
             logging.warning(
-                'Failed to parse proxy URL to get proxy_ip for metrics labeling',
-                exc=exc,
-                extra={'proxy': proxy},
+                'Failed to parse proxy URL to get proxy_ip for metrics '
+                'labeling', exc=exc, extra={'proxy': proxy},
             )
             proxy_ip = None
         proxy_network: str = proxy_network_for(proxy_ip)
-        fetch_proxy_network = proxy_network
         extra['proxy_ip'] = proxy_ip or 'none'
         extra['proxy_network'] = proxy_network
         extra['proxy'] = proxy or 'none'
@@ -697,6 +772,8 @@ async def fetch_rss(
             await jitter_pool_warmup(proxy)
             response: Response = await http.get(
                 rss_url,
+                headers=_rss_browser_headers(),
+                cookies=_rss_browser_cookies(proxy),
                 timeout=httpx.Timeout(
                     HTTP_REQUEST_TIMEOUT,
                     connect=HTTP_CONNECT_TIMEOUT,
@@ -708,12 +785,18 @@ async def fetch_rss(
                 },
             )
             response.raise_for_status()
+            duration: float = monotonic() - scrape_start
             data: str = response.text
             logging.debug(
-                'Fetched RSS feed successfully', extra=extra,
+                'Fetched RSS feed successfully',
+                extra=extra | {
+                    'duration': duration,
+                    'status_code': getattr(response, 'status_code', None),
+                },
             )
             YouTubeRateLimiter.get().report_rss_success(proxy)
         except httpx.HTTPStatusError as exc:
+            duration = monotonic() - scrape_start
             status_code: int = exc.response.status_code
             if status_code == 404:
                 fetch_status = 'not_found'
@@ -722,9 +805,11 @@ async def fetch_rss(
             else:
                 fetch_status = f'http_{status_code}'
             _handle_http_status_error(
-                exc, rss_url, proxy, proxy_ip, proxy_network, extra,
+                exc, rss_url, proxy, proxy_ip,
+                extra | {'duration': duration},
             )
         except httpx.TimeoutException as exc:
+            duration = monotonic() - scrape_start
             # Split connect vs read so SYN-drop pressure (the
             # dominant signal in production) is visible in
             # Prometheus instead of bundled into a single
@@ -740,15 +825,19 @@ async def fetch_rss(
                 timeout_kind = 'timeout_other'
             fetch_status = timeout_kind
             _record_rss_failure(
-                timeout_kind, proxy_ip, proxy_network, pfl,
+                timeout_kind, proxy_ip, pfl,
             )
             logging.warning(
                 'Timeout fetching RSS feed',
                 exc=exc,
-                extra=extra | {'timeout_kind': timeout_kind},
+                extra=extra | {
+                    'timeout_kind': timeout_kind,
+                    'duration': duration,
+                },
             )
             raise
         except (httpx.NetworkError, httpx.ProxyError) as exc:
+            duration = monotonic() - scrape_start
             cause: BaseException | None = (
                 exc.__cause__ or exc.__context__
             )
@@ -758,38 +847,45 @@ async def fetch_rss(
             ):
                 fetch_status = 'bind_failed'
                 _record_rss_failure(
-                    'bind_failed', proxy_ip, proxy_network, pfl,
+                    'bind_failed', proxy_ip, pfl,
                 )
                 logging.warning(
                     'Local IP not bound on this host',
-                    exc=exc, extra=extra,
+                    exc=exc, extra=extra | {'duration': duration},
                 )
             else:
                 fetch_status = 'network'
                 _record_rss_failure(
-                    'network', proxy_ip, proxy_network, pfl,
+                    'network', proxy_ip, pfl,
                 )
                 logging.warning(
                     'Network error fetching RSS feed',
-                    exc=exc, extra=extra,
+                    exc=exc, extra=extra | {'duration': duration},
                 )
             raise
         except Exception as exc:
+            duration = monotonic() - scrape_start
             fetch_status = 'unknown'
             _record_rss_failure(
-                'unknown', proxy_ip, proxy_network, pfl,
+                'unknown', proxy_ip, pfl,
             )
             logging.warning(
-                'Getting RSS data failed', exc=exc, extra=extra,
+                'Getting RSS data failed',
+                exc=exc,
+                extra=extra | {'duration': duration},
             )
             raise
 
         if not data:
+            duration = monotonic() - scrape_start
             fetch_status = 'no_data'
             _record_rss_failure(
-                'no_data', proxy_ip, proxy_network, pfl,
+                'no_data', proxy_ip, pfl,
             )
-            logging.warning('No data received from RSS feed', extra=extra)
+            logging.warning(
+                'No data received from RSS feed',
+                extra=extra | {'duration': duration},
+            )
             raise RuntimeError(
                 f'No data received from RSS feed {rss_url}'
             )
@@ -823,6 +919,7 @@ async def fetch_rss(
                 )
 
         fetch_status = 'success'
+        duration = monotonic() - scrape_start
         METRIC_SCRAPE_DURATION.labels(
             platform='youtube',
             scraper='rss_scraper',
@@ -830,9 +927,10 @@ async def fetch_rss(
             api='rss',
             outcome='success',
             worker_id=get_worker_id(),
-        ).observe(monotonic() - scrape_start)
+        ).observe(duration)
         return videos
     except Exception:
+        duration = monotonic() - scrape_start
         METRIC_SCRAPE_DURATION.labels(
             platform='youtube',
             scraper='rss_scraper',
@@ -840,15 +938,16 @@ async def fetch_rss(
             api='rss',
             outcome='failure',
             worker_id=get_worker_id(),
-        ).observe(monotonic() - scrape_start)
+        ).observe(duration)
         raise
     finally:
+        duration = monotonic() - scrape_start
         METRIC_RSS_FETCH_DURATION.labels(
             platform='youtube',
             scraper='rss_scraper',
             worker_id=get_worker_id(),
             status=fetch_status,
-        ).observe(monotonic() - scrape_start)
+        ).observe(duration)
 
 
 async def check_video_exists(
@@ -886,6 +985,7 @@ MSG_PROCESSED_VIDEOS: str = 'Processed videos for channel'
 async def _fetch_rss_safe(
     rss_url: str,
     channel_handle: str,
+    proxy: str | None = None,
 ) -> list[YouTubeVideo] | None | Exception:
     '''
     Wrapper around :func:`fetch_rss` that captures
@@ -896,108 +996,121 @@ async def _fetch_rss_safe(
         return await fetch_rss(
             rss_url,
             channel_handle=channel_handle,
+            proxy=proxy,
         )
     except Exception as exc:
         return exc
 
 
-async def _enrich_and_store_video(
+async def _queue_video_for_scrape(
     video: YouTubeVideo,
-    innertube: InnerTube,
-    proxy: str | None,
     channel_handle: str,
-    settings: RssSettings,
+    video_queue: RedisVideoScrapeQueue,
 ) -> str | None:
     '''
-    Enrich a single video via InnerTube and write the resulting
-    ``video-min-`` file to ``settings.video_data_directory``.
-    Upload is the video scraper's responsibility — it sweeps the
-    same directory for both ``video-min-*`` and ``video-dlp-*``
-    files and pushes them through its bulk and watch upload
-    pipelines.  Returns the bare filename on success, ``None`` on
-    failure.
+    Enqueue a video id onto the Redis-backed video scrape queue so
+    the video scraper picks it up. Returns the video id on success,
+    ``None`` on failure.
 
     :param channel_handle: Display name of the channel, used only
         for logging.
+    :param video_queue: Redis-backed scrape queue the video scraper
+        consumes from.
     '''
 
-    proxy_ip: str = _extract_proxy_ip(proxy) if proxy else 'none'
-    proxy_network: str = proxy_network_for(proxy_ip)
+    video_id: str = str(video.video_id)
     extra: dict[str, str] = {
-        'video_id': video.video_id,
+        'video_id': video_id,
         'channel_handle': channel_handle,
-        'proxy_ip': proxy_ip,
-        'proxy_network': proxy_network,
     }
     try:
-        await video.from_innertube(
-            innertube=innertube, proxy=proxy,
-        )
-        logging.debug(
-            'Updated video using InnerTube data', extra=extra,
-        )
-        METRIC_INNERTUBE_SUCCESS.labels(
-            platform='youtube',
-            scraper='rss_scraper',
-            entity='video',
-            api='innertube',
-            status='success',
-            worker_id=get_worker_id(),
-            proxy_ip=proxy_ip,
-            proxy_file=proxy_file_label(proxy or ''),
-        ).inc()
-    except Exception as exc:
-        METRIC_INNERTUBE_FAILURES.labels(
-            platform='youtube',
-            scraper='rss_scraper',
-            entity='video',
-            api='innertube',
-            status='failed',
-            worker_id=get_worker_id(),
-            proxy_ip=proxy_ip,
-            proxy_file=proxy_file_label(proxy or ''),
-        ).inc()
-        logging.warning(
-            'Failed to get InnerTube video data, '
-            'will continue with RSS data',
-            exc=exc, extra=extra,
-        )
-
-    try:
-        # Prefer the priority directory if configured so the
-        # --video-upload-only container uploads RSS-discovered
-        # videos ahead of the bulk-archive backlog. Fall back
-        # to video_data_directory for the legacy code path.
-        target_dir: str = (
-            settings.video_priority_directory
-            or settings.video_data_directory
-        )
-        filename: str = await video.to_file(
-            target_dir,
-            filename_prefix=VIDEO_FILENAME_PREFIX,
-            overwrite=True,
-        )
-        extra['filename'] = filename
+        await video_queue.enqueue(video_id, source='rss')
     except Exception as exc:
         logging.warning(
-            'Failed to write video file to disk, '
+            'Failed to enqueue video for scrape, '
             'skipping video',
             exc=exc, extra=extra,
         )
         return None
 
-    # Upload is the video scraper's responsibility: its bulk and
-    # watch uploaders sweep ``video-min-*`` and ``video-dlp-*``
-    # files together (sharing the same ``boinko/youtube/video``
-    # schema) and move successfully-uploaded copies to
-    # ``uploaded_dir``.  Doing the upload here would race with
-    # that sweep and cause duplicate POSTs to the API.
     logging.debug(
-        'Stored video-min file; upload deferred to the '
-        'video scraper',
+        'Queued video-id request for video scraper',
         extra=extra,
     )
-    return filename
+    return video_id
+
+
+def _get_rss_circuit_breaker(
+    settings: 'RssSettings',
+) -> RssCircuitBreaker:
+    '''Process-wide singleton breaker, parameterised from settings.
+
+    Pulled out as a function so the unit suite can monkey-patch
+    it to inject a stub.
+    '''
+    return RssCircuitBreaker.get(
+        redis_dsn=settings.redis_dsn,
+        state_dir=settings.rate_limiter_state_dir,
+        fail_threshold=settings.rss_circuit_fail_threshold,
+        window_size=settings.rss_circuit_window_size,
+        initial_open_seconds=(
+            settings.rss_circuit_initial_open_seconds
+        ),
+        max_open_seconds=settings.rss_circuit_max_open_seconds,
+        impaired_reopen_threshold=(
+            settings.rss_circuit_impaired_reopen_threshold
+        ),
+        recovery_threshold=(
+            settings.rss_circuit_recovery_threshold
+        ),
+        wait_jitter_seconds=(
+            settings.rss_circuit_wait_jitter_seconds
+        ),
+    )
+
+
+_CIRCUIT_STATES: tuple[str, ...] = (
+    'closed-regular', 'open-regular',
+    'closed-impaired', 'open-impaired',
+)
+
+
+async def _publish_circuit_gauges_once(
+    breaker: RssCircuitBreaker,
+) -> None:
+    state = await breaker._backend.read_state()
+    is_open_str: str = 'open' if state.is_open else 'closed'
+    label: str = f'{is_open_str}-{state.mode}'
+    for s in _CIRCUIT_STATES:
+        METRIC_RSS_CIRCUIT_STATE.labels(
+            platform='youtube', state=s,
+        ).set(1.0 if s == label else 0.0)
+    METRIC_RSS_CIRCUIT_OPEN_SECONDS.labels(
+        platform='youtube',
+    ).set(float(state.current_cooldown_s))
+
+
+async def _circuit_gauge_reaper(
+    settings: 'RssSettings',
+    poll_interval_seconds: float = 5.0,
+) -> None:
+    '''Poll the breaker's state and publish the state gauge.
+
+    Only WORKER_ID=='1' runs this so each host has one publisher.
+    '''
+    if get_worker_id() != '1':
+        return
+    breaker: RssCircuitBreaker = _get_rss_circuit_breaker(
+        settings,
+    )
+    while True:
+        try:
+            await _publish_circuit_gauges_once(breaker)
+        except Exception as exc:
+            logging.warning(
+                'Circuit gauge reaper failed', exc=exc,
+            )
+        await asyncio.sleep(poll_interval_seconds)
 
 
 async def process_channel(
@@ -1007,6 +1120,7 @@ async def process_channel(
     name_map_backend: NameMap,
     channel_validator: SchemaValidator,
     tier: int,
+    video_queue: RedisVideoScrapeQueue,
 ) -> bool | None:
     '''
     Fetches the RSS feed for one channel and checks or stores each video.
@@ -1116,13 +1230,21 @@ async def process_channel(
     # (an HTTP GET to /feeds/videos.xml). Both run concurrently
     # via asyncio.gather; the wall-clock duration of the gather
     # is dominated by the slower of the two.
+    breaker: RssCircuitBreaker = _get_rss_circuit_breaker(
+        settings,
+    )
+    wait_seconds: float = await breaker.acquire()
+    METRIC_RSS_CIRCUIT_WAIT_SECONDS.labels(
+        platform='youtube',
+    ).observe(wait_seconds)
+
     update_result: tuple[bool, int, str | None]
     rss_result: list[YouTubeVideo] | None | Exception
     update_result, rss_result = await asyncio.gather(
         _timed(
             'update_channel',
             update_channel(
-                client, channel_handle, channel_id,
+                channel_handle, channel_id,
                 creator_map_backend, name_map_backend,
                 channel_validator, proxy,
                 settings=settings,
@@ -1133,6 +1255,7 @@ async def process_channel(
             _fetch_rss_safe(
                 rss_url,
                 channel_handle=rss_channel_handle,
+                proxy=proxy,
             ),
         ),
     )
@@ -1150,26 +1273,61 @@ async def process_channel(
         return False
     await creator_queue.update_tier(channel_id, sub_count)
 
+    # Bind had_feed once; used by both error and success paths.
+    had_feed: bool = await creator_queue.has_had_feed(channel_id)
+
     # Handle RSS fetch errors.
     if isinstance(rss_result, RuntimeError):
+        # 5xx: unchanged behavior — log, no fail-count bump,
+        # no breaker.
         logging.debug(
             'Server error fetching RSS feed',
-            extra=extra | {'error': str(rss_result)}
+            extra=extra | {'error': str(rss_result)},
         )
         return True
+
+    if isinstance(rss_result, ValueError):
+        # HTTP 404: report to the circuit breaker.
+        report: CircuitReport = await breaker.report(
+            channel_id=channel_id,
+            has_had_feed=had_feed,
+            was_not_found=True,
+        )
+        if report.transition is not None:
+            METRIC_RSS_CIRCUIT_TRANSITIONS.labels(
+                platform='youtube',
+                from_state=report.transition.from_state,
+                to_state=report.transition.to_state,
+            ).inc()
+        for rollback_cid in report.rollback_channel_ids:
+            await creator_queue.rollback_no_feeds(rollback_cid)
+        logging.debug(
+            'Failed to fetch RSS feed for channel',
+            exc=rss_result,
+            extra=extra | {'error': str(rss_result)},
+        )
+        if not report.suppress_channel_failure:
+            await creator_queue.set_no_feeds(
+                channel_id, rss_url, channel_handle, 1,
+            )
+        return False
+
     if isinstance(rss_result, Exception):
+        # Network/timeout or other unexpected error: no
+        # breaker, no suppress logic — preserve pre-breaker
+        # behavior.
         logging.debug(
             'Failed to fetch RSS feed for channel',
             exc=rss_result,
             extra=extra | {'error': str(rss_result)},
         )
         await creator_queue.set_no_feeds(
-            channel_id, rss_url, channel_handle, 1
+            channel_id, rss_url, channel_handle, 1,
         )
         return False
 
     videos: list[YouTubeVideo] | None = rss_result
-    if videos is None:
+    if not isinstance(videos, list):
         logging.debug(MSG_NO_RSS_FEED, extra=extra)
         await creator_queue.set_no_feeds(
             channel_id, rss_url, channel_handle, 1
@@ -1177,10 +1335,19 @@ async def process_channel(
         return False
 
     await creator_queue.mark_had_feed(channel_id)
-
-    no_feed_entry = await creator_queue.get_no_feeds(
-        channel_id,
+    success_report: CircuitReport = await breaker.report(
+        channel_id=channel_id,
+        has_had_feed=had_feed,
+        was_not_found=False,
     )
+    if success_report.transition is not None:
+        METRIC_RSS_CIRCUIT_TRANSITIONS.labels(
+            platform='youtube',
+            from_state=success_report.transition.from_state,
+            to_state=success_report.transition.to_state,
+        ).inc()
+
+    no_feed_entry = await creator_queue.get_no_feeds(channel_id)
     if no_feed_entry is not None:
         await creator_queue.clear_no_feeds(channel_id)
 
@@ -1199,16 +1366,13 @@ async def process_channel(
     #     batch-check existence on scrape.exchange ---
     candidates: list[YouTubeVideo] = []
     videos_existing: int = 0
+    video_fm = AssetFileManagement(settings.video_data_directory)
     for video in videos:
-        file_path: str = YouTubeVideo.get_filepath(
-            video.video_id,
-            settings.video_data_directory,
-            VIDEO_FILENAME_PREFIX,
-        )
-        if os.path.exists(file_path):
+        if not video:
+            continue
+        if video_fm.video_scrape_output_exists(video.video_id):
             logging.debug(
-                'Found existing file for video, '
-                'skipping',
+                'Found existing file for video, skipping',
                 extra=extra | {'video_id': video.video_id},
             )
             videos_existing += 1
@@ -1276,52 +1440,28 @@ async def process_channel(
         )
         return True
 
-    # --- Phase 3: enrich + upload new videos in
-    #     parallel ---
-    # Use the same session-swap helper the pool factory uses,
-    # so this one-off InnerTube carries the same 120s keepalive
-    # the rest of the fleet does instead of the library's
-    # default 5s.
-    innertube: InnerTube = build_innertube_with_pool_limits(
-        proxy,
-    )
-    install_innertube_phase_tracing(
-        innertube.adaptor.session,
-        proxy_file=proxy_file_label(proxy or ''),
-    )
-
-    def _close_innertube() -> None:
-        '''Close the InnerTube httpx session.'''
-        session: object = getattr(
-            innertube.adaptor, 'session', None,
-        )
-        if session is not None and hasattr(
-            session, 'close',
-        ):
-            session.close()
-
+    # --- Phase 3: queue new videos for the video scraper ---
     # update_ok was True above, so resolved_handle is set; assert for
     # the type-checker.
     assert resolved_handle is not None
-    enrich_started: float = monotonic()
-    enrich_results: list[str | None | Exception] = (
+    queue_started: float = monotonic()
+    queue_results: list[str | None | Exception] = (
         await asyncio.gather(
             *[
-                _enrich_and_store_video(
-                    video, innertube, proxy,
-                    channel_handle, settings,
+                _queue_video_for_scrape(
+                    video, channel_handle, video_queue,
                 )
                 for video in new_videos
             ],
             return_exceptions=True,
         )
     )
-    _observe_phase('enrich_videos', enrich_started)
+    _observe_phase('queue_videos', queue_started)
 
-    videos_uploaded: int = 0
+    videos_queued: int = 0
     videos_failed: int = 0
     for video, result in zip(
-        new_videos, enrich_results,
+        new_videos, queue_results,
     ):
         if isinstance(result, Exception):
             logging.warning(
@@ -1332,29 +1472,27 @@ async def process_channel(
         elif result is None:
             videos_failed += 1
         else:
-            videos_uploaded += 1
+            videos_queued += 1
 
     missed: int = (
-        len(new_videos) - videos_uploaded - videos_failed
+        len(new_videos) - videos_queued - videos_failed
     )
     logging.info(
         MSG_PROCESSED_VIDEOS, extra={
             'channel_handle': channel_handle,
-            'videos_uploaded': videos_uploaded,
+            'videos_queued': videos_queued,
             'videos_existing': videos_existing,
             'videos_failed': videos_failed,
             'video_count': len(videos),
         },
     )
     if missed > 0:
-        _close_innertube()
         raise RuntimeError(
             f'{missed} out of {len(videos)} videos '
             f'for channel {channel_handle!r} could not '
             f'be processed'
         )
 
-    _close_innertube()
     videos = []
     return True
 
@@ -1388,14 +1526,15 @@ async def _ensure_priority_directory(
             pass
 
 
-async def _write_channel_priority(
+async def _write_channel(
     record_dict: dict, settings: RssSettings,
 ) -> None:
     '''Persist the RSS-derived channel-stat record under
-    ``settings.channel_priority_directory_path``. The
-    ``--channel-upload-only`` container sweeps this
-    directory ahead of base_dir and POSTs each file to
-    scrape.exchange.
+    ``settings.channel_data_directory`` as
+    ``channel-rss-<handle>.json.br``. The
+    ``tools/yt_channel_upload.py`` picks these files up
+    alongside the standard ``channel-`` records and POSTs
+    each to scrape.exchange.
 
     The file is written via ``atomic_write_bytes`` so the
     consumer never sees a torn file. Concurrent writers
@@ -1410,25 +1549,17 @@ async def _write_channel_priority(
         signal that something on the filesystem side is
         wrong (disk full, permission, missing mount).
     '''
-    priority_dir: str = (
-        settings.channel_priority_directory_path
-    )
+    base_dir: str = settings.channel_data_directory
     handle: str = record_dict['channel_handle']
     target: Path = (
-        Path(priority_dir)
+        Path(base_dir)
         / f'channel-rss-{handle}.json.br'
     )
-    data: bytes = brotli.compress(
-        orjson.dumps(
-            record_dict, option=orjson.OPT_INDENT_2,
-        ),
-        quality=11, mode=brotli.MODE_TEXT,
-    )
-    await atomic_write_bytes(target, data)
+    await brotli_write_async(target, record_dict)
 
 
 async def update_channel(
-    client: ExchangeClient, channel_handle: str,
+    channel_handle: str,
     channel_id: str,
     creator_map_backend: CreatorMap,
     name_map_backend: NameMap,
@@ -1439,9 +1570,8 @@ async def update_channel(
 ) -> tuple[bool, int, str | None]:
     '''
     Fetches channel metadata via InnerTube and updates the channel
-    data on Scrape Exchange via the data API.
+    data on Scrape Exchange via a priority file.
 
-    :param client: The authenticated Scrape Exchange API client.
     :param channel_handle: The channel handle / vanity name as known
         to the caller (may be mis-cased; canonicalised here).
     :param channel_id: The YouTube channel ID.
@@ -1459,7 +1589,6 @@ async def update_channel(
 
     try:
         proxy_ip: str = _extract_proxy_ip(proxy) if proxy else 'none'
-        proxy_network: str = proxy_network_for(proxy_ip)
         tabs: YouTubeChannelTabs = YouTubeChannelTabs(channel_id, proxy)
         channel_data: dict = await tabs.browse_channel()
     except Exception as exc:
@@ -1593,7 +1722,7 @@ async def update_channel(
         )
         return False, subscriber_count, resolved_handle
 
-    await _write_channel_priority(record_dict, settings)
+    await _write_channel(record_dict, settings)
     METRIC_CHANNEL_PRIORITY_WRITES.labels(
         platform='youtube',
         scraper='rss_scraper',
@@ -1615,9 +1744,7 @@ def read_channel_file(filepath: str) -> dict[str, any]:
     '''
 
     if filepath.endswith(FILE_EXTENSION):
-        with open(filepath, 'rb') as f:
-            decompressed_data: bytes = brotli.decompress(f.read())
-            return orjson.loads(decompressed_data)
+        return brotli_read(filepath)
     elif filepath.endswith('.json'):
         with open(filepath, 'r') as f:
             return orjson.loads(f.read())
@@ -1739,6 +1866,7 @@ async def _publish_queue_sizes(
             scraper='rss_scraper',
             entity='rss_feed',
             tier=str(tier),
+            worker_id='',
         ).set(count)
 
 
@@ -2051,6 +2179,7 @@ async def _stream_processor(
     name_map_backend: NameMap,
     channel_validator: SchemaValidator,
     settings: RssSettings,
+    video_queue: RedisVideoScrapeQueue,
 ) -> None:
     '''Single-channel streaming processor.
 
@@ -2104,6 +2233,7 @@ async def _stream_processor(
                     creator_map_backend, name_map_backend,
                     channel_validator,
                     claim_tier,
+                    video_queue,
                 )
             except Exception as exc:
                 result = exc
@@ -2164,6 +2294,7 @@ async def worker_loop(
     creator_map_backend: CreatorMap,
     name_map_backend: NameMap,
     channel_validator: SchemaValidator,
+    video_queue: RedisVideoScrapeQueue,
 ) -> None:
     '''
     Runs indefinitely, processing channels in priority order.
@@ -2247,6 +2378,9 @@ async def worker_loop(
         _bg_tasks.append(asyncio.create_task(
             _publish_queue_metrics_loop(creator_queue),
         ))
+        _bg_tasks.append(asyncio.create_task(
+            _circuit_gauge_reaper(settings),
+        ))
         logging.info(
             'Started orphan-recovery and queue-metrics loops',
             extra={
@@ -2266,6 +2400,12 @@ async def worker_loop(
         await _publish_queue_sizes(creator_queue)
         await _publish_tier_population(creator_queue)
 
+    effective_concurrency: int = max(
+        settings.rss_concurrency,
+        len(settings.proxies),
+        1,
+    )
+
     logging.info(
         'Worker started',
         extra={
@@ -2274,6 +2414,7 @@ async def worker_loop(
             'min_interval': settings.min_interval,
             'retry_interval': settings.retry_interval,
             'rss_concurrency': settings.rss_concurrency,
+            'effective_concurrency': effective_concurrency,
             'discovered_channels': len(channel_map_data),
         },
     )
@@ -2294,7 +2435,7 @@ async def worker_loop(
         platform='youtube',
         scraper='rss_scraper',
         worker_id=get_worker_id(),
-    ).set(settings.rss_concurrency)
+    ).set(effective_concurrency)
     streamers: list[asyncio.Task[None]] = [
         asyncio.create_task(
             _stream_processor(
@@ -2305,9 +2446,10 @@ async def worker_loop(
                 name_map_backend=name_map_backend,
                 channel_validator=channel_validator,
                 settings=settings,
+                video_queue=video_queue,
             ),
         )
-        for i in range(settings.rss_concurrency)
+        for i in range(effective_concurrency)
     ]
     try:
         await asyncio.gather(*streamers)
@@ -2327,6 +2469,23 @@ async def _run_worker(
     enters :func:`worker_loop`.
     '''
     settings: RssSettings = ctx.settings
+
+    # Raise the open-file soft limit to the hard limit so
+    # _queue_video_for_scrape's path.touch() does not hit
+    # EMFILE (errno 24) and silently drop new video IDs.
+    # Default container soft limit is 1024; the hard limit
+    # is typically 524288. Matches yt_channel_scrape.py.
+    _: int
+    _hard: int
+    _, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    _target: int = (
+        _hard if _hard != resource.RLIM_INFINITY
+        else 1048576
+    )
+    resource.setrlimit(
+        resource.RLIMIT_NOFILE,
+        (_target, _hard),
+    )
 
     # Fail fast on a misconfigured priority directory so
     # the supervisor exits non-zero instead of silently
@@ -2357,6 +2516,27 @@ async def _run_worker(
             eligibility_fraction=settings.eligibility_fraction,
             had_feed_file=settings.had_feed_file,
         )
+
+    # The video scrape queue is Redis-only by design (see ADR
+    # 0001 + Phase 3 plan). RSS produces into it; the video
+    # scraper consumes from it. Without redis_dsn we cannot run
+    # the producer in any sensible way -- the old filesystem
+    # path.touch() producer was removed at the same time.
+    if not settings.redis_dsn:
+        raise RuntimeError(
+            'redis_dsn is required: the RSS scraper produces '
+            'into the Redis-backed video scrape queue and has '
+            'no filesystem fallback. Set REDIS_DSN in .env.',
+        )
+    video_queue_redis: aioredis.Redis = aioredis.from_url(
+        settings.redis_dsn, decode_responses=True,
+    )
+    video_queue: RedisVideoScrapeQueue = (
+        RedisVideoScrapeQueue(
+            video_queue_redis,
+            VideoScrapeQueueSettings(),
+        )
+    )
 
     creator_map_backend: CreatorMap
     if settings.redis_dsn:
@@ -2405,6 +2585,7 @@ async def _run_worker(
         creator_queue, tiers,
         creator_map_backend, name_map_backend,
         channel_validator,
+        video_queue,
     )
 
 
@@ -2433,7 +2614,11 @@ def main() -> None:
         scraper_label='rss',
         platform='youtube',
         num_processes=settings.rss_num_processes,
-        concurrency=settings.rss_concurrency,
+        concurrency=max(
+            settings.rss_concurrency,
+            len(settings.proxies),
+            1,
+        ),
         metrics_port=settings.metrics_port,
         log_file=settings.rss_log_file,
         log_level=settings.rss_log_level,

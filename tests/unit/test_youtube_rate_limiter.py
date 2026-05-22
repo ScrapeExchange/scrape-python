@@ -350,181 +350,20 @@ class TestLoadProxiesFromFile(unittest.TestCase):
             self.assertTrue(p.startswith('http'))
 
 
-class TestRssCircuitBreaker(_InProcessTestBase):
-    '''
-    The RSS circuit breaker trips after a configurable number of
-    consecutive soft-ban signals (HTTP 404 on an RSS fetch) for a
-    given proxy, stalls RSS acquire() for that proxy for a
-    cooldown that doubles on each successive open up to a cap, and
-    resets on any RSS success.
-    '''
+class TestRssTimeoutCircuitSelectProxy(_InProcessTestBase):
+    '''select_proxy() routes around open timeout circuits for RSS.'''
 
-    def setUp(self) -> None:
-        super().setUp()
-        self._ev_patcher = patch.dict(
-            os.environ,
-            {
-                'YOUTUBE_RSS_CIRCUIT_THRESHOLD': '5',
-                'YOUTUBE_RSS_CIRCUIT_MIN_COOLDOWN_SECONDS': '300',
-                'YOUTUBE_RSS_CIRCUIT_MAX_COOLDOWN_SECONDS': '14400',
-            },
-            clear=False,
-        )
-        self._ev_patcher.start()
-        YouTubeRateLimiter.reset()
-
-    def tearDown(self) -> None:
-        self._ev_patcher.stop()
-        super().tearDown()
-
-    def test_circuit_closed_by_default(self) -> None:
-        limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
-        self.assertFalse(
-            limiter.is_rss_circuit_open('http://a:3128')
-        )
-
-    def test_circuit_opens_after_threshold_failures(self) -> None:
-        limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
-        proxy: str = 'http://a:3128'
-        for _ in range(4):
-            limiter.report_rss_failure(proxy)
-        self.assertFalse(limiter.is_rss_circuit_open(proxy))
-        limiter.report_rss_failure(proxy)
-        self.assertTrue(limiter.is_rss_circuit_open(proxy))
-
-    def test_non_tripping_failure_ignored(self) -> None:
-        limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
-        proxy: str = 'http://a:3128'
-        for _ in range(20):
-            limiter.report_rss_failure(
-                proxy, is_circuit_tripping=False,
-            )
-        self.assertFalse(limiter.is_rss_circuit_open(proxy))
-
-    def test_success_resets_counter(self) -> None:
-        limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
-        proxy: str = 'http://a:3128'
-        for _ in range(4):
-            limiter.report_rss_failure(proxy)
-        limiter.report_rss_success(proxy)
-        for _ in range(4):
-            limiter.report_rss_failure(proxy)
-        self.assertFalse(limiter.is_rss_circuit_open(proxy))
-
-    def test_per_proxy_isolation(self) -> None:
-        limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
-        for _ in range(5):
-            limiter.report_rss_failure('http://a:3128')
-        self.assertTrue(
-            limiter.is_rss_circuit_open('http://a:3128')
-        )
-        self.assertFalse(
-            limiter.is_rss_circuit_open('http://b:3128')
-        )
-
-    def test_first_cooldown_is_min_cooldown(self) -> None:
-        limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
-        proxy: str = 'http://a:3128'
-        with patch(
-            'scrape_exchange.youtube.youtube_rate_limiter.time.time',
-            return_value=1000.0,
-        ):
-            for _ in range(5):
-                limiter.report_rss_failure(proxy)
-            open_until: float = (
-                limiter._rss_circuit_open_until(proxy)
-            )
-        self.assertAlmostEqual(open_until - 1000.0, 300.0, delta=0.01)
-
-    def test_cooldown_doubles_on_successive_opens(self) -> None:
-        limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
-        proxy: str = 'http://a:3128'
-        with patch(
-            'scrape_exchange.youtube.youtube_rate_limiter.time.time',
-        ) as tm:
-            tm.return_value = 1000.0
-            for _ in range(5):
-                limiter.report_rss_failure(proxy)
-            first_until: float = (
-                limiter._rss_circuit_open_until(proxy)
-            )
-            tm.return_value = first_until + 1.0
-            for _ in range(5):
-                limiter.report_rss_failure(proxy)
-            second_until: float = (
-                limiter._rss_circuit_open_until(proxy)
-            )
-        first_duration: float = first_until - 1000.0
-        second_duration: float = second_until - (first_until + 1.0)
-        self.assertAlmostEqual(
-            second_duration, first_duration * 2.0, delta=0.01,
-        )
-
-    def test_cooldown_capped_at_max(self) -> None:
-        with patch.dict(
-            os.environ,
-            {
-                'YOUTUBE_RSS_CIRCUIT_THRESHOLD': '2',
-                'YOUTUBE_RSS_CIRCUIT_MIN_COOLDOWN_SECONDS': '10',
-                'YOUTUBE_RSS_CIRCUIT_MAX_COOLDOWN_SECONDS': '40',
-            },
-            clear=False,
-        ):
-            YouTubeRateLimiter.reset()
-            limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
-            proxy: str = 'http://a:3128'
-            durations: list[float] = []
-            with patch(
-                'scrape_exchange.youtube.youtube_rate_limiter.time.time',
-            ) as tm:
-                now: float = 1000.0
-                for _ in range(6):
-                    tm.return_value = now
-                    limiter.report_rss_failure(proxy)
-                    limiter.report_rss_failure(proxy)
-                    open_until: float = (
-                        limiter._rss_circuit_open_until(proxy)
-                    )
-                    durations.append(open_until - now)
-                    now = open_until + 1.0
-        # Expected: 10, 20, 40, 40, 40, 40 (capped)
-        self.assertEqual(durations[0], 10.0)
-        self.assertEqual(durations[1], 20.0)
-        for d in durations[2:]:
-            self.assertEqual(d, 40.0)
-
-    def test_success_clears_consecutive_opens(self) -> None:
-        limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
-        proxy: str = 'http://a:3128'
-        with patch(
-            'scrape_exchange.youtube.youtube_rate_limiter.time.time',
-        ) as tm:
-            tm.return_value = 1000.0
-            for _ in range(5):
-                limiter.report_rss_failure(proxy)
-            first_until: float = (
-                limiter._rss_circuit_open_until(proxy)
-            )
-            tm.return_value = first_until + 1.0
-            limiter.report_rss_success(proxy)
-            for _ in range(5):
-                limiter.report_rss_failure(proxy)
-            new_until: float = (
-                limiter._rss_circuit_open_until(proxy)
-            )
-        # After success, the next trip must start from the min
-        # cooldown again, not continue the exponential.
-        self.assertAlmostEqual(
-            new_until - (first_until + 1.0), 300.0, delta=0.01,
-        )
-
-    def test_select_proxy_skips_open_circuit_for_rss(self) -> None:
+    def test_select_proxy_skips_open_timeout_circuit_for_rss(
+        self,
+    ) -> None:
+        '''proxy A's timeout circuit open → select_proxy returns
+        only B or C for RSS calls.'''
         limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
         limiter.set_proxies([
             'http://a:3128', 'http://b:3128', 'http://c:3128',
         ])
-        for _ in range(5):
-            limiter.report_rss_failure('http://a:3128')
+        for _ in range(20):
+            limiter.report_rss_timeout('http://a:3128')
         seen: set[str | None] = set()
         for _ in range(30):
             seen.add(limiter.select_proxy(YouTubeCallType.RSS))
@@ -534,14 +373,14 @@ class TestRssCircuitBreaker(_InProcessTestBase):
         )
 
     def test_select_proxy_unaffected_for_non_rss(self) -> None:
+        '''Timeout circuit only suppresses RSS routing, not BROWSE.'''
         limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
         limiter.set_proxies(['http://a:3128', 'http://b:3128'])
-        for _ in range(5):
-            limiter.report_rss_failure('http://a:3128')
+        for _ in range(20):
+            limiter.report_rss_timeout('http://a:3128')
         seen: set[str | None] = set()
         for _ in range(50):
             seen.add(limiter.select_proxy(YouTubeCallType.BROWSE))
-        # BROWSE circuit state is separate — proxy A still eligible.
         self.assertIn('http://a:3128', seen)
         self.assertIn('http://b:3128', seen)
 
@@ -555,11 +394,11 @@ class TestRssCircuitBreaker(_InProcessTestBase):
             'scrape_exchange.youtube.youtube_rate_limiter.time.time',
         ) as tm:
             tm.return_value = 1000.0
-            for _ in range(5):
-                limiter.report_rss_failure('http://a:3128')
+            for _ in range(20):
+                limiter.report_rss_timeout('http://a:3128')
             tm.return_value = 1100.0
-            for _ in range(5):
-                limiter.report_rss_failure('http://b:3128')
+            for _ in range(20):
+                limiter.report_rss_timeout('http://b:3128')
             # A trips at t=1000 → open until 1300
             # B trips at t=1100 → open until 1400
             # Both open while now < 1300; A is earliest.
@@ -570,15 +409,15 @@ class TestRssCircuitBreaker(_InProcessTestBase):
         self.assertEqual(chosen, 'http://a:3128')
 
 
-class TestRssCircuitBreakerAcquire(unittest.IsolatedAsyncioTestCase):
-    '''acquire() must honour open RSS circuits.'''
+class TestRssTimeoutCircuitAcquire(unittest.IsolatedAsyncioTestCase):
+    '''acquire() must honour open per-proxy timeout circuits.'''
 
     def setUp(self) -> None:
         self._env_patcher = patch.dict(
             os.environ,
             {
                 'RATE_LIMITER_STATE_DIR': '',
-                'YOUTUBE_RSS_CIRCUIT_THRESHOLD': '5',
+                'YOUTUBE_RSS_TIMEOUT_THRESHOLD': '5',
                 'YOUTUBE_RSS_CIRCUIT_MIN_COOLDOWN_SECONDS': '300',
                 'YOUTUBE_RSS_CIRCUIT_MAX_COOLDOWN_SECONDS': '14400',
             },
@@ -604,13 +443,13 @@ class TestRssCircuitBreakerAcquire(unittest.IsolatedAsyncioTestCase):
         YouTubeRateLimiter.reset()
         self._env_patcher.stop()
 
-    async def test_acquire_rss_skips_open_circuit_proxy(
+    async def test_acquire_rss_skips_open_timeout_circuit_proxy(
         self,
     ) -> None:
         limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
         limiter.set_proxies(['http://a:3128', 'http://b:3128'])
         for _ in range(5):
-            limiter.report_rss_failure('http://a:3128')
+            limiter.report_rss_timeout('http://a:3128')
         for _ in range(5):
             chosen: str | None = await limiter.acquire(
                 YouTubeCallType.RSS,
@@ -620,8 +459,8 @@ class TestRssCircuitBreakerAcquire(unittest.IsolatedAsyncioTestCase):
     async def test_acquire_rss_all_open_sleeps_until_reopen(
         self,
     ) -> None:
-        '''When all circuits are open, acquire() must sleep until
-        the earliest reopen time.'''
+        '''When all timeout circuits are open, acquire() sleeps
+        until the earliest reopen time.'''
         limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
         limiter.set_proxies(['http://a:3128'])
 
@@ -644,26 +483,24 @@ class TestRssCircuitBreakerAcquire(unittest.IsolatedAsyncioTestCase):
             new=fake_sleep,
         ):
             for _ in range(5):
-                limiter.report_rss_failure('http://a:3128')
+                limiter.report_rss_timeout('http://a:3128')
             # now=1000, open_until=1300
             await limiter.acquire(YouTubeCallType.RSS)
-        # Must have slept roughly 300s to wait out the circuit.
         self.assertGreaterEqual(sum(sleeps), 300.0)
 
-    async def test_acquire_non_rss_ignores_rss_circuit(
+    async def test_acquire_non_rss_ignores_timeout_circuit(
         self,
     ) -> None:
         limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
         limiter.set_proxies(['http://a:3128', 'http://b:3128'])
         for _ in range(5):
-            limiter.report_rss_failure('http://a:3128')
+            limiter.report_rss_timeout('http://a:3128')
         seen: set[str | None] = set()
         for _ in range(20):
             seen.add(
                 await limiter.acquire(YouTubeCallType.BROWSE),
             )
         # BROWSE rate-limit is balanced by tokens, not circuit.
-        # Proxy A must still be reachable.
         self.assertIn('http://a:3128', seen)
 
 
@@ -727,33 +564,6 @@ class TestPlayerDefaultRate(unittest.TestCase):
         )
 
 
-class TestRssCircuitMetricReasonLabel(_InProcessTestBase):
-    '''The trips counter has a ``reason`` label distinguishing
-    4xx/5xx-driven trips from timeout-driven trips.'''
-
-    def test_4xx_trip_increments_metric_with_reason_4xx_5xx(
-        self,
-    ) -> None:
-        limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
-        proxy: str = 'http://a:3128'
-        labels: dict[str, str] = {
-            'platform': 'youtube',
-            'scraper': 'rss_scraper',
-            'api': 'rss',
-            'proxy': proxy,
-            'reason': '4xx_5xx',
-        }
-        before: float = METRIC_RSS_CIRCUIT_OPENED.labels(
-            **labels,
-        )._value.get()
-        for _ in range(5):
-            limiter.report_rss_failure(proxy)
-        after: float = METRIC_RSS_CIRCUIT_OPENED.labels(
-            **labels,
-        )._value.get()
-        self.assertEqual(after - before, 1.0)
-
-
 class TestRssCircuitTimeoutBreaker(_InProcessTestBase):
     '''The breaker also trips when consecutive timeout_connect
     failures cross YOUTUBE_RSS_TIMEOUT_THRESHOLD (default 20).'''
@@ -790,51 +600,6 @@ class TestRssCircuitTimeoutBreaker(_InProcessTestBase):
             limiter.report_rss_timeout(proxy)
         self.assertTrue(limiter.is_rss_circuit_open(proxy))
 
-    def test_timeout_threshold_independent_of_4xx(self) -> None:
-        '''9 4xx + 19 timeouts: each below own threshold. Closed.
-        +1 timeout (= 20 timeouts): opens via timeout path.
-        Uses 4xx threshold=10 so 9 failures stay below it.'''
-        with patch.dict(
-            os.environ,
-            {'YOUTUBE_RSS_CIRCUIT_THRESHOLD': '10'},
-            clear=False,
-        ):
-            YouTubeRateLimiter.reset()
-            limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
-            proxy: str = 'http://a:3128'
-            for _ in range(9):
-                limiter.report_rss_failure(proxy)
-            for _ in range(19):
-                limiter.report_rss_timeout(proxy)
-            self.assertFalse(limiter.is_rss_circuit_open(proxy))
-            limiter.report_rss_timeout(proxy)
-            self.assertTrue(limiter.is_rss_circuit_open(proxy))
-
-    def test_4xx_does_not_reset_timeouts(self) -> None:
-        '''19 timeouts + 1 4xx: timeout streak not reset; +1
-        timeout (=20) trips on timeout reason.'''
-        limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
-        proxy: str = 'http://a:3128'
-        for _ in range(19):
-            limiter.report_rss_timeout(proxy)
-        limiter.report_rss_failure(proxy)
-        self.assertFalse(limiter.is_rss_circuit_open(proxy))
-        limiter.report_rss_timeout(proxy)
-        self.assertTrue(limiter.is_rss_circuit_open(proxy))
-
-    def test_timeout_does_not_reset_4xx(self) -> None:
-        '''4 4xx + 1 timeout + 1 4xx (= 5 4xx total) trips on 4xx
-        path. The intervening timeout did not reset the 4xx
-        counter.'''
-        limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
-        proxy: str = 'http://a:3128'
-        for _ in range(4):
-            limiter.report_rss_failure(proxy)
-        limiter.report_rss_timeout(proxy)
-        self.assertFalse(limiter.is_rss_circuit_open(proxy))
-        limiter.report_rss_failure(proxy)
-        self.assertTrue(limiter.is_rss_circuit_open(proxy))
-
     def test_timeout_trip_increments_metric_with_reason_timeout(
         self,
     ) -> None:
@@ -869,18 +634,17 @@ class TestRssCircuitTimeoutBreaker(_InProcessTestBase):
             limiter.report_rss_timeout(proxy)
         self.assertFalse(limiter.is_rss_circuit_open(proxy))
 
-    def test_success_resets_both_counters(self) -> None:
-        '''Mixed: 4 4xx + 19 timeouts + success + 4 4xx + 19
-        timeouts = closed (both counters were reset).'''
+    def test_success_resets_timeout_counter_and_opens(
+        self,
+    ) -> None:
+        '''19 timeouts + success + 19 timeouts → closed.
+        Success resets the counter AND the consecutive_opens
+        so the next trip starts at the min cooldown.'''
         limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
         proxy: str = 'http://a:3128'
-        for _ in range(4):
-            limiter.report_rss_failure(proxy)
         for _ in range(19):
             limiter.report_rss_timeout(proxy)
         limiter.report_rss_success(proxy)
-        for _ in range(4):
-            limiter.report_rss_failure(proxy)
         for _ in range(19):
             limiter.report_rss_timeout(proxy)
         self.assertFalse(limiter.is_rss_circuit_open(proxy))

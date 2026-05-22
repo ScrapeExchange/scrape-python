@@ -13,6 +13,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from scrape_exchange.datatypes import Platform, PlatformEntityType
 from scrape_exchange.content_claim import (
     ContentClaim,
     FileContentClaim,
@@ -243,7 +244,24 @@ class TestRedisContentClaimAcquire(
         result: bool = await self._claim.acquire('vid001')
         self.assertTrue(result)
         self._redis_inst.set.assert_awaited_once_with(
-            'youtube:claim:vid001',
+            'claim:youtube:vid001',
+            str(__import__('os').getpid()),
+            nx=True,
+            ex=600,
+        )
+
+    async def test_set_claim_generates_canonical_claim_key(
+        self,
+    ) -> None:
+        self._redis_inst.set.return_value = True
+        result: bool = await self._claim.set_claim(
+            Platform.YOUTUBE,
+            PlatformEntityType.VIDEO,
+            'vid001',
+        )
+        self.assertTrue(result)
+        self._redis_inst.set.assert_awaited_once_with(
+            'claim:youtube:video:vid001',
             str(__import__('os').getpid()),
             nx=True,
             ex=600,
@@ -287,7 +305,7 @@ class TestRedisContentClaimRelease(
     ) -> None:
         await self._claim.release('vid001')
         self._redis_inst.delete.assert_awaited_once_with(
-            'youtube:claim:vid001'
+            'claim:youtube:vid001'
         )
 
 
@@ -320,9 +338,9 @@ class TestRedisContentClaimCleanup(
         self,
     ) -> None:
         keys: list[str] = [
-            'youtube:claim:v1',
-            'youtube:claim:v2',
-            'youtube:claim:v3',
+            'claim:youtube:video:v1',
+            'claim:youtube:video:v2',
+            'claim:youtube:video:v3',
         ]
         # Single-page scan: cursor goes 0 → 0
         self._redis_inst.scan.return_value = (0, keys)
@@ -336,10 +354,10 @@ class TestRedisContentClaimCleanup(
 
     async def test_cleanup_multi_page_scan(self) -> None:
         page1: list[str] = [
-            'youtube:claim:v1',
-            'youtube:claim:v2',
+            'claim:youtube:video:v1',
+            'claim:youtube:video:v2',
         ]
-        page2: list[str] = ['youtube:claim:v3']
+        page2: list[str] = ['claim:youtube:video:v3']
         # First call returns cursor=42 (more pages),
         # second call returns cursor=0 (done).
         self._redis_inst.scan.side_effect = [

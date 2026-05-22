@@ -323,6 +323,7 @@ class AsyncYouTubeClient(AsyncClient):
         try:
             resp: Response = await super().get(url, **kwargs)
         except asyncio.CancelledError as exc:
+            duration: float = time.monotonic() - start
             METRIC_YT_REQUEST_DURATION.labels(
                 platform='youtube',
                 scraper=_get_scraper(),
@@ -330,7 +331,7 @@ class AsyncYouTubeClient(AsyncClient):
                 status_class='error',
                 worker_id=get_worker_id(),
                 proxy_file=proxy_file,
-            ).observe(time.monotonic() - start)
+            ).observe(duration)
             # curl_cffi can raise CancelledError from its internal stream task
             # during cleanup even when the outer task is not being cancelled.
             # Only propagate if this task is genuinely being cancelled.
@@ -338,7 +339,8 @@ class AsyncYouTubeClient(AsyncClient):
             if task is not None and task.cancelling() > 0:
                 raise
             _LOGGER.debug(
-                'HTTP GET cancelled (curl_cffi internal)', extra=extra,
+                'HTTP GET cancelled (curl_cffi internal)',
+                extra=extra | {'duration': duration},
             )
             if retries > 0:
                 await asyncio.sleep(random.uniform(delay - 1, delay))
@@ -351,6 +353,7 @@ class AsyncYouTubeClient(AsyncClient):
         except (TimeoutException, ConnectError, ReadTimeout,
                 ConnectTimeout, ConnectionResetError,
                 ConnectionRefusedError) as exc:
+            duration = time.monotonic() - start
             METRIC_YT_REQUEST_DURATION.labels(
                 platform='youtube',
                 scraper=_get_scraper(),
@@ -358,8 +361,12 @@ class AsyncYouTubeClient(AsyncClient):
                 status_class='error',
                 worker_id=get_worker_id(),
                 proxy_file=proxy_file,
-            ).observe(time.monotonic() - start)
-            _LOGGER.debug('HTTP GET timeout', exc=exc, extra=extra)
+            ).observe(duration)
+            _LOGGER.debug(
+                'HTTP GET timeout',
+                exc=exc,
+                extra=extra | {'duration': duration},
+            )
             if retries > 0:
                 await asyncio.sleep(random.uniform(delay-1, delay))
                 _LOGGER.debug(
@@ -372,6 +379,7 @@ class AsyncYouTubeClient(AsyncClient):
 
             raise RuntimeError(f'Timeout fetching URL {url}') from exc
         except RequestError as exc:
+            duration = time.monotonic() - start
             METRIC_YT_REQUEST_DURATION.labels(
                 platform='youtube',
                 scraper=_get_scraper(),
@@ -379,10 +387,15 @@ class AsyncYouTubeClient(AsyncClient):
                 status_class='error',
                 worker_id=get_worker_id(),
                 proxy_file=proxy_file,
-            ).observe(time.monotonic() - start)
-            _LOGGER.debug('HTTP GET request error', exc=exc, extra=extra)
+            ).observe(duration)
+            _LOGGER.debug(
+                'HTTP GET request error',
+                exc=exc,
+                extra=extra | {'duration': duration},
+            )
             raise
         except Exception as exc:
+            duration = time.monotonic() - start
             METRIC_YT_REQUEST_DURATION.labels(
                 platform='youtube',
                 scraper=_get_scraper(),
@@ -390,8 +403,12 @@ class AsyncYouTubeClient(AsyncClient):
                 status_class='error',
                 worker_id=get_worker_id(),
                 proxy_file=proxy_file,
-            ).observe(time.monotonic() - start)
-            _LOGGER.debug('HTTP GET error', exc=exc, extra=extra)
+            ).observe(duration)
+            _LOGGER.debug(
+                'HTTP GET error',
+                exc=exc,
+                extra=extra | {'duration': duration},
+            )
             if retries > 0:
                 await asyncio.sleep(random.uniform(delay-1, delay))
                 _LOGGER.debug(
@@ -404,6 +421,7 @@ class AsyncYouTubeClient(AsyncClient):
 
             raise RuntimeError(f'Timeout fetching URL {url}') from exc
 
+        duration = time.monotonic() - start
         METRIC_YT_REQUEST_DURATION.labels(
             platform='youtube',
             scraper=_get_scraper(),
@@ -411,9 +429,16 @@ class AsyncYouTubeClient(AsyncClient):
             status_class=_yt_status_class(resp.status_code),
             worker_id=get_worker_id(),
             proxy_file=proxy_file,
-        ).observe(time.monotonic() - start)
+        ).observe(duration)
         record_html_phase_metrics(
             resp, proxy_file=proxy_file,
+        )
+        _LOGGER.debug(
+            'HTTP GET completed',
+            extra=extra | {
+                'duration': duration,
+                'status_code': resp.status_code,
+            },
         )
 
         if (resp.status_code == 303
@@ -435,7 +460,10 @@ class AsyncYouTubeClient(AsyncClient):
         if resp.status_code != 200:
             _LOGGER.warning(
                 'Scrape failed',
-                extra={'url': url, 'status_code': resp.status_code}
+                extra=extra | {
+                    'duration': duration,
+                    'status_code': resp.status_code,
+                },
             )
             return None
 

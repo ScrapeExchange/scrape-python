@@ -231,6 +231,38 @@ class TestCleanupLowerRanked(unittest.TestCase):
             os.path.join(self.base, 'video-min-AAA.json.br')
         ))
 
+    def test_bare_video_id_is_lowest_ranked_video_variant(self):
+        self._write(self.base, 'dQw4w9WgXcQ', 1000.0)
+        self._write(self.base, 'video-min-dQw4w9WgXcQ.json.br', 2000.0)
+
+        deleted = self.fm.cleanup_lower_ranked(
+            'video-min-dQw4w9WgXcQ.json.br',
+        )
+
+        self.assertEqual(len(deleted), 1)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.base, 'dQw4w9WgXcQ')
+        ))
+        self.assertTrue(os.path.exists(
+            os.path.join(
+                self.base, 'video-min-dQw4w9WgXcQ.json.br',
+            )
+        ))
+
+    def test_bare_video_id_does_not_match_arbitrary_unknown_file(self):
+        self._write(self.base, 'not-a-video-id-file', 1000.0)
+        self._write(self.base, 'video-dlp-not-a-video-id-file.json.br',
+                    2000.0)
+
+        deleted = self.fm.cleanup_lower_ranked(
+            'video-dlp-not-a-video-id-file.json.br',
+        )
+
+        self.assertEqual(deleted, [])
+        self.assertTrue(os.path.exists(
+            os.path.join(self.base, 'not-a-video-id-file')
+        ))
+
 
 class TestReadWriteFile(unittest.IsolatedAsyncioTestCase):
 
@@ -650,6 +682,20 @@ class TestIsSuperseded(unittest.TestCase):
         self._write(self.uploaded, 'video-dlp-ABC.json.br', 2000.0)
         self.assertTrue(self.fm.is_superseded('video-min-ABC.json.br'))
 
+    def test_bare_video_id_superseded_by_uploaded_min_file(self):
+        self._write(self.base, 'dQw4w9WgXcQ', 1000.0)
+        self._write(
+            self.uploaded, 'video-min-dQw4w9WgXcQ.json.br', 2000.0,
+        )
+        self.assertTrue(self.fm.is_superseded('dQw4w9WgXcQ'))
+
+    def test_bare_video_id_marker_superseded_by_uploaded_dlp_file(self):
+        self._write(self.base, 'dQw4w9WgXcQ.failed', 1000.0)
+        self._write(
+            self.uploaded, 'video-dlp-dQw4w9WgXcQ.json.br', 2000.0,
+        )
+        self.assertTrue(self.fm.is_superseded('dQw4w9WgXcQ.failed'))
+
     def test_higher_ranked_uploaded_equal_mtime_returns_true(self):
         self._write(self.base, 'video-min-ABC.json.br', 1000.0)
         self._write(self.uploaded, 'video-dlp-ABC.json.br', 1000.0)
@@ -767,6 +813,46 @@ class TestListHelpers(unittest.TestCase):
         self._touch(self.base, 'a.txt')
         self.assertEqual(self.fm.list_base(prefix='nope'), [])
 
+    def test_video_scrape_output_false_when_only_bare_marker_exists(
+        self,
+    ):
+        self._touch(self.base, 'vid_a')
+        self.assertFalse(
+            self.fm.video_scrape_output_exists('vid_a'),
+        )
+
+    def test_video_scrape_output_true_for_video_min_in_base_dir(
+        self,
+    ):
+        self._touch(self.base, 'video-min-vid_a.json.br')
+        self.assertTrue(
+            self.fm.video_scrape_output_exists('vid_a'),
+        )
+
+    def test_video_scrape_output_true_for_video_dlp_in_base_dir(
+        self,
+    ):
+        self._touch(self.base, 'video-dlp-vid_a.json.br')
+        self.assertTrue(
+            self.fm.video_scrape_output_exists('vid_a'),
+        )
+
+    def test_video_scrape_output_true_for_video_min_in_uploaded_dir(
+        self,
+    ):
+        self._touch(self.uploaded, 'video-min-vid_a.json.br')
+        self.assertTrue(
+            self.fm.video_scrape_output_exists('vid_a'),
+        )
+
+    def test_video_scrape_output_true_for_video_dlp_in_uploaded_dir(
+        self,
+    ):
+        self._touch(self.uploaded, 'video-dlp-vid_a.json.br')
+        self.assertTrue(
+            self.fm.video_scrape_output_exists('vid_a'),
+        )
+
 
 class TestReadUploaded(unittest.IsolatedAsyncioTestCase):
 
@@ -864,6 +950,43 @@ class TestMarkInvalid(unittest.TestCase):
             )
 
 
+class TestBareVideoIdFiles(unittest.TestCase):
+
+    def test_all_supported_marker_suffixes_apply_to_bare_video_id(self):
+        with tempfile.TemporaryDirectory() as base:
+            fm = AssetFileManagement(base)
+            for suffix in (
+                '.not_found',
+                '.failed',
+                '.unresolved',
+                '.unavailable',
+                '.invalid',
+            ):
+                path = fm.marker_path('dQw4w9WgXcQ', suffix)
+                self.assertEqual(
+                    str(path),
+                    os.path.join(base, f'dQw4w9WgXcQ{suffix}'),
+                )
+                self.assertTrue(
+                    fm.is_marker(f'dQw4w9WgXcQ{suffix}'),
+                )
+
+    def test_iter_assets_includes_bare_video_id_files(self):
+        with tempfile.TemporaryDirectory() as base:
+            fm = AssetFileManagement(base)
+            path = os.path.join(base, 'dQw4w9WgXcQ')
+            with open(path, 'w') as f:
+                f.write('dQw4w9WgXcQ\n')
+            with open(os.path.join(base, 'dQw4w9WgXcQ.failed'), 'w') as f:
+                f.write('dQw4w9WgXcQ\n')
+
+            assets = list(fm.iter_assets('video'))
+
+            self.assertEqual(len(assets), 1)
+            self.assertEqual(assets[0][0], 'dQw4w9WgXcQ')
+            self.assertFalse(assets[0][1])
+
+
 class TestAtomicWriteBytes(unittest.TestCase):
     '''
     The atomic-write helper is the mitigation for the corrupted-
@@ -875,6 +998,7 @@ class TestAtomicWriteBytes(unittest.TestCase):
     def test_writes_payload_and_no_temp_files_remain(self) -> None:
         from scrape_exchange.file_management import (
             atomic_write_bytes,
+            TMP_SUBDIR_NAME,
         )
 
         with tempfile.TemporaryDirectory() as base:
@@ -883,10 +1007,15 @@ class TestAtomicWriteBytes(unittest.TestCase):
             self.assertEqual(
                 open(target, 'rb').read(), b'payload',
             )
-            # No ``foo.json.br.tmp.*`` orphan temp files remain
-            # in the directory.
-            entries: list[str] = os.listdir(base)
-            self.assertEqual(entries, ['foo.json.br'])
+            # The temp file is created in ``.tmp/`` and renamed
+            # onto the target, so the base dir contains the
+            # target plus the (empty) ``.tmp/`` sub-directory.
+            entries: list[str] = sorted(os.listdir(base))
+            self.assertEqual(entries, [TMP_SUBDIR_NAME, 'foo.json.br'])
+            tmp_entries: list[str] = os.listdir(
+                os.path.join(base, TMP_SUBDIR_NAME),
+            )
+            self.assertEqual(tmp_entries, [])
 
     def test_overwrites_existing_file_atomically(self) -> None:
         from scrape_exchange.file_management import (
@@ -906,10 +1035,11 @@ class TestAtomicWriteBytes(unittest.TestCase):
         self,
     ) -> None:
         '''When the rename step raises, the temp file must not
-        be left behind.'''
+        be left behind in the ``.tmp/`` sub-directory.'''
         from unittest.mock import patch
         from scrape_exchange.file_management import (
             atomic_write_bytes,
+            TMP_SUBDIR_NAME,
         )
         import aiofiles.os as aios
 
@@ -924,9 +1054,13 @@ class TestAtomicWriteBytes(unittest.TestCase):
                     asyncio.run(
                         atomic_write_bytes(target, b'payload'),
                     )
+            # The target should be absent and the ``.tmp/``
+            # sub-directory should hold no orphan temp files.
             entries: list[str] = os.listdir(base)
-            # Both the target and the temp file should be absent.
-            self.assertEqual(entries, [])
+            self.assertNotIn('foo.json.br', entries)
+            tmp_dir: str = os.path.join(base, TMP_SUBDIR_NAME)
+            if os.path.isdir(tmp_dir):
+                self.assertEqual(os.listdir(tmp_dir), [])
 
 
 if __name__ == '__main__':

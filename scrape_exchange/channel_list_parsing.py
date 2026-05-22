@@ -26,12 +26,11 @@ import re
 
 import orjson
 
+from scrape_exchange.youtube.youtube_channel import YouTubeChannel
+
 
 # A YouTube channel ID is "UC" + 22 base64url chars.
 CHANNEL_PREFIX: str = 'channel/'
-_UC_ID_RE: re.Pattern = re.compile(
-    r'^UC[A-Za-z0-9_-]{22}$',
-)
 
 # YouTube channel URL forms that show up in copy-paste channel
 # lists. The path forms that point at a canonical channel are
@@ -59,7 +58,7 @@ def is_channel_id(name: str) -> bool:
     '''
     if not name:
         return False
-    return bool(_UC_ID_RE.match(name))
+    return bool(YouTubeChannel.CHANNEL_ID_REGEX_MATCH.match(name))
 
 
 def is_uc_id_path(name: str) -> bool:
@@ -75,7 +74,9 @@ def is_uc_id_path(name: str) -> bool:
     if not name.startswith(CHANNEL_PREFIX):
         return False
     return bool(
-        _UC_ID_RE.match(name[len(CHANNEL_PREFIX):]),
+        YouTubeChannel.CHANNEL_ID_REGEX_MATCH.match(
+            name[len(CHANNEL_PREFIX):]
+        )
     )
 
 

@@ -10,6 +10,8 @@ Two interchangeable backends:
   works across hosts.
 * :class:`NullCreatorMap` — no-op for contexts that do not
   need the creator map.
+* :class:`InMemoryCreatorMap` — stateful in-process dict.
+  Useful for tests and dry-run operator scripts.
 
 The creator scraper is the authoritative writer. The RSS
 scraper reads only.
@@ -324,3 +326,51 @@ class NullCreatorMap(CreatorMap):
 
     async def size(self) -> int:
         return 0
+
+
+class InMemoryCreatorMap(CreatorMap):
+    '''Stateful in-process creator map backed by a plain dict.
+
+    Useful for tests and for operator scripts that need a
+    single-host, ephemeral CreatorMap (e.g. dry-run modes).
+    Writes are visible immediately and are lost when the
+    process exits. Thread-safety is not guaranteed; use an
+    asyncio-safe caller pattern.
+    '''
+
+    def __init__(self) -> None:
+        self._store: dict[str, str] = {}
+
+    async def get(
+        self, creator_id: str,
+    ) -> str | None:
+        return self._store.get(creator_id)
+
+    async def get_many(
+        self, creator_ids: list[str],
+    ) -> dict[str, str | None]:
+        return {
+            cid: self._store.get(cid)
+            for cid in creator_ids
+        }
+
+    async def get_all(self) -> dict[str, str]:
+        return dict(self._store)
+
+    async def put(
+        self, creator_id: str, creator_handle: str,
+    ) -> None:
+        self._store[creator_id] = creator_handle
+
+    async def put_many(
+        self, mapping: dict[str, str],
+    ) -> None:
+        self._store.update(mapping)
+
+    async def contains(
+        self, creator_id: str,
+    ) -> bool:
+        return creator_id in self._store
+
+    async def size(self) -> int:
+        return len(self._store)

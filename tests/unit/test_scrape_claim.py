@@ -1,5 +1,5 @@
 '''Unit tests for the cross-host scrape claim
-(``youtube:scraping:<handle>``) used by tools/yt_channel_scrape.py
+(``claim:youtube:channel:<handle>``) used by tools/yt_channel_scrape.py
 to deduplicate channel scrapes across hosts.'''
 
 import unittest
@@ -42,12 +42,13 @@ class TestTryAcquireScrapeClaim(
         )
         self.assertEqual(status, 'won')
         self.assertIsNotNone(claim)
-        # Live key with TTL ~300 s.
+        # Live key with TTL ~3600 s (matches the
+        # YOUTUBE_UPLOADED_CHANNELS_LIST refresh cadence).
         ttl: int = await self.redis.ttl(
-            'youtube:scraping:examplehandle',
+            'claim:youtube:channel:examplehandle',
         )
         self.assertGreater(ttl, 0)
-        self.assertLessEqual(ttl, 300)
+        self.assertLessEqual(ttl, 3600)
 
     async def test_second_caller_loses(self) -> None:
         first_claim, first_status = (

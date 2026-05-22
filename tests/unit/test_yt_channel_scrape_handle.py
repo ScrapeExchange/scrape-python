@@ -1,4 +1,4 @@
-'''Tests that the channel scraper uses channel_handle for upload.'''
+'''Tests that the channel uploader uses channel_handle for upload.'''
 
 import unittest
 from unittest.mock import AsyncMock
@@ -14,7 +14,7 @@ class TestChannelScraperHandleResolution(
         from scrape_exchange.youtube.youtube_channel import (
             YouTubeChannel,
         )
-        from tools.yt_channel_scrape import (
+        from tools.yt_channel_upload import (
             resolve_channel_upload_handle,
         )
 
@@ -45,7 +45,7 @@ class TestChannelScraperHandleResolution(
         from scrape_exchange.youtube.youtube_channel import (
             YouTubeChannel,
         )
-        from tools.yt_channel_scrape import (
+        from tools.yt_channel_upload import (
             resolve_channel_upload_handle,
         )
 
@@ -76,7 +76,7 @@ class TestChannelScraperHandleResolution(
         from scrape_exchange.youtube.youtube_channel import (
             YouTubeChannel,
         )
-        from tools.yt_channel_scrape import (
+        from tools.yt_channel_upload import (
             resolve_channel_upload_handle,
         )
 

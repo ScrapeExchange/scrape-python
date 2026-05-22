@@ -17,6 +17,7 @@ callable that receives a :class:`ScraperRunContext`.
 
 import asyncio
 import logging
+import os
 import signal
 import sys
 
@@ -48,6 +49,36 @@ from scrape_exchange.youtube.youtube_channel_tabs import (
     aclose_pooled_innertube,
 )
 from scrape_exchange.settings import ScraperSettings
+
+
+def _start_metrics_server_or_skip(metrics_port: int) -> None:
+    '''Bind the per-worker Prometheus metrics HTTP server on
+    ``metrics_port``. Skip the bind silently when the supervisor
+    has set ``PROMETHEUS_MULTIPROC_DIR``, because in that mode
+    worker metrics are aggregated through the multiproc directory
+    and exposed via the supervisor's single HTTP endpoint.
+    '''
+
+    if os.environ.get('PROMETHEUS_MULTIPROC_DIR'):
+        logging.info(
+            'Worker running under supervisor multiproc mode; '
+            'skipping per-worker metrics HTTP server',
+            extra={'metrics_port': metrics_port},
+        )
+        return
+    try:
+        start_metrics_server(metrics_port)
+        logging.info(
+            'Prometheus metrics available',
+            extra={'metrics_port': metrics_port},
+        )
+    except OSError as exc:
+        logging.warning(
+            'Failed to bind Prometheus metrics port; worker will '
+            'run without metrics',
+            exc=exc,
+            extra={'metrics_port': metrics_port},
+        )
 
 
 @dataclass
@@ -193,19 +224,7 @@ class ScraperRunner:
             },
         )
 
-        try:
-            start_metrics_server(self._metrics_port)
-            logging.info(
-                'Prometheus metrics available',
-                extra={'metrics_port': (self._metrics_port)}
-            )
-        except OSError as exc:
-            logging.warning(
-                'Failed to bind Prometheus metrics port; worker will run '
-                'without metrics', exc=exc, extra={
-                    'metrics_port': (self._metrics_port)
-                },
-            )
+        _start_metrics_server_or_skip(self._metrics_port)
         publish_config_metrics(
             role='worker', scraper_label=self._scraper_label, num_processes=1,
             concurrency=self._concurrency,
