@@ -39,6 +39,32 @@ https://scrape.exchange/schemas/cano-youtube-video-1.2.13
 
 You do not need to set `$id` yourself -- it will be overwritten on submission.
 
+## Semantic Versioning and Schema Families
+
+Schema versions use Semantic Versioning: `MAJOR.MINOR.PATCH`.
+
+Schemas with the same `(username, platform, entity, MAJOR)` belong to the same schema family. Within a family, versions are append-only: each new schema version must be strictly greater than every existing version in that family.
+
+When you publish a new version in an existing family, it must remain backward-compatible with the highest existing version in that family. In practice:
+
+- You can add optional fields.
+- You cannot delete existing fields.
+- You cannot add new required fields.
+- You cannot change field types, except for making a field nullable by adding `null`.
+- You cannot tighten constraints such as shrinking `maxLength`, increasing `minLength`, changing `pattern`, narrowing `enum`, raising `minimum`, lowering `maximum`, adding/changing `format`, or tightening array limits.
+- You cannot remove or retarget existing `x-scrape-*` annotations. Adding new annotations is allowed and applies only to new uploads.
+
+The compatibility check walks nested `properties`, array `items`, and `$defs`. If the API rejects a schema for compatibility reasons, the response includes JSON Pointer paths and rule names so you can fix the whole revision in one pass.
+
+Start a new major version, such as `2.0.0`, when you need to make a breaking change. A new major version starts a new family and has no compatibility obligation to the previous major.
+
+Important endpoint behavior:
+
+- Schema endpoints use exact versions. For example, `GET /api/v1/schema/param/{username}/{platform}/{entity}/{version}` returns that specific schema version.
+- Asset upload endpoints use exact versions. `POST /api/v1/data` and `POST /api/v1/bulk` must cite the exact schema version that validates the uploaded data.
+- Asset read/filter endpoints treat `version` as a family upper bound. For example, filtering at `1.3.0` returns matching assets from versions `1.0.0` through `1.3.0` in the same major family, deduplicated by `platform_content_id` with the highest matching version kept.
+- Omitting `version` on filter requests keeps the broad behavior and can return assets across all schema families.
+
 ## Rules
 
 1. **All property names must be `snake_case`.**
@@ -307,6 +333,8 @@ Note: the generated schema won't include `x-scrape-field` annotations -- you'll 
 | `GET /api/v1/schema/param/{username}/{platform}/{entity}` | List all versions for an entity |
 | `GET /api/v1/schema/param/{username}/{platform}` | List all schemas for a platform |
 | `GET /api/v1/schema/param/{username}` | List all schemas for a user |
+
+Schema retrieval endpoints are exact-version endpoints. Family-range semantics apply to asset reads and filters, not to schema lookup.
 
 ## Deleting a Schema
 

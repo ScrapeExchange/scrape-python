@@ -648,6 +648,145 @@ class TestUploadedVideoIds(unittest.IsolatedAsyncioTestCase):
         )
         collect.assert_not_awaited()
 
+    async def test_prepare_line_uses_prefetched_uploaded_status(
+        self,
+    ) -> None:
+        from tools.yt_video_upload import _prepare_video_line
+
+        settings = MagicMock()
+        video_fm = AsyncMock()
+        uploaded: AsyncMock = AsyncMock()
+        uploaded.contains.side_effect = AssertionError(
+            'single Redis lookup should not run',
+        )
+
+        with patch(
+            'tools.yt_video_upload.video_needs_uploading',
+            new=AsyncMock(return_value=True),
+        ), patch(
+            'tools.yt_video_upload._collect_video_record',
+            new=AsyncMock(),
+        ) as collect:
+            result = await _prepare_video_line(
+                'video-dlp-abc123XYZ.json.br',
+                settings,
+                video_fm,
+                AsyncMock(),
+                None,
+                _permissive_validator(),
+                uploaded,
+                already_uploaded=True,
+            )
+
+        self.assertIsNone(result)
+        video_fm.mark_uploaded.assert_awaited_once_with(
+            'video-dlp-abc123XYZ.json.br',
+        )
+        collect.assert_not_awaited()
+
+    async def test_upload_videos_batches_uploaded_id_lookups(
+        self,
+    ) -> None:
+        from contextlib import asynccontextmanager
+        from scrape_exchange.bulk_upload import BulkBatchOutcome
+        from tools.yt_video_upload import upload_videos
+
+        async def fake_collect(
+            filename: str,
+            settings: object,
+            video_fm: object,
+            creator_map_backend: object,
+            proxy: object,
+            validator: object,
+        ) -> tuple[str, dict]:
+            del (
+                settings, video_fm, creator_map_backend,
+                proxy, validator,
+            )
+            video_id: str = filename.removeprefix(
+                'video-dlp-',
+            ).removesuffix('.json.br')
+            return video_id, {'video_id': video_id}
+
+        async def fake_post(
+            batch_buf: bytes,
+            batch_records: list[tuple[str, str]],
+            settings: object,
+            client: object,
+            video_fm: object,
+        ) -> tuple[str, str, BulkBatchOutcome | None]:
+            del batch_buf, batch_records, settings, client, video_fm
+            return 'job-1', 'batch-1', None
+
+        async def fake_finalize_helper(*args: object) -> None:
+            del args
+
+        @asynccontextmanager
+        async def _noop_slot(*args: object, **kwargs: object):
+            del args, kwargs
+            yield None
+
+        settings = MagicMock()
+        settings.schema_owner = 'boinko'
+        settings.schema_version = '0.0.2'
+        settings.exchange_url = 'http://test'
+        settings.bulk_progress_timeout_seconds = 1.0
+        settings.bulk_batch_size = 1000
+        settings.bulk_max_batch_bytes = 10 * 1024 * 1024
+        settings.video_upload_concurrency = 3
+        settings.max_active_bulk_jobs = 1
+        settings.proxies = []
+        settings.video_data_directory = '/tmp/videos'
+
+        video_fm = MagicMock()
+        video_fm.list_base = MagicMock(side_effect=[
+            [
+                'video-dlp-one.json.br',
+                'video-dlp-two.json.br',
+                'video-dlp-three.json.br',
+            ],
+            [],
+        ])
+        uploaded = AsyncMock()
+        uploaded.contains.side_effect = AssertionError(
+            'single Redis lookup should not run',
+        )
+        uploaded.contains_many.return_value = {
+            'one': False,
+            'two': False,
+            'three': False,
+        }
+
+        with patch(
+            'tools.yt_video_upload.video_needs_uploading',
+            new=AsyncMock(return_value=True),
+        ), patch(
+            'tools.yt_video_upload._collect_video_record',
+            new=fake_collect,
+        ), patch(
+            'tools.yt_video_upload._post_one_video_batch',
+            new=fake_post,
+        ), patch(
+            'tools.yt_video_upload._finalize_one_video_batch',
+            new=fake_finalize_helper,
+        ), patch(
+            'tools.yt_video_upload.reserve_bulk_upload_slot',
+            new=_noop_slot,
+        ):
+            await upload_videos(
+                settings,
+                MagicMock(),
+                video_fm,
+                AsyncMock(),
+                _permissive_validator(),
+                uploaded,
+            )
+
+        uploaded.contains.assert_not_awaited()
+        uploaded.contains_many.assert_awaited_once_with(
+            ['one', 'two', 'three'],
+        )
+
     async def test_process_upload_file_moves_already_uploaded_video(
         self,
     ) -> None:
@@ -684,6 +823,283 @@ class TestUploadedVideoIds(unittest.IsolatedAsyncioTestCase):
             'video-min-abc123XYZ.json.br',
         )
         load.assert_not_awaited()
+
+
+class TestBulkBatchBytesReleasedBetweenPostAndFinalize(
+    unittest.IsolatedAsyncioTestCase,
+):
+    '''The video uploader's _spawn_batch._gated must drop its
+    reference to the batch bytes between the POST phase and the
+    long progress-wait phase. With the default 30-minute
+    bulk_progress_timeout_seconds, NOT dropping the reference
+    keeps hundreds of MB of payload alive per in-flight batch.
+    '''
+
+    async def test_buf_local_in_gated_is_empty_when_finalize_runs(
+        self,
+    ) -> None:
+        import inspect
+        from contextlib import asynccontextmanager
+        from scrape_exchange.bulk_upload import BulkBatchOutcome
+        from tools.yt_video_upload import upload_videos
+
+        # 1 MB payload — large enough that an accidentally-held
+        # reference would be obvious in a memory profile.
+        payload: bytes = b'x' * (1024 * 1024)
+        buf_at_finalize: dict[str, object] = {}
+
+        async def fake_post(
+            batch_buf: bytes,
+            batch_records: list[tuple[str, str]],
+            settings: object,
+            client: object,
+            video_fm: object,
+        ) -> tuple[str, str, BulkBatchOutcome | None]:
+            del (
+                batch_buf, batch_records, settings,
+                client, video_fm,
+            )
+            return 'job-1', 'batch-1', None
+
+        async def fake_finalize_helper(
+            job_id: str,
+            batch_id: str,
+            err: BulkBatchOutcome | None,
+            batch_records: list[tuple[str, str]],
+            settings: object,
+            client: object,
+            video_fm: object,
+            uploaded: object,
+        ) -> None:
+            del (
+                job_id, batch_id, err, settings,
+                client, video_fm, uploaded,
+            )
+            # Walk the frame stack to find _gated's frame
+            # and snapshot its _buf local at the moment the
+            # progress-wait phase begins.
+            frame = inspect.currentframe()
+            gated_frame = None
+            while frame is not None:
+                if frame.f_code.co_name == '_gated':
+                    gated_frame = frame
+                    break
+                frame = frame.f_back
+            assert gated_frame is not None, (
+                '_gated frame not in call stack'
+            )
+            buf_at_finalize['value'] = (
+                gated_frame.f_locals.get('_buf')
+            )
+            buf_at_finalize['records'] = batch_records
+
+        @asynccontextmanager
+        async def _noop_slot(*args: object, **kwargs: object):
+            del args, kwargs
+            yield None
+
+        async def fake_prepare(
+            filename: str,
+            settings: object,
+            video_fm: object,
+            creator_map_backend: object,
+            proxy: object,
+            validator: object,
+            uploaded: object,
+            **kwargs: object,
+        ) -> tuple[str, str, bytes]:
+            del (
+                settings, video_fm, creator_map_backend,
+                proxy, validator, uploaded, kwargs,
+            )
+            video_id: str = filename.split('-')[-1].rstrip(
+                '.json.br'
+            )
+            return video_id, filename, payload
+
+        settings = MagicMock()
+        settings.schema_owner = 'boinko'
+        settings.schema_version = '0.0.2'
+        settings.exchange_url = 'http://test'
+        settings.bulk_progress_timeout_seconds = 1.0
+        settings.bulk_batch_size = 1000
+        settings.bulk_max_batch_bytes = 10 * 1024 * 1024
+        settings.video_upload_concurrency = 1
+        settings.max_active_bulk_jobs = 1
+        settings.proxies = []
+        settings.video_data_directory = '/tmp/videos'
+
+        video_fm = MagicMock()
+        video_fm.list_base = MagicMock(side_effect=[
+            ['video-dlp-abcXYZ.json.br'], [],
+        ])
+        uploaded = AsyncMock()
+        uploaded.contains_many.return_value = {'abcXYZ': False}
+
+        with patch(
+            'tools.yt_video_upload._post_one_video_batch',
+            new=fake_post,
+        ), patch(
+            'tools.yt_video_upload._finalize_one_video_batch',
+            new=fake_finalize_helper,
+        ), patch(
+            'tools.yt_video_upload._prepare_video_line',
+            new=fake_prepare,
+        ), patch(
+            'tools.yt_video_upload.reserve_bulk_upload_slot',
+            new=_noop_slot,
+        ):
+            await upload_videos(
+                settings,
+                MagicMock(),
+                video_fm,
+                AsyncMock(),
+                _permissive_validator(),
+                uploaded,
+            )
+
+        self.assertIn('value', buf_at_finalize)
+        # The whole point: by the time the finalize helper is
+        # invoked (which then does the long progress wait),
+        # _gated's _buf local must already be empty bytes —
+        # NOT the 1 MB payload.
+        self.assertEqual(buf_at_finalize['value'], b'')
+        # batch_records is what the finalize phase needs and
+        # is small (filenames + content IDs).
+        self.assertEqual(
+            buf_at_finalize['records'],
+            [('abcXYZ', 'video-dlp-abcXYZ.json.br')],
+        )
+
+    async def test_batch_creation_is_bounded_by_active_jobs(
+        self,
+    ) -> None:
+        import asyncio
+        from contextlib import asynccontextmanager
+        from scrape_exchange.bulk_upload import BulkBatchOutcome
+        from tools.yt_video_upload import upload_videos
+
+        finalize_started = asyncio.Event()
+        release_finalize = asyncio.Event()
+        prepared: list[str] = []
+
+        async def fake_post(
+            batch_buf: bytes,
+            batch_records: list[tuple[str, str]],
+            settings: object,
+            client: object,
+            video_fm: object,
+        ) -> tuple[str, str, BulkBatchOutcome | None]:
+            del batch_buf, batch_records, settings, client, video_fm
+            return 'job-1', 'batch-1', None
+
+        async def fake_finalize_helper(
+            job_id: str,
+            batch_id: str,
+            err: BulkBatchOutcome | None,
+            batch_records: list[tuple[str, str]],
+            settings: object,
+            client: object,
+            video_fm: object,
+            uploaded: object,
+        ) -> None:
+            del (
+                job_id, batch_id, err, batch_records,
+                settings, client, video_fm, uploaded,
+            )
+            finalize_started.set()
+            await release_finalize.wait()
+
+        @asynccontextmanager
+        async def _noop_slot(*args: object, **kwargs: object):
+            del args, kwargs
+            yield None
+
+        async def fake_prepare(
+            filename: str,
+            settings: object,
+            video_fm: object,
+            creator_map_backend: object,
+            proxy: object,
+            validator: object,
+            uploaded: object,
+            **kwargs: object,
+        ) -> tuple[str, str, bytes]:
+            del (
+                settings, video_fm, creator_map_backend,
+                proxy, validator, uploaded, kwargs,
+            )
+            prepared.append(filename)
+            video_id: str = filename.removeprefix(
+                'video-dlp-',
+            ).removesuffix('.json.br')
+            return video_id, filename, b'{}\n'
+
+        settings = MagicMock()
+        settings.schema_owner = 'boinko'
+        settings.schema_version = '0.0.2'
+        settings.exchange_url = 'http://test'
+        settings.bulk_progress_timeout_seconds = 1.0
+        settings.bulk_batch_size = 1
+        settings.bulk_max_batch_bytes = 10 * 1024 * 1024
+        settings.video_upload_concurrency = 1
+        settings.max_active_bulk_jobs = 1
+        settings.proxies = []
+        settings.video_data_directory = '/tmp/videos'
+
+        video_fm = MagicMock()
+        video_fm.list_base = MagicMock(side_effect=[
+            [
+                'video-dlp-one.json.br',
+                'video-dlp-two.json.br',
+                'video-dlp-three.json.br',
+            ],
+            [],
+        ])
+        uploaded = AsyncMock()
+        uploaded.contains_many.return_value = {
+            'one': False,
+            'two': False,
+            'three': False,
+        }
+
+        with patch(
+            'tools.yt_video_upload._post_one_video_batch',
+            new=fake_post,
+        ), patch(
+            'tools.yt_video_upload._finalize_one_video_batch',
+            new=fake_finalize_helper,
+        ), patch(
+            'tools.yt_video_upload._prepare_video_line',
+            new=fake_prepare,
+        ), patch(
+            'tools.yt_video_upload.reserve_bulk_upload_slot',
+            new=_noop_slot,
+        ):
+            task = asyncio.create_task(upload_videos(
+                settings,
+                MagicMock(),
+                video_fm,
+                AsyncMock(),
+                _permissive_validator(),
+                uploaded,
+            ))
+            await asyncio.wait_for(finalize_started.wait(), timeout=1.0)
+            # The second file is needed to discover that the first
+            # batch is full. The third must not be prepared until
+            # one active batch has finished.
+            self.assertEqual(prepared, [
+                'video-dlp-one.json.br',
+                'video-dlp-two.json.br',
+            ])
+            release_finalize.set()
+            await task
+
+        self.assertEqual(prepared, [
+            'video-dlp-one.json.br',
+            'video-dlp-two.json.br',
+            'video-dlp-three.json.br',
+        ])
 
 
 if __name__ == '__main__':

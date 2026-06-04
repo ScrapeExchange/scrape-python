@@ -171,8 +171,14 @@ class YouTubeChannel:
     RX_SCRAPE_CHANNEL_ID: re.Pattern[str] = re.compile(
         r'"externalId":"(.*?)"'
     )
-    CHANNEL_ID_REGEX_MATCH: re.Pattern[str] = \
-        re.compile(r'^UC[A-Z0-9_-]{22}$', re.IGNORECASE)
+    # Prefix must be canonical uppercase ``UC``. Body is
+    # case-sensitive base64url: distinct case identifies distinct
+    # channels, so the body match is ``[A-Za-z0-9_-]`` rather than
+    # case-insensitive ``[A-Z0-9_-]``. Lowercase ``uc`` inputs are
+    # recoverable via :meth:`normalise_channel_id`.
+    CHANNEL_ID_REGEX_MATCH: re.Pattern[str] = re.compile(
+        r'^UC[A-Za-z0-9_-]{22}$',
+    )
 
     def __init__(
         self, channel_handle: str | None = None,
@@ -230,12 +236,16 @@ class YouTubeChannel:
         self.channel_handle: str | None = None
         if channel_handle:
             self.channel_handle = channel_handle.lstrip('@')
-            self.url = YouTubeChannel.CHANNEL_URL_WITH_AT.format(
-                channel_handle=self.channel_handle.replace(' ', '')
-            )
-        elif channel_id:
+        # channel_id is preferred for the scrape URL whenever available:
+        # it is stable and free of UTF-8, unlike the @handle. The handle
+        # (when supplied) is still kept above as metadata.
+        if channel_id:
             self.url = YouTubeChannel.CHANNEL_URL_WITH_ID.format(
                 channel_id=channel_id
+            )
+        elif self.channel_handle:
+            self.url = YouTubeChannel.CHANNEL_URL_WITH_AT.format(
+                channel_handle=self.channel_handle.replace(' ', '')
             )
         self.channel_id: str | None = channel_id
         self.description: str | None = None
@@ -1179,11 +1189,37 @@ class YouTubeChannel:
         return page_links
 
     @staticmethod
-    def is_channel_id(name: str) -> bool:
+    def is_channel_id(name: str | None) -> bool:
         if not name:
             return False
 
         return bool(YouTubeChannel.CHANNEL_ID_REGEX_MATCH.match(name))
+
+    @staticmethod
+    def normalise_channel_id(name: str | None) -> str | None:
+        '''Recover a canonical channel_id from a lowercase ``uc``
+        prefix.
+
+        YouTube channel_ids are 24 chars: a literal ``UC`` prefix
+        followed by 22 case-sensitive base64url chars. Some
+        upstream code paths (third-party imports, hand-typed URLs)
+        produce lowercase ``uc...`` forms. The body case is
+        irrecoverable once lost, but the prefix is fixed, so we
+        canonicalise by uppercasing the first two chars when the
+        rest of the string is a valid base64url body.
+
+        :returns: the canonical form (``UC`` + 22 base64url chars)
+            if *name* is already canonical or has a lowercase /
+            mixed-case ``uc`` prefix with a valid body; ``None``
+            otherwise.
+        '''
+        if not name or len(name) != 24:
+            return None
+        candidate: str = 'UC' + name[2:] if name[:2].upper() == 'UC' \
+            else name
+        if YouTubeChannel.CHANNEL_ID_REGEX_MATCH.match(candidate):
+            return candidate
+        return None
 
     async def _resolve_channel_id_via_innertube(self) -> bool:
         '''
@@ -1222,8 +1258,14 @@ class YouTubeChannel:
 
         # If the handle is itself a channel_id (some callers pass
         # ``UC...`` as a handle), use it directly with no API call.
-        if YouTubeChannel.is_channel_id(self.channel_handle):
-            self.channel_id = self.channel_handle
+        # Lowercase ``uc`` prefixes are canonicalised — the lookup
+        # would otherwise propagate a non-canonical id into
+        # ``ChannelIdentityStore.bind`` and the scrape queue.
+        normalised_id: str | None = YouTubeChannel.normalise_channel_id(
+            self.channel_handle,
+        )
+        if normalised_id is not None:
+            self.channel_id = normalised_id
             return True
 
         handle: str = self.channel_handle

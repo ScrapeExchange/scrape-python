@@ -75,11 +75,13 @@ input during a one-time reconciliation against the Redis maps.
 ### Channel state
 
 **scraped**:
-A **Channel** for which a `channel-{channel_id}.json.br` or
-`channel-{channel_handle}.json.br` file exists under
-`YOUTUBE_CHANNEL_DATA_DIR` (base or `uploaded/`). The file may be
-legacy or clean — both count. Use as the `status` value in
-`channels.lst` JSONL output.
+A **Channel** for which a `channel-{channel_id}.json.br` file exists
+under `YOUTUBE_CHANNEL_DATA_DIR` (base or `uploaded/`). The file is
+always keyed on `channel_id`; the legacy `channel-{channel_handle}`
+form is renamed to the id form by the one-time
+`yt_migrate_channel_files_to_id` cut-over and is not written by any
+current code path. Use as the `status` value in `channels.lst` JSONL
+output.
 
 **new**:
 A **Channel** known to the system (in `channels.lst` or a Redis map)

@@ -47,8 +47,25 @@ from scrape_exchange.youtube.youtube_client import (
 )
 from scrape_exchange.youtube.youtube_channel_tabs import (
     aclose_pooled_innertube,
+    configure_innertube_executor,
+    shutdown_innertube_executor,
 )
+from scrape_exchange.watchdog import Watchdog
 from scrape_exchange.settings import ScraperSettings
+
+
+# Cadence of the async heartbeat that proves the event loop is alive.
+# Must be comfortably below the watchdog loop timeout (default 60s).
+_HEARTBEAT_INTERVAL_SECONDS: float = 5.0
+
+
+async def _watchdog_heartbeat() -> None:
+    '''Touch the loop-liveness signal forever. If the event loop ever
+    freezes, this stops running and the watchdog's loop signal goes
+    stale.'''
+    while True:
+        Watchdog.get().touch_loop()
+        await asyncio.sleep(_HEARTBEAT_INTERVAL_SECONDS)
 
 
 def _start_metrics_server_or_skip(metrics_port: int) -> None:
@@ -191,7 +208,14 @@ class ScraperRunner:
                 'Scraper shutdown complete',
                 extra={'scraper': self._scraper_label},
             )
-        return 0
+        # Terminate via os._exit(0) rather than returning: the dedicated
+        # InnerTube executor's worker threads are non-daemon, and a still-
+        # wedged InnerTube call would otherwise hang the interpreter's
+        # atexit join indefinitely. The drain already ran in run()'s
+        # finally; flush logging and exit immediately. rc 0 makes the
+        # supervisor retire the slot (no respawn) for an intentional stop.
+        logging.shutdown()
+        os._exit(0)
 
     async def run(
         self,
@@ -229,6 +253,25 @@ class ScraperRunner:
             role='worker', scraper_label=self._scraper_label, num_processes=1,
             concurrency=self._concurrency,
         )
+
+        configure_innertube_executor(
+            self._settings.innertube_executor_threads,
+        )
+
+        heartbeat_task: asyncio.Task[Any] | None = None
+        watchdog: Watchdog | None = None
+        if self._settings.watchdog_enabled:
+            watchdog = Watchdog(
+                loop_timeout=(
+                    self._settings.watchdog_loop_timeout_seconds
+                ),
+                work_timeout=(
+                    self._settings.watchdog_work_timeout_seconds
+                ),
+            )
+            Watchdog.set_instance(watchdog)
+            watchdog.start()
+            heartbeat_task = asyncio.create_task(_watchdog_heartbeat())
 
         rate_limiter: RateLimiter = (self._rl_factory(self._settings))
         rate_limiter.set_proxies(self._settings.proxies)
@@ -285,8 +328,13 @@ class ScraperRunner:
             )
             raise
         finally:
+            if watchdog is not None:
+                watchdog.stop()
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
             if client is not None:
                 await client.drain_uploads(timeout=10.0)
             await aclose_pooled_httpx_clients()
             await aclose_pooled_youtube_clients()
             await aclose_pooled_innertube()
+            shutdown_innertube_executor()

@@ -48,7 +48,7 @@ class TestWriteChannelPriority(
 ):
     '''_write_channel writes a brotli-compressed
     JSON file under the channel data directory with the
-    canonical channel-rss-<handle>.json.br filename.'''
+    canonical channel-rss-<channel_id>.json.br filename.'''
 
     async def asyncSetUp(self) -> None:
         self.tmp: str = tempfile.mkdtemp()
@@ -80,7 +80,7 @@ class TestWriteChannelPriority(
         )
         path: Path = (
             Path(self.base_dir)
-            / 'channel-rss-somehandle.json.br'
+            / 'channel-rss-UC_xyz.json.br'
         )
         self.assertTrue(path.exists(), msg=str(path))
 
@@ -102,7 +102,7 @@ class TestWriteChannelPriority(
         )
         path: Path = (
             Path(self.base_dir)
-            / 'channel-rss-abc.json.br'
+            / 'channel-rss-UC_abc.json.br'
         )
         raw: bytes = path.read_bytes()
         decoded: dict = orjson.loads(
@@ -258,7 +258,7 @@ class TestUpdateChannelWritesPriority(
         self.assertEqual(resolved, 'canonhandle')
         path: Path = (
             Path(self.tmp)
-            / 'channel-rss-canonhandle.json.br'
+            / 'channel-rss-UC_xyz.json.br'
         )
         self.assertTrue(path.exists())
 
@@ -332,7 +332,7 @@ class TestUpdateChannelWritesPriority(
         self.assertEqual(record_dict['video_count'], 7)
         path: Path = (
             Path(self.tmp)
-            / 'channel-rss-noviews.json.br'
+            / 'channel-rss-UC_nv.json.br'
         )
         self.assertTrue(path.exists())
         decoded: dict = orjson.loads(

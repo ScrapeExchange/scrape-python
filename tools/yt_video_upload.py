@@ -26,6 +26,8 @@ from pydantic import AliasChoices, Field, field_validator
 
 from scrape_exchange.bulk_upload import (
     BulkBatchOutcome,
+    finalize_bulk_batch,
+    post_bulk_batch,
     record_bulk_filter_skip,
     reserve_bulk_upload_slot,
     resume_pending_bulk_uploads,
@@ -51,6 +53,7 @@ from scrape_exchange.youtube.youtube_rate_limiter import YouTubeRateLimiter
 from scrape_exchange.youtube.youtube_video import YouTubeVideo
 from scrape_exchange.youtube.uploaded_video_ids import UploadedVideoIds
 from scrape_exchange.worker_id import get_worker_id
+from scrape_exchange.watchdog import Watchdog
 
 from tools.yt_video_scrape import (
     FILE_EXTENSION,
@@ -73,6 +76,7 @@ from scrape_exchange.scraper_metrics import (
     METRIC_WATCHER_FILES_SKIPPED,
     METRIC_UPLOADED_ADDS,
     METRIC_UPLOADED_LOOKUPS,
+    METRIC_FILES_PENDING_UPLOAD,
 )
 
 from scrape_exchange.exchange_client import (
@@ -84,6 +88,9 @@ METRIC_VIDEOS_SKIPPED_HAS_FORMATS: Counter = METRIC_VIDEOS_ALREADY_UPLOADED
 
 SCRAPER_LABEL: str = 'video_uploader'
 _QUEUE_MAXSIZE: int = 10_000
+# How often an idle upload worker ticks the watchdog work signal while
+# blocked waiting for files. Must be < WATCHDOG_WORK_TIMEOUT_SECONDS.
+_WATCHDOG_TOUCH_INTERVAL: float = 30.0
 
 
 def _record_bulk_filter_skip(reason: str) -> None:
@@ -122,13 +129,44 @@ async def _contains_uploaded_video_id(
     return found
 
 
+async def _contains_uploaded_video_ids(
+    uploaded: UploadedVideoIds,
+    video_ids: list[str],
+) -> dict[str, bool]:
+    if not video_ids:
+        return {}
+    try:
+        found: dict[str, bool] = await uploaded.contains_many(
+            video_ids,
+        )
+    except Exception:
+        METRIC_UPLOADED_LOOKUPS.labels(outcome='error').inc(
+            len(video_ids),
+        )
+        raise
+    hits: int = sum(1 for value in found.values() if value)
+    misses: int = len(video_ids) - hits
+    if hits:
+        METRIC_UPLOADED_LOOKUPS.labels(outcome='hit').inc(hits)
+    if misses:
+        METRIC_UPLOADED_LOOKUPS.labels(outcome='miss').inc(
+            misses,
+        )
+    return found
+
+
 async def _move_already_uploaded_to_uploaded(
     video_id: str,
     filename: str,
     uploaded: UploadedVideoIds,
     video_fm: AssetFileManagement,
+    already_uploaded: bool | None = None,
 ) -> bool:
-    if not await _contains_uploaded_video_id(uploaded, video_id):
+    if already_uploaded is None:
+        already_uploaded = await _contains_uploaded_video_id(
+            uploaded, video_id,
+        )
+    if not already_uploaded:
         return False
     logging.debug(
         'Video found in uploaded-video-ids set; moving file '
@@ -585,40 +623,56 @@ async def _prepare_video_line(
     proxy: str | None,
     validator: SchemaValidator,
     uploaded: UploadedVideoIds,
+    already_uploaded: bool | None = None,
 ) -> tuple[str, str, bytes] | None:
     logging.debug(
         'Considering video file for bulk upload',
         extra={'filename': filename},
     )
-    if not await video_needs_uploading(video_fm, filename):
-        logging.debug(
-            'Video file superseded, skipping',
-            extra={'filename': filename},
+    try:
+        if not await video_needs_uploading(video_fm, filename):
+            logging.debug(
+                'Video file superseded, skipping',
+                extra={'filename': filename},
+            )
+            _record_bulk_filter_skip('superseded')
+            return None
+
+        parsed: tuple[str, str, bool] | None = _parse_entry(filename)
+        if parsed is None:
+            return None
+        video_id: str
+        video_id, _, _ = parsed
+        if await _move_already_uploaded_to_uploaded(
+            video_id, filename, uploaded, video_fm,
+            already_uploaded=already_uploaded,
+        ):
+            return None
+
+        record: tuple[str, dict] | None = (
+            await _collect_video_record(
+                filename, settings, video_fm,
+                creator_map_backend, proxy, validator,
+            )
         )
-        _record_bulk_filter_skip('superseded')
+        if record is None:
+            return None
+        record_dict: dict
+        video_id, record_dict = record
+        line: bytes = orjson.dumps(record_dict) + b'\n'
+        return video_id, filename, line
+    except OSError as exc:
+        # A per-file filesystem error (e.g. ENOSPC from the ext4
+        # single-directory entry limit when the data dir holds millions
+        # of files) must not crash the whole bulk drain. Skip this file;
+        # it is retried on the next pass and the directory keeps
+        # draining via the files that do succeed.
+        logging.warning(
+            'Per-file OS error during upload prep; skipping file',
+            extra={'filename': filename, 'error': repr(exc)},
+        )
+        _record_bulk_filter_skip('os_error')
         return None
-
-    parsed: tuple[str, str, bool] | None = _parse_entry(filename)
-    if parsed is None:
-        return None
-    video_id: str
-    video_id, _, _ = parsed
-    if await _move_already_uploaded_to_uploaded(
-        video_id, filename, uploaded, video_fm,
-    ):
-        return None
-
-    record: tuple[str, dict] | None = await _collect_video_record(
-        filename, settings, video_fm,
-        creator_map_backend, proxy, validator,
-    )
-    if record is None:
-        return None
-    video_id: str
-    record_dict: dict
-    video_id, record_dict = record
-    line: bytes = orjson.dumps(record_dict) + b'\n'
-    return video_id, filename, line
 
 
 async def _upload_one_video_batch(
@@ -629,9 +683,16 @@ async def _upload_one_video_batch(
     video_fm: AssetFileManagement,
     uploaded: UploadedVideoIds,
 ) -> None:
+    '''Backwards-compatible one-call upload helper.
+
+    Production hot path (``_spawn_batch._gated``) calls
+    :func:`_post_one_video_batch` and
+    :func:`_finalize_one_video_batch` directly so it can release
+    the batch bytes between phases. This wrapper is kept so
+    existing one-shot callers and tests continue to work.
+    '''
     if not batch_records:
         return
-
     outcome: BulkBatchOutcome = await upload_bulk_batch(
         batch_buf, batch_records,
         schema_owner=settings.schema_owner,
@@ -646,6 +707,69 @@ async def _upload_one_video_batch(
         ),
         filename_prefix='videos',
     )
+    await _emit_video_batch_metrics(outcome, uploaded)
+
+
+async def _post_one_video_batch(
+    batch_buf: bytes,
+    batch_records: list[tuple[str, str]],
+    settings: VideoUploadSettings,
+    client: ExchangeClient,
+    video_fm: AssetFileManagement,
+) -> tuple[str, str, BulkBatchOutcome | None]:
+    '''POST one batch and return ``(job_id, batch_id, error)``.
+
+    Callers MUST drop their ``batch_buf`` reference once this
+    returns — the remaining progress / results phases only need
+    ``batch_records``.
+    '''
+    return await post_bulk_batch(
+        batch_buf, batch_records,
+        schema_owner=settings.schema_owner,
+        schema_version=settings.schema_version,
+        platform='youtube',
+        entity='video',
+        exchange_url=settings.exchange_url,
+        client=client,
+        fm=video_fm,
+        filename_prefix='videos',
+    )
+
+
+async def _finalize_one_video_batch(
+    job_id: str,
+    batch_id: str,
+    err: BulkBatchOutcome | None,
+    batch_records: list[tuple[str, str]],
+    settings: VideoUploadSettings,
+    client: ExchangeClient,
+    video_fm: AssetFileManagement,
+    uploaded: UploadedVideoIds,
+) -> None:
+    '''Wait for the bulk job to finish, apply per-record results,
+    and emit metrics. Does not touch the original batch bytes.'''
+    outcome: BulkBatchOutcome
+    if err is not None:
+        outcome = err
+    else:
+        outcome = await finalize_bulk_batch(
+            job_id, batch_id, batch_records,
+            exchange_url=settings.exchange_url,
+            client=client,
+            fm=video_fm,
+            progress_timeout_seconds=(
+                settings.bulk_progress_timeout_seconds
+            ),
+        )
+    await _emit_video_batch_metrics(outcome, uploaded)
+
+
+async def _emit_video_batch_metrics(
+    outcome: BulkBatchOutcome,
+    uploaded: UploadedVideoIds,
+) -> None:
+    '''Record Prometheus counters from a bulk-batch outcome and
+    add successful video IDs to the uploaded-IDs set.'''
     METRIC_VIDEO_BULK_BATCHES.labels(
         platform='youtube',
         scraper=SCRAPER_LABEL,
@@ -707,6 +831,12 @@ async def upload_videos(
         prefix=VIDEO_MIN_PREFIX, suffix=FILE_EXTENSION,
     )
     files = [f for f in files if not f.endswith('failed')]
+    METRIC_FILES_PENDING_UPLOAD.labels(
+        platform='youtube',
+        scraper=SCRAPER_LABEL,
+        entity='video',
+        worker_id=get_worker_id(),
+    ).set(len(files))
     logging.info(
         'Found video files for bulk upload',
         extra={'files_length': len(files)},
@@ -725,13 +855,27 @@ async def upload_videos(
     bulk_semaphore: asyncio.Semaphore = asyncio.Semaphore(
         max(settings.max_active_bulk_jobs, 1),
     )
+    max_in_flight_batches: int = max(settings.max_active_bulk_jobs, 1)
     in_flight: set[Task] = set()
+
+    async def _wait_for_one_batch() -> None:
+        done: set[Task]
+        done, _pending = await asyncio.wait(
+            in_flight, return_when=asyncio.FIRST_COMPLETED,
+        )
+        in_flight.difference_update(done)
+        await asyncio.gather(*done, return_exceptions=True)
 
     def _spawn_batch(
         buf: bytes,
         records: list[tuple[str, str]],
     ) -> None:
-        async def _gated() -> None:
+        async def _gated(_buf: bytes) -> None:
+            # _buf is a parameter — NOT a closure capture — so
+            # this frame can drop the bytes between the POST
+            # and the long progress wait. Closure-capturing
+            # buf would keep the batch alive through the
+            # entire bulk lifecycle, blowing up memory.
             async with bulk_semaphore:
                 async with reserve_bulk_upload_slot(
                     video_fm,
@@ -742,17 +886,49 @@ async def upload_videos(
                         settings.bulk_progress_timeout_seconds
                     ),
                 ):
-                    await _upload_one_video_batch(
-                        buf, records,
+                    job_id: str
+                    batch_id: str
+                    err: BulkBatchOutcome | None
+                    (
+                        job_id, batch_id, err,
+                    ) = await _post_one_video_batch(
+                        _buf, records,
+                        settings, client, video_fm,
+                    )
+                    # Drop the batch bytes before the
+                    # progress wait. Only batch_records is
+                    # carried into the finalize phase.
+                    _buf = b''  # noqa: F841
+                    await _finalize_one_video_batch(
+                        job_id, batch_id, err, records,
                         settings, client, video_fm, uploaded,
                     )
-        task: Task = asyncio.create_task(_gated())
+        task: Task = asyncio.create_task(_gated(buf))
         in_flight.add(task)
-        task.add_done_callback(in_flight.discard)
 
     try:
         for start in range(0, len(files), concurrency):
+            # Watchdog progress signal: the initial bulk drain of a
+            # large backlog runs before the watch loop and must not
+            # look hung.
+            Watchdog.get().touch_work()
             chunk: list[str] = files[start:start + concurrency]
+            chunk_parsed: dict[str, tuple[str, str, bool]] = {}
+            for filename in chunk:
+                parsed: tuple[str, str, bool] | None = (
+                    _parse_entry(filename)
+                )
+                if parsed is not None:
+                    chunk_parsed[filename] = parsed
+            already_uploaded: dict[str, bool] = (
+                await _contains_uploaded_video_ids(
+                    uploaded,
+                    [
+                        parsed[0]
+                        for parsed in chunk_parsed.values()
+                    ],
+                )
+            )
             prepared: list[
                 tuple[str, str, bytes] | None
             ] = await asyncio.gather(*(
@@ -760,6 +936,10 @@ async def upload_videos(
                     f, settings, video_fm,
                     creator_map_backend, proxy, validator,
                     uploaded,
+                    already_uploaded=(
+                        already_uploaded.get(chunk_parsed[f][0])
+                        if f in chunk_parsed else None
+                    ),
                 )
                 for f in chunk
             ))
@@ -789,6 +969,8 @@ async def upload_videos(
                     _spawn_batch(
                         bytes(batch_buf), batch_records,
                     )
+                    if len(in_flight) >= max_in_flight_batches:
+                        await _wait_for_one_batch()
                     batch_buf = bytearray()
                     batch_records = []
                 batch_buf.extend(line)
@@ -796,6 +978,8 @@ async def upload_videos(
 
         if batch_records:
             _spawn_batch(bytes(batch_buf), batch_records)
+            if len(in_flight) >= max_in_flight_batches:
+                await _wait_for_one_batch()
     finally:
         if in_flight:
             await asyncio.gather(*in_flight, return_exceptions=True)
@@ -817,36 +1001,45 @@ async def _process_upload_file(
     video_id: str
     prefix: str
     video_id, prefix, _ = parsed
-    if not await video_needs_uploading(video_fm, filename):
-        METRIC_VIDEOS_ALREADY_UPLOADED.labels(
-            platform='youtube',
-            scraper=SCRAPER_LABEL,
-            entity='video',
-            reason='already_uploaded',
-            worker_id=get_worker_id(),
-        ).inc()
+    try:
+        if not await video_needs_uploading(video_fm, filename):
+            METRIC_VIDEOS_ALREADY_UPLOADED.labels(
+                platform='youtube',
+                scraper=SCRAPER_LABEL,
+                entity='video',
+                reason='already_uploaded',
+                worker_id=get_worker_id(),
+            ).inc()
+            return False
+        if await _move_already_uploaded_to_uploaded(
+            video_id, filename, uploaded, video_fm,
+        ):
+            return False
+        video: YouTubeVideo | None = await _load_video_file(
+            video_id, settings.video_data_directory,
+            prefix, filename, video_fm,
+        )
+        if video is None:
+            return False
+        handle: str | None = await resolve_video_upload_handle(
+            video, creator_map_backend, proxy,
+        )
+        if handle is None:
+            return False
+        uploaded_ok: bool = await enqueue_upload_video(
+            client, settings, video_fm, handle, video, validator,
+            filename_prefix=prefix,
+            uploaded=uploaded,
+        )
+    except OSError as exc:
+        # Per-file filesystem error (e.g. ENOSPC): skip this file rather
+        # than killing the worker; it is retried on a later pass.
+        logging.warning(
+            'Per-file OS error during upload; skipping file',
+            extra={'filename': filename, 'error': repr(exc)},
+        )
         return False
-    if await _move_already_uploaded_to_uploaded(
-        video_id, filename, uploaded, video_fm,
-    ):
-        return False
-    video: YouTubeVideo | None = await _load_video_file(
-        video_id, settings.video_data_directory,
-        prefix, filename, video_fm,
-    )
-    if video is None:
-        return False
-    handle: str | None = await resolve_video_upload_handle(
-        video, creator_map_backend, proxy,
-    )
-    if handle is None:
-        return False
-    uploaded: bool = await enqueue_upload_video(
-        client, settings, video_fm, handle, video, validator,
-        filename_prefix=prefix,
-        uploaded=uploaded,
-    )
-    if uploaded:
+    if uploaded_ok:
         METRIC_VIDEOS_ENQUEUED.labels(
             platform='youtube',
             scraper=SCRAPER_LABEL,
@@ -854,7 +1047,7 @@ async def _process_upload_file(
             mode='single',
             worker_id=get_worker_id(),
         ).inc()
-    return uploaded
+    return uploaded_ok
 
 
 async def _upload_worker(
@@ -868,7 +1061,18 @@ async def _upload_worker(
     uploaded: UploadedVideoIds,
 ) -> None:
     while True:
-        filename: str = await queue.get()
+        # Forward-progress signal for the liveness watchdog: this loop
+        # is the video uploader's unit of work. The bounded wait means
+        # an idle worker (empty queue) still ticks the signal every
+        # _WATCHDOG_TOUCH_INTERVAL seconds, while a worker wedged inside
+        # _process_upload_file goes stale and is correctly terminated.
+        Watchdog.get().touch_work()
+        try:
+            filename: str = await asyncio.wait_for(
+                queue.get(), timeout=_WATCHDOG_TOUCH_INTERVAL,
+            )
+        except asyncio.TimeoutError:
+            continue
         try:
             await _process_upload_file(
                 filename, settings, video_fm, client,

@@ -194,6 +194,65 @@ redis.call('HSET', KEYS[1], 'state', state)
 return 1
 '''
 
+_FORCE_RESCRAPE_LUA: str = '''
+-- KEYS[1] = meta hash
+-- KEYS[2] = target queue
+-- KEYS[3] = unresolved queue
+-- KEYS[4..S+3] = scheduled queues
+-- KEYS[S+4..S+T+3] = terminal state hashes
+-- ARGV[1] = member
+-- ARGV[2] = target state
+-- ARGV[3] = target score
+-- ARGV[4] = mode ('default', 'full', 'metadata')
+-- ARGV[5] = source
+-- ARGV[6] = now
+-- ARGV[7] = scheduled queue count
+-- ARGV[8] = terminal hash count
+local member = ARGV[1]
+local target_state = ARGV[2]
+local target_score = tonumber(ARGV[3])
+local mode = ARGV[4]
+local source = ARGV[5]
+local now = ARGV[6]
+local scheduled_count = tonumber(ARGV[7])
+local terminal_count = tonumber(ARGV[8])
+local scheduled_start = 4
+local terminal_start = scheduled_start + scheduled_count
+
+redis.call('ZREM', KEYS[3], member)
+for k = scheduled_start, terminal_start - 1 do
+    redis.call('ZREM', KEYS[k], member)
+end
+for k = terminal_start, terminal_start + terminal_count - 1 do
+    redis.call('HDEL', KEYS[k], member)
+end
+redis.call('ZADD', KEYS[2], target_score, member)
+redis.call('HSET', KEYS[1], 'state', target_state)
+if string.sub(member, 1, 2) == 'i:' then
+    redis.call('HSETNX', KEYS[1], 'channel_id', string.sub(member, 3))
+elseif string.sub(member, 1, 2) == 'h:' then
+    redis.call('HSETNX', KEYS[1], 'handle', string.sub(member, 3))
+end
+redis.call(
+    'HDEL', KEYS[1],
+    'unavailable_attempts',
+    'resolve_attempts',
+    'not_found_attempts',
+    'force_rescrape_mode',
+    'force_requested_at',
+    'force_source'
+)
+if mode ~= 'default' then
+    redis.call(
+        'HSET', KEYS[1],
+        'force_rescrape_mode', mode,
+        'force_requested_at', now,
+        'force_source', source
+    )
+end
+return 1
+'''
+
 
 class ChannelState(str, enum.Enum):
     PENDING_RESOLUTION = 'pending_resolution'
@@ -257,6 +316,12 @@ class ChannelScrapeQueueSettings(BaseSettings):
     )
     channel_unavailable_hard_threshold: int = Field(
         default=3,
+    )
+    channel_not_found_terminal_threshold: int = Field(
+        default=3,
+    )
+    channel_not_found_retry_seconds: int = Field(
+        default=3600,
     )
     channel_unavailable_soft_retry_seconds: int = Field(
         default=86400,
@@ -347,7 +412,32 @@ class ChannelScrapeQueue(ABC):
     ) -> None: ...
 
     @abstractmethod
-    async def unmark(self, member: str) -> None: ...
+    async def mark_not_found_confirmed(
+        self,
+        member: str,
+        *,
+        last_error: str | None,
+    ) -> bool: ...
+
+    @abstractmethod
+    async def unmark(
+        self, member: str, *, score: float | None = None,
+    ) -> None: ...
+
+    @abstractmethod
+    async def force_rescrape(
+        self,
+        member: str,
+        *,
+        mode: str,
+        source: str = 'cli',
+        now: float | None = None,
+    ) -> None: ...
+
+    @abstractmethod
+    async def clear_force_rescrape(
+        self, member: str,
+    ) -> None: ...
 
     @abstractmethod
     async def reap_soft_unavailable(
@@ -745,6 +835,83 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
             },
         )
 
+    async def mark_not_found_confirmed(
+        self,
+        member: str,
+        *,
+        last_error: str | None,
+    ) -> bool:
+        '''Record a not-found observation.
+
+        Returns True only when the configured confirmation
+        threshold is reached and the member is moved into the
+        terminal ``not_found`` state. Until then the member is
+        requeued for a retry.
+        '''
+        if not (
+            member.startswith('i:')
+            or member.startswith('h:')
+        ):
+            raise ValueError(
+                f'member must have h: or i: prefix: '
+                f'{member!r}'
+            )
+        meta_key: str = self._k_meta(member)
+        new_count: int = await self._redis.hincrby(
+            meta_key, 'not_found_attempts', 1,
+        )
+        threshold: int = (
+            self._settings
+            .channel_not_found_terminal_threshold
+        )
+        if new_count >= threshold:
+            await self.mark(
+                member,
+                state=ChannelState.NOT_FOUND,
+                last_error=last_error,
+                extra={'retries_done': new_count - 1},
+            )
+            return True
+        now: float = time.time()
+        retry_at: float = (
+            now
+            + float(
+                self._settings
+                .channel_not_found_retry_seconds
+            )
+        )
+        pipe: aioredis.client.Pipeline = (
+            self._redis.pipeline(transaction=True)
+        )
+        if member.startswith('i:'):
+            channel_id: str = member[2:]
+            tier_str: str | None = await self._redis.hget(
+                self._k_tiers(), channel_id,
+            )
+            tier: int = int(tier_str) if tier_str else 0
+            pipe.zadd(
+                self._k_scheduled(tier),
+                {member: retry_at},
+            )
+            state: ChannelState = ChannelState.SCHEDULED
+        else:
+            pipe.zadd(
+                self._k_unresolved(),
+                {member: retry_at},
+            )
+            state = ChannelState.PENDING_RESOLUTION
+        pipe.hset(
+            meta_key,
+            mapping={
+                'state': state.value,
+                'last_error': last_error or '',
+                'last_not_found_at': str(int(now)),
+                'next_retry_at': str(int(retry_at)),
+            },
+        )
+        await pipe.execute()
+        return False
+
     async def mark(
         self,
         member: str,
@@ -781,7 +948,9 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
             str(tier_count),
         )
 
-    async def unmark(self, member: str) -> None:
+    async def unmark(
+        self, member: str, *, score: float | None = None,
+    ) -> None:
         if member.startswith('h:'):
             target_queue: str = self._k_unresolved()
             target_state: ChannelState = (
@@ -806,6 +975,10 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
                 f'member must have h: or i: prefix: '
                 f'{member!r}'
             )
+        # Optional explicit due-time, used by the revival repair to
+        # spread a large cohort instead of making them all due now.
+        if score is not None:
+            target_score = score
         await self._redis.eval(
             _UNMARK_LUA,
             2,
@@ -814,6 +987,78 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
             member,
             target_state.value,
             str(target_score),
+        )
+
+    async def force_rescrape(
+        self,
+        member: str,
+        *,
+        mode: str,
+        source: str = 'cli',
+        now: float | None = None,
+    ) -> None:
+        if mode not in ('default', 'full', 'metadata'):
+            raise ValueError(
+                f'unknown force rescrape mode: {mode!r}',
+            )
+        if member.startswith('h:'):
+            target_queue: str = self._k_unresolved()
+            target_state: ChannelState = (
+                ChannelState.PENDING_RESOLUTION
+            )
+        elif member.startswith('i:'):
+            channel_id: str = member[2:]
+            tier_str: str | None = (
+                await self._redis.hget(
+                    self._k_tiers(), channel_id,
+                )
+            )
+            tier: int = int(tier_str) if tier_str else 0
+            target_queue = self._k_scheduled(tier)
+            target_state = ChannelState.SCHEDULED
+        else:
+            raise ValueError(
+                f'member must have h: or i: prefix: '
+                f'{member!r}'
+            )
+        forced_at: float = time.time() if now is None else now
+        scheduled_keys: list[str] = [
+            self._k_scheduled(t)
+            for t in range(len(self._tiers))
+        ]
+        terminal_keys: list[str] = [
+            self._k_state(state)
+            for state in sorted(
+                ChannelState.terminal_states(),
+                key=lambda state: state.value,
+            )
+        ]
+        await self._redis.eval(
+            _FORCE_RESCRAPE_LUA,
+            3 + len(scheduled_keys) + len(terminal_keys),
+            self._k_meta(member),
+            target_queue,
+            self._k_unresolved(),
+            *scheduled_keys,
+            *terminal_keys,
+            member,
+            target_state.value,
+            '0',
+            mode,
+            source,
+            str(int(forced_at)),
+            str(len(scheduled_keys)),
+            str(len(terminal_keys)),
+        )
+
+    async def clear_force_rescrape(
+        self, member: str,
+    ) -> None:
+        await self._redis.hdel(
+            self._k_meta(member),
+            'force_rescrape_mode',
+            'force_requested_at',
+            'force_source',
         )
 
     async def reap_soft_unavailable(

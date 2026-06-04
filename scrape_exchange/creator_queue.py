@@ -39,6 +39,7 @@ import orjson
 from scrape_exchange.file_management import (
     AssetFileManagement,
 )
+from scrape_exchange.redis_client import redis_from_url
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -1297,10 +1298,11 @@ class RedisCreatorQueue(CreatorQueue):
         platform: str = 'youtube',
         eligibility_fraction: float = 1.0,
     ) -> None:
-        import redis.asyncio as aioredis
-        self._redis: aioredis.Redis = (
-            aioredis.from_url(
-                redis_dsn, decode_responses=True,
+        self._redis = (
+            redis_from_url(
+                redis_dsn,
+                component=f'{platform}-creator-queue',
+                decode_responses=True,
             )
         )
         self._worker_id: str = worker_id

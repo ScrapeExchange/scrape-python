@@ -74,6 +74,21 @@ the channel identity maps, enqueued, and atomically renamed with a
 `.failed`. Both suffixes are audit markers and are skipped by later
 drain cycles.
 
+### Forced re-scrape modes
+
+Normal scheduled channel refreshes check scrape.exchange before
+scraping. If the channel already exists there, the worker performs a
+metadata-only refresh and skips `video_ids`; otherwise it runs the
+full channel-content path.
+
+Operators can override that decision with `yt_channel_queue.py
+rescrape --mode full KEY` or `--mode metadata KEY`. The command stores
+the requested mode on the Redis queue meta record and makes the channel
+due immediately. `full` forces the channel-content path and writes
+`video_ids`; `metadata` forces `with_video_ids=False`. The worker clears
+the force fields only after a successful scrape, so transient retries
+continue to honor the operator request.
+
 ### Parallelism: across tabs, not within a tab
 
 All channel tabs are dispatched with `asyncio.gather()`,

@@ -206,6 +206,93 @@ groups:
             {{ $value | humanizePercentage }} of channel handle →
             ID lookups are failing. Upstream or innertube issue.
 
+      - alert: YtChannelQueueMemberInMultipleStates
+        expr: |
+          channel_queue_drift_size{kind="member_in_multiple_states"} > 0
+        for: 10m
+        labels:
+          severity: warning
+          scraper: channel
+        annotations:
+          summary: "Channel queue member exists in multiple states"
+          description: |
+            {{ $value | humanize }} channel queue members are present
+            in more than one active or terminal state. Inspect with
+            yt_channel_queue reconcile --dry-run --json --sample 25.
+
+      - alert: YtChannelQueueRssCreatorsMissingChannelState
+        expr: |
+          channel_queue_drift_size{
+            kind="rss_creator_missing_channel_state"
+          } > 1000
+        for: 30m
+        labels:
+          severity: warning
+          scraper: channel
+        annotations:
+          summary: "RSS creators missing channel scrape accounting"
+          description: |
+            More than 1000 RSS creators are absent from channel queue
+            active and terminal state. Run bounded rss-missing repair.
+
+      - alert: YtChannelQueueStateMissingRssAccounting
+        expr: |
+          channel_queue_drift_size{
+            kind="channel_state_missing_rss_accounting"
+          } > 1000
+        for: 30m
+        labels:
+          severity: warning
+          scraper: channel
+        annotations:
+          summary: "Channel queue state missing RSS accounting"
+          description: |
+            More than 1000 channel queue members are missing both RSS
+            active inventory and RSS suppression accounting.
+
+      - alert: YtChannelTerminalMissingRssSuppression
+        expr: |
+          channel_queue_drift_size{
+            kind="channel_terminal_missing_rss_suppression"
+          } > 0
+        for: 30m
+        labels:
+          severity: warning
+          scraper: channel
+        annotations:
+          summary: "Terminal channel state missing RSS suppression"
+          description: |
+            Confirmed terminal channel states should be reflected in
+            rss:youtube:suppressed. Run rss-suppress repair.
+
+      - alert: YtChannelMetaScheduledMissingZset
+        expr: |
+          channel_queue_drift_size{
+            kind="meta_scheduled_missing_zset"
+          } > 1000
+        for: 30m
+        labels:
+          severity: warning
+          scraper: channel
+        annotations:
+          summary: "Scheduled channel metadata missing queue entry"
+          description: |
+            More than 1000 channel meta records say scheduled but are
+            absent from every scheduled queue tier.
+
+      - alert: YtChannelQueueReconcileStale
+        expr: |
+          time() - channel_queue_reconcile_last_success_timestamp > 21600
+        for: 10m
+        labels:
+          severity: warning
+          scraper: channel
+        annotations:
+          summary: "Channel queue reconcile metrics are stale"
+          description: |
+            No successful channel/RSS queue reconcile metrics pass has
+            completed in more than 6 hours.
+
       # --- FLEET-WIDE ------------------------------------------------
 
       - alert: YtScraperSupervisorMissing

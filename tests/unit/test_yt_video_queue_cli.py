@@ -119,15 +119,25 @@ class TestAdd(
 
     async def test_enqueues_each_id(self) -> None:
         queue = AsyncMock()
+        queue.enqueue.side_effect = [True, False]
         from tools.yt_video_queue import cmd_add
         ns = argparse.Namespace(
-            video_ids=['aaa', 'bbb'],
+            video_ids=['aaaaaaaaaaa', 'bbbbbbbbbbb'],
             source='cli',
+            file=None,
         )
-        rc: int = await cmd_add(ns, queue)
+        out = StringIO()
+        stdin = StringIO('')
+        stdin.isatty = lambda: True
+        with patch('sys.stdout', out), patch('sys.stdin', stdin):
+            rc: int = await cmd_add(ns, queue)
         self.assertEqual(rc, 0)
         self.assertEqual(
             queue.enqueue.await_count, 2,
+        )
+        self.assertIn(
+            'add: processed=2 duplicates=1 added=1',
+            out.getvalue(),
         )
 
 
@@ -252,10 +262,17 @@ class TestImport(
                     f.write('')
             from tools.yt_video_queue import cmd_import
             ns = argparse.Namespace(directory=td)
-            rc: int = await cmd_import(ns, queue)
+            queue.enqueue.side_effect = [True, False]
+            out = StringIO()
+            with patch('sys.stdout', out):
+                rc: int = await cmd_import(ns, queue)
             self.assertEqual(rc, 0)
             self.assertEqual(
                 queue.enqueue.await_count, 2,
+            )
+            self.assertIn(
+                'import: processed=2 duplicates=1 added=1',
+                out.getvalue(),
             )
             remaining = set(os.listdir(td))
             self.assertNotIn(

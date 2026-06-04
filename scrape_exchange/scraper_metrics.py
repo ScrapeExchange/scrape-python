@@ -127,6 +127,20 @@ METRIC_SCRAPE_QUEUE_SIZE: Gauge = Gauge(
 )
 
 # ---------------------------------------------------------------------------
+# files_pending_upload
+#   Files found on disk that may still need to be uploaded.
+#   Shared by channel and video upload tools; entity label distinguishes
+#   them. livemostrecent ensures only the latest value per process is
+#   used across a multi-process fleet.
+# ---------------------------------------------------------------------------
+METRIC_FILES_PENDING_UPLOAD: Gauge = Gauge(
+    'files_pending_upload',
+    'Number of files found that may need to be uploaded',
+    ['platform', 'scraper', 'entity', 'worker_id'],
+    multiprocess_mode='livemostrecent',
+)
+
+# ---------------------------------------------------------------------------
 # worker_sleep_seconds
 #   Seconds the worker is sleeping before its next processing round.
 #   Set to 0 when active.
@@ -289,6 +303,22 @@ METRIC_SUPERVISOR_RESPAWNS: Counter = Counter(
     'supervisor_respawns_total',
     'Number of times the supervisor has respawned a crashed child.',
     ['scraper', 'instance'],
+)
+
+# ---------------------------------------------------------------------------
+# watchdog_terminations_total
+#   Incremented by the liveness watchdog immediately before it calls
+#   os._exit(1) on a wedged worker. The ``signal`` label is ``loop`` (the
+#   async heartbeat went stale -> frozen event loop) or ``work`` (no
+#   forward worker progress -> all tasks wedged). Under multiprocess mode
+#   the increment survives the process exit and is summed across dead
+#   PIDs, so it is a durable "why did the slot restart" breakdown
+#   alongside the supervisor's respawn counter.
+# ---------------------------------------------------------------------------
+METRIC_WATCHDOG_TERMINATIONS: Counter = Counter(
+    'watchdog_terminations_total',
+    'Number of times the liveness watchdog has terminated a worker.',
+    ['signal'],
 )
 
 # ---------------------------------------------------------------------------

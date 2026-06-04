@@ -1,11 +1,11 @@
-'''Apply-bulk-results writes successful channel handles into
+'''Apply-bulk-results writes successful channel_ids into
 RedisExchangeChannelsSet.'''
 
 import unittest
 
 import fakeredis.aioredis
 
-from scrape_exchange.bulk_upload import apply_bulk_results
+from scrape_exchange.bulk_upload import apply_bulk_results, BulkResults
 from scrape_exchange.youtube.exchange_channels_set import (
     RedisExchangeChannelsSet,
 )
@@ -50,21 +50,18 @@ class TestApplyBulkResultsExchangeSet(
             ('UC1', 'channel-alpha.json.br'),
             ('UC2', 'channel-bravo.json.br'),
         ]
-        results: list[dict] = [
-            {
-                'platform_content_id': 'UC1',
-                'status': 'success',
-            },
-            {
+        results: BulkResults = BulkResults(
+            total=2, succeeded=1, failed=1, duplicate=0,
+            failures=[{
                 'platform_content_id': 'UC2',
                 'status': 'failed',
-            },
-        ]
+            }],
+        )
         await apply_bulk_results(
             batch_records, results, _StubFM(),
             batch_id='b', job_id='j',
             exchange_set=self.s,
-            handle_from_filename=_strip_channel_filename,
+            id_from_filename=_strip_channel_filename,
         )
         present: dict[str, bool] = (
             await self.s.contains_many(['alpha', 'bravo'])
@@ -79,22 +76,19 @@ class TestApplyBulkResultsExchangeSet(
         batch_records: list[tuple[str, str]] = [
             ('UC1', 'channel-alpha.json.br'),
         ]
-        results: list[dict] = [
-            {
-                'platform_content_id': 'UC1',
-                'status': 'success',
-            },
-        ]
+        results: BulkResults = BulkResults(
+            total=1, succeeded=1, failed=0, duplicate=0, failures=[],
+        )
         await apply_bulk_results(
             batch_records, results, _StubFM(),
             batch_id='b', job_id='j',
         )
         self.assertEqual(await self.s.size(), 0)
 
-    async def test_handle_from_filename_skipped_without_set(
+    async def test_id_from_filename_skipped_without_set(
         self,
     ) -> None:
-        '''If exchange_set is None, handle_from_filename is
+        '''If exchange_set is None, id_from_filename is
         ignored even if provided.'''
         called: list[str] = []
 
@@ -105,16 +99,33 @@ class TestApplyBulkResultsExchangeSet(
         batch_records: list[tuple[str, str]] = [
             ('UC1', 'channel-alpha.json.br'),
         ]
-        results: list[dict] = [
-            {
-                'platform_content_id': 'UC1',
-                'status': 'success',
-            },
-        ]
+        results: BulkResults = BulkResults(
+            total=1, succeeded=1, failed=0, duplicate=0, failures=[],
+        )
         await apply_bulk_results(
             batch_records, results, _StubFM(),
             batch_id='b', job_id='j',
             exchange_set=None,
-            handle_from_filename=_capture,
+            id_from_filename=_capture,
         )
         self.assertEqual(called, [])
+
+    async def test_exchange_set_gets_channel_ids(self) -> None:
+        '''An id-keyed filename yields the channel_id in the set.'''
+        cid: str = 'UCabcdefghijklmnopqrstuv'
+        filename: str = f'channel-{cid}.json.br'
+        await apply_bulk_results(
+            batch_records=[(cid, filename)],
+            results=BulkResults(
+                total=1, succeeded=1, failed=0, duplicate=0,
+                failures=[],
+            ),
+            fm=_StubFM(),
+            batch_id='b', job_id='j',
+            exchange_set=self.s,
+            id_from_filename=_strip_channel_filename,
+        )
+        membership: dict[str, bool] = (
+            await self.s.contains_many([cid])
+        )
+        self.assertTrue(membership[cid])

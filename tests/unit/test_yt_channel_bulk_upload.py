@@ -13,8 +13,10 @@ matching coverage.
 '''
 
 import asyncio
+import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta, UTC
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -24,6 +26,7 @@ import websockets.frames
 
 from scrape_exchange.bulk_upload import (
     BULK_STATE_DIR_NAME,
+    BulkResults,
     BulkUploadState,
     apply_bulk_results,
     bulk_progress_ws_url,
@@ -37,6 +40,45 @@ from scrape_exchange.bulk_upload import (
 )
 
 
+class TestChannelUploadSettings(unittest.TestCase):
+
+    def test_channel_concurrency_does_not_set_upload_concurrency(
+        self,
+    ) -> None:
+        from tools.yt_channel_upload import ChannelUploadSettings
+
+        with patch.dict(
+            os.environ,
+            {
+                'CHANNEL_CONCURRENCY': '768',
+            },
+            clear=True,
+        ):
+            settings = ChannelUploadSettings(
+                _cli_parse_args=False,
+            )
+
+        self.assertEqual(settings.channel_upload_concurrency, 3)
+
+    def test_channel_upload_concurrency_env_sets_upload_concurrency(
+        self,
+    ) -> None:
+        from tools.yt_channel_upload import ChannelUploadSettings
+
+        with patch.dict(
+            os.environ,
+            {
+                'CHANNEL_UPLOAD_CONCURRENCY': '7',
+            },
+            clear=True,
+        ):
+            settings = ChannelUploadSettings(
+                _cli_parse_args=False,
+            )
+
+        self.assertEqual(settings.channel_upload_concurrency, 7)
+
+
 class TestApplyBulkResults(unittest.IsolatedAsyncioTestCase):
 
     async def test_success_by_content_id_marks_uploaded(self) -> None:
@@ -47,10 +89,11 @@ class TestApplyBulkResults(unittest.IsolatedAsyncioTestCase):
             ('UCabc', 'channel-UCabc.json.br'),
             ('UCxyz', 'channel-UCxyz.json.br'),
         ]
-        results: list[dict] = [
-            {'platform_content_id': 'UCabc', 'status': 'success'},
-            {'platform_content_id': 'UCxyz', 'status': 'success'},
-        ]
+        # Failures-only contract: empty failures + total==submitted
+        # means both records succeeded.
+        results: BulkResults = BulkResults(
+            total=2, succeeded=2, failed=0, duplicate=0, failures=[],
+        )
         success, failed, missing, success_ids = await apply_bulk_results(
             batch_records, results, fm, 'batch1', 'job123',
         )
@@ -65,74 +108,78 @@ class TestApplyBulkResults(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(success_ids, {'UCabc', 'UCxyz'})
 
     async def test_failed_records_left_for_retry(self) -> None:
-        '''A failed result must not call mark_uploaded.'''
+        '''A failed record must not call mark_uploaded.'''
         fm = AsyncMock()
         batch_records: list[tuple[str, str]] = [
             ('UCabc', 'channel-UCabc.json.br'),
         ]
-        results: list[dict] = [
-            {
+        results: BulkResults = BulkResults(
+            total=1, succeeded=0, failed=1, duplicate=0,
+            failures=[{
                 'platform_content_id': 'UCabc',
                 'status': 'failed',
                 'reason': 'VALIDATION_ERROR: foo',
-            },
-        ]
+            }],
+        )
         await apply_bulk_results(
             batch_records, results, fm, 'batch1', 'job123',
         )
         fm.mark_uploaded.assert_not_called()
 
     async def test_record_index_fallback(self) -> None:
-        '''When a result has only record_index, the matching slot
-        in batch_records is used to find the source file.'''
+        '''A failure keyed only by record_index leaves that slot's
+        source file for retry and marks the other uploaded.'''
         fm = AsyncMock()
         batch_records: list[tuple[str, str]] = [
             ('UCabc', 'channel-UCabc.json.br'),
             ('UCxyz', 'channel-UCxyz.json.br'),
         ]
-        results: list[dict] = [
-            {'record_index': 1, 'status': 'success'},
-        ]
+        results: BulkResults = BulkResults(
+            total=2, succeeded=1, failed=1, duplicate=0,
+            failures=[{'record_index': 1, 'status': 'failed'}],
+        )
         await apply_bulk_results(
             batch_records, results, fm, 'batch1', 'job123',
         )
+        # index 1 (UCxyz) failed -> left; index 0 (UCabc) uploaded.
         fm.mark_uploaded.assert_awaited_once_with(
-            'channel-UCxyz.json.br',
+            'channel-UCabc.json.br',
         )
 
-    async def test_missing_results_left_for_retry(self) -> None:
-        '''Source files with no matching result entry are not
-        marked uploaded — they stay in base_dir for the next run.'''
+    async def test_incomplete_total_left_for_retry(self) -> None:
+        '''When the server's total is less than the records we sent,
+        the whole batch is left in base_dir — successes cannot be
+        identified under the failures-only contract.'''
         fm = AsyncMock()
         batch_records: list[tuple[str, str]] = [
             ('UCabc', 'channel-UCabc.json.br'),
             ('UCxyz', 'channel-UCxyz.json.br'),
             ('UCmissing', 'channel-UCmissing.json.br'),
         ]
-        # Only two results back from the server; UCmissing absent.
-        results: list[dict] = [
-            {'platform_content_id': 'UCabc', 'status': 'success'},
-            {'platform_content_id': 'UCxyz', 'status': 'success'},
-        ]
-        await apply_bulk_results(
+        # Server only accounted for 2 of the 3 submitted records.
+        results: BulkResults = BulkResults(
+            total=2, succeeded=2, failed=0, duplicate=0, failures=[],
+        )
+        success, failed, missing, _ = await apply_bulk_results(
             batch_records, results, fm, 'batch1', 'job123',
         )
-        marked: list[str] = [
-            call.args[0] for call in fm.mark_uploaded.call_args_list
-        ]
-        self.assertNotIn('channel-UCmissing.json.br', marked)
-        self.assertEqual(len(marked), 2)
+        fm.mark_uploaded.assert_not_called()
+        self.assertEqual((success, failed, missing), (0, 0, 3))
 
-    async def test_unmatchable_result_skipped(self) -> None:
-        '''A result with no matching content_id and no record_index
-        is logged and ignored (no file marked).'''
+    async def test_unmatchable_failure_left_for_retry(self) -> None:
+        '''A failure with no matching content_id and no record_index
+        blocks salvage — the whole batch is left for retry.'''
         fm = AsyncMock()
         batch_records: list[tuple[str, str]] = [
             ('UCabc', 'channel-UCabc.json.br'),
         ]
-        results: list[dict] = [
-            {'platform_content_id': 'UCunknown', 'status': 'success'},
-        ]
+        results: BulkResults = BulkResults(
+            total=1, succeeded=0, failed=1, duplicate=0,
+            failures=[{
+                'platform_content_id': 'UCunknown',
+                'status': 'failed',
+            }],
+        )
         await apply_bulk_results(
             batch_records, results, fm, 'batch1', 'job123',
         )
@@ -152,10 +199,9 @@ class TestApplyBulkResults(unittest.IsolatedAsyncioTestCase):
             ('UCabc', 'channel-UCabc.json.br'),
             ('UCxyz', 'channel-UCxyz.json.br'),
         ]
-        results: list[dict] = [
-            {'platform_content_id': 'UCabc', 'status': 'success'},
-            {'platform_content_id': 'UCxyz', 'status': 'success'},
-        ]
+        results: BulkResults = BulkResults(
+            total=2, succeeded=2, failed=0, duplicate=0, failures=[],
+        )
         await apply_bulk_results(
             batch_records, results, fm, 'batch1', 'job123',
         )
@@ -617,7 +663,7 @@ def _fake_state(job_id: str = 'abc123') -> BulkUploadState:
             ('UCabc', 'channel-UCabc.json.br'),
             ('UCxyz', 'channel-UCxyz.json.br'),
         ],
-        created_at='2026-04-29T12:34:56+00:00',
+        created_at=datetime.now(UTC).isoformat(),
     )
 
 
@@ -711,6 +757,27 @@ class TestResumePendingBulkUploads(
             )
             client.get.assert_not_called()
 
+    async def test_state_older_than_24_hours_is_deleted(
+        self,
+    ) -> None:
+        '''Very old accepted jobs are abandoned instead of re-polled.'''
+        with tempfile.TemporaryDirectory() as base:
+            fm = _fake_fm(Path(base))
+            stale: BulkUploadState = _fake_state('stale')
+            stale.created_at = (
+                datetime.now(UTC) - timedelta(hours=25)
+            ).isoformat()
+            await write_bulk_state(fm, stale)
+            client = MagicMock()
+            client.get = AsyncMock()
+
+            await resume_pending_bulk_uploads(
+                fm, client, 'http://test',
+            )
+
+            client.get.assert_not_called()
+            self.assertEqual(list_bulk_states(fm), [])
+
     async def test_404_deletes_state(self) -> None:
         '''API 404 on the job → state file is deleted.'''
         with tempfile.TemporaryDirectory() as base:
@@ -736,20 +803,15 @@ class TestResumePendingBulkUploads(
         with tempfile.TemporaryDirectory() as base:
             fm = _fake_fm(Path(base))
             await write_bulk_state(fm, _fake_state('done'))
-            results: list[dict] = [
-                {
-                    'platform_content_id': 'UCabc',
-                    'status': 'success',
-                },
-                {
-                    'platform_content_id': 'UCxyz',
-                    'status': 'success',
-                },
-            ]
+            # _fake_state submits 2 records; both succeed (empty
+            # failures list, total == submitted) under ADR-0008.
             client = MagicMock()
             client.get = AsyncMock(side_effect=[
                 _resp(200, {'status': 'completed'}),
-                _resp(200, {'results': results}),
+                _resp(200, {
+                    'total': 2, 'succeeded': 2, 'failed': 0,
+                    'duplicate': 0, 'results': [],
+                }),
             ])
 
             await resume_pending_bulk_uploads(
@@ -787,6 +849,33 @@ class TestResumePendingBulkUploads(
                 fm, client, 'http://test',
             )
 
+            self.assertEqual(len(list_bulk_states(fm)), 1)
+
+    async def test_pending_poll_touches_watchdog_work(
+        self,
+    ) -> None:
+        '''Intentional resume polling must not look like a hang.'''
+        with tempfile.TemporaryDirectory() as base:
+            fm = _fake_fm(Path(base))
+            fresh: BulkUploadState = _fake_state('pending')
+            fresh.created_at = datetime.now(UTC).isoformat()
+            await write_bulk_state(fm, fresh)
+            client = MagicMock()
+            client.get = AsyncMock(return_value=_resp(
+                200, {'status': 'running'},
+            ))
+            touch = MagicMock()
+
+            with patch(
+                'scrape_exchange.bulk_upload._touch_watchdog_work',
+                touch,
+            ):
+                await resume_pending_bulk_uploads(
+                    fm, client, 'http://test',
+                    poll_timeout_seconds=0.0,
+                )
+
+            touch.assert_called()
             self.assertEqual(len(list_bulk_states(fm)), 1)
 
 

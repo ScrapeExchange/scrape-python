@@ -6,7 +6,6 @@ NullContentClaim.
 '''
 
 import os
-import sys
 import tempfile
 import time
 import unittest
@@ -187,28 +186,29 @@ class TestFileContentClaimCleanup(
         self.assertEqual(removed, 0)
 
 
-def _make_redis_mocks() -> tuple[MagicMock, MagicMock]:
+def _make_redis_instance() -> MagicMock:
     '''
-    Build a (redis_module_mock, redis_instance_mock) pair.
-
-    The redis_instance_mock has async methods wired up so
+    Build a redis client mock with async methods wired up so
     tests can configure return values without touching the
     real Redis library.
+
+    ``RedisContentClaim`` builds its client through
+    ``scrape_exchange.content_claim.redis_from_url``; the
+    setUp methods patch that seam to return this instance,
+    rather than mocking the deep ``redis.asyncio`` module
+    internals (``BlockingConnectionPool`` / ``Redis``) the
+    helper happens to use.
     '''
     redis_instance: MagicMock = MagicMock()
     redis_instance.set = AsyncMock()
     redis_instance.delete = AsyncMock()
     redis_instance.scan = AsyncMock()
+    return redis_instance
 
-    aioredis_mod: MagicMock = MagicMock()
-    aioredis_mod.from_url = MagicMock(
-        return_value=redis_instance
-    )
 
-    redis_mod: MagicMock = MagicMock()
-    redis_mod.asyncio = aioredis_mod
-
-    return redis_mod, redis_instance
+_REDIS_FROM_URL: str = (
+    'scrape_exchange.content_claim.redis_from_url'
+)
 
 
 class TestRedisContentClaimAcquire(
@@ -217,15 +217,10 @@ class TestRedisContentClaimAcquire(
     '''Tests for RedisContentClaim.acquire().'''
 
     def setUp(self) -> None:
-        self._redis_mod, self._redis_inst = (
-            _make_redis_mocks()
-        )
-        self._patcher = patch.dict(
-            sys.modules,
-            {
-                'redis': self._redis_mod,
-                'redis.asyncio': self._redis_mod.asyncio,
-            },
+        self._redis_inst = _make_redis_instance()
+        self._patcher = patch(
+            _REDIS_FROM_URL,
+            return_value=self._redis_inst,
         )
         self._patcher.start()
         self._claim: RedisContentClaim = RedisContentClaim(
@@ -281,15 +276,10 @@ class TestRedisContentClaimRelease(
     '''Tests for RedisContentClaim.release().'''
 
     def setUp(self) -> None:
-        self._redis_mod, self._redis_inst = (
-            _make_redis_mocks()
-        )
-        self._patcher = patch.dict(
-            sys.modules,
-            {
-                'redis': self._redis_mod,
-                'redis.asyncio': self._redis_mod.asyncio,
-            },
+        self._redis_inst = _make_redis_instance()
+        self._patcher = patch(
+            _REDIS_FROM_URL,
+            return_value=self._redis_inst,
         )
         self._patcher.start()
         self._claim: RedisContentClaim = RedisContentClaim(
@@ -315,15 +305,10 @@ class TestRedisContentClaimCleanup(
     '''Tests for RedisContentClaim.cleanup_stale().'''
 
     def setUp(self) -> None:
-        self._redis_mod, self._redis_inst = (
-            _make_redis_mocks()
-        )
-        self._patcher = patch.dict(
-            sys.modules,
-            {
-                'redis': self._redis_mod,
-                'redis.asyncio': self._redis_mod.asyncio,
-            },
+        self._redis_inst = _make_redis_instance()
+        self._patcher = patch(
+            _REDIS_FROM_URL,
+            return_value=self._redis_inst,
         )
         self._patcher.start()
         self._claim: RedisContentClaim = RedisContentClaim(

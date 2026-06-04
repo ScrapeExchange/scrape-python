@@ -72,9 +72,9 @@ class TestDoScrapeChannelToDiskLatency(
         ):
             await yt_channel_scrape._do_scrape_channel_to_disk(
                 settings=settings, fm=fm,
-                channel_handle='@test',
+                channel_id='UCtest0000000000000000aa',
                 filename='test',
-                extra={},
+                extra={'channel_handle': '@test'},
             )
         return duration
 

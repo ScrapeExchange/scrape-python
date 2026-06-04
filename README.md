@@ -159,6 +159,14 @@ PYTHONPATH=. uv run tools/yt_channel_queue.py search --by handle veri
 # Re-scrape a channel even if it was recently scraped
 PYTHONPATH=. uv run tools/yt_channel_queue.py rescrape @veritasium
 
+# Force a full channel-content scrape, including video_ids
+PYTHONPATH=. uv run tools/yt_channel_queue.py rescrape \
+    --mode full @veritasium
+
+# Force a metadata-only scrape, without video_ids
+PYTHONPATH=. uv run tools/yt_channel_queue.py rescrape \
+    --mode metadata @veritasium
+
 # Remove from the queue
 PYTHONPATH=. uv run tools/yt_channel_queue.py remove @veritasium
 

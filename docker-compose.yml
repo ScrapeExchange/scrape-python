@@ -13,12 +13,6 @@
 x-container-paths: &container-paths
   YOUTUBE_VIDEO_DATA_DIR: /data/videos
   YOUTUBE_CHANNEL_DATA_DIR: /data/channels
-  YOUTUBE_CHANNEL_LIST: /data/channels.lst
-  YOUTUBE_CHANNEL_MAP_FILE: /data/channel_map.csv
-  RSS_QUEUE_FILE: /data/rss-queue.json
-  YOUTUBE_UPLOADED_VIDEOS_LIST: /data/uploaded_videos.lst
-  YOUTUBE_UPLOADED_CHANNELS_LIST: /data/uploaded_channels.lst
-  NO_FEEDS_FILE: /data/rss-no-feeds.txt
   DENO_PATH: /usr/local/deno/bin/deno
 
 x-scraper-common: &scraper-common

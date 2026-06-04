@@ -33,6 +33,12 @@ def _make_settings_mock(
     s.rate_limiter_state_dir = rate_limiter_state_dir
     s.redis_dsn = redis_dsn
     s.log_format = log_format
+    # New runner wiring reads these; keep the watchdog off in unit
+    # tests so no daemon thread / os._exit machinery is started.
+    s.watchdog_enabled = False
+    s.watchdog_loop_timeout_seconds = 60.0
+    s.watchdog_work_timeout_seconds = 180.0
+    s.innertube_executor_threads = 16
     return s
 
 

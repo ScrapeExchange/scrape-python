@@ -123,6 +123,16 @@ class ChannelIdentityStore:
         '''
         if not channel_id:
             raise ValueError('channel_id is empty')
+        # Defence in depth against non-canonical IDs leaking past
+        # ``YouTubeChannel.normalise_channel_id``. The scrape queue
+        # (``promote_to_scheduled`` / ``enqueue_scheduled``) makes
+        # the same check; matching it here prevents the maps from
+        # being corrupted by any caller that bypasses the queue.
+        if not channel_id.startswith('UC'):
+            raise ValueError(
+                f'channel_id must start with uppercase UC: '
+                f'{channel_id!r}'
+            )
         handle: str = _validate_handle(channel_handle)
         existing: str | None = await self.handle_map.get(handle)
         if existing is not None and existing != channel_id:

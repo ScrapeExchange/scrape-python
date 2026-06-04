@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 
 from prometheus_client import Counter, Gauge, Histogram
 
+from scrape_exchange.redis_client import redis_from_url
 from scrape_exchange.worker_id import get_worker_id
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
@@ -804,8 +805,9 @@ class _RedisBackend(_Backend[CallTypeT]):
         # connection errors so a single dropped SYN under
         # bursty startup load doesn't crash the worker.
         self._redis: aioredis.Redis = (
-            aioredis.from_url(
+            redis_from_url(
                 redis_dsn,
+                component=f'{platform}-rate-limiter',
                 decode_responses=True,
                 socket_connect_timeout=5.0,
                 socket_timeout=10.0,
