@@ -22,20 +22,23 @@ _PROXY_HOST_RE: re.Pattern[str] = re.compile(r'^[A-Za-z0-9._-]+$')
 # without a full restart, though typical usage is set-once
 # at start.
 _PROXY_NETWORKS_CACHE_KEY: str | None = None
-_PROXY_NETWORKS: list[IPv4Network] = []
+_PROXY_NETWORKS: list[tuple[IPv4Network, str]] = []
 
 
-def _load_proxy_networks() -> list[IPv4Network]:
+def _load_proxy_networks() -> list[tuple[IPv4Network, str]]:
     '''Parse the PROXY_NETWORKS env var into IPv4Network
     objects, skipping and warning on invalid entries.'''
     raw: str = os.environ.get('PROXY_NETWORKS', '')
-    nets: list[IPv4Network] = []
+    nets: list[tuple[IPv4Network, str]] = []
     for entry in raw.split(','):
         cidr: str = entry.strip()
         if not cidr:
             continue
+        if cidr == 'localhost/24':
+            nets.append((IPv4Network('192.168.1.0/24'), cidr))
+            continue
         try:
-            nets.append(IPv4Network(cidr, strict=False))
+            nets.append((IPv4Network(cidr, strict=False), cidr))
         except ValueError as exc:
             _LOGGER.warning(
                 'Invalid CIDR in PROXY_NETWORKS; skipping',
@@ -47,7 +50,7 @@ def _load_proxy_networks() -> list[IPv4Network]:
     return nets
 
 
-def _current_proxy_networks() -> list[IPv4Network]:
+def _current_proxy_networks() -> list[tuple[IPv4Network, str]]:
     global _PROXY_NETWORKS_CACHE_KEY, _PROXY_NETWORKS
     current_key: str = os.environ.get('PROXY_NETWORKS', '')
     if _PROXY_NETWORKS_CACHE_KEY != current_key:
@@ -83,9 +86,9 @@ def proxy_network_for(proxy_ip: str | None) -> str:
         addr: IPv4Address = IPv4Address(proxy_ip)
     except ValueError:
         return 'other'
-    for net in _current_proxy_networks():
+    for net, label in _current_proxy_networks():
         if addr in net:
-            return str(net)
+            return label
     return 'other'
 
 

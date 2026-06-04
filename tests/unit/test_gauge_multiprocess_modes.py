@@ -185,8 +185,8 @@ class TestToolLocalGaugeModes(unittest.TestCase):
             mod.METRIC_TIER_POPULATION._multiprocess_mode, 'max',
         )
 
-    def test_yt_channel_upload_files_pending_upload(self) -> None:
-        from tools.yt_channel_upload import (
+    def test_scraper_metrics_files_pending_upload(self) -> None:
+        from scrape_exchange.scraper_metrics import (
             METRIC_FILES_PENDING_UPLOAD,
         )
         self.assertEqual(

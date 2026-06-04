@@ -42,6 +42,7 @@ import redis.asyncio as aioredis
 
 from scrape_exchange.creator_map import RedisCreatorMap
 from scrape_exchange.handle_map import RedisHandleMap
+from scrape_exchange.redis_client import redis_from_url
 from scrape_exchange.youtube.channel_identity import (
     ChannelIdentityStore,
 )
@@ -588,9 +589,11 @@ def main(argv: list[str] | None = None) -> int:
     from scrape_exchange.creator_map import NullCreatorMap
 
     if settings.redis_dsn:
-        client: aioredis.Redis = aioredis.from_url(
+        client: aioredis.Redis = redis_from_url(
             settings.redis_dsn,
+            component='yt-cleanup-channel-list',
             decode_responses=True,
+            max_connections=1,
         )
         store: ChannelIdentityStore = ChannelIdentityStore(
             creator_map=RedisCreatorMap(

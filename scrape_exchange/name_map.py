@@ -29,6 +29,8 @@ import logging
 
 from abc import ABC, abstractmethod
 
+from scrape_exchange.redis_client import redis_from_url
+
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -75,9 +77,10 @@ class RedisNameMap(NameMap):
     def __init__(
         self, redis_dsn: str, platform: str,
     ) -> None:
-        import redis.asyncio as aioredis
-        self._redis: aioredis.Redis = aioredis.from_url(
-            redis_dsn, decode_responses=True,
+        self._redis = redis_from_url(
+            redis_dsn,
+            component=f'{platform}-name-map',
+            decode_responses=True,
         )
         self._key: str = f'{platform}:name_map'
 

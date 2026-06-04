@@ -15,6 +15,8 @@ from scrape_exchange.youtube.channel_identity import (
 def _mock_settings() -> MagicMock:
     s = MagicMock()
     s.channel_unavailable_hard_threshold = 3
+    s.channel_not_found_terminal_threshold = 3
+    s.channel_not_found_retry_seconds = 3600
     s.exchange_url = 'https://scrape.exchange'
     return s
 
@@ -93,11 +95,12 @@ class TestScrapeOne(
             creator_map_backend=creator_map,
             http_client=MagicMock(),
         )
-        queue.mark.assert_awaited_once()
-        kwargs = queue.mark.await_args.kwargs
-        self.assertEqual(
-            kwargs['state'],
-            ChannelState.NOT_FOUND,
+        (
+            queue.mark_not_found_confirmed
+            .assert_awaited_once_with(
+                'i:UCabc00000000000000000000',
+                last_error='404',
+            )
         )
         queue.update_tier.assert_not_called()
 
@@ -144,12 +147,20 @@ class TestScrapeOne(
         '._do_scrape_channel_to_disk_typed',
         new_callable=AsyncMock,
     )
-    async def test_no_handle_marks_unresolved(
+    async def test_no_handle_scrapes_by_id_not_unresolved(
         self,
         mock_scrape: AsyncMock,
         mock_exists: AsyncMock,
     ) -> None:
+        # A missing creator_map handle no longer diverts the channel to
+        # the terminal 'unresolved' state; it is scraped by channel_id.
         mock_exists.return_value = False
+        channel = MagicMock()
+        channel.subscriber_count = 5
+        channel.channel_id = 'UCabc00000000000000000000'
+        channel.channel_handle = None
+        channel.title = None
+        mock_scrape.return_value = channel
         queue = AsyncMock()
         creator_map = AsyncMock()
         creator_map.get.return_value = None
@@ -164,13 +175,12 @@ class TestScrapeOne(
             creator_map_backend=creator_map,
             http_client=MagicMock(),
         )
-        queue.mark.assert_awaited_once()
-        kwargs = queue.mark.await_args.kwargs
-        self.assertEqual(
-            kwargs['state'],
-            ChannelState.UNRESOLVED,
-        )
-        mock_scrape.assert_not_called()
+        mock_scrape.assert_awaited_once()
+        for call in queue.mark.await_args_list:
+            self.assertNotEqual(
+                call.kwargs.get('state'),
+                ChannelState.UNRESOLVED,
+            )
 
 
 class TestScrapeBatch(
@@ -222,6 +232,37 @@ class TestScrapeBatch(
         unblock.set()
         await batch
         self.assertEqual(mock_scrape.await_count, 3)
+
+    @patch(
+        'tools.yt_channel_scrape._scrape_one_queued',
+        new_callable=AsyncMock,
+    )
+    async def test_unexpected_scrape_error_marks_soft_unavailable(
+        self,
+        mock_scrape: AsyncMock,
+    ) -> None:
+        mock_scrape.side_effect = RuntimeError('redis pool saturated')
+        settings = _mock_settings()
+        settings.channel_concurrency = 1
+        settings.proxies = []
+        queue = AsyncMock()
+        from tools.yt_channel_scrape import (
+            _scrape_queued_batch,
+        )
+
+        await _scrape_queued_batch(
+            ['UC1'],
+            queue=queue,
+            settings=settings,
+            fm=MagicMock(),
+            creator_map_backend=AsyncMock(),
+            http_client=MagicMock(),
+        )
+
+        queue.mark_soft_unavailable.assert_awaited_once_with(
+            'UC1',
+            last_error='redis pool saturated',
+        )
 
 
 class TestExistenceCheck(
@@ -301,6 +342,10 @@ class TestExistenceCheck(
             http_client=http_client,
         )
         mock_typed.assert_awaited_once()
+        self.assertEqual(
+            mock_typed.await_args.args[3],
+            'channel-UCabc00000000000000000001.json.br',
+        )
         kwargs: dict = mock_typed.await_args.kwargs
         self.assertFalse(kwargs.get('metadata_only'))
 
@@ -343,3 +388,244 @@ class TestExistenceCheck(
         mock_typed.assert_awaited_once()
         kwargs: dict = mock_typed.await_args.kwargs
         self.assertFalse(kwargs.get('metadata_only'))
+
+
+class TestForceRescrapeMode(
+    unittest.IsolatedAsyncioTestCase,
+):
+
+    @patch(
+        'tools.yt_channel_scrape'
+        '._do_scrape_channel_to_disk_typed',
+        new_callable=AsyncMock,
+    )
+    @patch(
+        'tools.yt_channel_scrape'
+        '._channel_exists_on_exchange',
+        new_callable=AsyncMock,
+    )
+    async def test_full_mode_bypasses_existence_check(
+        self,
+        mock_exists: AsyncMock,
+        mock_typed: AsyncMock,
+    ) -> None:
+        mock_channel: MagicMock = MagicMock()
+        mock_channel.subscriber_count = 250
+        mock_typed.return_value = mock_channel
+        queue: AsyncMock = AsyncMock()
+        queue.get_meta.return_value = {
+            'force_rescrape_mode': 'full',
+        }
+        creator_map: AsyncMock = AsyncMock()
+        creator_map.get.return_value = 'foo'
+        from tools.yt_channel_scrape import (
+            _scrape_one_queued,
+        )
+        await _scrape_one_queued(
+            'UCabc00000000000000000003',
+            queue=queue,
+            settings=_mock_settings(),
+            fm=MagicMock(),
+            creator_map_backend=creator_map,
+            http_client=MagicMock(),
+        )
+        mock_exists.assert_not_awaited()
+        kwargs: dict = mock_typed.await_args.kwargs
+        self.assertFalse(kwargs.get('metadata_only'))
+        queue.clear_force_rescrape.assert_awaited_once_with(
+            'i:UCabc00000000000000000003',
+        )
+
+    @patch(
+        'tools.yt_channel_scrape'
+        '._do_scrape_channel_to_disk_typed',
+        new_callable=AsyncMock,
+    )
+    @patch(
+        'tools.yt_channel_scrape'
+        '._channel_exists_on_exchange',
+        new_callable=AsyncMock,
+    )
+    async def test_metadata_mode_bypasses_existence_check(
+        self,
+        mock_exists: AsyncMock,
+        mock_typed: AsyncMock,
+    ) -> None:
+        mock_channel: MagicMock = MagicMock()
+        mock_channel.subscriber_count = 250
+        mock_typed.return_value = mock_channel
+        queue: AsyncMock = AsyncMock()
+        queue.get_meta.return_value = {
+            'force_rescrape_mode': 'metadata',
+        }
+        creator_map: AsyncMock = AsyncMock()
+        creator_map.get.return_value = 'foo'
+        from tools.yt_channel_scrape import (
+            _scrape_one_queued,
+        )
+        await _scrape_one_queued(
+            'UCabc00000000000000000004',
+            queue=queue,
+            settings=_mock_settings(),
+            fm=MagicMock(),
+            creator_map_backend=creator_map,
+            http_client=MagicMock(),
+        )
+        mock_exists.assert_not_awaited()
+        kwargs: dict = mock_typed.await_args.kwargs
+        self.assertTrue(kwargs.get('metadata_only'))
+        queue.clear_force_rescrape.assert_awaited_once_with(
+            'i:UCabc00000000000000000004',
+        )
+
+    @patch(
+        'tools.yt_channel_scrape'
+        '._do_scrape_channel_to_disk_typed',
+        new_callable=AsyncMock,
+    )
+    @patch(
+        'tools.yt_channel_scrape'
+        '._channel_exists_on_exchange',
+        new_callable=AsyncMock,
+    )
+    async def test_transient_failure_keeps_force_metadata(
+        self,
+        mock_exists: AsyncMock,
+        mock_typed: AsyncMock,
+    ) -> None:
+        mock_typed.side_effect = RuntimeError('timeout')
+        queue: AsyncMock = AsyncMock()
+        queue.get_meta.return_value = {
+            'force_rescrape_mode': 'full',
+        }
+        creator_map: AsyncMock = AsyncMock()
+        creator_map.get.return_value = 'foo'
+        from tools.yt_channel_scrape import (
+            _scrape_one_queued,
+        )
+        await _scrape_one_queued(
+            'UCabc00000000000000000005',
+            queue=queue,
+            settings=_mock_settings(),
+            fm=MagicMock(),
+            creator_map_backend=creator_map,
+            http_client=MagicMock(),
+        )
+        mock_exists.assert_not_awaited()
+        queue.clear_force_rescrape.assert_not_called()
+
+
+class TestScrapeOneHandleOptional(
+    unittest.IsolatedAsyncioTestCase,
+):
+    '''A missing creator_map handle must not block scraping; a
+    successful scrape self-heals identity + name maps.'''
+
+    def _patches(self):
+        return (
+            patch(
+                'tools.yt_channel_scrape'
+                '._channel_exists_on_exchange',
+                new_callable=AsyncMock, return_value=False,
+            ),
+            patch(
+                'tools.yt_channel_scrape'
+                '._do_scrape_channel_to_disk_typed',
+                new_callable=AsyncMock,
+            ),
+        )
+
+    async def test_missing_handle_still_scrapes(self) -> None:
+        p_exists, p_scrape = self._patches()
+        with p_exists, p_scrape as mock_scrape:
+            channel = MagicMock()
+            channel.subscriber_count = 10
+            channel.channel_id = 'UCabc00000000000000000000'
+            channel.channel_handle = None
+            channel.title = None
+            mock_scrape.return_value = channel
+            queue = AsyncMock()
+            creator_map = AsyncMock()
+            creator_map.get.return_value = None  # no handle
+            from tools.yt_channel_scrape import _scrape_one_queued
+            await _scrape_one_queued(
+                'UCabc00000000000000000000',
+                queue=queue,
+                settings=_mock_settings(),
+                fm=MagicMock(),
+                creator_map_backend=creator_map,
+                http_client=MagicMock(),
+            )
+            mock_scrape.assert_awaited_once()
+            queue.update_tier.assert_awaited_once()
+            # Must NOT mark unresolved for a missing handle.
+            for call in queue.mark.await_args_list:
+                self.assertNotEqual(
+                    call.kwargs.get('state'),
+                    ChannelState.UNRESOLVED,
+                )
+
+    async def test_self_heal_binds_and_name_maps(self) -> None:
+        p_exists, p_scrape = self._patches()
+        with p_exists, p_scrape as mock_scrape:
+            channel = MagicMock()
+            channel.subscriber_count = 10
+            channel.channel_id = 'UCabc00000000000000000000'
+            channel.channel_handle = 'discovered'
+            channel.title = 'Discovered Title'
+            mock_scrape.return_value = channel
+            queue = AsyncMock()
+            creator_map = AsyncMock()
+            creator_map.get.return_value = None
+            identity = AsyncMock()
+            name_map = AsyncMock()
+            from tools.yt_channel_scrape import _scrape_one_queued
+            await _scrape_one_queued(
+                'UCabc00000000000000000000',
+                queue=queue,
+                settings=_mock_settings(),
+                fm=MagicMock(),
+                creator_map_backend=creator_map,
+                http_client=MagicMock(),
+                identity=identity,
+                name_map=name_map,
+            )
+            identity.bind.assert_awaited_once_with(
+                'UCabc00000000000000000000', 'discovered',
+            )
+            name_map.put.assert_awaited_once_with(
+                'Discovered Title', 'UCabc00000000000000000000',
+            )
+
+    async def test_self_heal_bind_inconsistent_swallowed(
+        self,
+    ) -> None:
+        from scrape_exchange.youtube.channel_identity import (
+            InconsistentIdentityError,
+        )
+        p_exists, p_scrape = self._patches()
+        with p_exists, p_scrape as mock_scrape:
+            channel = MagicMock()
+            channel.subscriber_count = 10
+            channel.channel_id = 'UCabc00000000000000000000'
+            channel.channel_handle = 'discovered'
+            channel.title = None
+            mock_scrape.return_value = channel
+            queue = AsyncMock()
+            creator_map = AsyncMock()
+            creator_map.get.return_value = None
+            identity = AsyncMock()
+            identity.bind.side_effect = InconsistentIdentityError('x')
+            from tools.yt_channel_scrape import _scrape_one_queued
+            await _scrape_one_queued(
+                'UCabc00000000000000000000',
+                queue=queue,
+                settings=_mock_settings(),
+                fm=MagicMock(),
+                creator_map_backend=creator_map,
+                http_client=MagicMock(),
+                identity=identity,
+                name_map=AsyncMock(),
+            )
+            # Bind raised, but the scrape still counts as success.
+            queue.update_tier.assert_awaited_once()

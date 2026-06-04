@@ -2,6 +2,8 @@
 
 from typing import ClassVar, Iterable
 
+from scrape_exchange.redis_client import redis_from_url
+
 
 class UploadedVideoIds:
     '''Fleet-wide set of YouTube IDs uploaded to scrape.exchange.'''
@@ -9,9 +11,10 @@ class UploadedVideoIds:
     _KEY: ClassVar[str] = 'youtube:video:uploaded'
 
     def __init__(self, redis_dsn: str) -> None:
-        import redis.asyncio as redis_async  # lazy import
-        self._client = redis_async.from_url(
-            redis_dsn, decode_responses=True,
+        self._client = redis_from_url(
+            redis_dsn,
+            component='youtube-uploaded-video-ids',
+            decode_responses=True,
         )
 
     async def contains(self, video_id: str) -> bool:

@@ -34,6 +34,8 @@ def _mock_settings() -> MagicMock:
     s = MagicMock()
     s.channel_resolve_max_attempts = 5
     s.channel_resolve_backoff_seconds = 300
+    s.channel_not_found_terminal_threshold = 3
+    s.channel_not_found_retry_seconds = 3600
     s.channel_data_directory = '/tmp/test'
     s.proxies = []
     return s
@@ -42,6 +44,40 @@ def _mock_settings() -> MagicMock:
 class TestResolveOne(
     unittest.IsolatedAsyncioTestCase,
 ):
+
+    @patch('tools.yt_channel_scrape.YouTubeChannel')
+    async def test_invalid_handle_marks_invalid_without_youtube(
+        self,
+        MockChannel: MagicMock,
+    ) -> None:
+        queue = AsyncMock()
+        identity = MagicMock()
+        identity.handle_map.get = AsyncMock(return_value=None)
+        from tools.yt_channel_scrape import (
+            _resolve_one_queued,
+        )
+
+        await _resolve_one_queued(
+            'bad handle',
+            queue=queue,
+            identity=identity,
+            settings=_mock_settings(),
+        )
+
+        MockChannel.assert_not_called()
+        identity.handle_map.get.assert_awaited_once_with(
+            'bad handle',
+        )
+        queue.mark.assert_awaited_once()
+        kwargs = queue.mark.await_args.kwargs
+        self.assertEqual(
+            kwargs['state'],
+            ChannelState.INVALID_HANDLE,
+        )
+        self.assertEqual(
+            kwargs['last_error'],
+            'invalid channel_handle',
+        )
 
     @patch('tools.yt_channel_scrape.YouTubeChannel')
     async def test_success_promotes(
@@ -89,11 +125,12 @@ class TestResolveOne(
             identity=identity,
             settings=_mock_settings(),
         )
-        queue.mark.assert_awaited_once()
-        kwargs = queue.mark.await_args.kwargs
-        self.assertEqual(
-            kwargs['state'],
-            ChannelState.NOT_FOUND,
+        (
+            queue.mark_not_found_confirmed
+            .assert_awaited_once_with(
+                'h:badhandle',
+                last_error='InnerTube returned no id',
+            )
         )
 
     @patch('tools.yt_channel_scrape.YouTubeChannel')

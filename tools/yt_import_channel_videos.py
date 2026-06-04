@@ -30,6 +30,7 @@ from pydantic_settings import (
 )
 
 from scrape_exchange.brotli import brotli_read
+from scrape_exchange.redis_client import redis_from_url
 from scrape_exchange.video_scrape_queue import (
     RedisVideoScrapeQueue,
     VideoScrapeQueueSettings,
@@ -165,8 +166,9 @@ async def main_async() -> int:
         logging.info('Nothing to enqueue; exiting')
         return 0
 
-    redis: aioredis.Redis = aioredis.from_url(
+    redis: aioredis.Redis = redis_from_url(
         settings.redis_dsn,
+        component='yt-import-channel-videos',
         decode_responses=True,
     )
     queue: RedisVideoScrapeQueue = (

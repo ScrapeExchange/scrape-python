@@ -9,11 +9,14 @@ the video IDs, playlist data, course data, post data, and product data.
 '''
 
 import asyncio
+import functools
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from logging import Logger
 from logging import getLogger
 import logging
 import time
-from typing import Final
+from typing import Any, Callable, Final
 
 import httpx
 
@@ -568,21 +571,25 @@ class YouTubeChannelTabs:
                 result: dict
                 if not params:
                     if not continuation_token:
-                        result = await asyncio.to_thread(
+                        result = await run_on_innertube_executor(
                             self.client.browse,
                             self.channel_id,
                         )
                     else:
-                        result = await asyncio.to_thread(
-                            self.client.browse,
-                            self.channel_id,
-                            continuation=continuation_token,
+                        result = await run_on_innertube_executor(
+                            functools.partial(
+                                self.client.browse,
+                                self.channel_id,
+                                continuation=continuation_token,
+                            ),
                         )
                 else:
-                    result = await asyncio.to_thread(
-                        self.client.browse,
-                        self.channel_id,
-                        params=params,
+                    result = await run_on_innertube_executor(
+                        functools.partial(
+                            self.client.browse,
+                            self.channel_id,
+                            params=params,
+                        ),
                     )
                 duration: float = time.monotonic() - start
                 METRIC_YT_REQUEST_DURATION.labels(
@@ -820,6 +827,60 @@ class YouTubeChannelTabs:
 _INNERTUBE_SYNC_HTTPX_TIMEOUT: Final[httpx.Timeout] = httpx.Timeout(
     connect=5.0, read=8.0, write=5.0, pool=5.0,
 )
+
+
+# Dedicated thread pool for the *synchronous* InnerTube calls
+# (player/next/browse run via run_in_executor). Kept separate from the
+# default ThreadPoolExecutor so a wedged InnerTube HTTP thread cannot
+# starve the cookie-file / brotli ``to_thread`` work that keeps a worker
+# alive — the silent-hang failure mode from 2026-05-30. Size is set from
+# settings at startup via :func:`configure_innertube_executor`.
+_INNERTUBE_EXECUTOR_THREADS: int = 16
+_INNERTUBE_EXECUTOR: ThreadPoolExecutor | None = None
+_INNERTUBE_EXECUTOR_LOCK: threading.Lock = threading.Lock()
+
+
+def configure_innertube_executor(threads: int) -> None:
+    '''Set the dedicated InnerTube executor size. Must be called before
+    the first :func:`innertube_executor` use (i.e. at scraper startup);
+    it does not resize an already-created pool.'''
+    global _INNERTUBE_EXECUTOR_THREADS
+    _INNERTUBE_EXECUTOR_THREADS = max(1, threads)
+
+
+def innertube_executor() -> ThreadPoolExecutor:
+    '''Return the process-wide dedicated InnerTube executor, creating it
+    lazily on first use.'''
+    global _INNERTUBE_EXECUTOR
+    if _INNERTUBE_EXECUTOR is None:
+        with _INNERTUBE_EXECUTOR_LOCK:
+            if _INNERTUBE_EXECUTOR is None:
+                _INNERTUBE_EXECUTOR = ThreadPoolExecutor(
+                    max_workers=_INNERTUBE_EXECUTOR_THREADS,
+                    thread_name_prefix='innertube',
+                )
+    return _INNERTUBE_EXECUTOR
+
+
+def run_on_innertube_executor(
+    fn: Callable[..., Any], *args: object,
+) -> asyncio.Future:
+    '''Schedule the synchronous *fn* on the dedicated InnerTube executor
+    and return the awaitable. Keyword-bearing calls pass a
+    ``functools.partial``.'''
+    loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+    return loop.run_in_executor(innertube_executor(), fn, *args)
+
+
+def shutdown_innertube_executor() -> None:
+    '''Drop and shut down the dedicated InnerTube executor without
+    waiting for running threads (a wedged InnerTube call would hang a
+    join; the process exits via os._exit regardless).'''
+    global _INNERTUBE_EXECUTOR
+    executor: ThreadPoolExecutor | None = _INNERTUBE_EXECUTOR
+    _INNERTUBE_EXECUTOR = None
+    if executor is not None:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def build_innertube_with_pool_limits(

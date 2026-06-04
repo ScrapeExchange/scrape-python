@@ -124,6 +124,61 @@ class ScraperSettings(BaseSettings):
         ),
     )
 
+    watchdog_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            'WATCHDOG_ENABLED', 'watchdog_enabled',
+        ),
+        description=(
+            'Enable the liveness watchdog. When on, a daemon thread '
+            'terminates the worker (os._exit(1), so the supervisor '
+            'respawns it) if the event loop or all workers stop making '
+            'progress. Set false to disable in environments where the '
+            'supervisor/container will not restart the process.'
+        ),
+    )
+    watchdog_loop_timeout_seconds: float = Field(
+        default=60.0,
+        validation_alias=AliasChoices(
+            'WATCHDOG_LOOP_TIMEOUT_SECONDS',
+            'watchdog_loop_timeout_seconds',
+        ),
+        description=(
+            'Seconds the async heartbeat may go un-touched before the '
+            'watchdog treats the event loop as frozen and terminates '
+            'the process. Tighter than the work timeout because a '
+            'frozen loop is the more urgent failure.'
+        ),
+    )
+    watchdog_work_timeout_seconds: float = Field(
+        default=180.0,
+        validation_alias=AliasChoices(
+            'WATCHDOG_WORK_TIMEOUT_SECONDS',
+            'watchdog_work_timeout_seconds',
+        ),
+        description=(
+            'Seconds with no forward worker progress before the '
+            'watchdog terminates the process. Must exceed any '
+            'legitimate global quiet period; intentional long sleeps '
+            '(e.g. an open RSS circuit) chunk-and-touch the watchdog so '
+            'they do not look like a hang.'
+        ),
+    )
+    innertube_executor_threads: int = Field(
+        default=16,
+        validation_alias=AliasChoices(
+            'INNERTUBE_EXECUTOR_THREADS', 'innertube_executor_threads',
+        ),
+        description=(
+            'Thread-pool size for the dedicated executor that runs the '
+            'synchronous InnerTube player/next/browse calls. Isolated '
+            'from the default executor so a wedged InnerTube call cannot '
+            'starve cookie-file/brotli to_thread work. Also caps '
+            'per-process InnerTube concurrency (throughput is roughly '
+            'this / p50 scrape seconds). Each thread costs ~8 MB of '
+            'stack; keep well within the 1 GB/tool budget.'
+        ),
+    )
     worker_id: str = Field(
         default='0',
         validation_alias=AliasChoices(

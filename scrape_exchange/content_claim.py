@@ -33,6 +33,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 
 from scrape_exchange.datatypes import Platform, PlatformEntityType
+from scrape_exchange.redis_client import redis_from_url
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -261,8 +262,10 @@ class RedisContentClaim(ContentClaim):
                 'pip install "redis[hiredis]>=5.0.0"'
             ) from None
         self._redis: aioredis.Redis = (
-            aioredis.from_url(
-                redis_dsn, decode_responses=True,
+            redis_from_url(
+                redis_dsn,
+                component=f'{platform}-content-claim',
+                decode_responses=True,
             )
         )
         self._ttl: int = ttl

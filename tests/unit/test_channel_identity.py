@@ -90,6 +90,45 @@ class TestChannelIdentityBind(unittest.TestCase):
         with self.assertRaises(ValueError):
             asyncio.run(store.bind('UC1', 'with/slash'))
 
+    def test_bind_rejects_lowercase_uc_prefix(self) -> None:
+        # Lowercase 'uc' prefix is never a valid YouTube
+        # channel_id. ``bind()`` must reject so the maps cannot
+        # be corrupted from any code path that bypasses
+        # ``normalise_channel_id``.
+        store = self._store()
+        with self.assertRaises(ValueError):
+            asyncio.run(
+                store.bind(
+                    'uc1toeoupkjz1qclgx-u8yfa', 'SomeHandle',
+                ),
+            )
+
+    def test_bind_rejects_mixed_case_uc_prefix(self) -> None:
+        store = self._store()
+        with self.assertRaises(ValueError):
+            asyncio.run(
+                store.bind(
+                    'Uc1toeoupkjz1qclgx-u8YFA', 'SomeHandle',
+                ),
+            )
+
+    def test_bind_accepts_canonical_uppercase_prefix(self) -> None:
+        # Mixed-case body is fine; the YouTube channel_id alphabet
+        # is case-sensitive base64url. Only the prefix is
+        # constrained.
+        store = self._store()
+        asyncio.run(
+            store.bind('UC1ToEoUPkjz1qcLGX-u8YFA', 'SomeHandle'),
+        )
+        self.assertEqual(
+            asyncio.run(
+                store.creator_map.get(
+                    'UC1ToEoUPkjz1qcLGX-u8YFA',
+                ),
+            ),
+            'SomeHandle',
+        )
+
 
 class TestBindInconsistencyDetection(
     unittest.IsolatedAsyncioTestCase,

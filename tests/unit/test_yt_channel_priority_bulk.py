@@ -21,6 +21,8 @@ from unittest import mock
 import brotli
 import orjson
 
+from scrape_exchange.bulk_upload import BulkResults
+
 
 def _load_yt_channel_upload() -> ModuleType:
     '''Load tools/yt_channel_upload.py under the bare
@@ -295,24 +297,20 @@ class TestUnifiedBulkUploadLoop(
             job_id: str,
             exchange_url: str,
             cl: object,
-        ) -> list[dict]:
+        ) -> BulkResults:
             buf: bytes = (
                 client.post.call_args
                 .kwargs['files']['file'][1]
             )
-            results_out: list[dict] = []
-            for idx, line in enumerate(
-                b for b in buf.split(b'\n') if b
-            ):
-                rec: dict = orjson.loads(line)
-                results_out.append({
-                    'platform_content_id': (
-                        rec['channel_id']
-                    ),
-                    'record_index': idx,
-                    'status': 'success',
-                })
-            return results_out
+            n: int = sum(
+                1 for b in buf.split(b'\n') if b
+            )
+            # All records succeed: empty failures list, total ==
+            # records submitted (ADR-0008 failures-only contract).
+            return BulkResults(
+                total=n, succeeded=n, failed=0, duplicate=0,
+                failures=[],
+            )
 
         async def fake_stream(
             job_id: str,
@@ -391,23 +389,18 @@ class TestUnifiedBulkUploadLoop(
             job_id: str,
             exchange_url: str,
             cl: object,
-        ) -> list[dict]:
+        ) -> BulkResults:
             buf: bytes = (
                 client.post.call_args
                 .kwargs['files']['file'][1]
             )
-            return [
-                {
-                    'platform_content_id': (
-                        orjson.loads(line)['channel_id']
-                    ),
-                    'record_index': idx,
-                    'status': 'success',
-                }
-                for idx, line in enumerate(
-                    b for b in buf.split(b'\n') if b
-                )
-            ]
+            n: int = sum(
+                1 for b in buf.split(b'\n') if b
+            )
+            return BulkResults(
+                total=n, succeeded=n, failed=0, duplicate=0,
+                failures=[],
+            )
 
         with (
             mock.patch.object(

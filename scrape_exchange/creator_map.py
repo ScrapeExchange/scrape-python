@@ -31,6 +31,7 @@ import aiofiles
 import redis.asyncio as aioredis
 
 from prometheus_client import Counter
+from scrape_exchange.redis_client import redis_from_url
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -224,8 +225,10 @@ class RedisCreatorMap(CreatorMap):
         self, redis_dsn: str, platform: str,
     ) -> None:
         self._redis: aioredis.Redis = (
-            aioredis.from_url(
-                redis_dsn, decode_responses=True,
+            redis_from_url(
+                redis_dsn,
+                component=f'{platform}-creator-map',
+                decode_responses=True,
             )
         )
         self._key: str = f'{platform}:creator_map'

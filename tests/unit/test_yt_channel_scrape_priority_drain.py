@@ -104,7 +104,7 @@ class TestDrainPriorityDirectoryResolveSuccess(
     async def asyncTearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    async def test_resolved_handle_returned(self) -> None:
+    async def test_resolved_channel_id_returned(self) -> None:
         settings: mock.MagicMock = _make_settings(
             str(self.priority_dir),
         )
@@ -120,8 +120,9 @@ class TestDrainPriorityDirectoryResolveSuccess(
                 )
             )
 
-        self.assertIn(_HANDLE, result)
-        self.assertEqual(result[_HANDLE], self.entry)
+        # Legacy drain now returns a {channel_id: path} map.
+        self.assertIn(_VALID_ID, result)
+        self.assertEqual(result[_VALID_ID], self.entry)
         # File not renamed yet
         self.assertTrue(self.entry.exists())
         # .failed must not exist
@@ -154,9 +155,9 @@ class TestDrainPriorityDirectoryResolveSuccess(
 class TestDrainPriorityDirectoryUnresolvable(
     unittest.IsolatedAsyncioTestCase,
 ):
-    '''When resolve_channel_id returns None the priority
-    entry is immediately renamed to <channel_id>.failed and
-    the handle is NOT included in the return dict.'''
+    '''When resolve_channel_id returns None the channel is still
+    scrapable by channel_id, so it is enqueued (not renamed
+    .failed); the handle is simply absent.'''
 
     async def asyncSetUp(self) -> None:
         self.tmp: str = tempfile.mkdtemp()
@@ -170,7 +171,7 @@ class TestDrainPriorityDirectoryUnresolvable(
     async def asyncTearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    async def test_entry_renamed_to_failed(self) -> None:
+    async def test_unresolvable_id_enqueued_not_failed(self) -> None:
         settings: mock.MagicMock = _make_settings(
             str(self.priority_dir),
         )
@@ -186,12 +187,13 @@ class TestDrainPriorityDirectoryUnresolvable(
                 )
             )
 
-        self.assertEqual(result, {})
-        self.assertFalse(self.entry.exists())
+        # channel_id alone is enough to scrape.
+        self.assertEqual(result, {_VALID_ID: self.entry})
+        self.assertTrue(self.entry.exists())
         failed: Path = self.priority_dir / (
             _VALID_ID + '.failed'
         )
-        self.assertTrue(failed.exists())
+        self.assertFalse(failed.exists())
 
     async def test_bind_not_called(self) -> None:
         settings: mock.MagicMock = _make_settings(
@@ -213,8 +215,8 @@ class TestDrainPriorityDirectoryUnresolvable(
 class TestDrainPriorityDirectoryInconsistentBind(
     unittest.IsolatedAsyncioTestCase,
 ):
-    '''InconsistentIdentityError during bind renames the
-    priority entry to .failed and excludes the handle.'''
+    '''An InconsistentIdentityError during bind is best-effort: the
+    channel is still enqueued by channel_id (not renamed .failed).'''
 
     async def asyncSetUp(self) -> None:
         self.tmp: str = tempfile.mkdtemp()
@@ -228,7 +230,9 @@ class TestDrainPriorityDirectoryInconsistentBind(
     async def asyncTearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    async def test_entry_renamed_to_failed(self) -> None:
+    async def test_inconsistent_bind_enqueued_not_failed(
+        self,
+    ) -> None:
         from scrape_exchange.youtube.channel_identity import (
             InconsistentIdentityError,
         )
@@ -250,18 +254,18 @@ class TestDrainPriorityDirectoryInconsistentBind(
                 )
             )
 
-        self.assertEqual(result, {})
-        self.assertFalse(self.entry.exists())
+        self.assertEqual(result, {_VALID_ID: self.entry})
+        self.assertTrue(self.entry.exists())
         failed: Path = self.priority_dir / (
             _VALID_ID + '.failed'
         )
-        self.assertTrue(failed.exists())
+        self.assertFalse(failed.exists())
 
 
 class TestDrainPriorityDirectorySkipsInvalidNames(
     unittest.IsolatedAsyncioTestCase,
 ):
-    '''Invalid filename entries are ignored.'''
+    '''Invalid filename entries are renamed to .failed.'''
 
     async def asyncSetUp(self) -> None:
         self.tmp: str = tempfile.mkdtemp()
@@ -271,7 +275,7 @@ class TestDrainPriorityDirectorySkipsInvalidNames(
     async def asyncTearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    async def test_non_channel_id_ignored(self) -> None:
+    async def test_non_channel_id_renamed_failed(self) -> None:
         invalid: Path = self.priority_dir / 'bad"handle'
         invalid.write_text('')
         (
@@ -295,7 +299,10 @@ class TestDrainPriorityDirectorySkipsInvalidNames(
 
         self.assertEqual(result, {})
         mock_resolve.assert_not_awaited()
-        self.assertTrue(invalid.exists())
+        self.assertFalse(invalid.exists())
+        self.assertTrue(
+            self.priority_dir.joinpath('bad"handle.failed').exists(),
+        )
 
     async def test_nonexistent_dir_returns_empty(
         self,

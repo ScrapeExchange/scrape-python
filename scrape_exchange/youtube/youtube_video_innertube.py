@@ -21,6 +21,7 @@ from innertube.errors import RequestError as InnerTubeRequestError
 
 from scrape_exchange.youtube.youtube_channel_tabs import (
     pooled_innertube_for_entry,
+    run_on_innertube_executor,
 )
 
 from dateutil import parser as dateutil_parser
@@ -79,7 +80,7 @@ async def _call_innertube(
     )
     async with lock:
         return await asyncio.wait_for(
-            asyncio.to_thread(fn, *args),
+            run_on_innertube_executor(fn, *args),
             timeout=_INNERTUBE_CALL_HARD_TIMEOUT_SECONDS,
         )
 

@@ -30,6 +30,11 @@ import redis.asyncio as aioredis
 from prometheus_client import Counter, Gauge
 from pydantic import AliasChoices, Field, field_validator
 
+from scrape_exchange.name_map import (
+    NameMap,
+    NullNameMap,
+    RedisNameMap,
+)
 from scrape_exchange.creator_map import (
     CreatorMap,
     FileCreatorMap,
@@ -65,6 +70,7 @@ from scrape_exchange.util import extract_proxy_ip, proxy_network_for
 
 from scrape_exchange.redis_claim import RedisClaim
 from scrape_exchange.worker_id import get_worker_id
+from scrape_exchange.watchdog import Watchdog
 from scrape_exchange.youtube.exchange_channels_set import (
     RedisExchangeChannelsSet,
 )
@@ -228,6 +234,29 @@ class ChannelSettings(YouTubeScraperSettings):
     channel_unavailable_hard_threshold: int = Field(
         default=3,
     )
+    channel_not_found_terminal_threshold: int = Field(
+        default=3,
+        validation_alias=AliasChoices(
+            'CHANNEL_NOT_FOUND_TERMINAL_THRESHOLD',
+            'channel_not_found_terminal_threshold',
+        ),
+        description=(
+            'Number of not_found observations required '
+            'before a channel is marked terminal not_found.'
+        ),
+    )
+    channel_not_found_retry_seconds: int = Field(
+        default=3600,
+        validation_alias=AliasChoices(
+            'CHANNEL_NOT_FOUND_RETRY_SECONDS',
+            'channel_not_found_retry_seconds',
+        ),
+        description=(
+            'Delay before retrying a channel after a '
+            'not_found observation that has not yet reached '
+            'the terminal threshold.'
+        ),
+    )
     channel_unavailable_soft_retry_seconds: int = Field(
         default=86400,
     )
@@ -316,11 +345,13 @@ CHANNEL_STATE_SIZE: Gauge = Gauge(
     'Number of channels currently in each '
     'workflow state.',
     ['state'],
+    multiprocess_mode='mostrecent',
 )
 CHANNEL_QUEUE_TIER_SIZE_NEW: Gauge = Gauge(
     'channel_queue_tier_size',
     'Number of channels in each scheduled tier.',
     ['tier'],
+    multiprocess_mode='mostrecent',
 )
 CHANNEL_RESOLVE_OUTCOMES: Counter = Counter(
     'channel_queue_resolve_outcomes_total',
@@ -343,6 +374,11 @@ CHANNEL_EXCHANGE_EXISTENCE_CHECK: Counter = Counter(
     'done before scraping a channel from the queue.',
     ['outcome'],
 )
+CHANNEL_FORCE_RESCRAPE_TOTAL: Counter = Counter(
+    'channel_force_rescrape_total',
+    'Forced channel re-scrape requests consumed by workers.',
+    ['mode', 'outcome'],
+)
 
 
 def _validate_settings(settings: ChannelSettings) -> None:
@@ -350,15 +386,12 @@ def _validate_settings(settings: ChannelSettings) -> None:
     Validate settings that are required for either the supervisor
     or the worker to run. Exits the process with code 1 and an
     error message on any violation.
+
+    ``channel_list`` is only required in the deprecated file-based
+    path (``REDIS_DSN`` unset). In Redis mode, channels are popped
+    from ``RedisChannelScrapeQueue`` and the file is never read.
     '''
 
-    if not settings.channel_list:
-        print(
-            'Error: file containing channels to scrape must be '
-            'provided via --channel-list or environment variable '
-            'YOUTUBE_CHANNEL_LIST'
-        )
-        sys.exit(1)
     if not settings.channel_data_directory:
         print(
             'Error: Directory for scraped channel data must be '
@@ -372,12 +405,58 @@ def _validate_settings(settings: ChannelSettings) -> None:
             'not exist. It will be created.'
         )
         os.makedirs(settings.channel_data_directory, exist_ok=True)
+    if settings.redis_dsn:
+        return
+    if not settings.channel_list:
+        print(
+            'Error: file containing channels to scrape must be '
+            'provided via --channel-list or environment variable '
+            'YOUTUBE_CHANNEL_LIST'
+        )
+        sys.exit(1)
     if not os.path.isfile(settings.channel_list):
         print(
             f'Error: Channel list file {settings.channel_list} '
             'does not exist'
         )
         sys.exit(1)
+
+
+def _build_identity_maps(
+    settings: 'ChannelSettings',
+) -> tuple[CreatorMap, NullHandleMap | RedisHandleMap, NameMap]:
+    '''Build the creator / handle / name map backends.
+
+    Constructor contracts differ and are easy to get wrong:
+    ``RedisCreatorMap`` and ``RedisNameMap`` take a **DSN string** and
+    build their own client, while ``RedisHandleMap`` takes a
+    **pre-built** client. Passing a client to ``RedisNameMap`` crashes
+    the worker at startup.
+    '''
+    if settings.redis_dsn:
+        creator_map_backend: CreatorMap = RedisCreatorMap(
+            settings.redis_dsn, platform='youtube',
+        )
+        handle_map_backend: NullHandleMap | RedisHandleMap = (
+            RedisHandleMap(
+                creator_map_backend.redis_client,
+                platform='youtube',
+            )
+        )
+        name_map_backend: NameMap = RedisNameMap(
+            settings.redis_dsn, platform='youtube',
+        )
+    else:
+        creator_map_backend = FileCreatorMap(
+            settings.channel_map_file,
+        )
+        handle_map_backend = NullHandleMap()
+        name_map_backend = NullNameMap()
+    return (
+        creator_map_backend,
+        handle_map_backend,
+        name_map_backend,
+    )
 
 
 async def _run_worker(
@@ -416,22 +495,12 @@ async def _run_worker(
 
     creator_map_backend: CreatorMap
     handle_map_backend: NullHandleMap | RedisHandleMap
-    if settings.redis_dsn:
-        creator_map_backend = RedisCreatorMap(
-            settings.redis_dsn,
-            platform='youtube',
-        )
-        redis_client: aioredis.Redis = (
-            creator_map_backend.redis_client
-        )
-        handle_map_backend = RedisHandleMap(
-            redis_client, platform='youtube',
-        )
-    else:
-        creator_map_backend = FileCreatorMap(
-            settings.channel_map_file,
-        )
-        handle_map_backend = NullHandleMap()
+    name_map_backend: NameMap
+    (
+        creator_map_backend,
+        handle_map_backend,
+        name_map_backend,
+    ) = _build_identity_maps(settings)
 
     identity_store: ChannelIdentityStore = ChannelIdentityStore(
         creator_map=creator_map_backend,
@@ -439,6 +508,9 @@ async def _run_worker(
     )
 
     if settings.redis_dsn:
+        redis_client: aioredis.Redis = (
+            creator_map_backend.redis_client
+        )
         queue_settings: ChannelScrapeQueueSettings = (
             ChannelScrapeQueueSettings(
                 channel_priority_queues=(
@@ -462,6 +534,14 @@ async def _run_worker(
                 channel_unavailable_hard_threshold=(
                     settings
                     .channel_unavailable_hard_threshold
+                ),
+                channel_not_found_terminal_threshold=(
+                    settings
+                    .channel_not_found_terminal_threshold
+                ),
+                channel_not_found_retry_seconds=(
+                    settings
+                    .channel_not_found_retry_seconds
                 ),
                 channel_unavailable_soft_retry_seconds=(
                     settings
@@ -525,6 +605,7 @@ async def _run_worker(
                             is_reap_worker=True,
                             shutdown_event=shutdown_event,
                             http_client=http_client,
+                            name_map=name_map_backend,
                         ),
                     )
                 )
@@ -566,6 +647,7 @@ async def _run_worker(
                     is_reap_worker=False,
                     shutdown_event=shutdown_event,
                     http_client=http_client,
+                    name_map=name_map_backend,
                 )
         finally:
             await http_client.aclose()
@@ -640,7 +722,7 @@ async def scrape_channels(
     # Drain the priority directory first so that channels
     # flagged by yt_import_channel_export.py are scraped
     # ahead of the channels.lst backlog.
-    priority_handles: dict[str, Path] = (
+    priority_ids: dict[str, Path] = (
         await _drain_priority_directory(
             settings, identity_store,
         )
@@ -648,7 +730,7 @@ async def scrape_channels(
     logging.info(
         'Priority directory drained',
         extra={
-            'priority_handles_count': len(priority_handles),
+            'priority_ids_count': len(priority_ids),
         },
     )
 
@@ -667,25 +749,24 @@ async def scrape_channels(
         'already scraped or marked as not found',
         extra={'new_channels_length': len(new_channels)},
     )
-    # Only keep channel handles (no spaces).  Priority
-    # handles come first; the channels.lst tail is shuffled
-    # independently so priority ordering is preserved.
+    # All entries are channel_ids now. Priority ids come first; the
+    # channels.lst tail is shuffled independently so priority ordering
+    # is preserved.
     regular_list: list[str] = [
-        ch for ch in new_channels
-        if ' ' not in ch and ch
-        and ch not in priority_handles
+        cid for cid in new_channels
+        if cid and cid not in priority_ids
     ]
     shuffle(regular_list)
     channel_list: list[str] = (
-        list(priority_handles.keys()) + regular_list
+        list(priority_ids.keys()) + regular_list
     )
 
-    # Feed channel names through a queue so only
+    # Feed channel_ids through a queue so only
     # ``channel_concurrency`` scrapes are live at any
     # time.
     queue: asyncio.Queue[str | None] = asyncio.Queue()
-    for name in channel_list:
-        queue.put_nowait(name)
+    for channel_id in channel_list:
+        queue.put_nowait(channel_id)
 
     errors: int = 0
     abort: bool = False
@@ -693,17 +774,14 @@ async def scrape_channels(
     async def worker() -> None:
         nonlocal errors, abort
         while not abort:
-            name: str | None = await queue.get()
-            if name is None:
+            channel_id: str | None = await queue.get()
+            if channel_id is None:
                 queue.task_done()
                 break
             try:
-                channel_handle: str = (
-                    normalize_channel_name(name)
-                )
                 failed: bool = await scrape_channel(
                     settings, fm,
-                    channel_handle, creator_map_backend,
+                    channel_id, creator_map_backend,
                 )
                 if failed:
                     errors += 1
@@ -717,7 +795,7 @@ async def scrape_channels(
                     'Unexpected error in channel '
                     'scrape worker',
                     exc=exc,
-                    extra={'channel_handle': name},
+                    extra={'channel_id': channel_id},
                 )
                 if errors > 100:
                     abort = True
@@ -747,7 +825,7 @@ async def scrape_channels(
     # Resolve the fate of every priority entry now that all
     # workers have finished: delete on success/sentinel,
     # rename to .failed otherwise.
-    _priority_post_cleanup(priority_handles, fm)
+    _priority_post_cleanup(priority_ids, fm)
 
     if abort:
         logging.critical(
@@ -763,9 +841,11 @@ async def scrape_channels(
 # Priority-directory drain helpers
 # ---------------------------------------------------------------------------
 
-_PRIORITY_CHANNEL_ID_RE: re.Pattern[str] = re.compile(
+_CHANNEL_ID_RE: re.Pattern[str] = re.compile(
     r'^UC[A-Za-z0-9_-]{22}$', re.IGNORECASE,
 )
+# Backwards-compatible alias for the priority-drain call site.
+_PRIORITY_CHANNEL_ID_RE: re.Pattern[str] = _CHANNEL_ID_RE
 
 
 def _rename_priority_to_failed(path: Path) -> None:
@@ -786,6 +866,14 @@ def _rename_priority_to_failed(path: Path) -> None:
         )
 
 
+def _is_valid_input_channel_handle(handle: str) -> bool:
+    return (
+        is_valid_channel_handle(handle)
+        and not any(c.isspace() for c in handle)
+        and '/' not in handle
+    )
+
+
 async def _drain_priority_directory(
     settings: 'ChannelSettings',
     identity_store: ChannelIdentityStore,
@@ -794,9 +882,11 @@ async def _drain_priority_directory(
 ) -> 'dict[str, Path]':
     '''Drain bare channel-ID or channel-handle priority files.
 
-    Legacy file mode returns resolved handles for
-    :func:`_priority_post_cleanup`. Redis mode enqueues each resolved
-    channel at priority and renames its source file to ``.processed``.
+    Legacy file mode returns a ``{channel_id: Path}`` map (the path is
+    the priority file) for :func:`_priority_post_cleanup`; every entry
+    is resolved to its channel_id so the id-internal worker queue stays
+    id-keyed. Redis mode enqueues each resolved channel at priority and
+    renames its source file to ``.processed``.
     '''
     priority_dir: Path = Path(
         settings.channel_priority_directory_path,
@@ -804,7 +894,7 @@ async def _drain_priority_directory(
     if not priority_dir.is_dir():
         return {}
 
-    handles: dict[str, Path] = {}
+    resolved_ids: dict[str, Path] = {}
     for path in sorted(priority_dir.iterdir()):
         if not path.is_file():
             continue
@@ -814,29 +904,30 @@ async def _drain_priority_directory(
         handle: str | None = None
         if _PRIORITY_CHANNEL_ID_RE.fullmatch(path.name):
             channel_id = path.name
+            # The handle is optional metadata: a channel_id is enough to
+            # scrape (via /channel/<id>). A failed/empty resolution does
+            # not block queueing — we proceed without a handle.
             try:
                 handle = await resolve_channel_id(channel_id)
             except Exception as exc:
                 logging.warning(
-                    'Priority drain: resolve_channel_id raised',
+                    'Priority drain: resolve_channel_id raised; '
+                    'enqueuing by channel_id without a handle',
                     extra={
                         'channel_id': channel_id,
                         'error': str(exc),
                     },
                 )
-                _rename_priority_to_failed(path)
-                continue
-            if handle is None:
-                logging.warning(
-                    'Priority drain: channel_id unresolvable, '
-                    'renaming to .failed',
-                    extra={'channel_id': channel_id},
-                )
-                _rename_priority_to_failed(path)
-                continue
+                handle = None
         else:
             handle = path.name.removeprefix('@')
-            if not is_valid_channel_handle(handle):
+            if not _is_valid_input_channel_handle(handle):
+                logging.warning(
+                    'Priority drain: invalid channel handle, '
+                    'renaming to .failed',
+                    extra={'handle': handle},
+                )
+                _rename_priority_to_failed(path)
                 continue
             try:
                 channel_id = await identity_store.handle_map.get(
@@ -866,19 +957,22 @@ async def _drain_priority_directory(
                 _rename_priority_to_failed(path)
                 continue
 
-        try:
-            await identity_store.bind(channel_id, handle)
-        except InconsistentIdentityError as exc:
-            logging.warning(
-                'Priority drain: inconsistent identity bind',
-                extra={
-                    'channel_id': channel_id,
-                    'handle': handle,
-                    'error': str(exc),
-                },
-            )
-            _rename_priority_to_failed(path)
-            continue
+        # Best-effort identity bind: only when a handle is known, and a
+        # conflict never blocks queueing — the channel is scrapable by
+        # channel_id regardless.
+        if handle:
+            try:
+                await identity_store.bind(channel_id, handle)
+            except InconsistentIdentityError as exc:
+                logging.warning(
+                    'Priority drain: inconsistent identity bind; '
+                    'enqueuing by channel_id anyway',
+                    extra={
+                        'channel_id': channel_id,
+                        'handle': handle,
+                        'error': str(exc),
+                    },
+                )
 
         logging.info(
             'Priority drain: resolved priority entry',
@@ -888,7 +982,7 @@ async def _drain_priority_directory(
             },
         )
         if channel_queue is None:
-            handles[handle] = path
+            resolved_ids[channel_id] = path
             continue
         await channel_queue.enqueue_scheduled(
             channel_id,
@@ -897,11 +991,11 @@ async def _drain_priority_directory(
         )
         path.rename(path.with_name(path.name + '.processed'))
 
-    return handles
+    return resolved_ids
 
 
 def _priority_post_cleanup(
-    priority_handles: 'dict[str, Path]',
+    priority_ids: 'dict[str, Path]',
     fm: AssetFileManagement,
 ) -> None:
     # Legacy file-based path only. Redis mode renames each priority
@@ -910,21 +1004,21 @@ def _priority_post_cleanup(
     and decide its fate:
 
     * **Delete** the priority file if a scraped
-      ``channel-{handle}.json.br``, a ``.not_found``
+      ``channel-{channel_id}.json.br``, a ``.not_found``
       sentinel, or a ``.unresolved`` sentinel exists in
       either ``fm.base_dir`` or ``fm.uploaded_dir``.
     * **Rename to .failed** otherwise.
     '''
-    for handle, path in priority_handles.items():
+    for channel_id, path in priority_ids.items():
         scraped: str = (
-            f'{CHANNEL_FILE_PREFIX}{handle}'
+            f'{CHANNEL_FILE_PREFIX}{channel_id}'
             f'{CHANNEL_FILE_POSTFIX}'
         )
         not_found: str = (
-            f'{CHANNEL_FILE_PREFIX}{handle}.not_found'
+            f'{CHANNEL_FILE_PREFIX}{channel_id}.not_found'
         )
         unresolved: str = (
-            f'{CHANNEL_FILE_PREFIX}{handle}.unresolved'
+            f'{CHANNEL_FILE_PREFIX}{channel_id}.unresolved'
         )
         success_markers: list[str] = [
             scraped, not_found, unresolved,
@@ -1052,6 +1146,7 @@ async def _queue_driven_loop(
     is_reap_worker: bool,
     shutdown_event: asyncio.Event,
     http_client: httpx.AsyncClient,
+    name_map: NameMap | None = None,
 ) -> None:
     '''Wave-driven main loop.
 
@@ -1068,18 +1163,23 @@ async def _queue_driven_loop(
     '''
     last_reap: float = 0.0
     while not shutdown_event.is_set():
+        # Top-of-loop watchdog progress signal: ticks on every wave,
+        # including idle waves where both queues are empty.
+        Watchdog.get().touch_work()
         handles: list[str] = (
             await queue.pop_unresolved(
                 settings.channel_queue_resolve_batch,
             )
         )
-        for handle in handles:
-            await _resolve_one_queued(
+        await asyncio.gather(*(
+            _resolve_one_queued(
                 handle,
                 queue=queue,
                 identity=identity,
                 settings=settings,
             )
+            for handle in handles
+        ))
         ids: list[str] = await queue.pop_scheduled(
             settings.channel_queue_scrape_batch,
             now=time.time(),
@@ -1091,6 +1191,8 @@ async def _queue_driven_loop(
             fm=fm,
             creator_map_backend=creator_map_backend,
             http_client=http_client,
+            identity=identity,
+            name_map=name_map,
         )
         now: float = time.time()
         if (
@@ -1134,6 +1236,8 @@ async def _scrape_queued_batch(
     fm: AssetFileManagement,
     creator_map_backend: CreatorMap,
     http_client: httpx.AsyncClient,
+    identity: ChannelIdentityStore | None = None,
+    name_map: NameMap | None = None,
 ) -> None:
     '''Scrape one already-popped scheduled batch concurrently.'''
     if not ids:
@@ -1149,14 +1253,31 @@ async def _scrape_queued_batch(
 
     async def scrape_one(channel_id: str) -> None:
         async with semaphore:
-            await _scrape_one_queued(
-                channel_id,
-                queue=queue,
-                settings=settings,
-                fm=fm,
-                creator_map_backend=creator_map_backend,
-                http_client=http_client,
-            )
+            try:
+                await _scrape_one_queued(
+                    channel_id,
+                    queue=queue,
+                    settings=settings,
+                    fm=fm,
+                    creator_map_backend=creator_map_backend,
+                    http_client=http_client,
+                    identity=identity,
+                    name_map=name_map,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logging.exception(
+                    'queued channel scrape failed after pop',
+                    extra={'channel_id': channel_id},
+                )
+                await queue.mark_soft_unavailable(
+                    channel_id,
+                    last_error=str(exc),
+                )
+                CHANNEL_SCRAPE_OUTCOMES.labels(
+                    outcome='soft_unavailable',
+                ).inc()
 
     await asyncio.gather(*(
         scrape_one(channel_id) for channel_id in ids
@@ -1181,6 +1302,36 @@ async def _resolve_one_queued(
         handle.strip().removeprefix('@').strip()
     )
     member: str = f'h:{canonical}'
+    if not _is_valid_input_channel_handle(canonical):
+        mapped: str | None = None
+        handle_map = getattr(identity, 'handle_map', None)
+        if handle_map is not None:
+            try:
+                mapped = await handle_map.get(canonical)
+            except Exception as exc:
+                logging.warning(
+                    'Invalid queued handle map lookup failed',
+                    extra={
+                        'handle': canonical,
+                        'error': str(exc),
+                    },
+                )
+        if isinstance(mapped, str) and mapped:
+            await queue.promote_to_scheduled(handle, mapped)
+            CHANNEL_RESOLVE_OUTCOMES.labels(
+                outcome='resolved',
+            ).inc()
+            return
+        await queue.mark(
+            member,
+            state=ChannelState.INVALID_HANDLE,
+            last_error='invalid channel_handle',
+            extra={'handle': canonical},
+        )
+        CHANNEL_RESOLVE_OUTCOMES.labels(
+            outcome='invalid_handle',
+        ).inc()
+        return
     channel: YouTubeChannel = YouTubeChannel(
         channel_handle=handle,
         deno_path=DENO_PATH,
@@ -1236,18 +1387,20 @@ async def _resolve_one_queued(
             ).inc()
         return
     if not ok or not channel.channel_id:
-        await queue.mark(
+        terminal: bool = await queue.mark_not_found_confirmed(
             member,
-            state=ChannelState.NOT_FOUND,
             last_error='InnerTube returned no id',
         )
         CHANNEL_RESOLVE_OUTCOMES.labels(
-            outcome='not_found',
+            outcome='not_found' if terminal else 'backoff',
         ).inc()
         return
     try:
         await identity.bind(
             channel.channel_id, canonical,
+        )
+        await queue.promote_to_scheduled(
+            handle, channel.channel_id,
         )
     except InconsistentIdentityError as exc:
         await queue.mark(
@@ -1259,9 +1412,20 @@ async def _resolve_one_queued(
             outcome='inconsistent_identity',
         ).inc()
         return
-    await queue.promote_to_scheduled(
-        handle, channel.channel_id,
-    )
+    except ValueError as exc:
+        # bind() and promote_to_scheduled both reject non-canonical
+        # channel_ids. With normalise_channel_id wired into the
+        # resolver this should not fire; if it ever does, mark the
+        # entry terminal rather than crashing the worker.
+        await queue.mark(
+            member,
+            state=ChannelState.INCONSISTENT_IDENTITY,
+            last_error=str(exc),
+        )
+        CHANNEL_RESOLVE_OUTCOMES.labels(
+            outcome='inconsistent_identity',
+        ).inc()
+        return
     CHANNEL_RESOLVE_OUTCOMES.labels(
         outcome='promoted',
     ).inc()
@@ -1327,6 +1491,36 @@ async def _channel_exists_on_exchange(
     return False
 
 
+async def _self_heal_identity(
+    channel: YouTubeChannel,
+    identity: ChannelIdentityStore | None,
+    name_map: NameMap | None,
+) -> None:
+    '''Best-effort write-back of the canonical handle and title
+    discovered during a successful scrape, so creator_map / name_map
+    self-heal. Never raises into the scrape outcome: an
+    ``InconsistentIdentityError`` or a backend error is logged and
+    swallowed.'''
+    cid: str | None = channel.channel_id
+    if identity is not None and cid and channel.channel_handle:
+        try:
+            await identity.bind(cid, channel.channel_handle)
+        except InconsistentIdentityError as exc:
+            logging.warning(
+                'self-heal identity.bind skipped',
+                extra={'channel_id': cid, 'error': str(exc)},
+            )
+    if name_map is not None and cid and channel.title:
+        try:
+            await name_map.put(channel.title, cid)
+        except Exception:
+            logging.warning(
+                'self-heal name_map.put failed',
+                exc_info=True,
+                extra={'channel_id': cid},
+            )
+
+
 async def _scrape_one_queued(
     channel_id: str,
     *,
@@ -1335,55 +1529,76 @@ async def _scrape_one_queued(
     fm: AssetFileManagement,
     creator_map_backend: CreatorMap,
     http_client: httpx.AsyncClient,
+    identity: ChannelIdentityStore | None = None,
+    name_map: NameMap | None = None,
 ) -> None:
     '''Scrape a single channel_id popped from the
-    scheduled queue. Looks up the handle from
-    creator_map_backend, runs
-    _do_scrape_channel_to_disk_typed, and dispatches
-    state transitions based on the outcome.
+    scheduled queue.
+
+    The channel is scraped by ``channel_id`` (via
+    ``/channel/<id>``), so a missing creator_map handle does
+    not block or divert it. The handle, when present, is only
+    a logging label. On a successful scrape the discovered
+    canonical handle and title are bound back into the
+    identity / name maps (best-effort self-heal) when
+    ``identity`` / ``name_map`` are supplied.
     '''
     member: str = f'i:{channel_id}'
+    meta: dict[str, str] = await queue.get_meta(member)
+    if not isinstance(meta, dict):
+        meta = {}
+    force_mode: str | None = meta.get(
+        'force_rescrape_mode',
+    )
+    if force_mode not in ('full', 'metadata'):
+        force_mode = None
+    # Optional: a display label only. A missing handle is a non-event —
+    # the scrape keys on channel_id.
     handle: str | None = (
         await creator_map_backend.get(channel_id)
     )
-    if handle is None:
-        await queue.mark(
-            member,
-            state=ChannelState.UNRESOLVED,
-            last_error=(
-                f'no handle in creator_map for '
-                f'{channel_id!r}'
-            ),
-        )
-        CHANNEL_SCRAPE_OUTCOMES.labels(
-            outcome='unresolved',
-        ).inc()
-        return
-    try:
-        metadata_only: bool = (
-            await _channel_exists_on_exchange(
-                http_client,
-                settings.exchange_url,
-                channel_id,
-            )
-        )
-    except Exception:
-        logging.warning(
-            'existence check raised unexpectedly; '
-            'falling back to full scrape',
-            exc_info=True,
-            extra={'channel_id': channel_id},
-        )
-        CHANNEL_EXCHANGE_EXISTENCE_CHECK.labels(
-            outcome='error',
-        ).inc()
+    scrape_decision: str
+    if force_mode == 'full':
         metadata_only = False
+        scrape_decision = 'forced_full'
+    elif force_mode == 'metadata':
+        metadata_only = True
+        scrape_decision = 'forced_metadata'
+    else:
+        try:
+            metadata_only = (
+                await _channel_exists_on_exchange(
+                    http_client,
+                    settings.exchange_url,
+                    channel_id,
+                )
+            )
+            scrape_decision = (
+                'exchange_exists'
+                if metadata_only
+                else 'exchange_missing'
+            )
+        except Exception:
+            logging.warning(
+                'existence check raised unexpectedly; '
+                'falling back to full scrape',
+                exc_info=True,
+                extra={'channel_id': channel_id},
+            )
+            CHANNEL_EXCHANGE_EXISTENCE_CHECK.labels(
+                outcome='error',
+            ).inc()
+            metadata_only = False
+            scrape_decision = 'exchange_error'
     extra: dict[str, str] = {
         'channel_id': channel_id,
-        'channel_handle': handle,
+        'channel_handle': handle or '',
         'metadata_only': str(metadata_only),
+        'scrape_decision': scrape_decision,
     }
-    filename: str = f'{CHANNEL_FILE_PREFIX}{handle}'
+    if force_mode:
+        extra['force_rescrape_mode'] = force_mode
+    filename: str = get_channel_filename(channel_id)
     try:
         channel: YouTubeChannel = (
             await _do_scrape_channel_to_disk_typed(
@@ -1392,14 +1607,18 @@ async def _scrape_one_queued(
             )
         )
     except ChannelNotFoundError as exc:
-        await queue.mark(
+        terminal: bool = await queue.mark_not_found_confirmed(
             member,
-            state=ChannelState.NOT_FOUND,
             last_error=str(exc),
         )
         CHANNEL_SCRAPE_OUTCOMES.labels(
-            outcome='not_found',
+            outcome='not_found' if terminal else 'backoff',
         ).inc()
+        if force_mode:
+            CHANNEL_FORCE_RESCRAPE_TOTAL.labels(
+                mode=force_mode,
+                outcome='not_found',
+            ).inc()
         return
     except ChannelTerminatedError as exc:
         await queue.mark(
@@ -1410,6 +1629,11 @@ async def _scrape_one_queued(
         CHANNEL_SCRAPE_OUTCOMES.labels(
             outcome='terminated',
         ).inc()
+        if force_mode:
+            CHANNEL_FORCE_RESCRAPE_TOTAL.labels(
+                mode=force_mode,
+                outcome='terminated',
+            ).inc()
         return
     except (RuntimeError, OSError) as exc:
         await queue.mark_soft_unavailable(
@@ -1418,12 +1642,24 @@ async def _scrape_one_queued(
         CHANNEL_SCRAPE_OUTCOMES.labels(
             outcome='soft_unavailable',
         ).inc()
+        if force_mode:
+            CHANNEL_FORCE_RESCRAPE_TOTAL.labels(
+                mode=force_mode,
+                outcome='soft_unavailable',
+            ).inc()
         return
     await queue.update_tier(
         channel_id,
         sub_count=channel.subscriber_count or 0,
         now=time.time(),
     )
+    await _self_heal_identity(channel, identity, name_map)
+    if force_mode:
+        await queue.clear_force_rescrape(member)
+        CHANNEL_FORCE_RESCRAPE_TOTAL.labels(
+            mode=force_mode,
+            outcome='scraped',
+        ).inc()
     CHANNEL_SCRAPE_OUTCOMES.labels(
         outcome='scraped',
     ).inc()
@@ -1467,13 +1703,39 @@ def normalize_channel_name(channel_handle: str) -> str:
     return name
 
 
-def get_channel_filename(channel_handle: str) -> str:
-    return f'{CHANNEL_FILE_PREFIX}{channel_handle}{CHANNEL_FILE_POSTFIX}'
+def get_channel_filename(channel_id: str) -> str:
+    return f'{CHANNEL_FILE_PREFIX}{channel_id}{CHANNEL_FILE_POSTFIX}'
 
 
-def _handle_from_channel_filename(filename: str) -> str:
+def _persisted_channel_id_or_fail(
+    channel_id: str | None, *, extra: dict[str, str],
+) -> str | None:
+    '''Return *channel_id* if it is non-empty, else bump the
+    ``no_channel_id`` failure metric, log, and return None. A channel
+    with no id cannot be keyed on disk, so the caller must treat the
+    scrape as failed rather than persist it.'''
+    if channel_id:
+        return channel_id
+    METRIC_SCRAPE_FAILURES.labels(
+        platform='youtube',
+        scraper='channel_scraper',
+        entity='channel',
+        api='html',
+        reason='no_channel_id',
+        worker_id=get_worker_id(),
+        proxy_ip='none',
+        proxy_file=proxy_file_label(''),
+    ).inc()
+    logging.warning(
+        'Scraped channel has no channel_id; not persisting',
+        extra=extra,
+    )
+    return None
+
+
+def _channel_id_from_filename(filename: str) -> str:
     '''Strip ``channel-`` prefix and ``.json.br`` suffix to recover
-    the bare handle, the inverse of :func:`get_channel_filename`.
+    the bare channel_id, the inverse of :func:`get_channel_filename`.
 
     Used by the bulk-upload write-back into
     ``youtube:exchange_channels`` so apply_bulk_results doesn't need
@@ -1481,6 +1743,48 @@ def _handle_from_channel_filename(filename: str) -> str:
     return filename.removeprefix(
         CHANNEL_FILE_PREFIX,
     ).removesuffix(CHANNEL_FILE_POSTFIX)
+
+
+async def _resolve_handle_to_channel_id(
+    identifier: str,
+    identity_store: ChannelIdentityStore,
+    fm: AssetFileManagement,
+) -> str | None:
+    '''Resolve one input-boundary identifier to a ``channel_id``.
+
+    A bare ``UC…`` id is returned unchanged with no I/O. A handle is
+    resolved via ``identity_store.handle_map`` (a ``NullHandleMap`` in
+    the no-Redis legacy path, so it simply misses there), then via the
+    InnerTube ``resolve_channel_handle()`` fallback. A handle-keyed
+    ``channel-<handle>.not_found`` negative-cache marker short-circuits
+    to ``None`` *before* any InnerTube call; a definitive InnerTube
+    miss writes that marker so the handle is not re-resolved next run.
+
+    This handle-keyed marker is the one deliberate exception to the
+    id-only keying rule: a handle that resolves to no id has no
+    ``channel_id`` to key on. Transient InnerTube failures surface as
+    ``resolve_channel_handle`` returning ``None`` today and are treated
+    as definitive here; if that proves too aggressive, separate the two
+    in ``channel_identity.py`` rather than caching transients.
+
+    Returns ``None`` when the identifier cannot be resolved to an id.
+    '''
+    if _CHANNEL_ID_RE.fullmatch(identifier):
+        return identifier
+    handle: str = identifier.lstrip('@')
+    if not handle:
+        return None
+    mapped: str | None = await identity_store.handle_map.get(handle)
+    if mapped:
+        return mapped
+    marker_name: str = f'{CHANNEL_FILE_PREFIX}{handle}'
+    if fm.marker_path(marker_name, '.not_found').exists():
+        return None
+    resolved: str | None = await resolve_channel_handle(handle)
+    if resolved:
+        return resolved
+    await fm.mark_not_found(marker_name, content=f'{handle}\n')
+    return None
 
 
 def _failed_marker_is_stale(
@@ -1630,7 +1934,7 @@ async def _try_scrape_channel_typed(
 
 async def _try_scrape_channel(
     channel: YouTubeChannel, settings: ChannelSettings,
-    fm: AssetFileManagement, channel_handle: str,
+    fm: AssetFileManagement, channel_id: str,
     extra: dict[str, str],
 ) -> tuple[bool, str | None]:
     '''
@@ -1652,8 +1956,8 @@ async def _try_scrape_channel(
     except ChannelNotFoundError:
         try:
             await fm.mark_not_found(
-                f'{CHANNEL_FILE_PREFIX}{channel_handle}',
-                content=f'{channel_handle}\n',
+                f'{CHANNEL_FILE_PREFIX}{channel_id}',
+                content=f'{channel_id}\n',
             )
         except OSError:
             logging.warning(
@@ -1743,19 +2047,19 @@ async def _persist_scraped_channel(
 
 
 async def _try_acquire_scrape_claim(
-    channel_handle: str,
+    channel_id: str,
     creator_map_backend: CreatorMap,
 ) -> tuple['RedisClaim | None', str]:
-    '''Try to acquire ``claim:youtube:channel:<channel_handle>`` on the
+    '''Try to acquire ``claim:youtube:channel:<channel_id>`` on the
     Redis behind ``creator_map_backend``. The claim coordinates
     cross-host scrape work so two hosts running the same channel
     list don't both burn an InnerTube ``BROWSE`` budget on the
-    same handle.
+    same channel_id.
 
     Returns ``(claim, status)`` where ``status`` is one of:
 
     * ``'won'``: claim is held; caller must call
-      ``RedisClaim.release(channel_handle)`` on terminal outcome.
+      ``RedisClaim.release(channel_id)`` on terminal outcome.
     * ``'lost'``: a peer host holds the claim; caller should
       skip the scrape.
     * ``'no_redis'``: ``creator_map_backend`` has no Redis
@@ -1767,7 +2071,9 @@ async def _try_acquire_scrape_claim(
     — matched to the ``YOUTUBE_UPLOADED_CHANNELS_LIST`` refresh
     cadence so a peer host hitting the same handle within a
     refresh window still sees the claim (and skips) even if our
-    process crashed without calling ``release``. Channel scrapes
+    process crashed without calling ``release``. Channel_id is the
+    claim key (was the handle) so cross-host coordination matches the
+    id-keyed filenames and markers. Channel scrapes
     typically finish in seconds, so the TTL is the
     crash-recovery floor, not the expected hold time.
     '''
@@ -1782,7 +2088,7 @@ async def _try_acquire_scrape_claim(
         ttl_seconds=3600,
         owner=get_worker_id(),
     )
-    won: bool = await claim.try_claim(channel_handle)
+    won: bool = await claim.try_claim(channel_id)
     METRIC_CHANNEL_SCRAPE_CLAIM.labels(
         platform='youtube',
         scraper='channel_scraper',
@@ -1798,7 +2104,7 @@ async def _try_acquire_scrape_claim(
 async def _scrape_channel_to_disk(
     settings: ChannelSettings,
     fm: AssetFileManagement,
-    channel_handle: str,
+    channel_id: str,
     filename: str,
     creator_map_backend: CreatorMap,
     extra: dict[str, str],
@@ -1819,7 +2125,7 @@ async def _scrape_channel_to_disk(
     claim_status: str
     scrape_claim, claim_status = (
         await _try_acquire_scrape_claim(
-            channel_handle, creator_map_backend,
+            channel_id, creator_map_backend,
         )
     )
     if claim_status == 'lost':
@@ -1831,37 +2137,44 @@ async def _scrape_channel_to_disk(
 
     try:
         return await _do_scrape_channel_to_disk(
-            settings, fm, channel_handle, filename, extra,
+            settings, fm, channel_id, filename, extra,
         )
     finally:
         if scrape_claim is not None:
-            await scrape_claim.release(channel_handle)
+            await scrape_claim.release(channel_id)
 
 
 async def _do_scrape_channel_to_disk(
     settings: ChannelSettings,
     fm: AssetFileManagement,
-    channel_handle: str,
+    channel_id: str,
     filename: str,
     extra: dict[str, str],
 ) -> tuple[bool, bool | None, YouTubeChannel | None]:
     '''Inner half of :func:`_scrape_channel_to_disk` — runs while
-    the cross-host scrape claim is held. Same return contract.'''
+    the cross-host scrape claim is held. Same return contract.
+
+    Id-primary: the channel is fetched by ``channel_id`` (the
+    ``/channel/<id>`` URL). A handle, if known, is carried in
+    ``extra['channel_handle']`` for the fetch URL preference and
+    logging only; it is never required.'''
     scrape_start: float = time.monotonic()
     logging.debug(
         'Channel not scraped, scraping now', extra=extra,
     )
+    log_handle: str = extra.get('channel_handle') or channel_id
     channel: YouTubeChannel = YouTubeChannel(
-        channel_handle=channel_handle, deno_path=DENO_PATH,
+        channel_handle=extra.get('channel_handle'),
+        deno_path=DENO_PATH,
         po_token_url=PO_TOKEN_URL, debug=True,
         save_dir=settings.channel_data_directory,
-        channel_id=extra.get('channel_id'),
+        channel_id=channel_id,
         with_download_client=False,
     )
     ok: bool
     scrape_proxy: str | None
     ok, scrape_proxy = await _try_scrape_channel(
-        channel, settings, fm, channel_handle, extra,
+        channel, settings, fm, channel_id, extra,
     )
     if not ok:
         METRIC_SCRAPE_DURATION.labels(
@@ -1884,12 +2197,12 @@ async def _do_scrape_channel_to_disk(
 
     if _channel_has_no_content(
         channel, scrape_proxy_ip,
-        scrape_proxy_network, scrape_proxy, channel_handle,
+        scrape_proxy_network, scrape_proxy, log_handle,
     ):
         return False, False, None
 
     if not await _persist_scraped_channel(
-        fm, filename, channel, channel_handle,
+        fm, filename, channel, log_handle,
     ):
         return False, True, None
 
@@ -1921,7 +2234,8 @@ async def _do_scrape_channel_to_disk(
     logging.info(
         'Downloaded channel',
         extra={
-            'channel_handle': channel_handle,
+            'channel_handle': log_handle,
+            'channel_id': channel_id,
             'proxy_ip': scrape_proxy_ip,
             'proxy_network': scrape_proxy_network,
         },
@@ -1932,7 +2246,7 @@ async def _do_scrape_channel_to_disk(
 async def _do_scrape_channel_to_disk_typed(
     settings: ChannelSettings,
     fm: AssetFileManagement,
-    channel_handle: str,
+    channel_handle: str | None,
     filename: str,
     extra: dict[str, str],
     *,
@@ -2012,6 +2326,13 @@ async def _do_scrape_channel_to_disk_typed(
             f'has no content',
         )
 
+    if _persisted_channel_id_or_fail(
+        channel.channel_id or extra.get('channel_id'), extra=extra,
+    ) is None:
+        raise RuntimeError(
+            f'channel {channel_handle!r} scraped without a channel_id',
+        )
+
     if not await _persist_scraped_channel(
         fm, filename, channel, channel_handle,
     ):
@@ -2057,28 +2378,39 @@ async def _do_scrape_channel_to_disk_typed(
 async def scrape_channel(
     settings: ChannelSettings,
     fm: AssetFileManagement,
-    channel_handle: str,
+    channel_id: str,
     creator_map_backend: CreatorMap,
 ) -> bool:
     '''
     Scrapes a single YouTube channel and stores it on disk.
 
+    Id-primary: the channel is keyed and fetched by ``channel_id``
+    (already resolved at the input boundary). The handle, if cheaply
+    known from the creator map, is carried only as a log field and to
+    prefer the ``/@handle`` URL — it is never required for the fetch.
+
     :param settings: Tool settings.
-    :param fm: AssetFileManagement instance owning the channel data directory.
-    :param channel_handle: The name of the YouTube channel to scrape.
+    :param fm: AssetFileManagement instance owning the channel data
+        directory.
+    :param channel_id: The YouTube channel_id to scrape.
     :param creator_map_backend: Shared CreatorMap for
         channel_id → handle persistence.
     :returns: whether channel scraping failed
     :raises: (none)
     '''
 
-    extra: dict[str, str] = {'channel_handle': channel_handle}
+    extra: dict[str, str] = {'channel_id': channel_id}
+    handle: str | None = await creator_map_backend.get(channel_id)
+    if handle:
+        extra['channel_handle'] = handle
     logging.debug('Processing channel', extra=extra)
-    filename: str = get_channel_filename(channel_handle)
+    filename: str = get_channel_filename(channel_id)
     extra['filename'] = filename
     base_path: Path = fm.base_dir / filename
 
-    if await _skip_due_to_existing_state(fm, filename, base_path, extra):
+    if await _skip_due_to_existing_state(
+        fm, filename, base_path, extra,
+    ):
         return False
 
     if not base_path.exists():
@@ -2086,7 +2418,7 @@ async def scrape_channel(
         early: bool | None
         proceed, early, _ = (
             await _scrape_channel_to_disk(
-                settings, fm, channel_handle, filename,
+                settings, fm, channel_id, filename,
                 creator_map_backend, extra,
             )
         )
@@ -2096,20 +2428,17 @@ async def scrape_channel(
 
 
 def _resolve_known_channel_id(
-    channel_id: str, channel_map_data: dict[str, str],
+    channel_id: str,
     fm: AssetFileManagement,
 ) -> tuple[str | None, str | None]:
     '''
-    Look up a channel ID in the creator map and on the unresolved
-    marker file. Returns ``(handle, unresolved_id)``: a handle if we
-    already have a mapping, an unresolved id to queue for resolution,
-    or both ``None`` if the id previously failed to resolve and
-    should be ignored.
+    Decide how to route a bare channel_id parsed from the list.
+    Returns ``(handle, channel_id)``: the handle slot is always
+    ``None`` because id-primary scraping fetches the ``/channel/<id>``
+    URL directly, so a known/unknown distinction no longer matters —
+    the id itself is the candidate. A prior ``.unresolved`` marker
+    still suppresses the id (returns ``(None, None)``).
     '''
-
-    if channel_id in channel_map_data:
-
-        return channel_map_data[channel_id], None
 
     marker: Path = fm.marker_path(
         f'{CHANNEL_FILE_PREFIX}{channel_id}', '.unresolved',
@@ -2124,7 +2453,7 @@ def _resolve_known_channel_id(
 
 
 def _parse_channel_line(
-    raw_line: str, channel_map_data: dict[str, str],
+    raw_line: str,
     fm: AssetFileManagement,
 ) -> tuple[str | None, str | None]:
     '''
@@ -2151,9 +2480,7 @@ def _parse_channel_line(
     if handle is not None:
         return handle, None
     if channel_id is not None:
-        return _resolve_known_channel_id(
-            channel_id, channel_map_data, fm,
-        )
+        return _resolve_known_channel_id(channel_id, fm)
     return None, None
 
 
@@ -2182,62 +2509,87 @@ def _load_uploaded_channel_handles(path: str | None) -> set[str]:
         return set()
 
 
+async def _skip_uploaded_channel(
+    channel_id: str, filename: str, scraped_path: Path,
+    fm: AssetFileManagement,
+) -> None:
+    '''Relocate a stale base-dir scraped file for an already-uploaded
+    channel into ``uploaded_dir`` so the uploader does not waste a
+    round-trip on it. A no-op (debug log only) when no such file
+    exists.'''
+    if not scraped_path.exists():
+        logging.debug(
+            'Skipping channel; already in uploaded channels list',
+            extra={'channel_id': channel_id},
+        )
+        return
+    try:
+        await fm.mark_uploaded(filename)
+        logging.info(
+            'Channel already uploaded; moved scraped file to '
+            'uploaded directory',
+            extra={'channel_id': channel_id, 'filename': filename},
+        )
+    except OSError as exc:
+        logging.warning(
+            'Failed to move scraped channel file to uploaded '
+            'directory',
+            exc=exc,
+            extra={'channel_id': channel_id, 'filename': filename},
+        )
+
+
 async def _filter_unscraped_candidates(
-    channel_handles: set[str], fm: AssetFileManagement,
+    identifiers: list[str], fm: AssetFileManagement,
     uploaded_handles: set[str],
+    identity_store: ChannelIdentityStore,
+    creator_map_backend: CreatorMap,
+    max_candidates: int,
 ) -> list[str]:
     '''
-    Drop handles we already have local data for. A handle is skipped
-    when any of these exist on disk: a ``.not_found`` marker, a
-    scraped file in ``base_dir``, or an uploaded file in
-    ``uploaded_dir``. Handles present in *uploaded_handles* (loaded
-    from ``YOUTUBE_UPLOADED_CHANNELS_LIST``) are also skipped so we
-    do not re-scrape work that has already been uploaded; if such a
-    handle still has a non-RSS scraped file sitting in ``base_dir``
-    it is moved into ``uploaded_dir`` first so the uploader does not
-    waste a round-trip on it.
+    Resolve input identifiers (handles or bare ``UC…`` ids) to
+    channel_ids, dropping any we already have local data for, and
+    stop once *max_candidates* fresh channel_ids have been gathered.
+
+    Resolution is lazy / budget-bounded: a handle in the no-Redis
+    legacy path costs an InnerTube call, so we resolve only until the
+    budget is met. Bare ids and negative-cached handles cost no HTTP.
+    Dedup keys (``.not_found`` marker, scraped file in ``base_dir``,
+    uploaded file in ``uploaded_dir``) are all channel_id-based. The
+    ``uploaded_handles`` membership test (loaded from
+    ``YOUTUBE_UPLOADED_CHANNELS_LIST``, which is handle-valued) maps the
+    id back to its handle via the creator map; a stale non-uploaded
+    scraped file for such a channel is relocated into ``uploaded_dir``
+    first so the uploader does not waste a round-trip on it.
     '''
 
     candidates: list[str] = []
-    for channel_handle in channel_handles:
-        if not channel_handle:
+    seen: set[str] = set()
+    for identifier in identifiers:
+        if len(candidates) >= max_candidates:
+            break
+        if not identifier:
             continue
-        filename: str = get_channel_filename(channel_handle)
+        channel_id: str | None = (
+            await _resolve_handle_to_channel_id(
+                identifier, identity_store, fm,
+            )
+        )
+        if not channel_id or channel_id in seen:
+            continue
+        seen.add(channel_id)
+        filename: str = get_channel_filename(channel_id)
         scraped_path: Path = fm.base_dir / filename
-        if channel_handle in uploaded_handles:
-            if (
-                scraped_path.exists()
-                and not filename.startswith('channel-rss-')
-            ):
-                try:
-                    await fm.mark_uploaded(filename)
-                    logging.info(
-                        'Channel already uploaded; moved scraped '
-                        'file to uploaded directory',
-                        extra={
-                            'channel_handle': channel_handle,
-                            'filename': filename,
-                        },
-                    )
-                except OSError as exc:
-                    logging.warning(
-                        'Failed to move scraped channel file to '
-                        'uploaded directory',
-                        exc=exc,
-                        extra={
-                            'channel_handle': channel_handle,
-                            'filename': filename,
-                        },
-                    )
-            else:
-                logging.debug(
-                    'Skipping channel; already in uploaded '
-                    'channels list',
-                    extra={'channel_handle': channel_handle},
-                )
+        handle: str | None = (
+            await creator_map_backend.get(channel_id)
+        )
+        if handle and handle in uploaded_handles:
+            await _skip_uploaded_channel(
+                channel_id, filename, scraped_path, fm,
+            )
             continue
         not_found_path: Path = fm.marker_path(
-            f'{CHANNEL_FILE_PREFIX}{channel_handle}', '.not_found',
+            f'{CHANNEL_FILE_PREFIX}{channel_id}', '.not_found',
         )
         uploaded_path: Path = fm.uploaded_dir / filename
         if (not_found_path.exists()
@@ -2245,10 +2597,10 @@ async def _filter_unscraped_candidates(
                 or uploaded_path.exists()):
             logging.debug(
                 'Skipping channel as we already have data for it',
-                extra={'channel_handle': channel_handle},
+                extra={'channel_id': channel_id},
             )
             continue
-        candidates.append(channel_handle)
+        candidates.append(channel_id)
     return candidates
 
 
@@ -2257,8 +2609,8 @@ def _select_new_channels(
     max_new_channels: int, already_resolved_count: int,
 ) -> set[str]:
     '''
-    Select up to the per-run scrape budget when no Redis
-    ``youtube:exchange_channels`` set is available.
+    Select up to the per-run scrape budget of channel_ids when no
+    Redis ``youtube:exchange_channels`` set is available.
     '''
 
     remaining: int = max(max_new_channels - already_resolved_count, 0)
@@ -2277,15 +2629,16 @@ async def _select_new_channels_via_set(
     max_new_channels: int,
     already_resolved_count: int,
 ) -> set[str]:
-    '''Same contract as :func:`_select_new_channels` but uses
-    a single batched ``SISMEMBER`` call.'''
+    '''Same contract as :func:`_select_new_channels` but uses a single
+    batched ``SISMEMBER`` of channel_ids against the id-keyed
+    ``youtube:exchange_channels`` set.'''
     capped: list[str] = candidates[:max_new_channels]
     membership: dict[str, bool] = (
         await exchange_channels.contains_many(capped)
     )
     selected: set[str] = set()
-    for handle in capped:
-        if membership.get(handle, False):
+    for channel_id in capped:
+        if membership.get(channel_id, False):
             METRIC_CHANNEL_EXCHANGE_SET_LOOKUP.labels(
                 platform='youtube',
                 scraper='channel_scraper',
@@ -2301,7 +2654,7 @@ async def _select_new_channels_via_set(
             outcome='miss',
             worker_id=get_worker_id(),
         ).inc()
-        selected.add(handle)
+        selected.add(channel_id)
         if (
             len(selected) + already_resolved_count
         ) >= max_new_channels:
@@ -2432,7 +2785,6 @@ async def read_channels(
 
     logging.info('Reading channel names', extra={'file_path': file_path})
 
-    channel_map_data: dict[str, str] = await creator_map_backend.get_all()
     new_channel_handles: set[str] = set()
     unresolved_ids: set[str] = set()
 
@@ -2467,7 +2819,7 @@ async def read_channels(
         channel_handle: str | None
         unresolved_id: str | None
         channel_handle, unresolved_id = _parse_channel_line(
-            entry, channel_map_data, fm,
+            entry, fm,
         )
         if channel_handle:
             new_channel_handles.add(channel_handle)
@@ -2481,7 +2833,6 @@ async def read_channels(
         },
     )
 
-    resolved_channels: set[str] = set()
     if unresolved_ids:
         logging.info(
             'Found unresolved channel IDs, will not '
@@ -2506,23 +2857,37 @@ async def read_channels(
                 ttl_seconds=60,
                 owner=get_worker_id(),
             )
-        resolved_channels = await review_unresolved_ids(
+        # review_unresolved_ids binds id→handle in the creator/handle
+        # maps as a background enrichment; the bare ids themselves flow
+        # to the id-primary candidate selection below, so its return is
+        # no longer needed to turn ids into candidates.
+        await review_unresolved_ids(
             unresolved_ids, creator_map_backend, fm,
             concurrency, max_resolved_channels,
             claim=resolve_claim,
             identity_store=identity_store,
         )
-        new_channel_handles.update(resolved_channels)
 
+    # Resolve handles (and pass bare ids through) to channel_ids at this
+    # input boundary; everything downstream is keyed on channel_id.
+    if identity_store is None:
+        identity_store = ChannelIdentityStore(
+            creator_map=creator_map_backend,
+            handle_map=NullHandleMap(),
+        )
+    identifiers: list[str] = (
+        list(new_channel_handles) + list(unresolved_ids)
+    )
     candidates: list[str] = await _filter_unscraped_candidates(
-        new_channel_handles, fm, uploaded_handles,
+        identifiers, fm, uploaded_handles, identity_store,
+        creator_map_backend, max_new_channels,
     )
 
     logging.info(
-        'Checking channel handles against local/Redis state',
+        'Checking channel_ids against local/Redis state',
         extra={'max_new_channels': max_new_channels},
     )
-    checked_channel_handles: set[str]
+    checked_channel_ids: set[str]
     redis_client_for_set: aioredis.Redis | None = (
         creator_map_backend.redis_client
     )
@@ -2530,18 +2895,18 @@ async def read_channels(
         exchange_set: RedisExchangeChannelsSet = (
             RedisExchangeChannelsSet(redis_client_for_set)
         )
-        checked_channel_handles = (
+        checked_channel_ids = (
             await _select_new_channels_via_set(
                 candidates, exchange_set,
-                max_new_channels, len(resolved_channels),
+                max_new_channels, 0,
             )
         )
     else:
-        checked_channel_handles = (
+        checked_channel_ids = (
             _select_new_channels(
                 candidates,
                 max_new_channels,
-                len(resolved_channels),
+                0,
             )
         )
 
@@ -2550,17 +2915,17 @@ async def read_channels(
         scraper='channel_scraper',
         entity='channel',
         worker_id=get_worker_id(),
-    ).set(len(checked_channel_handles))
+    ).set(len(checked_channel_ids))
     logging.info(
-        'Read unique channel handles from file',
+        'Read unique channel_ids from file',
         extra={
-            'checked_channel_handles_length': (
-                len(checked_channel_handles)
+            'checked_channel_ids_length': (
+                len(checked_channel_ids)
             ),
             'file_path': file_path,
         },
     )
-    return checked_channel_handles
+    return checked_channel_ids
 
 
 async def _innertube_resolve(

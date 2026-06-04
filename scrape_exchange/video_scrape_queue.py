@@ -70,23 +70,17 @@ _ENQUEUE_LUA: str = '''
 local existing_state = redis.call(
     'HGET', KEYS[2], 'state'
 )
--- If the video is already in a terminal state, do
--- not re-add it to the queue; the operator (or a
--- prior mark) has dispositioned it. Producers can
--- safely call enqueue() repeatedly without
--- bypassing tombstones; only `unmark` returns the
--- video to the queue.
-local terminal = {
-    'unavailable', 'failed', 'removed',
-}
+-- If the video already has Redis metadata, treat it as
+-- known and report a duplicate. Producers can safely call
+-- enqueue() repeatedly without bypassing tombstones; only
+-- `unmark` returns terminal records to the queue.
 if existing_state ~= false then
-    for _, t in ipairs(terminal) do
-        if existing_state == t then
-            return 0
-        end
-    end
+    return 0
 end
-redis.call('ZADD', KEYS[1], 'NX', ARGV[3], ARGV[1])
+local added = redis.call('ZADD', KEYS[1], 'NX', ARGV[3], ARGV[1])
+if added == 0 then
+    return 0
+end
 redis.call(
     'HSETNX', KEYS[2], 'source', ARGV[2]
 )
@@ -96,7 +90,7 @@ redis.call(
 redis.call(
     'HSETNX', KEYS[2], 'state', ARGV[4]
 )
-return 1
+return added
 '''
 
 _POP_LUA: str = '''
@@ -164,7 +158,7 @@ class VideoScrapeQueue(ABC):
     @abstractmethod
     async def enqueue(
         self, video_id: str, *, source: str,
-    ) -> None: ...
+    ) -> bool: ...
 
     @abstractmethod
     async def pop(self, batch: int) -> list[str]: ...
@@ -246,18 +240,19 @@ class RedisVideoScrapeQueue(VideoScrapeQueue):
 
     async def enqueue(
         self, video_id: str, *, source: str,
-    ) -> None:
+    ) -> bool:
         if not video_id:
             raise ValueError('empty video_id')
         now: float = time.time()
-        await self._redis.eval(
+        added: int = int(await self._redis.eval(
             _ENQUEUE_LUA, 2,
             self._k_queue(),
             self._k_meta(video_id),
             video_id, source,
             str(int(now)),
             VideoState.QUEUED.value,
-        )
+        ))
+        return added == 1
 
     async def pop(self, batch: int) -> list[str]:
         members: list[str] = await self._redis.eval(

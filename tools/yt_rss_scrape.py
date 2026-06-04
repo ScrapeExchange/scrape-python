@@ -89,6 +89,7 @@ from scrape_exchange.youtube.youtube_client import (
 from scrape_exchange.youtube.youtube_video import YouTubeVideo
 
 from scrape_exchange.worker_id import get_worker_id
+from scrape_exchange.watchdog import Watchdog
 from scrape_exchange.youtube.settings import YouTubeScraperSettings
 from scrape_exchange.creator_map import (
     CreatorMap,
@@ -109,6 +110,7 @@ from scrape_exchange.creator_queue import (
     TierConfig,
     parse_priority_queues,
 )
+from scrape_exchange.redis_client import redis_from_url
 from scrape_exchange.video_scrape_queue import (
     RedisVideoScrapeQueue,
     VideoScrapeQueueSettings,
@@ -564,6 +566,21 @@ class RssSettings(YouTubeScraperSettings):
             'independent.'
         ),
     )
+    rss_exchange_existence_concurrency: int = Field(
+        default=64,
+        validation_alias=AliasChoices(
+            'RSS_EXCHANGE_EXISTENCE_CONCURRENCY',
+            'rss_exchange_existence_concurrency',
+        ),
+        description=(
+            'Maximum concurrent scrape.exchange video-existence '
+            'GETs per RSS worker process. Waits above this limit '
+            'happen before ExchangeClient.get(), so connection-pool '
+            'backpressure is reflected in '
+            'rss_phase_duration_seconds{phase="check_existence"} '
+            'instead of exchange_api_request_duration_seconds.'
+        ),
+    )
     rss_num_processes: int = Field(
         default=1,
         validation_alias=AliasChoices(
@@ -615,6 +632,35 @@ class RssSettings(YouTubeScraperSettings):
     @classmethod
     def _normalize_rss_log_level(cls, v: str) -> str:
         return normalize_log_level(v)
+
+
+_EXCHANGE_EXISTENCE_SEMAPHORES: dict[
+    tuple[int, int], asyncio.Semaphore
+] = {}
+
+
+def _get_exchange_existence_semaphore(
+    settings: RssSettings,
+) -> asyncio.Semaphore:
+    '''Return the per-event-loop gate for exchange existence GETs.'''
+
+    raw_limit: object = getattr(
+        settings, 'rss_exchange_existence_concurrency', 64,
+    )
+    try:
+        limit: int = int(raw_limit)
+    except (TypeError, ValueError):
+        limit = 64
+    limit = max(1, limit)
+    loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+    key: tuple[int, int] = (id(loop), limit)
+    gate: asyncio.Semaphore | None = (
+        _EXCHANGE_EXISTENCE_SEMAPHORES.get(key)
+    )
+    if gate is None:
+        gate = asyncio.Semaphore(limit)
+        _EXCHANGE_EXISTENCE_SEMAPHORES[key] = gate
+    return gate
 
 
 # Re-export under the old private name so existing references in this
@@ -951,7 +997,8 @@ async def fetch_rss(
 
 
 async def check_video_exists(
-    client: ExchangeClient, settings: RssSettings, video_id: str
+    client: ExchangeClient, settings: RssSettings, video_id: str,
+    gate: asyncio.Semaphore | None = None,
 ) -> bool:
     '''
     Checks whether a video is already stored in Scrape Exchange.
@@ -967,7 +1014,11 @@ async def check_video_exists(
         f'{settings.exchange_url}{ExchangeClient.POST_DATA_API}'
         f'/content/youtube/video/{video_id}'
     )
-    response: Response = await client.get(url)
+    if gate is None:
+        response: Response = await client.get(url)
+    else:
+        async with gate:
+            response = await client.get(url)
 
     if response.status_code == 200:
         return True
@@ -1396,11 +1447,15 @@ async def process_channel(
     # candidates the slowest exchange API call dominates, which
     # is the right thing to measure for capacity planning.
     exist_started: float = monotonic()
+    existence_gate: asyncio.Semaphore = (
+        _get_exchange_existence_semaphore(settings)
+    )
     exist_results: list[bool | Exception] = (
         await asyncio.gather(
             *[
                 check_video_exists(
                     client, settings, v.video_id,
+                    gate=existence_gate,
                 )
                 for v in candidates
             ],
@@ -1531,14 +1586,19 @@ async def _write_channel(
 ) -> None:
     '''Persist the RSS-derived channel-stat record under
     ``settings.channel_data_directory`` as
-    ``channel-rss-<handle>.json.br``. The
+    ``channel-rss-<channel_id>.json.br``. The
     ``tools/yt_channel_upload.py`` picks these files up
     alongside the standard ``channel-`` records and POSTs
     each to scrape.exchange.
 
+    The file is keyed on ``channel_id``; a record with no
+    ``channel_id`` cannot be named on disk, so it is skipped
+    (no write), a warning is logged, and the
+    ``reason="no_channel_id"`` failure metric is bumped.
+
     The file is written via ``atomic_write_bytes`` so the
     consumer never sees a torn file. Concurrent writers
-    for the same handle are last-writer-wins; both
+    for the same channel_id are last-writer-wins; both
     records carry the same RSS-derived stats so the lost
     write is functionally identical.
 
@@ -1550,16 +1610,55 @@ async def _write_channel(
         wrong (disk full, permission, missing mount).
     '''
     base_dir: str = settings.channel_data_directory
-    handle: str = record_dict['channel_handle']
+    channel_id: str = record_dict.get('channel_id') or ''
+    if not channel_id:
+        METRIC_RSS_FAILURES.labels(
+            platform='youtube',
+            scraper='rss_scraper',
+            entity='channel',
+            api='rss',
+            reason='no_channel_id',
+            worker_id=get_worker_id(),
+            proxy_ip='none',
+            proxy_file='none',
+        ).inc()
+        logging.warning(
+            'RSS channel record has no channel_id; skipping write',
+            extra={
+                'channel_handle': record_dict.get('channel_handle'),
+            },
+        )
+        return
     target: Path = (
         Path(base_dir)
-        / f'channel-rss-{handle}.json.br'
+        / f'channel-rss-{channel_id}.json.br'
     )
     await brotli_write_async(target, record_dict)
 
 
+def _resolve_creator_handle(
+    canonical: str | None,
+    channel_handle: str | None,
+    channel_id: str,
+) -> str | None:
+    '''Decide the handle to persist in creator_map.
+
+    Order: the canonical handle from the browse response wins; else a
+    deterministic fallback derived from a *real* input handle; else
+    ``None`` (nothing to write). A ``channel_handle`` equal to the
+    ``channel_id`` is the queue's id-only seed label, not a real handle,
+    so it is treated as absent — never written, never passed to
+    ``fallback_handle``.
+    '''
+    if canonical:
+        return canonical
+    if channel_handle and channel_handle != channel_id:
+        return fallback_handle(channel_handle)
+    return None
+
+
 async def update_channel(
-    channel_handle: str,
+    channel_handle: str | None,
     channel_id: str,
     creator_map_backend: CreatorMap,
     name_map_backend: NameMap,
@@ -1621,42 +1720,50 @@ async def update_channel(
     ).inc()
 
     canonical: str | None = canonical_handle_from_browse(channel_data)
-    resolved_handle: str
+    resolved_handle: str | None = _resolve_creator_handle(
+        canonical, channel_handle, channel_id,
+    )
+    # A real input handle (not the id-only seed label).
+    real_input: str | None = (
+        channel_handle
+        if channel_handle and channel_handle != channel_id
+        else None
+    )
     if canonical:
-        resolved_handle = canonical
         CREATOR_MAP_RESOLUTION_TOTAL.labels(
             platform='youtube',
             scraper='rss_scraper',
             outcome='canonical',
         ).inc()
-    else:
-        resolved_handle = fallback_handle(channel_handle)
+    elif resolved_handle is not None:
         CREATOR_MAP_RESOLUTION_TOTAL.labels(
             platform='youtube',
             scraper='rss_scraper',
             outcome='fallback',
         ).inc()
 
-    if channel_handle != resolved_handle:
-        CREATOR_HANDLE_MISMATCH_TOTAL.labels(
-            platform='youtube', scraper='rss_scraper',
-        ).inc()
-        logging.info(
-            'RSS update_channel: canonicalising handle',
-            extra={
-                'channel_id': channel_id,
-                'input_name': channel_handle,
-                'canonical_handle': resolved_handle,
-            },
-        )
-
-    await creator_map_backend.put(channel_id, resolved_handle)
+    if resolved_handle is not None:
+        if real_input and real_input != resolved_handle:
+            CREATOR_HANDLE_MISMATCH_TOTAL.labels(
+                platform='youtube', scraper='rss_scraper',
+            ).inc()
+            logging.info(
+                'RSS update_channel: canonicalising handle',
+                extra={
+                    'channel_id': channel_id,
+                    'input_name': real_input,
+                    'canonical_handle': resolved_handle,
+                },
+            )
+        await creator_map_backend.put(channel_id, resolved_handle)
 
     metadata: dict = channel_data.get(
         'metadata', {}
     ).get('channelMetadataRenderer', {})
 
-    title: str = metadata.get('title', channel_handle)
+    # Title for name_map: prefer the scraped title, else a real input
+    # handle — never the id-only seed label.
+    title: str | None = metadata.get('title') or real_input
     if title:
         await name_map_backend.put(
             asset_title=title, asset_id=channel_id,
@@ -2105,12 +2212,15 @@ async def _seed_queue_from_uploaded_channels(
 
         cid: str | None = data.get('channel_id')
         handle: str | None = data.get('channel_handle')
-        if not cid or not handle:
+        if not cid:
             continue
         if cid in known:
             continue
 
-        creators[cid] = handle
+        # The handle is a display label only; RSS fetches by channel_id.
+        # Fall back to the (unique) channel_id so populate's name-dedup
+        # does not collapse every handle-less channel into one entry.
+        creators[cid] = handle or cid
         sub_count: int | None = data.get('subscriber_count')
         if isinstance(sub_count, int) and sub_count > 0:
             subscriber_counts[cid] = sub_count
@@ -2207,6 +2317,10 @@ async def _stream_processor(
     '''
     worker_id: str = get_worker_id()
     while True:
+        # Top-of-loop progress signal: ticks on busy and empty-claim
+        # iterations alike, so a wedged streamer is detectable while a
+        # genuinely idle queue keeps the watchdog fresh.
+        Watchdog.get().touch_work()
         try:
             t0: float = monotonic()
             batch: list[tuple[str, str, float]] = (
@@ -2334,6 +2448,17 @@ async def worker_loop(
     added: int = await creator_queue.populate(
         channel_map_data, channel_fm, tiers, subscriber_counts,
     )
+    # Capture the cardinality for the gauge + startup log line
+    # before releasing the dict itself. ``channel_map_data`` and
+    # ``known_ids`` are populate-time inputs; the streamers that
+    # run for the lifetime of the process do their own per-
+    # channel lookups against ``creator_map_backend``, so holding
+    # the full ~500k-entry dict + set in this frame is dead
+    # weight that adds hundreds of MB of RSS per worker.
+    channel_map_size: int = len(channel_map_data)
+    del channel_map_data
+    del known_ids
+    del subscriber_counts
     # Pull in any channels that exist as uploaded files on disk but
     # are missing from the creator_map (e.g. after a fleet rebuild
     # or DB wipe where the local archive is the source of truth).
@@ -2393,7 +2518,7 @@ async def worker_loop(
         platform='youtube',
         scraper='rss_scraper',
         worker_id=get_worker_id(),
-    ).set(len(channel_map_data))
+    ).set(channel_map_size)
     # Initial publish so the gauge is non-zero before the
     # first metric-loop tick; the loop takes over after that.
     if get_worker_id() == '1':
@@ -2415,7 +2540,7 @@ async def worker_loop(
             'retry_interval': settings.retry_interval,
             'rss_concurrency': settings.rss_concurrency,
             'effective_concurrency': effective_concurrency,
-            'discovered_channels': len(channel_map_data),
+            'discovered_channels': channel_map_size,
         },
     )
 
@@ -2528,8 +2653,10 @@ async def _run_worker(
             'into the Redis-backed video scrape queue and has '
             'no filesystem fallback. Set REDIS_DSN in .env.',
         )
-    video_queue_redis: aioredis.Redis = aioredis.from_url(
-        settings.redis_dsn, decode_responses=True,
+    video_queue_redis: aioredis.Redis = redis_from_url(
+        settings.redis_dsn,
+        component='youtube-rss-video-queue',
+        decode_responses=True,
     )
     video_queue: RedisVideoScrapeQueue = (
         RedisVideoScrapeQueue(

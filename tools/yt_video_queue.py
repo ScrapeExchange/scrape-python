@@ -12,6 +12,7 @@ import asyncio
 import os
 import re
 import sys
+from pathlib import Path
 from typing import Awaitable, Callable
 
 import redis.asyncio as aioredis
@@ -21,6 +22,7 @@ from pydantic_settings import (
     SettingsConfigDict,
 )
 
+from scrape_exchange.redis_client import redis_from_url
 from scrape_exchange.video_scrape_queue import (
     RedisVideoScrapeQueue,
     VideoScrapeQueueSettings,
@@ -65,7 +67,11 @@ def _build_parser() -> argparse.ArgumentParser:
     c_show.add_argument('video_id')
 
     c_add = sub.add_parser('add')
-    c_add.add_argument('video_ids', nargs='+')
+    c_add.add_argument('video_ids', nargs='*')
+    c_add.add_argument(
+        '--file', metavar='FILE',
+        help='file with one video_id per line',
+    )
     c_add.add_argument('--source', default='cli')
 
     c_remove = sub.add_parser('remove')
@@ -167,12 +173,86 @@ async def cmd_show(
     return 0
 
 
+def _parse_video_ids(text: str) -> list[str]:
+    '''Return valid video_ids from newline-delimited text.
+
+    Blank lines and lines starting with '#' are skipped.
+    Lines that don't match the video_id pattern are warned
+    to stderr and skipped.
+    '''
+    ids: list[str] = []
+    for raw in text.splitlines():
+        vid: str = raw.strip()
+        if not vid or vid.startswith('#'):
+            continue
+        if not _VIDEO_ID_RE.match(vid):
+            sys.stderr.write(
+                f'skipping invalid video_id: {vid!r}\n',
+            )
+            continue
+        ids.append(vid)
+    return ids
+
+
+async def _enqueue_video_ids(
+    queue: RedisVideoScrapeQueue,
+    video_ids: list[str],
+    *,
+    source: str,
+) -> tuple[int, int, int]:
+    processed: int = 0
+    added: int = 0
+    duplicates: int = 0
+    for vid in video_ids:
+        processed += 1
+        if await queue.enqueue(vid, source=source):
+            added += 1
+        else:
+            duplicates += 1
+    return processed, duplicates, added
+
+
+def _write_enqueue_status(
+    *,
+    label: str,
+    processed: int,
+    duplicates: int,
+    added: int,
+) -> None:
+    sys.stdout.write(
+        f'{label}: processed={processed} '
+        f'duplicates={duplicates} added={added}\n',
+    )
+
+
 async def cmd_add(
     ns: argparse.Namespace,
     queue: RedisVideoScrapeQueue,
 ) -> int:
-    for vid in ns.video_ids:
-        await queue.enqueue(vid, source=ns.source)
+    video_ids: list[str] = list(ns.video_ids)
+    if getattr(ns, 'file', None):
+        text: str = await asyncio.to_thread(
+            Path(ns.file).read_text,
+        )
+        video_ids.extend(_parse_video_ids(text))
+    if not sys.stdin.isatty():
+        text = await asyncio.to_thread(sys.stdin.read)
+        video_ids.extend(_parse_video_ids(text))
+    if not video_ids:
+        sys.stderr.write('no video_ids provided\n')
+        return 2
+    processed: int
+    duplicates: int
+    added: int
+    processed, duplicates, added = await _enqueue_video_ids(
+        queue, video_ids, source=ns.source,
+    )
+    _write_enqueue_status(
+        label='add',
+        processed=processed,
+        duplicates=duplicates,
+        added=added,
+    )
     return 0
 
 
@@ -290,7 +370,9 @@ async def cmd_import(
     ns: argparse.Namespace,
     queue: RedisVideoScrapeQueue,
 ) -> int:
-    imported: int = 0
+    processed: int = 0
+    duplicates: int = 0
+    added: int = 0
     for entry in os.listdir(ns.directory):
         path: str = os.path.join(
             ns.directory, entry,
@@ -299,13 +381,17 @@ async def cmd_import(
             continue
         if not _VIDEO_ID_RE.match(entry):
             continue
-        await queue.enqueue(
-            entry, source='migration',
-        )
+        processed += 1
+        if await queue.enqueue(entry, source='migration'):
+            added += 1
+        else:
+            duplicates += 1
         os.unlink(path)
-        imported += 1
-    sys.stdout.write(
-        f'imported: {imported}\n',
+    _write_enqueue_status(
+        label='import',
+        processed=processed,
+        duplicates=duplicates,
+        added=added,
     )
     return 0
 
@@ -337,9 +423,11 @@ async def main_async(argv: list[str]) -> int:
     settings: YtVideoQueueSettings = (
         YtVideoQueueSettings()
     )
-    redis: aioredis.Redis = aioredis.from_url(
+    redis: aioredis.Redis = redis_from_url(
         settings.redis_dsn,
+        component='yt-video-queue-cli',
         decode_responses=True,
+        max_connections=1,
     )
     queue: RedisVideoScrapeQueue = (
         RedisVideoScrapeQueue(

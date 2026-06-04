@@ -36,8 +36,10 @@ from scrape_exchange.content_claim import (
     RedisContentClaim,
 )
 from scrape_exchange.proxy_loader import proxy_file_label
+from scrape_exchange.redis_client import redis_from_url
 from scrape_exchange.util import extract_proxy_ip, proxy_network_for
 from scrape_exchange.worker_id import get_worker_id
+from scrape_exchange.watchdog import Watchdog
 from scrape_exchange.settings import normalize_log_level
 from scrape_exchange.scraper_runner import (
     ScraperRunContext,
@@ -429,6 +431,9 @@ async def _queue_driven_loop(
                 settings.video_queue_batch,
             )
             if not ids:
+                # Empty queue is "alive but idle", not a hang: keep the
+                # watchdog work signal fresh while we poll.
+                Watchdog.get().touch_work()
                 await asyncio.sleep(
                     settings.video_queue_idle_poll_seconds,
                 )
@@ -442,6 +447,7 @@ async def _queue_driven_loop(
     async def consumer() -> None:
         while True:
             vid: str = await inflight.get()
+            Watchdog.get().touch_work()
             try:
                 await _scrape_one_queued(
                     vid,
@@ -542,6 +548,7 @@ VIDEO_STATE_SIZE: Gauge = Gauge(
     'video_state_size',
     'Number of videos currently in each workflow state.',
     ['state'],
+    multiprocess_mode='mostrecent',
 )
 VIDEO_QUEUE_OUTCOMES: Counter = Counter(
     'video_queue_outcomes_total',
@@ -836,8 +843,10 @@ async def _run_worker(
     # so settings and lifetime are owned by _run_worker.
     video_queue: RedisVideoScrapeQueue | None = None
     if settings.redis_dsn:
-        video_queue_redis: aioredis.Redis = aioredis.from_url(
-            settings.redis_dsn, decode_responses=True,
+        video_queue_redis: aioredis.Redis = redis_from_url(
+            settings.redis_dsn,
+            component='youtube-video-queue',
+            decode_responses=True,
         )
         video_queue_settings: VideoScrapeQueueSettings = (
             VideoScrapeQueueSettings(

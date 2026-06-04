@@ -8,10 +8,6 @@ and recursively scrapes every new channel it finds. Persists discovered
 channels (with subscriber counts) and failed scrapes to append-only
 JSONL files so a crashed run can be resumed.
 
-Depends on scrape_exchange.youtube.youtube_client.AsyncYouTubeClient from
-the sibling repo ../scrape-python. Either `pip install -e ../scrape-python`
-or put that repo on PYTHONPATH before running this tool.
-
 :maintainer : Steven Hessing <steven@byoda.org>
 :copyright  : Copyright 2026
 :license    : GPLv3
@@ -407,7 +403,69 @@ class DiscoveredChannel:
         )
 
 
-def load_known_channels(filepath: str) -> set[str]:
+async def load_known_channels(
+    settings: 'DiscoverSettings',
+    creator_map: 'CreatorMap',
+) -> set[str]:
+    '''Return the set of already-known channel handles.
+
+    When ``REDIS_DSN`` is set, walk ``creator_map`` (the
+    shared ``youtube:creator_map`` hash) and return the
+    set of its handle values, normalised the same way
+    the file path does. The file is not consulted in
+    this mode — Redis is authoritative.
+
+    When ``REDIS_DSN`` is unset, fall back to reading
+    ``settings.channel_list`` (the legacy file path).
+    '''
+    if settings.redis_dsn:
+        pairs: dict[str, str] = await creator_map.get_all()
+        known: set[str] = {
+            _normalise_known_handle(handle)
+            for handle in pairs.values()
+            if handle
+        }
+        # _normalise_known_handle may return '' for
+        # malformed entries — drop those.
+        known.discard('')
+        _LOGGER.info(
+            'Loaded known channels from Redis creator_map',
+            extra={
+                'count': len(known),
+                'redis_dsn': settings.redis_dsn,
+            },
+        )
+        return known
+    return _load_known_channels_from_file(
+        settings.channel_list,
+    )
+
+
+def _normalise_known_handle(handle: str) -> str:
+    '''Normalise a single channel handle to the lowercase
+    form ``load_known_channels`` produces.
+
+    Strips a leading ``@`` and the YouTube URL prefix
+    when either is present, then lowercases. Returns
+    ``''`` for handles that still contain ``@`` after
+    stripping (the file loader treats those as
+    malformed too).
+    '''
+    url_prefix: str = 'https://www.youtube.com/'
+    h: str = handle.strip().lstrip('@')
+    if h.startswith(url_prefix):
+        h = h[len(url_prefix):]
+    h = h.lstrip('@').strip()
+    if '@' in h:
+        _LOGGER.warning(
+            'Channel has @ mid-string, skipping',
+            extra={'channel': h},
+        )
+        return ''
+    return h.lower()
+
+
+def _load_known_channels_from_file(filepath: str) -> set[str]:
     '''
     Read the known-channels list and return a set of normalized handles.
 
@@ -1263,8 +1321,19 @@ async def main() -> None:
         log_format=settings.log_format,
     )
 
-    known_channels: set[str] = load_known_channels(
-        settings.channel_list,
+    # Build the creator_map first so we can read known
+    # channels from Redis (when REDIS_DSN is set) without
+    # opening a second connection.
+    creator_map: CreatorMap = await build_creator_map(
+        settings,
+    )
+    identity_store: ChannelIdentityStore | None = (
+        build_identity_store(settings, creator_map)
+    )
+    name_map: NameMap = build_name_map(settings)
+
+    known_channels: set[str] = await load_known_channels(
+        settings, creator_map,
     )
     discovered: dict[str, int | None]
     fully_scraped: set[str]
@@ -1282,14 +1351,6 @@ async def main() -> None:
             'failed': len(failed),
         },
     )
-
-    creator_map: CreatorMap = await build_creator_map(
-        settings,
-    )
-    identity_store: ChannelIdentityStore | None = (
-        build_identity_store(settings, creator_map)
-    )
-    name_map: NameMap = build_name_map(settings)
 
     creator_handles: set[str] = set()
     if settings.skip_known_creators:

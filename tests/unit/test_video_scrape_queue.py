@@ -122,9 +122,10 @@ class TestEnqueue(_RedisQueueTestBase):
         # so capture the lower bound as an integer to
         # avoid sub-second comparison failures.
         before: int = int(time.time())
-        await self.queue.enqueue(
+        added: bool = await self.queue.enqueue(
             'dQw4w9WgXcQ', source='rss',
         )
+        self.assertTrue(added)
         score: float | None = await self.redis.zscore(
             'youtube:video:queue', 'dQw4w9WgXcQ',
         )
@@ -133,12 +134,14 @@ class TestEnqueue(_RedisQueueTestBase):
         self.assertGreaterEqual(score, before)
 
     async def test_idempotent(self) -> None:
-        await self.queue.enqueue(
+        added_first: bool = await self.queue.enqueue(
             'dQw4w9WgXcQ', source='rss',
         )
-        await self.queue.enqueue(
+        added_second: bool = await self.queue.enqueue(
             'dQw4w9WgXcQ', source='cli',
         )
+        self.assertTrue(added_first)
+        self.assertFalse(added_second)
         size: int = await self.redis.zcard(
             'youtube:video:queue',
         )
@@ -168,9 +171,10 @@ class TestEnqueue(_RedisQueueTestBase):
                 'source': 'rss', 'state': 'failed',
             },
         )
-        await self.queue.enqueue(
+        added: bool = await self.queue.enqueue(
             'dQw4w9WgXcQ', source='rss',
         )
+        self.assertFalse(added)
         state: str | None = await self.redis.hget(
             'youtube:video:meta:dQw4w9WgXcQ', 'state',
         )
@@ -198,9 +202,10 @@ class TestEnqueue(_RedisQueueTestBase):
             state=VideoState.FAILED,
         )
         # Producer tries again.
-        await self.queue.enqueue(
+        added: bool = await self.queue.enqueue(
             'dQw4w9WgXcQ', source='rss',
         )
+        self.assertFalse(added)
         # Must NOT be in the queue.
         score: float | None = await self.redis.zscore(
             'youtube:video:queue', 'dQw4w9WgXcQ',

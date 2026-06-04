@@ -63,6 +63,14 @@ class TestChannelScrapeQueueSettings(unittest.TestCase):
         )
         self.assertEqual(s.channel_resolve_max_attempts, 5)
 
+    def test_default_not_found_terminal_threshold(self) -> None:
+        s: ChannelScrapeQueueSettings = (
+            ChannelScrapeQueueSettings()
+        )
+        self.assertEqual(
+            s.channel_not_found_terminal_threshold, 3,
+        )
+
 
 class _RedisQueueTestBase(
     unittest.IsolatedAsyncioTestCase,
@@ -791,6 +799,57 @@ class TestMark(_RedisQueueTestBase):
         )
         self.assertEqual(state, 'not_found')
 
+    async def test_not_found_requires_confirmations(
+        self,
+    ) -> None:
+        await self.queue.enqueue_scheduled(
+            'UCa', source='cli',
+        )
+        terminal: bool = (
+            await self.queue.mark_not_found_confirmed(
+                'i:UCa',
+                last_error='HTTP 404',
+            )
+        )
+        self.assertFalse(terminal)
+        score: float | None = await self.redis.zscore(
+            'youtube:channel:queue:scheduled:0',
+            'i:UCa',
+        )
+        self.assertIsNotNone(score)
+        record: str | None = await self.redis.hget(
+            'youtube:channel:not_found', 'i:UCa',
+        )
+        self.assertIsNone(record)
+        attempts: str | None = await self.redis.hget(
+            'youtube:channel:meta:i:UCa',
+            'not_found_attempts',
+        )
+        self.assertEqual(attempts, '1')
+
+    async def test_third_not_found_marks_terminal(
+        self,
+    ) -> None:
+        await self.queue.enqueue_scheduled(
+            'UCa', source='cli',
+        )
+        await self.queue.mark_not_found_confirmed(
+            'i:UCa', last_error='HTTP 404',
+        )
+        await self.queue.mark_not_found_confirmed(
+            'i:UCa', last_error='HTTP 404',
+        )
+        terminal: bool = (
+            await self.queue.mark_not_found_confirmed(
+                'i:UCa', last_error='HTTP 404',
+            )
+        )
+        self.assertTrue(terminal)
+        record: str | None = await self.redis.hget(
+            'youtube:channel:not_found', 'i:UCa',
+        )
+        self.assertIsNotNone(record)
+
     async def test_moves_unresolved_to_invalid(
         self,
     ) -> None:
@@ -1027,11 +1086,202 @@ class TestUnmark(_RedisQueueTestBase):
         )
         self.assertEqual(in_t2, 0.0)
 
+    async def test_unmark_with_score_overrides_due_now(
+        self,
+    ) -> None:
+        await self.queue.enqueue_scheduled(
+            'UCa', source='cli',
+        )
+        await self.queue.mark(
+            'i:UCa',
+            state=ChannelState.UNRESOLVED,
+        )
+        await self.queue.unmark('i:UCa', score=12345.0)
+        score: float | None = await self.redis.zscore(
+            'youtube:channel:queue:scheduled:0',
+            'i:UCa',
+        )
+        self.assertEqual(score, 12345.0)
+
     async def test_unmark_invalid_prefix_raises(
         self,
     ) -> None:
         with self.assertRaises(ValueError):
             await self.queue.unmark('bad_prefix')
+
+
+class TestForceRescrape(_RedisQueueTestBase):
+
+    async def test_scheduled_writes_force_metadata(
+        self,
+    ) -> None:
+        await self.queue.enqueue_scheduled(
+            'UCa', source='cli',
+        )
+        await self.redis.hset(
+            'youtube:channel:meta:i:UCa',
+            mapping={
+                'unavailable_attempts': '2',
+                'resolve_attempts': '1',
+                'not_found_attempts': '1',
+            },
+        )
+        await self.queue.force_rescrape(
+            'i:UCa',
+            mode='full',
+            source='cli',
+            now=123.0,
+        )
+        score: float | None = await self.redis.zscore(
+            'youtube:channel:queue:scheduled:0',
+            'i:UCa',
+        )
+        self.assertEqual(score, 0.0)
+        meta: dict[str, str] = await self.redis.hgetall(
+            'youtube:channel:meta:i:UCa',
+        )
+        self.assertEqual(meta.get('state'), 'scheduled')
+        self.assertEqual(
+            meta.get('force_rescrape_mode'), 'full',
+        )
+        self.assertEqual(meta.get('force_source'), 'cli')
+        self.assertEqual(meta.get('force_requested_at'), '123')
+        self.assertNotIn('unavailable_attempts', meta)
+        self.assertNotIn('resolve_attempts', meta)
+        self.assertNotIn('not_found_attempts', meta)
+
+    async def test_default_mode_clears_force_metadata(
+        self,
+    ) -> None:
+        await self.queue.enqueue_scheduled(
+            'UCa', source='cli',
+        )
+        await self.redis.hset(
+            'youtube:channel:meta:i:UCa',
+            mapping={
+                'force_rescrape_mode': 'full',
+                'force_requested_at': '1',
+                'force_source': 'cli',
+            },
+        )
+        await self.queue.force_rescrape(
+            'i:UCa',
+            mode='default',
+            now=456.0,
+        )
+        meta: dict[str, str] = await self.redis.hgetall(
+            'youtube:channel:meta:i:UCa',
+        )
+        self.assertNotIn('force_rescrape_mode', meta)
+        self.assertNotIn('force_requested_at', meta)
+        self.assertNotIn('force_source', meta)
+        score: float | None = await self.redis.zscore(
+            'youtube:channel:queue:scheduled:0',
+            'i:UCa',
+        )
+        self.assertEqual(score, 0.0)
+
+    async def test_terminal_channel_restored_to_scheduled(
+        self,
+    ) -> None:
+        await self.queue.enqueue_scheduled(
+            'UCa', source='cli',
+        )
+        await self.queue.mark(
+            'i:UCa',
+            state=ChannelState.NOT_FOUND,
+        )
+        await self.queue.force_rescrape(
+            'i:UCa',
+            mode='metadata',
+            now=789.0,
+        )
+        terminal_record: str | None = await self.redis.hget(
+            'youtube:channel:not_found', 'i:UCa',
+        )
+        self.assertIsNone(terminal_record)
+        score: float | None = await self.redis.zscore(
+            'youtube:channel:queue:scheduled:0',
+            'i:UCa',
+        )
+        self.assertEqual(score, 0.0)
+        meta: dict[str, str] = await self.redis.hgetall(
+            'youtube:channel:meta:i:UCa',
+        )
+        self.assertEqual(meta.get('state'), 'scheduled')
+        self.assertEqual(
+            meta.get('force_rescrape_mode'), 'metadata',
+        )
+
+    async def test_handle_restored_to_unresolved(
+        self,
+    ) -> None:
+        await self.queue.enqueue_unresolved(
+            'foo', source='cli',
+        )
+        await self.queue.mark(
+            'h:foo',
+            state=ChannelState.INVALID_HANDLE,
+        )
+        await self.queue.force_rescrape(
+            'h:foo',
+            mode='full',
+            now=999.0,
+        )
+        score: float | None = await self.redis.zscore(
+            'youtube:channel:queue:unresolved',
+            'h:foo',
+        )
+        self.assertEqual(score, 0.0)
+        meta: dict[str, str] = await self.redis.hgetall(
+            'youtube:channel:meta:h:foo',
+        )
+        self.assertEqual(
+            meta.get('state'), 'pending_resolution',
+        )
+        self.assertEqual(
+            meta.get('force_rescrape_mode'), 'full',
+        )
+
+    async def test_clear_force_rescrape(
+        self,
+    ) -> None:
+        await self.queue.enqueue_scheduled(
+            'UCa', source='cli',
+        )
+        await self.redis.hset(
+            'youtube:channel:meta:i:UCa',
+            mapping={
+                'force_rescrape_mode': 'full',
+                'force_requested_at': '1',
+                'force_source': 'cli',
+            },
+        )
+        await self.queue.clear_force_rescrape('i:UCa')
+        meta: dict[str, str] = await self.redis.hgetall(
+            'youtube:channel:meta:i:UCa',
+        )
+        self.assertNotIn('force_rescrape_mode', meta)
+        self.assertNotIn('force_requested_at', meta)
+        self.assertNotIn('force_source', meta)
+
+    async def test_invalid_force_mode_raises(
+        self,
+    ) -> None:
+        with self.assertRaises(ValueError):
+            await self.queue.force_rescrape(
+                'i:UCa',
+                mode='bogus',
+            )
+
+    async def test_invalid_member_prefix_raises(
+        self,
+    ) -> None:
+        with self.assertRaises(ValueError):
+            await self.queue.force_rescrape(
+                'bad_prefix',
+                mode='full',
+            )
 
 
 class TestReapSoftUnavailable(_RedisQueueTestBase):

@@ -302,6 +302,26 @@ class TestYouTubeChannelInit(unittest.TestCase):
         self.assertIsNone(ch.url)
         self.assertIsNone(ch.title)
 
+    def test_init_prefers_channel_id_url_when_both_given(self) -> None:
+        # channel_id is preferred for the scrape URL (stable, no UTF-8),
+        # but the handle is still retained as metadata.
+        ch = YouTubeChannel(
+            channel_handle='HistoryMatters',
+            channel_id='UCaaaaaaaaaaaaaaaaaaaaaa',
+        )
+        self.assertIn('/channel/UCaaaaaaaaaaaaaaaaaaaaaa', ch.url)
+        self.assertNotIn('@HistoryMatters', ch.url)
+        self.assertEqual(ch.channel_handle, 'HistoryMatters')
+
+    def test_init_id_only_uses_channel_url(self) -> None:
+        ch = YouTubeChannel(channel_id='UCbbbbbbbbbbbbbbbbbbbbbb')
+        self.assertIn('/channel/UCbbbbbbbbbbbbbbbbbbbbbb', ch.url)
+        self.assertIsNone(ch.channel_handle)
+
+    def test_init_handle_only_uses_at_url(self) -> None:
+        ch = YouTubeChannel(channel_handle='HistoryMatters')
+        self.assertIn('@HistoryMatters', ch.url)
+
 
 class TestYouTubeChannelEquality(unittest.TestCase):
     def test_equal_channels(self) -> None:
@@ -319,6 +339,148 @@ class TestYouTubeChannelEquality(unittest.TestCase):
     def test_not_equal_different_type(self) -> None:
         ch = YouTubeChannel(channel_handle='X')
         self.assertNotEqual(ch, 'not_a_channel')
+
+
+# ---------------------------------------------------------------------------
+# Channel-id shape validation and normalisation
+# ---------------------------------------------------------------------------
+
+# A realistic mixed-case channel_id: prefix uppercase, body mixed-case
+# base64url. Real YouTube IDs use the full case-sensitive alphabet.
+_CANONICAL_ID: str = 'UC1ToEoUPkjz1qcLGX-u8YFA'
+
+
+class TestIsChannelIdStrict(unittest.TestCase):
+    '''``is_channel_id`` must reject lowercase ``uc`` prefixes.
+
+    The pre-fix regex used ``re.IGNORECASE`` and so accepted
+    ``'uc...'`` strings. Downstream consumers
+    (``ChannelIdentityStore.bind``, ``promote_to_scheduled``,
+    YouTube's own APIs) require the canonical ``UC`` prefix, so
+    lowercase forms must fail validation here and be routed
+    through ``normalise_channel_id`` instead.
+    '''
+
+    def test_accepts_canonical_uppercase_prefix(self) -> None:
+        self.assertTrue(YouTubeChannel.is_channel_id(_CANONICAL_ID))
+
+    def test_accepts_mixed_case_body(self) -> None:
+        # Body chars are case-sensitive base64url; both cases occur
+        # in real IDs.
+        self.assertTrue(
+            YouTubeChannel.is_channel_id('UCabcdefghijklmnopqrstuv')
+        )
+        self.assertTrue(
+            YouTubeChannel.is_channel_id('UCABCDEFGHIJKLMNOPQRSTUV')
+        )
+
+    def test_rejects_lowercase_uc_prefix(self) -> None:
+        self.assertFalse(
+            YouTubeChannel.is_channel_id(
+                'uc1toeoupkjz1qclgx-u8yfa'
+            )
+        )
+
+    def test_rejects_mixed_case_prefix(self) -> None:
+        self.assertFalse(
+            YouTubeChannel.is_channel_id('Uc' + _CANONICAL_ID[2:])
+        )
+        self.assertFalse(
+            YouTubeChannel.is_channel_id('uC' + _CANONICAL_ID[2:])
+        )
+
+    def test_rejects_wrong_length(self) -> None:
+        self.assertFalse(YouTubeChannel.is_channel_id('UC123'))
+        self.assertFalse(
+            YouTubeChannel.is_channel_id(
+                _CANONICAL_ID + 'x'
+            )
+        )
+
+    def test_rejects_empty_and_none(self) -> None:
+        self.assertFalse(YouTubeChannel.is_channel_id(''))
+        self.assertFalse(YouTubeChannel.is_channel_id(None))
+
+
+class TestNormaliseChannelId(unittest.TestCase):
+    '''``normalise_channel_id`` recovers a canonical ID from a
+    lowercase ``uc`` prefix while leaving the body case-sensitive.
+
+    A 24-char input whose first two chars are ``uc``/``Uc``/``uC``
+    and whose remaining 22 chars are valid base64url returns the
+    same string with the first two chars uppercased to ``UC``.
+    Already-canonical input round-trips unchanged. Anything else
+    returns ``None``.
+    '''
+
+    def test_returns_canonical_unchanged(self) -> None:
+        self.assertEqual(
+            YouTubeChannel.normalise_channel_id(_CANONICAL_ID),
+            _CANONICAL_ID,
+        )
+
+    def test_uppercases_lowercase_prefix(self) -> None:
+        lowercased: str = 'uc' + _CANONICAL_ID[2:]
+        self.assertEqual(
+            YouTubeChannel.normalise_channel_id(lowercased),
+            'UC' + _CANONICAL_ID[2:],
+        )
+
+    def test_uppercases_mixed_case_prefix(self) -> None:
+        self.assertEqual(
+            YouTubeChannel.normalise_channel_id(
+                'Uc' + _CANONICAL_ID[2:]
+            ),
+            _CANONICAL_ID,
+        )
+        self.assertEqual(
+            YouTubeChannel.normalise_channel_id(
+                'uC' + _CANONICAL_ID[2:]
+            ),
+            _CANONICAL_ID,
+        )
+
+    def test_preserves_body_case(self) -> None:
+        # Lowercased prefix must NOT lowercase the body — bodies
+        # are case-sensitive base64url and case differences identify
+        # distinct channels.
+        result: str | None = YouTubeChannel.normalise_channel_id(
+            'uc1ToEoUPkjz1qcLGX-u8YFA',
+        )
+        self.assertEqual(result, 'UC1ToEoUPkjz1qcLGX-u8YFA')
+
+    def test_returns_none_for_empty(self) -> None:
+        self.assertIsNone(YouTubeChannel.normalise_channel_id(''))
+
+    def test_returns_none_for_none(self) -> None:
+        self.assertIsNone(YouTubeChannel.normalise_channel_id(None))
+
+    def test_returns_none_for_wrong_length(self) -> None:
+        self.assertIsNone(
+            YouTubeChannel.normalise_channel_id('uc123'),
+        )
+        self.assertIsNone(
+            YouTubeChannel.normalise_channel_id(
+                _CANONICAL_ID + 'x',
+            ),
+        )
+
+    def test_returns_none_for_non_uc_prefix(self) -> None:
+        # 24-char string that does not begin with 'uc' in any case.
+        self.assertIsNone(
+            YouTubeChannel.normalise_channel_id(
+                'AB' + _CANONICAL_ID[2:],
+            ),
+        )
+
+    def test_returns_none_for_invalid_body_chars(self) -> None:
+        # '!' is not in the base64url alphabet.
+        self.assertIsNone(
+            YouTubeChannel.normalise_channel_id(
+                'uc!' + _CANONICAL_ID[3:],
+            ),
+        )
+
 
 class TestYouTubeChannelToFromDict(unittest.TestCase):
     def test_to_dict_basic_fields(self) -> None:

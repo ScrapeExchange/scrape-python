@@ -20,9 +20,17 @@ from ._rss_circuit_state import (
     CircuitState,
     apply_outcome,
 )
+from scrape_exchange.redis_client import redis_from_url
+from scrape_exchange.watchdog import Watchdog
 
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
+
+# Cap on a single open-circuit sleep. A park can legitimately last up to
+# ``rss_circuit_max_open_seconds`` (default 7200s), which dwarfs the
+# watchdog work timeout. Sleeping in bounded chunks and touching the
+# watchdog each chunk keeps an intentional wait from looking like a hang.
+_CIRCUIT_WAIT_CHUNK_SECONDS: float = 30.0
 
 
 class _CircuitBackend(abc.ABC):
@@ -78,8 +86,14 @@ class _CircuitBackend(abc.ABC):
             total_sleep: float = wait + jitter
             if total_sleep <= 0:
                 return slept
-            await asyncio.sleep(total_sleep)
-            slept += total_sleep
+            # Sleep in bounded chunks so a long open-circuit park does
+            # not look like a hang: touch the watchdog after each chunk.
+            chunk: float = min(
+                total_sleep, _CIRCUIT_WAIT_CHUNK_SECONDS,
+            )
+            await asyncio.sleep(chunk)
+            slept += chunk
+            Watchdog.get().touch_work()
 
 
 class _InProcessCircuitBackend(_CircuitBackend):
@@ -418,9 +432,10 @@ class _RedisCircuitBackend(_CircuitBackend):
         wait_jitter_seconds: float = 30.0,
     ) -> None:
         super().__init__(params, wait_jitter_seconds)
-        import redis.asyncio as redis_async  # lazy import
-        self._client = redis_async.from_url(
-            redis_dsn, decode_responses=True,
+        self._client = redis_from_url(
+            redis_dsn,
+            component='youtube-rss-circuit-breaker',
+            decode_responses=True,
         )
         self._script_sha: str | None = None
 

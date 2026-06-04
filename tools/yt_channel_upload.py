@@ -11,27 +11,33 @@ to the uploaded sub-directory.
 '''
 
 import asyncio
+import contextlib
 import logging
 import os
 import resource
 import sys
 
 from pathlib import Path
+from typing import Callable
 
 import orjson
 import redis.asyncio as aioredis
 
 from scrape_exchange.brotli import brotli_read
 
-from prometheus_client import Gauge
 from pydantic import AliasChoices, Field, field_validator
 from watchfiles import Change, awatch
 
 from scrape_exchange.bulk_upload import (
     BulkBatchOutcome,
+    BulkResults,
+    apply_bulk_results,
+    delete_bulk_state,
+    fetch_bulk_results,
+    post_bulk_batch,
     reserve_bulk_upload_slot,
     resume_pending_bulk_uploads,
-    upload_bulk_batch,
+    stream_bulk_job_progress,
 )
 from scrape_exchange.creator_map import (
     CREATOR_MAP_RESOLUTION_TOTAL,
@@ -53,6 +59,7 @@ from scrape_exchange.schema_validator import SchemaValidator, fetch_schema_dict
 from scrape_exchange.scraper_runner import ScraperRunContext, ScraperRunner
 from scrape_exchange.settings import normalize_log_level
 from scrape_exchange.worker_id import get_worker_id
+from scrape_exchange.watchdog import Watchdog
 from scrape_exchange.youtube.exchange_channels_set import (
     RedisExchangeChannelsSet,
 )
@@ -66,6 +73,7 @@ from scrape_exchange.scraper_metrics import (
     METRIC_UPLOADS_FAILED as METRIC_CHANNELS_BULK_FAILED,
     METRIC_UPLOADS_MISSING_RESULT as METRIC_CHANNELS_BULK_MISSING_RESULT,
     METRIC_UPLOAD_BATCHES as METRIC_BULK_BATCHES,
+    METRIC_FILES_PENDING_UPLOAD,
 )
 from scrape_exchange.exchange_client import (
     METRIC_BACKGROUND_UPLOADS as METRIC_CHANNELS_BULK_UPLOADED,
@@ -75,14 +83,8 @@ from scrape_exchange.exchange_client import (
 CHANNEL_FILE_POSTFIX = '.json.br'
 CHANNEL_RSS_FILE_PREFIX = 'channel-rss-'
 SCRAPER_LABEL: str = 'channel_uploader'
+_WATCHDOG_TOUCH_INTERVAL: float = 30.0
 
-
-METRIC_FILES_PENDING_UPLOAD = Gauge(
-    'files_pending_upload',
-    'Number of channel files found that may need to be uploaded',
-    ['platform', 'scraper', 'entity', 'worker_id'],
-    multiprocess_mode='livemostrecent',
-)
 
 FAIL_MARK_INVALID: str = 'Failed to mark channel file invalid'
 
@@ -114,7 +116,6 @@ class ChannelUploadSettings(YouTubeScraperSettings):
         default=3,
         validation_alias=AliasChoices(
             'CHANNEL_UPLOAD_CONCURRENCY', 'channel_upload_concurrency',
-            'CHANNEL_CONCURRENCY', 'channel_concurrency',
         ),
         description='Number of concurrent per-file upload prep workers.',
     )
@@ -197,7 +198,7 @@ def _validate_settings(settings: ChannelUploadSettings) -> None:
         os.makedirs(settings.channel_data_directory, exist_ok=True)
 
 
-def _handle_from_channel_filename(filename: str) -> str:
+def _channel_id_from_filename(filename: str) -> str:
     return filename.removeprefix(
         CHANNEL_FILE_PREFIX,
     ).removesuffix(CHANNEL_FILE_POSTFIX)
@@ -359,7 +360,7 @@ async def _upload_one_channel_batch(
     if not batch_records:
         return
 
-    outcome: BulkBatchOutcome = await upload_bulk_batch(
+    outcome: BulkBatchOutcome = await _upload_bulk_batch(
         batch_buf, batch_records,
         schema_owner=settings.schema_owner,
         schema_version=settings.schema_version,
@@ -373,7 +374,7 @@ async def _upload_one_channel_batch(
         ),
         filename_prefix='channels',
         exchange_set=exchange_set,
-        handle_from_filename=_handle_from_channel_filename,
+        id_from_filename=_channel_id_from_filename,
     )
     METRIC_BULK_BATCHES.labels(
         platform='youtube',
@@ -410,7 +411,72 @@ async def _upload_one_channel_batch(
             entity='channel',
             mode='bulk',
             worker_id=get_worker_id(),
-        ).inc(outcome.missing)
+    ).inc(outcome.missing)
+
+
+async def _upload_bulk_batch(
+    batch_buf: bytes,
+    batch_records: list[tuple[str, str]],
+    *,
+    schema_owner: str,
+    schema_version: str,
+    platform: str,
+    entity: str,
+    exchange_url: str,
+    client: ExchangeClient,
+    fm: AssetFileManagement,
+    progress_timeout_seconds: float,
+    filename_prefix: str,
+    exchange_set: RedisExchangeChannelsSet | None = None,
+    id_from_filename: Callable[[str], str] | None = None,
+) -> BulkBatchOutcome:
+    job_id: str
+    batch_id: str
+    err: BulkBatchOutcome | None
+    job_id, batch_id, err = await post_bulk_batch(
+        batch_buf, batch_records,
+        schema_owner=schema_owner,
+        schema_version=schema_version,
+        platform=platform,
+        entity=entity,
+        exchange_url=exchange_url,
+        client=client,
+        fm=fm,
+        filename_prefix=filename_prefix,
+    )
+    batch_buf = b''  # noqa: F841
+    if err is not None:
+        return err
+
+    if not await stream_bulk_job_progress(
+        job_id, exchange_url, client, progress_timeout_seconds,
+    ):
+        return BulkBatchOutcome(
+            status='progress_failed', job_id=job_id,
+            success=0, failed=0, missing=0,
+        )
+
+    results: BulkResults | None = await fetch_bulk_results(
+        job_id, exchange_url, client,
+    )
+    success: int
+    failed: int
+    missing: int
+    success_ids: set[str]
+    success, failed, missing, success_ids = await apply_bulk_results(
+        batch_records, results, fm, batch_id, job_id,
+        exchange_set=exchange_set,
+        id_from_filename=id_from_filename,
+    )
+    await delete_bulk_state(fm, job_id)
+    return BulkBatchOutcome(
+        status='completed',
+        job_id=job_id,
+        success=success,
+        failed=failed,
+        missing=missing,
+        success_ids=success_ids,
+    )
 
 
 async def upload_channels(
@@ -455,6 +521,9 @@ async def upload_channels(
     )
 
     for start in range(0, len(files), concurrency):
+        # Watchdog progress signal: the initial bulk drain of a large
+        # backlog runs before the watch loop and must not look hung.
+        Watchdog.get().touch_work()
         chunk: list[str] = files[start:start + concurrency]
         prepared: list[
             tuple[str, str, bytes] | None
@@ -496,7 +565,7 @@ async def upload_channels(
                         settings.bulk_progress_timeout_seconds
                     ),
                     exchange_set=exchange_set,
-                    handle_from_filename=_handle_from_channel_filename,
+                    id_from_filename=_channel_id_from_filename,
                 ):
                     await _upload_one_channel_batch(
                         bytes(batch_buf), batch_records,
@@ -519,7 +588,7 @@ async def upload_channels(
                 settings.bulk_progress_timeout_seconds
             ),
             exchange_set=exchange_set,
-            handle_from_filename=_handle_from_channel_filename,
+            id_from_filename=_channel_id_from_filename,
         ):
             await _upload_one_channel_batch(
                 bytes(batch_buf), batch_records,
@@ -611,17 +680,35 @@ async def _wait_for_channel_changes(base_dir: Path) -> None:
             return False
         return _is_base_channel_upload_file(Path(raw_path), base_dir)
 
-    async for changes in awatch(
+    watcher = awatch(
         base_dir,
         watch_filter=_watch_filter,
         force_polling=False,
         recursive=False,
-    ):
-        logging.debug(
-            'Channel upload watcher detected file changes',
-            extra={'changes': [(c.name, p) for c, p in changes]},
-        )
-        return
+    )
+    pending: asyncio.Task | None = None
+    try:
+        pending = asyncio.create_task(anext(watcher))
+        while True:
+            Watchdog.get().touch_work()
+            done, _ = await asyncio.wait(
+                {pending},
+                timeout=_WATCHDOG_TOUCH_INTERVAL,
+            )
+            if not done:
+                continue
+            changes = pending.result()
+            logging.debug(
+                'Channel upload watcher detected file changes',
+                extra={'changes': [(c.name, p) for c, p in changes]},
+            )
+            return
+    finally:
+        if pending is not None and not pending.done():
+            pending.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await pending
+        await watcher.aclose()
 
 
 async def _run_channel_bulk_batch(
@@ -662,6 +749,9 @@ async def _unified_bulk_upload_loop(
     max_active: int = max(settings.max_active_bulk_jobs, 1)
 
     while True:
+        # Forward-progress signal for the liveness watchdog; without it
+        # the watchdog terminates this uploader after its work timeout.
+        Watchdog.get().touch_work()
         batch_size: int = settings.bulk_batch_size
 
         base_names: list[str] = [
@@ -865,7 +955,7 @@ async def _run_worker(ctx: ScraperRunContext) -> None:
     await resume_pending_bulk_uploads(
         fm, ctx.client, settings.exchange_url,
         exchange_set=resume_exchange_set,
-        handle_from_filename=_handle_from_channel_filename,
+        id_from_filename=_channel_id_from_filename,
     )
     await upload_channels(
         settings, ctx.client, fm,
