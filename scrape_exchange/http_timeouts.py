@@ -146,10 +146,6 @@ _SCRAPER_TO_FIELDS: dict[str, tuple[str, str]] = {
     'yt_video_scrape.py': (
         'video_connect_timeout', 'video_request_timeout',
     ),
-    'rebuild_creator_map.py': (
-        'channel_connect_timeout',
-        'channel_request_timeout',
-    ),
 }
 
 _SCRIPT_NAME: str = (
