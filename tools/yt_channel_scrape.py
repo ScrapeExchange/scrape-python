@@ -719,9 +719,8 @@ async def scrape_channels(
         },
     )
 
-    # Drain the priority directory first so that channels
-    # flagged by yt_import_channel_export.py are scraped
-    # ahead of the channels.lst backlog.
+    # Drain the priority directory first so that flagged
+    # channels are scraped ahead of the channels.lst backlog.
     priority_ids: dict[str, Path] = (
         await _drain_priority_directory(
             settings, identity_store,

@@ -9,7 +9,7 @@ Each proxy gets its own cookie file so that per-proxy session state stays
 consistent with the proxy's identity from YouTube's perspective.  Cookie
 files are stored in a deterministic path under a shared temp directory and
 coordinated with ``fcntl`` file locks so that sibling processes (e.g. the
-worker pool used by ``rebuild_creator_map``) reuse the same acquired
+worker pool used by ``yt_channel_scrape``) reuse the same acquired
 cookies instead of each re-fetching 58-way in parallel at startup.
 
 Cookies are refreshed automatically when the TTL expires.

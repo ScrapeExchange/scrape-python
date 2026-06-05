@@ -52,7 +52,6 @@ _SCRAPER_BY_SCRIPT: dict[str, str] = {
     'yt_video_scrape.py': 'video_scraper',
     'yt_channel_scrape.py': 'channel_scraper',
     'yt_rss_scrape.py': 'rss_scraper',
-    'rebuild_creator_map.py': 'channel_scraper',
     'yt_discover_channels.py': 'discover',
 }
 
