@@ -425,6 +425,133 @@ class TestUnmark(_RedisQueueTestBase):
             )
             self.assertIsNone(v)
 
+    async def test_unmark_clears_force(self) -> None:
+        '''Reviving a terminal record must not leave a stale
+        force flag that a later non-force scrape would honour.'''
+        await self.queue.enqueue('aaa', source='rss')
+        await self.queue.mark(
+            'aaa', state=VideoState.FAILED,
+        )
+        await self.redis.hset(
+            'youtube:video:meta:aaa', 'force', '1',
+        )
+        await self.queue.unmark('aaa')
+        force: str | None = await self.redis.hget(
+            'youtube:video:meta:aaa', 'force',
+        )
+        self.assertIsNone(force)
+
+
+class TestForceEnqueue(_RedisQueueTestBase):
+
+    async def test_absent_adds_with_force(self) -> None:
+        outcome: str = await self.queue.force_enqueue(
+            'aaa', source='cli',
+        )
+        self.assertEqual(outcome, 'added')
+        score: float | None = await self.redis.zscore(
+            'youtube:video:queue', 'aaa',
+        )
+        self.assertIsNotNone(score)
+        meta: dict[str, str] = await self.redis.hgetall(
+            'youtube:video:meta:aaa',
+        )
+        self.assertEqual(meta.get('state'), 'queued')
+        self.assertEqual(meta.get('force'), '1')
+        self.assertEqual(meta.get('source'), 'cli')
+
+    async def test_terminal_revives_with_force(
+        self,
+    ) -> None:
+        await self.queue.enqueue('aaa', source='rss')
+        await self.queue.mark(
+            'aaa', state=VideoState.FAILED,
+        )
+        outcome: str = await self.queue.force_enqueue(
+            'aaa', source='cli',
+        )
+        self.assertEqual(outcome, 'revived')
+        in_failed: str | None = await self.redis.hget(
+            'youtube:video:failed', 'aaa',
+        )
+        self.assertIsNone(in_failed)
+        score: float | None = await self.redis.zscore(
+            'youtube:video:queue', 'aaa',
+        )
+        self.assertIsNotNone(score)
+        meta: dict[str, str] = await self.redis.hgetall(
+            'youtube:video:meta:aaa',
+        )
+        self.assertEqual(meta.get('state'), 'queued')
+        self.assertEqual(meta.get('force'), '1')
+
+    async def test_queued_waiting_sets_force(self) -> None:
+        await self.queue.enqueue('aaa', source='rss')
+        outcome: str = await self.queue.force_enqueue(
+            'aaa', source='cli',
+        )
+        self.assertEqual(outcome, 'forced_pending')
+        # Still queued exactly once.
+        size: int = await self.redis.zcard(
+            'youtube:video:queue',
+        )
+        self.assertEqual(size, 1)
+        force: str | None = await self.redis.hget(
+            'youtube:video:meta:aaa', 'force',
+        )
+        self.assertEqual(force, '1')
+
+    async def test_queued_after_pop_requeues(
+        self,
+    ) -> None:
+        '''An id popped (mid-scrape) keeps state=queued but is
+        gone from the zset; force re-adds it via ZADD NX.'''
+        await self.queue.enqueue('aaa', source='rss')
+        await self.queue.pop(1)
+        score_gone: float | None = await self.redis.zscore(
+            'youtube:video:queue', 'aaa',
+        )
+        self.assertIsNone(score_gone)
+        outcome: str = await self.queue.force_enqueue(
+            'aaa', source='cli',
+        )
+        self.assertEqual(outcome, 'forced_pending')
+        score: float | None = await self.redis.zscore(
+            'youtube:video:queue', 'aaa',
+        )
+        self.assertIsNotNone(score)
+
+    async def test_empty_video_id_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            await self.queue.force_enqueue('', source='cli')
+
+
+class TestConsumeForce(_RedisQueueTestBase):
+
+    async def test_returns_true_and_clears(self) -> None:
+        await self.queue.enqueue('aaa', source='rss')
+        await self.redis.hset(
+            'youtube:video:meta:aaa', 'force', '1',
+        )
+        first: bool = await self.queue.consume_force('aaa')
+        self.assertTrue(first)
+        force: str | None = await self.redis.hget(
+            'youtube:video:meta:aaa', 'force',
+        )
+        self.assertIsNone(force)
+        # Consumed exactly once.
+        second: bool = await self.queue.consume_force('aaa')
+        self.assertFalse(second)
+
+    async def test_returns_false_when_unset(self) -> None:
+        await self.queue.enqueue('aaa', source='rss')
+        result: bool = await self.queue.consume_force('aaa')
+        self.assertFalse(result)
+
+    async def test_missing_meta_returns_false(self) -> None:
+        result: bool = await self.queue.consume_force('nope')
+        self.assertFalse(result)
+
 
 class TestMetaOps(_RedisQueueTestBase):
 

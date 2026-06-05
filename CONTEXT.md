@@ -265,3 +265,7 @@ historical mixups live.
   takes over inline channel-id resolution from there. The old tool
   remains untouched and operators stop invoking it once the scraper
   cutover is live.
+
+## SCHEMA_OWNER and UPLOADER
+The SCHEMA_OWNER is the user who uploaded a JSONSchema to the registry. The UPLOADER
+is the account that uploaded assets such as videos or posts that reference a JSONSchema.

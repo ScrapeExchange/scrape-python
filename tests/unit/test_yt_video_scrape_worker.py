@@ -177,6 +177,8 @@ class TestScrapeOneQueued(
         self, mock_scrape: AsyncMock,
     ) -> None:
         queue: AsyncMock = AsyncMock()
+        # Not forced: the uploaded skip applies.
+        queue.consume_force.return_value = False
         from tools.yt_video_scrape import _scrape_one_queued
         await _scrape_one_queued(
             'aaa',
@@ -185,8 +187,32 @@ class TestScrapeOneQueued(
             proxies=[],
             uploaded=_mock_uploaded(True),
         )
+        queue.consume_force.assert_awaited_once_with('aaa')
         queue.complete.assert_awaited_once_with('aaa')
         mock_scrape.assert_not_awaited()
+
+    @patch(
+        'tools.yt_video_scrape._scrape_to_disk',
+        new_callable=AsyncMock,
+    )
+    async def test_forced_uploaded_is_scraped(
+        self, mock_scrape: AsyncMock,
+    ) -> None:
+        queue: AsyncMock = AsyncMock()
+        # Forced: bypass the uploaded skip and scrape anyway.
+        queue.consume_force.return_value = True
+        from tools.yt_video_scrape import _scrape_one_queued
+        await _scrape_one_queued(
+            'aaa',
+            queue=queue,
+            settings=_mock_settings(),
+            proxies=[],
+            uploaded=_mock_uploaded(True),
+        )
+        queue.consume_force.assert_awaited_once_with('aaa')
+        mock_scrape.assert_awaited_once()
+        # Successful scrape still completes the item.
+        queue.complete.assert_awaited_once_with('aaa')
 
     @patch(
         'tools.yt_video_scrape._scrape_to_disk',

@@ -21,14 +21,16 @@ import logging
 from pathlib import Path
 import random
 
-import brotli
-
 from prometheus_client import Counter, Gauge
 
 from pydantic import AliasChoices, Field, field_validator
 from yt_dlp.YoutubeDL import YoutubeDL
 
-from scrape_exchange.file_management import AssetFileManagement, VIDEO_ID_RE
+from scrape_exchange.file_management import (
+    AssetFileManagement,
+    VIDEO_MIN_FILE_PREFIX as VIDEO_MIN_PREFIX,
+    VIDEO_YTDLP_FILE_PREFIX as VIDEO_YTDLP_PREFIX,
+)
 from scrape_exchange.content_claim import (
     ContentClaim,
     FileContentClaim,
@@ -70,11 +72,6 @@ from scrape_exchange.scraper_metrics import (
     METRIC_UPLOADED_LOOKUPS,
 )
 
-VIDEO_MIN_PREFIX = 'video-min-'
-VIDEO_YTDLP_PREFIX = 'video-dlp-'
-
-
-FILE_EXTENSION: str = '.json.br'
 
 
 # Ordered table of yt-dlp error classifications. Each entry is
@@ -282,11 +279,19 @@ async def _scrape_one_queued(
         METRIC_UPLOADED_LOOKUPS.labels(outcome='error').inc()
         raise
     if is_uploaded:
-        METRIC_UPLOADED_LOOKUPS.labels(outcome='hit').inc()
-        await queue.complete(video_id)
-        VIDEO_QUEUE_OUTCOMES.labels(outcome='scraped').inc()
-        return
-    METRIC_UPLOADED_LOOKUPS.labels(outcome='miss').inc()
+        # A forced re-scrape (via yt_video_queue.py add/import
+        # --force) sets a one-shot ``force`` meta flag.
+        # consume_force clears it on read so the force is honoured
+        # exactly once and never leaks into a later scrape.
+        forced: bool = await queue.consume_force(video_id)
+        if not forced:
+            METRIC_UPLOADED_LOOKUPS.labels(outcome='hit').inc()
+            await queue.complete(video_id)
+            VIDEO_QUEUE_OUTCOMES.labels(outcome='scraped').inc()
+            return
+        METRIC_UPLOADED_LOOKUPS.labels(outcome='forced').inc()
+    else:
+        METRIC_UPLOADED_LOOKUPS.labels(outcome='miss').inc()
     attempts_left: int = (
         settings.video_transient_max_attempts
     )
@@ -577,21 +582,6 @@ class VideoSettings(YouTubeScraperSettings):
             'False (the default) only the InnerTube pass runs '
             'and those properties are left unset; this trades '
             'completeness for throughput.'
-        ),
-    )
-    video_priority_directory: str | None = Field(
-        default='priority',
-        validation_alias=AliasChoices(
-            'YOUTUBE_VIDEO_PRIORITY_DIRECTORY',
-            'youtube_video_priority_directory',
-        ),
-        description=(
-            'Optional staging directory of '
-            'bare 11-character YouTube video ID files to '
-            'process before base-directory requests. On a '
-            'successful scrape the source video ID file is '
-            'deleted only after the video-min/video-dlp output '
-            'has been atomically written.'
         ),
     )
     deno_path: str = Field(
@@ -920,112 +910,6 @@ async def _run_worker(
                 await publisher_task
             except (asyncio.CancelledError, Exception):
                 pass
-
-
-async def video_needs_uploading(video_fm: AssetFileManagement,
-                                filename: str) -> bool:
-    '''
-    Checks whether a video file in the base directory still needs to be
-    uploaded, deleting it from disk if it has already been superseded by an
-    uploaded copy.
-
-    A video is considered superseded when an uploaded ``video-dlp-{id}``
-    variant exists with a modification time greater than or equal to the
-    local file (ties go to the uploaded copy).  This is checked uniformly
-    for both ``video-min-`` and ``video-dlp-`` local files via
-    :meth:`AssetFileManagement.is_superseded`.
-
-    :param video_fm: AssetFileManagement instance owning the video data
-        directory.
-    :param filename: Bare filename to check.
-    :returns: ``True`` if the file still needs to be uploaded, ``False`` if
-        it was superseded (and removed).
-    '''
-    if not video_fm.is_superseded(filename):
-        return True
-    await video_fm.delete(filename, fail_ok=False)
-    return False
-
-
-def _is_bare_video_id(filename: str) -> bool:
-    return VIDEO_ID_RE.fullmatch(filename) is not None
-
-def _parse_entry(
-    entry: str,
-) -> tuple[str, str, bool] | None:
-    '''
-    Extract video ID, filename prefix, and scraping need
-    from a queue entry filename.
-
-    :param entry: Bare filename from the work queue.
-    :returns: ``(video_id, prefix, needs_scraping)`` or
-        ``None`` for unrecognised prefixes.
-    '''
-
-    if entry.startswith(VIDEO_MIN_PREFIX):
-        video_id: str = entry[
-            len(VIDEO_MIN_PREFIX):-len(FILE_EXTENSION)
-        ]
-        return video_id, VIDEO_MIN_PREFIX, True
-    if entry.startswith(VIDEO_YTDLP_PREFIX):
-        video_id = entry[
-            len(VIDEO_YTDLP_PREFIX):-len(FILE_EXTENSION)
-        ]
-        return video_id, VIDEO_YTDLP_PREFIX, False
-    if _is_bare_video_id(entry):
-        return entry, '', True
-    return None
-
-
-async def _load_video_file(
-    video_id: str,
-    data_dir: str,
-    prefix: str,
-    entry: str,
-    video_fm: AssetFileManagement,
-) -> YouTubeVideo | None:
-    '''
-    Read and decompress a video JSON file from disk.
-
-    Returns ``None`` (and logs) on missing files, corrupt
-    Brotli payloads, or any other read error.  Corrupt
-    files are deleted via *video_fm*.
-
-    :param video_id: YouTube video ID.
-    :param data_dir: Directory containing video files.
-    :param prefix: Filename prefix (``video-min-`` or
-        ``video-dlp-``).
-    :param entry: Bare filename for logging / deletion.
-    :param video_fm: File manager owning *data_dir*.
-    :returns: Parsed video or ``None``.
-    '''
-
-    try:
-        return await YouTubeVideo.from_file(
-            video_id, data_dir, prefix,
-        )
-    except FileNotFoundError:
-        logging.warning(
-            'Video file not found, skipping',
-            extra={'entry': entry},
-        )
-        return None
-    except brotli.error as exc:
-        logging.warning(
-            'Failed to decompress video file, '
-            'skipping',
-            exc_info=exc,
-            extra={'entry': entry},
-        )
-        await video_fm.delete(entry, fail_ok=False)
-        return None
-    except Exception as exc:
-        logging.warning(
-            'Failed to read video file, skipping',
-            exc_info=exc,
-            extra={'entry': entry},
-        )
-        return None
 
 
 if __name__ == '__main__':
