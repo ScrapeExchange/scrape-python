@@ -17,6 +17,7 @@ import logging
 from pathlib import Path
 from asyncio import Queue, Task
 
+import brotli
 import orjson
 
 from httpx import Response
@@ -40,7 +41,13 @@ from scrape_exchange.creator_map import (
     RedisCreatorMap,
 )
 from scrape_exchange.exchange_client import ExchangeClient
-from scrape_exchange.file_management import AssetFileManagement
+from scrape_exchange.file_management import (
+    AssetFileManagement,
+    VIDEO_ID_RE,
+    VIDEO_MIN_FILE_PREFIX as VIDEO_MIN_PREFIX,
+    VIDEO_YTDLP_FILE_PREFIX as VIDEO_YTDLP_PREFIX,
+    COMPRESSED_JSON_SUFFIX as FILE_EXTENSION,
+)
 from scrape_exchange.schema_validator import SchemaValidator, fetch_schema_dict
 from scrape_exchange.scraper_runner import ScraperRunContext, ScraperRunner
 from scrape_exchange.settings import normalize_log_level
@@ -55,14 +62,6 @@ from scrape_exchange.youtube.uploaded_video_ids import UploadedVideoIds
 from scrape_exchange.worker_id import get_worker_id
 from scrape_exchange.watchdog import Watchdog
 
-from tools.yt_video_scrape import (
-    FILE_EXTENSION,
-    VIDEO_MIN_PREFIX,
-    VIDEO_YTDLP_PREFIX,
-    _load_video_file,
-    _parse_entry,
-    video_needs_uploading,
-)
 
 from scrape_exchange.scraper_metrics import (
     METRIC_UPLOADS_ENQUEUED as METRIC_VIDEOS_ENQUEUED,
@@ -91,6 +90,114 @@ _QUEUE_MAXSIZE: int = 10_000
 # How often an idle upload worker ticks the watchdog work signal while
 # blocked waiting for files. Must be < WATCHDOG_WORK_TIMEOUT_SECONDS.
 _WATCHDOG_TOUCH_INTERVAL: float = 30.0
+
+
+async def _load_video_file(
+    video_id: str,
+    data_dir: str,
+    prefix: str,
+    entry: str,
+    video_fm: AssetFileManagement,
+) -> YouTubeVideo | None:
+    '''
+    Read and decompress a video JSON file from disk.
+
+    Returns ``None`` (and logs) on missing files, corrupt
+    Brotli payloads, or any other read error.  Corrupt
+    files are deleted via *video_fm*.
+
+    :param video_id: YouTube video ID.
+    :param data_dir: Directory containing video files.
+    :param prefix: Filename prefix (``video-min-`` or
+        ``video-dlp-``).
+    :param entry: Bare filename for logging / deletion.
+    :param video_fm: File manager owning *data_dir*.
+    :returns: Parsed video or ``None``.
+    '''
+
+    try:
+        return await YouTubeVideo.from_file(
+            video_id, data_dir, prefix,
+        )
+    except FileNotFoundError:
+        logging.warning(
+            'Video file not found, skipping',
+            extra={'entry': entry},
+        )
+        return None
+    except brotli.error as exc:
+        logging.warning(
+            'Failed to decompress video file, '
+            'skipping',
+            exc_info=exc,
+            extra={'entry': entry},
+        )
+        await video_fm.delete(entry, fail_ok=False)
+        return None
+    except Exception as exc:
+        logging.warning(
+            'Failed to read video file, skipping',
+            exc_info=exc,
+            extra={'entry': entry},
+        )
+        return None
+
+
+async def video_needs_uploading(
+    video_fm: AssetFileManagement, filename: str,
+) -> bool:
+    '''
+    Checks whether a video file in the base directory still needs to be
+    uploaded, deleting it from disk if it has already been superseded by an
+    uploaded copy.
+
+    A video is considered superseded when an uploaded ``video-dlp-{id}``
+    variant exists with a modification time greater than or equal to the
+    local file (ties go to the uploaded copy).  This is checked uniformly
+    for both ``video-min-`` and ``video-dlp-`` local files via
+    :meth:`AssetFileManagement.is_superseded`.
+
+    :param video_fm: AssetFileManagement instance owning the video data
+        directory.
+    :param filename: Bare filename to check.
+    :returns: ``True`` if the file still needs to be uploaded, ``False`` if
+        it was superseded (and removed).
+    '''
+    if not video_fm.is_superseded(filename):
+        return True
+    await video_fm.delete(filename, fail_ok=False)
+    return False
+
+
+def _is_bare_video_id(filename: str) -> bool:
+    return VIDEO_ID_RE.fullmatch(filename) is not None
+
+
+def _parse_entry(
+    entry: str,
+) -> tuple[str, str, bool] | None:
+    '''
+    Extract video ID, filename prefix, and scraping need
+    from a queue entry filename.
+
+    :param entry: Bare filename from the work queue.
+    :returns: ``(video_id, prefix, needs_scraping)`` or
+        ``None`` for unrecognised prefixes.
+    '''
+
+    if entry.startswith(VIDEO_MIN_PREFIX):
+        video_id: str = entry[
+            len(VIDEO_MIN_PREFIX):-len(FILE_EXTENSION)
+        ]
+        return video_id, VIDEO_MIN_PREFIX, True
+    if entry.startswith(VIDEO_YTDLP_PREFIX):
+        video_id = entry[
+            len(VIDEO_YTDLP_PREFIX):-len(FILE_EXTENSION)
+        ]
+        return video_id, VIDEO_YTDLP_PREFIX, False
+    if _is_bare_video_id(entry):
+        return entry, '', True
+    return None
 
 
 def _record_bulk_filter_skip(reason: str) -> None:

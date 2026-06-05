@@ -59,7 +59,67 @@ redis.call(
     ARGV[2], vid
 )
 redis.call('HSET', KEYS[1], 'state', 'queued')
+-- Clear any force tag so reviving a terminal record never
+-- re-arms a stale force into a later non-force scrape.
+redis.call('HDEL', KEYS[1], 'force')
 return 1
+'''
+
+# Force re-enqueue with explicit per-state behavior. The
+# ``force`` meta flag tells the scraper to scrape this id once
+# even when it is already in the fleet-wide uploaded set.
+_FORCE_ENQUEUE_LUA: str = '''
+-- KEYS[1] = queue_key
+-- KEYS[2] = meta_key
+-- KEYS[3] = unavailable hash
+-- KEYS[4] = failed hash
+-- KEYS[5] = removed hash
+-- ARGV[1] = video_id, ARGV[2] = source
+-- ARGV[3] = now (string), ARGV[4] = queued_state
+local vid = ARGV[1]
+local state = redis.call('HGET', KEYS[2], 'state')
+local is_terminal = (
+    state == 'unavailable'
+    or state == 'failed'
+    or state == 'removed'
+)
+if is_terminal then
+    redis.call('HDEL', KEYS[3], vid)
+    redis.call('HDEL', KEYS[4], vid)
+    redis.call('HDEL', KEYS[5], vid)
+    redis.call('ZADD', KEYS[1], ARGV[3], vid)
+    redis.call('HSET', KEYS[2], 'state', ARGV[4])
+    redis.call('HSET', KEYS[2], 'force', '1')
+    return 'revived'
+elseif state == ARGV[4] then
+    -- queued (waiting in zset, or popped and mid-scrape -
+    -- indistinguishable). Re-arm force and ensure it is
+    -- queued without disturbing an existing waiting score.
+    redis.call('HSET', KEYS[2], 'force', '1')
+    redis.call('ZADD', KEYS[1], 'NX', ARGV[3], vid)
+    return 'forced_pending'
+else
+    -- absent (no meta) or unknown -> add fresh with force.
+    redis.call('ZADD', KEYS[1], ARGV[3], vid)
+    redis.call('HSET', KEYS[2], 'state', ARGV[4])
+    redis.call('HSETNX', KEYS[2], 'source', ARGV[2])
+    redis.call('HSETNX', KEYS[2], 'created_at', ARGV[3])
+    redis.call('HSET', KEYS[2], 'force', '1')
+    return 'added'
+end
+'''
+
+# Consume-on-read of the force flag: return 1 and clear the
+# flag if it was set, else 0. Ensures a force is honoured at
+# most once and never leaks into a later scrape.
+_CONSUME_FORCE_LUA: str = '''
+-- KEYS[1] = meta_key
+local f = redis.call('HGET', KEYS[1], 'force')
+if f then
+    redis.call('HDEL', KEYS[1], 'force')
+    return 1
+end
+return 0
 '''
 
 _ENQUEUE_LUA: str = '''
@@ -253,6 +313,50 @@ class RedisVideoScrapeQueue(VideoScrapeQueue):
             VideoState.QUEUED.value,
         ))
         return added == 1
+
+    async def force_enqueue(
+        self, video_id: str, *, source: str,
+    ) -> str:
+        '''Force a (re-)scrape of *video_id* regardless of prior
+        state, tagging it so the scraper bypasses the uploaded-set
+        skip.
+
+        Returns the outcome:
+        - ``'revived'``  — was terminal; tombstone cleared, re-queued.
+        - ``'forced_pending'`` — was already queued / mid-scrape;
+          force re-armed (see the in-flight race note in the design).
+        - ``'added'``    — had no record; added fresh.
+        '''
+        if not video_id:
+            raise ValueError('empty video_id')
+        now: int = int(time.time())
+        result: Any = await self._redis.eval(
+            _FORCE_ENQUEUE_LUA, 5,
+            self._k_queue(),
+            self._k_meta(video_id),
+            self._k_state(VideoState.UNAVAILABLE),
+            self._k_state(VideoState.FAILED),
+            self._k_state(VideoState.REMOVED),
+            video_id, source,
+            str(now),
+            VideoState.QUEUED.value,
+        )
+        if isinstance(result, bytes):
+            return result.decode()
+        return str(result)
+
+    async def consume_force(self, video_id: str) -> bool:
+        '''Atomically read-and-clear the ``force`` meta flag.
+
+        Returns ``True`` (and clears the flag) when it was set, so a
+        force is honoured at most once and never leaks into a later
+        scrape; ``False`` otherwise.
+        '''
+        result: Any = await self._redis.eval(
+            _CONSUME_FORCE_LUA, 1,
+            self._k_meta(video_id),
+        )
+        return int(result) == 1
 
     async def pop(self, batch: int) -> list[str]:
         members: list[str] = await self._redis.eval(

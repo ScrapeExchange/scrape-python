@@ -97,22 +97,6 @@ class YouTubeScraperSettings(ScraperSettings):
         ),
         description='Directory to save the scraped video data',
     )
-    video_priority_directory: str | None = Field(
-        default=None,
-        validation_alias=AliasChoices(
-            'YOUTUBE_VIDEO_PRIORITY_DIRECTORY',
-            'youtube_video_priority_directory',
-        ),
-        description=(
-            'Optional staging directory where the RSS '
-            'scraper writes newly-discovered '
-            'video-min-*.json.br files so the '
-            'tools/yt_video_upload.py uploads them '
-            'ahead of the bulk-archive backlog. When '
-            'unset, files fall back to '
-            'video_data_directory (legacy behaviour).'
-        ),
-    )
     bulk_batch_size: int = Field(
         default=1000,
         validation_alias=AliasChoices(

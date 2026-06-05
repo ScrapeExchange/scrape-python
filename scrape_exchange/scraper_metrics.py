@@ -230,25 +230,6 @@ METRIC_CHANNEL_PRIORITY_QUEUE_AGE: Gauge = Gauge(
 )
 
 # ---------------------------------------------------------------------------
-# priority_directory_size
-#   Number of entries currently in the video scraper priority directory
-#   (YOUTUBE_VIDEO_PRIORITY_DIRECTORY). Sampled on every workload-prep
-#   cycle. A monotonically growing value indicates priority-write
-#   producers are outpacing the scraper workers. ``worker_id`` is left
-#   empty because the directory is shared across workers in a process;
-#   ``livemostrecent`` then returns the latest reading without N×
-#   inflation.
-# ---------------------------------------------------------------------------
-METRIC_PRIORITY_DIRECTORY_SIZE: Gauge = Gauge(
-    'priority_directory_size',
-    'Number of entries currently in the video scraper priority '
-    'directory (YOUTUBE_VIDEO_PRIORITY_DIRECTORY). Sampled on '
-    'every workload-prep cycle.',
-    ['platform', 'scraper', 'worker_id'],
-    multiprocess_mode='livemostrecent',
-)
-
-# ---------------------------------------------------------------------------
 # uploads_missing_result_total
 #   Records submitted in a bulk batch that did not appear in the job
 #   results (possible API timeout or partial response).

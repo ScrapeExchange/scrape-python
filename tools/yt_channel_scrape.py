@@ -2680,8 +2680,8 @@ async def _read_channel_list_file(
 
     The header is preserved separately so the write-back step
     can re-emit it unchanged when the deduplicated entry list is
-    persisted, matching the layout convention used by
-    :mod:`tools.cleanup_channel_list`.
+    persisted, matching the ``channels.lst`` layout convention
+    (leading comment header, then one entry per line).
     '''
     header: list[str] = []
     entries: list[str] = []
@@ -2715,9 +2715,8 @@ async def _persist_deduped_channel_list(
     must never abort the scraper, since the in-memory dedup is
     already correct.
 
-    Pattern matches :mod:`tools.cleanup_channel_list`'s
-    write-back so an operator running both gets consistent
-    on-disk shape.
+    Write-back preserves the ``channels.lst`` on-disk shape
+    (leading comment header, then one entry per line).
     '''
     list_path: Path = Path(file_path)
     backup: Path = list_path.with_suffix(
