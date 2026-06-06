@@ -13,7 +13,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, AsyncIterator, Iterable
 
 import httpx
 from pydantic import AliasChoices, Field
@@ -407,12 +407,18 @@ async def discover_for_term(
     *,
     continuations: int,
     limiter: YouTubeRateLimiter,
-) -> list[DiscoveredChannel]:
-    '''Search one term and return unique discovered channels.'''
+) -> AsyncIterator[DiscoveredChannel]:
+    '''Search one term, yielding discovered channels per page.
+
+    Each search page is parsed as soon as it arrives and its
+    channels (deduped within the page by :func:`extract_channels`)
+    are yielded in discovery order. Cross-page and cross-term
+    deduplication is the caller's responsibility (see
+    :class:`_ChannelEmitter`).
+    '''
 
     proxy = limiter.select_proxy(YouTubeCallType.BROWSE)
     continuation: str | None = None
-    channels: list[DiscoveredChannel] = []
     pages = max(0, continuations) + 1
 
     for page in range(pages):
@@ -423,7 +429,8 @@ async def discover_for_term(
             proxy=proxy,
             limiter=limiter,
         )
-        channels.extend(extract_channels(payload))
+        for channel in extract_channels(payload):
+            yield channel
         continuation = _get_continuation_token(payload)
         _LOGGER.info(
             'InnerTube search page processed',
@@ -436,7 +443,6 @@ async def discover_for_term(
         )
         if not continuation:
             break
-    return _dedupe_channels(channels)
 
 
 def _channel_to_json(channel: DiscoveredChannel) -> str:
@@ -448,6 +454,46 @@ def _channel_to_json(channel: DiscoveredChannel) -> str:
         ensure_ascii=False,
         separators=(',', ':'),
     )
+
+
+class _ChannelEmitter:
+    '''Stream discovered channels to *stream*, one JSON line each,
+    deduplicating across the whole run.
+
+    A channel is written the first time its ``channel_id`` is
+    seen, or — when it carries no ``channel_id`` — the first time
+    its ``channel_handle`` is seen. A handle that was emitted
+    without an id is re-emitted once a record carrying both the
+    handle and a new id arrives, so the id is not lost (the
+    "upgrade" case). Each line is flushed immediately so a
+    downstream pipe sees channels as they are discovered and a
+    mid-run crash leaves valid partial output.
+    '''
+
+    def __init__(self, stream: Any) -> None:
+        self._stream: Any = stream
+        self._seen_ids: set[str] = set()
+        self._seen_handles: set[str] = set()
+
+    def emit(self, channel: DiscoveredChannel) -> bool:
+        '''Write *channel* if it is new; return whether it was
+        written.'''
+
+        cid: str | None = channel.channel_id
+        handle: str | None = channel.channel_handle
+        if cid is not None:
+            if cid in self._seen_ids:
+                return False
+        elif handle is None or handle in self._seen_handles:
+            return False
+
+        if cid is not None:
+            self._seen_ids.add(cid)
+        if handle is not None:
+            self._seen_handles.add(handle)
+        self._stream.write(f'{_channel_to_json(channel)}\n')
+        self._stream.flush()
+        return True
 
 
 async def main_async(argv: list[str] | None = None) -> int:
@@ -472,18 +518,15 @@ async def main_async(argv: list[str] | None = None) -> int:
             random_word_language=settings.random_word_language,
         )
 
-    all_channels: list[DiscoveredChannel] = []
+    emitter = _ChannelEmitter(sys.stdout)
     try:
         for term in terms:
-            all_channels.extend(
-                await discover_for_term(
-                    term,
-                    continuations=settings.youtube_search_continuations,
-                    limiter=limiter,
-                )
-            )
-        for channel in _dedupe_channels(all_channels):
-            sys.stdout.write(f'{_channel_to_json(channel)}\n')
+            async for channel in discover_for_term(
+                term,
+                continuations=settings.youtube_search_continuations,
+                limiter=limiter,
+            ):
+                emitter.emit(channel)
         return 0
     finally:
         await aclose_pooled_innertube()

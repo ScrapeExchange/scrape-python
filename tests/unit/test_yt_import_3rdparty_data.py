@@ -8,7 +8,6 @@ Kaggle / Hugging Face downloaders is out of scope here.
 from __future__ import annotations
 
 import json
-import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,7 +16,6 @@ from unittest.mock import patch
 from tools.yt_import_3rdparty_data import (
     _ChannelFileSink,
     _VideoFileSink,
-    _video_sentinel_dir,
     ImportKaggleTrendingSettings,
 )
 
@@ -51,7 +49,7 @@ class TestImportSettingsDefaults(unittest.TestCase):
             s.channels_out, 'imported-channels.jsonl',
         )
 
-    def test_video_data_dir_default(self) -> None:
+    def test_videos_out_default(self) -> None:
         with patch.dict('os.environ', {}, clear=True):
             s: ImportKaggleTrendingSettings = (
                 ImportKaggleTrendingSettings(
@@ -59,14 +57,12 @@ class TestImportSettingsDefaults(unittest.TestCase):
                     _env_file=None,
                 )
             )
-        self.assertEqual(s.video_data_dir, 'imported-videos')
+        self.assertEqual(s.videos_out, 'import-videos.lst')
 
-    def test_video_data_dir_accepts_youtube_video_data_dir(
-        self,
-    ) -> None:
+    def test_videos_out_accepts_env_var(self) -> None:
         with patch.dict(
             'os.environ',
-            {'YOUTUBE_VIDEO_DATA_DIR': '/data/videos'},
+            {'VIDEOS_OUT': '/data/videos.lst'},
             clear=True,
         ):
             s: ImportKaggleTrendingSettings = (
@@ -75,16 +71,7 @@ class TestImportSettingsDefaults(unittest.TestCase):
                     _env_file=None,
                 )
             )
-        self.assertEqual(s.video_data_dir, '/data/videos')
-
-
-class TestVideoSentinelDir(unittest.TestCase):
-
-    def test_uses_new_child_directory(self) -> None:
-        self.assertEqual(
-            _video_sentinel_dir(Path('/data/videos')),
-            Path('/data/videos/new'),
-        )
+        self.assertEqual(s.videos_out, '/data/videos.lst')
 
 
 class TestChannelFileSink(
@@ -246,65 +233,72 @@ class TestVideoFileSink(
         self._tmp: tempfile.TemporaryDirectory = (
             tempfile.TemporaryDirectory()
         )
-        self.directory: Path = Path(
-            self._tmp.name, 'imported-videos',
+        self.path: Path = Path(
+            self._tmp.name, 'import-videos.lst',
         )
 
     async def asyncTearDown(self) -> None:
         self._tmp.cleanup()
 
-    async def test_enqueue_touches_named_file(self) -> None:
-        sink: _VideoFileSink = _VideoFileSink(self.directory)
+    async def test_enqueue_writes_one_id_per_line(self) -> None:
+        sink: _VideoFileSink = _VideoFileSink(self.path)
         await sink.enqueue('dQw4w9WgXcQ', source='kaggle')
-        self.assertTrue(
-            (self.directory / 'dQw4w9WgXcQ').is_file(),
+        await sink.enqueue('abc12345678', source='kaggle')
+        sink.close()
+        self.assertEqual(
+            self.path.read_text(encoding='utf-8'),
+            'dQw4w9WgXcQ\nabc12345678\n',
         )
 
-    async def test_enqueue_is_idempotent(self) -> None:
-        sink: _VideoFileSink = _VideoFileSink(self.directory)
+    async def test_enqueue_dedupes_within_run(self) -> None:
+        sink: _VideoFileSink = _VideoFileSink(self.path)
         await sink.enqueue('dQw4w9WgXcQ', source='a')
         await sink.enqueue('dQw4w9WgXcQ', source='b')
-        # Just one file exists; touch(exist_ok=True) didn't
-        # raise on the duplicate enqueue.
-        entries: list[str] = sorted(
-            os.listdir(self.directory),
+        sink.close()
+        # The same id seen across datasets is written once.
+        self.assertEqual(
+            self.path.read_text(encoding='utf-8'),
+            'dQw4w9WgXcQ\n',
         )
-        self.assertEqual(entries, ['dQw4w9WgXcQ'])
 
-    async def test_creates_directory_if_missing(
+    async def test_creates_parent_directory_if_missing(
         self,
     ) -> None:
         target: Path = Path(
-            self._tmp.name, 'fresh', 'level', 'videos',
+            self._tmp.name, 'fresh', 'level', 'videos.lst',
         )
         sink: _VideoFileSink = _VideoFileSink(target)
         await sink.enqueue('abc12345678', source='nested')
-        self.assertTrue(target.is_dir())
-        self.assertTrue((target / 'abc12345678').is_file())
+        sink.close()
+        self.assertTrue(target.parent.is_dir())
+        self.assertEqual(
+            target.read_text(encoding='utf-8'),
+            'abc12345678\n',
+        )
 
-    async def test_file_format_matches_yt_video_queue_import(
+    async def test_file_format_matches_yt_video_queue_add(
         self,
     ) -> None:
-        '''yt_video_queue.py import iterates the directory and
-        enqueues each filename whose suffix matches the 11-
-        character video_id regex. The sink must produce
-        exactly that on-disk shape.
+        '''yt_video_queue.py add --file parses the file with
+        ``_parse_video_ids``, keeping each line matching the
+        11-character video_id regex. The sink must produce
+        exactly that text shape.
         '''
-        sink: _VideoFileSink = _VideoFileSink(self.directory)
+        sink: _VideoFileSink = _VideoFileSink(self.path)
         await sink.enqueue('aaaaaaaaaaa', source='match')
         await sink.enqueue('bbbbbbbbbbb', source='match')
+        sink.close()
 
-        from tools.yt_video_queue import _VIDEO_ID_RE
-        matching: list[str] = sorted(
-            entry for entry in os.listdir(self.directory)
-            if _VIDEO_ID_RE.match(entry)
+        from tools.yt_video_queue import _parse_video_ids
+        parsed: list[str] = _parse_video_ids(
+            self.path.read_text(encoding='utf-8'),
         )
         self.assertEqual(
-            matching, ['aaaaaaaaaaa', 'bbbbbbbbbbb'],
+            parsed, ['aaaaaaaaaaa', 'bbbbbbbbbbb'],
         )
 
     async def test_close_is_idempotent(self) -> None:
-        sink: _VideoFileSink = _VideoFileSink(self.directory)
+        sink: _VideoFileSink = _VideoFileSink(self.path)
         sink.close()
         sink.close()  # must not raise
 

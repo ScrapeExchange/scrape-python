@@ -1,8 +1,11 @@
+import io
+import json
 import unittest
 
 from tools.yt_discover_search import (
     DiscoverSearchSettings,
     DiscoveredChannel,
+    _ChannelEmitter,
     _dedupe_channels,
     _get_continuation_token,
     _extract_words_from_random_payload,
@@ -185,6 +188,104 @@ class TestDedupeChannels(unittest.TestCase):
                 )
             ],
         )
+
+
+class _RecordingStream(io.StringIO):
+    '''StringIO that counts flush() calls.'''
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.flush_count: int = 0
+
+    def flush(self) -> None:
+        self.flush_count += 1
+        super().flush()
+
+
+class TestChannelEmitter(unittest.TestCase):
+    def _lines(self, stream: _RecordingStream) -> list[dict]:
+        return [
+            json.loads(line)
+            for line in stream.getvalue().splitlines()
+        ]
+
+    def test_emits_new_channel_once(self) -> None:
+        stream = _RecordingStream()
+        emitter = _ChannelEmitter(stream)
+
+        self.assertTrue(
+            emitter.emit(DiscoveredChannel('UCabc', '@abc')),
+        )
+        self.assertFalse(
+            emitter.emit(DiscoveredChannel('UCabc', '@abc')),
+        )
+        self.assertEqual(
+            self._lines(stream),
+            [{'channel_id': 'UCabc', 'channel_handle': '@abc'}],
+        )
+
+    def test_skips_duplicate_id_with_new_handle(self) -> None:
+        stream = _RecordingStream()
+        emitter = _ChannelEmitter(stream)
+
+        self.assertTrue(
+            emitter.emit(DiscoveredChannel('UCabc', '@abc')),
+        )
+        self.assertFalse(
+            emitter.emit(DiscoveredChannel('UCabc', '@other')),
+        )
+        self.assertEqual(len(self._lines(stream)), 1)
+
+    def test_handle_only_then_id_reemits_upgrade(self) -> None:
+        stream = _RecordingStream()
+        emitter = _ChannelEmitter(stream)
+
+        self.assertTrue(
+            emitter.emit(DiscoveredChannel(None, '@abc')),
+        )
+        # The richer id+handle record re-emits so the id is kept.
+        self.assertTrue(
+            emitter.emit(DiscoveredChannel('UCabc', '@abc')),
+        )
+        self.assertEqual(
+            self._lines(stream),
+            [
+                {'channel_id': None, 'channel_handle': '@abc'},
+                {'channel_id': 'UCabc', 'channel_handle': '@abc'},
+            ],
+        )
+
+    def test_id_then_handle_only_skips(self) -> None:
+        stream = _RecordingStream()
+        emitter = _ChannelEmitter(stream)
+
+        self.assertTrue(
+            emitter.emit(DiscoveredChannel('UCabc', '@abc')),
+        )
+        self.assertFalse(
+            emitter.emit(DiscoveredChannel(None, '@abc')),
+        )
+        self.assertEqual(len(self._lines(stream)), 1)
+
+    def test_skips_channel_with_no_identity(self) -> None:
+        stream = _RecordingStream()
+        emitter = _ChannelEmitter(stream)
+
+        self.assertFalse(
+            emitter.emit(DiscoveredChannel(None, None)),
+        )
+        self.assertEqual(stream.getvalue(), '')
+
+    def test_flushes_each_emitted_line(self) -> None:
+        stream = _RecordingStream()
+        emitter = _ChannelEmitter(stream)
+
+        emitter.emit(DiscoveredChannel('UCabc', '@abc'))
+        emitter.emit(DiscoveredChannel('UCdef', '@def'))
+        # One flush per written line; the skipped duplicate adds
+        # none.
+        emitter.emit(DiscoveredChannel('UCabc', '@abc'))
+        self.assertEqual(stream.flush_count, 2)
 
 
 if __name__ == '__main__':

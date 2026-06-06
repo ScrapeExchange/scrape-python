@@ -9,9 +9,9 @@ existing Redis-side ingestion tools:
 * ``tools/yt_channel_queue.py import <channels_out>`` — reads
   the JSONL channels file and enqueues each record onto the
   channel scrape queue.
-* ``tools/yt_video_queue.py import <YOUTUBE_VIDEO_DATA_DIR>/new`` —
-  reads the videos sentinel directory and enqueues each filename
-  (one empty file per video_id) onto the video scrape queue.
+* ``tools/yt_video_queue.py add --file <videos_out>`` — reads
+  the videos file (one video_id per line) and enqueues each id
+  onto the video scrape queue.
 
 This split keeps the importer offline-safe (no Redis required to
 extract identifiers from a dataset), reusable across hosts (the
@@ -29,9 +29,8 @@ row a video_id and (optional) channel handle/id are extracted
 via a column-alias mapping. Valid ``UC…`` channel_ids and
 validated handles are appended to ``channels_out`` as JSONL
 records compatible with :func:`tools.yt_channel_queue.cmd_import`.
-Video ids are recorded as one empty file each in
-``video_data_dir/new``, matching what
-:func:`tools.yt_video_queue.cmd_import` consumes.
+Video ids are written one per line to ``videos_out``, matching
+what :func:`tools.yt_video_queue.cmd_add` consumes.
 
 The legacy ``--csv-file`` flag is preserved as a manual override
 for offline work; when set, no Kaggle download happens and the
@@ -48,8 +47,8 @@ Examples:
       --csv-file /path/to/dataset.parquet
 
   # After the import, push the records into Redis:
-  python tools/yt_channel_queue.py import imported-channels.jsonl
-  python tools/yt_video_queue.py import imported-videos/new
+  python tools/yt_channel_queue.py import import-channels.jsonl
+  python tools/yt_video_queue.py add --file import-videos.lst
 
 :author    : Boinko <boinko@scrape.exchange>
 :copyright : 2026 Boinko
@@ -140,7 +139,7 @@ class _ChannelFileSink:
 
     .. code-block:: shell
 
-        yt_channel_queue.py import imported-channels.jsonl
+        yt_channel_queue.py import import-channels.jsonl
 
     Method names mirror the previously-used
     ``RedisChannelScrapeQueue`` so the call sites in this module
@@ -195,41 +194,48 @@ class _ChannelFileSink:
 
 
 class _VideoFileSink:
-    '''Sink that records each video_id by touching an empty
-    file named after the id in a local directory.
+    '''Append-only sink that writes one ``video_id`` per line to
+    a local file.
 
     This is the exact on-disk shape
-    ``tools/yt_video_queue.py import <directory>`` expects:
-    every filename matching the 11-char video_id regex is
-    enqueued and then unlinked.
+    ``tools/yt_video_queue.py add --file <file>`` expects: every
+    line matching the 11-char video_id regex is enqueued.
 
-    Method name (``enqueue``) mirrors
-    ``RedisVideoScrapeQueue`` so the call sites in this module
-    remain unchanged.
+    Within one run an in-memory ``seen`` set deduplicates ids, so
+    a video appearing across multiple datasets is written once —
+    preserving the idempotence the previous per-file sink got for
+    free from the filesystem.
+
+    Method name (``enqueue``) mirrors ``RedisVideoScrapeQueue`` so
+    the call sites in this module remain unchanged.
     '''
 
-    def __init__(self, directory: Path) -> None:
-        self._directory: Path = directory
-        directory.mkdir(parents=True, exist_ok=True)
+    def __init__(self, path: Path) -> None:
+        self._path: Path = path
+        self._seen: set[str] = set()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # buffered text-mode append, symmetric with
+        # ``_ChannelFileSink``. ``flush`` happens in ``close``.
+        self._fh = open(  # noqa: SIM115 — long-lived sink
+            path, 'a', encoding='utf-8',
+        )
 
     async def enqueue(
         self, video_id: str, *, source: str,
     ) -> None:
         del source  # the file sink stores no per-record source
-        # ``touch(exist_ok=True)`` makes re-runs idempotent —
-        # the same video_id seen across multiple datasets in
-        # one run is recorded once.
-        (self._directory / video_id).touch(exist_ok=True)
+        if video_id in self._seen:
+            return
+        self._seen.add(video_id)
+        self._fh.write(video_id + '\n')
 
     def close(self) -> None:
-        '''Symmetric with _ChannelFileSink; the video sink has
-        no resources to release but exposing close() keeps the
-        ownership shape uniform.'''
-
-
-def _video_sentinel_dir(video_data_dir: Path) -> Path:
-    '''Return the ``new/`` child directory for video-id sentinels.'''
-    return video_data_dir / 'new'
+        '''Flush and close the underlying file handle. Safe to
+        call more than once.'''
+        if self._fh is not None:
+            self._fh.flush()
+            self._fh.close()
+            self._fh = None
 
 
 # Dataset slugs (``owner/name``) processed by default. URLs and
@@ -378,7 +384,7 @@ class ImportKaggleTrendingSettings(BaseSettings):
         ),
     )
     channels_out: str = Field(
-        default='imported-channels.jsonl',
+        default='import-channels.jsonl',
         validation_alias=AliasChoices(
             'CHANNELS_OUT', 'channels_out',
         ),
@@ -391,23 +397,18 @@ class ImportKaggleTrendingSettings(BaseSettings):
             '``yt_channel_queue.py import <channels_out>``.'
         ),
     )
-    video_data_dir: str = Field(
-        default='imported-videos',
+    videos_out: str = Field(
+        default='import-videos.lst',
         validation_alias=AliasChoices(
-            'VIDEOS_OUT_DIR',
-            'videos_out_dir',
-            'YOUTUBE_VIDEO_DATA_DIR',
-            'youtube_video_data_dir',
+            'VIDEOS_OUT', 'videos_out',
         ),
         description=(
-            'Path to the videos data root. Each '
-            'discovered ``video_id`` becomes an empty file '
-            'named after the id under the ``new/`` child '
-            'directory, matching what '
-            '``tools/yt_video_queue.py import <dir>/new`` '
-            'consumes. The video queue tool unlinks each file '
-            'as it enqueues, so a re-run after a partial '
-            'import only processes the leftovers.'
+            'Path to the videos output file. Each discovered '
+            '``video_id`` is written on its own line; the file '
+            'format matches what '
+            '``tools/yt_video_queue.py add --file`` consumes, '
+            'so an operator finalises the load with '
+            '``yt_video_queue.py add --file <videos_out>``.'
         ),
     )
     log_level: str = Field(
@@ -1255,18 +1256,16 @@ async def main() -> int:
     )
 
     channels_path: Path = Path(settings.channels_out)
-    videos_dir: Path = _video_sentinel_dir(
-        Path(settings.video_data_dir),
-    )
+    videos_path: Path = Path(settings.videos_out)
     channel_queue: _ChannelFileSink = _ChannelFileSink(
         channels_path,
     )
-    video_queue: _VideoFileSink = _VideoFileSink(videos_dir)
+    video_queue: _VideoFileSink = _VideoFileSink(videos_path)
     _LOGGER.info(
         'Writing imported records to local files',
         extra={
             'channels_out': str(channels_path),
-            'video_data_dir': str(videos_dir),
+            'videos_out': str(videos_path),
         },
     )
     try:
@@ -1283,10 +1282,10 @@ async def main() -> int:
         _LOGGER.info(
             'Closed import sinks; finalise with '
             'yt_channel_queue.py import + '
-            'yt_video_queue.py import',
+            'yt_video_queue.py add --file',
             extra={
                 'channels_out': str(channels_path),
-                'video_data_dir': str(videos_dir),
+                'videos_out': str(videos_path),
             },
         )
 
