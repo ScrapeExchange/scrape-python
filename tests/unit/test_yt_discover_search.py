@@ -1,6 +1,10 @@
 import io
 import json
 import unittest
+from unittest import mock
+
+import httpx
+from innertube.errors import RequestError as InnerTubeRequestError
 
 from tools.yt_discover_search import (
     DiscoverSearchSettings,
@@ -10,6 +14,8 @@ from tools.yt_discover_search import (
     _get_continuation_token,
     _extract_words_from_random_payload,
     _normalise_handle,
+    _search_page_with_retry,
+    discover_for_term,
     extract_channels,
 )
 
@@ -286,6 +292,123 @@ class TestChannelEmitter(unittest.TestCase):
         # none.
         emitter.emit(DiscoveredChannel('UCabc', '@abc'))
         self.assertEqual(stream.flush_count, 2)
+
+
+class _FakeLimiter:
+    '''Minimal stand-in for YouTubeRateLimiter in tests.'''
+
+    def select_proxy(self, _call_type: object) -> str | None:
+        return None
+
+
+async def _drain(agen) -> list:
+    return [item async for item in agen]
+
+
+class TestSearchPageWithRetry(unittest.IsolatedAsyncioTestCase):
+    async def test_returns_payload_on_first_attempt(self) -> None:
+        payload = {'ok': True}
+        with mock.patch(
+            'tools.yt_discover_search._innertube_search',
+            new=mock.AsyncMock(return_value=payload),
+        ) as search:
+            result = await _search_page_with_retry(
+                'term', continuation=None, proxy=None,
+                limiter=_FakeLimiter(),
+            )
+        self.assertEqual(result, payload)
+        self.assertEqual(search.await_count, 1)
+
+    async def test_retries_once_then_succeeds(self) -> None:
+        payload = {'ok': True}
+        search = mock.AsyncMock(
+            side_effect=[httpx.ReadTimeout('slow'), payload],
+        )
+        with mock.patch(
+            'tools.yt_discover_search._innertube_search', new=search,
+        ), mock.patch(
+            'tools.yt_discover_search.asyncio.sleep',
+            new=mock.AsyncMock(),
+        ) as sleep:
+            result = await _search_page_with_retry(
+                'term', continuation=None, proxy=None,
+                limiter=_FakeLimiter(),
+            )
+        self.assertEqual(result, payload)
+        self.assertEqual(search.await_count, 2)
+        sleep.assert_awaited_once()
+
+    async def test_returns_none_after_two_transient_failures(
+        self,
+    ) -> None:
+        search = mock.AsyncMock(
+            side_effect=[
+                httpx.ConnectError('boom'),
+                InnerTubeRequestError('500'),
+            ],
+        )
+        with mock.patch(
+            'tools.yt_discover_search._innertube_search', new=search,
+        ), mock.patch(
+            'tools.yt_discover_search.asyncio.sleep',
+            new=mock.AsyncMock(),
+        ):
+            result = await _search_page_with_retry(
+                'term', continuation=None, proxy=None,
+                limiter=_FakeLimiter(),
+            )
+        self.assertIsNone(result)
+        self.assertEqual(search.await_count, 2)
+
+    async def test_non_transient_error_propagates(self) -> None:
+        search = mock.AsyncMock(side_effect=ValueError('bug'))
+        with mock.patch(
+            'tools.yt_discover_search._innertube_search', new=search,
+        ):
+            with self.assertRaises(ValueError):
+                await _search_page_with_retry(
+                    'term', continuation=None, proxy=None,
+                    limiter=_FakeLimiter(),
+                )
+        self.assertEqual(search.await_count, 1)
+
+
+class TestDiscoverForTermFailure(
+    unittest.IsolatedAsyncioTestCase,
+):
+    async def test_stops_term_when_page_gives_up(self) -> None:
+        '''A None page (retry exhausted) ends the term but keeps
+        channels yielded from the earlier successful page.'''
+
+        page_one = {
+            'channelRenderer': {
+                'channelId': 'UC22BdTgxefuvUivrjesETjg',
+            },
+            'continuationItemRenderer': {
+                'continuationEndpoint': {
+                    'continuationCommand': {'token': 'NEXT'},
+                },
+            },
+        }
+        # First page returns a payload with a continuation token;
+        # the second page exhausts its retry and returns None.
+        retry = mock.AsyncMock(side_effect=[page_one, None])
+        with mock.patch(
+            'tools.yt_discover_search._search_page_with_retry',
+            new=retry,
+        ):
+            channels = await _drain(
+                discover_for_term(
+                    'term', continuations=5,
+                    limiter=_FakeLimiter(),
+                )
+            )
+        self.assertEqual(
+            channels,
+            [DiscoveredChannel('UC22BdTgxefuvUivrjesETjg', None)],
+        )
+        # Two pages attempted: the good one and the one that gave up.
+        self.assertEqual(retry.await_count, 2)
 
 
 if __name__ == '__main__':

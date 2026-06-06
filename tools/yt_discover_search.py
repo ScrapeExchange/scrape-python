@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Iterable
 
 import httpx
+from innertube.errors import RequestError as InnerTubeRequestError
 from pydantic import AliasChoices, Field
 from pydantic_settings import CliPositionalArg, SettingsConfigDict
 
@@ -45,6 +46,21 @@ _OFFLINE_RANDOM_TERMS: tuple[str, ...] = (
     'viaggio', 'wissenschaft', 'jardin', 'cidade',
     'tecnologia', 'familia', 'natureza',
 )
+
+# Transient errors from an InnerTube search call that should not
+# crash the run: a timed-out / failed page yields no continuation
+# token, so the term simply ends and the next term continues.
+# Mirrors the set caught in
+# ``scrape_exchange/youtube/youtube_client.py``. ``InnerTubeRequestError``
+# covers HTTP 4xx/5xx responses from YouTube.
+_TRANSIENT_SEARCH_ERRORS: tuple[type[BaseException], ...] = (
+    httpx.TimeoutException,
+    httpx.ConnectError,
+    ConnectionResetError,
+    ConnectionRefusedError,
+    InnerTubeRequestError,
+)
+_SEARCH_RETRY_BACKOFF_SECONDS: float = 2.0
 
 
 @dataclass(frozen=True)
@@ -402,6 +418,50 @@ async def _innertube_search(
     return result
 
 
+async def _search_page_with_retry(
+    term: str,
+    *,
+    continuation: str | None,
+    proxy: str | None,
+    limiter: YouTubeRateLimiter,
+) -> dict[str, Any] | None:
+    '''Fetch one InnerTube search page, retrying once on a
+    transient error.
+
+    Returns the search payload, or ``None`` when both the initial
+    attempt and the single retry failed with a transient error
+    (timeout / connection reset / InnerTube request error). A
+    ``None`` return tells the caller to stop paginating the
+    current term and move on; non-transient errors propagate.
+    '''
+
+    for attempt in range(2):  # initial attempt + one retry
+        try:
+            return await _innertube_search(
+                term,
+                continuation=continuation,
+                proxy=proxy,
+                limiter=limiter,
+            )
+        except _TRANSIENT_SEARCH_ERRORS as exc:
+            action: str = (
+                'retrying' if attempt == 0 else 'giving up on term'
+            )
+            _LOGGER.warning(
+                f'InnerTube search page failed; {action}',
+                exc=exc,
+                extra={
+                    'search_term': term,
+                    'error_type': type(exc).__name__,
+                    'attempt': attempt,
+                    'has_continuation': bool(continuation),
+                },
+            )
+            if attempt == 0:
+                await asyncio.sleep(_SEARCH_RETRY_BACKOFF_SECONDS)
+    return None
+
+
 async def discover_for_term(
     term: str,
     *,
@@ -415,6 +475,11 @@ async def discover_for_term(
     are yielded in discovery order. Cross-page and cross-term
     deduplication is the caller's responsibility (see
     :class:`_ChannelEmitter`).
+
+    A page that fails transiently (timeout / connection error /
+    InnerTube request error) is retried once; if it still fails
+    the term stops paginating and the caller continues with the
+    next term. Channels yielded from earlier pages are kept.
     '''
 
     proxy = limiter.select_proxy(YouTubeCallType.BROWSE)
@@ -423,12 +488,14 @@ async def discover_for_term(
 
     for page in range(pages):
         start = time.monotonic()
-        payload = await _innertube_search(
+        payload = await _search_page_with_retry(
             term,
             continuation=continuation,
             proxy=proxy,
             limiter=limiter,
         )
+        if payload is None:
+            break
         for channel in extract_channels(payload):
             yield channel
         continuation = _get_continuation_token(payload)
