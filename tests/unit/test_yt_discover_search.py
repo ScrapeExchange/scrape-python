@@ -360,6 +360,29 @@ class TestSearchPageWithRetry(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result)
         self.assertEqual(search.await_count, 2)
 
+    async def test_proxy_error_is_transient(self) -> None:
+        '''A proxy 503 (httpx.ProxyError) must be treated as
+        transient and retried/skipped, not crash the tool.'''
+
+        search = mock.AsyncMock(
+            side_effect=[
+                httpx.ProxyError('503 Service Unavailable'),
+                httpx.ProxyError('503 Service Unavailable'),
+            ],
+        )
+        with mock.patch(
+            'tools.yt_discover_search._innertube_search', new=search,
+        ), mock.patch(
+            'tools.yt_discover_search.asyncio.sleep',
+            new=mock.AsyncMock(),
+        ):
+            result = await _search_page_with_retry(
+                'term', continuation=None, proxy=None,
+                limiter=_FakeLimiter(),
+            )
+        self.assertIsNone(result)
+        self.assertEqual(search.await_count, 2)
+
     async def test_non_transient_error_propagates(self) -> None:
         search = mock.AsyncMock(side_effect=ValueError('bug'))
         with mock.patch(

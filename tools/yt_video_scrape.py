@@ -73,7 +73,6 @@ from scrape_exchange.scraper_metrics import (
 )
 
 
-
 # Ordered table of yt-dlp error classifications. Each entry is
 # ``(reason, [substring, ...])``; the first reason whose substring
 # list contains a substring of the *lowercased* error string wins.

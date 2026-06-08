@@ -54,8 +54,12 @@ _OFFLINE_RANDOM_TERMS: tuple[str, ...] = (
 # ``scrape_exchange/youtube/youtube_client.py``. ``InnerTubeRequestError``
 # covers HTTP 4xx/5xx responses from YouTube.
 _TRANSIENT_SEARCH_ERRORS: tuple[type[BaseException], ...] = (
-    httpx.TimeoutException,
-    httpx.ConnectError,
+    # Base class for all httpx transport-level failures: timeouts,
+    # connect errors, network errors, proxy errors (e.g. a proxy
+    # returning 503), and protocol errors. A flapping proxy is
+    # transient, so the whole family is retried/skipped rather than
+    # crashing the run.
+    httpx.TransportError,
     ConnectionResetError,
     ConnectionRefusedError,
     InnerTubeRequestError,
@@ -208,9 +212,11 @@ async def choose_random_search_terms(
     '''Return *count* random search terms, falling back offline.'''
 
     count = max(1, count)
-    languages = _normalise_languages(settings.random_word_languages)
-    lang = random_word_language or random.choice(languages)
-    url = random_word_url or settings.random_word_url
+    languages: tuple[str, ...] = _normalise_languages(
+        settings.random_word_languages
+    )
+    lang: str = random_word_language or random.choice(languages)
+    url: str = random_word_url or settings.random_word_url
     params: dict[str, str | int] = {
         'number': count,
         'length': random.randint(5, 12),
@@ -219,12 +225,12 @@ async def choose_random_search_terms(
         params['lang'] = lang
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(url, params=params)
+            response: httpx.Response = await client.get(url, params=params)
             response.raise_for_status()
-            words = _extract_words_from_random_payload(
+            words: list[str] = _extract_words_from_random_payload(
                 response.json(),
             )
-            usable = [word for word in words if len(word) >= 5]
+            usable: list[str] = [word for word in words if len(word) >= 5]
             if usable:
                 if len(usable) < count:
                     usable.extend(
@@ -234,7 +240,7 @@ async def choose_random_search_terms(
                 return usable[:count]
             raise ValueError('random-word API returned no usable word')
     except Exception as exc:
-        fallback = [
+        fallback: list[str] = [
             random.choice(_OFFLINE_RANDOM_TERMS)
             for _ in range(count)
         ]
@@ -256,7 +262,8 @@ def _is_channel_id(value: object) -> bool:
 def _normalise_handle(value: object) -> str | None:
     if not isinstance(value, str):
         return None
-    text = value.strip()
+
+    text: str = value.strip()
     if not text:
         return None
     if text.startswith('https://www.youtube.com/'):
@@ -266,11 +273,12 @@ def _normalise_handle(value: object) -> str | None:
     if text.startswith('/'):
         text = text[1:]
     if text.startswith('@'):
-        handle = text.split('/', 1)[0]
+        handle: str = text.split('/', 1)[0]
     elif text.startswith('channel/'):
         return None
     else:
         return None
+
     if ' ' in handle or '/' in handle or len(handle) <= 1:
         return None
     return handle
@@ -342,10 +350,11 @@ def extract_channels(payload: dict[str, Any]) -> list[DiscoveredChannel]:
         if 'browseEndpoint' in value and isinstance(
             value['browseEndpoint'], dict,
         ):
-            candidate = _candidate_from_browse_endpoint(
-                value['browseEndpoint'],
-                parent if isinstance(parent, dict) else value,
-            )
+            candidate: DiscoveredChannel | None = \
+                _candidate_from_browse_endpoint(
+                    value['browseEndpoint'],
+                    parent if isinstance(parent, dict) else value,
+                )
             if candidate is not None:
                 candidates.append(candidate)
     return _dedupe_channels(candidates)
@@ -360,7 +369,7 @@ def _dedupe_channels(
     for channel in channels:
         if channel.channel_id is None and channel.channel_handle is None:
             continue
-        key = (
+        key: str = (
             f'id:{channel.channel_id}'
             if channel.channel_id is not None
             else f'handle:{channel.channel_handle}'
@@ -370,10 +379,10 @@ def _dedupe_channels(
             and channel.channel_handle is not None
             and channel.channel_handle in handle_to_key
         ):
-            old_key = handle_to_key[channel.channel_handle]
+            old_key: str = handle_to_key[channel.channel_handle]
             if old_key.startswith('handle:'):
                 by_key.pop(old_key, None)
-        existing = by_key.get(key)
+        existing: DiscoveredChannel | None = by_key.get(key)
         if existing is not None:
             channel = DiscoveredChannel(
                 existing.channel_id or channel.channel_id,
