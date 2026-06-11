@@ -222,7 +222,8 @@ def _build_parser() -> ArgumentParser:
         help=(
             'one of: not_found, invalid_handle, '
             'inconsistent_identity, terminated, '
-            'unresolved, removed, soft_unavailable'
+            'unresolved, removed, soft_unavailable, '
+            'hard_unavailable, topic, no_videos, low_subs'
         ),
     )
     c_mark.add_argument('--note', default=None)
@@ -395,7 +396,8 @@ def _build_parser() -> ArgumentParser:
             "'not_found', 'unresolved', 'terminated', "
             "'removed', 'invalid_handle', "
             "'inconsistent_identity', 'soft_unavailable', "
-            "'hard_unavailable')."
+            "'hard_unavailable', 'topic', 'no_videos', "
+            "'low_subs')."
         ),
     )
     c_export.add_argument(

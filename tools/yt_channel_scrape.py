@@ -96,6 +96,7 @@ PRIORITY_MAX_RETRIES: int = 5
 
 MAX_NEW_CHANNELS: int = 1000
 MAX_RESOLVED_CHANNELS: int = 100
+MIN_CHANNEL_SUBSCRIBERS: int = 10
 
 
 class ChannelSettings(YouTubeScraperSettings):
@@ -1520,6 +1521,54 @@ async def _self_heal_identity(
             )
 
 
+def _channel_is_topic(channel: YouTubeChannel) -> bool:
+    '''Return True for YouTube auto-generated topic channels.'''
+    title: Any = getattr(channel, 'title', None)
+    if (
+        isinstance(title, str)
+        and title.casefold().endswith(' - topic')
+    ):
+        return True
+    handle: Any = getattr(channel, 'channel_handle', None)
+    if (
+        isinstance(handle, str)
+        and handle.casefold().endswith('-topic')
+    ):
+        return True
+    return False
+
+
+def _channel_has_no_videos(channel: YouTubeChannel) -> bool:
+    '''Return True when scrape data confirms no videos.'''
+    video_count: Any = getattr(channel, 'video_count', None)
+    return isinstance(video_count, int) and video_count == 0
+
+
+def _channel_has_low_subscribers(
+    channel: YouTubeChannel,
+) -> bool:
+    '''Return True when scrape data confirms too few subscribers.'''
+    subscriber_count: Any = getattr(
+        channel, 'subscriber_count', None,
+    )
+    return (
+        isinstance(subscriber_count, int)
+        and subscriber_count < MIN_CHANNEL_SUBSCRIBERS
+    )
+
+
+def _channel_end_state(
+    channel: YouTubeChannel,
+) -> ChannelState | None:
+    if _channel_is_topic(channel):
+        return ChannelState.TOPIC
+    if _channel_has_low_subscribers(channel):
+        return ChannelState.LOW_SUBS
+    if _channel_has_no_videos(channel):
+        return ChannelState.NO_VIDEOS
+    return None
+
+
 async def _scrape_one_queued(
     channel_id: str,
     *,
@@ -1647,12 +1696,32 @@ async def _scrape_one_queued(
                 outcome='soft_unavailable',
             ).inc()
         return
+    await _self_heal_identity(channel, identity, name_map)
+    end_state: ChannelState | None = _channel_end_state(channel)
+    if end_state is not None:
+        await queue.mark(
+            member,
+            state=end_state,
+            note='channel matched terminal end-state',
+            extra={
+                'subscriber_count': channel.subscriber_count,
+                'video_count': channel.video_count,
+            },
+        )
+        CHANNEL_SCRAPE_OUTCOMES.labels(
+            outcome=end_state.value,
+        ).inc()
+        if force_mode:
+            CHANNEL_FORCE_RESCRAPE_TOTAL.labels(
+                mode=force_mode,
+                outcome=end_state.value,
+            ).inc()
+        return
     await queue.update_tier(
         channel_id,
         sub_count=channel.subscriber_count or 0,
         now=time.time(),
     )
-    await _self_heal_identity(channel, identity, name_map)
     if force_mode:
         await queue.clear_force_rescrape(member)
         CHANNEL_FORCE_RESCRAPE_TOTAL.labels(

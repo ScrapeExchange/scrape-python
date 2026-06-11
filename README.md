@@ -170,7 +170,8 @@ PYTHONPATH=. uv run tools/yt_channel_queue.py rescrape \
 # Remove from the queue
 PYTHONPATH=. uv run tools/yt_channel_queue.py remove @veritasium
 
-# Mark / unmark a state (not_found, terminated, etc.)
+# Mark a terminal state (not_found, terminated, topic,
+# no_videos, low_subs, etc.)
 PYTHONPATH=. uv run tools/yt_channel_queue.py mark @veritasium not_found
 ```
 

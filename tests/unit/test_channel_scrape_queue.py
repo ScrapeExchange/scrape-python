@@ -29,6 +29,13 @@ class TestChannelStateEnum(unittest.TestCase):
             ChannelState.PENDING_RESOLUTION.value,
             'pending_resolution',
         )
+        self.assertEqual(ChannelState.TOPIC.value, 'topic')
+        self.assertEqual(
+            ChannelState.NO_VIDEOS.value, 'no_videos',
+        )
+        self.assertEqual(
+            ChannelState.LOW_SUBS.value, 'low_subs',
+        )
 
     def test_terminal_states_set(self) -> None:
         terminal: frozenset[ChannelState] = (
@@ -38,6 +45,9 @@ class TestChannelStateEnum(unittest.TestCase):
         self.assertIn(
             ChannelState.SOFT_UNAVAILABLE, terminal,
         )
+        self.assertIn(ChannelState.TOPIC, terminal)
+        self.assertIn(ChannelState.NO_VIDEOS, terminal)
+        self.assertIn(ChannelState.LOW_SUBS, terminal)
         self.assertNotIn(
             ChannelState.SCHEDULED, terminal,
         )

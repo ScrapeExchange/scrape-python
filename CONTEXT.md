@@ -150,6 +150,22 @@ distinct from `soft_unavailable`: needs operator action to come
 back. Most often correlates with channels that are functionally
 gone but didn't trigger a clean `not_found` or `terminated` signal.
 
+**topic**:
+The scraped channel is a YouTube auto-generated Topic channel. Topic
+channels are terminal for the channel scrape queue because they are
+not creator accounts we want to refresh as channels.
+
+**no_videos**:
+The scraped channel exists, but YouTube reports `video_count = 0`.
+These channels are terminal until an operator explicitly restores
+them; the RSS path has no useful feed work to do for them.
+
+**low_subs**:
+The scraped channel exists, but its subscriber count is below the
+minimum population threshold for this scrape fleet. The current
+threshold is 10 subscribers. Operators can restore a channel later
+with `yt_channel_queue unmark` or `yt_channel_queue rescrape`.
+
 ### Redis identity maps
 
 Three Redis hashes give every direction of lookup between the identity

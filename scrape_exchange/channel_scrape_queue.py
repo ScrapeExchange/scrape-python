@@ -139,6 +139,7 @@ local states = {
     'inconsistent_identity', 'terminated',
     'unresolved', 'removed',
     'soft_unavailable', 'hard_unavailable',
+    'topic', 'no_videos', 'low_subs',
 }
 for _, s in ipairs(states) do
     redis.call(
@@ -183,6 +184,7 @@ local states = {
     'inconsistent_identity', 'terminated',
     'unresolved', 'removed',
     'soft_unavailable', 'hard_unavailable',
+    'topic', 'no_videos', 'low_subs',
 }
 for _, s in ipairs(states) do
     redis.call(
@@ -265,6 +267,9 @@ class ChannelState(str, enum.Enum):
     REMOVED = 'removed'
     SOFT_UNAVAILABLE = 'soft_unavailable'
     HARD_UNAVAILABLE = 'hard_unavailable'
+    TOPIC = 'topic'
+    NO_VIDEOS = 'no_videos'
+    LOW_SUBS = 'low_subs'
 
     @classmethod
     def terminal_states(
@@ -279,6 +284,9 @@ class ChannelState(str, enum.Enum):
             cls.REMOVED,
             cls.SOFT_UNAVAILABLE,
             cls.HARD_UNAVAILABLE,
+            cls.TOPIC,
+            cls.NO_VIDEOS,
+            cls.LOW_SUBS,
         })
 
 
