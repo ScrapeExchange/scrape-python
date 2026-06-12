@@ -464,6 +464,7 @@ async def _search_page_with_retry(
                     'error_type': type(exc).__name__,
                     'attempt': attempt,
                     'has_continuation': bool(continuation),
+                    'proxy': proxy,
                 },
             )
             if attempt == 0:
