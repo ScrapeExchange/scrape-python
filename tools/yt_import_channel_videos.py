@@ -33,6 +33,7 @@ from scrape_exchange.brotli import brotli_read
 from scrape_exchange.redis_client import redis_from_url
 from scrape_exchange.video_scrape_queue import (
     RedisVideoScrapeQueue,
+    VideoQueueChannelContext,
     VideoScrapeQueueSettings,
 )
 
@@ -81,8 +82,10 @@ class ImportChannelVideosSettings(BaseSettings):
     )
 
 
-def _read_video_ids(path: Path) -> list[str]:
-    '''Return the channel file's ``video_ids`` as a list.
+def _read_channel_file(
+    path: Path,
+) -> tuple[list[str], VideoQueueChannelContext]:
+    '''Return the channel file's ``video_ids`` and channel context.
 
     Delegates the brotli-decompress + JSON-parse + corruption-
     recovery cycle to :func:`scrape_exchange.brotli.brotli_read`;
@@ -96,12 +99,18 @@ def _read_video_ids(path: Path) -> list[str]:
     '''
     data: dict = brotli_read(path)
     video_ids: list = list(data.get('video_ids', []))
-    return [str(v) for v in video_ids]
+    return [str(v) for v in video_ids], VideoQueueChannelContext(
+        channel_id=data.get('channel_id') or None,
+        channel_handle=data.get('channel_handle') or None,
+        channel_url=data.get('channel_url') or None,
+        channel_is_verified=data.get('channel_is_verified'),
+    )
 
 
 async def _enqueue_all(
     video_ids: list[str],
     queue: RedisVideoScrapeQueue,
+    channel_context: VideoQueueChannelContext,
 ) -> tuple[int, int, int]:
     '''Enqueue each video id and return counters.
 
@@ -125,7 +134,14 @@ async def _enqueue_all(
             continue
         try:
             await queue.enqueue(
-                video_id, source=_SOURCE_LABEL,
+                video_id,
+                source=_SOURCE_LABEL,
+                channel_id=channel_context.channel_id,
+                channel_handle=channel_context.channel_handle,
+                channel_url=channel_context.channel_url,
+                channel_is_verified=(
+                    channel_context.channel_is_verified
+                ),
             )
             enqueued += 1
         except Exception as exc:
@@ -154,12 +170,14 @@ async def main_async() -> int:
         )
         return 2
 
-    video_ids: list[str] = _read_video_ids(path)
+    video_ids, channel_context = _read_channel_file(path)
     logging.info(
         'Read video_ids from channel file',
         extra={
             'channel_file': str(path),
             'video_count': len(video_ids),
+            'channel_id': channel_context.channel_id,
+            'channel_handle': channel_context.channel_handle,
         },
     )
     if not video_ids:
@@ -178,7 +196,9 @@ async def main_async() -> int:
     )
     try:
         enqueued, skipped, errors = (
-            await _enqueue_all(video_ids, queue)
+            await _enqueue_all(
+                video_ids, queue, channel_context,
+            )
         )
     finally:
         await redis.aclose()

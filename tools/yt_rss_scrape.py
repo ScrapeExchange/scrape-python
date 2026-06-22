@@ -276,7 +276,7 @@ METRIC_TIER_POPULATION: Gauge = Gauge(
     'Total cids in rss:<platform>:tiers HASH bucketed by '
     'their assigned tier. Includes queued, claimed, no_feeds '
     'and orphan cids alike — for the queued subset see '
-    'scrape_queue_size{tier=N}. Populated by the dedicated '
+    'scrape_queue_size{state=N}. Populated by the dedicated '
     'queue-metrics loop on a single worker per host; '
     'aggregate across instances with max by (tier), not sum.',
     ['platform', 'scraper', 'tier'],
@@ -1075,7 +1075,31 @@ async def _queue_video_for_scrape(
         'channel_handle': channel_handle,
     }
     try:
-        await video_queue.enqueue(video_id, source='rss')
+        video_channel_id: str | None = (
+            video.channel_id if isinstance(video.channel_id, str)
+            and video.channel_id else None
+        )
+        video_channel_handle: str | None = (
+            video.channel_handle
+            if isinstance(video.channel_handle, str)
+            and video.channel_handle else channel_handle
+        )
+        video_channel_url: str | None = (
+            video.channel_url if isinstance(video.channel_url, str)
+            and video.channel_url else None
+        )
+        video_channel_is_verified: bool | None = (
+            video.channel_is_verified
+            if isinstance(video.channel_is_verified, bool) else None
+        )
+        await video_queue.enqueue(
+            video_id,
+            source='rss',
+            channel_id=video_channel_id,
+            channel_handle=video_channel_handle,
+            channel_url=video_channel_url,
+            channel_is_verified=video_channel_is_verified,
+        )
     except Exception as exc:
         logging.warning(
             'Failed to enqueue video for scrape, '
@@ -1956,12 +1980,14 @@ async def _publish_queue_sizes(
 ) -> None:
     '''Set the per-tier queue size gauges from Redis ZCARD.
 
-    Queue size is shared state, not per-worker. The metric has
-    no ``worker_id`` label; publication is gated to a single
-    worker per host (``WORKER_ID == '1'``) by the caller. Two
-    publishers fleet-wide (one per supervisor host) → use
-    ``max by (tier)`` in PromQL when aggregating across
-    instances; ``sum`` would double-count.
+    Queue size is shared state, not per-worker. The metric still
+    carries ``worker_id`` as part of the shared scrape_queue_size
+    schema; RSS publishes it as the empty string so every worker on
+    one host collides into one live-most-recent series. Publication is
+    gated to a single worker per host (``WORKER_ID == '1'``) by the
+    caller. Multiple publishers fleet-wide must be collapsed with
+    ``max by (tier)`` in PromQL before summing; summing raw series
+    would double-count.
     '''
 
     sizes: dict[int, int] = (
@@ -1972,7 +1998,7 @@ async def _publish_queue_sizes(
             platform='youtube',
             scraper='rss_scraper',
             entity='rss_feed',
-            tier=str(tier),
+            state=str(tier),
             worker_id='',
         ).set(count)
 

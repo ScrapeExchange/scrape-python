@@ -21,6 +21,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import orjson
+import brotli
 import websockets.exceptions
 import websockets.frames
 
@@ -500,6 +501,57 @@ class TestCollectChannelRecordValidator(
     unittest.IsolatedAsyncioTestCase,
 ):
 
+    async def test_unrecoverable_brotli_requeued_then_deleted(
+        self,
+    ) -> None:
+        from tools.yt_channel_upload import _collect_channel_record
+
+        fm = AsyncMock()
+        fm.read_file.side_effect = brotli.error('corrupt')
+        scrape_queue = AsyncMock()
+        events: list[str] = []
+        scrape_queue.force_rescrape.side_effect = (
+            lambda *args, **kwargs: events.append('requeue')
+        )
+        fm.delete.side_effect = (
+            lambda *args, **kwargs: events.append('delete')
+        )
+
+        result = await _collect_channel_record(
+            'channel-UCabc.json.br', fm,
+            AsyncMock(), AsyncMock(), MagicMock(), scrape_queue,
+        )
+
+        self.assertIsNone(result)
+        scrape_queue.force_rescrape.assert_awaited_once_with(
+            'i:UCabc', mode='full',
+            source='channel_upload_corrupt_file',
+        )
+        fm.delete.assert_awaited_once_with(
+            'channel-UCabc.json.br', fail_ok=False,
+        )
+        self.assertEqual(events, ['requeue', 'delete'])
+
+    async def test_requeue_failure_preserves_corrupt_file(self) -> None:
+        from tools.yt_channel_upload import _collect_channel_record
+
+        fm = AsyncMock()
+        fm.read_file.side_effect = brotli.error('corrupt')
+        scrape_queue = AsyncMock()
+        scrape_queue.force_rescrape.side_effect = RuntimeError(
+            'redis unavailable',
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError, 'redis unavailable',
+        ):
+            await _collect_channel_record(
+                'channel-UCabc.json.br', fm,
+                AsyncMock(), AsyncMock(), MagicMock(), scrape_queue,
+            )
+
+        fm.delete.assert_not_awaited()
+
     async def test_invalid_record_marked_invalid_and_skipped(
         self,
     ) -> None:
@@ -547,6 +599,69 @@ class TestCollectChannelRecordValidator(
 class TestUnifiedBulkUploadLoopValidator(
     unittest.IsolatedAsyncioTestCase,
 ):
+
+    async def test_pending_scan_ignores_file_removed_after_listing(
+        self,
+    ) -> None:
+        from tools.yt_channel_upload import _pending_channel_paths
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            existing = base_dir / 'channel-UCok.json.br'
+            removed = base_dir / 'channel-UCgone.json.br'
+            existing.write_bytes(b'{}')
+
+            fm = MagicMock()
+            fm.base_dir = base_dir
+            fm.list_base.return_value = [removed.name, existing.name]
+
+            paths = _pending_channel_paths(fm, set(), 100)
+
+        self.assertEqual(paths, [existing])
+
+    async def test_corrupt_file_requeued_and_deleted(self) -> None:
+        from tools.yt_channel_upload import _unified_bulk_upload_loop
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            bad_file = base_dir / 'channel-UCbad.json.br'
+            bad_file.write_bytes(b'not brotli')
+
+            fm = MagicMock()
+            fm.base_dir = base_dir
+            fm.list_base = MagicMock(side_effect=[
+                [bad_file.name], [],
+            ])
+            fm.delete = AsyncMock()
+            scrape_queue = AsyncMock()
+
+            settings = MagicMock()
+            settings.bulk_batch_size = 100
+            settings.max_active_bulk_jobs = 1
+
+            class _StopLoop(Exception):
+                pass
+
+            async def _stop(*_args, **_kwargs) -> None:
+                raise _StopLoop()
+
+            with patch(
+                'tools.yt_channel_upload._wait_for_channel_changes',
+                new=_stop,
+            ):
+                with self.assertRaises(_StopLoop):
+                    await _unified_bulk_upload_loop(
+                        settings, MagicMock(), fm, MagicMock(),
+                        scrape_queue=scrape_queue,
+                    )
+
+            scrape_queue.force_rescrape.assert_awaited_once_with(
+                'i:UCbad', mode='full',
+                source='channel_upload_corrupt_file',
+            )
+            fm.delete.assert_awaited_once_with(
+                bad_file.name, fail_ok=False,
+            )
 
     async def test_invalid_record_marked_invalid_and_skipped(
         self,

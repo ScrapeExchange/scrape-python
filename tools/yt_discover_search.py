@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import json
 import logging
@@ -13,7 +14,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterable
+from typing import Any, AsyncIterator, Iterable, Iterator
 
 import httpx
 from innertube.errors import RequestError as InnerTubeRequestError
@@ -38,6 +39,7 @@ from scrape_exchange.youtube.youtube_rate_limiter import (
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
+_DEFAULT_OUTPUT_FILE: str = 'data/searched_channels.jsonl'
 _DEFAULT_RANDOM_WORD_LANGUAGES: tuple[str, ...] = (
     'en', 'es', 'it', 'de', 'fr', 'zh', 'pt-br', 'ro',
 )
@@ -98,6 +100,14 @@ class DiscoverSearchSettings(ScraperSettings):
         default='/dev/stderr',
         validation_alias=AliasChoices('LOG_FILE', 'log_file'),
         description='Log file path',
+    )
+    output_file: str = Field(
+        default=_DEFAULT_OUTPUT_FILE,
+        validation_alias=AliasChoices('OUTPUT_FILE', 'output_file'),
+        description=(
+            'JSONL file receiving discovered channels. Use "-" to '
+            'write channels to stdout.'
+        ),
     )
     youtube_search_continuations: int = Field(
         default=10,
@@ -573,6 +583,18 @@ class _ChannelEmitter:
         return True
 
 
+@contextlib.contextmanager
+def _channel_output_stream(output_file: str) -> Iterator[Any]:
+    if output_file == '-':
+        yield sys.stdout
+        return
+
+    path: Path = Path(output_file).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('a', encoding='utf-8') as stream:
+        yield stream
+
+
 async def main_async(argv: list[str] | None = None) -> int:
     settings = DiscoverSearchSettings(_cli_parse_args=argv)
     configure_logging(
@@ -595,15 +617,16 @@ async def main_async(argv: list[str] | None = None) -> int:
             random_word_language=settings.random_word_language,
         )
 
-    emitter = _ChannelEmitter(sys.stdout)
     try:
-        for term in terms:
-            async for channel in discover_for_term(
-                term,
-                continuations=settings.youtube_search_continuations,
-                limiter=limiter,
-            ):
-                emitter.emit(channel)
+        with _channel_output_stream(settings.output_file) as stream:
+            emitter = _ChannelEmitter(stream)
+            for term in terms:
+                async for channel in discover_for_term(
+                    term,
+                    continuations=settings.youtube_search_continuations,
+                    limiter=limiter,
+                ):
+                    emitter.emit(channel)
         return 0
     finally:
         await aclose_pooled_innertube()

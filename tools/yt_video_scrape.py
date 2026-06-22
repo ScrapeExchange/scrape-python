@@ -37,6 +37,10 @@ from scrape_exchange.content_claim import (
     NullContentClaim,
     RedisContentClaim,
 )
+from scrape_exchange.creator_map import (
+    CreatorMap,
+    RedisCreatorMap,
+)
 from scrape_exchange.proxy_loader import proxy_file_label
 from scrape_exchange.redis_client import redis_from_url
 from scrape_exchange.util import extract_proxy_ip, proxy_network_for
@@ -48,6 +52,7 @@ from scrape_exchange.scraper_runner import (
     ScraperRunner,
 )
 from scrape_exchange.youtube.youtube_rate_limiter import YouTubeRateLimiter
+from scrape_exchange.youtube.youtube_channel import YouTubeChannel
 from scrape_exchange.youtube.youtube_video import YouTubeVideo
 from scrape_exchange.youtube.youtube_video import (
     DENO_PATH, PO_TOKEN_URL, YTDLP_CACHE_DIR,
@@ -56,6 +61,8 @@ from scrape_exchange.youtube.settings import YouTubeScraperSettings
 from scrape_exchange.youtube.uploaded_video_ids import UploadedVideoIds
 from scrape_exchange.video_scrape_queue import (
     RedisVideoScrapeQueue,
+    VideoQueueChannelContext,
+    VideoScrapeQueueEntry,
     VideoScrapeQueueSettings,
     VideoState,
 )
@@ -209,6 +216,8 @@ async def _scrape_to_disk(
     settings: 'VideoSettings',
     proxy: str | None,
     download_client: YoutubeDL | None,
+    creator_map_backend: CreatorMap | None = None,
+    channel_context: VideoQueueChannelContext | None = None,
 ) -> None:
     '''Single-attempt scrape that raises on any failure.
 
@@ -226,7 +235,7 @@ async def _scrape_to_disk(
     hosts with no proxies configured (e.g. scraper003).
     '''
     video: YouTubeVideo = await YouTubeVideo.scrape(
-        video_id, channel_handle='',
+        video_id, channel_handle=None,
         channel_thumbnail=None,
         ytdlp_cache_dir=settings.ytdlp_cache_dir,
         download_client=download_client,
@@ -236,6 +245,14 @@ async def _scrape_to_disk(
         proxies=[proxy] if proxy else [],
         with_formats=settings.video_use_yt_dlp,
     )
+    if channel_context is not None:
+        _apply_queue_channel_context(video, channel_context)
+    if creator_map_backend is not None:
+        await _resolve_video_channel_handle(
+            video,
+            creator_map_backend=creator_map_backend,
+            proxy=proxy,
+        )
     output_prefix: str = (
         VIDEO_YTDLP_PREFIX
         if settings.video_use_yt_dlp else VIDEO_MIN_PREFIX
@@ -246,6 +263,66 @@ async def _scrape_to_disk(
     )
 
 
+def _apply_queue_channel_context(
+    video: YouTubeVideo,
+    channel_context: VideoQueueChannelContext,
+) -> None:
+    '''
+    Fill missing channel fields from queue metadata. Every field is
+    optional; absence must never block the scrape.
+    '''
+    if channel_context.channel_id and not video.channel_id:
+        video.channel_id = channel_context.channel_id
+    if channel_context.channel_handle and not video.channel_handle:
+        video.channel_handle = channel_context.channel_handle
+    if channel_context.channel_url and not video.channel_url:
+        video.channel_url = channel_context.channel_url
+    if (
+        channel_context.channel_is_verified is not None
+        and video.channel_is_verified is None
+    ):
+        video.channel_is_verified = (
+            channel_context.channel_is_verified
+        )
+
+
+async def _resolve_video_channel_handle(
+    video: YouTubeVideo,
+    *,
+    creator_map_backend: CreatorMap,
+    proxy: str | None,
+) -> None:
+    '''
+    Stamp a canonical channel handle onto a freshly scraped video
+    before it is written to disk.
+
+    InnerTube player data can omit ``ownerProfileUrl`` and its
+    ``author`` field is a display title, not necessarily the
+    canonical ``@handle``.  Prefer the shared channel_id -> handle
+    creator map, then resolve via the channel browse endpoint and
+    cache the result.
+    '''
+    if not video.channel_id:
+        return
+
+    cached: str | None = await creator_map_backend.get(
+        video.channel_id,
+    )
+    if cached:
+        video.channel_handle = cached
+        return
+
+    resolved: str | None = await YouTubeChannel.resolve_channel_id(
+        video.channel_id,
+        proxy=proxy,
+    )
+    if not resolved:
+        return
+
+    video.channel_handle = resolved
+    await creator_map_backend.put(video.channel_id, resolved)
+
+
 async def _scrape_one_queued(
     video_id: str,
     *,
@@ -253,6 +330,8 @@ async def _scrape_one_queued(
     settings: 'VideoSettings',
     proxies: list[str],
     uploaded: UploadedVideoIds,
+    creator_map_backend: CreatorMap,
+    channel_context: VideoQueueChannelContext | None = None,
 ) -> None:
     '''Scrape one queued video with the hybrid retry contract.
 
@@ -312,6 +391,8 @@ async def _scrape_one_queued(
                 settings=settings,
                 proxy=proxy,
                 download_client=None,
+                creator_map_backend=creator_map_backend,
+                channel_context=channel_context,
             )
         except Exception as exc:
             reason: str = _classify_scrape_error(exc)
@@ -390,6 +471,7 @@ async def _queue_driven_loop(
     proxies: list[str],
     concurrency: int,
     uploaded: UploadedVideoIds,
+    creator_map_backend: CreatorMap,
 ) -> None:
     '''Streaming producer/consumer loop for the queue-driven
     video scraper.
@@ -425,16 +507,16 @@ async def _queue_driven_loop(
     buffer_size: int = max(
         settings.video_queue_batch, concurrency,
     )
-    inflight: asyncio.Queue[str] = asyncio.Queue(
+    inflight: asyncio.Queue[VideoScrapeQueueEntry] = asyncio.Queue(
         maxsize=buffer_size,
     )
 
     async def producer() -> None:
         while True:
-            ids: list[str] = await queue.pop(
+            entries = await queue.pop_entries(
                 settings.video_queue_batch,
             )
-            if not ids:
+            if not entries:
                 # Empty queue is "alive but idle", not a hang: keep the
                 # watchdog work signal fresh while we poll.
                 Watchdog.get().touch_work()
@@ -442,23 +524,25 @@ async def _queue_driven_loop(
                     settings.video_queue_idle_poll_seconds,
                 )
                 continue
-            for vid in ids:
+            for entry in entries:
                 # ``put`` blocks when the buffer is full;
                 # that's the backpressure path — we stop
                 # popping from Redis until consumers drain.
-                await inflight.put(vid)
+                await inflight.put(entry)
 
     async def consumer() -> None:
         while True:
-            vid: str = await inflight.get()
+            entry = await inflight.get()
             Watchdog.get().touch_work()
             try:
                 await _scrape_one_queued(
-                    vid,
+                    entry.video_id,
                     queue=queue,
                     settings=settings,
                     proxies=proxies,
                     uploaded=uploaded,
+                    creator_map_backend=creator_map_backend,
+                    channel_context=entry.channel,
                 )
             except Exception:
                 # Defensive: per-video classification +
@@ -468,7 +552,7 @@ async def _queue_driven_loop(
                 # bad item cannot tear down the consumer.
                 logging.exception(
                     'Unexpected error scraping video',
-                    extra={'video_id': vid},
+                    extra={'video_id': entry.video_id},
                 )
             finally:
                 inflight.task_done()
@@ -867,6 +951,10 @@ async def _run_worker(
     uploaded_video_ids: UploadedVideoIds = UploadedVideoIds(
         settings.redis_dsn,
     )
+    creator_map_backend: CreatorMap = RedisCreatorMap(
+        settings.redis_dsn,
+        platform='youtube',
+    )
     # ``claim`` and ``video_fm`` constructed above are no longer
     # used by the queue-driven loop. They remain in place for
     # _run_worker startup-side effects (the FileContentClaim
@@ -901,6 +989,7 @@ async def _run_worker(
             list(settings.proxies),
             streaming_concurrency,
             uploaded_video_ids,
+            creator_map_backend,
         )
     finally:
         if publisher_task is not None:

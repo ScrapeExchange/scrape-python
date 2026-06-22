@@ -4,16 +4,8 @@
 #   docker compose -f docker-compose.yml \
 #     -f docker-compose.<your-host>.yml up -d
 #
-# All services use the ghcr.io image.  Host-specific settings
-# (NUM_PROCESSES, CONCURRENCY, volumes) go in the override file.
-
-# Container-internal paths that override the relative paths
-# from .env. Compose 'environment' takes precedence over
-# 'env_file', so these win.
-x-container-paths: &container-paths
-  YOUTUBE_VIDEO_DATA_DIR: /data/videos
-  YOUTUBE_CHANNEL_DATA_DIR: /data/channels
-  DENO_PATH: /usr/local/deno/bin/deno
+# All services use the ghcr.io image. Host-specific settings belong in
+# .env, and host bind mounts belong in the override file.
 
 x-scraper-common: &scraper-common
   image: ghcr.io/scrapeexchange/scrape-python:latest
@@ -28,47 +20,50 @@ services:
     restart: unless-stopped
     network_mode: host
     init: true
-    environment:
-      PORT: 4416
 
-  video:
+  yt-video:
     <<: *scraper-common
     command: ["tools/yt_video_scrape.py"]
     depends_on:
       - po-token-provider
-    container_name: video
-    environment:
-      <<: *container-paths
-      VIDEO_LOG_FILE: /var/log/scrape/scraper/yt_video.log
+    container_name: yt-video
 
-  video-upload:
+  yt-video-upload:
     <<: *scraper-common
     command: ["tools/yt_video_upload.py"]
-    container_name: video-upload
-    environment:
-      <<: *container-paths
-      VIDEO_UPLOAD_LOG_FILE: /var/log/scrape/scraper/yt_video_upload.log
+    container_name: yt-video-upload
 
-  channel:
+  yt-channel:
     <<: *scraper-common
     command: ["tools/yt_channel_scrape.py"]
-    container_name: channel
-    environment:
-      <<: *container-paths
-      CHANNEL_LOG_FILE: /var/log/scrape/scraper/yt_channel.log
+    container_name: yt-channel
 
-  channel-upload:
+  yt-channel-upload:
     <<: *scraper-common
     command: ["tools/yt_channel_upload.py"]
-    container_name: channel-upload
-    environment:
-      <<: *container-paths
-      CHANNEL_UPLOAD_LOG_FILE: /var/log/scrape/scraper/yt_channel_upload.log
+    container_name: yt-channel-upload
 
-  rss:
+  yt-rss:
     <<: *scraper-common
     command: ["tools/yt_rss_scrape.py"]
-    container_name: rss
-    environment:
-      <<: *container-paths
-      RSS_LOG_FILE: /var/log/scrape/scraper/yt_rss.log
+    container_name: yt-rss
+
+  tt-creator:
+    <<: *scraper-common
+    command: ["tools/tt_creator_scrape.py"]
+    container_name: tt-creator
+
+  tt-video:
+    <<: *scraper-common
+    command: ["tools/tt_video_scrape.py"]
+    container_name: tt-video
+
+  tt-creator-upload:
+    <<: *scraper-common
+    command: ["tools/tt_creator_upload.py"]
+    container_name: tt-creator-upload
+
+  tt-video-upload:
+    <<: *scraper-common
+    command: ["tools/tt_video_upload.py"]
+    container_name: tt-video-upload

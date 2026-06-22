@@ -26,7 +26,12 @@ import aiofiles.os
 from collections.abc import Iterator
 from pathlib import Path
 
-from .brotli import brotli_read_async, brotli_write_async, TMP_SUBDIR_NAME
+from .brotli import (
+    WORLD_READABLE_FILE_MODE,
+    TMP_SUBDIR_NAME,
+    brotli_read_async,
+    brotli_write_async,
+)
 
 VIDEO_FILE_PREFIX: str = 'video-'
 VIDEO_MIN_FILE_PREFIX: str = 'video-min-'
@@ -36,7 +41,7 @@ VIDEO_ID_FILE_PREFIX: str = '<video-id>'
 VIDEO_ID_RE: re.Pattern[str] = re.compile(r'^[A-Za-z0-9_-]{11}$')
 
 
-async def atomic_write_bytes(
+def _atomic_write_bytes_sync(
     path: Path | str, data: bytes,
 ) -> None:
     '''
@@ -80,15 +85,25 @@ async def atomic_write_bytes(
     tmp_dir.mkdir(exist_ok=True)
     tmp: Path = tmp_dir / f'{target.name}.tmp.{secrets.token_hex(8)}'
     try:
-        async with aiofiles.open(tmp, 'wb') as f:
-            await f.write(data)
-        await aiofiles.os.rename(tmp, target)
+        with open(tmp, 'wb') as f:
+            f.write(data)
+        os.rename(tmp, target)
+        os.chmod(target, WORLD_READABLE_FILE_MODE)
     except Exception:
         try:
-            await aiofiles.os.remove(tmp)
+            os.remove(tmp)
         except OSError:
             pass
         raise
+
+
+async def atomic_write_bytes(
+    path: Path | str, data: bytes,
+) -> None:
+    '''
+    Async wrapper for :func:`_atomic_write_bytes_sync`.
+    '''
+    _atomic_write_bytes_sync(path, data)
 
 logger = logging.getLogger(__name__)
 
@@ -836,9 +851,10 @@ class AssetFileManagement:
         src: Path = self.base_dir / filename
         dst: Path = self.uploaded_dir / filename
         try:
-            await aiofiles.os.rename(src, dst)
+            os.rename(src, dst)
         except FileNotFoundError:
             if dst.exists():
+                os.chmod(dst, WORLD_READABLE_FILE_MODE)
                 logger.debug(
                     'Source already moved to uploaded dir by '
                     'another process; treating as success',
@@ -846,6 +862,7 @@ class AssetFileManagement:
                 )
                 return dst
             raise
+        os.chmod(dst, WORLD_READABLE_FILE_MODE)
         logger.debug(
             'Marked src as uploaded',
             extra={'src': src, 'dst': dst},
@@ -878,9 +895,10 @@ class AssetFileManagement:
         src: Path = source_dir / filename
         dst: Path = self.uploaded_dir / filename
         try:
-            await aiofiles.os.rename(src, dst)
+            os.rename(src, dst)
         except FileNotFoundError:
             if dst.exists():
+                os.chmod(dst, WORLD_READABLE_FILE_MODE)
                 logger.debug(
                     'Source already moved to uploaded dir by '
                     'another process; treating as success',
@@ -888,6 +906,7 @@ class AssetFileManagement:
                 )
                 return dst
             raise
+        os.chmod(dst, WORLD_READABLE_FILE_MODE)
         logger.debug(
             'Marked src as uploaded (custom source)',
             extra={'src': src, 'dst': dst},
@@ -940,7 +959,8 @@ class AssetFileManagement:
         new_name: str = f'{filename}{suffix}'
         src: Path = self.base_dir / filename
         dst: Path = self.base_dir / new_name
-        await aiofiles.os.rename(src, dst)
+        os.rename(src, dst)
+        os.chmod(dst, WORLD_READABLE_FILE_MODE)
         logger.debug(
             'Renamed file',
             extra={'src': src, 'dst': dst},
@@ -1017,8 +1037,9 @@ class AssetFileManagement:
                 f'(must end with one of {MARKER_SUFFIXES})'
             )
         path: Path = self.base_dir / marker_filename
-        async with aiofiles.open(path, 'w') as f:
+        with open(path, 'w') as f:
             if content is not None:
-                await f.write(content)
+                f.write(content)
+        os.chmod(path, WORLD_READABLE_FILE_MODE)
         logger.debug('Touched marker file', extra={'path': path})
         return path

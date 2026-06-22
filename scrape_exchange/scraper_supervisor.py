@@ -23,6 +23,7 @@ fleet is currently configured.
 import asyncio
 import logging
 import os
+import random
 import signal
 import subprocess
 import sys
@@ -208,7 +209,10 @@ class SupervisorConfig:
     metrics_port: int
     log_file: str | None
     log_file_env_var: str | None = None
+    concurrency_env_var: str | None = None
+    child_concurrencies: list[int] | None = None
     metrics_port_env_var: str | None = None
+    split_proxy_pool: bool = False
     api_key_id: str | None = None
     api_key_secret: str | None = None
     exchange_url: str = 'https://scrape.exchange'
@@ -338,6 +342,39 @@ def proxy_pool_for_children(
     return [list(proxies) for _ in range(n)]
 
 
+def distribute_total_concurrency(total: int, n: int) -> list[int]:
+    '''Split a total concurrency limit across child processes.'''
+    if total <= 0:
+        raise ValueError(
+            f'total concurrency must be >= 1, got {total}',
+        )
+    if n <= 0:
+        raise ValueError(
+            f'num_processes must be >= 1, got {n}',
+        )
+    active: int = min(total, n)
+    base: int = total // active
+    remainder: int = total % active
+    return [
+        base + (1 if index < remainder else 0)
+        for index in range(active)
+    ]
+
+
+def random_proxy_subset(
+    proxies: list[str],
+    limit: int,
+) -> list[str]:
+    '''Choose a random proxy subset when capacity is below pool size.'''
+    if limit <= 0:
+        raise ValueError(
+            f'proxy subset limit must be >= 1, got {limit}',
+        )
+    if limit >= len(proxies):
+        return list(proxies)
+    return random.sample(proxies, limit)
+
+
 def _spawn_one_slot(slot: _ChildSlot) -> None:
     '''Launch the subprocess for *slot* and record its handle and
     spawn timestamp. Used both at startup and on respawn so the
@@ -353,6 +390,7 @@ def _spawn_one_slot(slot: _ChildSlot) -> None:
 def spawn_children(
     config: SupervisorConfig, chunks: list[list[str]],
     jwt_header: str | None = None,
+    child_concurrencies: list[int] | None = None,
 ) -> list[_ChildSlot]:
     '''Spawn one child subprocess per chunk in *chunks*, returning
     one ``_ChildSlot`` per child. The slot captures the spawn
@@ -373,6 +411,13 @@ def spawn_children(
         child_env[config.num_processes_env_var] = '1'
         child_env['PROXIES'] = ','.join(chunk)
         child_env['WORKER_ID'] = str(worker_instance)
+        if child_concurrencies is not None:
+            child_concurrency: int = child_concurrencies[index]
+            if config.concurrency_env_var:
+                child_env[config.concurrency_env_var] = str(
+                    child_concurrency,
+                )
+            child_env['CONCURRENCY'] = str(child_concurrency)
         if jwt_header is not None:
             child_env[EXCHANGE_JWT_ENV_VAR] = jwt_header
         child_log_file: str | None = None
@@ -389,6 +434,12 @@ def spawn_children(
                 'scraper': config.scraper_label,
                 'worker_instance': worker_instance,
                 'proxies_count': len(chunk),
+                'concurrency': (
+                    child_concurrencies[index]
+                    if child_concurrencies is not None else (
+                        config.concurrency
+                    )
+                ),
                 'log_file': child_log_file,
             },
         )
@@ -726,10 +777,22 @@ def run_supervisor(config: SupervisorConfig) -> int:
         return 1
 
     n: int = min(config.num_processes, len(proxies))
-    # Every child receives the full proxy pool.  The YouTube rate limiter is
-    # shared across worker processes, so overlapping proxy visibility is safe
-    # and lets each child choose any currently token-rich outbound IP.
-    chunks: list[list[str]] = proxy_pool_for_children(proxies, n)
+    if config.split_proxy_pool:
+        chunks: list[list[str]] = split_proxies(proxies, n)
+        if not chunks_are_disjoint_cover(chunks, proxies):
+            return 1
+    else:
+        # Every child receives the full proxy pool.  The YouTube rate
+        # limiter is shared across worker processes, so overlapping proxy
+        # visibility is safe and lets each child choose any currently
+        # token-rich outbound IP.
+        chunks = proxy_pool_for_children(proxies, n)
+
+    child_concurrencies: list[int] | None = config.child_concurrencies
+    if child_concurrencies is not None:
+        child_concurrencies = child_concurrencies[:len(chunks)]
+        chunks = chunks[:len(child_concurrencies)]
+        n = len(chunks)
 
     # Fetch the JWT once so children don't each hit the token
     # endpoint independently at startup.  Retry with 1s → 2s →
@@ -791,6 +854,7 @@ def run_supervisor(config: SupervisorConfig) -> int:
 
     slots: list[_ChildSlot] = spawn_children(
         config, chunks, jwt_header=jwt_header,
+        child_concurrencies=child_concurrencies,
     )
     shutdown_state: dict[str, float | None] = {
         'deadline': None,

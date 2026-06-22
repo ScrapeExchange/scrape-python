@@ -20,6 +20,8 @@ class TestProxyFilesSetting(unittest.TestCase):
     def setUp(self) -> None:
         # Reset registry between tests.
         set_active_catalog(ProxyCatalog())
+        os.environ.pop('PROXY_FILES', None)
+        os.environ.pop('PROXIES', None)
 
     def tearDown(self) -> None:
         set_active_catalog(ProxyCatalog())
@@ -43,6 +45,7 @@ class TestProxyFilesSetting(unittest.TestCase):
             os.environ['PROXY_FILES'] = f'{a},{b}'
 
             s: ScraperSettings = ScraperSettings(
+                _env_file=None,
                 _cli_parse_args=False,
             )
 
@@ -60,6 +63,7 @@ class TestProxyFilesSetting(unittest.TestCase):
     def test_unset_proxy_files_yields_empty_proxies(self) -> None:
         os.environ.pop('PROXY_FILES', None)
         s: ScraperSettings = ScraperSettings(
+            _env_file=None,
             _cli_parse_args=False,
         )
         self.assertEqual(s.proxies, [])
@@ -78,7 +82,8 @@ class TestProxyFilesSetting(unittest.TestCase):
             p: Path = Path(tmp) / 'a.txt'
             p.write_text('http://1.1.1.1:80\n', encoding='utf-8')
             s: ScraperSettings = ScraperSettings(
-                proxy_files=p, _cli_parse_args=False,
+                proxy_files=p, _env_file=None,
+                _cli_parse_args=False,
             )
         self.assertEqual(s.proxies, ['http://1.1.1.1:80'])
 
@@ -90,11 +95,48 @@ class TestProxyFilesSetting(unittest.TestCase):
             b: Path = tmpdir / 'b.txt'
             b.write_text('http://2.2.2.2:80\n', encoding='utf-8')
             s: ScraperSettings = ScraperSettings(
-                proxy_files=[a, b], _cli_parse_args=False,
+                proxy_files=[a, b], _env_file=None,
+                _cli_parse_args=False,
             )
         self.assertEqual(s.proxies, [
             'http://1.1.1.1:80', 'http://2.2.2.2:80',
         ])
+
+    def test_legacy_proxies_env_loads_direct_entries(self) -> None:
+        os.environ['PROXIES'] = (
+            'http://1.1.1.1:80,2.2.2.2:81,local://192.0.2.7'
+        )
+
+        s: ScraperSettings = ScraperSettings(
+            _env_file=None,
+            _cli_parse_args=False,
+        )
+
+        self.assertEqual(s.proxies, [
+            'http://1.1.1.1:80',
+            'http://2.2.2.2:81',
+            'local://192.0.2.7',
+        ])
+        self.assertEqual(
+            proxy_file_label('http://1.1.1.1:80'), 'env',
+        )
+
+    def test_proxy_files_wins_over_legacy_proxies_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            p: Path = Path(tmp) / 'a.txt'
+            p.write_text('http://1.1.1.1:80\n', encoding='utf-8')
+            os.environ['PROXY_FILES'] = str(p)
+            os.environ['PROXIES'] = 'http://2.2.2.2:81'
+
+            s: ScraperSettings = ScraperSettings(
+                _env_file=None,
+                _cli_parse_args=False,
+            )
+
+        self.assertEqual(s.proxies, ['http://1.1.1.1:80'])
+        self.assertEqual(
+            proxy_file_label('http://1.1.1.1:80'), 'a',
+        )
 
 
 if __name__ == '__main__':

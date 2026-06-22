@@ -6,6 +6,7 @@ loops call Watchdog.get().touch_work() while operating.
 
 import asyncio
 import contextlib
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -44,6 +45,36 @@ class TestVideoUploadWorkerTouches(_WatchdogProbe):
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         proc.assert_awaited_once()
+        self.wd.touch_work.assert_called()
+
+    async def test_idle_video_watcher_yields_and_touches_work(
+        self,
+    ) -> None:
+        from tools.yt_video_upload import _watch_and_upload
+
+        captured_kwargs = {}
+
+        async def idle_watcher(*_args, **kwargs):
+            captured_kwargs.update(kwargs)
+            yield set()
+            await asyncio.sleep(3600)
+
+        queue: asyncio.Queue = asyncio.Queue()
+        settings = MagicMock()
+        settings.video_data_directory = '/tmp'
+        with patch(
+            'tools.yt_video_upload.awatch', idle_watcher,
+        ):
+            task = asyncio.create_task(
+                _watch_and_upload(queue, MagicMock(), settings),
+            )
+            await asyncio.sleep(0.01)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        self.assertFalse(captured_kwargs['recursive'])
+        self.assertTrue(captured_kwargs['yield_on_timeout'])
         self.wd.touch_work.assert_called()
 
 
@@ -115,6 +146,59 @@ class TestChannelBulkLoopTouches(_WatchdogProbe):
                 MagicMock(), MagicMock(),
             )
         self.wd.touch_work.assert_called()
+
+    async def test_channel_batch_scan_and_decode_run_off_loop(
+        self,
+    ) -> None:
+        import brotli
+        import orjson
+        from tools.yt_channel_upload import _unified_bulk_upload_loop
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            path = base_dir / 'channel-UCtest.json.br'
+            path.write_bytes(brotli.compress(orjson.dumps({
+                'channel_id': 'UCtest',
+            })))
+
+            fm = MagicMock()
+            fm.base_dir = base_dir
+            fm.list_base = MagicMock(side_effect=[[path.name], []])
+            validator = MagicMock()
+            validator.validate.return_value = 'invalid'
+            fm.mark_invalid = AsyncMock()
+
+            settings = MagicMock()
+            settings.bulk_batch_size = 100
+            settings.max_active_bulk_jobs = 1
+
+            class _StopLoop(Exception):
+                pass
+
+            async def stop_loop(*_args, **_kwargs):
+                raise _StopLoop()
+
+            original_to_thread = asyncio.to_thread
+            calls = []
+
+            async def recording_to_thread(func, *args, **kwargs):
+                calls.append(func)
+                return await original_to_thread(func, *args, **kwargs)
+
+            with patch(
+                'tools.yt_channel_upload.asyncio.to_thread',
+                recording_to_thread,
+            ), patch(
+                'tools.yt_channel_upload._wait_for_channel_changes',
+                stop_loop,
+            ):
+                with self.assertRaises(_StopLoop):
+                    await _unified_bulk_upload_loop(
+                        settings, MagicMock(), fm, validator,
+                    )
+
+            self.assertGreaterEqual(len(calls), 2)
+            self.wd.touch_work.assert_called()
 
 
 if __name__ == '__main__':

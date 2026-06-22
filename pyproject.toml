@@ -26,7 +26,24 @@ dependencies = [
     "huggingface-hub>=0.26.0",
     "pyarrow>=24.0.0",
     "paramiko>=3.5.0",
+    # Pins are coupled and load-bearing (see the camoufox
+    # anti-detection design spec): Camoufox's Firefox 135 build
+    # crashes on Playwright 1.60, and the CamoufoxTikTokApi subclass
+    # depends on TikTokApi 7.1.0 internals. Do not float these.
+    "tiktokapi==7.1.0",
+    "playwright==1.51.0",
+    "camoufox[geoip]>=0.4.0",
 ]
+
+[project.scripts]
+scrape-queue = "tools.scrape_queue:main"
+tt-video-scrape = "tools.tt_video_scrape:main"
+
+[tool.uv]
+package = true
+
+[tool.setuptools.packages.find]
+include = ["scrape_exchange*", "tools*"]
 
 [dependency-groups]
 dev = [

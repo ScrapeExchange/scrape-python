@@ -1,0 +1,64 @@
+# Copy this file to docker-compose.override.yml and replace the
+# /path/to/... sources with host paths for your machine.
+#
+# Long-form bind mounts with `create_host_path: false` make missing
+# host paths fail the container start loudly, instead of Docker
+# silently creating directories at the host paths and bind-mounting
+# those directories into the container.
+
+x-scraper-volumes: &scraper-volumes
+  - type: bind
+    source: /path/to/proxies
+    target: /data/proxies
+    bind:
+      create_host_path: false
+  - type: bind
+    source: /path/to/youtube/channels
+    target: /data/channels
+    bind:
+      create_host_path: false
+  - type: bind
+    source: /path/to/youtube/videos
+    target: /data/videos
+    bind:
+      create_host_path: false
+  - type: bind
+    source: /path/to/tiktok/creators
+    target: /data/tiktok/creators
+    bind:
+      create_host_path: true
+  - type: bind
+    source: /path/to/tiktok/videos
+    target: /data/tiktok/videos
+    bind:
+      create_host_path: true
+  - type: bind
+    source: /path/to/tiktok/session-state
+    target: /data/tiktok/session-state
+    bind:
+      create_host_path: true
+  - type: bind
+    source: /path/to/scrape/logs
+    target: /var/log/scrape
+    bind:
+      create_host_path: false
+
+services:
+  yt-video:
+    volumes: *scraper-volumes
+  yt-video-upload:
+    volumes: *scraper-volumes
+  yt-channel:
+    volumes: *scraper-volumes
+  yt-channel-upload:
+    volumes: *scraper-volumes
+  yt-rss:
+    volumes: *scraper-volumes
+  tt-creator:
+    volumes: *scraper-volumes
+  tt-video:
+    volumes: *scraper-volumes
+  tt-creator-upload:
+    volumes: *scraper-volumes
+  tt-video-upload:
+    volumes: *scraper-volumes

@@ -1,6 +1,8 @@
 import io
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import httpx
@@ -10,6 +12,7 @@ from tools.yt_discover_search import (
     DiscoverSearchSettings,
     DiscoveredChannel,
     _ChannelEmitter,
+    _channel_output_stream,
     _dedupe_channels,
     _get_continuation_token,
     _extract_words_from_random_payload,
@@ -48,6 +51,14 @@ class TestDiscoverSearchSettings(unittest.TestCase):
         settings = DiscoverSearchSettings(_cli_parse_args=[])
 
         self.assertEqual(settings.keyword_count, 1)
+
+    def test_output_file_defaults_to_searched_channels_jsonl(self) -> None:
+        settings = DiscoverSearchSettings(_cli_parse_args=[])
+
+        self.assertEqual(
+            settings.output_file,
+            'data/searched_channels.jsonl',
+        )
 
 
 class TestRandomWordPayload(unittest.TestCase):
@@ -292,6 +303,21 @@ class TestChannelEmitter(unittest.TestCase):
         # none.
         emitter.emit(DiscoveredChannel('UCabc', '@abc'))
         self.assertEqual(stream.flush_count, 2)
+
+
+class TestChannelOutputStream(unittest.TestCase):
+    def test_creates_parent_directory_for_output_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path: Path = Path(tmp) / 'nested' / 'channels.jsonl'
+
+            with _channel_output_stream(str(path)) as stream:
+                stream.write('{"channel_id":"UCabc"}\n')
+
+            self.assertTrue(path.exists())
+            self.assertEqual(
+                path.read_text(encoding='utf-8'),
+                '{"channel_id":"UCabc"}\n',
+            )
 
 
 class _FakeLimiter:

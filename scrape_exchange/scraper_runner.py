@@ -135,6 +135,9 @@ class ScraperRunner:
             [ScraperSettings], RateLimiter
         ],
         client_required: bool = True,
+        split_proxy_pool: bool = False,
+        concurrency_env_var: str | None = None,
+        child_concurrencies: list[int] | None = None,
     ) -> None:
         self._settings: ScraperSettings = settings
         self._scraper_label: str = scraper_label
@@ -148,6 +151,9 @@ class ScraperRunner:
             [ScraperSettings], RateLimiter
         ] = rate_limiter_factory
         self._client_required: bool = client_required
+        self._split_proxy_pool: bool = split_proxy_pool
+        self._concurrency_env_var: str | None = concurrency_env_var
+        self._child_concurrencies: list[int] | None = child_concurrencies
 
     def run_sync(
         self,
@@ -181,6 +187,7 @@ class ScraperRunner:
                     f'{self._scraper_label.upper()}'
                     '_LOG_FILE'
                 ),
+                split_proxy_pool=self._split_proxy_pool,
                 metrics_port_env_var=(
                     f'{self._scraper_label.upper()}'
                     '_METRICS_PORT'
@@ -190,6 +197,8 @@ class ScraperRunner:
                 proxies=self._settings.proxies,
                 metrics_port=self._metrics_port,
                 log_file=self._log_file or None,
+                concurrency_env_var=self._concurrency_env_var,
+                child_concurrencies=self._child_concurrencies,
                 api_key_id=(
                     self._settings.api_key_id
                 ),

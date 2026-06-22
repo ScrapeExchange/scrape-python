@@ -31,10 +31,12 @@ class TestChannelStateEnum(unittest.TestCase):
         )
         self.assertEqual(ChannelState.TOPIC.value, 'topic')
         self.assertEqual(
-            ChannelState.NO_VIDEOS.value, 'no_videos',
+            ChannelState.NO_VIDEOS.value,
+            'no_videos',
         )
         self.assertEqual(
-            ChannelState.LOW_SUBS.value, 'low_subs',
+            ChannelState.LOW_SUBS.value,
+            'low_subs',
         )
 
     def test_terminal_states_set(self) -> None:
@@ -937,6 +939,29 @@ class TestMark(_RedisQueueTestBase):
         )
         self.assertIsNone(nf)
         self.assertIsNotNone(term)
+
+    async def test_new_terminal_transition_clears_old(
+        self,
+    ) -> None:
+        await self.queue.enqueue_scheduled(
+            'UCa', source='cli',
+        )
+        await self.queue.mark(
+            'i:UCa',
+            state=ChannelState.NO_VIDEOS,
+        )
+        await self.queue.mark(
+            'i:UCa',
+            state=ChannelState.LOW_SUBS,
+        )
+        no_videos: str | None = await self.redis.hget(
+            'youtube:channel:no_videos', 'i:UCa',
+        )
+        low_subs: str | None = await self.redis.hget(
+            'youtube:channel:low_subs', 'i:UCa',
+        )
+        self.assertIsNone(no_videos)
+        self.assertIsNotNone(low_subs)
 
 
 class TestMarkSoftUnavailable(_RedisQueueTestBase):

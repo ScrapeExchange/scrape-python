@@ -135,6 +135,32 @@ def _parse_count(text: str | None) -> int | None:
         return None
 
 
+def _channel_handle_from_url(url: str | None) -> str | None:
+    '''
+    Extract a canonical YouTube handle from a channel URL.
+
+    InnerTube's ``videoDetails.author`` is the display name, not
+    necessarily the ``@handle``.  The watch microformat often carries
+    ``ownerProfileUrl`` as ``https://www.youtube.com/@Handle``; when it
+    does, prefer that value for ``channel_handle``.
+    '''
+    if not url or '/@' not in url:
+        return None
+    handle: str = url.split('/@', 1)[1].split('/', 1)[0]
+    handle = handle.split('?', 1)[0].split('#', 1)[0].strip()
+    return handle or None
+
+
+def _youtube_url(path_or_url: str | None) -> str | None:
+    if not path_or_url:
+        return None
+    if path_or_url.startswith(('http://', 'https://')):
+        return path_or_url
+    if path_or_url.startswith('/'):
+        return f'https://www.youtube.com{path_or_url}'
+    return None
+
+
 def _find(contents: list[dict], key: str) -> dict | None:
     '''
     Return the value for key in the first item of contents that has it.
@@ -482,11 +508,12 @@ class InnerTubeVideoParser:
         video.channel_id = (
             video_details.get('channelId') or video.channel_id
         )
+        owner_profile_url: str | None = microformat.get('ownerProfileUrl')
+        video.channel_url = owner_profile_url or video.channel_url
         video.channel_handle = (
-            video_details.get('author') or video.channel_handle
-        )
-        video.channel_url = (
-            microformat.get('ownerProfileUrl') or video.channel_url
+            _channel_handle_from_url(owner_profile_url)
+            or video_details.get('author')
+            or video.channel_handle
         )
         video.is_live = bool(
             video_details.get('isLiveContent', video.is_live)
@@ -727,6 +754,13 @@ class InnerTubeVideoParser:
 
         secondary = _find(contents, 'videoSecondaryInfoRenderer')
         if secondary:
+            owner_renderer: dict = (
+                secondary
+                .get('owner', {})
+                .get('videoOwnerRenderer', {})
+            )
+            self._apply_owner_renderer(owner_renderer)
+
             rows = (
                 secondary
                 .get('metadataRowContainer', {})
@@ -748,9 +782,7 @@ class InnerTubeVideoParser:
             # thumbnail with a real url; the unfiltered list can
             # contain ones without a url, see Bug #1 guard above.
             owner_thumbs: list[dict] = (
-                secondary
-                .get('owner', {})
-                .get('videoOwnerRenderer', {})
+                owner_renderer
                 .get('thumbnail', {})
                 .get('thumbnails', [])
             )
@@ -771,6 +803,60 @@ class InnerTubeVideoParser:
         self.video.chapters = InnerTubeVideoParser._parse_chapters_from_next(
             next_data
         )
+
+    def _apply_owner_renderer(self, owner_renderer: dict) -> None:
+        '''
+        Extract channel identity from the owner block of the
+        InnerTube ``next`` response.
+
+        Age-restricted or otherwise partial ``player`` responses can
+        omit ``videoDetails.channelId`` and microformat owner URLs, while
+        ``next`` still includes the owner renderer used by the watch
+        page sidebar.  That renderer is the same source we already use
+        for the channel thumbnail.
+        '''
+        if not owner_renderer:
+            return
+
+        endpoint: dict = (
+            owner_renderer
+            .get('navigationEndpoint', {})
+        )
+        if not endpoint:
+            title_runs: list[dict] = (
+                owner_renderer
+                .get('title', {})
+                .get('runs', [])
+            )
+            if title_runs:
+                endpoint = title_runs[0].get(
+                    'navigationEndpoint', {}
+                )
+
+        browse_endpoint: dict = endpoint.get(
+            'browseEndpoint', {},
+        )
+        channel_id: str | None = browse_endpoint.get('browseId')
+        if channel_id:
+            self.video.channel_id = (
+                self.video.channel_id or channel_id
+            )
+
+        url: str | None = (
+            browse_endpoint.get('canonicalBaseUrl')
+            or endpoint
+            .get('commandMetadata', {})
+            .get('webCommandMetadata', {})
+            .get('url')
+        )
+        channel_url: str | None = _youtube_url(url)
+        if channel_url:
+            self.video.channel_url = (
+                self.video.channel_url or channel_url
+            )
+        handle: str | None = _channel_handle_from_url(channel_url)
+        if handle:
+            self.video.channel_handle = handle
 
     @staticmethod
     def _parse_chapters_from_next(next_data: dict) -> list[dict]:

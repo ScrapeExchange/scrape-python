@@ -221,9 +221,20 @@ class _VideoFileSink:
         )
 
     async def enqueue(
-        self, video_id: str, *, source: str,
+        self,
+        video_id: str,
+        *,
+        source: str,
+        channel_id: str | None = None,
+        channel_handle: str | None = None,
+        channel_url: str | None = None,
+        channel_is_verified: bool | None = None,
     ) -> None:
         del source  # the file sink stores no per-record source
+        del channel_id
+        del channel_handle
+        del channel_url
+        del channel_is_verified
         if video_id in self._seen:
             return
         self._seen.add(video_id)
@@ -266,6 +277,11 @@ COLUMN_ALIASES: dict[str, list[str]] = {
     'channel_handle': [
         'channel_handle', 'channelHandle', 'handle',
         'channel_username', 'channel_user',
+    ],
+    'channel_url': ['channel_url', 'channelUrl', 'channel_URL'],
+    'channel_is_verified': [
+        'channel_is_verified', 'channelIsVerified',
+        'channel_verified', 'verified',
     ],
 }
 
@@ -502,6 +518,15 @@ def _pick(row: dict, field_name: str) -> str:
     return ''
 
 
+def _pick_bool(row: dict, field_name: str) -> bool | None:
+    raw: str = _pick(row, field_name).lower()
+    if raw in {'1', 'true', 'yes', 'y'}:
+        return True
+    if raw in {'0', 'false', 'no', 'n'}:
+        return False
+    return None
+
+
 def _extract_channel(
     row: dict,
 ) -> tuple[str | None, str | None, str | None]:
@@ -713,7 +738,14 @@ async def import_file(
                 continue
             try:
                 await video_queue.enqueue(
-                    video_id, source=source,
+                    video_id,
+                    source=source,
+                    channel_id=channel_id,
+                    channel_handle=handle,
+                    channel_url=_pick(row, 'channel_url') or None,
+                    channel_is_verified=_pick_bool(
+                        row, 'channel_is_verified',
+                    ),
                 )
                 stats.enqueued_videos += 1
             except Exception as exc:

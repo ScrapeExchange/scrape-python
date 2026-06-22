@@ -1,0 +1,79 @@
+'''
+Unit tests for ``scrape_exchange.tiktok.settings``.
+'''
+
+import os
+import unittest
+from unittest.mock import patch
+
+from scrape_exchange.tiktok.settings import (
+    TikTokScraperSettings,
+)
+
+
+class TestTikTokScraperSettings(unittest.TestCase):
+
+    def test_defaults(self) -> None:
+        s: TikTokScraperSettings = TikTokScraperSettings(
+            _env_file=None,
+            _cli_parse_args=[],
+        )
+        self.assertIsNone(s.creator_data_directory)
+        self.assertIsNone(s.video_data_directory)
+        self.assertIsNone(s.hashtag_data_directory)
+        self.assertEqual(
+            s.session_state_dir,
+            '/tmp/scrape_exchange/tiktok',
+        )
+        self.assertEqual(s.ms_token_ttl_seconds, 14400)
+        self.assertEqual(s.session_bootstrap_timeout_ms, 90000)
+        self.assertEqual(s.bulk_batch_size, 1000)
+        self.assertEqual(
+            s.bulk_max_batch_bytes, 7 * 1024 ** 3,
+        )
+        self.assertEqual(
+            s.bulk_progress_timeout_seconds, 1800.0,
+        )
+
+    def test_env_aliases(self) -> None:
+        env: dict = {
+            'TIKTOK_CREATOR_DATA_DIR': '/data/tt/creators',
+            'TIKTOK_VIDEO_DATA_DIR': '/data/tt/videos',
+            'TIKTOK_HASHTAG_DATA_DIR': '/data/tt/hashtags',
+            'TIKTOK_SESSION_STATE_DIR': '/var/lib/tiktok',
+            'TIKTOK_MS_TOKEN_TTL': '7200',
+            'TIKTOK_SESSION_BOOTSTRAP_TIMEOUT': '120000',
+            'BULK_BATCH_SIZE': '2000',
+            'BULK_MAX_BATCH_BYTES': '1234567890',
+            'BULK_PROGRESS_TIMEOUT': '900.5',
+        }
+        with patch.dict(os.environ, env, clear=False):
+            s: TikTokScraperSettings = TikTokScraperSettings(
+                _env_file=None,
+                _cli_parse_args=[],
+            )
+            self.assertEqual(
+                s.creator_data_directory, '/data/tt/creators',
+            )
+            self.assertEqual(
+                s.video_data_directory, '/data/tt/videos',
+            )
+            self.assertEqual(
+                s.hashtag_data_directory, '/data/tt/hashtags',
+            )
+            self.assertEqual(
+                s.session_state_dir, '/var/lib/tiktok',
+            )
+            self.assertEqual(s.ms_token_ttl_seconds, 7200)
+            self.assertEqual(s.session_bootstrap_timeout_ms, 120000)
+            self.assertEqual(s.bulk_batch_size, 2000)
+            self.assertEqual(
+                s.bulk_max_batch_bytes, 1234567890,
+            )
+            self.assertEqual(
+                s.bulk_progress_timeout_seconds, 900.5,
+            )
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -13,10 +13,11 @@ tests/collateral/local
 
 *.swp
 
+data/ 
+
 .claude/
 .claudeignore
-CLAUDE.md
-AGENTS.md
+LOCAL.md
 docs/adr
 docs/agents
 docs/operator

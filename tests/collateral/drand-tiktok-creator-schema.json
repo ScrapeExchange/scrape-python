@@ -1,0 +1,214 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://scrape.exchange/schemas/drand-tiktok-creator-0.0.1",
+  "title": "TikTok Creator Metadata",
+  "description": "Every field tt_creator_scrape.py writes for a scraped TikTok creator/profile (TikTokCreator.to_dict()). Null-valued optional fields are omitted from the record (exclude_none); the always-present fields are listed in `required`.",
+  "type": "object",
+  "properties": {
+    "username": {
+      "type": "string",
+      "description": "TikTok @username (uniqueId). Keys the on-disk record and the scrape queue, though a creator can rename.",
+      "x-scrape-field": "platform_creator_id"
+    },
+    "sec_uid": {
+      "type": "string",
+      "description": "Stable opaque user id (secUid); the durable identity across username changes.",
+      "x-scrape-field": "platform_content_id"
+    },
+    "user_id": {
+      "type": "string",
+      "description": "Numeric user id (id), kept as a string to avoid precision loss."
+    },
+    "nickname": {
+      "type": ["string", "null"],
+      "description": "Display name. Omitted from the record when absent."
+    },
+    "signature": {
+      "type": ["string", "null"],
+      "description": "Profile bio/signature text. Omitted when absent."
+    },
+    "avatar_thumbnail": {
+      "type": "string",
+      "format": "uri",
+      "description": "Profile avatar image URL (from avatarLarger). Omitted from the record when absent.",
+      "x-scrape-field": "platform_creator_thumbnail_url"
+    },
+    "avatar_urls": {
+      "type": "array",
+      "description": "Profile avatar image URL variants returned by TikTok, preserving variant names such as thumb, medium, and large.",
+      "items": {
+        "$ref": "#/$defs/avatar_ref"
+      }
+    },
+    "verified": {
+      "type": "boolean",
+      "description": "Whether TikTok marks the account as verified."
+    },
+    "private_account": {
+      "type": "boolean",
+      "description": "Whether the account is private."
+    },
+    "region": {
+      "type": ["string", "null"],
+      "description": "Account region code. Omitted when absent."
+    },
+    "language": {
+      "type": ["string", "null"],
+      "description": "Account language code. Omitted when absent."
+    },
+    "follower_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of followers. Read from statsV2 when present (overflow-safe), else stats.",
+      "x-scrape-gauge": true
+    },
+    "following_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of accounts this creator follows.",
+      "x-scrape-gauge": true
+    },
+    "heart_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total likes/hearts across the creator's content.",
+      "x-scrape-gauge": true
+    },
+    "video_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of public videos.",
+      "x-scrape-gauge": true
+    },
+    "friend_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of mutual friends.",
+      "x-scrape-gauge": true
+    },
+    "videos": {
+      "type": "array",
+      "description": "Recent public videos discovered on the creator profile, as compact ids/URLs.",
+      "items": {
+        "$ref": "#/$defs/video_ref"
+      }
+    },
+    "reposts": {
+      "type": "array",
+      "description": "Recent reposted videos discovered on the creator profile, as compact ids/URLs.",
+      "items": {
+        "$ref": "#/$defs/video_ref"
+      }
+    },
+    "liked": {
+      "type": "array",
+      "description": "Recent liked videos when the creator's liked list is public, as compact ids/URLs.",
+      "items": {
+        "$ref": "#/$defs/video_ref"
+      }
+    },
+    "playlists": {
+      "type": "array",
+      "description": "Playlists discovered on the creator profile, as compact playlist metadata.",
+      "items": {
+        "$ref": "#/$defs/playlist_ref"
+      }
+    },
+    "url": {
+      "type": "string",
+      "format": "uri",
+      "description": "Canonical profile URL (https://www.tiktok.com/@<username>).",
+      "x-scrape-field": "source_url"
+    },
+    "scraped_timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "UTC timestamp at which this record was scraped."
+    }
+  },
+  "required": [
+    "username",
+    "sec_uid",
+    "user_id",
+    "verified",
+    "private_account",
+    "follower_count",
+    "following_count",
+    "heart_count",
+    "video_count",
+    "friend_count",
+    "videos",
+    "reposts",
+    "liked",
+    "playlists",
+    "url",
+    "scraped_timestamp"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "playlist_ref": {
+      "type": "object",
+      "description": "Compact reference to a TikTok playlist.",
+      "properties": {
+        "playlist_id": {
+          "type": "string",
+          "description": "TikTok playlist/mix id."
+        },
+        "name": {
+          "type": ["string", "null"],
+          "description": "Playlist display name, when present."
+        },
+        "video_count": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Number of videos in the playlist, when present."
+        },
+        "cover_url": {
+          "type": ["string", "null"],
+          "format": "uri",
+          "description": "Playlist cover image URL, when present."
+        }
+      },
+      "required": ["playlist_id"],
+      "additionalProperties": false
+    },
+    "avatar_ref": {
+      "type": "object",
+      "description": "Named TikTok avatar URL variant.",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "TikTok avatar variant key, e.g. thumb, medium, or large."
+        },
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Avatar image URL for this variant."
+        }
+      },
+      "required": ["name", "url"],
+      "additionalProperties": false
+    },
+    "video_ref": {
+      "type": "object",
+      "description": "Compact reference to a TikTok video/post.",
+      "properties": {
+        "video_id": {
+          "type": "string",
+          "description": "TikTok video/item id."
+        },
+        "username": {
+          "type": "string",
+          "description": "TikTok @username (uniqueId) of the account that created the video."
+        },
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Canonical TikTok video URL."
+        }
+      },
+      "required": ["video_id", "username", "url"],
+      "additionalProperties": false
+    }
+  }
+}
