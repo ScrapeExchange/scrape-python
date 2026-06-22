@@ -25,7 +25,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, UTC
 from pathlib import Path
-from typing import TYPE_CHECKING, AsyncIterator, Callable
+from typing import TYPE_CHECKING, AsyncIterator, Awaitable, Callable, TypeVar
 from uuid import uuid4
 
 import aiofiles.os
@@ -103,6 +103,7 @@ _STALE_BULK_STATE_AGE: timedelta = timedelta(hours=24)
 _SLOT_WAIT_SLEEP_SECONDS: float = 5.0
 _SLOT_RESERVATIONS: dict[Path, int] = {}
 _SLOT_CONDITION: asyncio.Condition = asyncio.Condition()
+_T = TypeVar('_T')
 
 
 @dataclass
@@ -178,6 +179,27 @@ def _touch_watchdog_work() -> None:
         Watchdog.get().touch_work()
     except Exception:
         pass
+
+
+async def _await_with_watchdog(awaitable: Awaitable[_T]) -> _T:
+    '''Await a long operation while keeping the work watchdog fresh.'''
+    task: asyncio.Task[_T] = asyncio.create_task(awaitable)
+    try:
+        while True:
+            _touch_watchdog_work()
+            done, _ = await asyncio.wait(
+                {task},
+                timeout=_WS_RECV_TOUCH_INTERVAL,
+            )
+            if done:
+                return await task
+    except BaseException:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        raise
 
 
 def _bulk_state_created_at(state: BulkUploadState) -> datetime | None:
@@ -1214,23 +1236,26 @@ async def post_bulk_batch(
     # how long an upload may take -- only real network failure
     # ends the request, not a timeout mismatch.
     try:
-        post_resp: Response = await client.post(
-            bulk_url,
-            data={
-                'username': schema_owner,
-                'platform': platform,
-                'entity': entity,
-                'version': schema_version,
-            },
-            files={
-                'file': (
-                    upload_filename, batch_buf,
-                    'application/x-ndjson',
+        post_resp: Response = await _await_with_watchdog(
+            client.post(
+                bulk_url,
+                data={
+                    'username': schema_owner,
+                    'platform': platform,
+                    'entity': entity,
+                    'version': schema_version,
+                },
+                files={
+                    'file': (
+                        upload_filename, batch_buf,
+                        'application/x-ndjson',
+                    ),
+                },
+                timeout=Timeout(
+                    connect=30.0, write=3600.0, read=3600.0,
+                    pool=60.0,
                 ),
-            },
-            timeout=Timeout(
-                connect=30.0, write=3600.0, read=3600.0, pool=60.0,
-            ),
+            )
         )
     except Exception as exc:
         logging.warning(

@@ -950,11 +950,16 @@ class TestPublishQueueMetricsLoop(
                 platform='youtube',
                 scraper='rss_scraper',
                 entity='rss_feed',
-                tier='1',
+                state='1',
                 worker_id='',
             )._value.get()
         )
         self.assertEqual(qs_t1, 7)
+        queue_labelnames: set[str] = set(
+            yt_rss_scrape.METRIC_QUEUE_SIZE._labelnames,
+        )
+        self.assertIn('tier', queue_labelnames)
+        self.assertNotIn('state', queue_labelnames)
 
         # channel_tier_population without state label.
         tp_t1: float = (

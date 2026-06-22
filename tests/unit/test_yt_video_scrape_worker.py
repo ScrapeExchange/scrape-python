@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from scrape_exchange.video_scrape_queue import (
     VideoState,
 )
+from scrape_exchange.creator_map import InMemoryCreatorMap
 
 
 def _mock_settings() -> MagicMock:
@@ -19,6 +20,10 @@ def _mock_uploaded(is_uploaded: bool = False) -> AsyncMock:
     uploaded: AsyncMock = AsyncMock()
     uploaded.contains.return_value = is_uploaded
     return uploaded
+
+
+def _creator_map() -> InMemoryCreatorMap:
+    return InMemoryCreatorMap()
 
 
 class TestScrapeOneQueued(
@@ -43,6 +48,7 @@ class TestScrapeOneQueued(
             settings=_mock_settings(),
             proxies=['http://test-proxy:8080'],
             uploaded=_mock_uploaded(),
+            creator_map_backend=_creator_map(),
         )
         queue.complete.assert_awaited_once_with('aaa')
         queue.mark.assert_not_called()
@@ -67,6 +73,7 @@ class TestScrapeOneQueued(
             settings=_mock_settings(),
             proxies=['http://test-proxy:8080'],
             uploaded=_mock_uploaded(),
+            creator_map_backend=_creator_map(),
         )
         queue.mark.assert_awaited_once()
         kwargs: dict = queue.mark.await_args.kwargs
@@ -97,6 +104,7 @@ class TestScrapeOneQueued(
             settings=_mock_settings(),
             proxies=['http://test-proxy:8080'],
             uploaded=_mock_uploaded(),
+            creator_map_backend=_creator_map(),
         )
         self.assertEqual(
             mock_scrape.await_count, 3,
@@ -132,6 +140,7 @@ class TestScrapeOneQueued(
             settings=_mock_settings(),
             proxies=['http://test-proxy:8080'],
             uploaded=_mock_uploaded(),
+            creator_map_backend=_creator_map(),
         )
         self.assertEqual(
             mock_scrape.await_count, 3,
@@ -162,6 +171,7 @@ class TestScrapeOneQueued(
             settings=_mock_settings(),
             proxies=['http://test-proxy:8080'],
             uploaded=_mock_uploaded(),
+            creator_map_backend=_creator_map(),
         )
         queue.mark.assert_awaited_once()
         kwargs: dict = queue.mark.await_args.kwargs
@@ -186,6 +196,7 @@ class TestScrapeOneQueued(
             settings=_mock_settings(),
             proxies=[],
             uploaded=_mock_uploaded(True),
+            creator_map_backend=_creator_map(),
         )
         queue.consume_force.assert_awaited_once_with('aaa')
         queue.complete.assert_awaited_once_with('aaa')
@@ -208,6 +219,7 @@ class TestScrapeOneQueued(
             settings=_mock_settings(),
             proxies=[],
             uploaded=_mock_uploaded(True),
+            creator_map_backend=_creator_map(),
         )
         queue.consume_force.assert_awaited_once_with('aaa')
         mock_scrape.assert_awaited_once()
@@ -229,6 +241,7 @@ class TestScrapeOneQueued(
             settings=_mock_settings(),
             proxies=[],
             uploaded=_mock_uploaded(False),
+            creator_map_backend=_creator_map(),
         )
         mock_scrape.assert_awaited_once()
 

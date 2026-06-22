@@ -1,0 +1,39 @@
+{
+  "id": "7000000000000000002",
+  "desc": "photo dump #aesthetic",
+  "createTime": 1700000100,
+  "author": {
+    "uniqueId": "samplecreator",
+    "secUid": "MS4wLjABAAAA-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+  },
+  "video": {
+    "duration": 0,
+    "ratio": "1080p",
+    "cover": "https://p16-sign.tiktokcdn-us.com/photo-cover.jpeg",
+    "originCover": "https://p16-sign.tiktokcdn-us.com/photo-origin.jpeg",
+    "dynamicCover": "https://p16-sign.tiktokcdn-us.com/photo-dyn.webp",
+    "subtitleInfos": []
+  },
+  "imagePost": {
+    "images": [
+      {"imageURL": {"urlList": ["https://example/1.jpg"]}},
+      {"imageURL": {"urlList": ["https://example/2.jpg"]}},
+      {"imageURL": {"urlList": ["https://example/3.jpg"]}}
+    ]
+  },
+  "music": {
+    "id": "7100000000000000002",
+    "title": "Aesthetic Loop",
+    "authorName": "musicmaker",
+    "original": false,
+    "duration": 30,
+    "playUrl": "https://sf16-ies-music-va.tiktokcdn.com/aesthetic.m4a"
+  },
+  "stats": {
+    "playCount": 50000,
+    "diggCount": 4200,
+    "commentCount": 88,
+    "shareCount": 410,
+    "collectCount": 200
+  }
+}

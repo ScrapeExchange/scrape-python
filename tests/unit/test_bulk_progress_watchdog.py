@@ -67,6 +67,22 @@ class TestBulkProgressChunkTouch(
         # Touched many times (≈deadline/interval), not just once.
         self.assertGreaterEqual(self.wd.touch_work.call_count, 3)
 
+    async def test_long_await_keeps_touching_until_done(
+        self,
+    ) -> None:
+        from scrape_exchange import bulk_upload
+
+        with patch.object(
+            bulk_upload, '_WS_RECV_TOUCH_INTERVAL', 0.01,
+            create=True,
+        ):
+            result = await bulk_upload._await_with_watchdog(
+                asyncio.sleep(0.05, result='done'),
+            )
+
+        self.assertEqual(result, 'done')
+        self.assertGreaterEqual(self.wd.touch_work.call_count, 3)
+
 
 if __name__ == '__main__':
     unittest.main()

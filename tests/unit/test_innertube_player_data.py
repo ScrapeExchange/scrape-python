@@ -162,6 +162,42 @@ class TestApplyPlayerDataIdentityFieldsNotClobbered(
             'https://www.youtube.com/embed/vid12345',
         )
 
+    def test_owner_profile_url_sets_handle_when_missing(self) -> None:
+        video: YouTubeVideo = YouTubeVideo(
+            video_id='vid12345', channel_handle=None,
+        )
+        player_data: dict = {
+            'videoDetails': {},
+            'microformat': {
+                'playerMicroformatRenderer': {
+                    'ownerProfileUrl':
+                        'https://www.youtube.com/@CanonicalHandle',
+                },
+            },
+        }
+        InnerTubeVideoParser._apply_player_data(video, player_data)
+        self.assertEqual(video.channel_handle, 'CanonicalHandle')
+
+    def test_owner_profile_url_handle_wins_over_display_author(
+        self,
+    ) -> None:
+        video: YouTubeVideo = YouTubeVideo(
+            video_id='vid12345', channel_handle=None,
+        )
+        player_data: dict = {
+            'videoDetails': {
+                'author': 'Display Name With Spaces',
+            },
+            'microformat': {
+                'playerMicroformatRenderer': {
+                    'ownerProfileUrl':
+                        'https://www.youtube.com/@CanonicalHandle/videos',
+                },
+            },
+        }
+        InnerTubeVideoParser._apply_player_data(video, player_data)
+        self.assertEqual(video.channel_handle, 'CanonicalHandle')
+
     def test_empty_title_and_description_do_not_clobber(
         self,
     ) -> None:
@@ -300,6 +336,111 @@ class TestNextDataSetsChannelThumbnail(unittest.TestCase):
         self.assertEqual(
             parser.video.channel_thumbnail_url,
             'https://x/s176',
+        )
+
+    def test_owner_renderer_sets_channel_identity(self) -> None:
+        parser = self._build_parser_with_video()
+        parser.video.channel_id = None
+        parser.video.channel_handle = ''
+        parser.video.channel_url = None
+        next_data: dict = {
+            'contents': {
+                'twoColumnWatchNextResults': {
+                    'results': {
+                        'results': {
+                            'contents': [
+                                {'videoSecondaryInfoRenderer': {
+                                    'owner': {
+                                        'videoOwnerRenderer': {
+                                            'navigationEndpoint': {
+                                                'commandMetadata': {
+                                                    'webCommandMetadata': {
+                                                        'url': (
+                                                            '/@Canonical'
+                                                        ),
+                                                    },
+                                                },
+                                                'browseEndpoint': {
+                                                    'browseId': (
+                                                        'UC1234567890'
+                                                        'abcdefghij'
+                                                    ),
+                                                    'canonicalBaseUrl': (
+                                                        '/@Canonical'
+                                                    ),
+                                                },
+                                            },
+                                        },
+                                    },
+                                }},
+                            ],
+                        },
+                    },
+                },
+            },
+        }
+
+        parser._parse_next_data(next_data)
+
+        self.assertEqual(
+            parser.video.channel_id,
+            'UC1234567890abcdefghij',
+        )
+        self.assertEqual(parser.video.channel_handle, 'Canonical')
+        self.assertEqual(
+            parser.video.channel_url,
+            'https://www.youtube.com/@Canonical',
+        )
+
+    def test_owner_title_run_endpoint_sets_channel_identity(
+        self,
+    ) -> None:
+        parser = self._build_parser_with_video()
+        parser.video.channel_id = None
+        parser.video.channel_handle = ''
+        parser.video.channel_url = None
+        next_data: dict = {
+            'contents': {
+                'twoColumnWatchNextResults': {
+                    'results': {
+                        'results': {
+                            'contents': [
+                                {'videoSecondaryInfoRenderer': {
+                                    'owner': {
+                                        'videoOwnerRenderer': {
+                                            'title': {
+                                                'runs': [{
+                                                    'text': (
+                                                        'Display Name'
+                                                    ),
+                                                    'navigationEndpoint': {
+                                                        'browseEndpoint': {
+                                                            'browseId': (
+                                                                'UCabc'
+                                                            ),
+                                                            'canonicalBaseUrl':
+                                                                '/@FromTitle',
+                                                        },
+                                                    },
+                                                }],
+                                            },
+                                        },
+                                    },
+                                }},
+                            ],
+                        },
+                    },
+                },
+            },
+        }
+
+        parser._parse_next_data(next_data)
+
+        self.assertEqual(parser.video.channel_id, 'UCabc')
+        self.assertEqual(parser.video.channel_handle, 'FromTitle')
+        self.assertEqual(
+            parser.video.channel_url,
+            'https://www.youtube.com/@FromTitle',
         )
 
     def test_url_less_owner_thumbnails_filtered(self) -> None:

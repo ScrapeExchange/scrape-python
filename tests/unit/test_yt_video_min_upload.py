@@ -244,7 +244,12 @@ class TestRssEnrichDoesNotUpload(
         self.assertEqual(filename, 'abc')
         upload_mock.assert_not_called()
         video_queue.enqueue.assert_awaited_once_with(
-            'abc', source='rss',
+            'abc',
+            source='rss',
+            channel_id=None,
+            channel_handle='display-name',
+            channel_url=None,
+            channel_is_verified=None,
         )
         video.from_innertube.assert_not_awaited()
         video.to_file.assert_not_awaited()

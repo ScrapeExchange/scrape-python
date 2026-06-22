@@ -3,14 +3,23 @@ Unit tests for scrape_exchange.file_management.AssetFileManagement.
 '''
 
 import os
+import stat
+import asyncio
 import unittest
 import tempfile
+from pathlib import Path
 
 from scrape_exchange.file_management import (
     AssetFileManagement,
     DEFAULT_PREFIX_RANKINGS,
     MARKER_SUFFIXES,
+    WORLD_READABLE_FILE_MODE,
+    atomic_write_bytes,
 )
+
+
+def _file_mode(path: str | os.PathLike) -> int:
+    return stat.S_IMODE(os.stat(path).st_mode)
 
 
 class TestAssetFileManagementInit(unittest.TestCase):
@@ -300,6 +309,11 @@ class TestReadWriteFile(unittest.IsolatedAsyncioTestCase):
             os.path.join(self.base, 'video-min-XYZ.json.br')
         ))
 
+    async def test_write_file_is_world_readable(self):
+        path = os.path.join(self.base, 'video-min-XYZ.json.br')
+        await self.fm.write_file('video-min-XYZ.json.br', {'x': 1})
+        self.assertEqual(_file_mode(path), WORLD_READABLE_FILE_MODE)
+
     async def test_write_overwrites_existing_file(self):
         await self.fm.write_file('video-dlp-XYZ.json.br', {'v': 1})
         await self.fm.write_file('video-dlp-XYZ.json.br', {'v': 2})
@@ -390,6 +404,15 @@ class TestReadWriteFile(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(os.path.exists(
             os.path.join(self.base, 'video-min-OTHER.json.br')
         ))
+
+
+class TestAtomicWriteBytesPermissions(unittest.TestCase):
+
+    def test_atomic_write_bytes_creates_world_readable_file(self):
+        with tempfile.TemporaryDirectory() as base:
+            path = os.path.join(base, 'bulk-state.json')
+            asyncio.run(atomic_write_bytes(path, b'{}'))
+            self.assertEqual(_file_mode(path), WORLD_READABLE_FILE_MODE)
 
 
 class TestIsMarker(unittest.TestCase):
@@ -497,6 +520,7 @@ class TestMarkerHelpers(unittest.IsolatedAsyncioTestCase):
         )
         with open(path) as f:
             self.assertEqual(f.read(), '')
+        self.assertEqual(_file_mode(path), WORLD_READABLE_FILE_MODE)
 
     async def test_mark_not_found_writes_content(self):
         path = await self.fm.mark_not_found('channel-foo', content='foo\n')
@@ -528,6 +552,7 @@ class TestMarkerHelpers(unittest.IsolatedAsyncioTestCase):
         src = os.path.join(self.base, 'channel-foo.json.br')
         with open(src, 'w') as f:
             f.write('x')
+        os.chmod(src, 0o600)
         dst = await self.fm.mark_uploaded('channel-foo.json.br')
         self.assertFalse(os.path.exists(src))
         self.assertTrue(os.path.exists(dst))
@@ -535,6 +560,20 @@ class TestMarkerHelpers(unittest.IsolatedAsyncioTestCase):
             str(dst),
             os.path.join(self.uploaded, 'channel-foo.json.br'),
         )
+        self.assertEqual(_file_mode(dst), WORLD_READABLE_FILE_MODE)
+
+    async def test_mark_uploaded_from_moves_world_readable_file(self):
+        with tempfile.TemporaryDirectory() as source:
+            src = os.path.join(source, 'channel-foo.json.br')
+            with open(src, 'w') as f:
+                f.write('x')
+            os.chmod(src, 0o600)
+            dst = await self.fm.mark_uploaded_from(
+                'channel-foo.json.br',
+                Path(source),
+            )
+        self.assertTrue(os.path.exists(dst))
+        self.assertEqual(_file_mode(dst), WORLD_READABLE_FILE_MODE)
 
     async def test_mark_uploaded_missing_source_raises(self):
         with self.assertRaises((FileNotFoundError, OSError)):
@@ -544,12 +583,13 @@ class TestMarkerHelpers(unittest.IsolatedAsyncioTestCase):
         src = os.path.join(self.base, 'channel-foo.json.br')
         with open(src, 'w') as f:
             f.write('x')
+        os.chmod(src, 0o600)
         new_name = await self.fm.mark_failed('channel-foo.json.br')
+        dst = os.path.join(self.base, 'channel-foo.json.br.failed')
         self.assertEqual(new_name, 'channel-foo.json.br.failed')
         self.assertFalse(os.path.exists(src))
-        self.assertTrue(os.path.exists(
-            os.path.join(self.base, 'channel-foo.json.br.failed')
-        ))
+        self.assertTrue(os.path.exists(dst))
+        self.assertEqual(_file_mode(dst), WORLD_READABLE_FILE_MODE)
 
     async def test_touch_marker_rejects_non_marker_filename(self):
         with self.assertRaises(ValueError):

@@ -1,0 +1,181 @@
+{
+  "id": "7000000000000000001",
+  "AIGCDescription": "",
+  "CategoryType": 101,
+  "IsHDBitrate": true,
+  "desc": "loving #fyp content with friends @bestie #foryou",
+  "createTime": 1700000000,
+  "author": {
+    "id": "1234567890",
+    "uniqueId": "charlidamelio",
+    "secUid": "MS4wLjABAAAA-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "nickname": "Charli",
+    "signature": "hello",
+    "avatarThumb": "https://example/avatar-thumb.jpeg",
+    "avatarMedium": "https://example/avatar-medium.jpeg",
+    "avatarLarger": "https://example/avatar-large.jpeg",
+    "verified": true,
+    "privateAccount": false,
+    "secret": false,
+    "relation": 0,
+    "commentSetting": 0,
+    "downloadSetting": 0,
+    "duetSetting": 0,
+    "stitchSetting": 0,
+    "isEmbedBanned": false,
+    "openFavorite": true,
+    "ftc": false,
+    "isADVirtual": false,
+    "UserStoryStatus": 0
+  },
+  "authorStats": {
+    "followerCount": 155000000,
+    "followingCount": 1270,
+    "heartCount": 12345678900,
+    "videoCount": 2600,
+    "diggCount": 10000,
+    "friendCount": 0,
+    "heart": 12345678900
+  },
+  "authorStatsV2": {
+    "followerCount": "155000000",
+    "followingCount": "1270",
+    "heartCount": "12345678900",
+    "videoCount": "2600",
+    "diggCount": "10000",
+    "friendCount": "0",
+    "heart": "12345678900"
+  },
+  "video": {
+    "id": "video-api-1",
+    "duration": 28,
+    "ratio": "720p",
+    "width": 720,
+    "height": 1280,
+    "cover": "https://p16-sign.tiktokcdn-us.com/sample-cover.jpeg",
+    "originCover": "https://p16-sign.tiktokcdn-us.com/sample-origin.jpeg",
+    "dynamicCover": "https://p16-sign.tiktokcdn-us.com/sample-dyn.webp",
+    "definition": "540p",
+    "videoQuality": "normal",
+    "format": "mp4",
+    "codecType": "h264",
+    "bitrate": 1132103,
+    "encodedType": "normal",
+    "playAddr": "https://v16-webapp-prime.tiktok.com/video/tos/sample-play/?mime_type=video_mp4&expire=1767139200&signature=0000000000000000000000000000000000000000",
+    "downloadAddr": "https://v16-webapp-prime.tiktok.com/video/tos/sample-download/?mime_type=video_mp4&expire=1767139200&signature=0000000000000000000000000000000000000000",
+    "volumeInfo": { "Loudness": -14.2, "Peak": 0.79433 },
+    "bitrateInfo": [
+      {
+        "GearName": "normal_540_0",
+        "Bitrate": 1132103,
+        "QualityType": 20,
+        "CodecType": "h264",
+        "MVMAF": "",
+        "PlayAddr": {
+          "DataSize": 3962360,
+          "FileCs": "c:0-9931-2c93",
+          "FileHash": "abc0123456789abcdef0123456789abc",
+          "Height": 1024,
+          "Uri": "v09044g40000sample0",
+          "UrlKey": "v09044g40000sample0_h264_540p_1132103",
+          "UrlList": [
+            "https://v16-webapp-prime.tiktok.com/video/tos/sample0/?mime_type=video_mp4&expire=1767139200&signature=0000000000000000000000000000000000000000",
+            "https://v19-webapp-prime.tiktok.com/video/tos/sample0/?mime_type=video_mp4&expire=1767139200&signature=0000000000000000000000000000000000000000"
+          ],
+          "Width": 576
+        }
+      },
+      {
+        "GearName": "adapt_540_1",
+        "Bitrate": 789012,
+        "QualityType": 28,
+        "CodecType": "bytevc1",
+        "MVMAF": "",
+        "PlayAddr": {
+          "DataSize": 2761542,
+          "FileCs": "c:0-9931-2c93",
+          "FileHash": "def0123456789abcdef0123456789def",
+          "Height": 1024,
+          "Uri": "v09044g40000sample1",
+          "UrlKey": "v09044g40000sample1_bytevc1_540p_789012",
+          "UrlList": [
+            "https://v16-webapp-prime.tiktok.com/video/tos/sample1/?mime_type=video_mp4&expire=1767139200&signature=0000000000000000000000000000000000000000"
+          ],
+          "Width": 576
+        }
+      },
+      {
+        "GearName": "adapt_720_1",
+        "Bitrate": 1456789,
+        "QualityType": 25,
+        "CodecType": "bytevc1",
+        "MVMAF": "",
+        "PlayAddr": {
+          "DataSize": 5097762,
+          "FileCs": "c:0-9931-2c93",
+          "FileHash": "0120123456789abcdef0123456789abc",
+          "Height": 1280,
+          "Uri": "v09044g40000sample2",
+          "UrlKey": "v09044g40000sample2_bytevc1_720p_1456789",
+          "UrlList": [
+            "https://v16-webapp-prime.tiktok.com/video/tos/sample2/?mime_type=video_mp4&expire=1767139200&signature=0000000000000000000000000000000000000000"
+          ],
+          "Width": 720
+        }
+      }
+    ],
+    "subtitleInfos": []
+  },
+  "music": {
+    "id": "7100000000000000001",
+    "title": "Original Sound",
+    "authorName": "charlidamelio",
+    "original": true,
+    "duration": 28,
+    "playUrl": "https://sf16-ies-music-va.tiktokcdn.com/sample.m4a",
+    "coverLarge": "https://example/music-large.jpeg",
+    "coverMedium": "https://example/music-medium.jpeg",
+    "coverThumb": "https://example/music-thumb.jpeg",
+    "isCopyrighted": false,
+    "is_commerce_music": false,
+    "is_unlimited_music": false,
+    "private": false,
+    "shoot_duration": 28
+  },
+  "stats": {
+    "playCount": 12000000,
+    "diggCount": 950000,
+    "commentCount": 8200,
+    "shareCount": 41000,
+    "collectCount": 17000
+  },
+  "statsV2": {
+    "repostCount": "1234"
+  },
+  "textLanguage": "en",
+  "textTranslatable": true,
+  "titleLanguage": "un",
+  "titleTranslatable": false,
+  "isAd": false,
+  "isReviewing": false,
+  "officalItem": false,
+  "originalItem": false,
+  "privateItem": false,
+  "secret": false,
+  "shareEnabled": true,
+  "forFriend": false,
+  "collected": false,
+  "digged": false,
+  "duetDisplay": 0,
+  "stitchDisplay": 0,
+  "itemCommentStatus": 0,
+  "item_control": {
+    "can_repost": true
+  },
+  "creatorAIComment": {
+    "eligibleVideo": true,
+    "hasAITopic": false,
+    "notEligibleReason": 0
+  },
+  "backendSourceEventTracking": "opaque-public-token"
+}

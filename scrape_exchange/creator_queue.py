@@ -31,7 +31,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 
 import aiofiles
 import orjson
@@ -459,6 +459,26 @@ class CreatorQueue(ABC):
             per-cycle leak rate rather than
             post-recovery zeros.
         '''
+
+    @abstractmethod
+    async def reschedule_in(
+        self, creator_id: str, delay_seconds: float,
+    ) -> None:
+        '''Re-enqueue *creator_id* at ``now + delay_seconds`` in its
+        current tier, ignoring the tier interval (unlike release).'''
+
+    @abstractmethod
+    async def discard_member(self, creator_id: str) -> None:
+        '''Hard-delete *creator_id* from every queue structure,
+        leaving no residue (unlike remove, which retains the entry).'''
+
+    @abstractmethod
+    async def schedule_if_absent(
+        self, creator_id: str, name: str, weight: int,
+    ) -> bool:
+        '''Atomically enqueue *creator_id* at its *weight* tier iff it
+        is not already queued (any tier), claimed, or excluded. Returns
+        whether it scheduled.'''
 
 
 # -----------------------------------------------------------
@@ -975,6 +995,52 @@ class FileCreatorQueue(CreatorQueue):
         )
         await self._persist_queue()
 
+    async def reschedule_in(
+        self, creator_id: str, delay_seconds: float,
+    ) -> None:
+        self._claimed.discard(creator_id)
+        tier: int = self._creator_tiers.get(
+            creator_id,
+            self._tiers[-1].tier if self._tiers else 1,
+        )
+        now: float = datetime.now(UTC).timestamp()
+        name: str = self._names.get(creator_id, creator_id)
+        self._ensure_heap(tier)
+        heapq.heappush(
+            self._heaps[tier],
+            (now + delay_seconds, name, creator_id),
+        )
+        await self._persist_queue()
+
+    async def discard_member(self, creator_id: str) -> None:
+        self._claimed.discard(creator_id)
+        tier: int | None = self._creator_tiers.pop(creator_id, None)
+        self._names.pop(creator_id, None)
+        if tier is not None and tier in self._heaps:
+            self._heaps[tier] = [
+                entry for entry in self._heaps[tier]
+                if entry[2] != creator_id
+            ]
+            heapq.heapify(self._heaps[tier])
+        await self._persist_queue()
+
+    async def schedule_if_absent(
+        self, creator_id: str, name: str, weight: int,
+    ) -> bool:
+        if creator_id in self._claimed:
+            return False
+        for heap in self._heaps.values():
+            if any(entry[2] == creator_id for entry in heap):
+                return False
+        tier: int = tier_for_subscriber_count(self._tiers, weight)
+        now: float = datetime.now(UTC).timestamp()
+        self._ensure_heap(tier)
+        heapq.heappush(self._heaps[tier], (now, name, creator_id))
+        self._creator_tiers[creator_id] = tier
+        self._names[creator_id] = name
+        await self._persist_queue()
+        return True
+
     async def update_tier(
         self,
         creator_id: str,
@@ -1223,13 +1289,38 @@ return out
 # KEYS[1]      = creators hash
 # KEYS[2..N+1] = queue:1..queue:N
 # KEYS[N+2]    = tiers hash
+# KEYS[N+3]    = excluded set (operator-removed members)
 # ARGV[1]      = now (unix timestamp)
 # ARGV[2]      = claim_key prefix
 # ARGV[3]      = last tier number (string)
 
+_LUA_SCHEDULE_IF_ABSENT: str = '''\
+local num_q = tonumber(ARGV[6])
+local cid = ARGV[1]
+if redis.call('SISMEMBER', KEYS[num_q + 4], cid) == 1 then
+    return 0
+end
+if redis.call('EXISTS', KEYS[num_q + 5]) == 1 then
+    return 0
+end
+for i = 1, num_q do
+    if redis.call('ZSCORE', KEYS[i], cid) then
+        return 0
+    end
+end
+redis.call('ZADD', KEYS[num_q + 6], ARGV[5], cid)
+redis.call('HSET', KEYS[num_q + 1], cid, ARGV[2])
+redis.call('HSET', KEYS[num_q + 2], cid, ARGV[4])
+redis.call('SADD', KEYS[num_q + 3], ARGV[3])
+return 1
+'''
+
+
 _LUA_RECOVER_ORPHANS: str = '''\
 local recovered = 0
-local num_queues = #KEYS - 2
+local num_queues = #KEYS - 3
+local tiers_key = KEYS[#KEYS - 1]
+local excluded_key = KEYS[#KEYS]
 local cursor = '0'
 repeat
     local result = redis.call(
@@ -1250,9 +1341,11 @@ repeat
         if not in_any then
             local claimed = redis.call(
                 'EXISTS', ARGV[2] .. cid)
-            if claimed == 0 then
+            local excluded = redis.call(
+                'SISMEMBER', excluded_key, cid)
+            if claimed == 0 and excluded == 0 then
                 local tier_str = redis.call(
-                    'HGET', KEYS[#KEYS], cid)
+                    'HGET', tiers_key, cid)
                 local tier = tonumber(tier_str)
                     or tonumber(ARGV[3])
                 local qkey = KEYS[tier + 1]
@@ -1277,13 +1370,15 @@ class RedisCreatorQueue(CreatorQueue):
     processing.
 
     All Redis keys are prefixed with
-    ``rss:{platform}:`` so multiple platforms can
-    coexist on the same Redis instance.
+    ``{key_namespace}:{platform}:`` so multiple platforms
+    can coexist on the same Redis instance.  The default
+    namespace is ``rss`` (YouTube legacy); TikTok uses
+    ``scrape``.
 
-    Tier queues: ``rss:{platform}:queue:1``, ``:queue:2``
-    etc.  Tier membership: ``rss:{platform}:tiers``
+    Tier queues: ``{prefix}:queue:1``, ``:queue:2``
+    etc.  Tier membership: ``{prefix}:tiers``
     hash (``creator_id`` → tier number as string).
-    Case-insensitive name index: ``rss:{platform}:names``
+    Case-insensitive name index: ``{prefix}:names``
     set (lowercased channel names for dedup).
 
     Uses ``redis.asyncio`` following the pattern
@@ -1297,6 +1392,7 @@ class RedisCreatorQueue(CreatorQueue):
         worker_id: str,
         platform: str = 'youtube',
         eligibility_fraction: float = 1.0,
+        key_namespace: str = 'rss',
     ) -> None:
         self._redis = (
             redis_from_url(
@@ -1308,22 +1404,34 @@ class RedisCreatorQueue(CreatorQueue):
         self._worker_id: str = worker_id
         self._platform: str = platform
         self._eligibility_fraction: float = eligibility_fraction
-
-        p: str = self._platform
-        self._key_creators: str = (
-            f'rss:{p}:creators'
+        self._key_prefix: str = (
+            f'{key_namespace}:{platform}'
         )
-        self._key_tiers: str = f'rss:{p}:tiers'
+
+        self._key_creators: str = (
+            f'{self._key_prefix}:creators'
+        )
+        self._key_tiers: str = (
+            f'{self._key_prefix}:tiers'
+        )
         self._claim_prefix: str = (
-            f'rss:{p}:claim:'
+            f'{self._key_prefix}:claim:'
         )
         self._no_feeds_prefix: str = (
-            f'rss:{p}:no_feeds:'
+            f'{self._key_prefix}:no_feeds:'
         )
         self._key_had_feed: str = (
-            f'rss:{p}:had_feed'
+            f'{self._key_prefix}:had_feed'
         )
-        self._key_names: str = f'rss:{p}:names'
+        self._key_names: str = (
+            f'{self._key_prefix}:names'
+        )
+        # Operator-excluded members ("removed" state). Never written
+        # by the RSS scraper, so its recover/populate paths are
+        # unaffected (an empty set makes the SISMEMBER guard a no-op).
+        self._key_excluded: str = (
+            f'{self._key_prefix}:excluded'
+        )
         self._names_indexed: bool = False
 
         # Populated by populate(); tier queues keys.
@@ -1332,10 +1440,11 @@ class RedisCreatorQueue(CreatorQueue):
 
         self._claim_script: Any = None
         self._recover_script: Any = None
+        self._schedule_script: Any = None
 
     async def _ensure_names_index(self) -> None:
         '''
-        Populate ``rss:{p}:names`` from the creators
+        Populate the names set from the creators
         hash if the set does not yet exist.  Uses
         ``HSCAN`` to avoid loading the entire hash
         into Python memory at once.  Idempotent:
@@ -1374,12 +1483,14 @@ class RedisCreatorQueue(CreatorQueue):
             if cursor == 0:
                 break
 
+    def _queue_key(self, tier: int) -> str:
+        return f'{self._key_prefix}:queue:{tier}'
+
     def _build_queue_keys(
         self, tiers: list[TierConfig],
     ) -> list[str]:
-        p: str = self._platform
         return [
-            f'rss:{p}:queue:{tc.tier}'
+            self._queue_key(tc.tier)
             for tc in sorted(
                 tiers, key=lambda t: t.tier,
             )
@@ -1398,6 +1509,11 @@ class RedisCreatorQueue(CreatorQueue):
         self._recover_script = (
             self._redis.register_script(
                 _LUA_RECOVER_ORPHANS,
+            )
+        )
+        self._schedule_script = (
+            self._redis.register_script(
+                _LUA_SCHEDULE_IF_ABSENT,
             )
         )
 
@@ -1437,6 +1553,7 @@ class RedisCreatorQueue(CreatorQueue):
                     self._key_creators,
                     *self._key_queues,
                     self._key_tiers,
+                    self._key_excluded,
                 ],
                 args=[
                     str(now),
@@ -1469,9 +1586,9 @@ class RedisCreatorQueue(CreatorQueue):
         subscriber_counts: dict[str, int],
     ) -> int:
         '''
-        Migrate from the old single ``rss:{platform}:queue``
-        sorted set to per-tier queues.  Returns the count
-        of members migrated.
+        Migrate from the old single-queue sorted set
+        to per-tier queues.  Returns the count of members
+        migrated.
 
         Uses ``RENAME`` to atomically claim the old key so
         that concurrent scrapers starting at the same time
@@ -1480,10 +1597,9 @@ class RedisCreatorQueue(CreatorQueue):
         been distributed to tier queues.
         '''
 
-        p: str = self._platform
-        old_key: str = f'rss:{p}:queue'
+        old_key: str = f'{self._key_prefix}:queue'
         tmp_key: str = (
-            f'rss:{p}:queue:_migrating'
+            f'{self._key_prefix}:queue:_migrating'
             f':{self._worker_id}'
         )
 
@@ -1521,11 +1637,10 @@ class RedisCreatorQueue(CreatorQueue):
             tier: int = tier_for_subscriber_count(
                 tiers, count,
             )
-            queue_key: str = (
-                f'rss:{p}:queue:{tier}'
-            )
             pipe.zadd(
-                queue_key, {cid: score}, nx=True,
+                self._queue_key(tier),
+                {cid: score},
+                nx=True,
             )
             pipe.hset(
                 self._key_tiers,
@@ -1611,12 +1726,10 @@ class RedisCreatorQueue(CreatorQueue):
                 tier: int = tier_for_subscriber_count(
                     tiers, count,
                 )
-                p: str = self._platform
-                queue_key: str = (
-                    f'rss:{p}:queue:{tier}'
-                )
                 pipe.zadd(
-                    queue_key, {cid: now}, nx=True,
+                    self._queue_key(tier),
+                    {cid: now},
+                    nx=True,
                 )
                 pipe.hset(
                     self._key_creators, cid, name,
@@ -1708,14 +1821,12 @@ class RedisCreatorQueue(CreatorQueue):
             now
             + interval_seconds * self._eligibility_fraction
         )
-        p: str = self._platform
-        queue_key: str = f'rss:{p}:queue:{tier}'
         pipe = self._redis.pipeline()
         pipe.delete(
             f'{self._claim_prefix}{creator_id}',
         )
         pipe.zadd(
-            queue_key,
+            self._queue_key(tier),
             {creator_id: next_check},
         )
         # Self-heal: if the tier hash had no entry for this
@@ -1731,6 +1842,64 @@ class RedisCreatorQueue(CreatorQueue):
                 str(tier),
             )
         await pipe.execute()
+
+    async def reschedule_in(
+        self, creator_id: str, delay_seconds: float,
+    ) -> None:
+        tier: int = await self._member_tier(creator_id)
+        now: float = datetime.now(UTC).timestamp()
+        pipe = self._redis.pipeline()
+        pipe.delete(f'{self._claim_prefix}{creator_id}')
+        pipe.zadd(
+            self._queue_key(tier),
+            {creator_id: now + delay_seconds},
+        )
+        await pipe.execute()
+
+    async def discard_member(self, creator_id: str) -> None:
+        # Hard-delete: unlike remove(), erase the creators/tiers/names
+        # entries too so no 'absent' residue remains. The names set
+        # stores name.lower() (see add_member), so purge that form.
+        name: str | None = await self._redis.hget(
+            self._key_creators, creator_id,
+        )
+        name_lower: str = (name or creator_id).lower()
+        pipe = self._redis.pipeline()
+        for key in self._key_queues:
+            pipe.zrem(key, creator_id)
+        pipe.delete(f'{self._claim_prefix}{creator_id}')
+        pipe.hdel(self._key_tiers, creator_id)
+        pipe.hdel(self._key_creators, creator_id)
+        pipe.srem(self._key_excluded, creator_id)
+        pipe.srem(self._key_names, name_lower)
+        await pipe.execute()
+
+    async def schedule_if_absent(
+        self, creator_id: str, name: str, weight: int,
+    ) -> bool:
+        self._ensure_lua_scripts()
+        tier: int = tier_for_subscriber_count(self._tiers, weight)
+        now: float = datetime.now(UTC).timestamp()
+        result: int = await self._schedule_script(
+            keys=[
+                *self._key_queues,
+                self._key_creators,
+                self._key_tiers,
+                self._key_names,
+                self._key_excluded,
+                f'{self._claim_prefix}{creator_id}',
+                self._queue_key(tier),
+            ],
+            args=[
+                creator_id,
+                name,
+                name.lower(),
+                str(tier),
+                str(now),
+                str(len(self._key_queues)),
+            ],
+        )
+        return int(result) == 1
 
     async def update_tier(
         self,
@@ -1894,12 +2063,10 @@ class RedisCreatorQueue(CreatorQueue):
     ) -> dict[int, int]:
         sizes: dict[int, int] = {}
         for tc in self._tiers:
-            key: str = (
-                f'rss:{self._platform}'
-                f':queue:{tc.tier}'
-            )
             sizes[tc.tier] = (
-                await self._redis.zcard(key)
+                await self._redis.zcard(
+                    self._queue_key(tc.tier),
+                )
             )
         return sizes
 
@@ -1943,6 +2110,7 @@ class RedisCreatorQueue(CreatorQueue):
                 self._key_creators,
                 *self._key_queues,
                 self._key_tiers,
+                self._key_excluded,
             ],
             args=[
                 str(now),
@@ -2049,7 +2217,6 @@ class RedisCreatorQueue(CreatorQueue):
 
                     if recover and orphans:
                         rec_pipe = self._redis.pipeline()
-                        p: str = self._platform
                         for cid, tier in orphans:
                             # nx=True so a concurrent release()
                             # that runs between scan and recovery
@@ -2057,7 +2224,7 @@ class RedisCreatorQueue(CreatorQueue):
                             # is preserved — we only want to
                             # re-enqueue truly absent creators.
                             rec_pipe.zadd(
-                                f'rss:{p}:queue:{tier}',
+                                self._queue_key(tier),
                                 {cid: now},
                                 nx=True,
                             )
@@ -2067,3 +2234,183 @@ class RedisCreatorQueue(CreatorQueue):
                 break
 
         return breakdown
+
+    # -- operator helpers (queue admin tool) --------------------
+
+    async def _member_tier(self, creator_id: str) -> int:
+        tier_str: str | None = await self._redis.hget(
+            self._key_tiers, creator_id,
+        )
+        if tier_str:
+            return int(tier_str)
+        return self._tiers[-1].tier if self._tiers else 1
+
+    async def _queued_score(
+        self, creator_id: str,
+    ) -> float | None:
+        for key in self._key_queues:
+            score: float | None = await self._redis.zscore(
+                key, creator_id,
+            )
+            if score is not None:
+                return score
+        return None
+
+    async def _state_of(
+        self, creator_id: str,
+    ) -> tuple[str, float | None]:
+        '''Classify a member into queued|claimed|removed|absent.'''
+        if await self._redis.sismember(
+            self._key_excluded, creator_id,
+        ):
+            return 'removed', None
+        if await self._redis.exists(
+            f'{self._claim_prefix}{creator_id}',
+        ):
+            return 'claimed', None
+        score: float | None = await self._queued_score(creator_id)
+        if score is not None:
+            return 'queued', score
+        return 'absent', None
+
+    async def add_member(
+        self,
+        creator_id: str,
+        name: str,
+        subscriber_count: int,
+    ) -> bool:
+        '''Queue *creator_id* at its follower-count tier (also the
+        restore path for an excluded member). Returns whether it was
+        newly queued.'''
+        tier: int = tier_for_subscriber_count(
+            self._tiers, subscriber_count,
+        )
+        now: float = datetime.now(UTC).timestamp()
+        await self._redis.srem(self._key_excluded, creator_id)
+        added: int = await self._redis.zadd(
+            self._queue_key(tier),
+            {creator_id: now},
+            nx=True,
+        )
+        pipe = self._redis.pipeline()
+        pipe.hset(self._key_creators, creator_id, name)
+        pipe.hset(self._key_tiers, creator_id, str(tier))
+        pipe.sadd(self._key_names, name.lower())
+        await pipe.execute()
+        return bool(added)
+
+    async def exclude(self, creator_id: str) -> None:
+        '''Mark *creator_id* removed: drop it from every tier queue
+        and its claim, and record it in the excluded set so the
+        recover path will not resurrect it.'''
+        pipe = self._redis.pipeline()
+        for key in self._key_queues:
+            pipe.zrem(key, creator_id)
+        pipe.delete(f'{self._claim_prefix}{creator_id}')
+        pipe.sadd(self._key_excluded, creator_id)
+        await pipe.execute()
+
+    async def unexclude(self, creator_id: str) -> None:
+        await self._redis.srem(self._key_excluded, creator_id)
+
+    async def reschedule(self, creator_id: str) -> bool:
+        '''Make *creator_id* due now in its tier (clearing any
+        excluded flag so it actually runs).'''
+        tier: int = await self._member_tier(creator_id)
+        now: float = datetime.now(UTC).timestamp()
+        pipe = self._redis.pipeline()
+        pipe.srem(self._key_excluded, creator_id)
+        pipe.zadd(
+            self._queue_key(tier),
+            {creator_id: now},
+        )
+        await pipe.execute()
+        return True
+
+    async def show_member(
+        self, creator_id: str,
+    ) -> dict | None:
+        '''Return ``{creator_id, name, state, tier, score}`` or
+        ``None`` when the member is unknown.'''
+        name: str | None = await self._redis.hget(
+            self._key_creators, creator_id,
+        )
+        state: str
+        score: float | None
+        state, score = await self._state_of(creator_id)
+        if name is None and state == 'absent':
+            return None
+        tier_str: str | None = await self._redis.hget(
+            self._key_tiers, creator_id,
+        )
+        return {
+            'creator_id': creator_id,
+            'name': name,
+            'state': state,
+            'tier': int(tier_str) if tier_str else None,
+            'score': score,
+        }
+
+    async def search_members(
+        self, term: str, limit: int,
+    ) -> list[dict]:
+        '''Case-insensitive match of *term* against member id or
+        name, each annotated with state/tier (bounded by *limit*).'''
+        term_l: str = term.lower()
+        results: list[dict] = []
+        cursor: int = 0
+        while True:
+            cursor, data = await self._redis.hscan(
+                self._key_creators, cursor, count=500,
+            )
+            for cid, name in data.items():
+                hay: str = f'{cid}\n{name or ""}'.lower()
+                if term_l not in hay:
+                    continue
+                rec: dict | None = await self.show_member(cid)
+                if rec is not None:
+                    results.append(rec)
+                if len(results) >= limit:
+                    return results
+            if cursor == 0:
+                break
+        return results
+
+    async def count_by_state(self) -> dict[str, int]:
+        '''Counts for the three operator states.'''
+        queued: int = 0
+        for key in self._key_queues:
+            queued += await self._redis.zcard(key)
+        removed: int = await self._redis.scard(self._key_excluded)
+        claimed: int = 0
+        cursor: int = 0
+        pattern: str = f'{self._claim_prefix}*'
+        while True:
+            cursor, keys = await self._redis.scan(
+                cursor, match=pattern, count=500,
+            )
+            claimed += len(keys)
+            if cursor == 0:
+                break
+        return {
+            'queued': queued,
+            'claimed': claimed,
+            'removed': removed,
+        }
+
+    async def iter_members(self) -> AsyncIterator[dict]:
+        '''Yield a ``show_member`` record for every known creator,
+        including removed ones (the creators hash retains them).
+        Streams via ``HSCAN`` so the whole hash is never held in
+        memory at once.'''
+        cursor: int = 0
+        while True:
+            cursor, data = await self._redis.hscan(
+                self._key_creators, cursor, count=500,
+            )
+            for cid in data:
+                rec: dict | None = await self.show_member(cid)
+                if rec is not None:
+                    yield rec
+            if cursor == 0:
+                break

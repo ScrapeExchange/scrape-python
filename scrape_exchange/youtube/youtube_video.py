@@ -448,9 +448,8 @@ class YouTubeVideo:
             raise ValueError(
                 "yt-dlp info_dict missing required 'id'"
             )
-        uploader_id: str = info.get('uploader_id') or ''
         channel_handle: str | None = (
-            uploader_id.lstrip('@') or None
+            YouTubeVideo._yt_dlp_channel_handle(info)
         )
         video: Self = YouTubeVideo(
             video_id=video_id,
@@ -511,6 +510,36 @@ class YouTubeVideo:
             info.get('formats') or [],
         )
         return video
+
+    @staticmethod
+    def _yt_dlp_channel_handle(info: dict) -> str | None:
+        '''
+        Return the canonical handle from a yt-dlp info dict when it
+        is available.
+
+        ``channel`` is often a display title and can be empty.  yt-dlp's
+        ``uploader_id`` is the closest field to YouTube's ``@handle``.
+        '''
+        uploader_id: object = info.get('uploader_id')
+        if isinstance(uploader_id, str):
+            handle: str = uploader_id.strip().lstrip('@')
+            if handle:
+                return handle
+
+        channel_url: object = info.get('channel_url')
+        if isinstance(channel_url, str) and '/@' in channel_url:
+            handle = channel_url.split('/@', 1)[1].split('/', 1)[0]
+            handle = handle.split('?', 1)[0].split('#', 1)[0].strip()
+            if handle:
+                return handle
+
+        channel: object = info.get('channel')
+        if isinstance(channel, str):
+            handle = channel.strip().lstrip('@')
+            if handle:
+                return handle
+
+        return None
 
     @staticmethod
     def _yt_dlp_media_type(
@@ -1246,8 +1275,10 @@ class YouTubeVideo:
             ) from exc
 
         self.channel_id = video_info.get('channel_id')
-        self.channel_handle: str = \
-            self.channel_handle or video_info.get('channel')
+        self.channel_handle: str | None = (
+            self.channel_handle
+            or YouTubeVideo._yt_dlp_channel_handle(video_info)
+        )
         self.channel_url: str = video_info.get('channel_url')
         self.channel_is_verified: bool = video_info.get('channel_is_verified')
         self.channel_follower_count: int = video_info.get(

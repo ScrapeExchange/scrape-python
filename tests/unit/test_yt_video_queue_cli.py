@@ -1,9 +1,19 @@
 '''Unit tests for tools.yt_video_queue.'''
 
+import argparse
+import os
+import shutil
+import tempfile
 import unittest
+from io import StringIO
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 
+from scrape_exchange.video_scrape_queue import (
+    VideoState,
+)
 from tools.yt_video_queue import main_async
 
 
@@ -24,15 +34,6 @@ class TestDispatcherStub(
         with self.assertRaises(SystemExit) as ctx:
             await main_async([])
         self.assertNotEqual(ctx.exception.code, 0)
-
-
-import argparse
-from io import StringIO
-from unittest.mock import AsyncMock, MagicMock, patch
-
-from scrape_exchange.video_scrape_queue import (
-    VideoState,
-)
 
 
 class TestCount(
@@ -117,13 +118,12 @@ class TestShow(
 
 def _stub_sources() -> object:
     '''A _ScrapedBeforeSources with an empty uploaded set and no
-    disk / API source (so the filter passes every id through).'''
+    API source (so the filter passes every id through).'''
     from tools.yt_video_queue import _ScrapedBeforeSources
     uploaded = AsyncMock()
     uploaded.contains_many.return_value = {}
     return _ScrapedBeforeSources(
         uploaded=uploaded,
-        file_mgmt=None,
         exchange_client=None,
         warnings=[],
     )
@@ -161,7 +161,7 @@ class TestAdd(
         )
         self.assertIn(
             'add: processed=2 already_scraped=0 '
-            '(uploaded=0 terminal=0 disk=0 api=0) '
+            '(uploaded=0 terminal=0 api=0) '
             'duplicates=1 added=1',
             out.getvalue(),
         )
@@ -286,122 +286,87 @@ class TestMarkUnmark(
         queue.unmark.assert_awaited_once_with('aaa')
 
 
-import os
-import shutil
-import tempfile
-
-
 class TestImport(
     unittest.IsolatedAsyncioTestCase,
 ):
 
-    async def test_enqueues_valid_ids_only(
+    async def _import(
         self,
-    ) -> None:
-        queue = AsyncMock()
-        td = tempfile.mkdtemp()
-        try:
-            for name in [
-                'dQw4w9WgXcQ', 'aBcDeFgHiJk',
-            ]:
-                with open(
-                    os.path.join(td, name), 'w',
-                ) as f:
-                    f.write('')
-            for name in [
-                'video-min-dQw4w9WgXcQ.json.br',
-                'short',
-                'priority',
-                '12345678901234567890',
-            ]:
-                with open(
-                    os.path.join(td, name), 'w',
-                ) as f:
-                    f.write('')
-            from tools.yt_video_queue import cmd_import
-            ns = argparse.Namespace(
-                directory=td,
-                source='migration',
-                force=False,
-                no_remote_check=True,
-            )
-            queue.enqueue.side_effect = [True, False]
-            queue.get_state.return_value = None
-            out = StringIO()
-            with patch('sys.stdout', out), patch(
-                'tools.yt_video_queue._build_sources',
-                new=AsyncMock(return_value=_stub_sources()),
-            ):
-                rc: int = await cmd_import(ns, queue)
-            self.assertEqual(rc, 0)
-            self.assertEqual(
-                queue.enqueue.await_count, 2,
-            )
-            self.assertIn(
-                'import: processed=2 ',
-                out.getvalue(),
-            )
-            self.assertIn('added=1', out.getvalue())
-            remaining = set(os.listdir(td))
-            self.assertNotIn(
-                'dQw4w9WgXcQ', remaining,
-            )
-            self.assertNotIn(
-                'aBcDeFgHiJk', remaining,
-            )
-            self.assertIn('short', remaining)
-            self.assertIn(
-                'video-min-dQw4w9WgXcQ.json.br',
-                remaining,
-            )
-        finally:
-            shutil.rmtree(td)
+        path: Path,
+    ) -> tuple[int, AsyncMock, str]:
+        from tools.yt_video_queue import cmd_import
 
-    async def test_already_scraped_sentinel_consumed(
+        queue = AsyncMock()
+        queue.enqueue.return_value = True
+        queue.get_state.return_value = None
+        ns = argparse.Namespace(
+            file=str(path),
+            source='migration',
+            force=False,
+            no_remote_check=True,
+        )
+        out = StringIO()
+        with patch('sys.stdout', out), patch(
+            'tools.yt_video_queue._build_sources',
+            new=AsyncMock(return_value=_stub_sources()),
+        ):
+            rc: int = await cmd_import(ns, queue)
+        return rc, queue, out.getvalue()
+
+    async def test_imports_plain_text_file(
         self,
     ) -> None:
-        '''An id filtered as already-scraped must still have its
-        sentinel unlinked, else it re-reports forever.'''
-        from tools.yt_video_queue import (
-            _ScrapedBeforeSources, cmd_import,
-        )
-        queue = AsyncMock()
-        queue.get_state.return_value = None
-        td = tempfile.mkdtemp()
-        try:
-            with open(
-                os.path.join(td, 'dQw4w9WgXcQ'), 'w',
-            ) as f:
-                f.write('')
-            uploaded = AsyncMock()
-            uploaded.contains_many.return_value = {
-                'dQw4w9WgXcQ': True,
-            }
-            sources = _ScrapedBeforeSources(
-                uploaded=uploaded,
-                file_mgmt=None,
-                exchange_client=None,
-                warnings=[],
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'videos.txt'
+            path.write_text(
+                'dQw4w9WgXcQ\ninvalid\naBcDeFgHiJk\n',
             )
-            ns = argparse.Namespace(
-                directory=td,
-                source='migration',
-                force=False,
-                no_remote_check=True,
-            )
-            out = StringIO()
-            with patch('sys.stdout', out), patch(
-                'tools.yt_video_queue._build_sources',
-                new=AsyncMock(return_value=sources),
-            ):
-                rc: int = await cmd_import(ns, queue)
+            rc, queue, out = await self._import(path)
             self.assertEqual(rc, 0)
-            queue.enqueue.assert_not_called()
-            self.assertIn('already_scraped=1', out.getvalue())
-            # Sentinel consumed despite never being enqueued.
-            self.assertEqual(os.listdir(td), [])
-        finally:
-            shutil.rmtree(td)
+            self.assertEqual(queue.enqueue.await_count, 2)
+            queue.enqueue.assert_any_await(
+                'dQw4w9WgXcQ', source='migration',
+            )
+            queue.enqueue.assert_any_await(
+                'aBcDeFgHiJk', source='migration',
+            )
+            self.assertIn('import: processed=2 ', out)
+            self.assertTrue(path.exists())
+
+    async def test_imports_first_csv_field(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'videos.csv'
+            path.write_text(
+                'dQw4w9WgXcQ,title one\n'
+                '"aBcDeFgHiJk","title, two"\n',
+            )
+            rc, queue, _ = await self._import(path)
+            self.assertEqual(rc, 0)
+            self.assertEqual(queue.enqueue.await_count, 2)
+
+    async def test_imports_video_id_from_jsonl(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'videos.jsonl'
+            path.write_text(
+                '{"video_id":"dQw4w9WgXcQ","title":"one"}\n'
+                '{"video_id":"aBcDeFgHiJk"}\n'
+                '{"other":"ignored"}\n',
+            )
+            rc, queue, out = await self._import(path)
+            self.assertEqual(rc, 0)
+            self.assertEqual(queue.enqueue.await_count, 2)
+            self.assertIn('import: processed=2 ', out)
+
+    async def test_import_requires_file_argument(
+        self,
+    ) -> None:
+        with self.assertRaises(SystemExit) as ctx:
+            await main_async(['import'])
+        self.assertNotEqual(ctx.exception.code, 0)
 
 
 class TestIngestSentinels(
@@ -537,7 +502,6 @@ class TestFilterAlreadyScraped(
             ['aaa'],
             uploaded=self._uploaded({'aaa': True}),
             queue=queue,
-            file_mgmt=None,
             exchange_client=None,
             schema_version='0.0.2',
             remote_check=True,
@@ -557,7 +521,6 @@ class TestFilterAlreadyScraped(
             ['aaa'],
             uploaded=self._uploaded({}),
             queue=self._queue(VideoState.FAILED),
-            file_mgmt=None,
             exchange_client=None,
             schema_version='0.0.2',
             remote_check=True,
@@ -575,7 +538,6 @@ class TestFilterAlreadyScraped(
             ['aaa'],
             uploaded=self._uploaded({}),
             queue=self._queue(VideoState.QUEUED),
-            file_mgmt=None,
             exchange_client=None,
             schema_version='0.0.2',
             remote_check=True,
@@ -583,24 +545,6 @@ class TestFilterAlreadyScraped(
         self.assertEqual(res.survivors, [])
         self.assertEqual(res.duplicates, 1)
         self.assertEqual(res.already_scraped['terminal'], 0)
-
-    async def test_disk_hit(self) -> None:
-        from tools.yt_video_queue import (
-            _filter_already_scraped,
-        )
-        fm = MagicMock()
-        fm.video_scrape_output_exists.return_value = True
-        res = await _filter_already_scraped(
-            ['aaa'],
-            uploaded=self._uploaded({}),
-            queue=self._queue(None),
-            file_mgmt=fm,
-            exchange_client=None,
-            schema_version='0.0.2',
-            remote_check=True,
-        )
-        self.assertEqual(res.survivors, [])
-        self.assertEqual(res.already_scraped['disk'], 1)
 
     async def test_api_200_scoped_to_uploader(self) -> None:
         from tools.yt_video_queue import (
@@ -614,7 +558,6 @@ class TestFilterAlreadyScraped(
                 ['aaa'],
                 uploaded=self._uploaded({}),
                 queue=self._queue(None),
-                file_mgmt=None,
                 exchange_client=_api_client('me'),
                 schema_version='0.0.2',
                 remote_check=True,
@@ -639,7 +582,6 @@ class TestFilterAlreadyScraped(
                 ['aaa'],
                 uploaded=self._uploaded({}),
                 queue=self._queue(None),
-                file_mgmt=None,
                 exchange_client=_api_client('me'),
                 schema_version='0.0.2',
                 remote_check=True,
@@ -659,7 +601,6 @@ class TestFilterAlreadyScraped(
                 ['aaa'],
                 uploaded=self._uploaded({}),
                 queue=self._queue(None),
-                file_mgmt=None,
                 exchange_client=_api_client('me'),
                 schema_version='0.0.2',
                 remote_check=True,
@@ -678,7 +619,6 @@ class TestFilterAlreadyScraped(
                 ['aaa'],
                 uploaded=self._uploaded({}),
                 queue=self._queue(None),
-                file_mgmt=None,
                 exchange_client=_api_client('me'),
                 schema_version='0.0.2',
                 remote_check=False,
@@ -700,7 +640,6 @@ class TestFilterAlreadyScraped(
             ['aaa'],
             uploaded=uploaded,
             queue=self._queue(None),
-            file_mgmt=None,
             exchange_client=None,
             schema_version='0.0.2',
             remote_check=True,

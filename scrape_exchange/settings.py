@@ -14,7 +14,7 @@ from pydantic import (
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from scrape_exchange.proxy_loader import (
-    load_proxy_catalog, set_active_catalog,
+    load_proxy_catalog, load_proxy_entries, set_active_catalog,
 )
 
 
@@ -100,6 +100,17 @@ class ScraperSettings(BaseSettings):
             'http://user:pass@host:port) or a local egress IP '
             '(local://x.x.x.x). Replaces the legacy PROXIES env '
             'var.'
+        ),
+    )
+    proxies_env: str | None = Field(
+        default=None,
+        exclude=True,
+        validation_alias=AliasChoices(
+            'PROXIES', 'proxies_env',
+        ),
+        description=(
+            'Legacy comma-separated proxy entries. Used by scraper '
+            'supervisor child processes after splitting PROXY_FILES.'
         ),
     )
     # ClassVar: not a pydantic/env field. Instance value is
@@ -231,7 +242,17 @@ class ScraperSettings(BaseSettings):
                 for p in self.proxy_files.split(',')
                 if p.strip()
             ]
-        catalog = load_proxy_catalog(paths)
+        if paths:
+            catalog = load_proxy_catalog(paths)
+        elif self.proxies_env:
+            entries: list[str] = [
+                entry.strip()
+                for entry in self.proxies_env.split(',')
+                if entry.strip()
+            ]
+            catalog = load_proxy_entries(entries)
+        else:
+            catalog = load_proxy_catalog([])
         # ClassVar attrs aren't in model_fields; write to instance
         # __dict__ directly to avoid pydantic's __setattr__ guard
         # rejecting an unknown field.

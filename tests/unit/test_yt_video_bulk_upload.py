@@ -13,6 +13,8 @@ from tempfile import TemporaryDirectory
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import brotli
+
 from scrape_exchange.youtube.youtube_channel import YouTubeChannel
 from scrape_exchange.youtube.youtube_thumbnail import YouTubeThumbnail
 from scrape_exchange.youtube.youtube_video import YouTubeVideo
@@ -34,6 +36,67 @@ def _thumbnail(
         'width': 480,
         'height': 360,
     })
+
+
+class TestLoadVideoFile(unittest.IsolatedAsyncioTestCase):
+
+    async def test_unrecoverable_brotli_requeued_then_deleted(
+        self,
+    ) -> None:
+        from tools.yt_video_upload import _load_video_file
+
+        video_fm = AsyncMock()
+        scrape_queue = AsyncMock()
+        events: list[str] = []
+        scrape_queue.force_enqueue.side_effect = (
+            lambda *args, **kwargs: events.append('enqueue')
+        )
+        video_fm.delete.side_effect = (
+            lambda *args, **kwargs: events.append('delete')
+        )
+
+        with patch(
+            'tools.yt_video_upload.YouTubeVideo.from_file',
+            new=AsyncMock(side_effect=brotli.error('corrupt')),
+        ):
+            result = await _load_video_file(
+                'abc123XYZ', '/tmp', 'video-dlp-',
+                'video-dlp-abc123XYZ.json.br', video_fm,
+                scrape_queue,
+            )
+
+        self.assertIsNone(result)
+        scrape_queue.force_enqueue.assert_awaited_once_with(
+            'abc123XYZ', source='video_upload_corrupt_file',
+        )
+        video_fm.delete.assert_awaited_once_with(
+            'video-dlp-abc123XYZ.json.br', fail_ok=False,
+        )
+        self.assertEqual(events, ['enqueue', 'delete'])
+
+    async def test_requeue_failure_preserves_corrupt_file(self) -> None:
+        from tools.yt_video_upload import _load_video_file
+
+        video_fm = AsyncMock()
+        scrape_queue = AsyncMock()
+        scrape_queue.force_enqueue.side_effect = RuntimeError(
+            'redis unavailable',
+        )
+
+        with patch(
+            'tools.yt_video_upload.YouTubeVideo.from_file',
+            new=AsyncMock(side_effect=brotli.error('corrupt')),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, 'redis unavailable',
+            ):
+                await _load_video_file(
+                    'abc123XYZ', '/tmp', 'video-dlp-',
+                    'video-dlp-abc123XYZ.json.br', video_fm,
+                    scrape_queue,
+                )
+
+        video_fm.delete.assert_not_awaited()
 
 
 class TestCollectVideoRecord(unittest.IsolatedAsyncioTestCase):
@@ -532,7 +595,7 @@ class TestBulkUploadedVideoIds(unittest.IsolatedAsyncioTestCase):
 
         uploaded: AsyncMock = AsyncMock()
         with patch(
-            'tools.yt_video_upload.upload_bulk_batch',
+            'tools.yt_video_upload.upload_prepared_bulk_batch',
             new=AsyncMock(return_value=BulkBatchOutcome(
                 status='completed',
                 job_id='job1',
@@ -605,12 +668,75 @@ class TestVideoUploadStartup(unittest.IsolatedAsyncioTestCase):
         resume_mock.assert_awaited_once()
         bulk_mock.assert_awaited_once()
         worker_mock.assert_awaited_once()
+        scrape_queue = bulk_mock.await_args.args[6]
+        self.assertIs(
+            worker_mock.await_args.kwargs['scrape_queue'],
+            scrape_queue,
+        )
         self.assertFalse(
             worker_mock.await_args.kwargs['enqueue_existing'],
         )
 
 
 class TestUploadedVideoIds(unittest.IsolatedAsyncioTestCase):
+
+    async def test_iter_video_upload_filenames_streams_real_directory(
+        self,
+    ) -> None:
+        from tools.yt_video_upload import _iter_video_upload_filenames
+
+        with TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            (base_dir / 'video-dlp-one.json.br').write_bytes(b'{}')
+            (base_dir / 'video-min-two.json.br').write_bytes(b'{}')
+            (base_dir / 'video-dlp-three.json.br.failed').write_bytes(
+                b'{}',
+            )
+            (base_dir / 'not-a-video.json.br').write_bytes(b'{}')
+
+            video_fm = MagicMock()
+            video_fm.base_dir = base_dir
+            video_fm.list_base.side_effect = AssertionError(
+                'real-directory scan should not materialise list_base',
+            )
+
+            filenames = sorted(_iter_video_upload_filenames(video_fm))
+
+        self.assertEqual(filenames, [
+            'video-dlp-one.json.br',
+            'video-min-two.json.br',
+        ])
+
+    async def test_upload_worker_count_ignores_scrape_proxies(
+        self,
+    ) -> None:
+        from tools.yt_video_upload import upload_worker_loop
+
+        settings = MagicMock()
+        settings.video_upload_concurrency = 2
+        settings.proxies = ['http://p1:8080', 'http://p2:8080']
+        settings.video_upload_watch = False
+
+        video_fm = MagicMock()
+        video_fm.list_base.return_value = []
+        client = AsyncMock()
+        worker = AsyncMock()
+
+        with patch(
+            'tools.yt_video_upload._upload_worker',
+            new=worker,
+        ):
+            await upload_worker_loop(
+                settings, video_fm, client, AsyncMock(),
+                _permissive_validator(), AsyncMock(),
+                enqueue_existing=False,
+            )
+
+        self.assertEqual(worker.call_count, 2)
+        self.assertEqual(
+            [call.args[0] for call in worker.call_args_list],
+            [None, None],
+        )
 
     async def test_prepare_line_moves_already_uploaded_video(
         self,
@@ -698,10 +824,11 @@ class TestUploadedVideoIds(unittest.IsolatedAsyncioTestCase):
             creator_map_backend: object,
             proxy: object,
             validator: object,
+            scrape_queue: object = None,
         ) -> tuple[str, dict]:
             del (
                 settings, video_fm, creator_map_backend,
-                proxy, validator,
+                proxy, validator, scrape_queue,
             )
             video_id: str = filename.removeprefix(
                 'video-dlp-',

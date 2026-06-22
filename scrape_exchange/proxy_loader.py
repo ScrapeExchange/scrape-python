@@ -207,6 +207,44 @@ def load_proxy_catalog(paths: Sequence[Path]) -> ProxyCatalog:
     return ProxyCatalog(entries=entries, source=source)
 
 
+def load_proxy_entries(
+    entries: Sequence[str],
+    *,
+    label: str = 'env',
+) -> ProxyCatalog:
+    """Parse direct proxy entries from an environment variable.
+
+    Used for supervisor-spawned workers, where the parent has already
+    read ``PROXY_FILES`` and passes a comma-separated proxy slice via
+    ``PROXIES``.
+    """
+
+    parsed: list[str] = []
+    source: dict[str, str] = {}
+    dup_count: int = 0
+    for index, raw in enumerate(entries, start=1):
+        stripped: str = raw.strip()
+        if not stripped:
+            continue
+        try:
+            canonical: str = _parse_entry(stripped)
+        except ValueError as exc:
+            raise ValueError(
+                f'PROXIES entry {index}: {stripped} ({exc})'
+            ) from exc
+        if canonical in source:
+            dup_count += 1
+            continue
+        parsed.append(canonical)
+        source[canonical] = label
+    if dup_count:
+        _LOGGER.info(
+            'proxy_loader: dropped %d duplicate entries from PROXIES',
+            dup_count,
+        )
+    return ProxyCatalog(entries=parsed, source=source)
+
+
 def _validate_port(port: str, raw: str) -> None:
     """Raise ValueError if *port* is not a valid TCP port number."""
     if not port.isdigit() or not 1 <= int(port) <= 65535:

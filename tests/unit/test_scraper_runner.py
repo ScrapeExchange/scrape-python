@@ -128,7 +128,43 @@ class TestScraperRunnerSupervisor(
         code: int = runner.run_sync(worker_fn)
         self.assertEqual(code, 0)
         mock_supervisor.assert_called_once()
+        self.assertFalse(
+            mock_supervisor.call_args.args[0].split_proxy_pool,
+        )
         worker_fn.assert_not_called()
+
+    @patch(
+        'scrape_exchange.scraper_runner'
+        '.run_supervisor',
+    )
+    @patch(
+        'scrape_exchange.scraper_runner'
+        '.configure_logging',
+    )
+    def test_supervisor_receives_split_proxy_pool_flag(
+        self,
+        mock_logging: MagicMock,
+        mock_supervisor: MagicMock,
+    ) -> None:
+        mock_supervisor.return_value = 0
+        settings = _make_settings_mock()
+        runner = ScraperRunner(
+            settings=settings,
+            scraper_label='tiktok_creator',
+            platform='tiktok',
+            num_processes=4,
+            concurrency=3,
+            metrics_port=9300,
+            log_file='/dev/stdout',
+            log_level='INFO',
+            rate_limiter_factory=MagicMock(),
+            split_proxy_pool=True,
+        )
+        code: int = runner.run_sync(AsyncMock())
+        self.assertEqual(code, 0)
+        self.assertTrue(
+            mock_supervisor.call_args.args[0].split_proxy_pool,
+        )
 
 
 class TestScraperRunnerWorker(

@@ -24,9 +24,11 @@ from scrape_exchange.scraper_supervisor import (
     _kill_children,
     _should_escalate,
     chunks_are_disjoint_cover,
+    distribute_total_concurrency,
     install_signal_forwarders,
     publish_config_metrics,
     proxy_pool_for_children,
+    random_proxy_subset,
     spawn_children,
     split_proxies,
 )
@@ -122,6 +124,50 @@ class TestProxyPoolForChildren(unittest.TestCase):
             proxy_pool_for_children(['a'], 0)
 
 
+class TestDistributeTotalConcurrency(unittest.TestCase):
+
+    def test_evenly_distributes_total(self) -> None:
+        self.assertEqual(
+            distribute_total_concurrency(5, 2),
+            [3, 2],
+        )
+        self.assertEqual(
+            distribute_total_concurrency(3, 8),
+            [1, 1, 1],
+        )
+
+    def test_invalid_values_raise(self) -> None:
+        with self.assertRaises(ValueError):
+            distribute_total_concurrency(0, 2)
+        with self.assertRaises(ValueError):
+            distribute_total_concurrency(2, 0)
+
+
+class TestRandomProxySubset(unittest.TestCase):
+
+    def test_uses_random_sample_when_limit_is_smaller(self) -> None:
+        proxies: list[str] = ['p1', 'p2', 'p3', 'p4']
+        with patch(
+            'scrape_exchange.scraper_supervisor.random.sample',
+            return_value=['p4', 'p2'],
+        ) as sample:
+            selected: list[str] = random_proxy_subset(proxies, 2)
+
+        sample.assert_called_once_with(proxies, 2)
+        self.assertEqual(selected, ['p4', 'p2'])
+
+    def test_returns_copy_when_limit_covers_pool(self) -> None:
+        proxies: list[str] = ['p1', 'p2']
+        selected: list[str] = random_proxy_subset(proxies, 5)
+
+        self.assertEqual(selected, proxies)
+        self.assertIsNot(selected, proxies)
+
+    def test_invalid_limit_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            random_proxy_subset(['p1'], 0)
+
+
 class TestPublishConfigMetrics(unittest.TestCase):
 
     def setUp(self) -> None:
@@ -190,6 +236,7 @@ class TestSpawnChildrenEnv(unittest.TestCase):
     def _make_config(
         self, log_file: str | None = None,
         log_file_env_var: str | None = 'CHANNEL_LOG_FILE',
+        concurrency_env_var: str | None = None,
     ) -> SupervisorConfig:
         return SupervisorConfig(
             scraper_label='channel',
@@ -200,6 +247,7 @@ class TestSpawnChildrenEnv(unittest.TestCase):
             metrics_port=9600,
             log_file=log_file,
             log_file_env_var=log_file_env_var,
+            concurrency_env_var=concurrency_env_var,
             metrics_port_env_var='CHANNEL_METRICS_PORT',
         )
 
@@ -305,6 +353,39 @@ class TestSpawnChildrenEnv(unittest.TestCase):
         for env in captured_envs:
             self.assertNotIn('LOG_FILE', env)
             self.assertNotIn('CHANNEL_LOG_FILE', env)
+
+    def test_child_concurrencies_are_written_per_child(self) -> None:
+        config: SupervisorConfig = self._make_config(
+            concurrency_env_var='CHANNEL_CONCURRENCY',
+        )
+        chunks: list[list[str]] = [
+            ['http://a'], ['http://b'], ['http://c'],
+        ]
+        captured_envs: list[dict[str, str]] = []
+
+        def fake_popen(argv, env, **kwargs):
+            captured_envs.append(env)
+            mock = MagicMock()
+            mock.pid = 12345
+            return mock
+
+        with patch(
+            'scrape_exchange.scraper_supervisor.subprocess.Popen',
+            side_effect=fake_popen,
+        ):
+            spawn_children(
+                config, chunks,
+                child_concurrencies=[3, 2, 1],
+            )
+
+        self.assertEqual(
+            [env['CHANNEL_CONCURRENCY'] for env in captured_envs],
+            ['3', '2', '1'],
+        )
+        self.assertEqual(
+            [env['CONCURRENCY'] for env in captured_envs],
+            ['3', '2', '1'],
+        )
 
     def test_no_log_file_env_var_falls_back_to_base_log_file(
         self,

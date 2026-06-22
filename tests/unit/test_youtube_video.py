@@ -29,6 +29,28 @@ class TestYouTubeVideo(unittest.TestCase):
         self.assertEqual(restored.channel_thumbnail_asset.width, 88)
         self.assertEqual(restored.channel_thumbnail_asset.height, 88)
 
+    def test_from_yt_dlp_uses_uploader_id_for_channel_handle(
+        self,
+    ) -> None:
+        video: YouTubeVideo = YouTubeVideo.from_yt_dlp({
+            'id': 'C7TICwKPG5g',
+            'uploader_id': '@CanonicalHandle',
+            'channel': '',
+            'formats': [],
+        })
+
+        self.assertEqual(video.channel_handle, 'CanonicalHandle')
+
+    def test_yt_dlp_channel_handle_prefers_uploader_id_over_channel(
+        self,
+    ) -> None:
+        handle: str | None = YouTubeVideo._yt_dlp_channel_handle({
+            'uploader_id': '@CanonicalHandle',
+            'channel': 'Display Name',
+        })
+
+        self.assertEqual(handle, 'CanonicalHandle')
+
 
 if __name__ == '__main__':
     unittest.main()

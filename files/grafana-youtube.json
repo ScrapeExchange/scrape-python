@@ -219,7 +219,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(max by (tier) (scrape_queue_size{scraper=\"rss_scraper\",entity=\"rss_feed\",job=~\"$job\",instance=~\"$instance\"}))",
+          "expr": "sum(max by (state) (scrape_queue_size{scraper=\"rss_scraper\",entity=\"rss_feed\",job=~\"$job\",instance=~\"$instance\"}))",
           "legendFormat": "RSS",
           "range": true,
           "refId": "A"
@@ -2965,7 +2965,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(max by (tier) (scrape_queue_size{scraper=\"rss_scraper\",entity=\"rss_feed\",job=~\"$job\",instance=~\"$instance\"}))",
+          "expr": "sum(max by (state) (scrape_queue_size{scraper=\"rss_scraper\",entity=\"rss_feed\",job=~\"$job\",instance=~\"$instance\"}))",
           "legendFormat": "RSS",
           "refId": "A"
         },

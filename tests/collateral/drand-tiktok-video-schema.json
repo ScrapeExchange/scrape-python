@@ -1,0 +1,253 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://scrape.exchange/schemas/drand-tiktok-video-0.0.1",
+  "title": "TikTok Video Metadata",
+  "description": "Schema representing a TikTok video or photo carousel post.",
+  "type": "object",
+  "properties": {
+    "video_id": {
+      "type": "string",
+      "x-scrape-field": "platform_content_id"
+    },
+    "username": {
+      "type": "string",
+      "x-scrape-field": "platform_creator_id"
+    },
+    "sec_uid": { "type": "string" },
+    "author_id": { "type": "string" },
+    "author_nickname": { "type": "string" },
+    "author_signature": { "type": "string" },
+    "author_avatar_urls": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/avatar_ref" }
+    },
+    "author_avatar_url": {
+      "type": "string",
+      "format": "uri",
+      "x-scrape-field": "platform_creator_thumbnail_url"
+    },
+    "author_verified": { "type": "boolean" },
+    "author_private": { "type": "boolean" },
+    "author_secret": { "type": "boolean" },
+    "author_relation": { "type": "integer" },
+    "author_comment_setting": { "type": "integer" },
+    "author_download_setting": { "type": "integer" },
+    "author_duet_setting": { "type": "integer" },
+    "author_stitch_setting": { "type": "integer" },
+    "author_embed_banned": { "type": "boolean" },
+    "author_open_favorite": { "type": "boolean" },
+    "author_ftc": { "type": "boolean" },
+    "author_is_ad_virtual": { "type": "boolean" },
+    "author_user_story_status": { "type": "integer" },
+    "author_stats": {
+      "type": "object",
+      "additionalProperties": { "type": "integer", "minimum": 0 }
+    },
+    "description": { "type": ["string", "null"] },
+    "aigc_description": { "type": "string" },
+    "created_timestamp": {
+      "type": "string", "format": "date-time"
+    },
+    "duration": {
+      "type": ["integer", "null"], "minimum": 0
+    },
+    "video_api_id": { "type": "string" },
+    "is_hd_bitrate": { "type": "boolean" },
+    "formats": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/format" }
+    },
+    "play_url": { "type": "string", "format": "uri" },
+    "download_url": { "type": "string", "format": "uri" },
+    "definition": { "type": "string" },
+    "video_quality": { "type": "string" },
+    "container_format": { "type": "string" },
+    "encoded_type": { "type": "string" },
+    "is_photo_post": { "type": "boolean" },
+    "image_count": {
+      "type": ["integer", "null"], "minimum": 0
+    },
+    "image_urls": {
+      "type": "array",
+      "items": { "type": "string", "format": "uri" }
+    },
+    "image_cover_urls": {
+      "type": "object",
+      "additionalProperties": { "type": "string", "format": "uri" }
+    },
+    "view_count": {
+      "type": "integer", "minimum": 0,
+      "x-scrape-gauge": true
+    },
+    "like_count": {
+      "type": "integer", "minimum": 0,
+      "x-scrape-gauge": true
+    },
+    "comment_count": {
+      "type": "integer", "minimum": 0,
+      "x-scrape-gauge": true
+    },
+    "share_count": {
+      "type": "integer", "minimum": 0,
+      "x-scrape-gauge": true
+    },
+    "collect_count": {
+      "type": "integer", "minimum": 0,
+      "x-scrape-gauge": true
+    },
+    "repost_count": {
+      "type": "integer", "minimum": 0,
+      "x-scrape-gauge": true
+    },
+    "category_type": { "type": "integer" },
+    "text_language": { "type": "string" },
+    "text_translatable": { "type": "boolean" },
+    "title_language": { "type": "string" },
+    "title_translatable": { "type": "boolean" },
+    "is_ad": { "type": "boolean" },
+    "is_reviewing": { "type": "boolean" },
+    "official_item": { "type": "boolean" },
+    "original_item": { "type": "boolean" },
+    "private_item": { "type": "boolean" },
+    "secret": { "type": "boolean" },
+    "share_enabled": { "type": "boolean" },
+    "for_friend": { "type": "boolean" },
+    "collected": { "type": "boolean" },
+    "digged": { "type": "boolean" },
+    "duet_display": { "type": "integer" },
+    "stitch_display": { "type": "integer" },
+    "item_comment_status": { "type": "integer" },
+    "can_repost": { "type": "boolean" },
+    "creator_ai_comment": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "backend_source_event_tracking": { "type": "string" },
+    "thumbnails": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/thumbnail" },
+      "x-scrape-field": "platform_content_thumbnail_url"
+    },
+    "sound": { "$ref": "#/$defs/sound" },
+    "hashtags": {
+      "type": "array", "items": { "type": "string" }
+    },
+    "mentions": {
+      "type": "array", "items": { "type": "string" }
+    },
+    "subtitles": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/caption" }
+    },
+    "url": {
+      "type": "string", "format": "uri",
+      "x-scrape-field": "source_url"
+    },
+    "availability": {
+      "type": ["string", "null"],
+      "enum": ["public", "private", "deleted", null]
+    },
+    "scraped_timestamp": {
+      "type": "string", "format": "date-time"
+    },
+    "raw_item": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  },
+  "required": ["video_id", "username", "url"],
+  "additionalProperties": false,
+  "$defs": {
+    "thumbnail": {
+      "type": "object",
+      "properties": {
+        "id": { "type": ["string", "null"] },
+        "url": { "type": "string", "format": "uri" },
+        "width": { "type": ["integer", "null"], "minimum": 0 },
+        "height": { "type": ["integer", "null"], "minimum": 0 },
+        "preference": { "type": ["string", "null"] },
+        "display_hint": { "type": ["string", "null"] }
+      },
+      "required": ["url"],
+      "additionalProperties": false
+    },
+    "avatar_ref": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "url": { "type": "string", "format": "uri" }
+      },
+      "required": ["name", "url"],
+      "additionalProperties": false
+    },
+    "caption": {
+      "type": "object",
+      "properties": {
+        "language_code": { "type": ["string", "null"] },
+        "url": { "type": ["string", "null"], "format": "uri" },
+        "extension": { "type": ["string", "null"] },
+        "protocol": { "type": ["string", "null"] }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "format": {
+      "type": "object",
+      "properties": {
+        "gear_name": { "type": "string" },
+        "bitrate": {
+          "type": ["integer", "null"], "minimum": 0
+        },
+        "quality_type": { "type": ["integer", "null"] },
+        "codec": { "type": ["string", "null"] },
+        "width": {
+          "type": ["integer", "null"], "minimum": 0
+        },
+        "height": {
+          "type": ["integer", "null"], "minimum": 0
+        },
+        "data_size": {
+          "type": ["integer", "null"], "minimum": 0
+        },
+        "uri": { "type": ["string", "null"] },
+        "url_key": { "type": ["string", "null"] },
+        "urls": {
+          "type": "array",
+          "items": { "type": "string", "format": "uri" }
+        },
+        "file_hash": { "type": ["string", "null"] }
+      },
+      "required": ["gear_name"],
+      "additionalProperties": false
+    },
+    "sound": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": ["string", "null"] },
+        "author_name": { "type": ["string", "null"] },
+        "original": { "type": ["boolean", "null"] },
+        "duration": { "type": ["integer", "null"], "minimum": 0 },
+        "play_url": { "type": ["string", "null"], "format": "uri" },
+        "cover_large_url": {
+          "type": ["string", "null"], "format": "uri"
+        },
+        "cover_medium_url": {
+          "type": ["string", "null"], "format": "uri"
+        },
+        "cover_thumb_url": {
+          "type": ["string", "null"], "format": "uri"
+        },
+        "copyrighted": { "type": ["boolean", "null"] },
+        "commerce_music": { "type": ["boolean", "null"] },
+        "unlimited_music": { "type": ["boolean", "null"] },
+        "private": { "type": ["boolean", "null"] },
+        "shoot_duration": {
+          "type": ["integer", "null"], "minimum": 0
+        }
+      },
+      "required": ["id"],
+      "additionalProperties": false
+    }
+  }
+}

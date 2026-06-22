@@ -196,6 +196,9 @@ class TestStatsCommand(
         self.assertEqual(rc, 0)
         for s in ChannelState:
             self.assertIn(s.value, out.getvalue())
+        self.assertIn('topic', out.getvalue())
+        self.assertIn('no_videos', out.getvalue())
+        self.assertIn('low_subs', out.getvalue())
 
 
 class TestShowCommand(

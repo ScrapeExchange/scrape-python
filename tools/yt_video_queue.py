@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
 import dataclasses
+import json
 import os
 import re
 import sys
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Iterator
 
 import httpx
 import redis.asyncio as aioredis
@@ -25,7 +27,6 @@ from pydantic_settings import (
 )
 
 from scrape_exchange.exchange_client import ExchangeClient
-from scrape_exchange.file_management import AssetFileManagement
 from scrape_exchange.redis_client import redis_from_url
 from scrape_exchange.scrape_api import get_data_by_param
 from scrape_exchange.video_scrape_queue import (
@@ -41,6 +42,7 @@ from scrape_exchange.youtube.uploaded_video_ids import (
 _VIDEO_ID_RE: re.Pattern[str] = re.compile(
     r'^[A-Za-z0-9_-]{11}$',
 )
+_ENQUEUE_POLICY_BATCH_SIZE: int = 1_000
 
 
 _Handler = Callable[
@@ -87,12 +89,6 @@ class YtVideoQueueSettings(BaseSettings):
             'SCHEMA_VERSION', 'schema_version',
         ),
     )
-    video_data_directory: str | None = Field(
-        default=None,
-        validation_alias=AliasChoices(
-            'YOUTUBE_VIDEO_DATA_DIR', 'video_data_directory',
-        ),
-    )
 
 
 def _add_enqueue_policy_flags(
@@ -111,9 +107,17 @@ def _add_enqueue_policy_flags(
         '--no-remote-check', action='store_true',
         help=(
             'skip the scrape.exchange API existence check (the '
-            'expensive per-id lookup); use only the uploaded set, '
-            'terminal state and local disk to decide'
+            'expensive per-id lookup); use only the uploaded set '
+            'and terminal state to decide'
         ),
+    )
+    parser.add_argument('--channel-id', default=None)
+    parser.add_argument('--channel-handle', default=None)
+    parser.add_argument('--channel-url', default=None)
+    parser.add_argument(
+        '--channel-is-verified',
+        action='store_true',
+        default=None,
     )
 
 
@@ -160,8 +164,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     c_import = sub.add_parser('import')
     c_import.add_argument(
-        'directory', nargs='?',
-        default='/data/videos',
+        'file', metavar='FILE',
+        help=(
+            'text, CSV, or JSONL file containing video_ids'
+        ),
     )
     c_import.add_argument('--source', default='migration')
     _add_enqueue_policy_flags(c_import)
@@ -262,21 +268,64 @@ def _parse_video_ids(text: str) -> list[str]:
     return ids
 
 
-# Cheap -> expensive order for the four 'scraped before' sources.
+def _read_import_video_ids(path: Path) -> list[str]:
+    '''Read video_ids from a text, CSV, or JSONL file.'''
+    suffix: str = path.suffix.lower()
+    if suffix == '.csv':
+        candidates: list[str] = []
+        with path.open(newline='', encoding='utf-8') as file:
+            for row in csv.reader(file):
+                if row:
+                    candidates.append(row[0])
+        return _parse_video_ids('\n'.join(candidates))
+
+    if suffix in {'.jsonl', '.ndjson'}:
+        candidates = []
+        with path.open(encoding='utf-8') as file:
+            for line_number, raw in enumerate(file, start=1):
+                if not raw.strip():
+                    continue
+                try:
+                    record: object = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    sys.stderr.write(
+                        f'skipping invalid JSONL line '
+                        f'{line_number}: {exc.msg}\n',
+                    )
+                    continue
+                if not isinstance(record, dict):
+                    sys.stderr.write(
+                        f'skipping JSONL line {line_number}: '
+                        'expected an object\n',
+                    )
+                    continue
+                video_id: object = record.get('video_id')
+                if not isinstance(video_id, str):
+                    sys.stderr.write(
+                        f'skipping JSONL line {line_number}: '
+                        'missing string video_id\n',
+                    )
+                    continue
+                candidates.append(video_id)
+        return _parse_video_ids('\n'.join(candidates))
+
+    return _parse_video_ids(path.read_text(encoding='utf-8'))
+
+
+# Cheap -> expensive order for the 'scraped before' sources.
 _API_CHECK_CONCURRENCY: int = 8
 
 
 @dataclasses.dataclass
 class _ScrapedBeforeSources:
-    '''Collaborators for the four-source 'scraped before' check.
+    '''Collaborators for the 'scraped before' check.
 
-    Any of ``file_mgmt`` / ``exchange_client`` may be ``None`` when
-    that source is unavailable (fail-open). ``warnings`` lists the
-    skipped sources for the operator.
+    ``exchange_client`` may be ``None`` when that source is
+    unavailable (fail-open). ``warnings`` lists the skipped sources
+    for the operator.
     '''
 
     uploaded: UploadedVideoIds | None
-    file_mgmt: AssetFileManagement | None
     exchange_client: ExchangeClient | None
     warnings: list[str]
 
@@ -299,10 +348,28 @@ class EnqueueReport:
     forced_pending: int = 0
     already_scraped: dict[str, int] = dataclasses.field(
         default_factory=lambda: {
-            'uploaded': 0, 'terminal': 0,
-            'disk': 0, 'api': 0,
+            'uploaded': 0, 'terminal': 0, 'api': 0,
         },
     )
+
+    def add(self, other: 'EnqueueReport') -> None:
+        self.processed += other.processed
+        self.added += other.added
+        self.duplicates += other.duplicates
+        self.revived += other.revived
+        self.forced_pending += other.forced_pending
+        self.forced = self.forced or other.forced
+        for key, value in other.already_scraped.items():
+            self.already_scraped[key] = (
+                self.already_scraped.get(key, 0) + value
+            )
+
+
+def _chunks(
+    items: list[str], size: int = _ENQUEUE_POLICY_BATCH_SIZE,
+) -> Iterator[list[str]]:
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
 
 
 async def _build_sources(
@@ -310,22 +377,13 @@ async def _build_sources(
 ) -> _ScrapedBeforeSources:
     '''Construct the 'scraped before' collaborators from settings.
 
-    Missing credentials / ``video_data_directory`` disable that
-    source (fail-open) and append a warning rather than failing.
+    Missing credentials disable the API source (fail-open) and append
+    a warning rather than failing.
     '''
     warnings: list[str] = []
     uploaded: UploadedVideoIds = UploadedVideoIds(
         settings.redis_dsn,
     )
-    file_mgmt: AssetFileManagement | None = None
-    if settings.video_data_directory:
-        file_mgmt = AssetFileManagement(
-            settings.video_data_directory,
-        )
-    else:
-        warnings.append(
-            'disk check skipped: video_data_directory not set',
-        )
     exchange_client: ExchangeClient | None = None
     if remote_check:
         if settings.api_key_id and settings.api_key_secret:
@@ -353,7 +411,6 @@ async def _build_sources(
             )
     return _ScrapedBeforeSources(
         uploaded=uploaded,
-        file_mgmt=file_mgmt,
         exchange_client=exchange_client,
         warnings=warnings,
     )
@@ -402,26 +459,6 @@ async def _source_terminal(
         else:
             pending.append(vid)
     return pending, terminal_hits, duplicates
-
-
-def _source_disk(
-    video_ids: list[str], file_mgmt: AssetFileManagement | None,
-) -> tuple[list[str], int]:
-    '''Source 3: local disk (data dir + uploaded dir).'''
-    if file_mgmt is None:
-        return list(video_ids), 0
-    pending: list[str] = []
-    hits: int = 0
-    for vid in video_ids:
-        try:
-            exists: bool = file_mgmt.video_scrape_output_exists(vid)
-        except Exception:
-            exists = False
-        if exists:
-            hits += 1
-        else:
-            pending.append(vid)
-    return pending, hits
 
 
 async def _source_api(
@@ -483,19 +520,18 @@ async def _filter_already_scraped(
     *,
     uploaded: UploadedVideoIds | None,
     queue: RedisVideoScrapeQueue,
-    file_mgmt: AssetFileManagement | None,
     exchange_client: ExchangeClient | None,
     schema_version: str,
     remote_check: bool,
     concurrency: int = _API_CHECK_CONCURRENCY,
 ) -> FilterResult:
     '''Partition *video_ids* into survivors (to enqueue) and ids
-    already scraped before, checking the four sources cheap ->
-    expensive and short-circuiting per id. Unavailable sources are
-    skipped (fail-open).
+    already scraped before, checking sources cheap -> expensive and
+    short-circuiting per id. Unavailable sources are skipped
+    (fail-open).
     '''
     already: dict[str, int] = {
-        'uploaded': 0, 'terminal': 0, 'disk': 0, 'api': 0,
+        'uploaded': 0, 'terminal': 0, 'api': 0,
     }
     processed: int = len(video_ids)
 
@@ -506,7 +542,6 @@ async def _filter_already_scraped(
     pending, already['terminal'], duplicates = (
         await _source_terminal(pending, queue)
     )
-    pending, already['disk'] = _source_disk(pending, file_mgmt)
     pending, already['api'] = await _source_api(
         pending,
         exchange_client=exchange_client,
@@ -537,6 +572,18 @@ async def _run_enqueue_policy(
         getattr(ns, 'no_remote_check', False),
     )
     source: str = getattr(ns, 'source', 'cli')
+    channel_kwargs: dict = {
+        key: value
+        for key, value in {
+            'channel_id': getattr(ns, 'channel_id', None),
+            'channel_handle': getattr(ns, 'channel_handle', None),
+            'channel_url': getattr(ns, 'channel_url', None),
+            'channel_is_verified': getattr(
+                ns, 'channel_is_verified', None,
+            ),
+        }.items()
+        if value is not None
+    }
 
     if force:
         outcomes: dict[str, int] = {
@@ -544,7 +591,7 @@ async def _run_enqueue_policy(
         }
         for vid in video_ids:
             result: str = await queue.force_enqueue(
-                vid, source=source,
+                vid, source=source, **channel_kwargs,
             )
             if result in outcomes:
                 outcomes[result] += 1
@@ -562,28 +609,32 @@ async def _run_enqueue_policy(
     try:
         for warning in sources.warnings:
             sys.stderr.write(f'warning: {warning}\n')
-        filtered: FilterResult = await _filter_already_scraped(
-            video_ids,
-            uploaded=sources.uploaded,
-            queue=queue,
-            file_mgmt=sources.file_mgmt,
-            exchange_client=sources.exchange_client,
-            schema_version=settings.schema_version,
-            remote_check=remote_check,
-        )
-        added: int = 0
-        duplicates: int = filtered.duplicates
-        for vid in filtered.survivors:
-            if await queue.enqueue(vid, source=source):
-                added += 1
-            else:
-                duplicates += 1
-        return EnqueueReport(
-            processed=filtered.processed,
-            added=added,
-            duplicates=duplicates,
-            already_scraped=filtered.already_scraped,
-        )
+        total_report: EnqueueReport = EnqueueReport()
+        for batch in _chunks(video_ids):
+            filtered: FilterResult = await _filter_already_scraped(
+                batch,
+                uploaded=sources.uploaded,
+                queue=queue,
+                exchange_client=sources.exchange_client,
+                schema_version=settings.schema_version,
+                remote_check=remote_check,
+            )
+            added: int = 0
+            duplicates: int = filtered.duplicates
+            for vid in filtered.survivors:
+                if await queue.enqueue(
+                    vid, source=source, **channel_kwargs,
+                ):
+                    added += 1
+                else:
+                    duplicates += 1
+            total_report.add(EnqueueReport(
+                processed=filtered.processed,
+                added=added,
+                duplicates=duplicates,
+                already_scraped=filtered.already_scraped,
+            ))
+        return total_report
     finally:
         if sources.exchange_client is not None:
             try:
@@ -603,12 +654,12 @@ def _write_enqueue_status(
         )
         return
     a: dict[str, int] = report.already_scraped
-    total: int = a['uploaded'] + a['terminal'] + a['disk'] + a['api']
+    total: int = a['uploaded'] + a['terminal'] + a['api']
     sys.stdout.write(
         f'{label}: processed={report.processed} '
         f'already_scraped={total} '
         f'(uploaded={a["uploaded"]} terminal={a["terminal"]} '
-        f'disk={a["disk"]} api={a["api"]}) '
+        f'api={a["api"]}) '
         f'duplicates={report.duplicates} added={report.added}\n',
     )
 
@@ -751,18 +802,9 @@ async def cmd_import(
     ns: argparse.Namespace,
     queue: RedisVideoScrapeQueue,
 ) -> int:
-    # Collect valid sentinels first so the skip/force policy can
-    # run as a batch (the API source short-circuits cheaper checks).
-    video_ids: list[str] = []
-    paths: list[str] = []
-    for entry in os.listdir(ns.directory):
-        path: str = os.path.join(ns.directory, entry)
-        if not os.path.isfile(path):
-            continue
-        if not _VIDEO_ID_RE.match(entry):
-            continue
-        video_ids.append(entry)
-        paths.append(path)
+    video_ids: list[str] = await asyncio.to_thread(
+        _read_import_video_ids, Path(ns.file),
+    )
     if not video_ids:
         _write_enqueue_status('import', EnqueueReport(processed=0))
         return 0
@@ -770,15 +812,6 @@ async def cmd_import(
         video_ids, ns=ns, queue=queue,
         settings=YtVideoQueueSettings(),
     )
-    # Every valid id is dispositioned (added / duplicate /
-    # already_scraped, or force-enqueued), so consume all their
-    # sentinels — leaving them would re-report the same files on
-    # every run. Invalid filenames were never collected here.
-    for path in paths:
-        try:
-            os.unlink(path)
-        except FileNotFoundError:
-            pass
     _write_enqueue_status('import', report)
     return 0
 

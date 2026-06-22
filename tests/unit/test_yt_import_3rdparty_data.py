@@ -17,6 +17,7 @@ from tools.yt_import_3rdparty_data import (
     _ChannelFileSink,
     _VideoFileSink,
     ImportKaggleTrendingSettings,
+    import_file,
 )
 
 
@@ -250,6 +251,24 @@ class TestVideoFileSink(
             'dQw4w9WgXcQ\nabc12345678\n',
         )
 
+    async def test_enqueue_accepts_queue_channel_context(
+        self,
+    ) -> None:
+        sink: _VideoFileSink = _VideoFileSink(self.path)
+        await sink.enqueue(
+            'dQw4w9WgXcQ',
+            source='kaggle',
+            channel_id='UCaaaaaaaaaaaaaaaaaaaaaa',
+            channel_handle='example',
+            channel_url='https://www.youtube.com/@example',
+            channel_is_verified=True,
+        )
+        sink.close()
+        self.assertEqual(
+            self.path.read_text(encoding='utf-8'),
+            'dQw4w9WgXcQ\n',
+        )
+
     async def test_enqueue_dedupes_within_run(self) -> None:
         sink: _VideoFileSink = _VideoFileSink(self.path)
         await sink.enqueue('dQw4w9WgXcQ', source='a')
@@ -301,6 +320,58 @@ class TestVideoFileSink(
         sink: _VideoFileSink = _VideoFileSink(self.path)
         sink.close()
         sink.close()  # must not raise
+
+
+class TestImportFile(
+    unittest.IsolatedAsyncioTestCase,
+):
+
+    async def asyncSetUp(self) -> None:
+        self._tmp: tempfile.TemporaryDirectory = (
+            tempfile.TemporaryDirectory()
+        )
+        self.root: Path = Path(self._tmp.name)
+
+    async def asyncTearDown(self) -> None:
+        self._tmp.cleanup()
+
+    async def test_import_file_accepts_video_channel_context(
+        self,
+    ) -> None:
+        data_path: Path = self.root / 'rows.csv'
+        data_path.write_text(
+            '\n'.join([
+                'video_id,channel_id,channel_handle,channel_url,'
+                'channel_is_verified',
+                'dQw4w9WgXcQ,UCaaaaaaaaaaaaaaaaaaaaaa,example,'
+                'https://www.youtube.com/@example,true',
+            ]) + '\n',
+            encoding='utf-8',
+        )
+        videos_path: Path = self.root / 'videos.lst'
+        channels_path: Path = self.root / 'channels.jsonl'
+        video_sink: _VideoFileSink = _VideoFileSink(videos_path)
+        channel_sink: _ChannelFileSink = _ChannelFileSink(
+            channels_path,
+        )
+        try:
+            stats = await import_file(
+                data_path,
+                video_sink,
+                channel_sink,
+                'fixture',
+                set(),
+            )
+        finally:
+            video_sink.close()
+            channel_sink.close()
+
+        self.assertEqual(stats.errors, 0)
+        self.assertEqual(stats.enqueued_videos, 1)
+        self.assertEqual(
+            videos_path.read_text(encoding='utf-8'),
+            'dQw4w9WgXcQ\n',
+        )
 
 
 if __name__ == '__main__':

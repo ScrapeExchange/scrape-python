@@ -1,7 +1,7 @@
 '''
 Verify ``scrape_queue_size`` carries a ``worker_id`` label. Per-
 process callers pass ``get_worker_id()`` so each worker has its
-own series and ``sum by (entity, tier)`` gives a fleet total.
+own series and ``sum by (entity, state)`` gives a fleet total.
 Shared-state callers pass ``worker_id=''`` so all workers collide
 on one series and ``livemostrecent`` gives the correct shared
 value without inflating dashboards.
@@ -25,7 +25,7 @@ class TestScrapeQueueSizeLabel(unittest.TestCase):
         labelnames = set(METRIC_SCRAPE_QUEUE_SIZE._labelnames)
         self.assertEqual(
             labelnames,
-            {'platform', 'scraper', 'entity', 'tier', 'worker_id'},
+            {'platform', 'scraper', 'entity', 'state', 'worker_id'},
         )
 
 

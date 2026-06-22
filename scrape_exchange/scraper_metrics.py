@@ -104,15 +104,15 @@ METRIC_UPLOADED_ADDS: Counter = Counter(
 
 # ---------------------------------------------------------------------------
 # scrape_queue_size
-#   Current number of items pending in the scrape queue. Use tier='none'
-#   for scrapers that do not partition their queue by tier.
+#   Current number of items pending in the scrape queue. Use state='none'
+#   for scrapers that do not partition their queue by tier/state.
 #
 #   ``worker_id`` is present so per-process and shared-state callers can
 #   coexist without double-counting:
 #
 #   - Per-process callers (e.g. yt_video_scrape: asyncio.Queue per worker)
 #     pass ``worker_id=get_worker_id()``. Each worker writes its own series;
-#     ``sum by (entity, tier)`` gives the correct fleet total.
+#     ``sum by (entity, state)`` gives the correct fleet total.
 #
 #   - Shared-state callers (e.g. yt_video_upload: directory listing,
 #     yt_rss_scrape: Redis-backed tier sizes) pass ``worker_id=''``. All
@@ -122,8 +122,51 @@ METRIC_UPLOADED_ADDS: Counter = Counter(
 METRIC_SCRAPE_QUEUE_SIZE: Gauge = Gauge(
     'scrape_queue_size',
     'Number of items pending processing in the scrape queue.',
-    ['platform', 'scraper', 'entity', 'tier', 'worker_id'],
+    ['platform', 'scraper', 'entity', 'state', 'worker_id'],
     multiprocess_mode='livemostrecent',
+)
+
+# ---------------------------------------------------------------------------
+# scrape_queue_enqueue_total
+#   Incremented when a producer successfully adds an item to a scrape queue.
+#   ``source`` is intentionally low-cardinality: examples include rss,
+#   tiktok_creator, import, cli.
+# ---------------------------------------------------------------------------
+METRIC_SCRAPE_QUEUE_ENQUEUES: Counter = Counter(
+    'scrape_queue_enqueue_total',
+    'Number of scrape queue items enqueued.',
+    ['platform', 'scraper', 'entity', 'source'],
+)
+
+# ---------------------------------------------------------------------------
+# scrape_retry_total
+#   Incremented when a scrape schedules or consumes a retry after a
+#   transient/rate-limit/auth-class failure.
+# ---------------------------------------------------------------------------
+METRIC_SCRAPE_RETRIES: Counter = Counter(
+    'scrape_retry_total',
+    'Number of scrape retries by platform, entity, scraper, api, and reason.',
+    ['platform', 'scraper', 'entity', 'api', 'reason'],
+)
+
+# ---------------------------------------------------------------------------
+# tiktok_short_url_resolutions_total
+#   Outcomes of resolving a vm/vt.tiktok.com short link to a creator handle.
+# ---------------------------------------------------------------------------
+METRIC_TIKTOK_SHORT_URL_RESOLUTIONS: Counter = Counter(
+    'tiktok_short_url_resolutions_total',
+    'TikTok creator short-URL resolution outcomes.',
+    ['platform', 'scraper', 'entity', 'outcome'],
+)
+
+# ---------------------------------------------------------------------------
+# scrape_records_written_total
+#   Incremented after a scraped record is successfully persisted to disk.
+# ---------------------------------------------------------------------------
+METRIC_SCRAPE_RECORDS_WRITTEN: Counter = Counter(
+    'scrape_records_written_total',
+    'Number of scraped records successfully written to disk.',
+    ['platform', 'scraper', 'entity'],
 )
 
 # ---------------------------------------------------------------------------

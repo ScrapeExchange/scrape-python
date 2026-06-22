@@ -46,6 +46,7 @@ DEFAULT_QUALITY: int = 9
 
 
 TMP_SUBDIR_NAME: str = '.tmp'
+WORLD_READABLE_FILE_MODE: int = 0o644
 
 
 def brotli_write(
@@ -106,6 +107,7 @@ def brotli_write(
         with open(fd, 'wb') as fh:
             fh.write(encoded)
         Path(tmp).replace(target)
+        target.chmod(WORLD_READABLE_FILE_MODE)
     except Exception:
         Path(tmp).unlink(missing_ok=True)
         raise

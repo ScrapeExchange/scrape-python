@@ -1,7 +1,9 @@
 '''Tests for scrape_exchange.brotli read/write/recovery.'''
 
 import json
+import os
 import secrets
+import stat
 import string
 import tempfile
 import unittest
@@ -10,6 +12,7 @@ from pathlib import Path
 import brotli
 
 from scrape_exchange.brotli import (
+    WORLD_READABLE_FILE_MODE,
     _close_truncated_json,
     brotli_read,
     brotli_write,
@@ -24,6 +27,13 @@ class TestBrotliWrite(unittest.TestCase):
             data: dict = {'a': 1, 'b': ['x', 'y']}
             brotli_write(p, data)
             self.assertEqual(brotli_read(p), data)
+
+    def test_written_file_is_world_readable(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            p: Path = Path(d) / 'x.json.br'
+            brotli_write(p, {'a': 1})
+            mode: int = stat.S_IMODE(os.stat(p).st_mode)
+            self.assertEqual(mode, WORLD_READABLE_FILE_MODE)
 
     def test_unicode_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as d:

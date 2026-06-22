@@ -10,6 +10,7 @@ import fakeredis.aioredis
 from scrape_exchange.video_scrape_queue import (
     RedisVideoScrapeQueue,
     VideoScrapeQueue,
+    VideoScrapeQueueEntry,
     VideoScrapeQueueSettings,
     VideoState,
 )
@@ -112,6 +113,30 @@ class TestKeyPrefixes(_RedisQueueTestBase):
             'youtube:video:removed',
         )
 
+    async def test_platform_scopes_keys(self) -> None:
+        tiktok_queue: RedisVideoScrapeQueue = (
+            RedisVideoScrapeQueue(
+                self.redis, self.settings, platform='tiktok',
+            )
+        )
+        await self.queue.enqueue('dQw4w9WgXcQ', source='yt')
+        await tiktok_queue.enqueue(
+            '7000000000000000001', source='tt',
+        )
+        self.assertEqual(
+            await self.redis.zcard('youtube:video:queue'), 1,
+        )
+        self.assertEqual(
+            await self.redis.zcard('tiktok:video:queue'), 1,
+        )
+        self.assertEqual(
+            await self.redis.hget(
+                'tiktok:video:meta:7000000000000000001',
+                'source',
+            ),
+            'tt',
+        )
+
 
 class TestEnqueue(_RedisQueueTestBase):
 
@@ -161,6 +186,44 @@ class TestEnqueue(_RedisQueueTestBase):
         self.assertEqual(meta.get('source'), 'rss')
         self.assertEqual(meta.get('state'), 'queued')
         self.assertIn('created_at', meta)
+
+    async def test_writes_optional_channel_context(
+        self,
+    ) -> None:
+        await self.queue.enqueue(
+            'dQw4w9WgXcQ',
+            source='rss',
+            channel_id='UC1234567890abcdefghij',
+            channel_handle='SomeHandle',
+            channel_url='https://www.youtube.com/@SomeHandle',
+            channel_is_verified=True,
+        )
+        meta: dict[str, str] = await self.queue.get_meta(
+            'dQw4w9WgXcQ',
+        )
+
+        self.assertEqual(
+            meta['channel_id'], 'UC1234567890abcdefghij',
+        )
+        self.assertEqual(meta['channel_handle'], 'SomeHandle')
+        self.assertEqual(
+            meta['channel_url'],
+            'https://www.youtube.com/@SomeHandle',
+        )
+        self.assertEqual(meta['channel_is_verified'], '1')
+
+    async def test_omits_missing_channel_context(self) -> None:
+        await self.queue.enqueue(
+            'dQw4w9WgXcQ', source='rss',
+        )
+        meta: dict[str, str] = await self.queue.get_meta(
+            'dQw4w9WgXcQ',
+        )
+
+        self.assertNotIn('channel_id', meta)
+        self.assertNotIn('channel_handle', meta)
+        self.assertNotIn('channel_url', meta)
+        self.assertNotIn('channel_is_verified', meta)
 
     async def test_state_not_overwritten_on_re_enqueue(
         self,
@@ -264,6 +327,35 @@ class TestPop(_RedisQueueTestBase):
         popped: list[str] = await self.queue.pop(3)
         self.assertEqual(len(popped), 3)
 
+    async def test_pop_entries_returns_channel_context(
+        self,
+    ) -> None:
+        await self.queue.enqueue(
+            'dQw4w9WgXcQ',
+            source='rss',
+            channel_id='UC1234567890abcdefghij',
+            channel_handle='SomeHandle',
+            channel_url='https://www.youtube.com/@SomeHandle',
+            channel_is_verified=False,
+        )
+
+        entries: list[VideoScrapeQueueEntry] = (
+            await self.queue.pop_entries(10)
+        )
+
+        self.assertEqual(len(entries), 1)
+        entry: VideoScrapeQueueEntry = entries[0]
+        self.assertEqual(entry.video_id, 'dQw4w9WgXcQ')
+        self.assertEqual(
+            entry.channel.channel_id, 'UC1234567890abcdefghij',
+        )
+        self.assertEqual(entry.channel.channel_handle, 'SomeHandle')
+        self.assertEqual(
+            entry.channel.channel_url,
+            'https://www.youtube.com/@SomeHandle',
+        )
+        self.assertFalse(entry.channel.channel_is_verified)
+
 
 class TestComplete(_RedisQueueTestBase):
 
@@ -336,6 +428,37 @@ class TestMark(_RedisQueueTestBase):
             'youtube:video:meta:aaa', 'state',
         )
         self.assertEqual(state, 'unavailable')
+
+    async def test_mark_preserves_channel_context(self) -> None:
+        await self.queue.enqueue(
+            'aaa',
+            source='rss',
+            channel_id='UC1234567890abcdefghij',
+            channel_handle='SomeHandle',
+            channel_url='https://www.youtube.com/@SomeHandle',
+            channel_is_verified=True,
+        )
+        await self.queue.mark(
+            'aaa',
+            state=VideoState.FAILED,
+            last_error='private',
+        )
+        raw: str | None = await self.redis.hget(
+            'youtube:video:failed', 'aaa',
+        )
+        self.assertIsNotNone(raw)
+        assert raw is not None
+        record: dict[str, Any] = json.loads(raw)
+
+        self.assertEqual(
+            record['channel_id'], 'UC1234567890abcdefghij',
+        )
+        self.assertEqual(record['channel_handle'], 'SomeHandle')
+        self.assertEqual(
+            record['channel_url'],
+            'https://www.youtube.com/@SomeHandle',
+        )
+        self.assertEqual(record['channel_is_verified'], '1')
 
     async def test_mark_records_fields(self) -> None:
         await self.queue.enqueue('aaa', source='rss')
@@ -484,6 +607,33 @@ class TestForceEnqueue(_RedisQueueTestBase):
         )
         self.assertEqual(meta.get('state'), 'queued')
         self.assertEqual(meta.get('force'), '1')
+
+    async def test_terminal_revive_updates_channel_context(
+        self,
+    ) -> None:
+        await self.queue.enqueue('aaa', source='rss')
+        await self.queue.mark(
+            'aaa', state=VideoState.FAILED,
+        )
+        await self.queue.force_enqueue(
+            'aaa',
+            source='cli',
+            channel_id='UC1234567890abcdefghij',
+            channel_handle='ForcedHandle',
+            channel_url='https://www.youtube.com/@ForcedHandle',
+            channel_is_verified=True,
+        )
+
+        meta: dict[str, str] = await self.queue.get_meta('aaa')
+        self.assertEqual(
+            meta['channel_id'], 'UC1234567890abcdefghij',
+        )
+        self.assertEqual(meta['channel_handle'], 'ForcedHandle')
+        self.assertEqual(
+            meta['channel_url'],
+            'https://www.youtube.com/@ForcedHandle',
+        )
+        self.assertEqual(meta['channel_is_verified'], '1')
 
     async def test_queued_waiting_sets_force(self) -> None:
         await self.queue.enqueue('aaa', source='rss')

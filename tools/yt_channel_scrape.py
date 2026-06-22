@@ -91,12 +91,28 @@ from scrape_exchange.scraper_metrics import (
 )
 
 CHANNEL_FILE_POSTFIX = '.json.br'
+TOPIC_CHANNEL_SUFFIX: str = ' - topic'
+TOPIC_HANDLE_SUFFIX: str = '-topic'
+TOPIC_CHANNEL_LAST_ERROR: str = 'topic channel skipped'
+MIN_CHANNEL_SUBSCRIBERS: int = 10
 
 PRIORITY_MAX_RETRIES: int = 5
 
 MAX_NEW_CHANNELS: int = 1000
 MAX_RESOLVED_CHANNELS: int = 100
 MIN_CHANNEL_SUBSCRIBERS: int = 10
+
+
+class TopicChannelError(RuntimeError):
+    '''Raised when a channel is identified as a YouTube Topic channel.'''
+
+
+class ChannelNoContentError(RuntimeError):
+    '''Raised when a scraped channel has no uploadable content.'''
+
+    def __init__(self, message: str, channel: YouTubeChannel) -> None:
+        super().__init__(message)
+        self.channel: YouTubeChannel = channel
 
 
 class ChannelSettings(YouTubeScraperSettings):
@@ -1020,8 +1036,11 @@ def _priority_post_cleanup(
         unresolved: str = (
             f'{CHANNEL_FILE_PREFIX}{channel_id}.unresolved'
         )
+        invalid: str = (
+            f'{scraped}.invalid'
+        )
         success_markers: list[str] = [
-            scraped, not_found, unresolved,
+            scraped, not_found, unresolved, invalid,
         ]
         succeeded: bool = any(
             (fm.base_dir / name).exists()
@@ -1521,54 +1540,6 @@ async def _self_heal_identity(
             )
 
 
-def _channel_is_topic(channel: YouTubeChannel) -> bool:
-    '''Return True for YouTube auto-generated topic channels.'''
-    title: Any = getattr(channel, 'title', None)
-    if (
-        isinstance(title, str)
-        and title.casefold().endswith(' - topic')
-    ):
-        return True
-    handle: Any = getattr(channel, 'channel_handle', None)
-    if (
-        isinstance(handle, str)
-        and handle.casefold().endswith('-topic')
-    ):
-        return True
-    return False
-
-
-def _channel_has_no_videos(channel: YouTubeChannel) -> bool:
-    '''Return True when scrape data confirms no videos.'''
-    video_count: Any = getattr(channel, 'video_count', None)
-    return isinstance(video_count, int) and video_count == 0
-
-
-def _channel_has_low_subscribers(
-    channel: YouTubeChannel,
-) -> bool:
-    '''Return True when scrape data confirms too few subscribers.'''
-    subscriber_count: Any = getattr(
-        channel, 'subscriber_count', None,
-    )
-    return (
-        isinstance(subscriber_count, int)
-        and subscriber_count < MIN_CHANNEL_SUBSCRIBERS
-    )
-
-
-def _channel_end_state(
-    channel: YouTubeChannel,
-) -> ChannelState | None:
-    if _channel_is_topic(channel):
-        return ChannelState.TOPIC
-    if _channel_has_low_subscribers(channel):
-        return ChannelState.LOW_SUBS
-    if _channel_has_no_videos(channel):
-        return ChannelState.NO_VIDEOS
-    return None
-
-
 async def _scrape_one_queued(
     channel_id: str,
     *,
@@ -1605,6 +1576,21 @@ async def _scrape_one_queued(
     handle: str | None = (
         await creator_map_backend.get(channel_id)
     )
+    filename: str = get_channel_filename(channel_id)
+    topic_extra: dict[str, str] = {
+        'channel_id': channel_id,
+        'channel_handle': handle or '',
+        'filename': filename,
+    }
+    if force_mode:
+        topic_extra['force_rescrape_mode'] = force_mode
+    if await _reject_topic_channel_if_needed(
+        handle, fm, filename, topic_extra,
+    ):
+        await _mark_topic_channel_queued(
+            queue, member, handle, force_mode,
+        )
+        return
     scrape_decision: str
     if force_mode == 'full':
         metadata_only = False
@@ -1646,7 +1632,6 @@ async def _scrape_one_queued(
     }
     if force_mode:
         extra['force_rescrape_mode'] = force_mode
-    filename: str = get_channel_filename(channel_id)
     try:
         channel: YouTubeChannel = (
             await _do_scrape_channel_to_disk_typed(
@@ -1654,6 +1639,23 @@ async def _scrape_one_queued(
                 metadata_only=metadata_only,
             )
         )
+    except TopicChannelError as exc:
+        await _mark_topic_channel_queued(
+            queue, member, handle, force_mode,
+            last_error=str(exc),
+        )
+        return
+    except ChannelNoContentError as exc:
+        end_state: ChannelState = (
+            _channel_end_state(exc.channel)
+            or ChannelState.NO_VIDEOS
+        )
+        await _mark_channel_end_state(
+            queue, member, channel_id, exc.channel, end_state,
+            force_mode=force_mode,
+            last_error=str(exc),
+        )
+        return
     except ChannelNotFoundError as exc:
         terminal: bool = await queue.mark_not_found_confirmed(
             member,
@@ -1699,23 +1701,10 @@ async def _scrape_one_queued(
     await _self_heal_identity(channel, identity, name_map)
     end_state: ChannelState | None = _channel_end_state(channel)
     if end_state is not None:
-        await queue.mark(
-            member,
-            state=end_state,
-            note='channel matched terminal end-state',
-            extra={
-                'subscriber_count': channel.subscriber_count,
-                'video_count': channel.video_count,
-            },
+        await _mark_channel_end_state(
+            queue, member, channel_id, channel, end_state,
+            force_mode=force_mode,
         )
-        CHANNEL_SCRAPE_OUTCOMES.labels(
-            outcome=end_state.value,
-        ).inc()
-        if force_mode:
-            CHANNEL_FORCE_RESCRAPE_TOTAL.labels(
-                mode=force_mode,
-                outcome=end_state.value,
-            ).inc()
         return
     await queue.update_tier(
         channel_id,
@@ -1773,6 +1762,168 @@ def normalize_channel_name(channel_handle: str) -> str:
 
 def get_channel_filename(channel_id: str) -> str:
     return f'{CHANNEL_FILE_PREFIX}{channel_id}{CHANNEL_FILE_POSTFIX}'
+
+
+def _is_topic_channel_handle(channel_handle: str | None) -> bool:
+    '''Return True when *channel_handle* is a YouTube Topic label.
+
+    Some no-vanity YouTube channels use a fallback display-name handle,
+    such as ``artist - topic``. Treat those as non-scrapable channel
+    records so they do not enter the upload pipeline.
+    '''
+    if not isinstance(channel_handle, str):
+        return False
+    return (
+        channel_handle.strip().casefold()
+        .endswith(TOPIC_CHANNEL_SUFFIX)
+    )
+
+
+def _is_topic_channel_title(channel_title: str | None) -> bool:
+    if not isinstance(channel_title, str):
+        return False
+    return (
+        channel_title.strip().casefold()
+        .endswith(TOPIC_CHANNEL_SUFFIX)
+    )
+
+
+def _is_topic_channel_scrape(channel: YouTubeChannel) -> bool:
+    handle: str | None = (
+        channel.channel_handle
+        if isinstance(channel.channel_handle, str)
+        else None
+    )
+    handle_is_topic: bool = bool(
+        handle
+        and handle.strip().casefold().endswith(
+            TOPIC_HANDLE_SUFFIX,
+        )
+    )
+    return (
+        _is_topic_channel_title(channel.title)
+        or handle_is_topic
+    )
+
+
+def _channel_has_low_subscribers(
+    channel: YouTubeChannel,
+) -> bool:
+    count: int | None = channel.subscriber_count
+    return count is not None and count < MIN_CHANNEL_SUBSCRIBERS
+
+
+def _channel_has_no_videos(channel: YouTubeChannel) -> bool:
+    return channel.video_count == 0
+
+
+def _channel_end_state(
+    channel: YouTubeChannel,
+) -> ChannelState | None:
+    if _is_topic_channel_scrape(channel):
+        return ChannelState.TOPIC
+    if _channel_has_low_subscribers(channel):
+        return ChannelState.LOW_SUBS
+    if _channel_has_no_videos(channel):
+        return ChannelState.NO_VIDEOS
+    return None
+
+
+async def _mark_channel_end_state(
+    queue: RedisChannelScrapeQueue,
+    member: str,
+    channel_id: str,
+    channel: YouTubeChannel,
+    end_state: ChannelState,
+    *,
+    force_mode: str | None,
+    last_error: str | None = None,
+) -> None:
+    await queue.mark(
+        member,
+        state=end_state,
+        last_error=(
+            last_error
+            or f'channel classified as {end_state.value}'
+        ),
+        extra={
+            'channel_id': channel_id,
+            'channel_handle': channel.channel_handle or '',
+            'channel_title': channel.title or '',
+            'subscriber_count': str(
+                channel.subscriber_count
+                if channel.subscriber_count is not None
+                else ''
+            ),
+            'video_count': str(
+                channel.video_count
+                if channel.video_count is not None
+                else ''
+            ),
+        },
+    )
+    CHANNEL_SCRAPE_OUTCOMES.labels(
+        outcome=end_state.value,
+    ).inc()
+    if force_mode:
+        await queue.clear_force_rescrape(member)
+        CHANNEL_FORCE_RESCRAPE_TOTAL.labels(
+            mode=force_mode,
+            outcome=end_state.value,
+        ).inc()
+
+
+async def _write_empty_invalid_channel_file(
+    fm: AssetFileManagement,
+    filename: str,
+    *,
+    extra: dict[str, str],
+) -> str:
+    invalid_name: str = f'{filename}.invalid'
+    await atomic_write_bytes(fm.base_dir / invalid_name, b'')
+    logging.info(
+        'Topic channel skipped and marked invalid',
+        extra=extra | {'invalid_filename': invalid_name},
+    )
+    return invalid_name
+
+
+async def _reject_topic_channel_if_needed(
+    channel_handle: str | None,
+    fm: AssetFileManagement,
+    filename: str,
+    extra: dict[str, str],
+) -> bool:
+    if not _is_topic_channel_handle(channel_handle):
+        return False
+    await _write_empty_invalid_channel_file(
+        fm, filename, extra=extra,
+    )
+    return True
+
+
+async def _mark_topic_channel_queued(
+    queue: RedisChannelScrapeQueue,
+    member: str,
+    channel_handle: str | None,
+    force_mode: str | None,
+    *,
+    last_error: str = TOPIC_CHANNEL_LAST_ERROR,
+) -> None:
+    await queue.mark(
+        member,
+        state=ChannelState.TOPIC,
+        last_error=last_error,
+        extra={'channel_handle': channel_handle or ''},
+    )
+    CHANNEL_SCRAPE_OUTCOMES.labels(
+        outcome='topic',
+    ).inc()
+    if force_mode:
+        CHANNEL_FORCE_RESCRAPE_TOTAL.labels(
+            mode=force_mode,
+            outcome='topic',
+        ).inc()
 
 
 def _persisted_channel_id_or_fail(
@@ -1900,6 +2051,14 @@ async def _skip_due_to_existing_state(
                 'Channel has .failed marker, skipping', extra=extra,
             )
             return True
+
+    invalid_path: Path = fm.marker_path(filename, '.invalid')
+    if invalid_path.exists():
+        logging.debug(
+            'Channel has .invalid marker, skipping',
+            extra=extra,
+        )
+        return True
 
     if not fm.was_uploaded(filename):
         return False
@@ -2255,6 +2414,13 @@ async def _do_scrape_channel_to_disk(
         ).observe(time.monotonic() - scrape_start)
         return False, False, None
 
+    discovered_handle: str | None = channel.channel_handle
+    if await _reject_topic_channel_if_needed(
+        discovered_handle, fm, filename,
+        extra | {'channel_handle': discovered_handle or ''},
+    ):
+        return False, False, None
+
     scrape_proxy_ip: str = (
         extract_proxy_ip(scrape_proxy)
         if scrape_proxy else 'none'
@@ -2336,14 +2502,10 @@ async def _do_scrape_channel_to_disk_typed(
         outcome, not a failure).
 
     Raises:
-        ChannelNotFoundError: channel returned 404,
-            or the scrape produced no content (no
-            video_ids, playlists, courses, podcasts,
-            products) — only raised when
-            ``metadata_only`` is False. From the
-            queue's perspective both mean "terminal,
-            nothing for us". ``last_error``
-            distinguishes them.
+        ChannelNotFoundError: channel returned 404.
+        ChannelNoContentError: scrape produced no content
+            (no video_ids, playlists, courses, podcasts,
+            products) when ``metadata_only`` is False.
         RuntimeError: scrape transient failure or
             persistence failure. Caller decides
             whether to soft-unavailable or retry.
@@ -2376,6 +2538,13 @@ async def _do_scrape_channel_to_disk_typed(
         ).observe(time.monotonic() - scrape_start)
         raise
 
+    discovered_handle: str | None = channel.channel_handle
+    if await _reject_topic_channel_if_needed(
+        discovered_handle, fm, filename,
+        extra | {'channel_handle': discovered_handle or ''},
+    ):
+        raise TopicChannelError(TOPIC_CHANNEL_LAST_ERROR)
+
     scrape_proxy_ip: str = (
         extract_proxy_ip(scrape_proxy)
         if scrape_proxy else 'none'
@@ -2389,9 +2558,10 @@ async def _do_scrape_channel_to_disk_typed(
         scrape_proxy_network, scrape_proxy,
         channel_handle,
     ):
-        raise ChannelNotFoundError(
+        raise ChannelNoContentError(
             f'channel {channel_handle!r} scraped but '
             f'has no content',
+            channel,
         )
 
     if _persisted_channel_id_or_fail(
@@ -2475,6 +2645,11 @@ async def scrape_channel(
     filename: str = get_channel_filename(channel_id)
     extra['filename'] = filename
     base_path: Path = fm.base_dir / filename
+
+    if await _reject_topic_channel_if_needed(
+        handle, fm, filename, extra,
+    ):
+        return False
 
     if await _skip_due_to_existing_state(
         fm, filename, base_path, extra,

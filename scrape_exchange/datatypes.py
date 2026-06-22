@@ -49,6 +49,7 @@ class Platform(str, Enum):
 class PlatformEntityType(str, Enum):
     CHANNEL = 'channel'
     VIDEO = 'video'
+    CREATOR = 'creator'
     MESSAGE = 'message'
     COMMENT = 'comment'
     POST = 'post'

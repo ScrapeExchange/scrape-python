@@ -1,12 +1,15 @@
 '''Scrape-phase tests for the new queue path.'''
 
 import asyncio
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from scrape_exchange.channel_scrape_queue import (
     ChannelState,
 )
+from scrape_exchange.file_management import AssetFileManagement
 from scrape_exchange.youtube.channel_identity import (
     ChannelNotFoundError,
 )
@@ -64,6 +67,54 @@ class TestChannelEndState(unittest.TestCase):
 class TestScrapeOne(
     unittest.IsolatedAsyncioTestCase,
 ):
+
+    async def test_topic_handle_marks_invalid_without_scrape(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            queue = AsyncMock()
+            creator_map = AsyncMock()
+            creator_map.get.return_value = 'Artist - Topic'
+            fm = AssetFileManagement(tmp)
+            channel_id: str = 'UCabc00000000000000000000'
+            from tools.yt_channel_scrape import (
+                _scrape_one_queued,
+            )
+            with (
+                patch(
+                    'tools.yt_channel_scrape'
+                    '._channel_exists_on_exchange',
+                    new_callable=AsyncMock,
+                ) as mock_exists,
+                patch(
+                    'tools.yt_channel_scrape'
+                    '._do_scrape_channel_to_disk_typed',
+                    new_callable=AsyncMock,
+                ) as mock_scrape,
+            ):
+                await _scrape_one_queued(
+                    channel_id,
+                    queue=queue,
+                    settings=_mock_settings(),
+                    fm=fm,
+                    creator_map_backend=creator_map,
+                    http_client=MagicMock(),
+                )
+
+            invalid_path: Path = (
+                Path(tmp)
+                / f'channel-{channel_id}.json.br.invalid'
+            )
+            self.assertTrue(invalid_path.exists())
+            self.assertEqual(invalid_path.read_bytes(), b'')
+            mock_exists.assert_not_awaited()
+            mock_scrape.assert_not_awaited()
+            queue.mark.assert_awaited_once_with(
+                f'i:{channel_id}',
+                state=ChannelState.TOPIC,
+                last_error='topic channel skipped',
+                extra={'channel_handle': 'Artist - Topic'},
+            )
 
     @patch(
         'tools.yt_channel_scrape'
@@ -139,7 +190,7 @@ class TestScrapeOne(
             queue.mark.await_args.kwargs['state'],
             ChannelState.LOW_SUBS,
         )
-        queue.update_tier.assert_not_called()
+        queue.update_tier.assert_not_awaited()
 
     @patch(
         'tools.yt_channel_scrape'
@@ -151,7 +202,7 @@ class TestScrapeOne(
         '._do_scrape_channel_to_disk_typed',
         new_callable=AsyncMock,
     )
-    async def test_ten_subscribers_updates_tier(
+    async def test_ten_subscribers_remains_schedulable(
         self,
         mock_scrape: AsyncMock,
         mock_exists: AsyncMock,
@@ -174,7 +225,7 @@ class TestScrapeOne(
             creator_map_backend=creator_map,
             http_client=MagicMock(),
         )
-        queue.mark.assert_not_called()
+        queue.mark.assert_not_awaited()
         queue.update_tier.assert_awaited_once()
 
     @patch(
@@ -293,11 +344,55 @@ class TestScrapeOne(
             creator_map_backend=creator_map,
             http_client=MagicMock(),
         )
+        queue.mark.assert_awaited_once()
         self.assertEqual(
             queue.mark.await_args.kwargs['state'],
             ChannelState.NO_VIDEOS,
         )
-        queue.update_tier.assert_not_called()
+        queue.update_tier.assert_not_awaited()
+
+    @patch(
+        'tools.yt_channel_scrape'
+        '._channel_exists_on_exchange',
+        new_callable=AsyncMock,
+    )
+    @patch(
+        'tools.yt_channel_scrape'
+        '._do_scrape_channel_to_disk_typed',
+        new_callable=AsyncMock,
+    )
+    async def test_topic_scrape_precedes_low_subs(
+        self,
+        mock_scrape: AsyncMock,
+        mock_exists: AsyncMock,
+    ) -> None:
+        mock_exists.return_value = False
+        channel = MagicMock()
+        channel.subscriber_count = 0
+        channel.video_count = 0
+        channel.channel_id = 'UCabc00000000000000000000'
+        channel.channel_handle = 'artist-topic'
+        channel.title = 'Artist'
+        mock_scrape.return_value = channel
+        queue = AsyncMock()
+        creator_map = AsyncMock()
+        creator_map.get.return_value = 'artist'
+        from tools.yt_channel_scrape import (
+            _scrape_one_queued,
+        )
+        await _scrape_one_queued(
+            'UCabc00000000000000000000',
+            queue=queue,
+            settings=_mock_settings(),
+            fm=MagicMock(),
+            creator_map_backend=creator_map,
+            http_client=MagicMock(),
+        )
+        queue.mark.assert_awaited_once()
+        self.assertEqual(
+            queue.mark.await_args.kwargs['state'],
+            ChannelState.TOPIC,
+        )
 
     @patch(
         'tools.yt_channel_scrape'
@@ -338,6 +433,55 @@ class TestScrapeOne(
                 'i:UCabc00000000000000000000',
                 last_error='404',
             )
+        )
+        queue.update_tier.assert_not_called()
+
+    @patch(
+        'tools.yt_channel_scrape'
+        '._channel_exists_on_exchange',
+        new_callable=AsyncMock,
+    )
+    @patch(
+        'tools.yt_channel_scrape'
+        '._do_scrape_channel_to_disk_typed',
+        new_callable=AsyncMock,
+    )
+    async def test_no_content_marks_no_videos_not_not_found(
+        self,
+        mock_scrape: AsyncMock,
+        mock_exists: AsyncMock,
+    ) -> None:
+        mock_exists.return_value = False
+        channel = MagicMock()
+        channel.subscriber_count = None
+        channel.video_count = None
+        channel.channel_id = 'UCabc00000000000000000000'
+        channel.channel_handle = 'empty'
+        channel.title = 'Empty Channel'
+        from tools.yt_channel_scrape import (
+            ChannelNoContentError,
+            _scrape_one_queued,
+        )
+        mock_scrape.side_effect = ChannelNoContentError(
+            'scraped but has no content',
+            channel,
+        )
+        queue = AsyncMock()
+        creator_map = AsyncMock()
+        creator_map.get.return_value = 'empty'
+        await _scrape_one_queued(
+            'UCabc00000000000000000000',
+            queue=queue,
+            settings=_mock_settings(),
+            fm=MagicMock(),
+            creator_map_backend=creator_map,
+            http_client=MagicMock(),
+        )
+        queue.mark_not_found_confirmed.assert_not_awaited()
+        queue.mark.assert_awaited_once()
+        self.assertEqual(
+            queue.mark.await_args.kwargs['state'],
+            ChannelState.NO_VIDEOS,
         )
         queue.update_tier.assert_not_called()
 
@@ -500,6 +644,48 @@ class TestScrapeBatch(
             'UC1',
             last_error='redis pool saturated',
         )
+
+
+class TestTypedScrape(
+    unittest.IsolatedAsyncioTestCase,
+):
+
+    @patch(
+        'tools.yt_channel_scrape._persist_scraped_channel',
+        new_callable=AsyncMock,
+    )
+    @patch(
+        'tools.yt_channel_scrape._channel_has_no_content',
+        return_value=True,
+    )
+    @patch(
+        'tools.yt_channel_scrape._try_scrape_channel_typed',
+        new_callable=AsyncMock,
+    )
+    async def test_no_content_raises_distinct_error(
+        self,
+        mock_try: AsyncMock,
+        mock_no_content: MagicMock,
+        mock_persist: AsyncMock,
+    ) -> None:
+        mock_try.return_value = None
+        settings = _mock_settings()
+        settings.channel_data_directory = '/tmp'
+        from tools.yt_channel_scrape import (
+            ChannelNoContentError,
+            _do_scrape_channel_to_disk_typed,
+        )
+        with self.assertRaises(ChannelNoContentError):
+            await _do_scrape_channel_to_disk_typed(
+                settings,
+                MagicMock(),
+                'empty',
+                'channel-UCabc00000000000000000000.json.br',
+                {'channel_id': 'UCabc00000000000000000000'},
+                metadata_only=False,
+            )
+        mock_no_content.assert_called_once()
+        mock_persist.assert_not_awaited()
 
 
 class TestExistenceCheck(

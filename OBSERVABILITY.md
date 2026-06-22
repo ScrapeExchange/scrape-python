@@ -47,6 +47,18 @@ scrape_configs:
   - job_name: 'yt_video_scrape'
     static_configs:
       - targets: ['localhost:9400', 'localhost:9401', 'localhost:9402', 'localhost:9403']
+  - job_name: 'tt_creator_scrape'
+    static_configs:
+      - targets: ['localhost:9300']
+  - job_name: 'tt_video_scrape'
+    static_configs:
+      - targets: ['localhost:9700']
+  - job_name: 'tt_creator_upload'
+    static_configs:
+      - targets: ['localhost:9301']
+  - job_name: 'tt_video_upload'
+    static_configs:
+      - targets: ['localhost:9701']
 ```
 
 3. Run `docker-compose up -d` to start the Prometheus and Grafana containers.
