@@ -275,7 +275,7 @@ class ChannelSettings(YouTubeScraperSettings):
         ),
     )
     channel_unavailable_soft_retry_seconds: int = Field(
-        default=86400,
+        default=3 * 86400,
     )
     channel_soft_reap_interval_seconds: int = Field(
         default=60,

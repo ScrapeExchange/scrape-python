@@ -528,6 +528,47 @@ class TestScrapeOne(
         '._do_scrape_channel_to_disk_typed',
         new_callable=AsyncMock,
     )
+    async def test_terminal_page_message_stays_soft_unavailable(
+        self,
+        mock_scrape: AsyncMock,
+        mock_exists: AsyncMock,
+    ) -> None:
+        message: str = (
+            'This channel was removed because it violated our '
+            'Community Guidelines.'
+        )
+        mock_exists.return_value = False
+        mock_scrape.side_effect = RuntimeError(message)
+        queue = AsyncMock()
+        creator_map = AsyncMock()
+        creator_map.get.return_value = 'foo'
+        from tools.yt_channel_scrape import (
+            _scrape_one_queued,
+        )
+        await _scrape_one_queued(
+            'UCabc00000000000000000000',
+            queue=queue,
+            settings=_mock_settings(),
+            fm=MagicMock(),
+            creator_map_backend=creator_map,
+            http_client=MagicMock(),
+        )
+        queue.mark_soft_unavailable.assert_awaited_once_with(
+            'UCabc00000000000000000000',
+            last_error=message,
+        )
+        queue.mark.assert_not_awaited()
+
+    @patch(
+        'tools.yt_channel_scrape'
+        '._channel_exists_on_exchange',
+        new_callable=AsyncMock,
+    )
+    @patch(
+        'tools.yt_channel_scrape'
+        '._do_scrape_channel_to_disk_typed',
+        new_callable=AsyncMock,
+    )
     async def test_no_handle_scrapes_by_id_not_unresolved(
         self,
         mock_scrape: AsyncMock,

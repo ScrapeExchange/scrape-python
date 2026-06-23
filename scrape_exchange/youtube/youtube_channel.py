@@ -99,6 +99,33 @@ METRIC_CHANNEL_HANDLE_RESOLVER_OUTCOMES: Counter = Counter(
     ],
 )
 
+TERMINAL_CHANNEL_PAGE_MESSAGES: tuple[str, ...] = (
+    (
+        'This channel was removed because it violated our '
+        'Community Guidelines.'
+    ),
+    (
+        'This account has been terminated because we received '
+        'multiple third-party claims of copyright infringement '
+        'regarding material the user posted.'
+    ),
+    'This channel is not available.',
+)
+
+
+def _normalise_page_text(value: str) -> str:
+    return ' '.join(value.split())
+
+
+def terminal_channel_page_message(page_contents: str) -> str | None:
+    '''Return a terminal channel-page message found in raw HTML.'''
+
+    normalised: str = _normalise_page_text(page_contents)
+    for message in TERMINAL_CHANNEL_PAGE_MESSAGES:
+        if _normalise_page_text(message) in normalised:
+            return message
+    return None
+
 
 def canonical_handle_from_browse(channel_data: dict) -> str | None:
     '''
@@ -759,6 +786,16 @@ class YouTubeChannel:
                 'Could not retrieve about page for channel '
                 f'{self.channel_handle}'
             )
+
+        terminal_message: str | None = terminal_channel_page_message(
+            page_contents
+        )
+        if terminal_message:
+            _LOGGER.info(
+                'About page contains terminal channel message',
+                extra={**extra, 'terminal_message': terminal_message},
+            )
+            raise RuntimeError(terminal_message)
 
         page_data: dict[str, any] = self._extract_initial_data(page_contents)
 
