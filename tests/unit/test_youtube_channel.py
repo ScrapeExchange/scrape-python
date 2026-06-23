@@ -42,6 +42,7 @@ from scrape_exchange.youtube.youtube_channel import (
     YouTubeThumbnail,
     YouTubeExternalLink,
     YouTubeChannelLink,
+    terminal_channel_page_message,
 )
 from scrape_exchange.youtube.youtube_course import YouTubeCourse, YouTubeCourseVideo
 from scrape_exchange.youtube.youtube_playlist import YouTubePlaylist
@@ -1990,6 +1991,72 @@ class TestScrapeAboutPageViewCountFallback(
             await ch.scrape_about_page()
 
         self.assertEqual(ch.view_count, 1234567)
+
+
+class TestTerminalChannelPageMessage(
+    unittest.IsolatedAsyncioTestCase,
+):
+    '''Terminal channel page messages should be detected before parsing.'''
+
+    def test_detects_exact_terminal_message(self) -> None:
+        message: str = (
+            'This channel was removed because it violated our '
+            'Community Guidelines.'
+        )
+        self.assertEqual(
+            terminal_channel_page_message(f'<html>{message}</html>'),
+            message,
+        )
+
+    def test_detects_terminal_message_across_whitespace(self) -> None:
+        message: str = (
+            'This account has been terminated because we received '
+            'multiple third-party claims of copyright infringement '
+            'regarding material the user posted.'
+        )
+        page_contents: str = (
+            '<div>This account has been terminated because we received\n'
+            'multiple third-party claims of copyright infringement\t'
+            'regarding material the user posted.</div>'
+        )
+        self.assertEqual(
+            terminal_channel_page_message(page_contents),
+            message,
+        )
+
+    def test_non_terminal_page_returns_none(self) -> None:
+        self.assertIsNone(
+            terminal_channel_page_message(
+                '<html><body>Welcome to this channel.</body></html>',
+            ),
+        )
+
+    async def test_scrape_about_page_logs_and_raises_message(self) -> None:
+        message: str = 'This channel is not available.'
+        ch: YouTubeChannel = YouTubeChannel(channel_handle='Test')
+        ch.url = 'https://www.youtube.com/@Test'
+        mock_client: AsyncMock = AsyncMock()
+        mock_client.get = AsyncMock(
+            return_value=f'<html><body>{message}</body></html>',
+        )
+        mock_client.proxy = None
+        ch.browse_client = mock_client
+
+        with patch.object(
+            ch, '_extract_initial_data',
+        ) as extract_initial_data, self.assertLogs(
+            'scrape_exchange.youtube.youtube_channel',
+            level='INFO',
+        ) as logs:
+            with self.assertRaises(RuntimeError) as caught:
+                await ch.scrape_about_page()
+
+        self.assertEqual(str(caught.exception), message)
+        extract_initial_data.assert_not_called()
+        self.assertEqual(
+            getattr(logs.records[0], 'terminal_message'),
+            message,
+        )
 
 
 class TestResolveChannelIdViaInnerTube(unittest.IsolatedAsyncioTestCase):
