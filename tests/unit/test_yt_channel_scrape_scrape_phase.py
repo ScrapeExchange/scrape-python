@@ -13,6 +13,7 @@ from scrape_exchange.file_management import AssetFileManagement
 from scrape_exchange.youtube.channel_identity import (
     ChannelNotFoundError,
 )
+from scrape_exchange.watchdog import Watchdog
 
 
 def _mock_settings() -> MagicMock:
@@ -605,55 +606,99 @@ class TestScrapeOne(
             )
 
 
-class TestScrapeBatch(
+class TestScrapeWorkers(
     unittest.IsolatedAsyncioTestCase,
 ):
+    def setUp(self) -> None:
+        self.watchdog = Watchdog(loop_timeout=0.0, work_timeout=0.0)
+        self.watchdog.touch_work = MagicMock()
+        Watchdog.set_instance(self.watchdog)
+
+    def tearDown(self) -> None:
+        Watchdog.reset()
 
     @patch(
         'tools.yt_channel_scrape._scrape_one_queued',
         new_callable=AsyncMock,
     )
-    async def test_runs_scrapes_concurrently_up_to_limit(
+    async def test_workers_keep_claiming_while_peer_is_slow(
         self,
         mock_scrape: AsyncMock,
     ) -> None:
-        entered = 0
-        max_entered = 0
-        first_two_started = asyncio.Event()
-        unblock = asyncio.Event()
+        slow_started: asyncio.Event = asyncio.Event()
+        fast_completed: asyncio.Event = asyncio.Event()
+        unblock_slow: asyncio.Event = asyncio.Event()
+        pop_count: int = 0
 
-        async def scrape_one(*args, **kwargs) -> None:
-            nonlocal entered, max_entered
-            entered += 1
-            max_entered = max(max_entered, entered)
-            if entered == 2:
-                first_two_started.set()
-            await unblock.wait()
-            entered -= 1
+        async def pop_scheduled(
+            count: int,
+            *,
+            now: float,
+        ) -> list[str]:
+            nonlocal pop_count
+            self.assertEqual(count, 1)
+            self.assertGreater(now, 0.0)
+            pop_count += 1
+            if pop_count == 1:
+                return ['UCslow']
+            if pop_count == 2:
+                return ['UCfast']
+            return []
+
+        async def scrape_one(channel_id: str, **kwargs) -> None:
+            if channel_id == 'UCslow':
+                slow_started.set()
+                await unblock_slow.wait()
+                return
+            if channel_id == 'UCfast':
+                fast_completed.set()
+                return
+            self.fail(f'unexpected channel_id {channel_id}')
 
         mock_scrape.side_effect = scrape_one
         settings = _mock_settings()
-        settings.channel_concurrency = 2
-        settings.proxies = []
+        settings.channel_queue_idle_poll_seconds = 0.01
+        shutdown_event: asyncio.Event = asyncio.Event()
+        queue = AsyncMock()
+        queue.pop_scheduled.side_effect = pop_scheduled
+        active_started_at: dict[str, float] = {}
+        completed_count: int = 0
+
+        def record_completed() -> None:
+            nonlocal completed_count
+            completed_count += 1
+
         from tools.yt_channel_scrape import (
-            _scrape_queued_batch,
+            _scrape_scheduled_worker,
         )
-        batch = asyncio.create_task(
-            _scrape_queued_batch(
-                ['UC1', 'UC2', 'UC3'],
-                queue=AsyncMock(),
-                settings=settings,
-                fm=MagicMock(),
-                creator_map_backend=AsyncMock(),
-                http_client=MagicMock(),
-            ),
-        )
-        await first_two_started.wait()
+        tasks: list[asyncio.Task[None]] = [
+            asyncio.create_task(
+                _scrape_scheduled_worker(
+                    worker_index=index,
+                    queue=queue,
+                    settings=settings,
+                    fm=MagicMock(),
+                    creator_map_backend=AsyncMock(),
+                    http_client=MagicMock(),
+                    shutdown_event=shutdown_event,
+                    active_started_at=active_started_at,
+                    record_completed=record_completed,
+                )
+            )
+            for index in range(2)
+        ]
+        try:
+            await slow_started.wait()
+            await fast_completed.wait()
+            self.assertEqual(completed_count, 1)
+            self.assertIn('0:UCslow', active_started_at)
+        finally:
+            shutdown_event.set()
+            unblock_slow.set()
+            await asyncio.gather(*tasks)
+
         self.assertEqual(mock_scrape.await_count, 2)
-        self.assertEqual(max_entered, 2)
-        unblock.set()
-        await batch
-        self.assertEqual(mock_scrape.await_count, 3)
+        self.assertEqual(completed_count, 2)
 
     @patch(
         'tools.yt_channel_scrape._scrape_one_queued',
@@ -665,25 +710,90 @@ class TestScrapeBatch(
     ) -> None:
         mock_scrape.side_effect = RuntimeError('redis pool saturated')
         settings = _mock_settings()
-        settings.channel_concurrency = 1
-        settings.proxies = []
+        settings.channel_queue_idle_poll_seconds = 0.01
+        shutdown_event: asyncio.Event = asyncio.Event()
         queue = AsyncMock()
+        queue.pop_scheduled.return_value = ['UC1']
+        active_started_at: dict[str, float] = {}
+
+        def record_completed() -> None:
+            shutdown_event.set()
+
         from tools.yt_channel_scrape import (
-            _scrape_queued_batch,
+            _scrape_scheduled_worker,
         )
 
-        await _scrape_queued_batch(
-            ['UC1'],
+        await _scrape_scheduled_worker(
+            worker_index=0,
             queue=queue,
             settings=settings,
             fm=MagicMock(),
             creator_map_backend=AsyncMock(),
             http_client=MagicMock(),
+            shutdown_event=shutdown_event,
+            active_started_at=active_started_at,
+            record_completed=record_completed,
         )
 
         queue.mark_soft_unavailable.assert_awaited_once_with(
             'UC1',
             last_error='redis pool saturated',
+        )
+        self.assertGreaterEqual(
+            self.watchdog.touch_work.call_count,
+            1,
+        )
+
+    async def test_long_running_workers_report_progress(self) -> None:
+        active_started_at: dict[str, float] = {
+            '0:UCslow': 1.0,
+        }
+        shutdown_event: asyncio.Event = asyncio.Event()
+
+        from tools.yt_channel_scrape import (
+            _report_scrape_worker_progress,
+        )
+
+        with patch(
+            'tools.yt_channel_scrape.'
+            'CHANNEL_BATCH_PROGRESS_INTERVAL_SECONDS',
+            0.01,
+        ):
+            with self.assertLogs(level='INFO') as logs:
+                reporter: asyncio.Task[None] = asyncio.create_task(
+                    _report_scrape_worker_progress(
+                        active_started_at,
+                        get_completed_count=lambda: 3,
+                        worker_count=4,
+                        shutdown_event=shutdown_event,
+                    ),
+                )
+                await asyncio.sleep(0.03)
+                shutdown_event.set()
+                await reporter
+
+        self.assertIn(
+            'channel scrape worker progress',
+            '\n'.join(logs.output),
+        )
+        self.assertGreaterEqual(
+            self.watchdog.touch_work.call_count,
+            1,
+        )
+
+    async def test_worker_count_keeps_existing_proxy_floor(
+        self,
+    ) -> None:
+        settings = _mock_settings()
+        settings.channel_concurrency = 2
+        settings.proxies = ['p1', 'p2', 'p3']
+        from tools.yt_channel_scrape import (
+            _channel_scrape_worker_count,
+        )
+
+        self.assertEqual(
+            _channel_scrape_worker_count(settings),
+            3,
         )
 
 

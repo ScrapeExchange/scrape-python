@@ -10,6 +10,7 @@ import logging
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from scrape_exchange.watchdog import Watchdog
 from scrape_exchange.youtube.youtube_channel_tabs import YouTubeChannelTabs
 from scrape_exchange.youtube.youtube_types import YouTubeChannelPageType
 
@@ -519,6 +520,14 @@ class TestGetPageTabs(unittest.IsolatedAsyncioTestCase):
 
 
 class TestBrowse(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.watchdog = Watchdog(loop_timeout=0.0, work_timeout=0.0)
+        self.watchdog.touch_work = MagicMock()
+        Watchdog.set_instance(self.watchdog)
+
+    def tearDown(self) -> None:
+        Watchdog.reset()
+
     async def test_browse_no_params(self) -> None:
         tabs = YouTubeChannelTabs(CHANNEL_ID)
         tabs.client = MagicMock()
@@ -548,7 +557,8 @@ class TestBrowse(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, {'data': 'cont'})
 
     @patch(
-        'scrape_exchange.youtube.youtube_channel_tabs.AsyncYouTubeClient._delay',
+        'scrape_exchange.youtube.youtube_channel_tabs.'
+        'AsyncYouTubeClient._delay',
         new_callable=AsyncMock,
     )
     async def test_browse_retries_on_failure(self, mock_delay) -> None:
@@ -568,7 +578,8 @@ class TestBrowse(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tabs.client.browse.call_count, 3)
 
     @patch(
-        'scrape_exchange.youtube.youtube_channel_tabs.AsyncYouTubeClient._delay',
+        'scrape_exchange.youtube.youtube_channel_tabs.'
+        'AsyncYouTubeClient._delay',
         new_callable=AsyncMock,
     )
     async def test_browse_raises_after_max_retries(self, mock_delay) -> None:
@@ -582,6 +593,40 @@ class TestBrowse(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(RuntimeError) as ctx:
                 await tabs._browse(max_retries=2)
         self.assertIn('Failed to fetch tabbed data', str(ctx.exception))
+
+    @patch(
+        'scrape_exchange.youtube.youtube_channel_tabs.'
+        'AsyncYouTubeClient._delay',
+        new_callable=AsyncMock,
+    )
+    async def test_browse_hard_timeout_on_wedged_executor(
+        self,
+        mock_delay: AsyncMock,
+    ) -> None:
+        tabs = YouTubeChannelTabs(CHANNEL_ID)
+        tabs.client = MagicMock()
+        pending: asyncio.Future[dict] = asyncio.Future()
+
+        with patch(
+            'scrape_exchange.youtube.youtube_channel_tabs.'
+            '_INNERTUBE_BROWSE_HARD_TIMEOUT_SECONDS',
+            0.01,
+        ), patch(
+            'scrape_exchange.youtube.youtube_channel_tabs.'
+            'run_on_innertube_executor',
+            return_value=pending,
+        ):
+            with self.assertLogs(
+                'scrape_exchange.youtube.youtube_channel_tabs',
+                level='ERROR',
+            ):
+                with self.assertRaises(RuntimeError) as ctx:
+                    await tabs._browse(max_retries=1)
+
+        self.assertIn('Failed to fetch tabbed data', str(ctx.exception))
+        self.assertTrue(pending.cancelled())
+        self.watchdog.touch_work.assert_called_once()
+        mock_delay.assert_not_awaited()
 
 
 class TestScrapeContent(unittest.IsolatedAsyncioTestCase):
@@ -956,6 +1001,167 @@ class TestScrapeContent(unittest.IsolatedAsyncioTestCase):
             await task
 
         self.assertEqual(started, {'videos_p', 'shorts_p'})
+
+    async def test_scrape_tab_records_page_item_and_duration_metrics(
+        self,
+    ) -> None:
+        tabs = YouTubeChannelTabs(CHANNEL_ID)
+        tab_renderer = {
+            'title': 'Videos',
+            'endpoint': {
+                'browseEndpoint': {'params': 'videos_p'},
+            },
+        }
+        first_page = {}
+        continuation_page = {
+            'onResponseReceivedActions': [
+                {
+                    'appendContinuationItemsAction': {
+                        'continuationItems': [
+                            {
+                                'richItemRenderer': {
+                                    'content': {
+                                        'videoRenderer': {
+                                            'videoId': 'vid2',
+                                        },
+                                    },
+                                },
+                            },
+                        ],
+                    },
+                },
+            ],
+        }
+
+        async def browse(*, params='', continuation_token=''):
+            if params == 'videos_p':
+                return first_page
+            if continuation_token == 'tok':
+                return continuation_page
+            return {}
+
+        with patch.object(
+            tabs, '_browse', side_effect=browse,
+        ), patch.object(
+            tabs, 'get_tab',
+            return_value={
+                'content': {
+                    'richGridRenderer': {
+                        'contents': [
+                            {
+                                'richItemRenderer': {
+                                    'content': {
+                                        'videoRenderer': {
+                                            'videoId': 'vid1',
+                                        },
+                                    },
+                                },
+                            },
+                            {
+                                'continuationItemRenderer': {
+                                    'continuationEndpoint': {
+                                        'continuationCommand': {
+                                            'token': 'tok',
+                                        },
+                                    },
+                                },
+                            },
+                        ],
+                    },
+                },
+            },
+        ), patch(
+            'scrape_exchange.youtube.youtube_channel_tabs'
+            '.CHANNEL_TAB_PAGES',
+        ) as pages, patch(
+            'scrape_exchange.youtube.youtube_channel_tabs'
+            '.CHANNEL_TAB_ITEMS',
+        ) as items, patch(
+            'scrape_exchange.youtube.youtube_channel_tabs'
+            '.CHANNEL_TAB_DURATION',
+        ) as duration:
+            video_ids, *_ = await tabs._scrape_tab(
+                tab_renderer, 'videos',
+            )
+
+        self.assertEqual(video_ids, {'vid1', 'vid2'})
+        page_types: list[str] = [
+            call.kwargs['page_type']
+            for call in pages.labels.call_args_list
+        ]
+        self.assertEqual(page_types, ['initial', 'continuation'])
+        for call in pages.labels.call_args_list:
+            self.assertEqual(call.kwargs['tab'], 'videos')
+            self.assertEqual(call.kwargs['outcome'], 'success')
+        items.labels.assert_called_once()
+        self.assertEqual(items.labels.call_args.kwargs['item_type'],
+                         'video_id')
+        items.labels.return_value.inc.assert_called_once_with(2)
+        duration.labels.assert_called_once()
+        self.assertEqual(duration.labels.call_args.kwargs['tab'], 'videos')
+        self.assertEqual(duration.labels.call_args.kwargs['outcome'],
+                         'success')
+        duration.labels.return_value.observe.assert_called_once()
+
+    async def test_scrape_tab_records_failed_continuation_page(
+        self,
+    ) -> None:
+        tabs = YouTubeChannelTabs(CHANNEL_ID)
+        tab_renderer = {
+            'title': 'Videos',
+            'endpoint': {
+                'browseEndpoint': {'params': 'videos_p'},
+            },
+        }
+
+        async def browse(*, params='', continuation_token=''):
+            if params == 'videos_p':
+                return {}
+            if continuation_token == 'tok':
+                raise RuntimeError('continuation failed')
+            return {}
+
+        with patch.object(
+            tabs, '_browse', side_effect=browse,
+        ), patch.object(
+            tabs, 'get_tab',
+            return_value={
+                'content': {
+                    'richGridRenderer': {
+                        'contents': [
+                            {
+                                'continuationItemRenderer': {
+                                    'continuationEndpoint': {
+                                        'continuationCommand': {
+                                            'token': 'tok',
+                                        },
+                                    },
+                                },
+                            },
+                        ],
+                    },
+                },
+            },
+        ), patch(
+            'scrape_exchange.youtube.youtube_channel_tabs'
+            '.CHANNEL_TAB_PAGES',
+        ) as pages, patch(
+            'scrape_exchange.youtube.youtube_channel_tabs'
+            '.CHANNEL_TAB_DURATION',
+        ) as duration:
+            with self.assertRaises(RuntimeError):
+                await tabs._scrape_tab(tab_renderer, 'videos')
+
+        page_calls: list[dict] = [
+            call.kwargs for call in pages.labels.call_args_list
+        ]
+        self.assertEqual(page_calls[0]['page_type'], 'initial')
+        self.assertEqual(page_calls[0]['outcome'], 'success')
+        self.assertEqual(page_calls[1]['page_type'], 'continuation')
+        self.assertEqual(page_calls[1]['outcome'], 'failure')
+        duration.labels.assert_called_once()
+        self.assertEqual(duration.labels.call_args.kwargs['outcome'],
+                         'failure')
 
     @patch(
         'scrape_exchange.youtube.youtube_channel_tabs.AsyncYouTubeClient._delay',

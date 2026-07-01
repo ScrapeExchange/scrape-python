@@ -453,6 +453,53 @@ class TestMarkUnmarkCommands(
             ChannelState.HARD_UNAVAILABLE,
         )
 
+    async def test_batch_mark_reads_args_and_stdin(
+        self,
+    ) -> None:
+        queue = AsyncMock()
+        from tools.yt_channel_queue import cmd_mark
+        ns = argparse.Namespace(
+            key=None,
+            state=None,
+            batch=True,
+            keys=[
+                '@foo',
+                '-',
+            ],
+            args=[
+                'terminated',
+                '@foo',
+                '-',
+            ],
+            note='bulk review',
+            hard=False,
+        )
+        stdin = StringIO(
+            'UCXuqSBlHAE6Xw-yeJA0Tunw\n'
+            '@bar\n'
+        )
+        with patch('sys.stdin', stdin):
+            rc: int = await cmd_mark(ns, queue)
+        self.assertEqual(rc, 0)
+        calls = queue.mark.await_args_list
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(
+            [call.args[0] for call in calls],
+            [
+                'h:foo',
+                'i:UCXuqSBlHAE6Xw-yeJA0Tunw',
+                'h:bar',
+            ],
+        )
+        self.assertEqual(
+            [call.kwargs['state'] for call in calls],
+            [ChannelState.TERMINATED] * 3,
+        )
+        self.assertEqual(
+            [call.kwargs['note'] for call in calls],
+            ['bulk review'] * 3,
+        )
+
     async def test_unknown_state_returns_2(
         self,
     ) -> None:
@@ -465,6 +512,16 @@ class TestMarkUnmarkCommands(
         rc: int = await cmd_mark(ns, queue)
         self.assertEqual(rc, 2)
         queue.mark.assert_not_called()
+
+    def test_mark_batch_parser_accepts_stdin_mode(
+        self,
+    ) -> None:
+        from tools.yt_channel_queue import _build_parser
+        ns = _build_parser().parse_args([
+            'mark', '--batch', 'terminated',
+        ])
+        self.assertTrue(ns.batch)
+        self.assertEqual(ns.args, ['terminated'])
 
     async def test_unmark(self) -> None:
         queue = AsyncMock()

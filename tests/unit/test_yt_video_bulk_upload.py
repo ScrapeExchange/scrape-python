@@ -914,6 +914,240 @@ class TestUploadedVideoIds(unittest.IsolatedAsyncioTestCase):
             ['one', 'two', 'three'],
         )
 
+    async def test_files_pending_upload_decreases_after_success(
+        self,
+    ) -> None:
+        from contextlib import asynccontextmanager
+        from scrape_exchange.bulk_upload import BulkBatchOutcome
+        from tools.yt_video_upload import upload_videos
+
+        gauge_values: list[int] = []
+
+        class _Gauge:
+            def set(self, value: int) -> None:
+                gauge_values.append(value)
+
+        class _Metric:
+            def labels(self, **kwargs: object) -> _Gauge:
+                del kwargs
+                return _Gauge()
+
+        async def fake_post(
+            batch_buf: bytes,
+            batch_records: list[tuple[str, str]],
+            settings: object,
+            client: object,
+            video_fm: object,
+        ) -> tuple[str, str, BulkBatchOutcome | None]:
+            del batch_buf, batch_records, settings, client, video_fm
+            return 'job-1', 'batch-1', None
+
+        async def fake_finalize_helper(
+            job_id: str,
+            batch_id: str,
+            err: BulkBatchOutcome | None,
+            batch_records: list[tuple[str, str]],
+            settings: object,
+            client: object,
+            video_fm: object,
+            uploaded: object,
+        ) -> BulkBatchOutcome:
+            del (
+                job_id, batch_id, err, batch_records,
+                settings, client, video_fm, uploaded,
+            )
+            return BulkBatchOutcome(
+                status='completed',
+                job_id='job-1',
+                success=1,
+                failed=0,
+                missing=0,
+            )
+
+        @asynccontextmanager
+        async def _noop_slot(*args: object, **kwargs: object):
+            del args, kwargs
+            yield None
+
+        async def fake_prepare(
+            filename: str,
+            settings: object,
+            video_fm: object,
+            creator_map_backend: object,
+            proxy: object,
+            validator: object,
+            uploaded: object,
+            **kwargs: object,
+        ) -> tuple[str, str, bytes]:
+            del (
+                settings, video_fm, creator_map_backend,
+                proxy, validator, uploaded, kwargs,
+            )
+            return 'abcXYZ', filename, b'{}\n'
+
+        settings = MagicMock()
+        settings.schema_owner = 'boinko'
+        settings.schema_version = '0.0.2'
+        settings.exchange_url = 'http://test'
+        settings.bulk_progress_timeout_seconds = 1.0
+        settings.bulk_batch_size = 1000
+        settings.bulk_max_batch_bytes = 10 * 1024 * 1024
+        settings.video_upload_concurrency = 1
+        settings.max_active_bulk_jobs = 1
+        settings.proxies = []
+        settings.video_data_directory = '/tmp/videos'
+
+        video_fm = MagicMock()
+        video_fm.list_base = MagicMock(side_effect=[
+            ['video-dlp-abcXYZ.json.br'], [],
+        ])
+        uploaded = AsyncMock()
+        uploaded.contains_many.return_value = {'abcXYZ': False}
+
+        with patch(
+            'tools.yt_video_upload.METRIC_FILES_PENDING_UPLOAD',
+            new=_Metric(),
+        ), patch(
+            'tools.yt_video_upload._post_one_video_batch',
+            new=fake_post,
+        ), patch(
+            'tools.yt_video_upload._finalize_one_video_batch',
+            new=fake_finalize_helper,
+        ), patch(
+            'tools.yt_video_upload._prepare_video_line',
+            new=fake_prepare,
+        ), patch(
+            'tools.yt_video_upload.reserve_bulk_upload_slot',
+            new=_noop_slot,
+        ):
+            await upload_videos(
+                settings,
+                MagicMock(),
+                video_fm,
+                AsyncMock(),
+                _permissive_validator(),
+                uploaded,
+            )
+
+        self.assertEqual(gauge_values, [1, 0])
+
+    async def test_files_pending_upload_decreases_after_failure(
+        self,
+    ) -> None:
+        from contextlib import asynccontextmanager
+        from scrape_exchange.bulk_upload import BulkBatchOutcome
+        from tools.yt_video_upload import upload_videos
+
+        gauge_values: list[int] = []
+
+        class _Gauge:
+            def set(self, value: int) -> None:
+                gauge_values.append(value)
+
+        class _Metric:
+            def labels(self, **kwargs: object) -> _Gauge:
+                del kwargs
+                return _Gauge()
+
+        async def fake_post(
+            batch_buf: bytes,
+            batch_records: list[tuple[str, str]],
+            settings: object,
+            client: object,
+            video_fm: object,
+        ) -> tuple[str, str, BulkBatchOutcome | None]:
+            del batch_buf, batch_records, settings, client, video_fm
+            return 'job-1', 'batch-1', None
+
+        async def fake_finalize_helper(
+            job_id: str,
+            batch_id: str,
+            err: BulkBatchOutcome | None,
+            batch_records: list[tuple[str, str]],
+            settings: object,
+            client: object,
+            video_fm: object,
+            uploaded: object,
+        ) -> BulkBatchOutcome:
+            del (
+                job_id, batch_id, err, batch_records,
+                settings, client, video_fm, uploaded,
+            )
+            return BulkBatchOutcome(
+                status='completed',
+                job_id='job-1',
+                success=0,
+                failed=1,
+                missing=0,
+            )
+
+        @asynccontextmanager
+        async def _noop_slot(*args: object, **kwargs: object):
+            del args, kwargs
+            yield None
+
+        async def fake_prepare(
+            filename: str,
+            settings: object,
+            video_fm: object,
+            creator_map_backend: object,
+            proxy: object,
+            validator: object,
+            uploaded: object,
+            **kwargs: object,
+        ) -> tuple[str, str, bytes]:
+            del (
+                settings, video_fm, creator_map_backend,
+                proxy, validator, uploaded, kwargs,
+            )
+            return 'abcXYZ', filename, b'{}\n'
+
+        settings = MagicMock()
+        settings.schema_owner = 'boinko'
+        settings.schema_version = '0.0.2'
+        settings.exchange_url = 'http://test'
+        settings.bulk_progress_timeout_seconds = 1.0
+        settings.bulk_batch_size = 1000
+        settings.bulk_max_batch_bytes = 10 * 1024 * 1024
+        settings.video_upload_concurrency = 1
+        settings.max_active_bulk_jobs = 1
+        settings.proxies = []
+        settings.video_data_directory = '/tmp/videos'
+
+        video_fm = MagicMock()
+        video_fm.list_base = MagicMock(side_effect=[
+            ['video-dlp-abcXYZ.json.br'], [],
+        ])
+        uploaded = AsyncMock()
+        uploaded.contains_many.return_value = {'abcXYZ': False}
+
+        with patch(
+            'tools.yt_video_upload.METRIC_FILES_PENDING_UPLOAD',
+            new=_Metric(),
+        ), patch(
+            'tools.yt_video_upload._post_one_video_batch',
+            new=fake_post,
+        ), patch(
+            'tools.yt_video_upload._finalize_one_video_batch',
+            new=fake_finalize_helper,
+        ), patch(
+            'tools.yt_video_upload._prepare_video_line',
+            new=fake_prepare,
+        ), patch(
+            'tools.yt_video_upload.reserve_bulk_upload_slot',
+            new=_noop_slot,
+        ):
+            await upload_videos(
+                settings,
+                MagicMock(),
+                video_fm,
+                AsyncMock(),
+                _permissive_validator(),
+                uploaded,
+            )
+
+        self.assertEqual(gauge_values, [1, 0])
+
     async def test_process_upload_file_moves_already_uploaded_video(
         self,
     ) -> None:

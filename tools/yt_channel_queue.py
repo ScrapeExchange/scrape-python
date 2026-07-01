@@ -215,15 +215,29 @@ def _build_parser() -> ArgumentParser:
             'full: force video_ids; metadata: force without video_ids'
         ),
     )
-    c_mark: ArgumentParser = sub.add_parser('mark')
-    c_mark.add_argument('key')
-    c_mark.add_argument(
-        'state',
+    c_mark: ArgumentParser = sub.add_parser(
+        'mark',
         help=(
-            'one of: not_found, invalid_handle, '
-            'inconsistent_identity, terminated, '
-            'unresolved, removed, soft_unavailable, '
-            'hard_unavailable, topic, no_videos, low_subs'
+            'Mark one channel, or pass --batch to mark '
+            'multiple channel IDs/handles from args or stdin.'
+        ),
+    )
+    c_mark.add_argument(
+        'args',
+        nargs='*',
+        metavar='key state',
+        help=(
+            'default: KEY STATE. With --batch: STATE [KEY ...]. '
+            'Batch KEY may be "-" for stdin; with no KEY, stdin '
+            'is read.'
+        ),
+    )
+    c_mark.add_argument(
+        '--batch',
+        action='store_true',
+        help=(
+            'read multiple channel_ids/channel_handles from '
+            'command line or stdin'
         ),
     )
     c_mark.add_argument('--note', default=None)
@@ -1030,22 +1044,64 @@ async def cmd_mark(
     ns: Namespace,
     queue: RedisChannelScrapeQueue,
 ) -> int:
-    try:
-        target: ChannelState = ChannelState(ns.state)
-    except ValueError:
+    batch: bool = getattr(ns, 'batch', False)
+    args: list[str] | None = getattr(ns, 'args', None)
+    state_value: str | None = getattr(ns, 'state', None)
+    raw_keys: list[str]
+    if args is not None:
+        if batch:
+            if len(args) < 1:
+                sys.stderr.write(
+                    'usage: mark --batch STATE [KEY ...]\n',
+                )
+                return 2
+            state_value = args[0]
+            raw_keys = args[1:]
+        else:
+            if len(args) != 2:
+                sys.stderr.write(
+                    'usage: mark KEY STATE\n',
+                )
+                return 2
+            raw_keys = [args[0]]
+            state_value = args[1]
+    elif batch:
+        raw_keys = getattr(ns, 'keys', [])
+    else:
+        key_value: str | None = getattr(ns, 'key', None)
+        if key_value is None or state_value is None:
+            sys.stderr.write(
+                'usage: mark KEY STATE\n',
+            )
+            return 2
+        raw_keys = [key_value]
+
+    if state_value is None:
         sys.stderr.write(
-            f'unknown state: {ns.state!r}\n',
+            'usage: mark KEY STATE\n',
         )
         return 2
+    try:
+        target: ChannelState = ChannelState(state_value)
+    except ValueError:
+        sys.stderr.write(
+            f'unknown state: {state_value!r}\n',
+        )
+        return 2
+    hard: bool = getattr(ns, 'hard', False)
+    note: str | None = getattr(ns, 'note', None)
     if (
-        ns.hard
+        hard
         and target == ChannelState.SOFT_UNAVAILABLE
     ):
         target = ChannelState.HARD_UNAVAILABLE
-    member: str = _normalise_key(ns.key)
-    await queue.mark(
-        member, state=target, note=ns.note,
-    )
+    for raw in _iter_key_inputs(raw_keys):
+        if not raw.strip():
+            continue
+        member: str = _normalise_key(raw)
+        await queue.mark(
+            member, state=target, note=note,
+        )
     return 0
 
 

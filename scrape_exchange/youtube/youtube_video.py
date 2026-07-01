@@ -108,6 +108,7 @@ class YouTubeVideo:
         self.channel_id: str | None = None
         self.channel_handle = channel_handle
         self.channel_url: str | None = None
+        self.channel_country: str | None = None
         self.channel_is_verified: bool | None = None
         self.channel_follower_count: int | None = None
         self.channel_thumbnail_url: str | None = \
@@ -178,6 +179,7 @@ class YouTubeVideo:
             and self.channel_id == other.channel_id
             and self.channel_handle == other.channel_handle
             and self.channel_url == other.channel_url
+            and self.channel_country == other.channel_country
             and self.channel_is_verified == other.channel_is_verified
             and self.channel_thumbnail_url == other.channel_thumbnail_url
             and self.created_timestamp == other.created_timestamp
@@ -237,6 +239,7 @@ class YouTubeVideo:
             'channel_id': self.channel_id,
             'channel_handle': self.channel_handle,
             'channel_url': self.channel_url,
+            'channel_country': self.channel_country,
             'channel_is_verified': self.channel_is_verified,
             'channel_follower_count': self.channel_follower_count,
             'availability': self.availability,
@@ -336,6 +339,7 @@ class YouTubeVideo:
         video.description = data.get('description')
         video.channel_id = data.get('channel_id')
         video.channel_url = data.get('channel_url')
+        video.channel_country = data.get('channel_country')
         video.channel_is_verified = data.get('channel_is_verified')
         video.channel_follower_count = data.get('channel_follower_count')
         video.availability = data.get('availability')

@@ -18,8 +18,11 @@ default when the key is absent; this test set asserts the new
 import unittest
 
 from scrape_exchange.youtube.youtube_video import YouTubeVideo
+from scrape_exchange.youtube import youtube_video_innertube as innertube_mod
 from scrape_exchange.youtube.youtube_video_innertube import (
     InnerTubeVideoParser,
+    _classify_player_reason,
+    _player_response_shape,
 )
 
 
@@ -257,6 +260,120 @@ class TestVideoThumbnailFiltering(unittest.TestCase):
         self.assertEqual(len(video.thumbnails), 2)
         for thumb in video.thumbnails.values():
             self.assertIsNotNone(thumb.url)
+
+
+class TestPlayerResponseInstrumentation(unittest.TestCase):
+    '''Classify sparse InnerTube ``player()`` responses without using
+    raw YouTube reason text as a Prometheus label.
+    '''
+
+    def test_unplayable_status_is_unavailable(self) -> None:
+        player_data: dict = {
+            'playabilityStatus': {
+                'status': 'UNPLAYABLE',
+                'reason': 'This video is unavailable',
+            },
+            'videoDetails': {},
+        }
+        self.assertEqual(
+            _classify_player_reason(player_data),
+            'unavailable',
+        )
+
+    def test_login_required_age_gate_is_restricted(self) -> None:
+        player_data: dict = {
+            'playabilityStatus': {
+                'status': 'LOGIN_REQUIRED',
+                'reason': 'Sign in to confirm your age',
+            },
+            'videoDetails': {},
+        }
+        self.assertEqual(
+            _classify_player_reason(player_data),
+            'restricted',
+        )
+
+    def test_bot_pressure_reason_is_client_block(self) -> None:
+        player_data: dict = {
+            'playabilityStatus': {
+                'status': 'LOGIN_REQUIRED',
+                'reason': (
+                    'Sign in to confirm you are not a bot. '
+                    'This helps protect our community.'
+                ),
+            },
+            'videoDetails': {},
+        }
+        self.assertEqual(
+            _classify_player_reason(player_data),
+            'client_block',
+        )
+
+    def test_response_shape_reports_useful_video_details(self) -> None:
+        player_data: dict = {
+            'videoDetails': {
+                'title': 'A video',
+                'channelId': 'UCabcdef',
+                'thumbnail': {
+                    'thumbnails': [
+                        {'url': 'https://i.ytimg.com/vi/x/default.jpg'},
+                    ],
+                },
+            },
+        }
+        self.assertEqual(
+            _player_response_shape(player_data),
+            {
+                'has_title': True,
+                'has_thumbnails': True,
+                'has_channel_id': True,
+            },
+        )
+
+    def test_record_player_response_uses_bounded_labels(self) -> None:
+        calls: list[dict] = []
+
+        class FakeCounter:
+            def labels(self, **kwargs: object) -> 'FakeCounter':
+                calls.append(kwargs)
+                return self
+
+            def inc(self) -> None:
+                return None
+
+        player_data: dict = {
+            'playabilityStatus': {
+                'status': 'LOGIN_REQUIRED',
+                'reason': (
+                    'Sign in to confirm you are not a bot. '
+                    'This helps protect our community.'
+                ),
+            },
+            'videoDetails': {},
+        }
+
+        original = innertube_mod.METRIC_INNERTUBE_PLAYER_RESPONSES
+        try:
+            innertube_mod.METRIC_INNERTUBE_PLAYER_RESPONSES = (
+                FakeCounter()
+            )
+            with self.assertLogs(level='WARNING') as logs:
+                innertube_mod._record_player_response(
+                    'vid123',
+                    player_data,
+                    proxy_file='proxy-a',
+                )
+        finally:
+            innertube_mod.METRIC_INNERTUBE_PLAYER_RESPONSES = original
+
+        self.assertEqual(calls[0]['status'], 'login_required')
+        self.assertEqual(calls[0]['reason_class'], 'client_block')
+        self.assertEqual(calls[0]['has_title'], 'false')
+        self.assertEqual(calls[0]['has_thumbnails'], 'false')
+        self.assertIn(
+            'InnerTube PLAYER returned sparse videoDetails',
+            logs.output[0],
+        )
 
 
 class TestNextDataSetsChannelThumbnail(unittest.TestCase):

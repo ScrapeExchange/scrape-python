@@ -153,3 +153,44 @@ class TestScrapeToDisk(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(video.channel_is_verified)
         video.to_file.assert_awaited_once()
+
+    async def test_scrape_enriches_derived_metadata_before_write(
+        self,
+    ) -> None:
+        from tools.yt_video_scrape import _scrape_to_disk
+
+        video: MagicMock = MagicMock()
+        video.channel_id = 'UC1234567890abcdefghij'
+        video.category = 'Music'
+        video.to_file = AsyncMock()
+        settings: MagicMock = MagicMock()
+        settings.ytdlp_cache_dir = '/tmp/ytdlp-cache'
+        settings.video_data_directory = '/tmp/videos'
+        settings.channel_data_directory = '/tmp/channels'
+        settings.log_level = 'INFO'
+        settings.video_use_yt_dlp = False
+        redis: MagicMock = MagicMock()
+
+        with patch(
+            'tools.yt_video_scrape.YouTubeVideo.scrape',
+            new=AsyncMock(return_value=video),
+        ), patch(
+            'tools.yt_video_scrape.enrich_video_channel_country',
+            new=AsyncMock(),
+        ) as enrich, patch(
+            'tools.yt_video_scrape.increment_channel_category_count',
+            new=AsyncMock(),
+        ) as increment:
+            await _scrape_to_disk(
+                'C7TICwKPG5g',
+                settings=settings,
+                proxy=None,
+                download_client=None,
+                redis=redis,
+            )
+
+        enrich.assert_awaited_once()
+        increment.assert_awaited_once_with(
+            redis, 'UC1234567890abcdefghij', 'Music',
+        )
+        video.to_file.assert_awaited_once()

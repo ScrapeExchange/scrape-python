@@ -123,10 +123,14 @@ The channel scraper distinguishes two operations:
 - **Scrape** — full tab walk. Expensive, claim-deduplicated
   fleet-wide.
 
-Two batch sizes (`CHANNEL_QUEUE_RESOLVE_BATCH`,
-`CHANNEL_QUEUE_SCRAPE_BATCH`) let workers pop one resolve
-batch + one scrape batch per cycle, so resolve work
-doesn't starve when the scrape queue is hot.
+`CHANNEL_QUEUE_RESOLVE_BATCH` lets the foreground loop pop
+resolve work in bounded batches. Scrape work is different:
+`CHANNEL_CONCURRENCY` starts that many long-lived workers,
+and each worker pops one scheduled channel, scrapes it, then
+immediately pops the next. This avoids head-of-line blocking
+where one huge channel can hold a whole scrape batch open.
+`CHANNEL_QUEUE_SCRAPE_BATCH` is deprecated and ignored by
+`yt_channel_scrape.py`.
 
 ### Failure handling
 
