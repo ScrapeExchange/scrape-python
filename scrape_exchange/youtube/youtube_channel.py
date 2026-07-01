@@ -276,6 +276,7 @@ class YouTubeChannel:
             )
         self.channel_id: str | None = channel_id
         self.description: str | None = None
+        self.category: str | None = None
         self.keywords: set[str] = set()
         self.verified: bool = False
         self.is_family_safe: bool = False
@@ -340,6 +341,7 @@ class YouTubeChannel:
             self.channel_id == other.channel_id and
             self.title == other.title and
             self.description == other.description and
+            self.category == other.category and
             self.joined_date == other.joined_date and
             self.rss_url == other.rss_url and
             self.verified == other.verified and
@@ -367,6 +369,7 @@ class YouTubeChannel:
             ),
             'title': self.title,
             'description': self.description,
+            'category': self.category,
             'keywords': list(self.keywords),
             'is_family_safe': self.is_family_safe,
             'country': self.country,
@@ -421,6 +424,7 @@ class YouTubeChannel:
         )
         channel.title = data.get('title')
         channel.description = data.get('description')
+        channel.category = data.get('category')
         channel.keywords = set(data.get('keywords', []))
         channel.is_family_safe = data.get('is_family_safe', False)
         channel.country = data.get('country')

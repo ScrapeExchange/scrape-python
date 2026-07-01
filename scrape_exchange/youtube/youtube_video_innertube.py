@@ -18,6 +18,7 @@ from typing import Any
 
 from innertube import InnerTube
 from innertube.errors import RequestError as InnerTubeRequestError
+from prometheus_client import Counter
 
 from scrape_exchange.youtube.youtube_channel_tabs import (
     pooled_innertube_for_entry,
@@ -53,6 +54,51 @@ _INNERTUBE_CALL_LOCKS: dict[int, asyncio.Lock] = {}
 # p99 so this only fires on a genuine hang, not on a slow-but-
 # progressing call.
 _INNERTUBE_CALL_HARD_TIMEOUT_SECONDS: float = 60.0
+
+METRIC_INNERTUBE_PLAYER_RESPONSES: Counter = Counter(
+    'innertube_player_responses_total',
+    'InnerTube player() response quality by playability status and '
+    'bounded reason class. Non-OK or sparse 2xx responses can explain '
+    'video-min files that later fail upload validation.',
+    [
+        'platform', 'scraper', 'status', 'reason_class',
+        'has_title', 'has_thumbnails', 'has_channel_id',
+        'worker_id', 'proxy_file',
+    ],
+)
+
+_CONTENT_UNAVAILABLE_STATUSES: frozenset[str] = frozenset({
+    'age_verification_required',
+    'live_stream_offline',
+    'unplayable',
+})
+
+_CLIENT_BLOCK_PATTERNS: tuple[str, ...] = (
+    'automated',
+    'bot',
+    'client',
+    'protect our community',
+    'robot',
+    'traffic',
+    'unusual',
+)
+
+_RESTRICTED_PATTERNS: tuple[str, ...] = (
+    'age',
+    'members-only',
+    'members only',
+    'premium',
+    'private',
+    'sign in',
+)
+
+_UNAVAILABLE_PATTERNS: tuple[str, ...] = (
+    'copyright',
+    'deleted',
+    'not available',
+    'removed',
+    'unavailable',
+)
 
 
 async def _call_innertube(
@@ -159,6 +205,101 @@ def _youtube_url(path_or_url: str | None) -> str | None:
     if path_or_url.startswith('/'):
         return f'https://www.youtube.com{path_or_url}'
     return None
+
+
+def _normalise_status(value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        return 'missing'
+    return value.strip().lower()
+
+
+def _reason_contains(reason: str, patterns: tuple[str, ...]) -> bool:
+    return any(pattern in reason for pattern in patterns)
+
+
+def _classify_player_reason(player_data: dict[str, Any]) -> str:
+    '''
+    Return a bounded class explaining why ``player()`` is not useful.
+
+    Raw ``playabilityStatus.reason`` strings can contain video-specific
+    text and should not become metric labels. Keep this classification
+    intentionally coarse; the raw reason is emitted in structured logs.
+    '''
+
+    playability: dict = player_data.get('playabilityStatus', {})
+    status: str = _normalise_status(playability.get('status'))
+    reason: str = str(playability.get('reason') or '').lower()
+
+    if status == 'ok':
+        return 'ok'
+    if _reason_contains(reason, _CLIENT_BLOCK_PATTERNS):
+        return 'client_block'
+    if status in _CONTENT_UNAVAILABLE_STATUSES:
+        return 'unavailable'
+    if _reason_contains(reason, _UNAVAILABLE_PATTERNS):
+        return 'unavailable'
+    if status == 'login_required':
+        return 'restricted'
+    if _reason_contains(reason, _RESTRICTED_PATTERNS):
+        return 'restricted'
+    if status == 'missing':
+        return 'missing_playability'
+    return 'other'
+
+
+def _player_response_shape(player_data: dict[str, Any]) -> dict[str, bool]:
+    video_details: dict = player_data.get('videoDetails', {})
+    thumbnails: list = (
+        video_details.get('thumbnail', {}).get('thumbnails', [])
+    )
+    return {
+        'has_title': bool(video_details.get('title')),
+        'has_thumbnails': any(
+            bool(thumbnail.get('url')) for thumbnail in thumbnails
+            if isinstance(thumbnail, dict)
+        ),
+        'has_channel_id': bool(video_details.get('channelId')),
+    }
+
+
+def _record_player_response(
+    video_id: str,
+    player_data: dict[str, Any],
+    *,
+    proxy_file: str,
+) -> None:
+    playability: dict = player_data.get('playabilityStatus', {})
+    status: str = _normalise_status(playability.get('status'))
+    reason_class: str = _classify_player_reason(player_data)
+    shape: dict[str, bool] = _player_response_shape(player_data)
+
+    METRIC_INNERTUBE_PLAYER_RESPONSES.labels(
+        platform='youtube',
+        scraper=_get_scraper(),
+        status=status,
+        reason_class=reason_class,
+        has_title=str(shape['has_title']).lower(),
+        has_thumbnails=str(shape['has_thumbnails']).lower(),
+        has_channel_id=str(shape['has_channel_id']).lower(),
+        worker_id=get_worker_id(),
+        proxy_file=proxy_file,
+    ).inc()
+
+    if (
+        status != 'ok'
+        or not shape['has_title']
+        or not shape['has_thumbnails']
+    ):
+        logging.warning(
+            'InnerTube PLAYER returned sparse videoDetails',
+            extra={
+                'video_id': video_id,
+                'playability_status': status,
+                'playability_reason': playability.get('reason'),
+                'playability_reason_class': reason_class,
+                **shape,
+            },
+        )
 
 
 def _find(contents: list[dict], key: str) -> dict | None:
@@ -338,6 +479,11 @@ class InnerTubeVideoParser:
                 )
                 raise RuntimeError(f'InnerTube API call failed: {exc}')
 
+        _record_player_response(
+            video.video_id,
+            player_data,
+            proxy_file=proxy_file,
+        )
         InnerTubeVideoParser._apply_player_data(video, player_data)
 
         _next_penalty: float = _PLAYER_PENALTY_INITIAL

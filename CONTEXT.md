@@ -32,6 +32,20 @@ stable. May contain spaces, slashes, and any unicode.
 _Avoid_: "name", "channel_name", "display name" — all refer to the same
 thing.
 
+**channel category**:
+The topical category assigned to a **Channel**. When YouTube does not
+provide one directly, it may be inferred from the categories of the
+channel's videos.
+_Avoid_: "topic" — in this repo, **topic** is a channel workflow state
+for YouTube auto-generated Topic channels.
+
+**channel country**:
+The ISO2 country associated with a **Channel**. When copied onto videos,
+it describes the creator/channel origin, not the countries where the
+video is available to watch.
+_Avoid_: `available_country_codes` for this meaning — that field
+describes video availability.
+
 ### Intake artifacts
 
 **channels.lst**:

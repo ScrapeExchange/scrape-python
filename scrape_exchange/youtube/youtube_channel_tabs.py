@@ -19,6 +19,7 @@ import time
 from typing import Any, Callable, Final
 
 import httpx
+from prometheus_client import Counter, Histogram
 
 from innertube import InnerTube
 from innertube.errors import RequestError as InnerTubeRequestError
@@ -42,6 +43,7 @@ from scrape_exchange.proxy_phase_metrics import (
     install_innertube_phase_tracing,
 )
 from scrape_exchange.util import extract_proxy_ip, proxy_network_for
+from scrape_exchange.watchdog import Watchdog
 from .youtube_cookiejar import YouTubeCookieJar
 from .youtube_rate_limiter import YouTubeRateLimiter, YouTubeCallType
 from .youtube_playlist import YouTubePlaylist
@@ -50,6 +52,65 @@ from .youtube_post import YouTubePost
 from .youtube_product import YouTubeProduct
 
 _LOGGER: Logger = getLogger(__name__)
+
+CHANNEL_TAB_DURATION: Histogram = Histogram(
+    'channel_tab_scrape_duration_seconds',
+    'Duration of one YouTube channel tab scrape.',
+    [
+        'platform', 'scraper', 'entity', 'tab',
+        'outcome', 'worker_id',
+    ],
+    buckets=(
+        0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+        10.0, 30.0, 60.0, 120.0, 300.0,
+    ),
+)
+CHANNEL_TAB_PAGES: Counter = Counter(
+    'channel_tab_pages_total',
+    'YouTube channel tab pages fetched by page type.',
+    [
+        'platform', 'scraper', 'entity', 'tab',
+        'page_type', 'outcome', 'worker_id',
+    ],
+)
+CHANNEL_TAB_ITEMS: Counter = Counter(
+    'channel_tab_items_total',
+    'Items parsed from YouTube channel tabs.',
+    [
+        'platform', 'scraper', 'entity', 'tab',
+        'item_type', 'worker_id',
+    ],
+)
+
+_KNOWN_TAB_LABELS: Final[set[str]] = {
+    'courses',
+    'live',
+    'playlists',
+    'podcasts',
+    'posts',
+    'shorts',
+    'store',
+    'videos',
+}
+
+
+def _tab_metric_label(title: str) -> str:
+    '''Return a low-cardinality Prometheus label for a tab title.'''
+
+    normalised: str = title.strip().lower().replace(' ', '_')
+    if normalised in _KNOWN_TAB_LABELS:
+        return normalised
+    return 'other'
+
+
+def _tab_metric_base(tab: str) -> dict[str, str]:
+    return {
+        'platform': 'youtube',
+        'scraper': _get_scraper(),
+        'entity': 'channel',
+        'tab': tab,
+        'worker_id': get_worker_id(),
+    }
 
 
 class YouTubeChannelTabs:
@@ -208,130 +269,192 @@ class YouTubeChannelTabs:
         set[YouTubeCourse], set[YouTubePost],
         set[YouTubeProduct],
     ]:
+        started_at: float = time.monotonic()
+        tab_label: str = _tab_metric_label(title)
+        metric_base: dict[str, str] = _tab_metric_base(tab_label)
+        outcome: str = 'success'
+        active_page_type: str | None = None
         video_ids: set[str] = set()
         extra: dict[str, str] = {'channel_id': self.channel_id}
-        params: str = tab_renderer[
-            'endpoint'
-        ]['browseEndpoint']['params']
-        page_data: dict = await self._browse(params=params)
-        page_tab: dict[str, any] = self.get_tab(page_data, title)
 
-        if title == 'playlists':
-            playlists: set[YouTubePlaylist] = (
-                self._get_playlist_items(page_tab)
-            )
-            _LOGGER.debug(
-                'Parsed playlists',
-                extra=extra | {'playlists_length': len(playlists)}
-            )
-            return video_ids, set(), playlists, set(), set(), set()
-        if title == 'courses':
-            courses: set[YouTubeCourse] = (
-                self._get_course_items(page_tab)
-            )
-            _LOGGER.debug(
-                'Parsed courses',
-                extra=extra | {'courses_length': len(courses)}
-            )
-            return video_ids, set(), set(), courses, set(), set()
-        if title == 'posts':
-            posts: set[YouTubePost] = self._get_post_items(
-                page_tab,
-            )
-            _LOGGER.debug(
-                'Parsed posts',
-                extra=extra | {'posts_length': len(posts)}
-            )
-            return video_ids, set(), set(), set(), posts, set()
-        if title == 'store':
-            products: set[YouTubeProduct] = (
-                self._get_product_items(page_tab)
-            )
-            _LOGGER.debug(
-                'Parsed merch products',
-                extra=extra | {'products_length': len(products)}
-            )
-            return video_ids, set(), set(), set(), set(), products
+        try:
+            params: str = tab_renderer[
+                'endpoint'
+            ]['browseEndpoint']['params']
+            active_page_type = 'initial'
+            page_data: dict = await self._browse(params=params)
+            active_page_type = None
+            CHANNEL_TAB_PAGES.labels(
+                **metric_base,
+                page_type='initial',
+                outcome='success',
+            ).inc()
+            page_tab: dict[str, any] = self.get_tab(page_data, title)
 
-        contents: list = page_tab.get(
-            'content', {}
-        ).get(
-            'richGridRenderer', {}
-        ).get('contents', [])
+            if title == 'playlists':
+                playlists: set[YouTubePlaylist] = (
+                    self._get_playlist_items(page_tab)
+                )
+                CHANNEL_TAB_ITEMS.labels(
+                    **metric_base,
+                    item_type='playlist',
+                ).inc(len(playlists))
+                _LOGGER.debug(
+                    'Parsed playlists',
+                    extra=extra | {'playlists_length': len(playlists)}
+                )
+                return video_ids, set(), playlists, set(), set(), set()
+            if title == 'courses':
+                courses: set[YouTubeCourse] = (
+                    self._get_course_items(page_tab)
+                )
+                CHANNEL_TAB_ITEMS.labels(
+                    **metric_base,
+                    item_type='course',
+                ).inc(len(courses))
+                _LOGGER.debug(
+                    'Parsed courses',
+                    extra=extra | {'courses_length': len(courses)}
+                )
+                return video_ids, set(), set(), courses, set(), set()
+            if title == 'posts':
+                posts: set[YouTubePost] = self._get_post_items(
+                    page_tab,
+                )
+                CHANNEL_TAB_ITEMS.labels(
+                    **metric_base,
+                    item_type='post',
+                ).inc(len(posts))
+                _LOGGER.debug(
+                    'Parsed posts',
+                    extra=extra | {'posts_length': len(posts)}
+                )
+                return video_ids, set(), set(), set(), posts, set()
+            if title == 'store':
+                products: set[YouTubeProduct] = (
+                    self._get_product_items(page_tab)
+                )
+                CHANNEL_TAB_ITEMS.labels(
+                    **metric_base,
+                    item_type='product',
+                ).inc(len(products))
+                _LOGGER.debug(
+                    'Parsed merch products',
+                    extra=extra | {'products_length': len(products)}
+                )
+                return video_ids, set(), set(), set(), set(), products
 
-        if not contents:
-            _LOGGER.debug(
-                'No contents found for channel tab',
-                extra=extra | {'title': title}
+            contents: list = page_tab.get(
+                'content', {}
+            ).get(
+                'richGridRenderer', {}
+            ).get('contents', [])
+
+            if not contents:
+                _LOGGER.debug(
+                    'No contents found for channel tab',
+                    extra=extra | {'title': title}
+                )
+                return video_ids, set(), set(), set(), set(), set()
+
+            if title == 'podcasts':
+                podcast_ids: set[str] = self._get_podcast_ids(
+                    contents,
+                )
+                CHANNEL_TAB_ITEMS.labels(
+                    **metric_base,
+                    item_type='podcast_id',
+                ).inc(len(podcast_ids))
+                _LOGGER.debug(
+                    'Parsed podcasts',
+                    extra=extra | {
+                        'podcast_ids_length': len(podcast_ids)
+                    }
+                )
+                return video_ids, podcast_ids, set(), set(), set(), set()
+
+            continuation_token: str = self.get_continuation_token(
+                contents[-1],
             )
-            return video_ids, set(), set(), set(), set(), set()
-
-        if title == 'podcasts':
-            podcast_ids: set[str] = self._get_podcast_ids(
-                contents,
-            )
-            _LOGGER.debug(
-                'Parsed podcasts',
-                extra=extra | {'podcast_ids_length': len(podcast_ids)}
-            )
-            return video_ids, podcast_ids, set(), set(), set(), set()
-
-        continuation_token: str = self.get_continuation_token(
-            contents[-1],
-        )
-        if 'continuationItemRenderer' in contents[-1]:
-            contents = contents[:-1]
-
-        _LOGGER.debug(
-            'Parsed videos or shorts',
-            extra=extra | {'contents_length': len(contents)}
-        )
-        for content in contents:
-            video_id = self._extract_video_id(content, title)
-            if video_id:
-                video_ids.add(video_id)
-
-        # Subsequent pages for one tab keep their tab-local order.
-        while continuation_token:
-            continued_data: dict = await self._browse(
-                continuation_token=continuation_token
-            )
-
-            actions: list = continued_data.get(
-                'onResponseReceivedActions'
-            )
-            if not actions:
-                break
-
-            continuation_items: list = actions[0].get(
-                'appendContinuationItemsAction', {}
-            ).get('continuationItems')
-
-            if not continuation_items:
-                break
-
-            continuation_token = self.get_continuation_token(
-                continuation_items[-1]
-            )
-            if 'continuationItemRenderer' in continuation_items[-1]:
-                continuation_items = continuation_items[:-1]
+            if 'continuationItemRenderer' in contents[-1]:
+                contents = contents[:-1]
 
             _LOGGER.debug(
                 'Parsed videos or shorts',
-                extra=extra | {
-                    'continuation_items_length': len(
-                        continuation_items
-                    )
-                }
+                extra=extra | {'contents_length': len(contents)}
             )
-            for item in continuation_items:
-                video_id: str | None = self._extract_video_id(
-                    item, title,
-                )
+            for content in contents:
+                video_id = self._extract_video_id(content, title)
                 if video_id:
                     video_ids.add(video_id)
 
-        return video_ids, set(), set(), set(), set(), set()
+            # Subsequent pages for one tab keep their tab-local order.
+            while continuation_token:
+                active_page_type = 'continuation'
+                continued_data: dict = await self._browse(
+                    continuation_token=continuation_token
+                )
+                active_page_type = None
+
+                CHANNEL_TAB_PAGES.labels(
+                    **metric_base,
+                    page_type='continuation',
+                    outcome='success',
+                ).inc()
+
+                actions: list = continued_data.get(
+                    'onResponseReceivedActions'
+                )
+                if not actions:
+                    break
+
+                continuation_items: list = actions[0].get(
+                    'appendContinuationItemsAction', {}
+                ).get('continuationItems')
+
+                if not continuation_items:
+                    break
+
+                continuation_token = self.get_continuation_token(
+                    continuation_items[-1]
+                )
+                if 'continuationItemRenderer' in continuation_items[-1]:
+                    continuation_items = continuation_items[:-1]
+
+                _LOGGER.debug(
+                    'Parsed videos or shorts',
+                    extra=extra | {
+                        'continuation_items_length': len(
+                            continuation_items
+                        )
+                    }
+                )
+                for item in continuation_items:
+                    video_id: str | None = self._extract_video_id(
+                        item, title,
+                    )
+                    if video_id:
+                        video_ids.add(video_id)
+
+            CHANNEL_TAB_ITEMS.labels(
+                **metric_base,
+                item_type='video_id',
+            ).inc(len(video_ids))
+            return video_ids, set(), set(), set(), set(), set()
+        except Exception:
+            outcome = 'failure'
+            if active_page_type is not None:
+                CHANNEL_TAB_PAGES.labels(
+                    **metric_base,
+                    page_type=active_page_type,
+                    outcome='failure',
+                ).inc()
+            raise
+        finally:
+            CHANNEL_TAB_DURATION.labels(
+                **metric_base,
+                outcome=outcome,
+            ).observe(time.monotonic() - started_at)
 
     def _extract_video_id(self, item: dict[str, any], tab_title: str
                           ) -> str | None:
@@ -571,12 +694,12 @@ class YouTubeChannelTabs:
                 result: dict
                 if not params:
                     if not continuation_token:
-                        result = await run_on_innertube_executor(
+                        result = await _call_innertube_browse(
                             self.client.browse,
                             self.channel_id,
                         )
                     else:
-                        result = await run_on_innertube_executor(
+                        result = await _call_innertube_browse(
                             functools.partial(
                                 self.client.browse,
                                 self.channel_id,
@@ -584,7 +707,7 @@ class YouTubeChannelTabs:
                             ),
                         )
                 else:
-                    result = await run_on_innertube_executor(
+                    result = await _call_innertube_browse(
                         functools.partial(
                             self.client.browse,
                             self.channel_id,
@@ -610,6 +733,7 @@ class YouTubeChannelTabs:
                 )
                 return result
             except InnerTubeRequestError as exc:
+                Watchdog.get().touch_work()
                 duration = time.monotonic() - start
                 status_class: str = (
                     '4xx' if exc.error.code == 429 else 'error'
@@ -670,6 +794,7 @@ class YouTubeChannelTabs:
                         )
                     penalty = min(penalty * 2, _PENALTY_MAX)
             except Exception as exc:
+                Watchdog.get().touch_work()
                 duration = time.monotonic() - start
                 METRIC_YT_REQUEST_DURATION.labels(
                     platform='youtube',
@@ -828,6 +953,12 @@ _INNERTUBE_SYNC_HTTPX_TIMEOUT: Final[httpx.Timeout] = httpx.Timeout(
     connect=5.0, read=8.0, write=5.0, pool=5.0,
 )
 
+# Wall-clock safety net for a single channel-tab InnerTube BROWSE call.
+# The sync HTTP stack should time out first, but live proxy stalls can still
+# wedge executor futures long enough for the scraper watchdog to kill the
+# worker. Keep this below WATCHDOG_WORK_TIMEOUT_SECONDS.
+_INNERTUBE_BROWSE_HARD_TIMEOUT_SECONDS: float = 60.0
+
 
 # Dedicated thread pool for the *synchronous* InnerTube calls
 # (player/next/browse run via run_in_executor). Kept separate from the
@@ -870,6 +1001,19 @@ def run_on_innertube_executor(
     ``functools.partial``.'''
     loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
     return loop.run_in_executor(innertube_executor(), fn, *args)
+
+
+async def _call_innertube_browse(
+    fn: Callable[..., dict[str, Any]], *args: object,
+) -> dict[str, Any]:
+    '''
+    Run one synchronous InnerTube BROWSE call with a wall-clock cap.
+    '''
+
+    return await asyncio.wait_for(
+        run_on_innertube_executor(fn, *args),
+        timeout=_INNERTUBE_BROWSE_HARD_TIMEOUT_SECONDS,
+    )
 
 
 def shutdown_innertube_executor() -> None:

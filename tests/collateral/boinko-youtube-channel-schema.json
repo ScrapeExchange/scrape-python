@@ -13,7 +13,8 @@
     "channel_handle": {
       "type": "string",
       "description": "The channel handle (without @)",
-      "x-scrape-field": "platform_creator_id"
+      "x-scrape-field": "platform_creator_id",
+      "x-scrape-normalize": "lowercase"
     },
     "url": {
       "type": "string",
@@ -23,20 +24,25 @@
     },
     "title": {
       "type": ["string", "null"],
-      "description": "The human-readable channel title"
+      "description": "The human-readable channel title",
+      "x-scrape-extract-hashtags": true
     },
     "description": {
       "type": ["string", "null"],
-      "description": "The channel description"
+      "description": "The channel description",
+      "x-scrape-extract-hashtags": true,
+      "x-scrape-extract-cashtags": true
     },
     "keywords": {
       "type": "array",
       "items": { "type": "string" },
-      "description": "List of keywords/tags associated with the channel"
+      "description": "List of keywords/tags associated with the channel",
+      "x-scrape-tags": "keywords"
     },
     "category": {
       "type": ["string", "null"],
-      "description": "The channel category/genre if available"
+      "description": "The channel category/genre if available",
+      "x-scrape-tags": "categories"
     },
     "is_family_safe": {
       "type": "boolean",
@@ -44,7 +50,8 @@
     },
     "country": {
       "type": ["string", "null"],
-      "description": "ISO2 country code (if available)"
+      "description": "ISO2 country code (if available)",
+      "x-scrape-field": "country"
     },
     "available_country_codes": {
       "type": "array",

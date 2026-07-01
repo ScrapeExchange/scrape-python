@@ -41,6 +41,7 @@ from scrape_exchange.creator_map import (
     CreatorMap,
     RedisCreatorMap,
 )
+from scrape_exchange.exchange_client import ExchangeClient
 from scrape_exchange.proxy_loader import proxy_file_label
 from scrape_exchange.redis_client import redis_from_url
 from scrape_exchange.util import extract_proxy_ip, proxy_network_for
@@ -53,6 +54,10 @@ from scrape_exchange.scraper_runner import (
 )
 from scrape_exchange.youtube.youtube_rate_limiter import YouTubeRateLimiter
 from scrape_exchange.youtube.youtube_channel import YouTubeChannel
+from scrape_exchange.youtube.derived_metadata import (
+    enrich_video_channel_country,
+    increment_channel_category_count,
+)
 from scrape_exchange.youtube.youtube_video import YouTubeVideo
 from scrape_exchange.youtube.youtube_video import (
     DENO_PATH, PO_TOKEN_URL, YTDLP_CACHE_DIR,
@@ -218,6 +223,9 @@ async def _scrape_to_disk(
     download_client: YoutubeDL | None,
     creator_map_backend: CreatorMap | None = None,
     channel_context: VideoQueueChannelContext | None = None,
+    redis: aioredis.Redis | None = None,
+    exchange_client: ExchangeClient | None = None,
+    exchange_username: str | None = None,
 ) -> None:
     '''Single-attempt scrape that raises on any failure.
 
@@ -253,6 +261,16 @@ async def _scrape_to_disk(
             creator_map_backend=creator_map_backend,
             proxy=proxy,
         )
+    await enrich_video_channel_country(
+        video,
+        redis=redis,
+        channel_data_directory=settings.channel_data_directory,
+        client=exchange_client,
+        username=exchange_username,
+    )
+    await increment_channel_category_count(
+        redis, video.channel_id, video.category,
+    )
     output_prefix: str = (
         VIDEO_YTDLP_PREFIX
         if settings.video_use_yt_dlp else VIDEO_MIN_PREFIX
@@ -332,6 +350,9 @@ async def _scrape_one_queued(
     uploaded: UploadedVideoIds,
     creator_map_backend: CreatorMap,
     channel_context: VideoQueueChannelContext | None = None,
+    redis: aioredis.Redis | None = None,
+    exchange_client: ExchangeClient | None = None,
+    exchange_username: str | None = None,
 ) -> None:
     '''Scrape one queued video with the hybrid retry contract.
 
@@ -393,6 +414,9 @@ async def _scrape_one_queued(
                 download_client=None,
                 creator_map_backend=creator_map_backend,
                 channel_context=channel_context,
+                redis=redis,
+                exchange_client=exchange_client,
+                exchange_username=exchange_username,
             )
         except Exception as exc:
             reason: str = _classify_scrape_error(exc)
@@ -472,6 +496,9 @@ async def _queue_driven_loop(
     concurrency: int,
     uploaded: UploadedVideoIds,
     creator_map_backend: CreatorMap,
+    redis: aioredis.Redis | None = None,
+    exchange_client: ExchangeClient | None = None,
+    exchange_username: str | None = None,
 ) -> None:
     '''Streaming producer/consumer loop for the queue-driven
     video scraper.
@@ -543,6 +570,9 @@ async def _queue_driven_loop(
                     uploaded=uploaded,
                     creator_map_backend=creator_map_backend,
                     channel_context=entry.channel,
+                    redis=redis,
+                    exchange_client=exchange_client,
+                    exchange_username=exchange_username,
                 )
             except Exception:
                 # Defensive: per-video classification +
@@ -955,12 +985,10 @@ async def _run_worker(
         settings.redis_dsn,
         platform='youtube',
     )
-    # ``claim`` and ``video_fm`` constructed above are no longer
-    # used by the queue-driven loop. They remain in place for
-    # _run_worker startup-side effects (the FileContentClaim
-    # constructor seeds its directory; AssetFileManagement
-    # ensures the data dir exists). A later cleanup can prune
-    # those once cross-process dedup at queue level is verified.
+    # ``claim`` and ``video_fm`` constructed above remain in place
+    # for startup-side effects: the claim constructor seeds local
+    # state when needed, and AssetFileManagement ensures the data
+    # directory exists.
     del claim, video_fm
 
     # Per-host singleton: only WORKER_ID '1' publishes queue-size
@@ -990,6 +1018,12 @@ async def _run_worker(
             streaming_concurrency,
             uploaded_video_ids,
             creator_map_backend,
+            video_queue_redis,
+            ctx.client,
+            (
+                ctx.client.authenticated_username
+                if ctx.client is not None else None
+            ),
         )
     finally:
         if publisher_task is not None:

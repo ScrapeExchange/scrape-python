@@ -21,7 +21,7 @@ import time
 
 from random import shuffle
 from pathlib import Path
-from typing import Any
+from typing import Callable
 
 import aiofiles
 import httpx
@@ -80,6 +80,10 @@ from scrape_exchange.channel_scrape_queue import (
     RedisChannelScrapeQueue,
 )
 from scrape_exchange.youtube.settings import YouTubeScraperSettings
+from scrape_exchange.youtube.derived_metadata import (
+    enrich_channel_category,
+    set_channel_country,
+)
 from scrape_exchange.youtube.youtube_channel import YouTubeChannel
 from scrape_exchange.youtube.youtube_rate_limiter import YouTubeRateLimiter
 from scrape_exchange.youtube.youtube_video import DENO_PATH, PO_TOKEN_URL
@@ -95,6 +99,7 @@ TOPIC_CHANNEL_SUFFIX: str = ' - topic'
 TOPIC_HANDLE_SUFFIX: str = '-topic'
 TOPIC_CHANNEL_LAST_ERROR: str = 'topic channel skipped'
 MIN_CHANNEL_SUBSCRIBERS: int = 10
+CHANNEL_BATCH_PROGRESS_INTERVAL_SECONDS: float = 30.0
 
 PRIORITY_MAX_RETRIES: int = 5
 
@@ -1167,140 +1172,236 @@ async def _queue_driven_loop(
     http_client: httpx.AsyncClient,
     name_map: NameMap | None = None,
 ) -> None:
-    '''Wave-driven main loop.
+    '''Queue-driven main loop.
 
-    Each iteration:
-    1. Drains a batch from the unresolved queue
-       → resolve.
-    2. Drains a batch from the scheduled queue
-       (across all tiers) → scrape.
-    3. On the elected reap worker, runs the
+    Long-lived scheduled-scrape workers pull one channel at a time
+    from Redis. This avoids batch head-of-line blocking where a few
+    very large channels prevent the process from claiming more work.
+
+    The foreground loop:
+    1. Drains a batch from the unresolved queue → resolve.
+    2. On the elected reap worker, runs the
        soft-unavailable reaper at the configured
        interval.
-    4. Sleeps ``idle_poll_seconds`` if both queues
-       were empty.
+    3. Sleeps ``idle_poll_seconds`` if the unresolved queue is empty.
     '''
     last_reap: float = 0.0
-    while not shutdown_event.is_set():
-        # Top-of-loop watchdog progress signal: ticks on every wave,
-        # including idle waves where both queues are empty.
-        Watchdog.get().touch_work()
-        handles: list[str] = (
-            await queue.pop_unresolved(
-                settings.channel_queue_resolve_batch,
-            )
-        )
-        await asyncio.gather(*(
-            _resolve_one_queued(
-                handle,
+    active_started_at: dict[str, float] = {}
+    completed_count: int = 0
+    worker_count: int = _channel_scrape_worker_count(settings)
+
+    def record_completed() -> None:
+        nonlocal completed_count
+        completed_count += 1
+
+    scrape_workers: list[asyncio.Task[None]] = [
+        asyncio.create_task(
+            _scrape_scheduled_worker(
+                worker_index=index,
                 queue=queue,
-                identity=identity,
                 settings=settings,
-            )
-            for handle in handles
-        ))
-        ids: list[str] = await queue.pop_scheduled(
-            settings.channel_queue_scrape_batch,
-            now=time.time(),
+                fm=fm,
+                creator_map_backend=creator_map_backend,
+                http_client=http_client,
+                identity=identity,
+                name_map=name_map,
+                shutdown_event=shutdown_event,
+                active_started_at=active_started_at,
+                record_completed=record_completed,
+            ),
         )
-        await _scrape_queued_batch(
-            ids,
-            queue=queue,
-            settings=settings,
-            fm=fm,
-            creator_map_backend=creator_map_backend,
-            http_client=http_client,
-            identity=identity,
-            name_map=name_map,
+        for index in range(worker_count)
+    ]
+    reporter: asyncio.Task[None] = asyncio.create_task(
+        _report_scrape_worker_progress(
+            active_started_at,
+            get_completed_count=lambda: completed_count,
+            worker_count=worker_count,
+            shutdown_event=shutdown_event,
         )
-        now: float = time.time()
-        if (
-            is_reap_worker
-            and (
-                now - last_reap
-                >= (
-                    settings
-                    .channel_soft_reap_interval_seconds
+    )
+    try:
+        while not shutdown_event.is_set():
+            # Top-of-loop watchdog progress signal: ticks on every
+            # resolve/reap wave, including idle waves.
+            Watchdog.get().touch_work()
+            handles: list[str] = (
+                await queue.pop_unresolved(
+                    settings.channel_queue_resolve_batch,
                 )
             )
-        ):
-            try:
-                reaped: int = (
-                    await queue.reap_soft_unavailable(
-                        now=now,
+            await asyncio.gather(*(
+                _resolve_one_queued(
+                    handle,
+                    queue=queue,
+                    identity=identity,
+                    settings=settings,
+                )
+                for handle in handles
+            ))
+            now: float = time.time()
+            if (
+                is_reap_worker
+                and (
+                    now - last_reap
+                    >= (
+                        settings
+                        .channel_soft_reap_interval_seconds
                     )
                 )
-                if reaped:
-                    CHANNEL_SOFT_REAP.labels(
-                        outcome='reaped',
-                    ).inc(reaped)
-            except Exception:
-                logging.warning(
-                    'soft-unavailable reap failed',
-                    exc_info=True,
+            ):
+                try:
+                    reaped: int = (
+                        await queue.reap_soft_unavailable(
+                            now=now,
+                        )
+                    )
+                    if reaped:
+                        CHANNEL_SOFT_REAP.labels(
+                            outcome='reaped',
+                        ).inc(reaped)
+                except Exception:
+                    logging.warning(
+                        'soft-unavailable reap failed',
+                        exc_info=True,
+                    )
+                last_reap = now
+            if not handles:
+                await asyncio.sleep(
+                    settings
+                    .channel_queue_idle_poll_seconds,
                 )
-            last_reap = now
-        if not handles and not ids:
-            await asyncio.sleep(
-                settings
-                .channel_queue_idle_poll_seconds,
-            )
+    finally:
+        shutdown_event.set()
+        for task in [*scrape_workers, reporter]:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *scrape_workers, reporter,
+            return_exceptions=True,
+        )
 
 
-async def _scrape_queued_batch(
-    ids: list[str],
+def _channel_scrape_worker_count(
+    settings: ChannelSettings,
+) -> int:
+    return max(
+        settings.channel_concurrency,
+        len(settings.proxies),
+        1,
+    )
+
+
+async def _report_scrape_worker_progress(
+    active_started_at: dict[str, float],
     *,
+    get_completed_count: Callable[[], int],
+    worker_count: int,
+    shutdown_event: asyncio.Event,
+) -> None:
+    while not shutdown_event.is_set():
+        try:
+            await asyncio.wait_for(
+                shutdown_event.wait(),
+                timeout=CHANNEL_BATCH_PROGRESS_INTERVAL_SECONDS,
+            )
+            return
+        except TimeoutError:
+            pass
+
+        if not active_started_at:
+            continue
+
+        Watchdog.get().touch_work()
+        now: float = time.monotonic()
+        oldest_age: float = max(
+            now - started
+            for started in active_started_at.values()
+        )
+        logging.info(
+            'channel scrape worker progress',
+            extra={
+                'active_count': len(active_started_at),
+                'completed_count': get_completed_count(),
+                'worker_count': worker_count,
+                'oldest_inflight_seconds': round(oldest_age, 1),
+            },
+        )
+
+
+async def _scrape_scheduled_worker(
+    *,
+    worker_index: int,
     queue: RedisChannelScrapeQueue,
     settings: ChannelSettings,
     fm: AssetFileManagement,
     creator_map_backend: CreatorMap,
     http_client: httpx.AsyncClient,
+    shutdown_event: asyncio.Event,
+    active_started_at: dict[str, float],
+    record_completed: Callable[[], None],
     identity: ChannelIdentityStore | None = None,
     name_map: NameMap | None = None,
 ) -> None:
-    '''Scrape one already-popped scheduled batch concurrently.'''
-    if not ids:
-        return
-    concurrency: int = max(
-        settings.channel_concurrency,
-        len(settings.proxies),
-        1,
-    )
-    semaphore: asyncio.Semaphore = asyncio.Semaphore(
-        concurrency,
-    )
+    '''Continuously claim and scrape scheduled channel IDs.'''
+    while not shutdown_event.is_set():
+        Watchdog.get().touch_work()
+        try:
+            ids: list[str] = await queue.pop_scheduled(
+                1,
+                now=time.time(),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.warning(
+                'scheduled channel pop failed',
+                exc_info=True,
+                extra={'worker_index': worker_index},
+            )
+            await asyncio.sleep(
+                settings.channel_queue_idle_poll_seconds,
+            )
+            continue
 
-    async def scrape_one(channel_id: str) -> None:
-        async with semaphore:
-            try:
-                await _scrape_one_queued(
-                    channel_id,
-                    queue=queue,
-                    settings=settings,
-                    fm=fm,
-                    creator_map_backend=creator_map_backend,
-                    http_client=http_client,
-                    identity=identity,
-                    name_map=name_map,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logging.exception(
-                    'queued channel scrape failed after pop',
-                    extra={'channel_id': channel_id},
-                )
-                await queue.mark_soft_unavailable(
-                    channel_id,
-                    last_error=str(exc),
-                )
-                CHANNEL_SCRAPE_OUTCOMES.labels(
-                    outcome='soft_unavailable',
-                ).inc()
+        if not ids:
+            await asyncio.sleep(
+                settings.channel_queue_idle_poll_seconds,
+            )
+            continue
 
-    await asyncio.gather(*(
-        scrape_one(channel_id) for channel_id in ids
-    ))
+        channel_id: str = ids[0]
+        active_key: str = f'{worker_index}:{channel_id}'
+        active_started_at[active_key] = time.monotonic()
+        try:
+            await _scrape_one_queued(
+                channel_id,
+                queue=queue,
+                settings=settings,
+                fm=fm,
+                creator_map_backend=creator_map_backend,
+                http_client=http_client,
+                identity=identity,
+                name_map=name_map,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logging.exception(
+                'queued channel scrape failed after pop',
+                extra={'channel_id': channel_id},
+            )
+            await queue.mark_soft_unavailable(
+                channel_id,
+                last_error=str(exc),
+            )
+            CHANNEL_SCRAPE_OUTCOMES.labels(
+                outcome='soft_unavailable',
+            ).inc()
+        finally:
+            active_started_at.pop(active_key, None)
+            record_completed()
+            Watchdog.get().touch_work()
 
 
 async def _resolve_one_queued(
@@ -1490,7 +1591,7 @@ async def _channel_exists_on_exchange(
         ).inc()
         return False
     try:
-        body: dict[str, Any] = resp.json()
+        body: dict[str, any] = resp.json()
     except Exception:
         CHANNEL_EXCHANGE_EXISTENCE_CHECK.labels(
             outcome='error',
@@ -2335,6 +2436,7 @@ async def _scrape_channel_to_disk(
     filename: str,
     creator_map_backend: CreatorMap,
     extra: dict[str, str],
+    redis: aioredis.Redis | None = None,
 ) -> tuple[bool, bool | None, YouTubeChannel | None]:
     '''Acquire the cross-host scrape claim, run InnerTube, persist
     on success. Returns
@@ -2364,7 +2466,7 @@ async def _scrape_channel_to_disk(
 
     try:
         return await _do_scrape_channel_to_disk(
-            settings, fm, channel_id, filename, extra,
+            settings, fm, channel_id, filename, extra, redis,
         )
     finally:
         if scrape_claim is not None:
@@ -2377,6 +2479,7 @@ async def _do_scrape_channel_to_disk(
     channel_id: str,
     filename: str,
     extra: dict[str, str],
+    redis: aioredis.Redis | None = None,
 ) -> tuple[bool, bool | None, YouTubeChannel | None]:
     '''Inner half of :func:`_scrape_channel_to_disk` — runs while
     the cross-host scrape claim is held. Same return contract.
@@ -2434,6 +2537,13 @@ async def _do_scrape_channel_to_disk(
         scrape_proxy_network, scrape_proxy, log_handle,
     ):
         return False, False, None
+
+    await enrich_channel_category(
+        channel,
+        redis=redis,
+        video_data_directory=settings.video_data_directory,
+    )
+    await set_channel_country(redis, channel_id, channel.country)
 
     if not await _persist_scraped_channel(
         fm, filename, channel, log_handle,
@@ -2663,6 +2773,7 @@ async def scrape_channel(
             await _scrape_channel_to_disk(
                 settings, fm, channel_id, filename,
                 creator_map_backend, extra,
+                getattr(creator_map_backend, 'redis_client', None),
             )
         )
         if not proceed:

@@ -1,10 +1,23 @@
 import unittest
+from pathlib import Path
+
+import orjson
+from jsonschema import Draft202012Validator
 
 from scrape_exchange.youtube.youtube_thumbnail import YouTubeThumbnail
 from scrape_exchange.youtube.youtube_video import YouTubeVideo
 
 
 class TestYouTubeVideo(unittest.TestCase):
+    def test_to_dict_round_trips_channel_country(self) -> None:
+        video: YouTubeVideo = YouTubeVideo(video_id='dQw4w9WgXcQ')
+        video.channel_id = 'UCaaaaaaaaaaaaaaaaaaaaaa'
+        video.channel_country = 'US'
+
+        restored: YouTubeVideo = YouTubeVideo.from_dict(video.to_dict())
+
+        self.assertEqual(restored.channel_country, 'US')
+
     def test_from_dict_restores_channel_thumbnail(self) -> None:
         video: YouTubeVideo = YouTubeVideo(
             video_id='dQw4w9WgXcQ',
@@ -50,6 +63,22 @@ class TestYouTubeVideo(unittest.TestCase):
         })
 
         self.assertEqual(handle, 'CanonicalHandle')
+
+
+class TestYouTubeVideoSchema(unittest.TestCase):
+    def test_schema_allows_channel_country(self) -> None:
+        schema_path: Path = Path(
+            'tests/collateral/boinko-youtube-video-schema.json'
+        )
+        schema: dict = orjson.loads(schema_path.read_bytes())
+        validator = Draft202012Validator(schema)
+        video: YouTubeVideo = YouTubeVideo(video_id='dQw4w9WgXcQ')
+        video.channel_id = 'UCaaaaaaaaaaaaaaaaaaaaaa'
+        video.channel_country = 'US'
+
+        errors: list = list(validator.iter_errors(video.to_dict()))
+
+        self.assertEqual(errors, [])
 
 
 if __name__ == '__main__':

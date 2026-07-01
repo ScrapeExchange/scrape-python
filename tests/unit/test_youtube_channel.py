@@ -527,6 +527,7 @@ class TestYouTubeChannelToFromDict(unittest.TestCase):
         ch.channel_id = 'UC_RT'
         ch.title = 'RT Title'
         ch.description = 'desc'
+        ch.category = 'Education'
         ch.keywords = {'keyword1', 'keyword2'}
         ch.is_family_safe = True
         ch.country = 'US'
@@ -555,6 +556,7 @@ class TestYouTubeChannelToFromDict(unittest.TestCase):
         data = ch.to_dict()
         restored = YouTubeChannel.from_dict(data)
 
+        self.assertEqual(restored.category, 'Education')
         self.assertEqual(ch, restored)
 
     def test_from_dict_empty(self) -> None:

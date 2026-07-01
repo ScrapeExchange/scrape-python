@@ -135,6 +135,9 @@ def _settings(**overrides: object) -> MagicMock:
     s.creator_queue_idle_poll_seconds = overrides.get(
         'creator_queue_idle_poll_seconds', 30,
     )
+    s.creator_orphan_recovery_interval_seconds = overrides.get(
+        'creator_orphan_recovery_interval_seconds', 600,
+    )
     s.creator_video_ref_count = overrides.get(
         'creator_video_ref_count', 0,
     )
@@ -1293,6 +1296,18 @@ class TestMaintenanceLoop(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         q: MagicMock = MagicMock()
         q.cleanup_stale_claims = AsyncMock(return_value=0)
+        q.scan_and_recover_orphans = AsyncMock(
+            return_value={
+                1: {
+                    'queued': 2, 'claimed': 0,
+                    'no_feeds': 0, 'orphan': 1,
+                },
+                2: {
+                    'queued': 3, 'claimed': 0,
+                    'no_feeds': 0, 'orphan': 0,
+                },
+            },
+        )
         q.queue_sizes_by_tier = AsyncMock(
             return_value={1: 2, 2: 3},
         )
@@ -1308,7 +1323,10 @@ class TestMaintenanceLoop(unittest.IsolatedAsyncioTestCase):
             await tool._maintenance_loop(q, s, '0', shutdown)
 
         wd.get.return_value.touch_work.assert_called()
-        q.cleanup_stale_claims.assert_awaited()
+        q.scan_and_recover_orphans.assert_awaited_once_with(
+            recover=True,
+        )
+        q.cleanup_stale_claims.assert_not_awaited()
         self.assertEqual(
             tool.METRIC_SCRAPE_QUEUE_SIZE.labels(
                 platform='tiktok', scraper='tiktok_creator',

@@ -106,6 +106,59 @@ class TestDoScrapeChannelToDiskLatency(
         duration: MagicMock = await self._run('persist_failed')
         duration.labels.assert_not_called()
 
+    async def test_success_enriches_derived_metadata_before_persist(
+        self,
+    ) -> None:
+        async def stub_try_scrape(
+            channel: Any, settings: Any, fm: Any,
+            channel_handle: str, extra: dict[str, str],
+        ) -> tuple[bool, str | None]:
+            channel.country = 'US'
+            return True, 'http://1.2.3.4:8080'
+
+        async def stub_persist(
+            fm: Any, filename: str, channel: Any,
+            channel_handle: str,
+        ) -> bool:
+            return True
+
+        settings: MagicMock = MagicMock()
+        settings.channel_data_directory = '/tmp/scrape-test'
+        settings.video_data_directory = '/tmp/videos'
+        redis: MagicMock = MagicMock()
+
+        with patch.object(
+            yt_channel_scrape, '_try_scrape_channel',
+            side_effect=stub_try_scrape,
+        ), patch.object(
+            yt_channel_scrape, '_channel_has_no_content',
+            return_value=False,
+        ), patch.object(
+            yt_channel_scrape, '_persist_scraped_channel',
+            side_effect=stub_persist,
+        ), patch.object(
+            yt_channel_scrape, 'enrich_channel_category',
+            new=unittest.mock.AsyncMock(),
+        ) as enrich, patch.object(
+            yt_channel_scrape, 'set_channel_country',
+            new=unittest.mock.AsyncMock(),
+        ) as set_country, patch.object(
+            yt_channel_scrape, 'METRIC_SCRAPE_DURATION',
+        ), patch.object(
+            yt_channel_scrape, 'METRIC_CHANNELS_SCRAPED',
+        ):
+            await yt_channel_scrape._do_scrape_channel_to_disk(
+                settings=settings,
+                fm=MagicMock(),
+                channel_id='UCtest0000000000000000aa',
+                filename='test',
+                extra={'channel_handle': '@test'},
+                redis=redis,
+            )
+
+        enrich.assert_awaited_once()
+        set_country.assert_awaited_once()
+
 
 if __name__ == '__main__':
     unittest.main()

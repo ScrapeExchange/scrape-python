@@ -272,6 +272,18 @@ class CreatorSettings(TikTokScraperSettings):
         ),
         description='Sleep ceiling when nothing is due.',
     )
+    creator_orphan_recovery_interval_seconds: float = Field(
+        default=600.0,
+        validation_alias=AliasChoices(
+            'TIKTOK_CREATOR_ORPHAN_RECOVERY_INTERVAL',
+            'creator_orphan_recovery_interval_seconds',
+        ),
+        description=(
+            'Minimum interval between full creator queue orphan '
+            'recovery scans. Queue-size metrics still update on '
+            'creator_queue_idle_poll_seconds.'
+        ),
+    )
     creator_retry_interval_seconds: float = Field(
         default=300.0,
         validation_alias=AliasChoices(
@@ -1115,10 +1127,18 @@ async def _maintenance_loop(
     workers and publish per-tier queue sizes. Touches the watchdog
     each pass.
     '''
+    loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+    next_orphan_recovery_at: float = 0.0
     while not shutdown_event.is_set():
         Watchdog.get().touch_work()
         try:
-            await queue.cleanup_stale_claims()
+            now: float = loop.time()
+            if now >= next_orphan_recovery_at:
+                await _recover_creator_queue_orphans(queue)
+                next_orphan_recovery_at = (
+                    now
+                    + settings.creator_orphan_recovery_interval_seconds
+                )
             sizes: dict[int, int] = (
                 await queue.queue_sizes_by_tier()
             )
@@ -1143,6 +1163,32 @@ async def _maintenance_loop(
                 extra={'error': str(exc)},
             )
         await asyncio.sleep(settings.creator_queue_idle_poll_seconds)
+
+
+async def _recover_creator_queue_orphans(
+    queue: CreatorQueue,
+) -> int:
+    '''
+    Recover queue orphans without running the Redis-wide Lua recovery.
+
+    ``cleanup_stale_claims`` is implemented by ``RedisCreatorQueue`` as a
+    single Lua script that scans every creator while holding Redis'
+    event loop. The batched scanner yields between HSCAN/pipeline
+    chunks, so other scrapers can keep using Redis.
+    '''
+    breakdown: dict[int, dict[str, int]] = (
+        await queue.scan_and_recover_orphans(recover=True)
+    )
+    recovered: int = sum(
+        counts.get('orphan', 0)
+        for counts in breakdown.values()
+    )
+    if recovered:
+        _LOGGER.info(
+            'Recovered TikTok creator queue orphans',
+            extra={'recovered': recovered},
+        )
+    return recovered
 
 
 def _build_queue(

@@ -890,7 +890,7 @@ async def _finalize_one_video_batch(
     client: ExchangeClient,
     video_fm: AssetFileManagement,
     uploaded: UploadedVideoIds,
-) -> None:
+) -> BulkBatchOutcome:
     '''Wait for the bulk job to finish, apply per-record results,
     and emit metrics. Does not touch the original batch bytes.'''
     outcome: BulkBatchOutcome = await finalize_prepared_bulk_batch(
@@ -900,6 +900,7 @@ async def _finalize_one_video_batch(
         fm=video_fm,
     )
     await _emit_video_batch_metrics(outcome, uploaded)
+    return outcome
 
 
 async def _emit_video_batch_metrics(
@@ -961,6 +962,21 @@ async def upload_videos(
     )
     max_in_flight_batches: int = max(max_active_jobs, 1)
     in_flight: set[Task] = set()
+    pending_files: int = 0
+    pending_upload_gauge = METRIC_FILES_PENDING_UPLOAD.labels(
+        platform='youtube',
+        scraper=SCRAPER_LABEL,
+        entity='video',
+        worker_id=get_worker_id(),
+    )
+
+    def _set_pending_upload_count(value: int) -> None:
+        nonlocal pending_files
+        pending_files = max(value, 0)
+        pending_upload_gauge.set(pending_files)
+
+    def _add_pending_upload_count(delta: int) -> None:
+        _set_pending_upload_count(pending_files + delta)
 
     async def _wait_for_one_batch() -> None:
         done: set[Task]
@@ -1003,10 +1019,19 @@ async def upload_videos(
                     # progress wait. Only batch_records is
                     # carried into the finalize phase.
                     _buf = b''  # noqa: F841
-                    await _finalize_one_video_batch(
-                        job_id, batch_id, err, records,
-                        settings, client, video_fm, uploaded,
+                    outcome: BulkBatchOutcome | None = (
+                        await _finalize_one_video_batch(
+                            job_id, batch_id, err, records,
+                            settings, client, video_fm, uploaded,
+                        )
                     )
+                    if outcome is not None:
+                        finalized: int = (
+                            outcome.success
+                            + outcome.failed
+                            + outcome.missing
+                        )
+                        _add_pending_upload_count(-finalized)
         task: Task = asyncio.create_task(_gated(buf))
         in_flight.add(task)
 
@@ -1014,7 +1039,6 @@ async def upload_videos(
         filenames: Iterator[str] = _iter_video_upload_filenames(
             video_fm,
         )
-        files_seen: int = 0
         while True:
             # Watchdog progress signal: the initial bulk drain of a
             # large backlog runs before the watch loop and must not
@@ -1027,13 +1051,7 @@ async def upload_videos(
             )
             if not chunk:
                 break
-            files_seen += len(chunk)
-            METRIC_FILES_PENDING_UPLOAD.labels(
-                platform='youtube',
-                scraper=SCRAPER_LABEL,
-                entity='video',
-                worker_id=get_worker_id(),
-            ).set(files_seen)
+            _add_pending_upload_count(len(chunk))
             chunk_parsed: dict[str, tuple[str, str, bool]] = {}
             for filename in chunk:
                 parsed: tuple[str, str, bool] | None = (

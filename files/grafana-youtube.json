@@ -18,7 +18,7 @@
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
-  "id": 46,
+  "id": 0,
   "links": [],
   "panels": [
     {
@@ -575,10 +575,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "editorMode": "code",
           "expr": "sum by (entity, mode) (rate(uploads_completed_total{job=~\"$job\",instance=~\"$instance\"}[5m]))",
           "legendFormat": "{{entity}} / {{mode}}",
-          "range": true,
           "refId": "A"
         },
         {
@@ -586,10 +584,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "editorMode": "code",
           "expr": "sum by (entity) (rate(bulk_job_records_sum{job=~\"$job\",instance=~\"$instance\"}[5m])) / sum by (entity) (rate(bulk_job_records_count{job=~\"$job\",instance=~\"$instance\"}[5m]))",
           "legendFormat": "{{entity}} assets/bulk",
-          "range": true,
           "refId": "B"
         }
       ],
@@ -687,7 +683,7 @@
             "uid": "b2ee3b55-9017-40c3-9e1e-e2c68921f97c"
           },
           "editorMode": "code",
-          "expr": "sum(rate(redis_commands_total{instance=\"192.168.1.11:9121\"} [5m])) by (cmd)",
+          "expr": "sum(rate(redis_commands_total{instance=\"192.168.1.13:9121\"} [5m])) by (cmd)",
           "format": "time_series",
           "interval": "",
           "intervalFactor": 2,
@@ -719,7 +715,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "",
+      "description": "Scrape failures plus sparse InnerTube player() responses that can create unusable video-min files. Sparse player responses are grouped by bounded reason_class/status so content restrictions can be separated from client/proxy soft blocks.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -832,9 +828,18 @@
           "expr": "sum by (entity, reason) (rate(scrape_failures_total{job=~\"$job\",instance=~\"$instance\"}[5m]))",
           "legendFormat": "{{entity}} / {{reason}}",
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (reason_class, status, has_thumbnails) (rate(innertube_player_responses_total{scraper=\"video_scraper\",has_thumbnails=\"false\",job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "legendFormat": "video player sparse / {{reason_class}} / {{status}} / thumbs={{has_thumbnails}}",
+          "refId": "B"
         }
       ],
-      "title": "Scrape failures by entity × reason",
+      "title": "Scrape failures and sparse player responses",
       "type": "timeseries"
     },
     {
@@ -2501,8 +2506,10 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
+          "editorMode": "code",
           "expr": "histogram_quantile(0.50, sum by (le, entity) (rate(scrape_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\"}[10m])))",
           "legendFormat": "p50 {{entity}}",
+          "range": true,
           "refId": "A"
         },
         {
@@ -2860,12 +2867,329 @@
       "type": "timeseries"
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Duration of each non-home channel tab scrape. Split by tab and outcome to identify slow videos/shorts/live/post/store work inside full channel scrapes.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 102
+      },
+      "id": 94,
+      "options": {
+        "legend": {
+          "calcs": [
+            "median"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, tab, outcome) (rate(channel_tab_scrape_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\"}[10m])))",
+          "legendFormat": "p95 {{tab}} {{outcome}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le, tab, outcome) (rate(channel_tab_scrape_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\"}[10m])))",
+          "legendFormat": "p50 {{tab}} {{outcome}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Channel tab scrape duration p50/p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Rate of InnerTube tab pages fetched by initial vs continuation page. Continuation-heavy tabs are the likely source of slow channel work.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 102
+      },
+      "id": 95,
+      "options": {
+        "legend": {
+          "calcs": [
+            "median"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (tab, page_type, outcome) (rate(channel_tab_pages_total{job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{tab}} {{page_type}} {{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Channel tab pages fetched /s",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Rate of parsed IDs and objects from channel tabs. Compare against page fetch rate to spot tabs that burn requests without yielding much useful content.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 110
+      },
+      "id": 96,
+      "options": {
+        "legend": {
+          "calcs": [
+            "median"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (tab, item_type) (rate(channel_tab_items_total{job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{tab}} {{item_type}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Channel tab items parsed /s",
+      "type": "timeseries"
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 102
+        "y": 118
       },
       "id": 18,
       "panels": [],
@@ -2939,7 +3263,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 103
+        "y": 119
       },
       "id": 19,
       "options": {
@@ -3006,7 +3330,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 111
+        "y": 127
       },
       "id": 23,
       "panels": [],
@@ -3080,7 +3404,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 112
+        "y": 128
       },
       "id": 24,
       "options": {
@@ -3181,7 +3505,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 112
+        "y": 128
       },
       "id": 25,
       "options": {
@@ -3291,7 +3615,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 120
+        "y": 136
       },
       "id": 26,
       "options": {
@@ -3394,7 +3718,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 120
+        "y": 136
       },
       "id": 27,
       "options": {
@@ -3461,7 +3785,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 128
+        "y": 144
       },
       "id": 92,
       "panels": [],
@@ -3507,7 +3831,7 @@
             "spanNulls": false,
             "stacking": {
               "group": "A",
-              "mode": "normal"
+              "mode": "none"
             },
             "thresholdsStyle": {
               "mode": "off"
@@ -3535,15 +3859,12 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 129
+        "y": 145
       },
       "id": 85,
       "options": {
         "legend": {
-          "calcs": [
-            "last",
-            "max"
-          ],
+          "calcs": [],
           "displayMode": "list",
           "placement": "bottom",
           "showLegend": true
@@ -3638,7 +3959,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 129
+        "y": 145
       },
       "id": 86,
       "options": {
@@ -3739,7 +4060,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 137
+        "y": 153
       },
       "id": 87,
       "options": {
@@ -3840,7 +4161,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 137
+        "y": 153
       },
       "id": 88,
       "options": {
@@ -3880,7 +4201,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 145
+        "y": 161
       },
       "id": 89,
       "panels": [],
@@ -3954,7 +4275,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 146
+        "y": 162
       },
       "id": 90,
       "options": {
@@ -4055,7 +4376,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 146
+        "y": 162
       },
       "id": 91,
       "options": {
@@ -4095,7 +4416,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 154
+        "y": 170
       },
       "id": 28,
       "panels": [],
@@ -4169,7 +4490,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 155
+        "y": 171
       },
       "id": 29,
       "options": {
@@ -4270,7 +4591,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 155
+        "y": 171
       },
       "id": 30,
       "options": {
@@ -4371,7 +4692,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 163
+        "y": 179
       },
       "id": 31,
       "options": {
@@ -4472,7 +4793,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 163
+        "y": 179
       },
       "id": 32,
       "options": {
@@ -4512,7 +4833,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 171
+        "y": 187
       },
       "id": 33,
       "panels": [],
@@ -4586,7 +4907,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 172
+        "y": 188
       },
       "id": 34,
       "options": {
@@ -4705,7 +5026,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 172
+        "y": 188
       },
       "id": 35,
       "options": {
@@ -4789,7 +5110,9 @@
       {
         "current": {
           "text": "All",
-          "value": "$__all"
+          "value": [
+            "$__all"
+          ]
         },
         "datasource": {
           "type": "prometheus",
@@ -4819,5 +5142,5 @@
   "timezone": "",
   "title": "YouTube scrapers — progress, failures & latency",
   "uid": "scrape-youtube",
-  "version": 44
+  "version": 54
 }
