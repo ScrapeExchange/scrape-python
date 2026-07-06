@@ -6,6 +6,8 @@ from unittest.mock import MagicMock, patch
 
 from scrape_exchange.redis_client import (
     DEFAULT_MAX_CONNECTIONS,
+    call_with_redis_busy_retry,
+    is_redis_busy_script_error,
     redis_client_name,
     redis_from_url,
 )
@@ -37,13 +39,11 @@ class TestRedisFromUrl(unittest.TestCase):
             patch(
                 'redis.asyncio.BlockingConnectionPool.from_url',
             ) as from_url,
-            patch('redis.asyncio.Redis') as redis_cls,
             patch.dict(os.environ, {}, clear=True),
         ):
             pool = MagicMock()
             from_url.return_value = pool
-            redis_cls.return_value = MagicMock()
-            redis_from_url(
+            client = redis_from_url(
                 'redis://localhost:6379/0',
                 component='test-component',
                 decode_responses=True,
@@ -59,21 +59,19 @@ class TestRedisFromUrl(unittest.TestCase):
             redis_client_name('test-component'),
         )
         self.assertTrue(kwargs['decode_responses'])
-        redis_cls.assert_called_once_with(connection_pool=pool)
+        self.assertIs(client.connection_pool, pool)
 
     def test_env_overrides_default_pool_cap(self) -> None:
         with (
             patch(
                 'redis.asyncio.BlockingConnectionPool.from_url',
             ) as from_url,
-            patch('redis.asyncio.Redis') as redis_cls,
             patch.dict(
                 os.environ, {'REDIS_MAX_CONNECTIONS': '9'},
                 clear=True,
             ),
         ):
             from_url.return_value = MagicMock()
-            redis_cls.return_value = MagicMock()
             redis_from_url(
                 'redis://localhost:6379/0',
                 component='test-component',
@@ -89,14 +87,12 @@ class TestRedisFromUrl(unittest.TestCase):
             patch(
                 'redis.asyncio.BlockingConnectionPool.from_url',
             ) as from_url,
-            patch('redis.asyncio.Redis') as redis_cls,
             patch.dict(
                 os.environ, {'REDIS_MAX_CONNECTIONS': '9'},
                 clear=True,
             ),
         ):
             from_url.return_value = MagicMock()
-            redis_cls.return_value = MagicMock()
             redis_from_url(
                 'redis://localhost:6379/0',
                 component='test-component',
@@ -107,3 +103,126 @@ class TestRedisFromUrl(unittest.TestCase):
             from_url.call_args.kwargs['max_connections'],
             1,
         )
+
+
+class TestRedisBusyRetry(unittest.IsolatedAsyncioTestCase):
+
+    async def test_retries_busy_script_response(
+        self,
+    ) -> None:
+        from redis.exceptions import ResponseError
+
+        attempts: int = 0
+        sleeps: list[float] = []
+
+        async def operation() -> str:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise ResponseError(
+                    'BUSY Redis is busy running a script. '
+                    'You can only call SCRIPT KILL or '
+                    'SHUTDOWN NOSAVE.',
+                )
+            return 'ok'
+
+        async def sleep(delay: float) -> None:
+            sleeps.append(delay)
+
+        with patch.dict(
+            os.environ,
+            {
+                'REDIS_BUSY_RETRIES': '2',
+                'REDIS_BUSY_RETRY_BASE_SECONDS': '0.01',
+                'REDIS_BUSY_RETRY_MAX_SECONDS': '0.01',
+            },
+            clear=True,
+        ):
+            result: str = await call_with_redis_busy_retry(
+                operation, sleep=sleep,
+            )
+
+        self.assertEqual(result, 'ok')
+        self.assertEqual(attempts, 2)
+        self.assertEqual(sleeps, [0.01])
+
+    async def test_does_not_retry_other_response_error(
+        self,
+    ) -> None:
+        from redis.exceptions import ResponseError
+
+        attempts: int = 0
+
+        async def operation() -> str:
+            nonlocal attempts
+            attempts += 1
+            raise ResponseError('WRONGTYPE Operation failed')
+
+        with self.assertRaises(ResponseError):
+            await call_with_redis_busy_retry(operation)
+
+        self.assertEqual(attempts, 1)
+
+    def test_identifies_busy_script_error(self) -> None:
+        from redis.exceptions import ResponseError
+
+        self.assertTrue(is_redis_busy_script_error(
+            ResponseError(
+                'BUSY Redis is busy running a script. '
+                'You can only call SCRIPT KILL or '
+                'SHUTDOWN NOSAVE.',
+            ),
+        ))
+        self.assertFalse(is_redis_busy_script_error(
+            ResponseError('WRONGTYPE Operation failed'),
+        ))
+
+    async def test_pipeline_retries_busy_script_response(
+        self,
+    ) -> None:
+        from redis.asyncio.client import Pipeline
+        from redis.exceptions import ResponseError
+
+        attempts: int = 0
+
+        async def execute(
+            pipeline: Pipeline,
+            raise_on_error: bool = True,
+        ) -> list[str]:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                pipeline.command_stack = []
+                raise ResponseError(
+                    'BUSY Redis is busy running a script. '
+                    'You can only call SCRIPT KILL or '
+                    'SHUTDOWN NOSAVE.',
+                )
+            self.assertTrue(pipeline.command_stack)
+            return ['ok']
+
+        with (
+            patch(
+                'redis.asyncio.BlockingConnectionPool.from_url',
+            ) as from_url,
+            patch.object(Pipeline, 'execute', execute),
+            patch.dict(
+                os.environ,
+                {
+                    'REDIS_BUSY_RETRIES': '2',
+                    'REDIS_BUSY_RETRY_BASE_SECONDS': '0',
+                },
+                clear=True,
+            ),
+        ):
+            from_url.return_value = MagicMock()
+            client = redis_from_url(
+                'redis://localhost:6379/0',
+                component='test-component',
+            )
+            pipe = client.pipeline(transaction=False)
+            pipe.set('key', 'value')
+            result: list[str] = await pipe.execute()
+
+        self.assertEqual(result, ['ok'])
+        self.assertEqual(attempts, 2)

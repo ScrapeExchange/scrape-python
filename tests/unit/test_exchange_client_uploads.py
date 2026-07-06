@@ -49,6 +49,7 @@ def _make_client(
     client._upload_queue = None
     client._upload_tasks = []
     client._upload_shutdown = False
+    client._upload_queue_depths = {}
     httpx.AsyncClient.__init__(
         client,
         transport=httpx.MockTransport(handler),

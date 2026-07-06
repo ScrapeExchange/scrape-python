@@ -28,20 +28,10 @@ services:
       - po-token-provider
     container_name: yt-video
 
-  yt-video-upload:
-    <<: *scraper-common
-    command: ["tools/yt_video_upload.py"]
-    container_name: yt-video-upload
-
   yt-channel:
     <<: *scraper-common
     command: ["tools/yt_channel_scrape.py"]
     container_name: yt-channel
-
-  yt-channel-upload:
-    <<: *scraper-common
-    command: ["tools/yt_channel_upload.py"]
-    container_name: yt-channel-upload
 
   yt-rss:
     <<: *scraper-common
@@ -58,12 +48,14 @@ services:
     command: ["tools/tt_video_scrape.py"]
     container_name: tt-video
 
-  tt-creator-upload:
+  ig-creator:
     <<: *scraper-common
-    command: ["tools/tt_creator_upload.py"]
-    container_name: tt-creator-upload
+    command: ["tools/ig_creator_scrape.py"]
+    container_name: ig-creator
 
-  tt-video-upload:
+  scrape-upload:
     <<: *scraper-common
-    command: ["tools/tt_video_upload.py"]
-    container_name: tt-video-upload
+    command: ["tools/scrape_upload.py"]
+    container_name: scrape-upload
+    profiles:
+      - scrape-upload

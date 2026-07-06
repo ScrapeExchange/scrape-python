@@ -127,6 +127,19 @@ METRIC_SCRAPE_QUEUE_SIZE: Gauge = Gauge(
 )
 
 # ---------------------------------------------------------------------------
+# creator_scrape_state_size
+#   Current count of creators by their most recent scrape-result status.
+#   This is intentionally separate from scrape_queue_size because a creator
+#   may be both queued and last_failed_unknown_followers.
+# ---------------------------------------------------------------------------
+METRIC_CREATOR_SCRAPE_STATE_SIZE: Gauge = Gauge(
+    'creator_scrape_state_size',
+    'Number of creators by last scrape-result status.',
+    ['platform', 'scraper', 'status', 'worker_id'],
+    multiprocess_mode='livemostrecent',
+)
+
+# ---------------------------------------------------------------------------
 # scrape_queue_enqueue_total
 #   Incremented when a producer successfully adds an item to a scrape queue.
 #   ``source`` is intentionally low-cardinality: examples include rss,
@@ -167,6 +180,32 @@ METRIC_SCRAPE_RECORDS_WRITTEN: Counter = Counter(
     'scrape_records_written_total',
     'Number of scraped records successfully written to disk.',
     ['platform', 'scraper', 'entity'],
+)
+
+# ---------------------------------------------------------------------------
+# instagram_profile_json_timeouts_total
+#   Evidence summary for Instagram creator pages that reached DOMContentLoaded
+#   but never exposed hydrated profile JSON before the scraper timeout.
+# ---------------------------------------------------------------------------
+METRIC_INSTAGRAM_PROFILE_JSON_TIMEOUTS: Counter = Counter(
+    'instagram_profile_json_timeouts_total',
+    'Number of Instagram profile JSON hydration timeouts, labelled by '
+    'low-cardinality page evidence.',
+    [
+        'platform', 'scraper', 'entity',
+        'http_status', 'title_kind', 'marker_summary',
+    ],
+)
+
+METRIC_INSTAGRAM_PROFILE_TIMEOUT_HTML_BYTES: Gauge = Gauge(
+    'instagram_profile_timeout_html_bytes',
+    'Latest HTML byte size observed for Instagram profile JSON hydration '
+    'timeouts, labelled by low-cardinality page evidence.',
+    [
+        'platform', 'scraper', 'entity',
+        'http_status', 'title_kind', 'marker_summary',
+    ],
+    multiprocess_mode='livemostrecent',
 )
 
 # ---------------------------------------------------------------------------

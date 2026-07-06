@@ -38,6 +38,16 @@ x-scraper-volumes: &scraper-volumes
     bind:
       create_host_path: true
   - type: bind
+    source: /path/to/instagram/creators
+    target: /data/instagram/creators
+    bind:
+      create_host_path: true
+  - type: bind
+    source: /path/to/instagram/session-state
+    target: /data/instagram/session-state
+    bind:
+      create_host_path: true
+  - type: bind
     source: /path/to/scrape/logs
     target: /var/log/scrape
     bind:
@@ -46,11 +56,7 @@ x-scraper-volumes: &scraper-volumes
 services:
   yt-video:
     volumes: *scraper-volumes
-  yt-video-upload:
-    volumes: *scraper-volumes
   yt-channel:
-    volumes: *scraper-volumes
-  yt-channel-upload:
     volumes: *scraper-volumes
   yt-rss:
     volumes: *scraper-volumes
@@ -58,7 +64,10 @@ services:
     volumes: *scraper-volumes
   tt-video:
     volumes: *scraper-volumes
-  tt-creator-upload:
+  ig-creator:
     volumes: *scraper-volumes
-  tt-video-upload:
+  scrape-upload:
     volumes: *scraper-volumes
+    environment:
+      SCRAPE_UPLOAD_MODE: bulk
+      SCRAPE_UPLOAD_WATCH: "true"

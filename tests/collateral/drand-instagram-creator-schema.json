@@ -1,0 +1,205 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://scrape.exchange/schemas/drand-instagram-creator-0.0.1",
+  "title": "Instagram Creator Metadata",
+  "description": "Fields written by ig_creator_scrape.py.",
+  "type": "object",
+  "properties": {
+    "username": {
+      "type": "string",
+      "description": "Instagram username without @.",
+      "x-scrape-field": "platform_creator_id",
+      "x-scrape-normalize": "lowercase"
+    },
+    "follower_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Required follower count for successful records.",
+      "x-scrape-gauge": true
+    },
+    "verified": {
+      "type": "boolean",
+      "description": "Whether Instagram marks the account as verified."
+    },
+    "private_account": {
+      "type": "boolean",
+      "description": "Whether the account is private."
+    },
+    "url": {
+      "type": "string",
+      "format": "uri",
+      "description": "Canonical profile URL.",
+      "x-scrape-field": "source_url"
+    },
+    "scraped_timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "UTC timestamp at which this record was scraped."
+    },
+    "pk": {
+      "type": "string",
+      "description": "Instagram numeric primary key string."
+    },
+    "user_id": {
+      "type": "string",
+      "description": "Instagram GraphQL user id string.",
+      "x-scrape-field": "platform_content_id"
+    },
+    "full_name": {
+      "type": "string",
+      "description": "Display name. Omitted from the record when absent."
+    },
+    "biography": {
+      "type": "string",
+      "description": "Profile bio text, including intentionally empty strings.",
+      "x-scrape-extract-hashtags": true,
+      "x-scrape-extract-cashtags": true
+    },
+    "external_url": {
+      "type": "string",
+      "format": "uri",
+      "description": "Legacy single external profile URL."
+    },
+    "bio_links": {
+      "type": "array",
+      "description": "Public links listed on the Instagram profile.",
+      "items": {
+        "$ref": "#/$defs/bio_link"
+      }
+    },
+    "avatar_url": {
+      "type": "string",
+      "format": "uri",
+      "description": "Profile avatar image URL.",
+      "x-scrape-field": "platform_creator_thumbnail_url"
+    },
+    "following_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of accounts this creator follows.",
+      "x-scrape-gauge": true
+    },
+    "post_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of public profile posts.",
+      "x-scrape-gauge": true
+    },
+    "category": {
+      "type": "string",
+      "description": "Instagram category name, when exposed.",
+      "x-scrape-tags": "categories"
+    },
+    "business_account": {
+      "type": "boolean",
+      "description": "Whether Instagram marks the profile as business."
+    },
+    "professional_account": {
+      "type": "boolean",
+      "description": "Whether Instagram marks the profile as professional."
+    },
+    "unpublished": {
+      "type": "boolean",
+      "description": "Whether Instagram marks the account as unpublished."
+    },
+    "memorialized": {
+      "type": "boolean",
+      "description": "Whether Instagram marks the account as memorialized."
+    },
+    "coppa_enforced": {
+      "type": "boolean",
+      "description": "Whether Instagram marks COPPA enforcement on the account."
+    },
+    "has_any_clips": {
+      "type": "boolean",
+      "description": "Whether Instagram reports any Reels/clips."
+    },
+    "pronouns": {
+      "type": "array",
+      "description": "Pronouns listed on the profile.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "account_badges": {
+      "type": "array",
+      "description": "Raw account badge objects exposed by Instagram.",
+      "items": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    "linked_fb_info": {
+      "type": "object",
+      "description": "Raw linked Facebook profile/page metadata, when exposed.",
+      "additionalProperties": true
+    },
+    "text_post_app_badge_label": {
+      "type": "string",
+      "description": "Threads/text-post app badge label, when exposed."
+    },
+    "show_text_post_app_badge": {
+      "type": "boolean",
+      "description": "Whether clients should show the text-post app badge."
+    }
+  },
+  "required": [
+    "username",
+    "follower_count",
+    "verified",
+    "private_account",
+    "url",
+    "scraped_timestamp",
+    "bio_links",
+    "pronouns",
+    "account_badges"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "bio_link": {
+      "type": "object",
+      "description": "A public link listed on an Instagram profile.",
+      "properties": {
+        "title": {
+          "type": "string",
+          "description": "Display label shown for the link."
+        },
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Destination URL."
+        },
+        "lynx_url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Instagram linkshim URL for the destination."
+        },
+        "link_type": {
+          "type": "string",
+          "description": "Instagram link type, e.g. external."
+        },
+        "image_url": {
+          "type": "string",
+          "description": "Optional image URL; may be an empty string."
+        },
+        "media_type": {
+          "type": "string",
+          "description": "Instagram media type for the link preview, e.g. none."
+        },
+        "media_accent_color_hex": {
+          "type": "string",
+          "description": "Optional accent color; may be an empty string."
+        },
+        "creation_source": {
+          "type": "string",
+          "description": "Instagram source that created the link metadata."
+        },
+        "is_pinned": {
+          "type": "boolean",
+          "description": "Whether the profile owner pinned the link."
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

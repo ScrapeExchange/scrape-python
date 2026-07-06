@@ -89,8 +89,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (scraper, entity) (increase(scrapes_completed_total{platform=\"tiktok\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"}[1h]))",
-          "legendFormat": "{{scraper}} / {{entity}}",
+          "expr": "sum by (platform, scraper, entity) (increase(scrapes_completed_total{platform=~\"$platform\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"}[1h]))",
+          "legendFormat": "{{platform}} / {{scraper}} / {{entity}}",
           "refId": "A"
         }
       ],
@@ -156,8 +156,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (scraper, reason) (increase(scrape_failures_total{platform=\"tiktok\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"}[1h]))",
-          "legendFormat": "{{scraper}} / {{reason}}",
+          "expr": "sum by (platform, scraper, reason) (increase(scrape_failures_total{platform=~\"$platform\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"}[1h]))",
+          "legendFormat": "{{platform}} / {{scraper}} / {{reason}}",
           "refId": "A"
         }
       ],
@@ -169,7 +169,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Live TikTok Redis queue depth by scraper, entity, and state/tier.",
+      "description": "Live Redis queue depth by platform, scraper, entity, and state/tier.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -220,8 +220,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (scraper, entity, state) (max by (scraper, entity, state, worker_id) (scrape_queue_size{platform=\"tiktok\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"}))",
-          "legendFormat": "{{scraper}} / {{entity}} / {{state}}",
+          "expr": "sum by (platform, scraper, entity, state) (max by (platform, scraper, entity, state, worker_id) (scrape_queue_size{platform=~\"$platform\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"}))",
+          "legendFormat": "{{platform}} / {{scraper}} / {{entity}} / {{state}}",
           "refId": "A"
         }
       ],
@@ -248,7 +248,7 @@
               }
             ]
           },
-          "unit": "ops"
+          "unit": "short"
         },
         "overrides": []
       },
@@ -283,13 +283,14 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (scraper, endpoint, outcome) (rate(tiktok_api_call_total{platform=\"tiktok\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"}[5m]))",
-          "legendFormat": "{{scraper}} / {{endpoint}} / {{outcome}}",
+          "expr": "sum by (platform, scraper, status) (max by (platform, scraper, status, worker_id) (creator_scrape_state_size{platform=~\"$platform\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"}))",
+          "legendFormat": "{{platform}} / {{scraper}} / {{status}}",
           "refId": "A"
         }
       ],
-      "title": "TikTok API calls/sec",
-      "type": "stat"
+      "title": "Creator scrape state",
+      "type": "stat",
+      "description": "Latest creator scrape-result states, separate from queue state."
     },
     {
       "collapsed": false,
@@ -389,8 +390,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (scraper, entity) (rate(scrapes_completed_total{platform=\"tiktok\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"}[5m]))",
-          "legendFormat": "completed {{scraper}} / {{entity}}",
+          "expr": "sum by (platform, scraper, entity) (rate(scrapes_completed_total{platform=~\"$platform\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "legendFormat": "completed {{platform}} / {{scraper}} / {{entity}}",
           "refId": "A"
         },
         {
@@ -398,8 +399,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (scraper, entity) (rate(scrape_records_written_total{platform=\"tiktok\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"}[5m]))",
-          "legendFormat": "written {{scraper}} / {{entity}}",
+          "expr": "sum by (platform, scraper, entity) (rate(scrape_records_written_total{platform=~\"$platform\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "legendFormat": "written {{platform}} / {{scraper}} / {{entity}}",
           "refId": "B"
         }
       ],
@@ -491,8 +492,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (scraper, entity, reason) (rate(scrape_failures_total{platform=\"tiktok\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"}[5m]))",
-          "legendFormat": "{{scraper}} / {{entity}} / {{reason}}",
+          "expr": "sum by (platform, scraper, entity, reason) (rate(scrape_failures_total{platform=~\"$platform\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{platform}} / {{scraper}} / {{entity}} / {{reason}}",
           "refId": "A"
         }
       ],
@@ -504,7 +505,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Creator scraper writes discovered videos to the TikTok video queue.",
+      "description": "Queue enqueue rate by producer/source.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -585,8 +586,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (scraper, entity, source) (rate(scrape_queue_enqueue_total{platform=\"tiktok\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"}[5m]))",
-          "legendFormat": "{{scraper}} -> {{entity}} from {{source}}",
+          "expr": "sum by (platform, scraper, entity, source) (rate(scrape_queue_enqueue_total{platform=~\"$platform\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{platform}} / {{scraper}} -> {{entity}} from {{source}}",
           "refId": "A"
         }
       ],
@@ -598,7 +599,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Retry scheduling by TikTok failure class.",
+      "description": "Retry scheduling by platform failure class.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -679,8 +680,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (scraper, entity, api, reason) (rate(scrape_retry_total{platform=\"tiktok\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"}[5m]))",
-          "legendFormat": "{{scraper}} / {{entity}} / {{api}} / {{reason}}",
+          "expr": "sum by (platform, scraper, entity, api, reason) (rate(scrape_retry_total{platform=~\"$platform\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{platform}} / {{scraper}} / {{entity}} / {{api}} / {{reason}}",
           "refId": "A"
         }
       ],
@@ -688,12 +689,200 @@
       "type": "timeseries"
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 22
+      },
+      "id": 15,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (http_status, title_kind, marker_summary) (rate(instagram_profile_json_timeouts_total{platform=~\"$platform\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{http_status}} / {{title_kind}} / {{marker_summary}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Instagram creator JSON timeout evidence",
+      "type": "timeseries",
+      "description": "Profile JSON hydration timeouts by low-cardinality page evidence. Shows whether Instagram returned a login wall, challenge, not-found page, or no known marker."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 22
+      },
+      "id": 16,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (http_status, title_kind, marker_summary) (instagram_profile_timeout_html_bytes{platform=~\"$platform\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"})",
+          "legendFormat": "{{http_status}} / {{title_kind}} / {{marker_summary}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Instagram timeout HTML size",
+      "type": "timeseries",
+      "description": "Latest HTML size captured when Instagram creator profile JSON did not hydrate. Large login-wall pages make blocks visible without logging full HTML."
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 22
+        "y": 30
       },
       "id": 20,
       "panels": [],
@@ -760,7 +949,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 23
+        "y": 31
       },
       "id": 21,
       "options": {
@@ -853,7 +1042,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 23
+        "y": 31
       },
       "id": 22,
       "options": {
@@ -955,7 +1144,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 31
+        "y": 39
       },
       "id": 23,
       "options": {
@@ -980,8 +1169,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.50, sum by (le, scraper, entity, outcome) (rate(scrape_duration_seconds_bucket{platform=\"tiktok\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"}[10m])))",
-          "legendFormat": "p50 {{scraper}} / {{entity}} / {{outcome}}",
+          "expr": "histogram_quantile(0.50, sum by (le, platform, scraper, entity, outcome) (rate(scrape_duration_seconds_bucket{platform=~\"$platform\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"}[10m])))",
+          "legendFormat": "p50 {{platform}} / {{scraper}} / {{entity}} / {{outcome}}",
           "refId": "A"
         },
         {
@@ -989,8 +1178,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, scraper, entity, outcome) (rate(scrape_duration_seconds_bucket{platform=\"tiktok\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"}[10m])))",
-          "legendFormat": "p95 {{scraper}} / {{entity}} / {{outcome}}",
+          "expr": "histogram_quantile(0.95, sum by (le, platform, scraper, entity, outcome) (rate(scrape_duration_seconds_bucket{platform=~\"$platform\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"}[10m])))",
+          "legendFormat": "p95 {{platform}} / {{scraper}} / {{entity}} / {{outcome}}",
           "refId": "B"
         }
       ],
@@ -1058,7 +1247,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 31
+        "y": 39
       },
       "id": 24,
       "options": {
@@ -1097,7 +1286,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 39
+        "y": 47
       },
       "id": 30,
       "panels": [],
@@ -1164,7 +1353,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 40
+        "y": 48
       },
       "id": 31,
       "options": {
@@ -1189,8 +1378,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (scraper, state) (tiktok_session_pool_size{platform=\"tiktok\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"})",
-          "legendFormat": "{{scraper}} / {{state}}",
+          "expr": "sum by (platform, scraper, state) ({__name__=~\"(tiktok|instagram)_session_pool_size\",platform=~\"$platform\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"})",
+          "legendFormat": "{{platform}} / {{scraper}} / {{state}}",
           "refId": "A"
         }
       ],
@@ -1257,7 +1446,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 40
+        "y": 48
       },
       "id": 32,
       "options": {
@@ -1282,8 +1471,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.50, sum by (le, scraper) (rate(tiktok_session_acquire_wait_seconds_bucket{platform=\"tiktok\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"}[5m])))",
-          "legendFormat": "p50 {{scraper}}",
+          "expr": "histogram_quantile(0.50, sum by (le, platform, scraper) (rate({__name__=~\"(tiktok|instagram)_session_acquire_wait_seconds_bucket\",platform=~\"$platform\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"}[5m])))",
+          "legendFormat": "p50 {{platform}} / {{scraper}}",
           "refId": "A"
         },
         {
@@ -1291,8 +1480,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, scraper) (rate(tiktok_session_acquire_wait_seconds_bucket{platform=\"tiktok\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"}[5m])))",
-          "legendFormat": "p95 {{scraper}}",
+          "expr": "histogram_quantile(0.95, sum by (le, platform, scraper) (rate({__name__=~\"(tiktok|instagram)_session_acquire_wait_seconds_bucket\",platform=~\"$platform\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"}[5m])))",
+          "legendFormat": "p95 {{platform}} / {{scraper}}",
           "refId": "B"
         }
       ],
@@ -1359,7 +1548,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 48
+        "y": 56
       },
       "id": 33,
       "options": {
@@ -1384,8 +1573,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (scraper, proxy_ip) (tiktok_session_acquire_active{platform=\"tiktok\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"})",
-          "legendFormat": "{{scraper}} / {{proxy_ip}}",
+          "expr": "sum by (platform, scraper, proxy_ip) ({__name__=~\"(tiktok|instagram)_session_acquire_active\",platform=~\"$platform\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"})",
+          "legendFormat": "{{platform}} / {{scraper}} / {{proxy_ip}}",
           "refId": "A"
         }
       ],
@@ -1452,7 +1641,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 48
+        "y": 56
       },
       "id": 34,
       "options": {
@@ -1546,7 +1735,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 56
+        "y": 64
       },
       "id": 35,
       "options": {
@@ -1585,7 +1774,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 64
+        "y": 72
       },
       "id": 40,
       "panels": [],
@@ -1652,7 +1841,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 65
+        "y": 73
       },
       "id": 41,
       "options": {
@@ -1677,8 +1866,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (script, api, proxy) (rate(rate_limit_acquired_requests_total{platform=\"tiktok\",api=~\"$api_bucket\",job=~\"$job\",instance=~\"$instance\"}[5m]))",
-          "legendFormat": "{{script}} / {{api}} / {{proxy}}",
+          "expr": "sum by (platform, script, api, proxy) (rate(rate_limit_acquired_requests_total{platform=~\"$platform\",api=~\"$api_bucket\",job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{platform}} / {{script}} / {{api}} / {{proxy}}",
           "refId": "A"
         }
       ],
@@ -1745,7 +1934,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 65
+        "y": 73
       },
       "id": 42,
       "options": {
@@ -1770,8 +1959,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (script, api, proxy) (rate(rate_limit_wait_events_total{platform=\"tiktok\",api=~\"$api_bucket\",job=~\"$job\",instance=~\"$instance\"}[5m]))",
-          "legendFormat": "{{script}} / {{api}} / {{proxy}}",
+          "expr": "sum by (platform, script, api, proxy) (rate(rate_limit_wait_events_total{platform=~\"$platform\",api=~\"$api_bucket\",job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{platform}} / {{script}} / {{api}} / {{proxy}}",
           "refId": "A"
         }
       ],
@@ -1838,7 +2027,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 73
+        "y": 81
       },
       "id": 43,
       "options": {
@@ -1863,8 +2052,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, script, api) (rate(rate_limit_sleep_seconds_bucket{platform=\"tiktok\",api=~\"$api_bucket\",job=~\"$job\",instance=~\"$instance\"}[5m])))",
-          "legendFormat": "p95 {{script}} / {{api}}",
+          "expr": "histogram_quantile(0.95, sum by (le, platform, script, api) (rate(rate_limit_sleep_seconds_bucket{platform=~\"$platform\",api=~\"$api_bucket\",job=~\"$job\",instance=~\"$instance\"}[5m])))",
+          "legendFormat": "p95 {{platform}} / {{script}} / {{api}}",
           "refId": "A"
         }
       ],
@@ -1931,7 +2120,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 73
+        "y": 81
       },
       "id": 44,
       "options": {
@@ -1956,8 +2145,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "avg by (script, api, proxy) (rate_limit_bucket_tokens{platform=\"tiktok\",api=~\"$api_bucket\",job=~\"$job\",instance=~\"$instance\"})",
-          "legendFormat": "{{script}} / {{api}} / {{proxy}}",
+          "expr": "avg by (platform, script, api, proxy) (rate_limit_bucket_tokens{platform=~\"$platform\",api=~\"$api_bucket\",job=~\"$job\",instance=~\"$instance\"})",
+          "legendFormat": "{{platform}} / {{script}} / {{api}} / {{proxy}}",
           "refId": "A"
         }
       ],
@@ -1970,7 +2159,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 81
+        "y": 89
       },
       "id": 50,
       "panels": [],
@@ -2037,7 +2226,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 82
+        "y": 90
       },
       "id": 51,
       "options": {
@@ -2130,7 +2319,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 82
+        "y": 90
       },
       "id": 52,
       "options": {
@@ -2162,14 +2351,514 @@
       ],
       "title": "Watchdog terminations (1h)",
       "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 99
+      },
+      "id": 60,
+      "panels": [],
+      "title": "Uploads",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 8,
+        "x": 0,
+        "y": 100
+      },
+      "id": 61,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (platform, entity) (files_pending_upload{platform=~\"$platform\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"})",
+          "legendFormat": "{{platform}} / {{entity}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Files pending upload",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 8,
+        "x": 8,
+        "y": 100
+      },
+      "id": 62,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (platform, entity) (upload_queue_depth{platform=~\"$platform\",job=~\"$job\",instance=~\"$instance\"})",
+          "legendFormat": "{{platform}} / {{entity}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Background queue depth",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 8,
+        "x": 16,
+        "y": 100
+      },
+      "id": 63,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (platform, entity, mode, status) (increase(uploads_completed_total{platform=~\"$platform\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"}[1h]))",
+          "legendFormat": "{{platform}} / {{entity}} / {{mode}} / {{status}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Uploads completed (1h)",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 104
+      },
+      "id": 64,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (platform, entity, mode, status) (rate(uploads_completed_total{platform=~\"$platform\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{platform}} / {{entity}} / {{mode}} / {{status}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Uploads per second",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 104
+      },
+      "id": 65,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (platform, entity, mode) (rate(uploads_failed_total{platform=~\"$platform\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "legendFormat": "failed {{platform}} / {{entity}} / {{mode}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (platform, entity, mode) (rate(uploads_missing_result_total{platform=~\"$platform\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "legendFormat": "missing {{platform}} / {{entity}} / {{mode}}",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (platform, entity, reason) (rate(upload_queue_dropped_total{platform=~\"$platform\",job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "legendFormat": "dropped {{platform}} / {{entity}} / {{reason}}",
+          "refId": "C"
+        }
+      ],
+      "title": "Upload failures and missing results",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 112
+      },
+      "id": 66,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (platform, entity, mode, outcome) (rate(upload_batches_total{platform=~\"$platform\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{platform}} / {{entity}} / {{mode}} / {{outcome}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Bulk upload batches",
+      "type": "timeseries"
     }
   ],
   "preload": false,
   "refresh": "1m",
   "schemaVersion": 42,
   "tags": [
+    "scraper",
     "tiktok",
-    "scrape",
+    "instagram",
     "scrape.exchange"
   ],
   "templating": {
@@ -2187,7 +2876,21 @@
         "type": "datasource"
       },
       {
-        "allValue": "tiktok-creator|tiktok-video|tiktok-creator-upload|tiktok-video-upload",
+        "allValue": "youtube|tiktok|instagram",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "includeAll": true,
+        "label": "Platform",
+        "multi": true,
+        "name": "platform",
+        "options": [],
+        "query": "youtube,tiktok,instagram",
+        "type": "custom"
+      },
+      {
+        "allValue": "scrape-upload|tiktok-creator|tiktok-video|tiktok-creator-upload|tiktok-video-upload|ig-creator|instagram-creator",
         "current": {
           "text": "All",
           "value": "$__all"
@@ -2202,7 +2905,7 @@
         "name": "job",
         "options": [],
         "query": {
-          "query": "label_values({job=~\"tiktok-creator|tiktok-video|tiktok-creator-upload|tiktok-video-upload\"}, job)",
+          "query": "label_values({platform=~\"$platform\",job=~\"scrape-upload|tiktok-creator|tiktok-video|tiktok-creator-upload|tiktok-video-upload|ig-creator|instagram-creator\"}, job)",
           "refId": "StandardVariableQuery"
         },
         "refresh": 2,
@@ -2211,7 +2914,7 @@
         "type": "query"
       },
       {
-        "allValue": "tiktok_creator|tiktok_video|tiktok_creator_uploader|tiktok_video_uploader",
+        "allValue": "scrape_uploader|tiktok_creator|tiktok_video|tiktok_creator_uploader|tiktok_video_uploader|instagram_creator|exchange_client",
         "current": {
           "text": "All",
           "value": "$__all"
@@ -2226,7 +2929,7 @@
         "name": "scraper",
         "options": [],
         "query": {
-          "query": "label_values({platform=\"tiktok\",job=~\"$job\"}, scraper)",
+          "query": "label_values({platform=~\"$platform\",job=~\"$job\"}, scraper)",
           "refId": "StandardVariableQuery"
         },
         "refresh": 2,
@@ -2261,7 +2964,7 @@
         "type": "query"
       },
       {
-        "allValue": "creator_api|video_api|api|bootstrap",
+        "allValue": "creator_api|video_api|api|bootstrap|creator",
         "current": {
           "text": "All",
           "value": [
@@ -2278,7 +2981,7 @@
         "name": "api_bucket",
         "options": [],
         "query": {
-          "query": "label_values({platform=\"tiktok\",job=~\"$job\",instance=~\"$instance\",api=~\"creator_api|video_api|api|bootstrap\"}, api)",
+          "query": "label_values(rate_limit_acquired_requests_total{platform=~\"$platform\",job=~\"$job\",instance=~\"$instance\",api=~\"creator_api|video_api|api|bootstrap|creator\"}, api)",
           "refId": "StandardVariableQuery"
         },
         "refresh": 2,
@@ -2294,7 +2997,7 @@
   },
   "timepicker": {},
   "timezone": "",
-  "title": "TikTok scrapers - progress, sessions & rate limits",
+  "title": "Scrapers - progress, sessions & rate limits",
   "uid": "scrape-tiktok",
   "version": 1
 }

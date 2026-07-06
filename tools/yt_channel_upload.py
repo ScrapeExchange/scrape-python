@@ -594,6 +594,7 @@ async def enqueue_upload_channel(
         },
         file_manager=fm,
         filename=filename,
+        platform='youtube',
         entity='channel',
         log_extra={
             'channel_handle': channel.channel_handle,

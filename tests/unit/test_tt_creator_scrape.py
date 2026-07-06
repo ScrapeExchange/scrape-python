@@ -1296,7 +1296,7 @@ class TestMaintenanceLoop(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         q: MagicMock = MagicMock()
         q.cleanup_stale_claims = AsyncMock(return_value=0)
-        q.scan_and_recover_orphans = AsyncMock(
+        q.scan_and_recover_orphans_with_fleet_lock = AsyncMock(
             return_value={
                 1: {
                     'queued': 2, 'claimed': 0,
@@ -1323,7 +1323,7 @@ class TestMaintenanceLoop(unittest.IsolatedAsyncioTestCase):
             await tool._maintenance_loop(q, s, '0', shutdown)
 
         wd.get.return_value.touch_work.assert_called()
-        q.scan_and_recover_orphans.assert_awaited_once_with(
+        q.scan_and_recover_orphans_with_fleet_lock.assert_awaited_once_with(
             recover=True,
         )
         q.cleanup_stale_claims.assert_not_awaited()

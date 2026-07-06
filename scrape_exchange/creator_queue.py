@@ -461,6 +461,20 @@ class CreatorQueue(ABC):
         '''
 
     @abstractmethod
+    async def scan_and_recover_orphans_with_fleet_lock(
+        self,
+        recover: bool = True,
+        lock_ttl_seconds: int = 300,
+    ) -> dict[int, dict[str, int]] | None:
+        '''
+        Run :meth:`scan_and_recover_orphans` only when this worker
+        acquires the fleet-wide recovery lock.
+
+        Returns ``None`` when another scraper holds a fresh lock and
+        this worker should skip the recovery pass.
+        '''
+
+    @abstractmethod
     async def reschedule_in(
         self, creator_id: str, delay_seconds: float,
     ) -> None:
@@ -1211,6 +1225,14 @@ class FileCreatorQueue(CreatorQueue):
                 breakdown[tier]['queued'] += 1
         return breakdown
 
+    async def scan_and_recover_orphans_with_fleet_lock(
+        self,
+        recover: bool = True,
+        lock_ttl_seconds: int = 300,
+    ) -> dict[int, dict[str, int]] | None:
+        # File backend is single-process, so there is no fleet lock.
+        return await self.scan_and_recover_orphans(recover=recover)
+
 
 # -----------------------------------------------------------
 # Redis-backed implementation (cross-host)
@@ -1316,51 +1338,6 @@ return 1
 '''
 
 
-_LUA_RECOVER_ORPHANS: str = '''\
-local recovered = 0
-local num_queues = #KEYS - 3
-local tiers_key = KEYS[#KEYS - 1]
-local excluded_key = KEYS[#KEYS]
-local cursor = '0'
-repeat
-    local result = redis.call(
-        'HSCAN', KEYS[1], cursor, 'COUNT', 200)
-    cursor = result[1]
-    local data = result[2]
-    for i = 1, #data, 2 do
-        local cid = data[i]
-        local in_any = false
-        for q = 1, num_queues do
-            local sc = redis.call(
-                'ZSCORE', KEYS[q + 1], cid)
-            if sc then
-                in_any = true
-                break
-            end
-        end
-        if not in_any then
-            local claimed = redis.call(
-                'EXISTS', ARGV[2] .. cid)
-            local excluded = redis.call(
-                'SISMEMBER', excluded_key, cid)
-            if claimed == 0 and excluded == 0 then
-                local tier_str = redis.call(
-                    'HGET', tiers_key, cid)
-                local tier = tonumber(tier_str)
-                    or tonumber(ARGV[3])
-                local qkey = KEYS[tier + 1]
-                redis.call(
-                    'ZADD', qkey,
-                    ARGV[1], cid)
-                recovered = recovered + 1
-            end
-        end
-    end
-until cursor == '0'
-return recovered
-'''
-
-
 class RedisCreatorQueue(CreatorQueue):
     '''
     Redis-backed queue using per-tier sorted sets.
@@ -1426,6 +1403,9 @@ class RedisCreatorQueue(CreatorQueue):
         self._key_names: str = (
             f'{self._key_prefix}:names'
         )
+        self._key_creator_state: str = (
+            f'{self._key_prefix}:creator_state'
+        )
         # Operator-excluded members ("removed" state). Never written
         # by the RSS scraper, so its recover/populate paths are
         # unaffected (an empty set makes the SISMEMBER guard a no-op).
@@ -1439,8 +1419,10 @@ class RedisCreatorQueue(CreatorQueue):
         self._tiers: list[TierConfig] = []
 
         self._claim_script: Any = None
-        self._recover_script: Any = None
         self._schedule_script: Any = None
+
+    def _orphan_recovery_lock_key(self) -> str:
+        return f'{self._key_prefix}:orphan_recovery_lock'
 
     async def _ensure_names_index(self) -> None:
         '''
@@ -1506,11 +1488,6 @@ class RedisCreatorQueue(CreatorQueue):
                 _LUA_CLAIM_BATCH,
             )
         )
-        self._recover_script = (
-            self._redis.register_script(
-                _LUA_RECOVER_ORPHANS,
-            )
-        )
         self._schedule_script = (
             self._redis.register_script(
                 _LUA_SCHEDULE_IF_ABSENT,
@@ -1541,26 +1518,19 @@ class RedisCreatorQueue(CreatorQueue):
             if results[i]
         )
 
-    async def _recover_orphans(
-        self, last_tier: int,
-    ) -> int:
+    async def _recover_orphans(self) -> int:
         '''Re-enqueue creators not in any queue.'''
 
-        now: float = datetime.now(UTC).timestamp()
-        recovered: int = (
-            await self._recover_script(
-                keys=[
-                    self._key_creators,
-                    *self._key_queues,
-                    self._key_tiers,
-                    self._key_excluded,
-                ],
-                args=[
-                    str(now),
-                    self._claim_prefix,
-                    str(last_tier),
-                ],
+        breakdown: dict[int, dict[str, int]] | None = (
+            await self.scan_and_recover_orphans_with_fleet_lock(
+                recover=True,
             )
+        )
+        if breakdown is None:
+            return 0
+        recovered: int = sum(
+            counts.get('orphan', 0)
+            for counts in breakdown.values()
         )
         if recovered:
             _LOGGER.info(
@@ -1691,7 +1661,6 @@ class RedisCreatorQueue(CreatorQueue):
 
         now: float = datetime.now(UTC).timestamp()
         added: int = 0
-        last_tier: int = tiers[-1].tier
         chunk_size: int = 500
 
         for i in range(
@@ -1749,9 +1718,7 @@ class RedisCreatorQueue(CreatorQueue):
                     self._key_names, *new_names,
                 )
 
-        added += await self._recover_orphans(
-            last_tier,
-        )
+        added += await self._recover_orphans()
         return added
 
     async def claim_batch(
@@ -2100,44 +2067,26 @@ class RedisCreatorQueue(CreatorQueue):
         return counts
 
     async def cleanup_stale_claims(self) -> int:
-        self._ensure_lua_scripts()
-        now: float = datetime.now(UTC).timestamp()
-        last_tier: int = (
-            self._tiers[-1].tier if self._tiers else 1
-        )
-        return await self._recover_script(
-            keys=[
-                self._key_creators,
-                *self._key_queues,
-                self._key_tiers,
-                self._key_excluded,
-            ],
-            args=[
-                str(now),
-                self._claim_prefix,
-                str(last_tier),
-            ],
-        )
+        return await self._recover_orphans()
 
-    async def scan_and_recover_orphans(
+    async def _scan_and_recover_orphans(
         self,
         recover: bool = True,
-    ) -> dict[int, dict[str, int]]:
-        '''See ``CreatorQueue.scan_and_recover_orphans``.
+    ) -> tuple[dict[int, dict[str, int]], int]:
+        '''Classify tier members and recover absent creators.
 
         Python-side HSCAN over ``_key_tiers`` in batches
         of 500. For each batch, one Redis pipeline
-        issues ZSCORE against every tier queue plus
-        EXISTS for the claim and no_feeds keys. Orphan
-        recovery (if ``recover=True``) runs as a second
-        pipeline on the same batch.
+        issues ZSCORE against every tier queue, EXISTS for
+        claim/no_feeds keys, and SISMEMBER for the excluded
+        set. Orphan recovery (if ``recover=True``) runs as a
+        second pipeline on the same batch.
 
         Smaller pipelined batches are preferred over a
-        single blocking Lua scan (which
-        ``cleanup_stale_claims`` uses at boot) because
-        this method runs periodically — it must yield
-        control between batches so other Redis clients
-        are not held up.
+        single blocking Lua scan because this path can run
+        at boot and periodically; it must yield control
+        between batches so other Redis clients are not held
+        up.
         '''
 
         breakdown: dict[int, dict[str, int]] = {
@@ -2148,13 +2097,14 @@ class RedisCreatorQueue(CreatorQueue):
             for tc in self._tiers
         }
         if not self._tiers:
-            return breakdown
+            return (breakdown, 0)
 
         valid_tiers: set[int] = set(breakdown.keys())
         num_queues: int = len(self._key_queues)
-        ops_per_cid: int = num_queues + 2
+        ops_per_cid: int = num_queues + 3
         now: float = datetime.now(UTC).timestamp()
         cursor: int = 0
+        recovered: int = 0
 
         while True:
             cursor, data = await self._redis.hscan(
@@ -2181,6 +2131,9 @@ class RedisCreatorQueue(CreatorQueue):
                     pipe.exists(
                         f'{self._no_feeds_prefix}{cid}',
                     )
+                    pipe.sismember(
+                        self._key_excluded, cid,
+                    )
 
                 if items:
                     results: list = await pipe.execute()
@@ -2202,6 +2155,11 @@ class RedisCreatorQueue(CreatorQueue):
                                 offset + num_queues + 1
                             ]
                         )
+                        excluded: int = (
+                            results[
+                                offset + num_queues + 2
+                            ]
+                        )
                         if any(
                             s is not None for s in zscores
                         ):
@@ -2210,6 +2168,8 @@ class RedisCreatorQueue(CreatorQueue):
                             state = 'claimed'
                         elif no_feeds_exists:
                             state = 'no_feeds'
+                        elif excluded:
+                            continue
                         else:
                             state = 'orphan'
                             orphans.append((cid, tier))
@@ -2228,12 +2188,63 @@ class RedisCreatorQueue(CreatorQueue):
                                 {cid: now},
                                 nx=True,
                             )
-                        await rec_pipe.execute()
+                        rec_results: list = (
+                            await rec_pipe.execute()
+                        )
+                        recovered += sum(
+                            1 for result in rec_results
+                            if result
+                        )
 
             if cursor == 0:
                 break
 
+        return (breakdown, recovered)
+
+    async def scan_and_recover_orphans(
+        self,
+        recover: bool = True,
+    ) -> dict[int, dict[str, int]]:
+        '''See ``CreatorQueue.scan_and_recover_orphans``.'''
+
+        breakdown, _recovered = (
+            await self._scan_and_recover_orphans(
+                recover=recover,
+            )
+        )
         return breakdown
+
+    async def scan_and_recover_orphans_with_fleet_lock(
+        self,
+        recover: bool = True,
+        lock_ttl_seconds: int = 300,
+    ) -> dict[int, dict[str, int]] | None:
+        '''Run orphan recovery only when the fleet lock is free.'''
+
+        acquired: bool = bool(
+            await self._redis.set(
+                self._orphan_recovery_lock_key(),
+                self._worker_id,
+                ex=lock_ttl_seconds,
+                nx=True,
+            )
+        )
+        if not acquired:
+            ttl: int = await self._redis.ttl(
+                self._orphan_recovery_lock_key(),
+            )
+            _LOGGER.info(
+                'Skipping orphan recovery; fleet lock is held',
+                extra={
+                    'lock_key': self._orphan_recovery_lock_key(),
+                    'lock_ttl_seconds': ttl,
+                },
+            )
+            return None
+
+        return await self.scan_and_recover_orphans(
+            recover=recover,
+        )
 
     # -- operator helpers (queue admin tool) --------------------
 
@@ -2272,6 +2283,138 @@ class RedisCreatorQueue(CreatorQueue):
         if score is not None:
             return 'queued', score
         return 'absent', None
+
+    @staticmethod
+    def _utc_now_iso() -> str:
+        return datetime.now(UTC).isoformat()
+
+    @staticmethod
+    def _decode_scrape_state(raw: str | bytes | None) -> dict[str, Any]:
+        if raw is None:
+            return {'scrape_status': 'never_scraped'}
+        try:
+            data: object = orjson.loads(raw)
+        except orjson.JSONDecodeError:
+            return {
+                'scrape_status': 'other',
+                'last_error': 'malformed creator_state json',
+            }
+        if not isinstance(data, dict):
+            return {
+                'scrape_status': 'other',
+                'last_error': 'invalid creator_state shape',
+            }
+        status: object = data.get('scrape_status') or data.get('status')
+        if not isinstance(status, str) or not status:
+            data['scrape_status'] = 'never_scraped'
+        elif 'scrape_status' not in data:
+            data['scrape_status'] = status
+        return data
+
+    async def get_scrape_state(self, creator_id: str) -> dict[str, Any]:
+        '''Return the last scrape-result state for *creator_id*.'''
+        raw: str | None = await self._redis.hget(
+            self._key_creator_state, creator_id,
+        )
+        return self._decode_scrape_state(raw)
+
+    async def record_scrape_attempt(
+        self,
+        creator_id: str,
+        *,
+        worker_id: str = '',
+        proxy_ip: str = '',
+        evidence: dict[str, Any] | None = None,
+    ) -> None:
+        '''Record that a scrape attempt started for *creator_id*.'''
+        state: dict[str, Any] = await self.get_scrape_state(creator_id)
+        state['last_attempt_at'] = self._utc_now_iso()
+        state['worker_id'] = worker_id
+        state['proxy_ip'] = proxy_ip
+        if evidence:
+            state.update(evidence)
+        await self._redis.hset(
+            self._key_creator_state,
+            creator_id,
+            orjson.dumps(state).decode('utf-8'),
+        )
+
+    async def record_scrape_success(
+        self,
+        creator_id: str,
+        *,
+        follower_count: int,
+        worker_id: str = '',
+        proxy_ip: str = '',
+        evidence: dict[str, Any] | None = None,
+    ) -> None:
+        '''Record a successful creator scrape.'''
+        state: dict[str, Any] = await self.get_scrape_state(creator_id)
+        now: str = self._utc_now_iso()
+        state.update({
+            'scrape_status': 'scraped',
+            'last_attempt_at': now,
+            'last_success_at': now,
+            'last_follower_count': int(follower_count),
+            'failure_count': 0,
+            'worker_id': worker_id,
+            'proxy_ip': proxy_ip,
+        })
+        state.pop('last_error', None)
+        if evidence:
+            state.update(evidence)
+        await self._redis.hset(
+            self._key_creator_state,
+            creator_id,
+            orjson.dumps(state).decode('utf-8'),
+        )
+
+    async def record_scrape_failure(
+        self,
+        creator_id: str,
+        *,
+        status: str,
+        error: str,
+        worker_id: str = '',
+        proxy_ip: str = '',
+        evidence: dict[str, Any] | None = None,
+    ) -> None:
+        '''Record a failed creator scrape result.'''
+        state: dict[str, Any] = await self.get_scrape_state(creator_id)
+        failure_count: int = int(state.get('failure_count') or 0) + 1
+        state.update({
+            'scrape_status': status,
+            'last_attempt_at': self._utc_now_iso(),
+            'last_error': error,
+            'failure_count': failure_count,
+            'worker_id': worker_id,
+            'proxy_ip': proxy_ip,
+        })
+        if evidence:
+            state.update(evidence)
+        await self._redis.hset(
+            self._key_creator_state,
+            creator_id,
+            orjson.dumps(state).decode('utf-8'),
+        )
+
+    async def count_by_scrape_status(self) -> dict[str, int]:
+        '''Count creators by their persisted scrape-result status.'''
+        counts: dict[str, int] = {}
+        cursor: int = 0
+        while True:
+            cursor, data = await self._redis.hscan(
+                self._key_creator_state, cursor, count=500,
+            )
+            for raw in data.values():
+                state: dict[str, Any] = self._decode_scrape_state(raw)
+                status: str = str(
+                    state.get('scrape_status') or 'never_scraped',
+                )
+                counts[status] = counts.get(status, 0) + 1
+            if cursor == 0:
+                break
+        return counts
 
     async def add_member(
         self,
@@ -2343,12 +2486,18 @@ class RedisCreatorQueue(CreatorQueue):
         tier_str: str | None = await self._redis.hget(
             self._key_tiers, creator_id,
         )
+        scrape_state: dict[str, Any] = await self.get_scrape_state(
+            creator_id,
+        )
         return {
             'creator_id': creator_id,
             'name': name,
             'state': state,
+            'queue_state': state,
             'tier': int(tier_str) if tier_str else None,
             'score': score,
+            'scrape_status': scrape_state.get('scrape_status'),
+            'scrape_state': scrape_state,
         }
 
     async def search_members(
