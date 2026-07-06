@@ -93,6 +93,24 @@ class TestBrotliReadRecovery(unittest.TestCase):
             re_read: dict = brotli_read(p)
             self.assertEqual(recovered, re_read)
 
+    def test_small_trailing_junk_recovered_and_rewritten(self) -> None:
+        data: dict = {
+            'id': 'good',
+            'url': 'https://scrape.exchange/good',
+        }
+        corrupt: bytes = (
+            brotli.compress(json.dumps(data).encode()) + b'garbage'
+        )
+        with tempfile.TemporaryDirectory() as d:
+            p: Path = Path(d) / 'small-corrupt.json.br'
+            p.write_bytes(corrupt)
+
+            self.assertEqual(brotli_read(p), data)
+            self.assertEqual(
+                json.loads(brotli.decompress(p.read_bytes()).decode()),
+                data,
+            )
+
     def test_unrecoverable_raises(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             p: Path = Path(d) / 'garbage.json.br'

@@ -220,6 +220,90 @@ class TestScanAndRecoverOrphans(
         self.assertIsNone(score_q1)
         self.assertIsNotNone(score_q2)
 
+    async def test_fleet_lock_recovery_sets_expiring_lock(
+        self,
+    ) -> None:
+        q: RedisCreatorQueue = await self._queue()
+        cid: str = 'UC_locked_recover'
+
+        await q._redis.hset(
+            q._key_tiers, cid, '2',
+        )
+
+        breakdown: dict[int, dict[str, int]] | None = (
+            await q.scan_and_recover_orphans_with_fleet_lock(
+                recover=True,
+                lock_ttl_seconds=300,
+            )
+        )
+
+        self.assertIsNotNone(breakdown)
+        assert breakdown is not None
+        self.assertEqual(breakdown[2]['orphan'], 1)
+        self.assertIsNotNone(
+            await q._redis.zscore(
+                f'rss:{TEST_PLATFORM}:queue:2', cid,
+            )
+        )
+        ttl: int = await q._redis.ttl(
+            q._orphan_recovery_lock_key(),
+        )
+        self.assertGreater(ttl, 0)
+        self.assertLessEqual(ttl, 300)
+
+    async def test_fleet_lock_recovery_skips_when_lock_fresh(
+        self,
+    ) -> None:
+        q: RedisCreatorQueue = await self._queue()
+        cid: str = 'UC_locked_skip'
+
+        await q._redis.hset(
+            q._key_tiers, cid, '1',
+        )
+        await q._redis.set(
+            q._orphan_recovery_lock_key(),
+            'other-worker',
+            ex=300,
+        )
+
+        breakdown: dict[int, dict[str, int]] | None = (
+            await q.scan_and_recover_orphans_with_fleet_lock(
+                recover=True,
+                lock_ttl_seconds=300,
+            )
+        )
+
+        self.assertIsNone(breakdown)
+        self.assertIsNone(
+            await q._redis.zscore(
+                f'rss:{TEST_PLATFORM}:queue:1', cid,
+            )
+        )
+
+    async def test_cleanup_stale_claims_skips_when_lock_fresh(
+        self,
+    ) -> None:
+        q: RedisCreatorQueue = await self._queue()
+        cid: str = 'UC_cleanup_locked_skip'
+
+        await q._redis.hset(
+            q._key_tiers, cid, '1',
+        )
+        await q._redis.set(
+            q._orphan_recovery_lock_key(),
+            'other-worker',
+            ex=300,
+        )
+
+        recovered: int = await q.cleanup_stale_claims()
+
+        self.assertEqual(recovered, 0)
+        self.assertIsNone(
+            await q._redis.zscore(
+                f'rss:{TEST_PLATFORM}:queue:1', cid,
+            )
+        )
+
     async def test_recover_false_does_not_enqueue(
         self,
     ) -> None:
@@ -234,6 +318,25 @@ class TestScanAndRecoverOrphans(
             recover=False,
         )
         self.assertEqual(breakdown[1]['orphan'], 1)
+
+        score: float | None = await q._redis.zscore(
+            f'rss:{TEST_PLATFORM}:queue:1', cid,
+        )
+        self.assertIsNone(score)
+
+    async def test_excluded_member_is_not_recovered(
+        self,
+    ) -> None:
+        q: RedisCreatorQueue = await self._queue()
+        cid: str = 'UC_removed'
+
+        await q._redis.hset(q._key_tiers, cid, '1')
+        await q._redis.sadd(q._key_excluded, cid)
+
+        breakdown = await q.scan_and_recover_orphans(
+            recover=True,
+        )
+        self.assertEqual(breakdown[1]['orphan'], 0)
 
         score: float | None = await q._redis.zscore(
             f'rss:{TEST_PLATFORM}:queue:1', cid,
@@ -864,7 +967,7 @@ class TestScanAndRecoverLoop(
         )
 
         queue = AsyncMock()
-        queue.scan_and_recover_orphans.return_value = {
+        queue.scan_and_recover_orphans_with_fleet_lock.return_value = {
             1: {
                 'queued': 10, 'claimed': 2,
                 'no_feeds': 5, 'orphan': 3,
@@ -893,7 +996,7 @@ class TestScanAndRecoverLoop(
         except asyncio.CancelledError:
             pass
 
-        queue.scan_and_recover_orphans.assert_called_with(
+        queue.scan_and_recover_orphans_with_fleet_lock.assert_called_with(
             recover=True,
         )
         after: float = (
@@ -904,6 +1007,48 @@ class TestScanAndRecoverLoop(
             )._value.get()
         )
         self.assertGreater(after, before)
+
+    async def test_lock_skip_does_not_increment_counter(
+        self,
+    ) -> None:
+        yt_rss_scrape: ModuleType = (
+            _load_yt_rss_scrape()
+        )
+
+        queue = AsyncMock()
+        queue.scan_and_recover_orphans_with_fleet_lock.return_value = (
+            None
+        )
+        before: float = (
+            yt_rss_scrape.METRIC_ORPHANS_RECOVERED.labels(
+                platform='youtube',
+                scraper='rss_scraper',
+                tier='1',
+            )._value.get()
+        )
+
+        task = asyncio.create_task(
+            yt_rss_scrape._scan_and_recover_loop(
+                queue,
+                interval_seconds=0.01,
+            ),
+        )
+        await asyncio.sleep(0.03)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        queue.scan_and_recover_orphans_with_fleet_lock.assert_called()
+        after: float = (
+            yt_rss_scrape.METRIC_ORPHANS_RECOVERED.labels(
+                platform='youtube',
+                scraper='rss_scraper',
+                tier='1',
+            )._value.get()
+        )
+        self.assertEqual(after, before)
 
 
 class TestPublishQueueMetricsLoop(

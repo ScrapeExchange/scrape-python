@@ -1176,9 +1176,13 @@ async def _recover_creator_queue_orphans(
     event loop. The batched scanner yields between HSCAN/pipeline
     chunks, so other scrapers can keep using Redis.
     '''
-    breakdown: dict[int, dict[str, int]] = (
-        await queue.scan_and_recover_orphans(recover=True)
+    breakdown: dict[int, dict[str, int]] | None = (
+        await queue.scan_and_recover_orphans_with_fleet_lock(
+            recover=True,
+        )
     )
+    if breakdown is None:
+        return 0
     recovered: int = sum(
         counts.get('orphan', 0)
         for counts in breakdown.values()

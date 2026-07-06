@@ -157,6 +157,52 @@ _TIKTOK_CREATOR_URL_RE: re.Pattern[str] = re.compile(
     r'https?://(?:www\.)?tiktok\.com/@([a-zA-Z0-9_.-]{2,24})'
     r'(?:/)?(?:\?.*)?$',
 )
+_INSTAGRAM_RESERVED_PATHS: set[str] = {
+    'about',
+    'accounts',
+    'api',
+    'developer',
+    'direct',
+    'explore',
+    'graphql',
+    'p',
+    'reel',
+    'reels',
+    'stories',
+}
+_INSTAGRAM_CREATOR_HANDLE_RE: re.Pattern[str] = re.compile(
+    r'^[a-zA-Z0-9_.]{1,30}$',
+)
+_INSTAGRAM_CREATOR_URL_RE: re.Pattern[str] = re.compile(
+    r'https?://(?:www\.)?instagram\.com/([^/?#]+)'
+    r'(?:/)?(?:[?#].*)?$',
+)
+
+
+def normalize_instagram_creator_handle(value: str) -> str | None:
+    '''Extract a lowercase Instagram username from a submission.'''
+    candidate: str = value.strip()
+    if not candidate:
+        return None
+    url_match: re.Match[str] | None = (
+        _INSTAGRAM_CREATOR_URL_RE.fullmatch(candidate)
+    )
+    if url_match is not None:
+        candidate = url_match.group(1)
+    if candidate.startswith('@'):
+        candidate = candidate[1:]
+    handle: str = candidate.lower()
+    if handle in _INSTAGRAM_RESERVED_PATHS:
+        return None
+    if (
+        handle.startswith('.')
+        or handle.endswith('.')
+        or '..' in handle
+    ):
+        return None
+    if not _INSTAGRAM_CREATOR_HANDLE_RE.fullmatch(handle):
+        return None
+    return handle
 
 
 def normalize_tiktok_creator_submission(value: str) -> str | None:
@@ -493,6 +539,78 @@ class TikTokVideoQueueAdapter(OperatorQueue):
             await self._queue._redis.aclose()
 
 
+class InstagramCreatorQueueAdapter(TikTokCreatorQueueAdapter):
+    '''Operator adapter over ``RedisCreatorQueue`` for Instagram
+    creators. States: queued | claimed | removed.'''
+
+    platform: str = 'instagram'
+    entity: str = 'creator'
+    member_label: str = 'username'
+
+    async def add(
+        self, members: list[tuple[str, int]],
+    ) -> int:
+        weight: int = self._fallback_weight()
+        added: int = 0
+        for member_id, requested_weight in members:
+            handle: str | None = normalize_instagram_creator_handle(
+                member_id,
+            )
+            if handle is None:
+                continue
+            member_weight: int = requested_weight or weight
+            if await self._queue.add_member(
+                handle, handle, member_weight,
+            ):
+                added += 1
+        return added
+
+    async def import_members(self, path: str) -> ImportReport:
+        weight: int = self._fallback_weight()
+        report = ImportReport()
+        with open(path, 'r') as fd:
+            for line_no, line in enumerate(fd, start=1):
+                report.total_lines += 1
+                stripped: str = line.strip()
+                if not stripped:
+                    report.blank += 1
+                    continue
+                if stripped.startswith('#'):
+                    report.comments += 1
+                    continue
+                raw: object = stripped
+                if stripped.startswith('{'):
+                    try:
+                        obj: object = json.loads(stripped)
+                    except json.JSONDecodeError as exc:
+                        print(
+                            f'{path}:{line_no}: skipping malformed '
+                            f'JSON: {exc}',
+                            file=sys.stderr,
+                        )
+                        report.invalid += 1
+                        continue
+                    if not isinstance(obj, dict):
+                        report.invalid += 1
+                        continue
+                    raw = (
+                        obj.get('username')
+                        or obj.get('creator_id')
+                        or obj.get('handle')
+                    )
+                handle: str | None = normalize_instagram_creator_handle(
+                    str(raw),
+                )
+                if handle is None:
+                    report.invalid += 1
+                    continue
+                if await self.add([(handle, weight)]):
+                    report.added += 1
+                else:
+                    report.duplicates += 1
+        return report
+
+
 def _build_tiktok_creator_adapter(
     settings: Any,
 ) -> OperatorQueue:
@@ -527,10 +645,30 @@ def _build_tiktok_video_adapter(settings: Any) -> OperatorQueue:
     return TikTokVideoQueueAdapter(queue)
 
 
+def _build_instagram_creator_adapter(settings: Any) -> OperatorQueue:
+    tiers: list[TierConfig] = parse_priority_queues(
+        getattr(
+            settings,
+            'instagram_creator_priority_queues',
+            '72:10000000,168:1000000,336:100000,720:10000,4320:0',
+        ),
+    )
+    queue: RedisCreatorQueue = RedisCreatorQueue(
+        settings.redis_dsn,
+        getattr(settings, 'worker_id', '0'),
+        'instagram',
+        key_namespace='scrape',
+    )
+    queue._tiers = tiers
+    queue._key_queues = queue._build_queue_keys(tiers)
+    return InstagramCreatorQueueAdapter(queue, tiers)
+
+
 # Registry: (platform, entity) -> adapter factory.
 ADAPTERS: dict[
     tuple[str, str], Callable[[Any], OperatorQueue]
 ] = {
+    ('instagram', 'creator'): _build_instagram_creator_adapter,
     ('tiktok', 'creator'): _build_tiktok_creator_adapter,
     ('tiktok', 'video'): _build_tiktok_video_adapter,
 }

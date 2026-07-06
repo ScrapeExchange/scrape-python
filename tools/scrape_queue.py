@@ -28,6 +28,7 @@ from pydantic_settings import (
 
 from scrape_exchange.queue_admin import (
     ImportReport,
+    normalize_instagram_creator_handle,
     normalize_tiktok_creator_submission,
     OperatorQueue,
     get_adapter,
@@ -56,6 +57,13 @@ class QueueToolSettings(BaseSettings):
         validation_alias=AliasChoices(
             'TIKTOK_CREATOR_PRIORITY_QUEUES',
             'creator_priority_queues',
+        ),
+    )
+    instagram_creator_priority_queues: str = Field(
+        default='72:10000000,168:1000000,336:100000,720:10000,4320:0',
+        validation_alias=AliasChoices(
+            'IG_CREATOR_PRIORITY_QUEUES',
+            'instagram_creator_priority_queues',
         ),
     )
 
@@ -105,6 +113,12 @@ def _normalizes_tiktok_creator_handles(
     adapter: OperatorQueue,
 ) -> bool:
     return adapter.platform == 'tiktok' and adapter.entity == 'creator'
+
+
+def _normalizes_instagram_creator_handles(
+    adapter: OperatorQueue,
+) -> bool:
+    return adapter.platform == 'instagram' and adapter.entity == 'creator'
 
 
 def _member_key(adapter: OperatorQueue) -> str:
@@ -194,6 +208,8 @@ async def cmd_add(
         resolved: str | None = member
         if _normalizes_tiktok_creator_handles(adapter):
             resolved = normalize_tiktok_creator_submission(member)
+        elif _normalizes_instagram_creator_handles(adapter):
+            resolved = normalize_instagram_creator_handle(member)
         if resolved is not None:
             pairs.append((resolved, ns.weight))
     added: int = await adapter.add(pairs)

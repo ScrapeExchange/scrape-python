@@ -15,21 +15,26 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 WORKDIR /app
 
+# Deno does not depend on Python packages or project source, so keep
+# it in a very stable layer.
+ENV DENO_INSTALL=/usr/local/deno
+RUN curl -fsSL https://deno.land/install.sh \
+    | DENO_INSTALL=${DENO_INSTALL} sh
+
 # Install dependencies first (layer caching)
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --no-install-project
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --no-install-project
+
+# Fetch browser assets before project source is copied. This keeps
+# Camoufox downloads cached across ordinary source-only image rebuilds.
+RUN PATH="/app/.venv/bin:${PATH}" camoufox fetch
 
 # Copy project source and install it
 COPY scrape_exchange/ scrape_exchange/
 COPY tools/ tools/
-RUN uv sync --frozen --no-dev
-
-# Fetch runtime assets while download tools are available in this
-# disposable stage. Only the installed artifacts are copied below.
-ENV DENO_INSTALL=/usr/local/deno
-RUN curl -fsSL https://deno.land/install.sh \
-    | DENO_INSTALL=${DENO_INSTALL} sh \
-    && PATH="/app/.venv/bin:${PATH}" camoufox fetch
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev
 
 # Wheels often include caches, test suites, development headers and
 # native debug symbols. None are needed by the running application.
@@ -107,6 +112,7 @@ COPY tools/ tools/
 RUN mkdir -p /data/videos /data/channels \
     /data/tiktok/creators /data/tiktok/videos \
     /data/tiktok/session-state \
+    /data/instagram/creators /data/instagram/session-state \
     /var/log/scrape/scraper \
     /var/tmp/yt_dlp_cache
 
@@ -116,6 +122,8 @@ ENV YOUTUBE_VIDEO_DATA_DIR=/data/videos \
     TIKTOK_CREATOR_DATA_DIR=/data/tiktok/creators \
     TIKTOK_VIDEO_DATA_DIR=/data/tiktok/videos \
     TIKTOK_SESSION_STATE_DIR=/data/tiktok/session-state \
+    IG_CREATOR_DATA_DIR=/data/instagram/creators \
+    IG_SESSION_STATE_DIR=/data/instagram/session-state \
     YOUTUBE_CHANNEL_LIST=/data/channels.lst \
     YOUTUBE_CHANNEL_MAP_FILE=/data/channel_map.csv \
     RSS_QUEUE_FILE=/data/rss-queue.json \

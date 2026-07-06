@@ -143,12 +143,10 @@ def brotli_read(path: Path | str) -> Any:
         return orjson.loads(brotli.decompress(raw))
     except brotli.error as exc:
         salvaged: bytes = _best_effort_decompress(raw)
-        recovered: Any = _best_effort_json(salvaged)
+        recovered: Any = _recover_json_from_salvaged(salvaged)
         if recovered is None:
-            text: str = salvaged.decode(
-                'utf-8', errors='replace',
-            )
-            recovered = _close_truncated_json(text)
+            salvaged = _best_effort_decompress(raw, chunk_size=1)
+            recovered = _recover_json_from_salvaged(salvaged)
         if recovered is None:
             logging.error(
                 'brotli decompression failed and no JSON '
@@ -205,6 +203,16 @@ async def brotli_read_async(path: Path | str) -> Any:
     worker thread so the caller's event loop is not blocked.
     '''
     return await asyncio.to_thread(brotli_read, path)
+
+
+def _recover_json_from_salvaged(salvaged: bytes) -> Any | None:
+    recovered: Any = _best_effort_json(salvaged)
+    if recovered is not None:
+        return recovered
+    text: str = salvaged.decode(
+        'utf-8', errors='replace',
+    )
+    return _close_truncated_json(text)
 
 
 def _best_effort_decompress(

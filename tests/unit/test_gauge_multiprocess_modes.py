@@ -66,6 +66,22 @@ class TestSharedModulesGaugeModes(unittest.TestCase):
             'livemostrecent',
         )
 
+    def test_exchange_client_upload_queue_metrics_are_entity_labelled(
+        self,
+    ) -> None:
+        from scrape_exchange.exchange_client import (
+            METRIC_UPLOAD_QUEUE_DEPTH,
+            METRIC_UPLOAD_QUEUE_DROPPED,
+        )
+        self.assertEqual(
+            METRIC_UPLOAD_QUEUE_DEPTH._labelnames,
+            ('platform', 'scraper', 'entity', 'worker_id'),
+        )
+        self.assertEqual(
+            METRIC_UPLOAD_QUEUE_DROPPED._labelnames,
+            ('platform', 'scraper', 'entity', 'reason', 'worker_id'),
+        )
+
     def test_scraper_metrics_scrape_queue_size_livemostrecent(
         self,
     ) -> None:

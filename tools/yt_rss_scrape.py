@@ -2071,10 +2071,15 @@ async def _scan_and_recover_loop(
     '''
     while True:
         try:
-            breakdown: dict[int, dict[str, int]] = (
+            breakdown: dict[int, dict[str, int]] | None = (
                 await creator_queue
-                .scan_and_recover_orphans(recover=True)
+                .scan_and_recover_orphans_with_fleet_lock(
+                    recover=True,
+                )
             )
+            if breakdown is None:
+                await asyncio.sleep(interval_seconds)
+                continue
             for tier, counts in breakdown.items():
                 METRIC_ORPHANS_RECOVERED.labels(
                     platform='youtube',

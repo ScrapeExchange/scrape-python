@@ -549,6 +549,7 @@ async def enqueue_upload_video(
         file_manager=video_fm,
         filename=filename,
         move_source_dir=move_source_dir,
+        platform='youtube',
         entity='video',
         log_extra={'video_id': video.video_id},
         on_success=(

@@ -57,7 +57,7 @@ METRIC_UPLOAD_QUEUE_DEPTH: Gauge = Gauge(
     'upload_queue_depth',
     'Number of background upload jobs currently waiting in the '
     'ExchangeClient fire-and-forget upload queue.',
-    ['platform', 'scraper', 'worker_id'],
+    ['platform', 'scraper', 'entity', 'worker_id'],
     multiprocess_mode='livemostrecent',
 )
 METRIC_UPLOAD_QUEUE_DROPPED: Counter = Counter(
@@ -65,7 +65,7 @@ METRIC_UPLOAD_QUEUE_DROPPED: Counter = Counter(
     'Background upload jobs dropped because the queue was full. The '
     'underlying asset file is left in the base directory and will be '
     'retried on the next scraper iteration.',
-    ['platform', 'scraper', 'reason', 'worker_id'],
+    ['platform', 'scraper', 'entity', 'reason', 'worker_id'],
 )
 METRIC_BACKGROUND_UPLOADS: Counter = Counter(
     'uploads_completed_total',
@@ -170,6 +170,7 @@ class _UploadJob:
     file_manager: 'AssetFileManagement | None' = None
     filename: str | None = None
     move_source_dir: 'Path | None' = None
+    platform: str = 'unknown'
     entity: str = 'unknown'
     log_extra: dict[str, Any] = field(default_factory=dict)
     on_success: Callable[[], Awaitable[None]] | None = None
@@ -219,6 +220,7 @@ class ExchangeClient(AsyncClient):
         self._upload_queue: asyncio.Queue[_UploadJob | None] | None = None
         self._upload_tasks: list[asyncio.Task] = []
         self._upload_shutdown: bool = False
+        self._upload_queue_depths: dict[tuple[str, str], int] = {}
 
         # No default Content-Type. httpx auto-sets the correct
         # value per body kind: ``application/json`` for ``json=``
@@ -631,6 +633,7 @@ class ExchangeClient(AsyncClient):
         file_manager: 'AssetFileManagement | None' = None,
         filename: str | None = None,
         move_source_dir: 'Path | None' = None,
+        platform: str = 'unknown',
         entity: str = 'unknown',
         log_extra: dict[str, Any] | None = None,
         on_success: Callable[[], Awaitable[None]] | None = None,
@@ -658,6 +661,8 @@ class ExchangeClient(AsyncClient):
             file whose successful upload should be marked.
         :param filename: Bare filename (relative to ``base_dir``) to
             mark as uploaded on success.
+        :param platform: Platform label for background upload metrics.
+        :param entity: Entity label for background upload metrics.
         :param log_extra: Additional structured fields to attach to
             background-worker log messages.
         :returns: ``True`` if the job was enqueued, ``False`` if it
@@ -675,6 +680,7 @@ class ExchangeClient(AsyncClient):
             file_manager=file_manager,
             filename=filename,
             move_source_dir=move_source_dir,
+            platform=platform,
             entity=entity,
             log_extra=dict(log_extra or {}),
             on_success=on_success,
@@ -683,8 +689,9 @@ class ExchangeClient(AsyncClient):
             self._upload_queue.put_nowait(job)
         except asyncio.QueueFull:
             METRIC_UPLOAD_QUEUE_DROPPED.labels(
-                platform='scrape_exchange',
+                platform=platform,
                 scraper='exchange_client',
+                entity=entity,
                 reason='queue_full',
                 worker_id=get_worker_id(),
             ).inc()
@@ -698,11 +705,7 @@ class ExchangeClient(AsyncClient):
             )
             return False
 
-        METRIC_UPLOAD_QUEUE_DEPTH.labels(
-            platform='scrape_exchange',
-            scraper='exchange_client',
-            worker_id=get_worker_id(),
-        ).set(self._upload_queue.qsize())
+        self._change_upload_queue_depth(job, 1)
         return True
 
     def _ensure_upload_tasks(self) -> None:
@@ -722,6 +725,38 @@ class ExchangeClient(AsyncClient):
             )
             self._upload_tasks.append(task)
 
+    def _change_upload_queue_depth(
+        self, job: _UploadJob, delta: int,
+    ) -> None:
+        '''
+        Keep queue-depth gauges accurate for mixed platform/entity
+        upload runs.
+        '''
+
+        key: tuple[str, str] = (job.platform, job.entity)
+        depth: int = max(0, self._upload_queue_depths.get(key, 0) + delta)
+        self._upload_queue_depths[key] = depth
+        METRIC_UPLOAD_QUEUE_DEPTH.labels(
+            platform=job.platform,
+            scraper='exchange_client',
+            entity=job.entity,
+            worker_id=get_worker_id(),
+        ).set(depth)
+
+    def _reset_upload_queue_depths(self) -> None:
+        '''
+        Clear all queue-depth series known to this client instance.
+        '''
+
+        for platform, entity in self._upload_queue_depths:
+            METRIC_UPLOAD_QUEUE_DEPTH.labels(
+                platform=platform,
+                scraper='exchange_client',
+                entity=entity,
+                worker_id=get_worker_id(),
+            ).set(0)
+        self._upload_queue_depths.clear()
+
     async def _upload_worker_loop(self) -> None:
         '''
         Drain jobs from the upload queue until the task is cancelled
@@ -737,6 +772,7 @@ class ExchangeClient(AsyncClient):
             # properly cancelled. ``drain_uploads`` waits on a gather
             # with ``return_exceptions=True`` so the raise is benign.
             job: _UploadJob = await self._upload_queue.get()
+            self._change_upload_queue_depth(job, -1)
             try:
                 await self._perform_background_upload(job)
             except Exception as exc:
@@ -749,7 +785,7 @@ class ExchangeClient(AsyncClient):
                     },
                 )
                 METRIC_BACKGROUND_UPLOADS.labels(
-                    platform='youtube',
+                    platform=job.platform,
                     scraper='exchange_client',
                     entity=job.entity,
                     mode='background',
@@ -758,11 +794,6 @@ class ExchangeClient(AsyncClient):
                 ).inc()
             finally:
                 self._upload_queue.task_done()
-                METRIC_UPLOAD_QUEUE_DEPTH.labels(
-                    platform='scrape_exchange',
-                    scraper='exchange_client',
-                    worker_id=get_worker_id(),
-                ).set(self._upload_queue.qsize())
 
     @staticmethod
     async def _mark_job_uploaded(job: _UploadJob) -> None:
@@ -806,7 +837,7 @@ class ExchangeClient(AsyncClient):
             )
         except Exception as exc:
             METRIC_BACKGROUND_UPLOADS.labels(
-                platform='youtube',
+                platform=job.platform,
                 scraper='exchange_client',
                 entity=job.entity,
                 mode='background',
@@ -834,7 +865,7 @@ class ExchangeClient(AsyncClient):
                     await self._mark_job_uploaded(job)
                 except OSError as exc:
                     METRIC_BACKGROUND_UPLOADS.labels(
-                        platform='youtube',
+                        platform=job.platform,
                         scraper='exchange_client',
                         entity=job.entity,
                         mode='background',
@@ -859,7 +890,7 @@ class ExchangeClient(AsyncClient):
             if job.on_success is not None:
                 await job.on_success()
             METRIC_BACKGROUND_UPLOADS.labels(
-                platform='youtube',
+                platform=job.platform,
                 scraper='exchange_client',
                 entity=job.entity,
                 mode='background',
@@ -892,10 +923,12 @@ class ExchangeClient(AsyncClient):
             )
             try:
                 self._upload_queue.put_nowait(job)
+                self._change_upload_queue_depth(job, 1)
             except asyncio.QueueFull:
                 METRIC_UPLOAD_QUEUE_DROPPED.labels(
-                    platform='scrape_exchange',
+                    platform=job.platform,
                     scraper='exchange_client',
+                    entity=job.entity,
                     reason='queue_full',
                     worker_id=get_worker_id(),
                 ).inc()
@@ -913,7 +946,7 @@ class ExchangeClient(AsyncClient):
             resp.status_code,
         )
         METRIC_BACKGROUND_UPLOADS.labels(
-            platform='youtube',
+            platform=job.platform,
             scraper='exchange_client',
             entity=job.entity,
             mode='background',
@@ -983,11 +1016,7 @@ class ExchangeClient(AsyncClient):
         )
         self._upload_tasks.clear()
         self._upload_queue = None
-        METRIC_UPLOAD_QUEUE_DEPTH.labels(
-            platform='scrape_exchange',
-            scraper='exchange_client',
-            worker_id=get_worker_id(),
-        ).set(0)
+        self._reset_upload_queue_depths()
 
     async def aclose(self) -> None:
         '''
