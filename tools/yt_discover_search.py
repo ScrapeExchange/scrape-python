@@ -18,6 +18,7 @@ from typing import Any, AsyncIterator, Iterable, Iterator
 
 import httpx
 from innertube.errors import RequestError as InnerTubeRequestError
+from innertube.errors import ResponseError as InnerTubeResponseError
 from pydantic import AliasChoices, Field
 from pydantic_settings import CliPositionalArg, SettingsConfigDict
 
@@ -54,7 +55,8 @@ _OFFLINE_RANDOM_TERMS: tuple[str, ...] = (
 # token, so the term simply ends and the next term continues.
 # Mirrors the set caught in
 # ``scrape_exchange/youtube/youtube_client.py``. ``InnerTubeRequestError``
-# covers HTTP 4xx/5xx responses from YouTube.
+# covers HTTP 4xx/5xx responses from YouTube. ``InnerTubeResponseError``
+# covers non-JSON responses, such as HTML interstitials.
 _TRANSIENT_SEARCH_ERRORS: tuple[type[BaseException], ...] = (
     # Base class for all httpx transport-level failures: timeouts,
     # connect errors, network errors, proxy errors (e.g. a proxy
@@ -65,6 +67,7 @@ _TRANSIENT_SEARCH_ERRORS: tuple[type[BaseException], ...] = (
     ConnectionResetError,
     ConnectionRefusedError,
     InnerTubeRequestError,
+    InnerTubeResponseError,
 )
 _SEARCH_RETRY_BACKOFF_SECONDS: float = 2.0
 

@@ -7,6 +7,7 @@ from unittest import mock
 
 import httpx
 from innertube.errors import RequestError as InnerTubeRequestError
+from innertube.errors import ResponseError as InnerTubeResponseError
 
 from tools.yt_discover_search import (
     DiscoverSearchSettings,
@@ -394,6 +395,35 @@ class TestSearchPageWithRetry(unittest.IsolatedAsyncioTestCase):
             side_effect=[
                 httpx.ProxyError('503 Service Unavailable'),
                 httpx.ProxyError('503 Service Unavailable'),
+            ],
+        )
+        with mock.patch(
+            'tools.yt_discover_search._innertube_search', new=search,
+        ), mock.patch(
+            'tools.yt_discover_search.asyncio.sleep',
+            new=mock.AsyncMock(),
+        ):
+            result = await _search_page_with_retry(
+                'term', continuation=None, proxy=None,
+                limiter=_FakeLimiter(),
+            )
+        self.assertIsNone(result)
+        self.assertEqual(search.await_count, 2)
+
+    async def test_non_json_response_error_is_transient(self) -> None:
+        '''YouTube can return an HTML interstitial where InnerTube
+        expects JSON; skip the current term instead of crashing.'''
+
+        search = mock.AsyncMock(
+            side_effect=[
+                InnerTubeResponseError(
+                    "Expected JSON response, got "
+                    "'text/html; charset=UTF-8'",
+                ),
+                InnerTubeResponseError(
+                    "Expected JSON response, got "
+                    "'text/html; charset=UTF-8'",
+                ),
             ],
         )
         with mock.patch(
