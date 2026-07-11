@@ -216,7 +216,7 @@ class TestScrapeUploadHelpers(unittest.TestCase):
                 _env_file=None,
             )
 
-        self.assertEqual(settings.metrics_port, 9299)
+        self.assertEqual(settings.metrics_port, 9800)
 
     def test_settings_watch_enabled_by_default(self) -> None:
         with patch.dict(os.environ, {}, clear=True):

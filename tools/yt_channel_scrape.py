@@ -1747,15 +1747,27 @@ async def _scrape_one_queued(
         )
         return
     except ChannelNoContentError as exc:
-        end_state: ChannelState = (
-            _channel_end_state(exc.channel)
-            or ChannelState.NO_VIDEOS
+        end_state: ChannelState | None = _channel_end_state(
+            exc.channel,
         )
-        await _mark_channel_end_state(
-            queue, member, channel_id, exc.channel, end_state,
-            force_mode=force_mode,
-            last_error=str(exc),
+        if end_state is not None:
+            await _mark_channel_end_state(
+                queue, member, channel_id, exc.channel, end_state,
+                force_mode=force_mode,
+                last_error=str(exc),
+            )
+            return
+        await queue.mark_soft_unavailable(
+            channel_id, last_error=str(exc),
         )
+        CHANNEL_SCRAPE_OUTCOMES.labels(
+            outcome='soft_unavailable',
+        ).inc()
+        if force_mode:
+            CHANNEL_FORCE_RESCRAPE_TOTAL.labels(
+                mode=force_mode,
+                outcome='soft_unavailable',
+            ).inc()
         return
     except ChannelNotFoundError as exc:
         terminal: bool = await queue.mark_not_found_confirmed(

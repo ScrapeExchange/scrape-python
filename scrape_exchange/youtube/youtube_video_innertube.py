@@ -266,6 +266,7 @@ def _record_player_response(
     video_id: str,
     player_data: dict[str, Any],
     *,
+    proxy_ip: str,
     proxy_file: str,
 ) -> None:
     playability: dict = player_data.get('playabilityStatus', {})
@@ -294,6 +295,7 @@ def _record_player_response(
             'InnerTube PLAYER returned sparse videoDetails',
             extra={
                 'video_id': video_id,
+                'proxy_ip': proxy_ip,
                 'playability_status': status,
                 'playability_reason': playability.get('reason'),
                 'playability_reason_class': reason_class,
@@ -482,6 +484,7 @@ class InnerTubeVideoParser:
         _record_player_response(
             video.video_id,
             player_data,
+            proxy_ip=proxy_ip,
             proxy_file=proxy_file,
         )
         InnerTubeVideoParser._apply_player_data(video, player_data)

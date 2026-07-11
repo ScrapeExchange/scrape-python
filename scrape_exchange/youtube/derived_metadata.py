@@ -22,6 +22,7 @@ from scrape_exchange.file_management import (
     VIDEO_YTDLP_FILE_PREFIX,
 )
 from scrape_exchange.scrape_api import (
+    GetDataResponseModel,
     fetch_youtube_channel,
     get_data_by_param,
 )
@@ -189,7 +190,7 @@ async def api_channel_country(
     if client is None or not username:
         return None
     try:
-        entry = await get_data_by_param(
+        entry: GetDataResponseModel = await get_data_by_param(
             client,
             username=username,
             platform=Platform.YOUTUBE,

@@ -361,6 +361,7 @@ class TestPlayerResponseInstrumentation(unittest.TestCase):
                 innertube_mod._record_player_response(
                     'vid123',
                     player_data,
+                    proxy_ip='203.0.113.10',
                     proxy_file='proxy-a',
                 )
         finally:
@@ -373,6 +374,9 @@ class TestPlayerResponseInstrumentation(unittest.TestCase):
         self.assertIn(
             'InnerTube PLAYER returned sparse videoDetails',
             logs.output[0],
+        )
+        self.assertEqual(
+            getattr(logs.records[0], 'proxy_ip'), '203.0.113.10',
         )
 
 

@@ -213,6 +213,10 @@ class ExchangeClient(AsyncClient):
         self.exchange_url: str = exchange_url
         self.jwt_header: str | None = None
         self.headers: dict[str, str] = {}
+        self._api_key_id: str | None = None
+        self._api_key_secret: str | None = None
+        self._auth_refresh_lock: asyncio.Lock = asyncio.Lock()
+        self._auth_had_success: bool = False
 
         # Background upload machinery is lazily started on first
         # ``enqueue_upload`` call so tests and callers that never need
@@ -290,6 +294,8 @@ class ExchangeClient(AsyncClient):
         '''
 
         self = ExchangeClient(exchange_url)
+        self._api_key_id = api_key_id
+        self._api_key_secret = api_key_secret
 
         # If the supervisor already fetched a JWT, use it.
         env_jwt: str | None = os.environ.get('EXCHANGE_JWT')
@@ -394,9 +400,82 @@ class ExchangeClient(AsyncClient):
 
             return jwt_header
 
+    def _record_auth_success(self, result: Response) -> None:
+        if (
+            self.headers.get('Authorization')
+            and 200 <= result.status_code < 300
+        ):
+            self._auth_had_success = True
+
+    def _should_refresh_auth(
+        self, result: Response, auth_retry: bool,
+    ) -> bool:
+        if not auth_retry or result.status_code != 401:
+            return False
+        if not getattr(self, '_auth_had_success', False):
+            return False
+        return bool(
+            getattr(self, '_api_key_id', None)
+            and getattr(self, '_api_key_secret', None)
+        )
+
+    async def _refresh_jwt_after_rejection(
+        self,
+        failed_auth_header: str | None,
+        url: str,
+    ) -> bool:
+        api_key_id: str | None = getattr(self, '_api_key_id', None)
+        api_key_secret: str | None = getattr(
+            self, '_api_key_secret', None,
+        )
+        if not api_key_id or not api_key_secret:
+            _LOGGER.warning(
+                'Cannot renew ExchangeClient JWT without API key '
+                'credentials',
+                extra={'url': url},
+            )
+            return False
+
+        lock: asyncio.Lock | None = getattr(
+            self, '_auth_refresh_lock', None,
+        )
+        if lock is None:
+            lock = asyncio.Lock()
+            self._auth_refresh_lock = lock
+
+        async with lock:
+            current_header: str | None = self.headers.get('Authorization')
+            if (
+                failed_auth_header is not None
+                and current_header != failed_auth_header
+            ):
+                return True
+
+            try:
+                jwt_header: str = await ExchangeClient.get_jwt_token(
+                    api_key_id,
+                    api_key_secret,
+                    self.exchange_url,
+                )
+            except Exception as exc:
+                _LOGGER.warning(
+                    'Failed to renew ExchangeClient JWT',
+                    exc=exc,
+                    extra={'url': url, 'exchange_url': self.exchange_url},
+                )
+                return False
+
+            self.jwt_header = jwt_header
+            self.headers['Authorization'] = jwt_header
+            _LOGGER.info(
+                'Renewed ExchangeClient JWT after API rejection',
+                extra={'url': url, 'exchange_url': self.exchange_url},
+            )
+            return True
+
     async def get(
         self, url: str, retries: int = 3,
-        delay: float = 1.0, **kwargs,
+        delay: float = 1.0, _auth_retry: bool = True, **kwargs,
     ) -> Response:
         '''
         Overrides the AsyncClient get method to include the JWT
@@ -416,6 +495,9 @@ class ExchangeClient(AsyncClient):
             await limiter.acquire(ScrapeExchangeCallType.GET)
 
         _LOGGER.debug('HTTP GET', extra={'url': url})
+        request_auth_header: str | None = self.headers.get(
+            'Authorization',
+        )
         start: datetime = datetime.now(UTC)
         try:
             result: Response = await super().get(
@@ -435,7 +517,8 @@ class ExchangeClient(AsyncClient):
                 )
                 return await self.get(
                     url, retries=retries - 1,
-                    delay=delay * 2, **kwargs,
+                    delay=delay * 2, _auth_retry=_auth_retry,
+                    **kwargs,
                 )
             _LOGGER.warning(
                 'GET request failed after retries',
@@ -457,6 +540,19 @@ class ExchangeClient(AsyncClient):
             status_class=_status_class(result.status_code),
             worker_id=get_worker_id(),
         ).observe(duration)
+
+        self._record_auth_success(result)
+        if self._should_refresh_auth(result, _auth_retry):
+            if await self._refresh_jwt_after_rejection(
+                request_auth_header, url,
+            ):
+                return await self.get(
+                    url,
+                    retries=retries,
+                    delay=delay,
+                    _auth_retry=False,
+                    **kwargs,
+                )
 
         if result.status_code == 429:
             METRIC_429_RECEIVED.labels(
@@ -485,7 +581,7 @@ class ExchangeClient(AsyncClient):
                 await asyncio.sleep(penalty)
                 return await self.get(
                     url, retries=retries - 1,
-                    delay=delay, **kwargs,
+                    delay=delay, _auth_retry=_auth_retry, **kwargs,
                 )
             return result
 
@@ -501,7 +597,7 @@ class ExchangeClient(AsyncClient):
 
     async def post(
         self, url: str, retries: int = 3,
-        delay: float = 1.0, **kwargs,
+        delay: float = 1.0, _auth_retry: bool = True, **kwargs,
     ) -> Response:
         '''
         Overrides the AsyncClient post method to include retry
@@ -524,6 +620,9 @@ class ExchangeClient(AsyncClient):
             await limiter.acquire(ScrapeExchangeCallType.POST)
 
         _LOGGER.debug('HTTP POST', extra={'url': url})
+        request_auth_header: str | None = self.headers.get(
+            'Authorization',
+        )
         start: datetime = datetime.now(UTC)
         try:
             result: Response = await super().post(
@@ -553,7 +652,8 @@ class ExchangeClient(AsyncClient):
                 )
                 return await self.post(
                     url, retries=retries - 1,
-                    delay=delay * 2, **kwargs,
+                    delay=delay * 2, _auth_retry=_auth_retry,
+                    **kwargs,
                 )
             _LOGGER.warning(
                 'POST request failed after retries',
@@ -575,6 +675,19 @@ class ExchangeClient(AsyncClient):
             status_class=_status_class(result.status_code),
             worker_id=get_worker_id(),
         ).observe(duration)
+
+        self._record_auth_success(result)
+        if self._should_refresh_auth(result, _auth_retry):
+            if await self._refresh_jwt_after_rejection(
+                request_auth_header, url,
+            ):
+                return await self.post(
+                    url,
+                    retries=retries,
+                    delay=delay,
+                    _auth_retry=False,
+                    **kwargs,
+                )
 
         if result.status_code == 429:
             METRIC_429_RECEIVED.labels(
@@ -603,7 +716,7 @@ class ExchangeClient(AsyncClient):
                 await asyncio.sleep(penalty)
                 return await self.post(
                     url, retries=retries - 1,
-                    delay=delay, **kwargs,
+                    delay=delay, _auth_retry=_auth_retry, **kwargs,
                 )
             return result
 

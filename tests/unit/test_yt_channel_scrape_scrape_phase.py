@@ -447,7 +447,7 @@ class TestScrapeOne(
         '._do_scrape_channel_to_disk_typed',
         new_callable=AsyncMock,
     )
-    async def test_no_content_marks_no_videos_not_not_found(
+    async def test_no_content_with_unknown_video_count_is_retryable(
         self,
         mock_scrape: AsyncMock,
         mock_exists: AsyncMock,
@@ -456,6 +456,104 @@ class TestScrapeOne(
         channel = MagicMock()
         channel.subscriber_count = None
         channel.video_count = None
+        channel.channel_id = 'UCabc00000000000000000000'
+        channel.channel_handle = 'empty'
+        channel.title = 'Empty Channel'
+        from tools.yt_channel_scrape import (
+            ChannelNoContentError,
+            _scrape_one_queued,
+        )
+        mock_scrape.side_effect = ChannelNoContentError(
+            'scraped but has no content',
+            channel,
+        )
+        queue = AsyncMock()
+        creator_map = AsyncMock()
+        creator_map.get.return_value = 'empty'
+        await _scrape_one_queued(
+            'UCabc00000000000000000000',
+            queue=queue,
+            settings=_mock_settings(),
+            fm=MagicMock(),
+            creator_map_backend=creator_map,
+            http_client=MagicMock(),
+        )
+        queue.mark_not_found_confirmed.assert_not_awaited()
+        queue.mark.assert_not_awaited()
+        queue.mark_soft_unavailable.assert_awaited_once_with(
+            'UCabc00000000000000000000',
+            last_error='scraped but has no content',
+        )
+        queue.update_tier.assert_not_called()
+
+    @patch(
+        'tools.yt_channel_scrape'
+        '._channel_exists_on_exchange',
+        new_callable=AsyncMock,
+    )
+    @patch(
+        'tools.yt_channel_scrape'
+        '._do_scrape_channel_to_disk_typed',
+        new_callable=AsyncMock,
+    )
+    async def test_no_content_with_positive_video_count_is_retryable(
+        self,
+        mock_scrape: AsyncMock,
+        mock_exists: AsyncMock,
+    ) -> None:
+        mock_exists.return_value = False
+        channel = MagicMock()
+        channel.subscriber_count = None
+        channel.video_count = 37
+        channel.channel_id = 'UCabc00000000000000000000'
+        channel.channel_handle = 'active'
+        channel.title = 'Active Channel'
+        from tools.yt_channel_scrape import (
+            ChannelNoContentError,
+            _scrape_one_queued,
+        )
+        mock_scrape.side_effect = ChannelNoContentError(
+            'scraped but has no content',
+            channel,
+        )
+        queue = AsyncMock()
+        creator_map = AsyncMock()
+        creator_map.get.return_value = 'active'
+        await _scrape_one_queued(
+            'UCabc00000000000000000000',
+            queue=queue,
+            settings=_mock_settings(),
+            fm=MagicMock(),
+            creator_map_backend=creator_map,
+            http_client=MagicMock(),
+        )
+        queue.mark_not_found_confirmed.assert_not_awaited()
+        queue.mark.assert_not_awaited()
+        queue.mark_soft_unavailable.assert_awaited_once_with(
+            'UCabc00000000000000000000',
+            last_error='scraped but has no content',
+        )
+        queue.update_tier.assert_not_called()
+
+    @patch(
+        'tools.yt_channel_scrape'
+        '._channel_exists_on_exchange',
+        new_callable=AsyncMock,
+    )
+    @patch(
+        'tools.yt_channel_scrape'
+        '._do_scrape_channel_to_disk_typed',
+        new_callable=AsyncMock,
+    )
+    async def test_no_content_with_zero_video_count_marks_no_videos(
+        self,
+        mock_scrape: AsyncMock,
+        mock_exists: AsyncMock,
+    ) -> None:
+        mock_exists.return_value = False
+        channel = MagicMock()
+        channel.subscriber_count = None
+        channel.video_count = 0
         channel.channel_id = 'UCabc00000000000000000000'
         channel.channel_handle = 'empty'
         channel.title = 'Empty Channel'
