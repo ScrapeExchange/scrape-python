@@ -944,6 +944,25 @@ class TestParseChannelVideoData(unittest.TestCase):
         with self.assertRaises(ValueError):
             ch.parse_channel_video_data(page_data)
 
+    def test_failed_video_count_parse_keeps_positive_count(self) -> None:
+        ch = YouTubeChannel(channel_handle='Test')
+        ch.video_count = 42
+        page_data = {
+            'metadata': {
+                'channelMetadataRenderer': {
+                    'name': 'TestChannel',
+                }
+            },
+        }
+        with patch.object(
+            YouTubeChannel,
+            'parse_video_count',
+            return_value=None,
+        ):
+            ch.parse_channel_video_data(page_data)
+
+        self.assertEqual(ch.video_count, 42)
+
 
 # ---------------------------------------------------------------------------
 # _set_channel_video_thumbnail
@@ -1923,6 +1942,115 @@ class TestCanonicalHandleAttribute(unittest.IsolatedAsyncioTestCase):
                 'UC1234567890abcdefghij',
                 'http://proxy-one:8080',
             )
+
+    async def test_video_count_falls_back_to_parsed_video_ids(
+        self,
+    ) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as save_dir:
+            channel: YouTubeChannel = YouTubeChannel(
+                channel_handle='input',
+            )
+            channel.channel_id = 'UC1234567890abcdefghij'
+
+            with patch(
+                'scrape_exchange.youtube.youtube_channel'
+                '.YouTubeChannelTabs',
+            ) as tabs_cls:
+                tabs_cls.return_value.browse_channel = AsyncMock(
+                    return_value={'metadata': {}},
+                )
+                tabs_cls.return_value.scrape_loaded_tabs = AsyncMock(
+                    return_value=(
+                        {'video-one', 'short-one'},
+                        set(), set(), set(), set(), set(),
+                    ),
+                )
+                with patch.object(
+                    channel, 'parse_channel_video_data',
+                ):
+                    await channel.scrape_channel_content(
+                        save_dir=save_dir,
+                    )
+
+            self.assertEqual(channel.video_count, 2)
+
+    async def test_zero_video_count_falls_back_to_parsed_video_ids(
+        self,
+    ) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as save_dir:
+            channel: YouTubeChannel = YouTubeChannel(
+                channel_handle='input',
+            )
+            channel.channel_id = 'UC1234567890abcdefghij'
+
+            def set_zero_video_count(page_data: dict) -> None:
+                channel.video_count = 0
+
+            with patch(
+                'scrape_exchange.youtube.youtube_channel'
+                '.YouTubeChannelTabs',
+            ) as tabs_cls:
+                tabs_cls.return_value.browse_channel = AsyncMock(
+                    return_value={'metadata': {}},
+                )
+                tabs_cls.return_value.scrape_loaded_tabs = AsyncMock(
+                    return_value=(
+                        {'video-one', 'video-two', 'short-one'},
+                        set(), set(), set(), set(), set(),
+                    ),
+                )
+                with patch.object(
+                    channel,
+                    'parse_channel_video_data',
+                    side_effect=set_zero_video_count,
+                ):
+                    await channel.scrape_channel_content(
+                        save_dir=save_dir,
+                    )
+
+            self.assertEqual(channel.video_count, 3)
+
+    async def test_positive_video_count_ignores_parsed_id_fallback(
+        self,
+    ) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as save_dir:
+            channel: YouTubeChannel = YouTubeChannel(
+                channel_handle='input',
+            )
+            channel.channel_id = 'UC1234567890abcdefghij'
+
+            def set_positive_video_count(page_data: dict) -> None:
+                channel.video_count = 99
+
+            with patch(
+                'scrape_exchange.youtube.youtube_channel'
+                '.YouTubeChannelTabs',
+            ) as tabs_cls:
+                tabs_cls.return_value.browse_channel = AsyncMock(
+                    return_value={'metadata': {}},
+                )
+                tabs_cls.return_value.scrape_loaded_tabs = AsyncMock(
+                    return_value=(
+                        {'video-one', 'short-one'},
+                        set(), set(), set(), set(), set(),
+                    ),
+                )
+                with patch.object(
+                    channel,
+                    'parse_channel_video_data',
+                    side_effect=set_positive_video_count,
+                ):
+                    await channel.scrape_channel_content(
+                        save_dir=save_dir,
+                    )
+
+            self.assertEqual(channel.video_count, 99)
 
 
 class TestScrapeAboutPageViewCountFallback(

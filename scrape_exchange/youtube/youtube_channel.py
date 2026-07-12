@@ -1017,8 +1017,11 @@ class YouTubeChannel:
         self.subscriber_count = \
             YouTubeChannel.parse_subscriber_count(page_data)
 
-        self.video_count: int | None = \
+        parsed_video_count: int | None = (
             YouTubeChannel.parse_video_count(page_data)
+        )
+        if parsed_video_count is not None or not self.video_count:
+            self.video_count = parsed_video_count
 
         channel_info: dict[str, any] | None = page_data.get(
             'metadata', {}
@@ -1591,6 +1594,7 @@ class YouTubeChannel:
             raise RuntimeError(
                 f'Failed to scrape channel content: {exc}'
             ) from exc
+        self._set_video_count_from_loaded_video_ids()
 
         videos_imported: int = 0
         if max_videos_per_channel:
@@ -1607,6 +1611,13 @@ class YouTubeChannel:
         )
 
         return videos_imported
+
+    def _set_video_count_from_loaded_video_ids(self) -> None:
+        if self.video_count not in (None, 0):
+            return
+        parsed_video_count: int = len(self.video_ids)
+        if parsed_video_count > 0:
+            self.video_count = parsed_video_count
 
     async def scrape_videos(
         self, save_dir: str, max_videos_per_channel: int,

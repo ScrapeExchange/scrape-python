@@ -19,6 +19,7 @@ from scrape_exchange.scrape_api import (
     PostFilterRequestModel,
     QueryResponseModel,
     filter_data,
+    get_data_by_param,
     get_data_by_item_id,
     iter_filter_data,
 )
@@ -124,6 +125,29 @@ class TestEndpointWrappers(
             called_url,
         )
         self.assertEqual(str(result.item_id), entry['item_id'])
+
+    async def test_get_data_by_param_serialises_platform_enum(
+        self,
+    ) -> None:
+        entry: dict = _make_entry()
+        client: MagicMock = MagicMock()
+        client.exchange_url = 'https://scrape.exchange'
+        client.get = AsyncMock(
+            return_value=_make_mock_response(entry),
+        )
+
+        await get_data_by_param(
+            client,
+            username='drand',
+            platform=Platform.YOUTUBE,
+            entity='channel',
+            version='0.0.2',
+            platform_content_id='UC0RqFH_a-Ha43-Q2ZYVhX_A',
+        )
+
+        called_url: str = client.get.await_args.args[0]
+        self.assertIn('/drand/youtube/channel/0.0.2/', called_url)
+        self.assertNotIn('Platform.YOUTUBE', called_url)
 
     async def test_filter_data_posts_json(self) -> None:
         entry: dict = _make_entry()

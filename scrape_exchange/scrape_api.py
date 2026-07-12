@@ -50,6 +50,12 @@ _DEFAULT_PAGE_SIZE: int = 100
 _MAX_PAGE_SIZE: int = 1000
 
 
+def _platform_path_component(platform: Platform | str) -> str:
+    if isinstance(platform, Platform):
+        return platform.value
+    return platform
+
+
 # ---------------------------------------------------------------
 # Pagination models (mirror server/datatypes.py)
 # ---------------------------------------------------------------
@@ -171,9 +177,10 @@ async def get_data_by_param(
     Full-key lookup; raises on 404 (record not found for that
     combination).
     '''
+    platform_value: str = _platform_path_component(platform)
     url: str = (
         f'{client.exchange_url.rstrip("/")}{_API_PREFIX}/data/param/'
-        f'{username}/{platform}/{entity}/{version}/'
+        f'{username}/{platform_value}/{entity}/{version}/'
         f'{platform_content_id}'
     )
     response = await client.get(url)
@@ -199,9 +206,10 @@ async def get_data_by_username_platform_entity(
     suffix: str = (
         f'/{version}' if version is not None else ''
     )
+    platform_value: str = _platform_path_component(platform)
     url: str = (
         f'{client.exchange_url.rstrip("/")}{_API_PREFIX}/data/param/'
-        f'{username}/{platform}/{entity}{suffix}'
+        f'{username}/{platform_value}/{entity}{suffix}'
     )
     params: dict[str, str] = {'first': str(first)}
     if after is not None:
@@ -226,9 +234,10 @@ async def get_data_by_content(
 
     Returns all uploaders' records for one content item.
     '''
+    platform_value: str = _platform_path_component(platform)
     url: str = (
         f'{client.exchange_url.rstrip("/")}{_API_PREFIX}/data/content/'
-        f'{platform}/{entity}/{platform_content_id}'
+        f'{platform_value}/{entity}/{platform_content_id}'
     )
     params: dict[str, str] = {'first': str(first)}
     if after is not None:
