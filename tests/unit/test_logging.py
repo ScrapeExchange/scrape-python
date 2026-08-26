@@ -10,6 +10,7 @@ import json
 import logging
 import unittest
 from io import StringIO
+from unittest.mock import patch
 
 from scrape_exchange import logging as se_logging
 from scrape_exchange.logging import (
@@ -171,6 +172,22 @@ class ConfigureLoggingTests(unittest.TestCase):
         self.assertEqual(len(handlers), 1)
         self.assertNotIsInstance(handlers[0].formatter, JsonFormatter)
         self.assertEqual(logging.getLogger().level, logging.DEBUG)
+
+    def test_stdout_uses_inherited_stream_without_reopening(self) -> None:
+        stream: StringIO = StringIO()
+        with patch('sys.stdout', stream), patch.object(
+            logging,
+            'FileHandler',
+            side_effect=PermissionError('cannot reopen cron pipe'),
+        ):
+            configure_logging(
+                level='INFO',
+                filename='/dev/stdout',
+                log_format='text',
+            )
+            logging.getLogger('test.cron').info('cron logging works')
+
+        self.assertIn('cron logging works', stream.getvalue())
 
     def test_exc_kwarg_json_emits_top_level_field(self) -> None:
         configure_logging(

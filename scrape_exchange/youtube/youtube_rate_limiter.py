@@ -51,6 +51,7 @@ from typing import ClassVar
 from prometheus_client import Counter, Gauge
 
 from scrape_exchange.rate_limiter import RateLimiter, _BucketConfig
+from scrape_exchange.util import extract_proxy_ip, extract_proxy_port
 from scrape_exchange.youtube.rate_limit_settings import (
     YT_RATE_LIMITS,
 )
@@ -364,7 +365,10 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
         _LOGGER.warning(
             'RSS circuit breaker opened for proxy',
             extra={
-                'proxy': proxy,
+                'proxy_ip': extract_proxy_ip(proxy) if proxy else 'none',
+                'proxy_port': (
+                    extract_proxy_port(proxy) if proxy else 'none'
+                ),
                 'cooldown_seconds': cooldown,
                 'consecutive_opens': state.consecutive_opens,
                 'reason': reason,
@@ -396,7 +400,14 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
         if had_state:
             _LOGGER.info(
                 'RSS circuit breaker reset by successful fetch',
-                extra={'proxy': proxy},
+                extra={
+                    'proxy_ip': (
+                        extract_proxy_ip(proxy) if proxy else 'none'
+                    ),
+                    'proxy_port': (
+                        extract_proxy_port(proxy) if proxy else 'none'
+                    ),
+                },
             )
 
     def select_proxy(
@@ -466,7 +477,12 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
                     'All RSS circuits open; sleeping until '
                     'earliest reopens',
                     extra={
-                        'proxy': proxy,
+                        'proxy_ip': (
+                            extract_proxy_ip(proxy) if proxy else 'none'
+                        ),
+                        'proxy_port': (
+                            extract_proxy_port(proxy) if proxy else 'none'
+                        ),
                         'wait_seconds': wait,
                     },
                 )

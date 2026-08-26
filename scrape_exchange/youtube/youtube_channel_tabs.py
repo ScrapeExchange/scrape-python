@@ -30,6 +30,8 @@ from scrape_exchange.proxy_loader import _POOLED_HTTPX_LIMITS
 from scrape_exchange.youtube.youtube_types import YouTubeChannelPageType
 
 from .youtube_client import (
+    ANDROID_CLIENT_VERSION,
+    ANDROID_USER_AGENT,
     AsyncYouTubeClient,
     INNERTUBE_CLIENT_NAME,
     INNERTUBE_CLIENT_VERSION,
@@ -42,7 +44,11 @@ from scrape_exchange.proxy_loader import proxy_file_label
 from scrape_exchange.proxy_phase_metrics import (
     install_innertube_phase_tracing,
 )
-from scrape_exchange.util import extract_proxy_ip, proxy_network_for
+from scrape_exchange.util import (
+    extract_proxy_ip,
+    extract_proxy_port,
+    proxy_network_for,
+)
 from scrape_exchange.watchdog import Watchdog
 from .youtube_cookiejar import YouTubeCookieJar
 from .youtube_rate_limiter import YouTubeRateLimiter, YouTubeCallType
@@ -665,11 +671,14 @@ class YouTubeChannelTabs:
             extract_proxy_ip(self.proxy) if self.proxy else 'none'
         )
         proxy_network: str = proxy_network_for(proxy_ip)
+        proxy_port: str = (
+            extract_proxy_port(self.proxy) if self.proxy else 'none'
+        )
         proxy_file: str = proxy_file_label(self.proxy or '')
         extra: dict[str, str] = {
             'channel_id': self.channel_id,
-            'proxy': self.proxy or 'none',
             'proxy_ip': proxy_ip,
+            'proxy_port': proxy_port,
             'proxy_network': proxy_network,
             'proxy_file': proxy_file,
         }
@@ -1029,6 +1038,9 @@ def shutdown_innertube_executor() -> None:
 
 def build_innertube_with_pool_limits(
     entry: str | None,
+    client_name: str = 'WEB',
+    client_version: str = INNERTUBE_CLIENT_VERSION,
+    user_agent: str | None = None,
 ) -> InnerTube:
     '''Construct an :class:`InnerTube` whose underlying
     ``httpx.Client`` carries our shared pool limits
@@ -1049,17 +1061,45 @@ def build_innertube_with_pool_limits(
     then closes).
     '''
 
-    client: InnerTube = InnerTube(
-        'WEB', INNERTUBE_CLIENT_VERSION, proxies=entry,
-    )
+    if user_agent is None:
+        client: InnerTube = InnerTube(
+            client_name, client_version, proxies=entry,
+        )
+    else:
+        client = InnerTube(
+            client_name,
+            client_version,
+            user_agent=user_agent,
+            proxies=entry,
+        )
     old_session: httpx.Client = client.adaptor.session
     client.adaptor.session = httpx.Client(
         base_url=old_session.base_url,
+        headers=old_session.headers.copy(),
         limits=_POOLED_HTTPX_LIMITS,
         timeout=_INNERTUBE_SYNC_HTTPX_TIMEOUT,
         proxies=entry,
     )
+    setattr(client, 'close', client.adaptor.session.close)
     old_session.close()
+    return client
+
+
+def _make_pooled_player_innertube_for_entry(
+    entry: str | None,
+) -> InnerTube:
+    '''Build a cookie-free Android client for player requests.'''
+
+    client: InnerTube = build_innertube_with_pool_limits(
+        entry,
+        client_name='ANDROID',
+        client_version=ANDROID_CLIENT_VERSION,
+        user_agent=ANDROID_USER_AGENT,
+    )
+    install_innertube_phase_tracing(
+        client.adaptor.session,
+        proxy_file=proxy_file_label(entry or ''),
+    )
     return client
 
 
@@ -1104,6 +1144,13 @@ _INNERTUBE_POOL: _LazyAsyncPool[
     aclose_attr='close',
 )
 
+_PLAYER_INNERTUBE_POOL: _LazyAsyncPool[
+    str | None, InnerTube,
+] = _LazyAsyncPool(
+    factory=_make_pooled_player_innertube_for_entry,
+    aclose_attr='close',
+)
+
 
 def pooled_innertube_for_entry(entry: str | None) -> InnerTube:
     '''Return the long-lived, keep-alive-pooled
@@ -1114,11 +1161,81 @@ def pooled_innertube_for_entry(entry: str | None) -> InnerTube:
     return _INNERTUBE_POOL.get(entry)
 
 
+def pooled_player_innertube_for_entry(
+    entry: str | None,
+) -> InnerTube:
+    '''Return the pooled Android VR client for player requests.'''
+
+    return _PLAYER_INNERTUBE_POOL.get(entry)
+
+
+def borrow_pooled_innertube_for_entry(
+    entry: str | None,
+) -> InnerTube:
+    '''Borrow the Web client used for one ``next`` request.'''
+
+    return _INNERTUBE_POOL.borrow(entry)
+
+
+async def release_pooled_innertube(client: InnerTube) -> None:
+    '''Release a Web client borrowed for one request.'''
+
+    await _INNERTUBE_POOL.release(client)
+
+
+def borrow_pooled_player_innertube_for_entry(
+    entry: str | None,
+) -> InnerTube:
+    '''Borrow the Android VR client used for one player request.'''
+
+    return _PLAYER_INNERTUBE_POOL.borrow(entry)
+
+
+async def release_pooled_player_innertube(
+    client: InnerTube,
+) -> None:
+    '''Release an Android VR client borrowed for one request.'''
+
+    await _PLAYER_INNERTUBE_POOL.release(client)
+
+
+async def refresh_pooled_innertube_for_entry(
+    entry: str | None,
+    *,
+    challenged: InnerTube,
+) -> bool:
+    '''Retire the exact player-client generation YouTube challenged.
+
+    New calls immediately receive a replacement. Existing borrowers keep
+    the challenged generation alive until their requests finish. A stale
+    response cannot retire a replacement created by an earlier response.
+    '''
+
+    return await _PLAYER_INNERTUBE_POOL.retire_key(
+        entry,
+        expected=challenged,
+    )
+
+
+async def refresh_pooled_web_innertube_for_entry(
+    entry: str | None,
+    *,
+    challenged: InnerTube,
+) -> bool:
+    '''Retire the exact Web-client generation that failed transport.'''
+
+    return await _INNERTUBE_POOL.retire_key(
+        entry,
+        expected=challenged,
+    )
+
+
 async def aclose_pooled_innertube() -> None:
     '''Close every pooled InnerTube session and empty the pool.
     Called from the scraper shutdown drain.'''
 
     await _INNERTUBE_POOL.aclose_all()
+    await _PLAYER_INNERTUBE_POOL.aclose_all()
 
 
 def _reset_pool_for_tests() -> None:
@@ -1126,3 +1243,4 @@ def _reset_pool_for_tests() -> None:
     aclose. Tests only.'''
 
     _INNERTUBE_POOL.reset_for_tests()
+    _PLAYER_INNERTUBE_POOL.reset_for_tests()

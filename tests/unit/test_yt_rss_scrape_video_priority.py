@@ -3,6 +3,7 @@
 import importlib.util
 import sys
 import unittest
+from pathlib import Path
 from types import ModuleType
 from unittest import mock
 
@@ -12,10 +13,14 @@ def _load_yt_rss_scrape() -> ModuleType:
         cached: ModuleType | None = sys.modules.get(_key)
         if cached is not None:
             return cached
+    tool_path: Path = (
+        Path(__file__).resolve().parents[2]
+        / 'tools'
+        / 'yt_rss_scrape.py'
+    )
     spec = importlib.util.spec_from_file_location(
         'yt_rss_scrape',
-        '/home/steven/src/scrape-python/tools/'
-        'yt_rss_scrape.py',
+        tool_path,
     )
     module: ModuleType = (
         importlib.util.module_from_spec(spec)
@@ -61,7 +66,12 @@ class TestQueueVideoForScrape(
         )
         self.assertEqual(result, 'vid_a')
         queue.enqueue.assert_awaited_once_with(
-            'vid_a', source='rss',
+            'vid_a',
+            source='rss',
+            channel_id=None,
+            channel_handle='hh',
+            channel_url=None,
+            channel_is_verified=None,
         )
         video.from_innertube.assert_not_awaited()
         video.to_file.assert_not_awaited()

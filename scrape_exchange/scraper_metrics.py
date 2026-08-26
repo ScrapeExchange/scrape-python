@@ -31,17 +31,21 @@ from prometheus_client import Counter, Gauge, Histogram
 #   Incremented once per successfully scraped entity (video, channel,
 #   rss_feed). Label superset covers all three tools.
 #   Labels not applicable to a particular tool should be passed as 'none'.
+#   channel_status is new/existing/unknown for channel scrapes and none
+#   for every other entity type.
 # ---------------------------------------------------------------------------
 METRIC_SCRAPES_COMPLETED: Counter = Counter(
     'scrapes_completed_total',
     'Number of entities successfully scraped, labelled by scraper, '
     'entity type, api (ytdlp/html/rss/innertube), proxy IP, '
-    'and proxy file. The proxy_network label was dropped to reduce '
-    'series cardinality; recover the per-network view by joining '
-    'proxy_file (which is 1:1 with network in production).',
+    'proxy file, and channel status. The proxy_network label was '
+    'dropped to reduce series cardinality; recover the per-network '
+    'view by joining proxy_file (which is 1:1 with network in '
+    'production).',
     [
         'platform', 'scraper', 'entity', 'api',
-        'worker_id', 'proxy_ip', 'proxy_file',
+        'worker_id', 'proxy_ip', 'proxy_port', 'proxy_file',
+        'channel_status',
     ],
 )
 
@@ -57,7 +61,7 @@ METRIC_SCRAPE_FAILURES: Counter = Counter(
     'proxy_network label was dropped to reduce series cardinality.',
     [
         'platform', 'scraper', 'entity', 'api',
-        'reason', 'worker_id', 'proxy_ip',
+        'reason', 'worker_id', 'proxy_ip', 'proxy_port',
         'proxy_file',
     ],
 )

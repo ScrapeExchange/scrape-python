@@ -3,6 +3,7 @@ including the local:// branch added for the PROXY_FILES feature."""
 
 import unittest
 
+import scrape_exchange.util as util
 from scrape_exchange.util import extract_proxy_ip
 
 
@@ -61,6 +62,49 @@ class TestExtractProxyIpLocalScheme(unittest.TestCase):
             with self.subTest(entry=entry):
                 with self.assertRaises(ValueError):
                     extract_proxy_ip(entry)
+
+
+class TestExtractProxyPort(unittest.TestCase):
+    """Proxy ports are exposed without leaking credentials."""
+
+    def test_extracts_explicit_port(self) -> None:
+        extract_proxy_port = getattr(util, 'extract_proxy_port', None)
+        self.assertIsNotNone(extract_proxy_port)
+        if extract_proxy_port is None:
+            return
+        self.assertEqual(
+            extract_proxy_port(
+                'http://user:secret@proxy.example:8080'
+            ),
+            '8080',
+        )
+
+    def test_returns_none_without_explicit_port(self) -> None:
+        extract_proxy_port = getattr(util, 'extract_proxy_port', None)
+        self.assertIsNotNone(extract_proxy_port)
+        if extract_proxy_port is None:
+            return
+        self.assertEqual(
+            extract_proxy_port('http://proxy.example'),
+            'none',
+        )
+        self.assertEqual(
+            extract_proxy_port('local://192.0.2.5'),
+            'none',
+        )
+
+    def test_rejects_invalid_port(self) -> None:
+        extract_proxy_port = getattr(util, 'extract_proxy_port', None)
+        self.assertIsNotNone(extract_proxy_port)
+        if extract_proxy_port is None:
+            return
+        for proxy in (
+            'http://proxy.example:not-a-port',
+            'http://proxy.example:70000',
+        ):
+            with self.subTest(proxy=proxy):
+                with self.assertRaises(ValueError):
+                    extract_proxy_port(proxy)
 
 
 if __name__ == '__main__':

@@ -1178,6 +1178,220 @@ class TestParseExternalUrls(unittest.TestCase):
         self.assertEqual(len(result), 0)
 
 
+class TestReconcileDescriptionExternalLinks(unittest.TestCase):
+    def test_adds_social_link_missing_from_external_urls(self) -> None:
+        channel: YouTubeChannel = YouTubeChannel(channel_handle='Test')
+        channel.description = (
+            'Follow us at https://www.instagram.com/example/. '
+            'Read more at https://example.com/news.'
+        )
+
+        channel._reconcile_description_external_links()
+
+        links: list[dict[str, str | int]] = [
+            link.to_dict() for link in channel.external_urls
+        ]
+        self.assertEqual(
+            links,
+            [{
+                'name': 'Instagram',
+                'url': 'https://www.instagram.com/example/',
+                'priority': 10,
+            }],
+        )
+
+    def test_existing_network_suppresses_description_profile(self) -> None:
+        channel: YouTubeChannel = YouTubeChannel(channel_handle='Test')
+        existing_link: YouTubeExternalLink = YouTubeExternalLink(
+            name='Instagram',
+            url='https://instagram.com/structured-profile',
+            priority=10,
+        )
+        channel.external_urls = {existing_link}
+        channel.description = (
+            'Alternate profile: https://instagram.com/description-profile'
+        )
+
+        channel._reconcile_description_external_links()
+
+        self.assertEqual(channel.external_urls, {existing_link})
+
+    def test_twitter_and_x_are_the_same_network(self) -> None:
+        channel: YouTubeChannel = YouTubeChannel(channel_handle='Test')
+        existing_link: YouTubeExternalLink = YouTubeExternalLink(
+            name='Twitter',
+            url='https://twitter.com/structured-profile',
+            priority=10,
+        )
+        channel.external_urls = {existing_link}
+        channel.description = 'Current profile: https://x.com/new-profile'
+
+        channel._reconcile_description_external_links()
+
+        self.assertEqual(channel.external_urls, {existing_link})
+
+    def test_adds_first_profile_per_network_and_rejects_lookalike(
+        self,
+    ) -> None:
+        channel: YouTubeChannel = YouTubeChannel(channel_handle='Test')
+        channel.description = (
+            'Facebook (https://m.facebook.com/first), then '
+            'https://facebook.com/second. Ignore '
+            'https://notinstagram.com/profile; use '
+            'https://instagram.com/real-profile.'
+        )
+
+        channel._reconcile_description_external_links()
+
+        links_by_name: dict[str, dict[str, str | int]] = {
+            link.name: link.to_dict() for link in channel.external_urls
+        }
+        self.assertEqual(
+            links_by_name,
+            {
+                'Facebook': {
+                    'name': 'Facebook',
+                    'url': 'https://m.facebook.com/first',
+                    'priority': 10,
+                },
+                'Instagram': {
+                    'name': 'Instagram',
+                    'url': 'https://instagram.com/real-profile',
+                    'priority': 20,
+                },
+            },
+        )
+
+    def test_adds_direct_email_address(self) -> None:
+        channel: YouTubeChannel = YouTubeChannel(channel_handle='Test')
+        channel.description = 'Email hello@example.com for details.'
+
+        channel._reconcile_description_external_links()
+
+        self.assertEqual(
+            [link.to_dict() for link in channel.external_urls],
+            [{
+                'name': 'email',
+                'url': 'mailto:hello@example.com',
+                'priority': 10,
+            }],
+        )
+
+    def test_normalizes_whitespace_around_at_sign(self) -> None:
+        channel: YouTubeChannel = YouTubeChannel(channel_handle='Test')
+        channel.description = 'Email hello   @   example.com for details.'
+
+        channel._reconcile_description_external_links()
+
+        self.assertEqual(
+            {link.url for link in channel.external_urls},
+            {'mailto:hello@example.com'},
+        )
+
+    def test_normalizes_whitespace_delimited_at_word(self) -> None:
+        channel: YouTubeChannel = YouTubeChannel(channel_handle='Test')
+        channel.description = 'Email hello at example.com for details.'
+
+        channel._reconcile_description_external_links()
+
+        self.assertEqual(
+            {link.url for link in channel.external_urls},
+            {'mailto:hello@example.com'},
+        )
+
+    def test_normalizes_hyphen_delimited_at_word(self) -> None:
+        channel: YouTubeChannel = YouTubeChannel(channel_handle='Test')
+        channel.description = 'Email hello-at-example.com for details.'
+
+        channel._reconcile_description_external_links()
+
+        self.assertEqual(
+            {link.url for link in channel.external_urls},
+            {'mailto:hello@example.com'},
+        )
+
+    def test_deduplicates_email_addresses_case_insensitively(self) -> None:
+        channel: YouTubeChannel = YouTubeChannel(channel_handle='Test')
+        channel.description = (
+            'Email Hello@example.com or hello @ EXAMPLE.COM.'
+        )
+
+        channel._reconcile_description_external_links()
+
+        self.assertEqual(
+            {link.url for link in channel.external_urls},
+            {'mailto:Hello@example.com'},
+        )
+
+    def test_normalizes_parenthesized_at_word_with_optional_spaces(
+        self,
+    ) -> None:
+        channel: YouTubeChannel = YouTubeChannel(channel_handle='Test')
+        channel.description = (
+            'Email first(at)example.com or second (at) example.org.'
+        )
+
+        channel._reconcile_description_external_links()
+
+        self.assertEqual(
+            {link.url for link in channel.external_urls},
+            {
+                'mailto:first@example.com',
+                'mailto:second@example.org',
+            },
+        )
+
+    def test_existing_mailto_link_suppresses_duplicate_address(self) -> None:
+        channel: YouTubeChannel = YouTubeChannel(channel_handle='Test')
+        existing_link: YouTubeExternalLink = YouTubeExternalLink(
+            name='email',
+            url='mailto:HELLO@example.com',
+            priority=10,
+        )
+        channel.external_urls = {existing_link}
+        channel.description = 'Email hello at EXAMPLE.COM.'
+
+        channel._reconcile_description_external_links()
+
+        self.assertEqual(channel.external_urls, {existing_link})
+
+    def test_rejects_malformed_email_addresses(self) -> None:
+        channel: YouTubeChannel = YouTubeChannel(channel_handle='Test')
+        channel.description = (
+            'Invalid hello..there@example.com, '
+            'hello at -example.com, and hello@example..com.'
+        )
+
+        channel._reconcile_description_external_links()
+
+        self.assertEqual(channel.external_urls, set())
+
+    def test_does_not_extract_email_from_url_path(self) -> None:
+        channel: YouTubeChannel = YouTubeChannel(channel_handle='Test')
+        channel.description = (
+            'Read https://example.com/hello-at-example.org for details.'
+        )
+
+        channel._reconcile_description_external_links()
+
+        self.assertEqual(
+            {link.name for link in channel.external_urls},
+            set(),
+        )
+
+    def test_missing_vanity_url_does_not_break_email_extraction(self) -> None:
+        channel: YouTubeChannel = YouTubeChannel(channel_handle='Test')
+        channel._parse_channel_about_metadata({
+            'description': 'Email hello@example.com',
+        })
+
+        channel._reconcile_description_external_links()
+
+        self.assertEqual(
+            {link.url for link in channel.external_urls},
+            {'mailto:hello@example.com'},
+        )
+
 # ---------------------------------------------------------------------------
 # parse_video_count / parse_subscriber_count edge cases
 # ---------------------------------------------------------------------------
@@ -1623,6 +1837,40 @@ class TestScrapeValidation(unittest.IsolatedAsyncioTestCase):
                 save_dir='/tmp',
                 max_videos_per_channel=unittest.mock.ANY
             )
+
+    async def test_content_description_reconciles_when_about_fails(
+        self,
+    ) -> None:
+        channel: YouTubeChannel = YouTubeChannel(
+            'TestCh', channel_id='UCknown'
+        )
+        channel.save_dir = '/tmp'
+
+        async def scrape_channel_content(
+            *args: object,
+            **kwargs: object,
+        ) -> int:
+            channel.description = (
+                'Follow https://www.instagram.com/content-profile'
+            )
+            return 0
+
+        with patch.object(
+            channel,
+            'scrape_about_page',
+            new_callable=AsyncMock,
+            side_effect=RuntimeError('about failed'),
+        ), patch.object(
+            channel,
+            'scrape_channel_content',
+            side_effect=scrape_channel_content,
+        ):
+            await channel.scrape(with_about_page=True)
+
+        self.assertEqual(
+            {link.url for link in channel.external_urls},
+            {'https://www.instagram.com/content-profile'},
+        )
 
     async def test_known_channel_scrapes_about_and_content_together(
         self,
@@ -2121,6 +2369,69 @@ class TestScrapeAboutPageViewCountFallback(
             await ch.scrape_about_page()
 
         self.assertEqual(ch.view_count, 1234567)
+
+    async def test_reconciles_description_after_structured_links(
+        self,
+    ) -> None:
+        page_data: dict = {
+            'metadata': {
+                'channelMetadataRenderer': {
+                    'description': (
+                        'Instagram: https://instagram.com/from-description'
+                    ),
+                    'vanityChannelUrl': (
+                        'https://www.youtube.com/@Test'
+                    ),
+                },
+            },
+        }
+        about_renderer: dict = {
+            'links': [{
+                'channelExternalLinkViewModel': {
+                    'title': {'content': 'Twitter'},
+                    'link': {
+                        'content': 'https://twitter.com/structured',
+                    },
+                },
+            }],
+        }
+        channel: YouTubeChannel = YouTubeChannel(channel_handle='Test')
+        channel.url = 'https://www.youtube.com/@Test'
+        mock_client: AsyncMock = AsyncMock()
+        mock_client.get = AsyncMock(return_value='<html/>')
+        mock_client.proxy = None
+        channel.browse_client = mock_client
+
+        with patch.object(
+            channel, '_extract_initial_data', return_value=page_data,
+        ), patch.object(
+            channel, '_find_about_renderer', return_value=about_renderer,
+        ), patch.object(
+            channel, '_parse_thumbnails_banners',
+        ), patch.object(
+            YouTubeChannel,
+            'extract_linked_channels',
+            return_value=set(),
+        ), patch.object(
+            YouTubeChannel,
+            'extract_channel_id',
+            return_value='UC1234567890abcdefghij',
+        ):
+            await channel.scrape_about_page()
+
+        links_by_name: dict[str, str] = {
+            link.name: link.url for link in channel.external_urls
+        }
+        self.assertEqual(
+            links_by_name,
+            {
+                'YouTube': 'https://www.youtube.com/@Test',
+                'Twitter': 'https://twitter.com/structured',
+                'Instagram': (
+                    'https://instagram.com/from-description'
+                ),
+            },
+        )
 
 
 class TestTerminalChannelPageMessage(

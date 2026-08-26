@@ -126,7 +126,7 @@
       "gridPos": {
         "h": 4,
         "w": 6,
-        "x": 12,
+        "x": 6,
         "y": 1
       },
       "id": 4,
@@ -263,8 +263,8 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
-        "w": 24,
+        "h": 10,
+        "w": 16,
         "x": 0,
         "y": 6
       },
@@ -293,7 +293,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (entity) (rate(scrapes_completed_total{job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "expr": "sum by (entity) (rate(scrapes_completed_total{job=~\"$job\",instance=~\"$instance\",entity=\"rss_feed\"}[5m]))",
           "legendFormat": "{{entity}}",
           "range": true,
           "refId": "A"
@@ -304,12 +304,38 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "",
+          "expr": "sum by (entity) (rate(scrapes_completed_total{job=~\"$job\",instance=~\"$instance\",entity=\"channel\",channel_status=\"new\"}[5m]))",
           "hide": false,
           "instant": false,
-          "legendFormat": "__auto",
+          "legendFormat": "channel - new",
           "range": true,
           "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (entity) (rate(scrapes_completed_total{job=~\"$job\",instance=~\"$instance\",entity=~\"channel\",channel_status=~\"existing\"}[5m]))",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "channel - existing",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (entity) (rate(scrapes_completed_total{job=~\"$job\",instance=~\"$instance\",entity=~\"channel\",channel_status!=\"existing\",channel_status!=\"new\"}[5m]))",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "{{entity}} - undetermined",
+          "range": true,
+          "refId": "D"
         }
       ],
       "title": "Scrapes per second by entity",
@@ -382,7 +408,7 @@
         "h": 10,
         "w": 8,
         "x": 16,
-        "y": 14
+        "y": 6
       },
       "id": 93,
       "options": {
@@ -426,7 +452,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 24
+        "y": 16
       },
       "id": 9,
       "panels": [],
@@ -522,10 +548,10 @@
         ]
       },
       "gridPos": {
-        "h": 8,
-        "w": 16,
+        "h": 9,
+        "w": 12,
         "x": 0,
-        "y": 25
+        "y": 17
       },
       "id": 10,
       "options": {
@@ -563,6 +589,120 @@
         }
       ],
       "title": "Scrape failures and sparse player responses",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Per-proxy_file success and failure rate (5m) of InnerTube channel.info calls made by the RSS scraper. Use to spot networks where InnerTube channel resolution is degrading.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 17
+      },
+      "id": 44,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (proxy_file) (rate(api_calls_total{api=\"innertube\",entity=\"channel\",status=\"failed\",job=~\"$job\",instance=~\"$instance\"}[5m])) / sum by (proxy_file) (rate(api_calls_total{api=\"innertube\",entity=\"channel\",job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{proxy_file}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "",
+          "legendFormat": "fail {{proxy_file}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "InnerTube Channel fail rate by proxy_file",
       "type": "timeseries"
     },
     {
@@ -634,7 +774,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 33
+        "y": 26
       },
       "id": 43,
       "options": {
@@ -681,229 +821,12 @@
       "type": "timeseries"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "description": "Per-proxy_file success and failure rate (5m) of InnerTube channel.info calls made by the RSS scraper. Use to spot networks where InnerTube channel resolution is degrading.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "showValues": false,
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          },
-          "unit": "percentunit"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 41
-      },
-      "id": 44,
-      "options": {
-        "legend": {
-          "calcs": [
-            "last",
-            "max"
-          ],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "pluginVersion": "12.3.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "editorMode": "code",
-          "expr": "sum by (proxy_file) (rate(api_calls_total{api=\"innertube\",entity=\"channel\",status=\"failed\",job=~\"$job\",instance=~\"$instance\"}[5m])) / sum by (proxy_file) (rate(api_calls_total{api=\"innertube\",entity=\"channel\",job=~\"$job\",instance=~\"$instance\"}[5m]))",
-          "legendFormat": "{{proxy_file}}",
-          "range": true,
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "editorMode": "code",
-          "expr": "",
-          "legendFormat": "fail {{proxy_file}}",
-          "range": true,
-          "refId": "B"
-        }
-      ],
-      "title": "InnerTube Channel fail rate by proxy_file",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "description": "Per-proxy_file failure rate (5m) of InnerTube video.info calls made by the RSS scraper. Use to spot networks where InnerTube video resolution is degrading.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "showValues": false,
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          },
-          "unit": "percentunit"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 41
-      },
-      "id": 45,
-      "options": {
-        "legend": {
-          "calcs": [
-            "last",
-            "max"
-          ],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "pluginVersion": "12.3.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "editorMode": "code",
-          "expr": "sum by (proxy_file) (rate(api_calls_total{scraper=\"rss_scraper\",api=\"innertube\",entity=\"video\",status=\"failed\",job=~\"$job\",instance=~\"$instance\"}[5m])) / sum by (proxy_file) (rate(api_calls_total{scraper=\"rss_scraper\",api=\"innertube\",entity=\"video\",job=~\"$job\",instance=~\"$instance\"}[5m]))",
-          "legendFormat": "ok {{proxy_file}}",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "InnerTube Video call fail ratio by proxy_file",
-      "type": "timeseries"
-    },
-    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 49
+        "y": 34
       },
       "id": 70,
       "panels": [],
@@ -915,7 +838,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "p50 / p95 of the TCP handshake to the proxy on RSS fetches. Histograms only record fresh connection establishment \u2014 keep-alive reuse skips the trace event, so _count reflects new tunnels, not total fetches.",
+      "description": "p50 / p95 of the TCP handshake to the proxy on RSS fetches. Histograms only record fresh connection establishment — keep-alive reuse skips the trace event, so _count reflects new tunnels, not total fetches.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -977,7 +900,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 50
+        "y": 35
       },
       "id": 71,
       "options": {
@@ -1002,8 +925,10 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
+          "editorMode": "code",
           "expr": "histogram_quantile(0.50, sum by (le, proxy_file) (rate(proxy_tcp_connect_seconds_bucket{call_type=\"rss\",job=~\"$job\",instance=~\"$instance\"}[5m])))",
           "legendFormat": "p50 {{proxy_file}}",
+          "range": true,
           "refId": "A"
         },
         {
@@ -1024,7 +949,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "p50 / p95 of the HTTP CONNECT exchange (proxy dialing YouTube on our behalf) on RSS fetches. The gap between connect_tcp.complete and start_tls.started \u2014 i.e. the proxy backend's dial-out queue.",
+      "description": "p50 / p95 of the HTTP CONNECT exchange (proxy dialing YouTube on our behalf) on RSS fetches. The gap between connect_tcp.complete and start_tls.started — i.e. the proxy backend's dial-out queue.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1086,7 +1011,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 50
+        "y": 35
       },
       "id": 72,
       "options": {
@@ -1133,7 +1058,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "p50 / p95 of the TLS handshake to YouTube via the proxy tunnel on RSS fetches. Slowness here \u2014 with fast TCP and HTTP CONNECT \u2014 indicates YouTube is throttling TLS from the proxy's egress IP rather than provider-side queueing.",
+      "description": "p50 / p95 of the TLS handshake to YouTube via the proxy tunnel on RSS fetches. Slowness here — with fast TCP and HTTP CONNECT — indicates YouTube is throttling TLS from the proxy's egress IP rather than provider-side queueing.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1195,7 +1120,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 50
+        "y": 35
       },
       "id": 73,
       "options": {
@@ -1243,7 +1168,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 58
+        "y": 43
       },
       "id": 74,
       "panels": [],
@@ -1255,7 +1180,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "p50 / p95 of the TCP handshake to the proxy on YouTube HTML fetches (channel about-page, home, search, session warm-up). Sourced from curl's CURLINFO_CONNECT_TIME minus CURLINFO_NAMELOOKUP_TIME. Histograms only record fresh connection establishment \u2014 keep-alive reuse skips because curl reports 0 for the connect-related fields on reuse.",
+      "description": "p50 / p95 of the TCP handshake to the proxy on YouTube HTML fetches (channel about-page, home, search, session warm-up). Sourced from curl's CURLINFO_CONNECT_TIME minus CURLINFO_NAMELOOKUP_TIME. Histograms only record fresh connection establishment — keep-alive reuse skips because curl reports 0 for the connect-related fields on reuse.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1317,7 +1242,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 59
+        "y": 44
       },
       "id": 75,
       "options": {
@@ -1364,7 +1289,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "p50 / p95 of the TLS handshake (plus HTTP CONNECT tunnel exchange for proxied requests) on YouTube HTML fetches. Sourced from curl's CURLINFO_APPCONNECT_TIME minus CURLINFO_CONNECT_TIME. Note: curl reports app-connect cumulatively, so the HTTP CONNECT exchange cannot be split out separately as it is on RSS \u2014 both are bundled here. Slowness with fast TCP indicates YouTube is throttling TLS from the proxy's egress IP or the provider's CONNECT-tunnel queue is backed up.",
+      "description": "p50 / p95 of the TLS handshake (plus HTTP CONNECT tunnel exchange for proxied requests) on YouTube HTML fetches. Sourced from curl's CURLINFO_APPCONNECT_TIME minus CURLINFO_CONNECT_TIME. Note: curl reports app-connect cumulatively, so the HTTP CONNECT exchange cannot be split out separately as it is on RSS — both are bundled here. Slowness with fast TCP indicates YouTube is throttling TLS from the proxy's egress IP or the provider's CONNECT-tunnel queue is backed up.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1426,7 +1351,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 59
+        "y": 44
       },
       "id": 76,
       "options": {
@@ -1474,7 +1399,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 67
+        "y": 52
       },
       "id": 77,
       "panels": [],
@@ -1486,7 +1411,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "p50 / p95 of the TCP handshake to the proxy on InnerTube calls (channel.browse / video.player). Sourced from httpcore trace events on the third-party innertube library's httpx.Client session. Histograms only record fresh connection establishment \u2014 keep-alive reuse skips the trace event.",
+      "description": "p50 / p95 of the TCP handshake to the proxy on InnerTube calls (channel.browse / video.player). Sourced from httpcore trace events on the third-party innertube library's httpx.Client session. Histograms only record fresh connection establishment — keep-alive reuse skips the trace event.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1548,7 +1473,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 68
+        "y": 53
       },
       "id": 78,
       "options": {
@@ -1595,7 +1520,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "p50 / p95 of the HTTP CONNECT exchange (proxy dialing YouTube on our behalf) on InnerTube calls. Gap between connect_tcp.complete and start_tls.started \u2014 the proxy backend's dial-out queue.",
+      "description": "p50 / p95 of the HTTP CONNECT exchange (proxy dialing YouTube on our behalf) on InnerTube calls. Gap between connect_tcp.complete and start_tls.started — the proxy backend's dial-out queue.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1657,7 +1582,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 68
+        "y": 53
       },
       "id": 79,
       "options": {
@@ -1766,7 +1691,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 68
+        "y": 53
       },
       "id": 80,
       "options": {
@@ -1814,7 +1739,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 76
+        "y": 61
       },
       "id": 81,
       "panels": [],
@@ -1890,7 +1815,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 77
+        "y": 62
       },
       "id": 82,
       "options": {
@@ -1929,7 +1854,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Average requests per fresh TCP connection. A value of 1 means every request opens a fresh connection (worst case \u2014 full handshake cost per fetch). 10 means each connection serves 10 requests on average before the pool retires it. Higher is better; large differences across proxy_files indicate that some providers terminate the keep-alive earlier than others.",
+      "description": "Average requests per fresh TCP connection. A value of 1 means every request opens a fresh connection (worst case — full handshake cost per fetch). 10 means each connection serves 10 requests on average before the pool retires it. Higher is better; large differences across proxy_files indicate that some providers terminate the keep-alive earlier than others.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1988,7 +1913,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 77
+        "y": 62
       },
       "id": 83,
       "options": {
@@ -2027,7 +1952,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 85
+        "y": 70
       },
       "id": 13,
       "panels": [],
@@ -2101,7 +2026,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 86
+        "y": 71
       },
       "id": 14,
       "options": {
@@ -2221,7 +2146,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 86
+        "y": 71
       },
       "id": 16,
       "options": {
@@ -2336,7 +2261,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 94
+        "y": 79
       },
       "id": 17,
       "options": {
@@ -2382,7 +2307,7 @@
           "refId": "B"
         }
       ],
-      "title": "scrape.exchange API request p50/p95 by method \u00d7 status_class",
+      "title": "scrape.exchange API request p50/p95 by method × status_class",
       "type": "timeseries"
     },
     {
@@ -2390,7 +2315,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Number of yt-dlp extract_info calls currently in the thread pool. Pins near executor ceiling (\u224812 per process) when GIL / executor is the bottleneck.",
+      "description": "Number of yt-dlp extract_info calls currently in the thread pool. Pins near executor ceiling (≈12 per process) when GIL / executor is the bottleneck.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2452,7 +2377,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 94
+        "y": 79
       },
       "id": 15,
       "options": {
@@ -2553,7 +2478,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 102
+        "y": 87
       },
       "id": 94,
       "options": {
@@ -2666,7 +2591,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 102
+        "y": 87
       },
       "id": 95,
       "options": {
@@ -2768,7 +2693,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 110
+        "y": 95
       },
       "id": 96,
       "options": {
@@ -2809,7 +2734,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 118
+        "y": 103
       },
       "id": 18,
       "panels": [],
@@ -2883,7 +2808,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 119
+        "y": 104
       },
       "id": 19,
       "options": {
@@ -2950,7 +2875,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 127
+        "y": 112
       },
       "id": 23,
       "panels": [],
@@ -3024,7 +2949,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 128
+        "y": 113
       },
       "id": 24,
       "options": {
@@ -3125,7 +3050,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 128
+        "y": 113
       },
       "id": 25,
       "options": {
@@ -3165,7 +3090,7 @@
           "refId": "B"
         }
       ],
-      "title": "RSS tier SLA \u2014 on-time vs overdue rate",
+      "title": "RSS tier SLA — on-time vs overdue rate",
       "type": "timeseries"
     },
     {
@@ -3235,7 +3160,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 136
+        "y": 121
       },
       "id": 26,
       "options": {
@@ -3338,7 +3263,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 136
+        "y": 121
       },
       "id": 27,
       "options": {
@@ -3396,7 +3321,7 @@
           "refId": "D"
         }
       ],
-      "title": "RSS \u2014 orphans / no-feed-limit / circuit-breaker",
+      "title": "RSS — orphans / no-feed-limit / circuit-breaker",
       "type": "timeseries"
     },
     {
@@ -3405,7 +3330,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 144
+        "y": 129
       },
       "id": 92,
       "panels": [],
@@ -3479,7 +3404,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 145
+        "y": 130
       },
       "id": 85,
       "options": {
@@ -3579,7 +3504,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 145
+        "y": 130
       },
       "id": 86,
       "options": {
@@ -3680,7 +3605,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 153
+        "y": 138
       },
       "id": 87,
       "options": {
@@ -3781,7 +3706,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 153
+        "y": 138
       },
       "id": 88,
       "options": {
@@ -3821,7 +3746,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 161
+        "y": 146
       },
       "id": 89,
       "panels": [],
@@ -3895,7 +3820,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 162
+        "y": 147
       },
       "id": 90,
       "options": {
@@ -3996,7 +3921,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 162
+        "y": 147
       },
       "id": 91,
       "options": {
@@ -4036,7 +3961,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 170
+        "y": 155
       },
       "id": 28,
       "panels": [],
@@ -4110,7 +4035,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 171
+        "y": 156
       },
       "id": 29,
       "options": {
@@ -4211,7 +4136,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 171
+        "y": 156
       },
       "id": 30,
       "options": {
@@ -4312,7 +4237,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 179
+        "y": 164
       },
       "id": 31,
       "options": {
@@ -4413,7 +4338,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 179
+        "y": 164
       },
       "id": 32,
       "options": {
@@ -4522,12 +4447,12 @@
     ]
   },
   "time": {
-    "from": "now-6h",
+    "from": "now-15m",
     "to": "now"
   },
   "timepicker": {},
   "timezone": "",
-  "title": "YouTube scrapers \u2014 progress, failures & latency",
+  "title": "YouTube scrapers — progress, failures & latency",
   "uid": "scrape-youtube",
-  "version": 54
+  "version": 62
 }

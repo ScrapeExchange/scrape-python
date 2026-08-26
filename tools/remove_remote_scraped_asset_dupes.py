@@ -21,7 +21,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 
-DEFAULT_DIR: str = '/home/steven/byoda/data/scraped-videos'
+DEFAULT_DIR: str = '~/byoda/data/scraped/youtube/videos'
 
 _STATUS_LINE_LEN: int = 0
 DELETE_BATCH_SIZE: int = 500
@@ -67,6 +67,16 @@ def _host_aliases() -> set[str]:
 
 def is_local_host(host: str) -> bool:
     return host in _host_aliases()
+
+
+def _remote_directory_arg(directory: str) -> str:
+    '''Quote a remote path while preserving current-user home expansion.'''
+    if directory == '~':
+        return '"$HOME"'
+    if directory.startswith('~/'):
+        relative: str = directory.removeprefix('~/')
+        return f'"$HOME"/{shlex.quote(relative)}'
+    return shlex.quote(directory)
 
 
 def _run_local(command: list[str], *, input: bytes | None = None) -> bytes:
@@ -305,14 +315,15 @@ def list_remote_files(
 ) -> list[RemoteFile]:
     # Null-delimited output keeps spaces, quotes, and tabs in paths safe.
     if is_local_host(host):
+        local_directory: str = str(Path(directory).expanduser())
         out: bytes = _run_local([
-            'find', directory,
+            'find', local_directory,
             '-maxdepth', '1',
             '-type', 'f',
             '-printf', r'%T@\t%p\0',
         ])
     else:
-        dir_arg: str = shlex.quote(directory)
+        dir_arg: str = _remote_directory_arg(directory)
         remote_command: str = (
             f'find {dir_arg} -maxdepth 1 -type f '
             r"-printf '%T@\t%p\0'"

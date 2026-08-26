@@ -16,6 +16,9 @@ default when the key is absent; this test set asserts the new
 '''
 
 import unittest
+from unittest.mock import AsyncMock, MagicMock, call, patch
+
+import httpx
 
 from scrape_exchange.youtube.youtube_video import YouTubeVideo
 from scrape_exchange.youtube import youtube_video_innertube as innertube_mod
@@ -362,6 +365,7 @@ class TestPlayerResponseInstrumentation(unittest.TestCase):
                     'vid123',
                     player_data,
                     proxy_ip='203.0.113.10',
+                    proxy_port='8080',
                     proxy_file='proxy-a',
                 )
         finally:
@@ -377,6 +381,324 @@ class TestPlayerResponseInstrumentation(unittest.TestCase):
         )
         self.assertEqual(
             getattr(logs.records[0], 'proxy_ip'), '203.0.113.10',
+        )
+        self.assertEqual(getattr(logs.records[0], 'proxy_port'), '8080')
+
+
+class TestBotDetectionResponseHandling(
+    unittest.IsolatedAsyncioTestCase,
+):
+    async def test_bot_detection_penalises_proxy_and_aborts_scrape(
+        self,
+    ) -> None:
+        proxy: str = 'http://localhost:8080'
+        player_data: dict = {
+            'playabilityStatus': {
+                'status': 'LOGIN_REQUIRED',
+                'reason': (
+                    'Sign in to confirm you are not a bot. '
+                    'This helps protect our community.'
+                ),
+            },
+            'videoDetails': {},
+        }
+        innertube: MagicMock = MagicMock()
+        limiter: MagicMock = MagicMock()
+        limiter.acquire = AsyncMock(return_value=proxy)
+        limiter.penalise = AsyncMock()
+
+        with (
+            patch.object(
+                innertube_mod,
+                '_call_innertube',
+                new=AsyncMock(return_value=player_data),
+            ) as call_innertube,
+            patch.object(
+                innertube_mod.YouTubeRateLimiter,
+                'get',
+                return_value=limiter,
+            ),
+            patch.object(
+                innertube_mod,
+                'refresh_pooled_innertube_for_entry',
+                new=AsyncMock(),
+            ) as refresh_client,
+        ):
+            with self.assertRaisesRegex(
+                innertube_mod.YouTubeBotDetectionError,
+                'bot detection',
+            ):
+                await InnerTubeVideoParser.scrape(
+                    YouTubeVideo(video_id='vid123'),
+                    innertube=innertube,
+                    proxy=proxy,
+                )
+
+        self.assertEqual(call_innertube.await_count, 1)
+        self.assertEqual(
+            limiter.penalise.await_args_list,
+            [
+                call(
+                    innertube_mod.YouTubeCallType.PLAYER,
+                    proxy,
+                    300.0,
+                ),
+                call(
+                    innertube_mod.YouTubeCallType.NEXT,
+                    proxy,
+                    300.0,
+                ),
+            ],
+        )
+        refresh_client.assert_awaited_once_with(
+            proxy,
+            challenged=innertube,
+        )
+
+
+class TestInnerTubeClientRouting(unittest.IsolatedAsyncioTestCase):
+    async def test_default_routes_player_to_android_and_next_to_web(
+        self,
+    ) -> None:
+        proxy: str = 'http://localhost:8080'
+        player_client: MagicMock = MagicMock()
+        web_client: MagicMock = MagicMock()
+        limiter: MagicMock = MagicMock()
+        limiter.acquire = AsyncMock(return_value=proxy)
+        player_data: dict = {
+            'playabilityStatus': {'status': 'OK'},
+            'videoDetails': {'title': 'Title'},
+        }
+        call_api: AsyncMock = AsyncMock(
+            side_effect=[player_data, {}],
+        )
+
+        with patch.object(
+            innertube_mod,
+            'borrow_pooled_player_innertube_for_entry',
+            return_value=player_client,
+        ) as borrow_player, patch.object(
+            innertube_mod,
+            'release_pooled_player_innertube',
+            new=AsyncMock(),
+        ) as release_player, patch.object(
+            innertube_mod,
+            'borrow_pooled_innertube_for_entry',
+            return_value=web_client,
+        ) as borrow_web, patch.object(
+            innertube_mod,
+            'release_pooled_innertube',
+            new=AsyncMock(),
+        ) as release_web, patch.object(
+            innertube_mod,
+            '_call_innertube',
+            new=call_api,
+        ), patch.object(
+            innertube_mod.YouTubeRateLimiter,
+            'get',
+            return_value=limiter,
+        ):
+            await InnerTubeVideoParser.scrape(
+                YouTubeVideo(video_id='vid123'),
+                proxy=proxy,
+                max_retries=1,
+            )
+
+        borrow_player.assert_called_once_with(proxy)
+        borrow_web.assert_called_once_with(proxy)
+        release_player.assert_awaited_once_with(player_client)
+        release_web.assert_awaited_once_with(web_client)
+        self.assertEqual(
+            call_api.await_args_list,
+            [
+                call(
+                    player_client,
+                    player_client.player,
+                    'vid123',
+                ),
+                call(web_client, web_client.next, 'vid123'),
+            ],
+        )
+
+    async def test_failed_player_call_releases_borrowed_client(
+        self,
+    ) -> None:
+        proxy: str = 'http://localhost:8080'
+        player_client: MagicMock = MagicMock()
+        limiter: MagicMock = MagicMock()
+        limiter.acquire = AsyncMock(return_value=proxy)
+
+        with patch.object(
+            innertube_mod,
+            'borrow_pooled_player_innertube_for_entry',
+            return_value=player_client,
+        ), patch.object(
+            innertube_mod,
+            'release_pooled_player_innertube',
+            new=AsyncMock(),
+        ) as release_player, patch.object(
+            innertube_mod,
+            '_call_innertube',
+            new=AsyncMock(side_effect=RuntimeError('request failed')),
+        ), patch.object(
+            innertube_mod.YouTubeRateLimiter,
+            'get',
+            return_value=limiter,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                'InnerTube API call failed',
+            ):
+                await InnerTubeVideoParser.scrape(
+                    YouTubeVideo(video_id='vid123'),
+                    proxy=proxy,
+                    max_retries=1,
+                )
+
+        release_player.assert_awaited_once_with(player_client)
+
+    async def test_transport_failure_retires_borrowed_player_client(
+        self,
+    ) -> None:
+        proxy: str = 'http://localhost:8080'
+        player_client: MagicMock = MagicMock()
+        limiter: MagicMock = MagicMock()
+        limiter.acquire = AsyncMock(return_value=proxy)
+
+        with patch.object(
+            innertube_mod,
+            'borrow_pooled_player_innertube_for_entry',
+            return_value=player_client,
+        ), patch.object(
+            innertube_mod,
+            'release_pooled_player_innertube',
+            new=AsyncMock(),
+        ), patch.object(
+            innertube_mod,
+            'refresh_pooled_innertube_for_entry',
+            new=AsyncMock(),
+        ) as retire_player, patch.object(
+            innertube_mod,
+            '_call_innertube',
+            new=AsyncMock(side_effect=httpx.ConnectTimeout('tls')),
+        ), patch.object(
+            innertube_mod.YouTubeRateLimiter,
+            'get',
+            return_value=limiter,
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'ConnectTimeout'):
+                await InnerTubeVideoParser.scrape(
+                    YouTubeVideo(video_id='vid123'),
+                    proxy=proxy,
+                    max_retries=1,
+                )
+
+        retire_player.assert_awaited_once_with(
+            proxy,
+            challenged=player_client,
+        )
+
+    async def test_transport_failure_retires_borrowed_web_client(
+        self,
+    ) -> None:
+        proxy: str = 'http://localhost:8080'
+        player_client: MagicMock = MagicMock()
+        web_client: MagicMock = MagicMock()
+        limiter: MagicMock = MagicMock()
+        limiter.acquire = AsyncMock(return_value=proxy)
+        player_data: dict = {
+            'playabilityStatus': {'status': 'OK'},
+            'videoDetails': {'title': 'Title'},
+        }
+
+        with patch.object(
+            innertube_mod,
+            'borrow_pooled_player_innertube_for_entry',
+            return_value=player_client,
+        ), patch.object(
+            innertube_mod,
+            'release_pooled_player_innertube',
+            new=AsyncMock(),
+        ), patch.object(
+            innertube_mod,
+            'borrow_pooled_innertube_for_entry',
+            return_value=web_client,
+        ), patch.object(
+            innertube_mod,
+            'release_pooled_innertube',
+            new=AsyncMock(),
+        ), patch.object(
+            innertube_mod,
+            'refresh_pooled_web_innertube_for_entry',
+            new=AsyncMock(),
+            create=True,
+        ) as retire_web, patch.object(
+            innertube_mod,
+            '_call_innertube',
+            new=AsyncMock(
+                side_effect=[player_data, httpx.PoolTimeout('pool')]
+            ),
+        ), patch.object(
+            innertube_mod.YouTubeRateLimiter,
+            'get',
+            return_value=limiter,
+        ):
+            await InnerTubeVideoParser.scrape(
+                YouTubeVideo(video_id='vid123'),
+                proxy=proxy,
+                max_retries=1,
+            )
+
+        retire_web.assert_awaited_once_with(
+            proxy,
+            challenged=web_client,
+        )
+
+    async def test_injected_client_handles_both_calls(self) -> None:
+        proxy: str = 'http://localhost:8080'
+        injected: MagicMock = MagicMock()
+        limiter: MagicMock = MagicMock()
+        limiter.acquire = AsyncMock(return_value=proxy)
+        call_api: AsyncMock = AsyncMock(
+            side_effect=[
+                {
+                    'playabilityStatus': {'status': 'OK'},
+                    'videoDetails': {'title': 'Title'},
+                },
+                {},
+            ],
+        )
+
+        with patch.object(
+            innertube_mod,
+            'borrow_pooled_player_innertube_for_entry',
+        ) as player_pool, patch.object(
+            innertube_mod,
+            'borrow_pooled_innertube_for_entry',
+        ) as web_pool, patch.object(
+            innertube_mod,
+            '_call_innertube',
+            new=call_api,
+        ), patch.object(
+            innertube_mod.YouTubeRateLimiter,
+            'get',
+            return_value=limiter,
+        ):
+            await InnerTubeVideoParser.scrape(
+                YouTubeVideo(video_id='vid123'),
+                innertube=injected,
+                proxy=proxy,
+                max_retries=1,
+            )
+
+        player_pool.assert_not_called()
+        web_pool.assert_not_called()
+        self.assertEqual(
+            call_api.await_args_list,
+            [
+                call(injected, injected.player, 'vid123'),
+                call(injected, injected.next, 'vid123'),
+            ],
         )
 
 

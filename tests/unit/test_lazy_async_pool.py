@@ -63,6 +63,59 @@ class TestLazyAsyncPool(unittest.IsolatedAsyncioTestCase):
         await pool.aclose_all()
         self.assertEqual(a.close_called, 1)
 
+    async def test_aclose_key_only_closes_requested_entry(
+        self,
+    ) -> None:
+        pool: _LazyAsyncPool = self._make(aclose_attr='close')
+        first: _FakeClient = pool.get('k1')
+        second: _FakeClient = pool.get('k2')
+
+        await pool.aclose_key('k1')
+
+        self.assertEqual(first.close_called, 1)
+        self.assertEqual(second.close_called, 0)
+        self.assertIsNot(pool.get('k1'), first)
+        self.assertIs(pool.get('k2'), second)
+
+    async def test_retire_defers_close_until_borrowers_release(
+        self,
+    ) -> None:
+        pool: _LazyAsyncPool = self._make(aclose_attr='close')
+        first_borrow: _FakeClient = pool.borrow('k1')
+        second_borrow: _FakeClient = pool.borrow('k1')
+
+        retired: bool = await pool.retire_key(
+            'k1', expected=first_borrow,
+        )
+        replacement: _FakeClient = pool.get('k1')
+
+        self.assertTrue(retired)
+        self.assertIs(first_borrow, second_borrow)
+        self.assertIsNot(replacement, first_borrow)
+        self.assertEqual(first_borrow.close_called, 0)
+
+        await pool.release(first_borrow)
+        self.assertEqual(first_borrow.close_called, 0)
+
+        await pool.release(second_borrow)
+        self.assertEqual(first_borrow.close_called, 1)
+
+    async def test_stale_retire_does_not_evict_replacement(
+        self,
+    ) -> None:
+        pool: _LazyAsyncPool = self._make(aclose_attr='close')
+        challenged: _FakeClient = pool.borrow('k1')
+        await pool.retire_key('k1', expected=challenged)
+        replacement: _FakeClient = pool.get('k1')
+
+        retired: bool = await pool.retire_key(
+            'k1', expected=challenged,
+        )
+
+        self.assertFalse(retired)
+        self.assertIs(pool.get('k1'), replacement)
+        await pool.release(challenged)
+
     async def test_aclose_all_swallows_exceptions(self) -> None:
         '''A failing aclose on one client does not block the others.'''
         class _Boom:

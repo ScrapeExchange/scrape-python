@@ -18,7 +18,9 @@ SESSION_POOL_SIZE: Gauge = Gauge(
 SESSION_ACQUIRE_ACTIVE: Gauge = Gauge(
     'instagram_session_acquire_active',
     'Instagram sessions currently held by a worker',
-    labelnames=('platform', 'scraper', 'proxy_ip', 'worker_id'),
+    labelnames=(
+        'platform', 'scraper', 'proxy_ip', 'proxy_port', 'worker_id',
+    ),
 )
 
 SESSION_ACQUIRE_WAIT_SECONDS: Histogram = Histogram(

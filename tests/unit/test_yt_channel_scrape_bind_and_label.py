@@ -40,6 +40,15 @@ class TestChannelScraperProxyFileLabel(unittest.TestCase):
         )
         self.assertIn('proxy_file', labelnames)
 
+    def test_channels_scraped_metric_has_channel_status_label(
+        self,
+    ) -> None:
+        labelnames: tuple[str, ...] = (
+            yt_channel_scrape
+            .METRIC_CHANNELS_SCRAPED._labelnames
+        )
+        self.assertIn('channel_status', labelnames)
+
     def test_no_content_metric_has_proxy_file_label(self) -> None:
         labelnames: tuple[str, ...] = (
             yt_channel_scrape

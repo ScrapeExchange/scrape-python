@@ -136,7 +136,7 @@ def _settings(**overrides: object) -> MagicMock:
         'creator_queue_idle_poll_seconds', 30,
     )
     s.creator_orphan_recovery_interval_seconds = overrides.get(
-        'creator_orphan_recovery_interval_seconds', 600,
+        'creator_orphan_recovery_interval_seconds', 86400,
     )
     s.creator_video_ref_count = overrides.get(
         'creator_video_ref_count', 0,
@@ -184,6 +184,17 @@ class TestCreatorSettings(unittest.TestCase):
             _cli_parse_args=[],
         )
         self.assertEqual(s.creator_concurrency, 0)
+
+    def test_orphan_recovery_defaults_to_once_per_day(self) -> None:
+        s = tool.CreatorSettings(
+            _env_file=None,
+            _cli_parse_args=[],
+        )
+
+        self.assertEqual(
+            s.creator_orphan_recovery_interval_seconds,
+            86400,
+        )
 
     def test_auto_creator_concurrency_uses_proxy_process_ratio(
         self,

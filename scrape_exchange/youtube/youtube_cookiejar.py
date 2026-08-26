@@ -34,6 +34,8 @@ from dataclasses import dataclass, field
 
 import httpx
 
+from scrape_exchange.util import extract_proxy_ip, extract_proxy_port
+
 from .youtube_client import (
     AsyncYouTubeClient,
     CONSENT_COOKIES,
@@ -388,7 +390,15 @@ class YouTubeCookieJar:
             _LOGGER.warning(
                 'Failed to load cookie file',
                 exc=exc,
-                extra={'cookie_file': entry.path, 'proxy': proxy},
+                extra={
+                    'cookie_file': entry.path,
+                    'proxy_ip': (
+                        extract_proxy_ip(proxy) if proxy else 'none'
+                    ),
+                    'proxy_port': (
+                        extract_proxy_port(proxy) if proxy else 'none'
+                    ),
+                },
             )
 
     async def _acquire(
@@ -428,7 +438,14 @@ class YouTubeCookieJar:
                     _LOGGER.debug(
                         'Adopted cookie file from another process',
                         extra={
-                            'proxy': proxy,
+                            'proxy_ip': (
+                                extract_proxy_ip(proxy)
+                                if proxy else 'none'
+                            ),
+                            'proxy_port': (
+                                extract_proxy_port(proxy)
+                                if proxy else 'none'
+                            ),
                             'cookie_file': path,
                             'age_s': round(age, 2),
                         },
@@ -482,7 +499,12 @@ class YouTubeCookieJar:
                     'Acquired cookies for proxy',
                     extra={
                         'cookie_count': len(cookies),
-                        'proxy': proxy,
+                        'proxy_ip': (
+                            extract_proxy_ip(proxy) if proxy else 'none'
+                        ),
+                        'proxy_port': (
+                            extract_proxy_port(proxy) if proxy else 'none'
+                        ),
                         'cookie_file': path,
                     },
                 )
@@ -494,7 +516,12 @@ class YouTubeCookieJar:
                     'Failed to acquire cookies for proxy',
                     exc=exc,
                     extra={
-                        'proxy': proxy,
+                        'proxy_ip': (
+                            extract_proxy_ip(proxy) if proxy else 'none'
+                        ),
+                        'proxy_port': (
+                            extract_proxy_port(proxy) if proxy else 'none'
+                        ),
                         'exc_cause_type': type(cause).__name__,
                         'exc_cause_message': str(cause),
                     },

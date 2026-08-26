@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from prometheus_client import Counter, Gauge, Histogram
 
 from scrape_exchange.redis_client import redis_from_url
+from scrape_exchange.util import extract_proxy_ip, extract_proxy_port
 from scrape_exchange.worker_id import get_worker_id
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
@@ -953,7 +954,13 @@ class _RedisBackend(_Backend[CallTypeT]):
             _LOGGER.warning(
                 'Redis unavailable; blocking request',
                 exc_info=True, extra={
-                    'proxy': proxy, 'call_type': call_type.value,
+                    'proxy_ip': (
+                        extract_proxy_ip(proxy) if proxy else 'none'
+                    ),
+                    'proxy_port': (
+                        extract_proxy_port(proxy) if proxy else 'none'
+                    ),
+                    'call_type': call_type.value,
                     'exc': str(e)
                 },
             )
@@ -1253,7 +1260,12 @@ class RateLimiter(ABC, Generic[CallTypeT]):
                     'Rate limiter waiting',
                     extra={
                         'call_type': call_type.value,
-                        'proxy': proxy,
+                        'proxy_ip': (
+                            extract_proxy_ip(proxy) if proxy else 'none'
+                        ),
+                        'proxy_port': (
+                            extract_proxy_port(proxy) if proxy else 'none'
+                        ),
                         'wait_seconds': wait,
                     },
                 )
@@ -1274,7 +1286,12 @@ class RateLimiter(ABC, Generic[CallTypeT]):
                 'Rate limiter jitter',
                 extra={
                     'call_type': call_type.value,
-                    'proxy': proxy,
+                    'proxy_ip': (
+                        extract_proxy_ip(proxy) if proxy else 'none'
+                    ),
+                    'proxy_port': (
+                        extract_proxy_port(proxy) if proxy else 'none'
+                    ),
                     'jitter_seconds': jitter,
                 },
             )
@@ -1303,7 +1320,10 @@ class RateLimiter(ABC, Generic[CallTypeT]):
             'Rate limiter penalised',
             extra={
                 'call_type': call_type.value,
-                'proxy': proxy,
+                'proxy_ip': extract_proxy_ip(proxy) if proxy else 'none',
+                'proxy_port': (
+                    extract_proxy_port(proxy) if proxy else 'none'
+                ),
                 'penalty_seconds': penalty_seconds,
             },
         )

@@ -331,6 +331,14 @@ class ChannelScrapeQueueSettings(BaseSettings):
     channel_not_found_retry_seconds: int = Field(
         default=3600,
     )
+    channel_missing_subscriber_retry_seconds: int = Field(
+        default=24 * 60 * 60,
+        gt=0,
+        description=(
+            'Delay before retrying a successful channel scrape '
+            'that did not return a subscriber count.'
+        ),
+    )
     channel_unavailable_soft_retry_seconds: int = Field(
         default=3 * 86400,
     )
@@ -387,6 +395,14 @@ class ChannelScrapeQueue(ABC):
         channel_id: str,
         *,
         sub_count: int,
+        now: float,
+    ) -> None: ...
+
+    @abstractmethod
+    async def retry_missing_subscriber_count(
+        self,
+        *,
+        channel_id: str,
         now: float,
     ) -> None: ...
 
@@ -774,6 +790,72 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
             self._k_meta(member),
             'unavailable_attempts',
         )
+        await pipe.execute()
+
+    async def retry_missing_subscriber_count(
+        self,
+        *,
+        channel_id: str,
+        now: float,
+    ) -> None:
+        '''Preserve the current tier and request a delayed full scrape.
+
+        A missing subscriber count is unknown data, not evidence that the
+        channel belongs in the zero-subscriber catch-all tier. The channel
+        has already been popped, so this transition must explicitly put it
+        back in its current tier. A full retry avoids repeating the
+        metadata-only path when the best-effort About request failed.
+        '''
+        member: str = f'i:{channel_id}'
+        current: ChannelState | None = await self.get_state(member)
+        if (
+            current is not None
+            and current in ChannelState.terminal_states()
+        ):
+            return
+        tier_str: str | None = await self._redis.hget(
+            self._k_tiers(), channel_id,
+        )
+        tier: int = 0
+        if tier_str is not None:
+            try:
+                candidate: int = int(tier_str)
+            except ValueError:
+                candidate = 0
+            if 0 <= candidate < len(self._tiers):
+                tier = candidate
+        retry_at: float = (
+            now
+            + float(
+                self._settings
+                .channel_missing_subscriber_retry_seconds
+            )
+        )
+        meta_key: str = self._k_meta(member)
+        pipe: aioredis.client.Pipeline = (
+            self._redis.pipeline(transaction=True)
+        )
+        for candidate_tier in range(len(self._tiers)):
+            pipe.zrem(
+                self._k_scheduled(candidate_tier), member,
+            )
+        pipe.hset(self._k_tiers(), channel_id, str(tier))
+        pipe.zadd(
+            self._k_scheduled(tier),
+            {member: retry_at},
+        )
+        pipe.hset(
+            meta_key,
+            mapping={
+                'state': ChannelState.SCHEDULED.value,
+                'last_attempt_at': str(int(now)),
+                'last_subscriber_count_missing_at': str(int(now)),
+                'force_rescrape_mode': 'full',
+                'force_requested_at': str(int(now)),
+                'force_source': 'missing_subscriber_count',
+            },
+        )
+        pipe.hdel(meta_key, 'unavailable_attempts')
         await pipe.execute()
 
     async def requeue_with_backoff(

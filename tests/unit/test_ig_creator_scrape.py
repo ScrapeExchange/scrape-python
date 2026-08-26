@@ -71,6 +71,18 @@ class TestInstagramCreatorSettings(unittest.TestCase):
 
         self.assertEqual(settings.metrics_port, 9900)
 
+    def test_orphan_recovery_defaults_to_once_per_day(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            settings = tool.CreatorSettings(
+                _env_file=None,
+                _cli_parse_args=[],
+            )
+
+        self.assertEqual(
+            settings.creator_orphan_recovery_interval_seconds,
+            86400,
+        )
+
     def test_disable_proxies_env_is_accepted(self) -> None:
         with patch.dict(
             os.environ,
@@ -248,6 +260,7 @@ class TestInstagramCreatorFailureHandling(unittest.IsolatedAsyncioTestCase):
                 settings,
                 'worker-1',
                 '__direct__',
+                'none',
             )
 
         self.assertEqual(reason, 'rate_limit')
@@ -294,6 +307,7 @@ class TestInstagramCreatorFailureHandling(unittest.IsolatedAsyncioTestCase):
                 settings,
                 'worker-1',
                 '__direct__',
+                'none',
             )
 
         self.assertEqual(reason, 'rate_limit')

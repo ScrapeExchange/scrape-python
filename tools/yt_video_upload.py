@@ -49,6 +49,7 @@ from scrape_exchange.schema_validator import SchemaValidator, fetch_schema_dict
 from scrape_exchange.redis_client import redis_from_url
 from scrape_exchange.scraper_runner import ScraperRunContext, ScraperRunner
 from scrape_exchange.settings import normalize_log_level
+from scrape_exchange.util import extract_proxy_ip, extract_proxy_port
 from scrape_exchange.upload import (
     BulkUploadConfig,
     emit_bulk_batch_metrics,
@@ -476,7 +477,10 @@ async def resolve_video_upload_handle(
             extra={
                 'video_id': video.video_id,
                 'channel_id': video.channel_id,
-                'proxy': proxy,
+                'proxy_ip': extract_proxy_ip(proxy) if proxy else 'none',
+                'proxy_port': (
+                    extract_proxy_port(proxy) if proxy else 'none'
+                ),
             },
         )
         CREATOR_MAP_RESOLUTION_TOTAL.labels(
