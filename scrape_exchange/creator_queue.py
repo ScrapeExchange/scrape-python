@@ -48,6 +48,9 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 # ``populate()`` re-enqueues the orphan.
 DEFAULT_CLAIM_TTL: int = 600
 
+# Full creator orphan-recovery scans run at most once per day.
+DEFAULT_ORPHAN_RECOVERY_INTERVAL_SECONDS: int = 24 * 60 * 60
+
 # No-feeds entries expire after 24 hours in Redis so
 # creators that were temporarily broken get retried.
 _NO_FEEDS_TTL: int = 86400
@@ -464,7 +467,9 @@ class CreatorQueue(ABC):
     async def scan_and_recover_orphans_with_fleet_lock(
         self,
         recover: bool = True,
-        lock_ttl_seconds: int = 300,
+        lock_ttl_seconds: int = (
+            DEFAULT_ORPHAN_RECOVERY_INTERVAL_SECONDS
+        ),
     ) -> dict[int, dict[str, int]] | None:
         '''
         Run :meth:`scan_and_recover_orphans` only when this worker
@@ -1228,7 +1233,9 @@ class FileCreatorQueue(CreatorQueue):
     async def scan_and_recover_orphans_with_fleet_lock(
         self,
         recover: bool = True,
-        lock_ttl_seconds: int = 300,
+        lock_ttl_seconds: int = (
+            DEFAULT_ORPHAN_RECOVERY_INTERVAL_SECONDS
+        ),
     ) -> dict[int, dict[str, int]] | None:
         # File backend is single-process, so there is no fleet lock.
         return await self.scan_and_recover_orphans(recover=recover)
@@ -2217,7 +2224,9 @@ class RedisCreatorQueue(CreatorQueue):
     async def scan_and_recover_orphans_with_fleet_lock(
         self,
         recover: bool = True,
-        lock_ttl_seconds: int = 300,
+        lock_ttl_seconds: int = (
+            DEFAULT_ORPHAN_RECOVERY_INTERVAL_SECONDS
+        ),
     ) -> dict[int, dict[str, int]] | None:
         '''Run orphan recovery only when the fleet lock is free.'''
 

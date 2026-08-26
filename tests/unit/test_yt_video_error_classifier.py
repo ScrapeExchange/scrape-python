@@ -12,8 +12,12 @@ messages so that case bug never returns.
 
 import unittest
 
+from scrape_exchange.youtube.youtube_video_innertube import (
+    YouTubeBotDetectionError,
+)
 from tools import yt_video_scrape
 from tools.yt_video_scrape import (
+    _classify_scrape_error,
     _classify_yt_dlp_error as classify,
 )
 
@@ -77,6 +81,26 @@ class TestRateLimitClassification(unittest.TestCase):
                 "TypeError: expected string or bytes-like object",
             ),
             'rate_limit',
+        )
+
+
+class TestBotDetectionClassification(unittest.TestCase):
+    def test_confirm_youre_not_a_bot(self) -> None:
+        self.assertEqual(
+            classify("Sign in to confirm you're not a bot"),
+            'bot_detection',
+        )
+
+    def test_confirm_youre_not_a_bot_curly_apostrophe(self) -> None:
+        self.assertEqual(
+            classify('Sign in to confirm you’re not a bot'),
+            'bot_detection',
+        )
+
+    def test_confirm_you_are_not_a_bot(self) -> None:
+        self.assertEqual(
+            classify('Sign in to confirm you are not a bot'),
+            'bot_detection',
         )
 
 
@@ -227,6 +251,14 @@ class TestPremiereClassification(unittest.TestCase):
 
 class TestTransientClassification(unittest.TestCase):
 
+    def test_typed_bot_detection_error(self) -> None:
+        self.assertEqual(
+            _classify_scrape_error(
+                YouTubeBotDetectionError('bot challenge'),
+            ),
+            'bot_detection',
+        )
+
     def test_offline_no_period(self) -> None:
         '''
         Bare ``offline`` (no trailing period) is treated as a
@@ -299,8 +331,8 @@ class TestDeadPatternGuard(unittest.TestCase):
         '''Pin the set of reason names so dashboard panels and the
         Prometheus label values stay in sync with the code.'''
         expected: set[str] = {
-            'rate_limit', 'missing_data', 'unavailable',
-            'premiere', 'transient',
+            'rate_limit', 'bot_detection', 'missing_data',
+            'unavailable', 'premiere', 'transient',
         }
         actual: set[str] = {
             reason for reason, _ in yt_video_scrape._ERROR_PATTERNS

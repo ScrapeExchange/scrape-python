@@ -47,7 +47,7 @@ class TestImportSettingsDefaults(unittest.TestCase):
                 )
             )
         self.assertEqual(
-            s.channels_out, 'imported-channels.jsonl',
+            s.channels_out, 'import-channels.jsonl',
         )
 
     def test_videos_out_default(self) -> None:

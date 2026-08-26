@@ -33,6 +33,7 @@ from scrape_exchange.tiktok.tiktok_camoufox_api import (
     apply_camoufox_env,
     camoufox_launch_options,
 )
+from scrape_exchange.util import extract_proxy_port
 from scrape_exchange.watchdog import Watchdog
 
 
@@ -270,6 +271,11 @@ class InstagramSessionPool:
                 platform='instagram',
                 scraper=self._scraper_label,
                 proxy_ip=bound.proxy_key,
+                proxy_port=(
+                    extract_proxy_port(bound.proxy)
+                    if bound.proxy != DIRECT_SESSION_PROXY
+                    else 'none'
+                ),
                 worker_id=self._worker_id,
             ).inc()
             try:
@@ -279,6 +285,11 @@ class InstagramSessionPool:
                     platform='instagram',
                     scraper=self._scraper_label,
                     proxy_ip=bound.proxy_key,
+                    proxy_port=(
+                        extract_proxy_port(bound.proxy)
+                        if bound.proxy != DIRECT_SESSION_PROXY
+                        else 'none'
+                    ),
                     worker_id=self._worker_id,
                 ).dec()
 

@@ -321,21 +321,13 @@ class TestUnifiedBulkUploadLoop(
             return True
 
         with (
-            mock.patch.object(
-                yt_channel_scrape,
-                'stream_bulk_job_progress',
+            mock.patch(
+                'scrape_exchange.bulk_upload.stream_bulk_job_progress',
                 side_effect=fake_stream,
             ),
-            mock.patch.object(
-                yt_channel_scrape,
-                'fetch_bulk_results',
-                side_effect=fake_fetch,
-            ),
             mock.patch(
-                'asyncio.sleep',
-                side_effect=[
-                    None, asyncio.CancelledError(),
-                ],
+                'scrape_exchange.bulk_upload.fetch_bulk_results',
+                side_effect=fake_fetch,
             ),
         ):
             with self.assertRaises(asyncio.CancelledError):
@@ -403,14 +395,12 @@ class TestUnifiedBulkUploadLoop(
             )
 
         with (
-            mock.patch.object(
-                yt_channel_scrape,
-                'stream_bulk_job_progress',
+            mock.patch(
+                'scrape_exchange.bulk_upload.stream_bulk_job_progress',
                 side_effect=fake_stream,
             ),
-            mock.patch.object(
-                yt_channel_scrape,
-                'fetch_bulk_results',
+            mock.patch(
+                'scrape_exchange.bulk_upload.fetch_bulk_results',
                 side_effect=fake_fetch,
             ),
         ):

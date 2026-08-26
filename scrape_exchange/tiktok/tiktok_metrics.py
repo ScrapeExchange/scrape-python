@@ -25,7 +25,9 @@ SESSION_ACQUIRE_ACTIVE: Gauge = Gauge(
     'tiktok_session_acquire_active',
     'Sessions currently held by a worker (mirror of '
     'extract_info_active for YouTube)',
-    labelnames=('platform', 'scraper', 'proxy_ip', 'worker_id'),
+    labelnames=(
+        'platform', 'scraper', 'proxy_ip', 'proxy_port', 'worker_id',
+    ),
 )
 
 SESSION_ACQUIRE_WAIT_SECONDS: Histogram = Histogram(
@@ -50,7 +52,9 @@ MS_TOKEN_REFRESH_TOTAL: Counter = Counter(
 MS_TOKEN_AGE_SECONDS: Gauge = Gauge(
     'tiktok_ms_token_age_seconds',
     'Age of the ms_token currently bound to each session',
-    labelnames=('platform', 'scraper', 'proxy_ip', 'worker_id'),
+    labelnames=(
+        'platform', 'scraper', 'proxy_ip', 'proxy_port', 'worker_id',
+    ),
 )
 
 API_CALL_TOTAL: Counter = Counter(

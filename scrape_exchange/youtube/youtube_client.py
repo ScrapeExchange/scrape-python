@@ -34,7 +34,11 @@ from scrape_exchange.http_timeouts import (
     HTTP_REQUEST_TIMEOUT,
 )
 from scrape_exchange.proxy_loader import proxy_file_label
-from scrape_exchange.util import extract_proxy_ip, proxy_network_for
+from scrape_exchange.util import (
+    extract_proxy_ip,
+    extract_proxy_port,
+    proxy_network_for,
+)
 from .youtube_rate_limiter import YouTubeRateLimiter, YouTubeCallType
 from scrape_exchange.proxy_phase_metrics import (
     HTML_CURL_INFOS,
@@ -103,7 +107,12 @@ def _yt_status_class(status_code: int | None) -> str:
 # InnerTube client identity matching the WEB client that a real Chrome
 # browser sends on every YouTube page navigation and XHR request.
 INNERTUBE_CLIENT_NAME: str = '1'
-INNERTUBE_CLIENT_VERSION: str = '2.20250626.01.00'
+INNERTUBE_CLIENT_VERSION: str = '2.20260708.00.00'
+ANDROID_CLIENT_VERSION: str = '21.26.364'
+ANDROID_USER_AGENT: str = (
+    'com.google.android.youtube/21.26.364 '
+    '(Linux; U; Android 11) gzip'
+)
 
 CONSENT_COOKIES: dict[str, str] = {
     'CONSENT': 'YES+cb.20210328-17-p0.en+FX+100',
@@ -159,11 +168,12 @@ class AsyncYouTubeClient(AsyncClient):
 
         if self.proxy:
             proxy_ip: str = extract_proxy_ip(self.proxy)
+            proxy_port: str = extract_proxy_port(self.proxy)
             _LOGGER.debug(
                 'Initializing AsyncYouTubeClient with proxy',
                 extra={
-                    'proxy': self.proxy,
                     'proxy_ip': proxy_ip,
+                    'proxy_port': proxy_port,
                     'proxy_network': proxy_network_for(proxy_ip),
                 }
             )
@@ -259,7 +269,14 @@ class AsyncYouTubeClient(AsyncClient):
                     'Session warm-up failed; proceeding without it',
                     exc=exc,
                     extra={
-                        'proxy': self.proxy,
+                        'proxy_ip': (
+                            extract_proxy_ip(self.proxy)
+                            if self.proxy else 'none'
+                        ),
+                        'proxy_port': (
+                            extract_proxy_port(self.proxy)
+                            if self.proxy else 'none'
+                        ),
                     },
                 )
             self._session_warmed = True
@@ -299,9 +316,13 @@ class AsyncYouTubeClient(AsyncClient):
             extract_proxy_ip(self.proxy) if self.proxy else 'none'
         )
         proxy_network: str = proxy_network_for(proxy_ip)
+        proxy_port: str = (
+            extract_proxy_port(self.proxy) if self.proxy else 'none'
+        )
         proxy_file: str = proxy_file_label(self.proxy or '')
         extra: dict[str, str] = {
             'proxy_ip': proxy_ip,
+            'proxy_port': proxy_port,
             'proxy_network': proxy_network,
             'proxy_file': proxy_file,
             'url': url,

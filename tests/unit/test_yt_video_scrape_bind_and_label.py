@@ -11,6 +11,8 @@ fall through to ``other``.
 import errno
 import unittest
 
+import httpx
+
 from tools.yt_video_scrape import (
     _classify_scrape_error,
     _is_bind_failure,
@@ -91,6 +93,16 @@ class TestClassifyScrapeError(unittest.TestCase):
         exc: RuntimeError = RuntimeError('mystery')
         self.assertEqual(
             _classify_scrape_error(exc), 'other',
+        )
+
+    def test_wrapped_http_transport_error_is_transient(self) -> None:
+        inner: httpx.PoolTimeout = httpx.PoolTimeout(
+            'connection pool exhausted'
+        )
+        outer: RuntimeError = RuntimeError('InnerTube API call failed')
+        outer.__cause__ = inner
+        self.assertEqual(
+            _classify_scrape_error(outer), 'transient',
         )
 
 

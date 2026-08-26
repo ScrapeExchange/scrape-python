@@ -13,7 +13,7 @@ import unittest
 
 from pathlib import Path
 from types import ModuleType
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 try:
     import fakeredis.aioredis
@@ -233,7 +233,6 @@ class TestScanAndRecoverOrphans(
         breakdown: dict[int, dict[str, int]] | None = (
             await q.scan_and_recover_orphans_with_fleet_lock(
                 recover=True,
-                lock_ttl_seconds=300,
             )
         )
 
@@ -248,8 +247,8 @@ class TestScanAndRecoverOrphans(
         ttl: int = await q._redis.ttl(
             q._orphan_recovery_lock_key(),
         )
-        self.assertGreater(ttl, 0)
-        self.assertLessEqual(ttl, 300)
+        self.assertGreater(ttl, 86300)
+        self.assertLessEqual(ttl, 86400)
 
     async def test_fleet_lock_recovery_skips_when_lock_fresh(
         self,
@@ -959,6 +958,23 @@ class TestScanAndRecoverLoop(
     the orphans-recovered counter.
     '''
 
+    async def test_waits_one_day_between_recovery_scans(
+        self,
+    ) -> None:
+        yt_rss_scrape: ModuleType = _load_yt_rss_scrape()
+        queue: AsyncMock = AsyncMock()
+        queue.scan_and_recover_orphans_with_fleet_lock.return_value = {}
+
+        with patch.object(
+            yt_rss_scrape.asyncio,
+            'sleep',
+            AsyncMock(side_effect=asyncio.CancelledError),
+        ) as sleep:
+            with self.assertRaises(asyncio.CancelledError):
+                await yt_rss_scrape._scan_and_recover_loop(queue)
+
+        sleep.assert_awaited_once_with(86400)
+
     async def test_orphan_recovery_increments_counter(
         self,
     ) -> None:
@@ -1103,8 +1119,8 @@ class TestPublishQueueMetricsLoop(
         queue_labelnames: set[str] = set(
             yt_rss_scrape.METRIC_QUEUE_SIZE._labelnames,
         )
-        self.assertIn('tier', queue_labelnames)
-        self.assertNotIn('state', queue_labelnames)
+        self.assertIn('state', queue_labelnames)
+        self.assertNotIn('tier', queue_labelnames)
 
         # channel_tier_population without state label.
         tp_t1: float = (

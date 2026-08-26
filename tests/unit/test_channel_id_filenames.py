@@ -282,7 +282,7 @@ class TestScrapeChannelById(unittest.IsolatedAsyncioTestCase):
 
         async def fake_to_disk(
             settings_, fm_, channel_id_, filename_,
-            creator_map_, extra_,
+            creator_map_, extra_, redis_,
         ):
             captured['channel_id'] = channel_id_
             captured['filename'] = filename_

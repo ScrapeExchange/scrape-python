@@ -152,6 +152,58 @@ class TestScrapeOne(
         queue.update_tier.assert_awaited_once()
         kwargs = queue.update_tier.await_args.kwargs
         self.assertEqual(kwargs['sub_count'], 1_000_000)
+        queue.set_meta.assert_awaited_once_with(
+            'i:UCabc00000000000000000000',
+            subscriber_count='1000000',
+        )
+
+    @patch(
+        'tools.yt_channel_scrape'
+        '._channel_exists_on_exchange',
+        new_callable=AsyncMock,
+    )
+    @patch(
+        'tools.yt_channel_scrape'
+        '._do_scrape_channel_to_disk_typed',
+        new_callable=AsyncMock,
+    )
+    async def test_missing_subscriber_count_schedules_full_retry(
+        self,
+        mock_scrape: AsyncMock,
+        mock_exists: AsyncMock,
+    ) -> None:
+        mock_exists.return_value = True
+        mock_scrape.return_value = _mock_channel(
+            subscriber_count=None,
+        )
+        queue = AsyncMock()
+        creator_map = AsyncMock()
+        creator_map.get.return_value = 'foo'
+        from tools.yt_channel_scrape import (
+            _scrape_one_queued,
+        )
+
+        await _scrape_one_queued(
+            'UCabc00000000000000000000',
+            queue=queue,
+            settings=_mock_settings(),
+            fm=MagicMock(),
+            creator_map_backend=creator_map,
+            http_client=MagicMock(),
+        )
+
+        queue.retry_missing_subscriber_count.assert_awaited_once()
+        retry_kwargs = (
+            queue.retry_missing_subscriber_count.await_args.kwargs
+        )
+        self.assertEqual(
+            retry_kwargs['channel_id'],
+            'UCabc00000000000000000000',
+        )
+        self.assertIsInstance(retry_kwargs['now'], float)
+        queue.update_tier.assert_not_awaited()
+        queue.set_meta.assert_not_awaited()
+        queue.clear_force_rescrape.assert_not_awaited()
 
     @patch(
         'tools.yt_channel_scrape'
@@ -899,6 +951,63 @@ class TestTypedScrape(
     unittest.IsolatedAsyncioTestCase,
 ):
 
+    async def test_success_metric_uses_channel_status(self) -> None:
+        channel: MagicMock = MagicMock()
+        channel.channel_id = 'UCabc00000000000000000000'
+        channel.channel_handle = 'channel'
+        channel.about_page_succeeded = True
+        settings: MagicMock = _mock_settings()
+        settings.channel_data_directory = '/tmp'
+        from tools.yt_channel_scrape import (
+            _do_scrape_channel_to_disk_typed,
+        )
+
+        with (
+            patch(
+                'tools.yt_channel_scrape.YouTubeChannel',
+                return_value=channel,
+            ),
+            patch(
+                'tools.yt_channel_scrape'
+                '._try_scrape_channel_typed',
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                'tools.yt_channel_scrape'
+                '._reject_topic_channel_if_needed',
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
+                'tools.yt_channel_scrape._persist_scraped_channel',
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch(
+                'tools.yt_channel_scrape.METRIC_CHANNELS_SCRAPED',
+            ) as completed,
+            patch(
+                'tools.yt_channel_scrape.METRIC_SCRAPE_DURATION',
+            ),
+        ):
+            await _do_scrape_channel_to_disk_typed(
+                settings,
+                MagicMock(),
+                'channel',
+                'channel-UCabc00000000000000000000.json.br',
+                {
+                    'channel_id': 'UCabc00000000000000000000',
+                    'channel_status': 'existing',
+                },
+                metadata_only=True,
+            )
+
+        self.assertEqual(
+            completed.labels.call_args.kwargs['channel_status'],
+            'existing',
+        )
+
     @patch(
         'tools.yt_channel_scrape._persist_scraped_channel',
         new_callable=AsyncMock,
@@ -941,6 +1050,38 @@ class TestExistenceCheck(
     unittest.IsolatedAsyncioTestCase,
 ):
 
+    async def test_not_found_response_returns_missing(self) -> None:
+        http_client: AsyncMock = AsyncMock()
+        response: MagicMock = MagicMock()
+        response.status_code = 404
+        http_client.get.return_value = response
+        from tools.yt_channel_scrape import (
+            _channel_exists_on_exchange,
+        )
+
+        result: bool | None = await _channel_exists_on_exchange(
+            http_client,
+            'https://api.scrape.exchange',
+            'UCabc00000000000000000000',
+        )
+
+        self.assertIs(result, False)
+
+    async def test_transport_error_returns_unknown(self) -> None:
+        http_client: AsyncMock = AsyncMock()
+        http_client.get.side_effect = OSError('network error')
+        from tools.yt_channel_scrape import (
+            _channel_exists_on_exchange,
+        )
+
+        result: bool | None = await _channel_exists_on_exchange(
+            http_client,
+            'https://api.scrape.exchange',
+            'UCabc00000000000000000000',
+        )
+
+        self.assertIsNone(result)
+
     @patch(
         'tools.yt_channel_scrape'
         '._do_scrape_channel_to_disk_typed',
@@ -978,6 +1119,8 @@ class TestExistenceCheck(
         mock_typed.assert_awaited_once()
         kwargs: dict = mock_typed.await_args.kwargs
         self.assertTrue(kwargs.get('metadata_only'))
+        extra: dict[str, str] = mock_typed.await_args.args[4]
+        self.assertEqual(extra['channel_status'], 'existing')
 
     @patch(
         'tools.yt_channel_scrape'
@@ -1020,6 +1163,8 @@ class TestExistenceCheck(
         )
         kwargs: dict = mock_typed.await_args.kwargs
         self.assertFalse(kwargs.get('metadata_only'))
+        extra: dict[str, str] = mock_typed.await_args.args[4]
+        self.assertEqual(extra['channel_status'], 'new')
 
     @patch(
         'tools.yt_channel_scrape'
@@ -1031,14 +1176,12 @@ class TestExistenceCheck(
         '._channel_exists_on_exchange',
         new_callable=AsyncMock,
     )
-    async def test_existence_check_error_falls_back(
+    async def test_unknown_existence_falls_back_to_full_scrape(
         self,
         mock_exists: AsyncMock,
         mock_typed: AsyncMock,
     ) -> None:
-        mock_exists.side_effect = Exception(
-            'network error',
-        )
+        mock_exists.return_value = None
         mock_channel: MagicMock = MagicMock()
         mock_channel.subscriber_count = 500
         mock_typed.return_value = mock_channel
@@ -1060,6 +1203,8 @@ class TestExistenceCheck(
         mock_typed.assert_awaited_once()
         kwargs: dict = mock_typed.await_args.kwargs
         self.assertFalse(kwargs.get('metadata_only'))
+        extra: dict[str, str] = mock_typed.await_args.args[4]
+        self.assertEqual(extra['channel_status'], 'unknown')
 
 
 class TestForceRescrapeMode(
@@ -1076,11 +1221,12 @@ class TestForceRescrapeMode(
         '._channel_exists_on_exchange',
         new_callable=AsyncMock,
     )
-    async def test_full_mode_bypasses_existence_check(
+    async def test_full_mode_checks_existence_for_label(
         self,
         mock_exists: AsyncMock,
         mock_typed: AsyncMock,
     ) -> None:
+        mock_exists.return_value = True
         mock_channel: MagicMock = MagicMock()
         mock_channel.subscriber_count = 250
         mock_typed.return_value = mock_channel
@@ -1101,9 +1247,11 @@ class TestForceRescrapeMode(
             creator_map_backend=creator_map,
             http_client=MagicMock(),
         )
-        mock_exists.assert_not_awaited()
+        mock_exists.assert_awaited_once()
         kwargs: dict = mock_typed.await_args.kwargs
         self.assertFalse(kwargs.get('metadata_only'))
+        extra: dict[str, str] = mock_typed.await_args.args[4]
+        self.assertEqual(extra['channel_status'], 'existing')
         queue.clear_force_rescrape.assert_awaited_once_with(
             'i:UCabc00000000000000000003',
         )
@@ -1118,11 +1266,12 @@ class TestForceRescrapeMode(
         '._channel_exists_on_exchange',
         new_callable=AsyncMock,
     )
-    async def test_metadata_mode_bypasses_existence_check(
+    async def test_metadata_mode_checks_existence_for_label(
         self,
         mock_exists: AsyncMock,
         mock_typed: AsyncMock,
     ) -> None:
+        mock_exists.return_value = False
         mock_channel: MagicMock = MagicMock()
         mock_channel.subscriber_count = 250
         mock_typed.return_value = mock_channel
@@ -1143,9 +1292,11 @@ class TestForceRescrapeMode(
             creator_map_backend=creator_map,
             http_client=MagicMock(),
         )
-        mock_exists.assert_not_awaited()
+        mock_exists.assert_awaited_once()
         kwargs: dict = mock_typed.await_args.kwargs
         self.assertTrue(kwargs.get('metadata_only'))
+        extra: dict[str, str] = mock_typed.await_args.args[4]
+        self.assertEqual(extra['channel_status'], 'new')
         queue.clear_force_rescrape.assert_awaited_once_with(
             'i:UCabc00000000000000000004',
         )
@@ -1165,6 +1316,7 @@ class TestForceRescrapeMode(
         mock_exists: AsyncMock,
         mock_typed: AsyncMock,
     ) -> None:
+        mock_exists.return_value = True
         mock_typed.side_effect = RuntimeError('timeout')
         queue: AsyncMock = AsyncMock()
         queue.get_meta.return_value = {
@@ -1183,7 +1335,7 @@ class TestForceRescrapeMode(
             creator_map_backend=creator_map,
             http_client=MagicMock(),
         )
-        mock_exists.assert_not_awaited()
+        mock_exists.assert_awaited_once()
         queue.clear_force_rescrape.assert_not_called()
 
 

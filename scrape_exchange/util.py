@@ -317,3 +317,29 @@ def extract_proxy_ip(proxy: str) -> str:
     if not host or not _PROXY_HOST_RE.match(host):
         raise ValueError(f'Invalid proxy URL: {proxy!r}')
     return host
+
+
+def extract_proxy_port(proxy: str) -> str:
+    '''Return an explicit proxy port without exposing credentials.
+
+    ``local://`` entries and URLs without an explicit port return
+    ``'none'``. Invalid and out-of-range ports raise ``ValueError`` so
+    malformed endpoint labels do not silently enter metrics.
+    '''
+
+    if proxy.startswith('local://'):
+        extract_proxy_ip(proxy)
+        return 'none'
+
+    # Reuse the host parser's validation, including its IPv6 rejection.
+    extract_proxy_ip(proxy)
+    remainder: str = proxy.split('://', 1)[-1]
+    if '@' in remainder:
+        remainder = remainder.split('@', 1)[1]
+    if ':' not in remainder:
+        return 'none'
+
+    port: str = remainder.rsplit(':', 1)[1]
+    if not port.isdigit() or not 1 <= int(port) <= 65535:
+        raise ValueError(f'Invalid proxy port: {proxy!r}')
+    return port

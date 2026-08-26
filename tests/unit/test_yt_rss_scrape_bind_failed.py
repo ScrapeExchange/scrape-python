@@ -64,10 +64,12 @@ class TestFetchRssBindFailed(unittest.IsolatedAsyncioTestCase):
         def fake_record(
             reason: str,
             ip: str | None,
+            port: str | None,
             file_label: str,
         ) -> None:
             recorded['reason'] = reason
             recorded['proxy_ip'] = ip
+            recorded['proxy_port'] = port
             recorded['proxy_file'] = file_label
 
         class _ConnFailClient:
@@ -113,4 +115,5 @@ class TestFetchRssBindFailed(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(recorded['reason'], 'bind_failed')
         self.assertEqual(recorded['proxy_ip'], '192.0.2.99')
+        self.assertEqual(recorded['proxy_port'], 'none')
         self.assertEqual(recorded['proxy_file'], 'local-egress')

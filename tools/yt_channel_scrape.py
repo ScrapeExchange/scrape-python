@@ -66,7 +66,11 @@ from scrape_exchange.scraper_runner import (
 )
 from scrape_exchange.proxy_loader import proxy_file_label
 from scrape_exchange.settings import normalize_log_level
-from scrape_exchange.util import extract_proxy_ip, proxy_network_for
+from scrape_exchange.util import (
+    extract_proxy_ip,
+    extract_proxy_port,
+    proxy_network_for,
+)
 
 from scrape_exchange.redis_claim import RedisClaim
 from scrape_exchange.worker_id import get_worker_id
@@ -279,6 +283,19 @@ class ChannelSettings(YouTubeScraperSettings):
             'the terminal threshold.'
         ),
     )
+    channel_missing_subscriber_retry_seconds: int = Field(
+        default=24 * 60 * 60,
+        gt=0,
+        validation_alias=AliasChoices(
+            'CHANNEL_MISSING_SUBSCRIBER_RETRY_SECONDS',
+            'channel_missing_subscriber_retry_seconds',
+        ),
+        description=(
+            'Delay before retrying a successful channel scrape '
+            'that did not return a subscriber count. The retry '
+            'uses a full scrape and preserves the current tier.'
+        ),
+    )
     channel_unavailable_soft_retry_seconds: int = Field(
         default=3 * 86400,
     )
@@ -333,8 +350,10 @@ METRIC_CHANNEL_NO_CONTENT_FOUND = Counter(
     'channel_no_content_found_total',
     'Number of channels scraped that had no videos, playlists, courses, '
     'podcasts, or products',
-    ['platform', 'scraper', 'entity', 'worker_id', 'proxy_ip',
-     'proxy_file'],
+    [
+        'platform', 'scraper', 'entity', 'worker_id', 'proxy_ip',
+        'proxy_port', 'proxy_file',
+    ],
 )
 METRIC_CHANNEL_RESOLVE_CLAIM: Counter = Counter(
     'channel_resolve_claim_total',
@@ -564,6 +583,10 @@ async def _run_worker(
                 channel_not_found_retry_seconds=(
                     settings
                     .channel_not_found_retry_seconds
+                ),
+                channel_missing_subscriber_retry_seconds=(
+                    settings
+                    .channel_missing_subscriber_retry_seconds
                 ),
                 channel_unavailable_soft_retry_seconds=(
                     settings
@@ -1143,7 +1166,7 @@ async def _publish_channel_queue_sizes(
             )
             for tier, n in tier_counts.items():
                 CHANNEL_QUEUE_TIER_SIZE_NEW.labels(
-                    tier=str(tier),
+                    tier=str(tier + 1),
                 ).set(n)
         except Exception:
             logging.warning(
@@ -1555,16 +1578,17 @@ async def _channel_exists_on_exchange(
     http_client: httpx.AsyncClient,
     exchange_url: str,
     channel_id: str,
-) -> bool:
+) -> bool | None:
     '''Check whether scrape.exchange already has the
     channel record. Returns True if the platform has
     at least one record under
     /api/v1/data/content/youtube/channel/<channel_id>.
 
-    On any error (network failure, non-200 response,
-    malformed JSON), returns False and increments the
-    error metric — the caller falls back to a full
-    scrape, which is the safe default.
+    A 404 response means the channel is confirmed missing.
+    On any error (network failure, unexpected non-200 response,
+    malformed JSON), returns None and increments the error
+    metric. This keeps an unavailable existence check distinct
+    from a confirmed missing channel.
     '''
     url: str = (
         f'{exchange_url.rstrip("/")}'
@@ -1584,19 +1608,24 @@ async def _channel_exists_on_exchange(
             exc_info=exc,
             extra={'channel_id': channel_id},
         )
+        return None
+    if resp.status_code == 404:
+        CHANNEL_EXCHANGE_EXISTENCE_CHECK.labels(
+            outcome='not_exists',
+        ).inc()
         return False
     if resp.status_code != 200:
         CHANNEL_EXCHANGE_EXISTENCE_CHECK.labels(
             outcome='error',
         ).inc()
-        return False
+        return None
     try:
         body: dict[str, any] = resp.json()
     except Exception:
         CHANNEL_EXCHANGE_EXISTENCE_CHECK.labels(
             outcome='error',
         ).inc()
-        return False
+        return None
     total_count: int = int(
         body.get('total_count', 0),
     )
@@ -1692,7 +1721,31 @@ async def _scrape_one_queued(
             queue, member, handle, force_mode,
         )
         return
+    try:
+        existence: bool | None = (
+            await _channel_exists_on_exchange(
+                http_client, settings.exchange_url, channel_id,
+            )
+        )
+    except Exception:
+        logging.warning(
+            'existence check raised unexpectedly; '
+            'falling back to unknown channel status',
+            exc_info=True,
+            extra={'channel_id': channel_id},
+        )
+        CHANNEL_EXCHANGE_EXISTENCE_CHECK.labels(
+            outcome='error',
+        ).inc()
+        existence = None
     scrape_decision: str
+    channel_status: str
+    if existence is True:
+        channel_status = 'existing'
+    elif existence is False:
+        channel_status = 'new'
+    else:
+        channel_status = 'unknown'
     if force_mode == 'full':
         metadata_only = False
         scrape_decision = 'forced_full'
@@ -1700,36 +1753,22 @@ async def _scrape_one_queued(
         metadata_only = True
         scrape_decision = 'forced_metadata'
     else:
-        try:
-            metadata_only = (
-                await _channel_exists_on_exchange(
-                    http_client,
-                    settings.exchange_url,
-                    channel_id,
-                )
-            )
-            scrape_decision = (
-                'exchange_exists'
-                if metadata_only
-                else 'exchange_missing'
-            )
-        except Exception:
-            logging.warning(
-                'existence check raised unexpectedly; '
-                'falling back to full scrape',
-                exc_info=True,
-                extra={'channel_id': channel_id},
-            )
-            CHANNEL_EXCHANGE_EXISTENCE_CHECK.labels(
-                outcome='error',
-            ).inc()
+        if existence is None:
             metadata_only = False
             scrape_decision = 'exchange_error'
+        else:
+            metadata_only = existence
+            scrape_decision = (
+                'exchange_exists'
+                if existence
+                else 'exchange_missing'
+            )
     extra: dict[str, str] = {
         'channel_id': channel_id,
         'channel_handle': handle or '',
         'metadata_only': str(metadata_only),
         'scrape_decision': scrape_decision,
+        'channel_status': channel_status,
     }
     if force_mode:
         extra['force_rescrape_mode'] = force_mode
@@ -1812,6 +1851,11 @@ async def _scrape_one_queued(
             ).inc()
         return
     await _self_heal_identity(channel, identity, name_map)
+    if channel.subscriber_count is not None:
+        await queue.set_meta(
+            member,
+            subscriber_count=str(channel.subscriber_count),
+        )
     end_state: ChannelState | None = _channel_end_state(channel)
     if end_state is not None:
         await _mark_channel_end_state(
@@ -1819,9 +1863,31 @@ async def _scrape_one_queued(
             force_mode=force_mode,
         )
         return
+    if channel.subscriber_count is None:
+        logging.warning(
+            'Channel scrape returned no subscriber count; '
+            'scheduling a full retry',
+            extra={
+                'channel_id': channel_id,
+                'channel_handle': channel.channel_handle or '',
+            },
+        )
+        await queue.retry_missing_subscriber_count(
+            channel_id=channel_id,
+            now=time.time(),
+        )
+        CHANNEL_SCRAPE_OUTCOMES.labels(
+            outcome='subscriber_count_missing',
+        ).inc()
+        if force_mode:
+            CHANNEL_FORCE_RESCRAPE_TOTAL.labels(
+                mode=force_mode,
+                outcome='subscriber_count_missing',
+            ).inc()
+        return
     await queue.update_tier(
         channel_id,
-        sub_count=channel.subscriber_count or 0,
+        sub_count=channel.subscriber_count,
         now=time.time(),
     )
     if force_mode:
@@ -2056,6 +2122,7 @@ def _persisted_channel_id_or_fail(
         reason='no_channel_id',
         worker_id=get_worker_id(),
         proxy_ip='none',
+        proxy_port='none',
         proxy_file=proxy_file_label(''),
     ).inc()
     logging.warning(
@@ -2211,6 +2278,9 @@ def _record_scrape_failure(
     proxy_used_ip: str = (
         extract_proxy_ip(proxy_used) if proxy_used else 'none'
     )
+    proxy_used_port: str = (
+        extract_proxy_port(proxy_used) if proxy_used else 'none'
+    )
     METRIC_SCRAPE_FAILURES.labels(
         platform='youtube',
         scraper='channel_scraper',
@@ -2219,11 +2289,13 @@ def _record_scrape_failure(
         reason='other',
         worker_id=get_worker_id(),
         proxy_ip=proxy_used_ip,
+        proxy_port=proxy_used_port,
         proxy_file=proxy_file_label(proxy_used or ''),
     ).inc()
     logging.warning(
         message, exc=exc, extra=extra | {
-            'proxy': proxy_used, 'proxy_ip': proxy_used_ip,
+            'proxy_ip': proxy_used_ip,
+            'proxy_port': proxy_used_port,
         },
     )
 
@@ -2345,6 +2417,10 @@ def _channel_has_no_content(
         entity='channel',
         worker_id=get_worker_id(),
         proxy_ip=scrape_proxy_ip,
+        proxy_port=(
+            extract_proxy_port(scrape_proxy)
+            if scrape_proxy else 'none'
+        ),
         proxy_file=proxy_file_label(scrape_proxy or ''),
     ).inc()
     logging.info(
@@ -2352,6 +2428,10 @@ def _channel_has_no_content(
         extra={
             'channel_handle': channel_handle,
             'proxy_ip': scrape_proxy_ip,
+            'proxy_port': (
+                extract_proxy_port(scrape_proxy)
+                if scrape_proxy else 'none'
+            ),
             'proxy_network': scrape_proxy_network,
             'playlists_length': len(channel.playlists),
             'courses_length': len(channel.courses),
@@ -2543,6 +2623,10 @@ async def _do_scrape_channel_to_disk(
     scrape_proxy_network: str = proxy_network_for(
         scrape_proxy_ip,
     )
+    scrape_proxy_port: str = (
+        extract_proxy_port(scrape_proxy)
+        if scrape_proxy else 'none'
+    )
 
     if _channel_has_no_content(
         channel, scrape_proxy_ip,
@@ -2577,7 +2661,9 @@ async def _do_scrape_channel_to_disk(
         api=success_api,
         worker_id=get_worker_id(),
         proxy_ip=scrape_proxy_ip,
+        proxy_port=scrape_proxy_port,
         proxy_file=proxy_file_label(scrape_proxy or ''),
+        channel_status=extra.get('channel_status', 'unknown'),
     ).inc()
     METRIC_SCRAPE_DURATION.labels(
         platform='youtube',
@@ -2593,6 +2679,7 @@ async def _do_scrape_channel_to_disk(
             'channel_handle': log_handle,
             'channel_id': channel_id,
             'proxy_ip': scrape_proxy_ip,
+            'proxy_port': scrape_proxy_port,
             'proxy_network': scrape_proxy_network,
         },
     )
@@ -2674,6 +2761,10 @@ async def _do_scrape_channel_to_disk_typed(
     scrape_proxy_network: str = proxy_network_for(
         scrape_proxy_ip,
     )
+    scrape_proxy_port: str = (
+        extract_proxy_port(scrape_proxy)
+        if scrape_proxy else 'none'
+    )
 
     if not metadata_only and _channel_has_no_content(
         channel, scrape_proxy_ip,
@@ -2712,9 +2803,11 @@ async def _do_scrape_channel_to_disk_typed(
         api=success_api,
         worker_id=get_worker_id(),
         proxy_ip=scrape_proxy_ip,
+        proxy_port=scrape_proxy_port,
         proxy_file=proxy_file_label(
             scrape_proxy or '',
         ),
+        channel_status=extra.get('channel_status', 'unknown'),
     ).inc()
     METRIC_SCRAPE_DURATION.labels(
         platform='youtube',
@@ -2729,6 +2822,7 @@ async def _do_scrape_channel_to_disk_typed(
         extra={
             'channel_handle': channel_handle,
             'proxy_ip': scrape_proxy_ip,
+            'proxy_port': scrape_proxy_port,
             'proxy_network': scrape_proxy_network,
         },
     )

@@ -1,6 +1,6 @@
 read settings, connectionstrings from LOCAL.md if the file exists.
 remember conversations about this code base and repo between sessions
-use the skills of the superpowers plugin at all times
+only use subagents if the user explicitly request them
 use uv for python package management
 use unittest for testing instead of pytest
 use pydantic-settings for environment variables and command line arguments

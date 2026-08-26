@@ -1081,15 +1081,16 @@ class TestAtomicWriteBytes(unittest.TestCase):
             atomic_write_bytes,
             TMP_SUBDIR_NAME,
         )
-        import aiofiles.os as aios
-
         with tempfile.TemporaryDirectory() as base:
             target: str = os.path.join(base, 'foo.json.br')
 
-            async def boom(*_args, **_kwargs):
+            def boom(*_args, **_kwargs):
                 raise OSError('rename blew up')
 
-            with patch.object(aios, 'rename', new=boom):
+            with patch(
+                'scrape_exchange.file_management.os.rename',
+                new=boom,
+            ):
                 with self.assertRaises(OSError):
                     asyncio.run(
                         atomic_write_bytes(target, b'payload'),

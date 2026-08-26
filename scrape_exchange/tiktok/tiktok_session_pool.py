@@ -43,6 +43,7 @@ from scrape_exchange.tiktok.tiktok_session_jar import (
     TikTokSessionJar,
 )
 from scrape_exchange.tiktok.tiktok_types import TikTokCallType
+from scrape_exchange.util import extract_proxy_port
 from scrape_exchange.watchdog import Watchdog
 
 
@@ -487,6 +488,11 @@ class TikTokSessionPool:
                 platform='tiktok',
                 scraper=self._scraper_label,
                 proxy_ip=bound.proxy_key,
+                proxy_port=(
+                    extract_proxy_port(bound.proxy)
+                    if bound.proxy != DIRECT_SESSION_PROXY
+                    else 'none'
+                ),
                 worker_id=self._worker_id,
             ).inc()
             rec = self._jar.get(bound.proxy_key)
@@ -495,6 +501,11 @@ class TikTokSessionPool:
                     platform='tiktok',
                     scraper=self._scraper_label,
                     proxy_ip=bound.proxy_key,
+                    proxy_port=(
+                        extract_proxy_port(bound.proxy)
+                        if bound.proxy != DIRECT_SESSION_PROXY
+                        else 'none'
+                    ),
                     worker_id=self._worker_id,
                 ).set(rec.age_seconds())
             try:
@@ -504,6 +515,11 @@ class TikTokSessionPool:
                     platform='tiktok',
                     scraper=self._scraper_label,
                     proxy_ip=bound.proxy_key,
+                    proxy_port=(
+                        extract_proxy_port(bound.proxy)
+                        if bound.proxy != DIRECT_SESSION_PROXY
+                        else 'none'
+                    ),
                     worker_id=self._worker_id,
                 ).dec()
 
@@ -585,6 +601,11 @@ class TikTokSessionPool:
                     platform='tiktok',
                     scraper=self._scraper_label,
                     proxy_ip=proxy_key,
+                    proxy_port=(
+                        extract_proxy_port(bound.proxy)
+                        if bound.proxy != DIRECT_SESSION_PROXY
+                        else 'none'
+                    ),
                     worker_id=self._worker_id,
                 ).set(rec2.age_seconds())
 

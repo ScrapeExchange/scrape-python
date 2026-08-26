@@ -8,23 +8,21 @@ and recursively scrapes every new channel it finds. Persists discovered
 channels (with subscriber counts) and failed scrapes to append-only
 JSONL files so a crashed run can be resumed.
 
-:maintainer : Steven Hessing <steven@byoda.org>
+:maintainer : Boinko (boinko@scrape.exchange)
 :copyright  : Copyright 2026
 :license    : GPLv3
 '''
 
-import re
-import sys
 import asyncio
 import logging
-
-from typing import Self
-from random import shuffle
+import re
+import sys
 from collections import deque
+from random import shuffle
+from typing import Self
 
-import orjson
 import aiofiles
-
+import orjson
 from bs4 import BeautifulSoup
 from pydantic import AliasChoices, Field
 
@@ -37,27 +35,25 @@ from scrape_exchange.handle_map import (
     NullHandleMap,
     RedisHandleMap,
 )
+from scrape_exchange.logging import configure_logging
 from scrape_exchange.name_map import (
     NameMap,
     NullNameMap,
     RedisNameMap,
 )
-from scrape_exchange.logging import configure_logging
 from scrape_exchange.settings import ScraperSettings
-from scrape_exchange.youtube.youtube_rate_limiter import (
-    YouTubeRateLimiter,
-)
 from scrape_exchange.youtube.channel_identity import (
     ChannelIdentityStore,
     InconsistentIdentityError,
 )
-
+from scrape_exchange.youtube.youtube_channel import YouTubeChannel
 from scrape_exchange.youtube.youtube_channel import (
     YouTubeChannel as ScrapeYouTubeChannel,
 )
 from scrape_exchange.youtube.youtube_client import AsyncYouTubeClient
-
-from scrape_exchange.youtube.youtube_channel import YouTubeChannel
+from scrape_exchange.youtube.youtube_rate_limiter import (
+    YouTubeRateLimiter,
+)
 
 # The underlying Redis hash name when the Redis backend is
 # active. Kept here for reference; RedisCreatorMap derives
@@ -404,8 +400,8 @@ class DiscoveredChannel:
 
 
 async def load_known_channels(
-    settings: 'DiscoverSettings',
-    creator_map: 'CreatorMap',
+    settings: DiscoverSettings,
+    creator_map: CreatorMap,
 ) -> set[str]:
     '''Return the set of already-known channel handles.
 
@@ -453,8 +449,7 @@ def _normalise_known_handle(handle: str) -> str:
     '''
     url_prefix: str = 'https://www.youtube.com/'
     h: str = handle.strip().lstrip('@')
-    if h.startswith(url_prefix):
-        h = h[len(url_prefix):]
+    h = h.removeprefix(url_prefix)
     h = h.lstrip('@').strip()
     if '@' in h:
         _LOGGER.warning(
@@ -478,7 +473,7 @@ def _load_known_channels_from_file(filepath: str) -> set[str]:
     known: set[str] = set()
     try:
         with open(filepath, 'r') as file_in:
-            for line in file_in.readlines():
+            for line in file_in:
                 line = line.strip()
                 if not line or line.startswith('#'):
                     continue
@@ -498,8 +493,7 @@ def _load_known_channels_from_file(filepath: str) -> set[str]:
                 else:
                     channel = words[1].strip().lstrip('@')
                 channel = channel.strip().lstrip('@').split(',')[0]
-                if channel.startswith(url_prefix):
-                    channel = channel[len(url_prefix):]
+                channel = channel.removeprefix(url_prefix)
                 channel = channel.lstrip('@')
                 if '@' in channel:
                     _LOGGER.warning(
@@ -617,8 +611,7 @@ def _handle_from_target(target: str) -> str | None:
     written to the creator_map.
     '''
     handle: str = target
-    if handle.startswith(CHANNEL_PREFIX):
-        handle = handle[len(CHANNEL_PREFIX):]
+    handle = handle.removeprefix(CHANNEL_PREFIX)
     handle = handle.lstrip('@')
     if not handle or YouTubeChannel.CHANNEL_ID_REGEX_MATCH.match(handle):
         return None
@@ -1141,7 +1134,7 @@ async def load_creator_handles(
 
 
 async def build_creator_map(
-    settings: 'DiscoverSettings',
+    settings: DiscoverSettings,
 ) -> CreatorMap:
     '''
     Construct the creator_map backend from *settings*.
@@ -1190,7 +1183,7 @@ async def build_creator_map(
 
 
 def build_identity_store(
-    settings: 'DiscoverSettings',
+    settings: DiscoverSettings,
     creator_map: CreatorMap,
 ) -> ChannelIdentityStore | None:
     '''
@@ -1218,7 +1211,7 @@ def build_identity_store(
 
 
 def build_name_map(
-    settings: 'DiscoverSettings',
+    settings: DiscoverSettings,
 ) -> NameMap:
     '''
     Construct the name_map backend from *settings*. Returns

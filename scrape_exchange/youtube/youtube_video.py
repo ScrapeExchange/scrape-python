@@ -9,6 +9,7 @@ Model a Youtube video
 import os
 import re
 import random
+import shutil
 import tempfile
 
 from enum import Enum
@@ -73,6 +74,29 @@ METRIC_EXTRACT_INFO_ACTIVE: Gauge = Gauge(
     ['platform', 'scraper', 'entity', 'api', 'proxy', 'worker_id'],
     multiprocess_mode='livemostrecent',
 )
+
+
+def _resolve_deno_path(configured_path: str) -> str:
+    '''Resolve an executable Deno path inside the current runtime.'''
+
+    expanded_path: str = os.path.expanduser(
+        os.path.expandvars(configured_path),
+    )
+    if (
+        expanded_path
+        and os.path.isfile(expanded_path)
+        and os.access(expanded_path, os.X_OK)
+    ):
+        return expanded_path
+
+    path_executable: str | None = shutil.which('deno')
+    if path_executable:
+        return path_executable
+
+    raise ValueError(
+        f'Deno executable not found: DENO_PATH={configured_path!r} '
+        'is not executable and deno is not available on PATH'
+    )
 
 
 class YouTubeMediaType(str, Enum):
@@ -910,15 +934,15 @@ class YouTubeVideo:
         :raises: ValueError if required parameters are missing
         '''
 
-        if not deno_path:
-            raise ValueError('deno_path is required if no download_client')
         if not po_token_url:
             raise ValueError('po_token_url is required if no download_client')
+
+        resolved_deno_path: str = _resolve_deno_path(deno_path)
 
         _LOGGER.debug(
             'Using deno and po-token-url',
             extra={
-                'deno_path': deno_path,
+                'deno_path': resolved_deno_path,
                 'po_token_url': po_token_url,
             }
         )
@@ -942,10 +966,11 @@ class YouTubeVideo:
                 'proxy': proxy,
                 'cookiefile': cookie_file_path,
                 'cachedir': ytdlp_cache_dir,
-                'js_runtimes': {'deno': {'path': deno_path}},
+                'js_runtimes': {
+                    'deno': {'path': resolved_deno_path},
+                },
                 'extractor_args': {
                     'youtube': {
-                        'player-client': 'tv,mweb',
                         'youtubepot-bgutilhttp:base_url': po_token_url
                     }
                 },

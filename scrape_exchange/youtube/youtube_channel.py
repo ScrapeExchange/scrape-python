@@ -15,6 +15,7 @@ from typing import Self
 from logging import Logger
 from logging import getLogger
 from datetime import UTC, datetime
+from urllib.parse import urlsplit
 
 from ..brotli import brotli_write_async
 import orjson
@@ -31,7 +32,10 @@ from prometheus_client import Counter
 
 from scrape_exchange.worker_id import get_worker_id
 from scrape_exchange.proxy_loader import proxy_file_label
-from scrape_exchange.util import extract_proxy_ip as _extract_proxy_ip
+from scrape_exchange.util import (
+    extract_proxy_ip as _extract_proxy_ip,
+    extract_proxy_port as _extract_proxy_port,
+)
 
 from .youtube_client import (
     AsyncYouTubeClient,
@@ -95,7 +99,7 @@ METRIC_CHANNEL_HANDLE_RESOLVER_OUTCOMES: Counter = Counter(
     [
         'platform', 'scraper', 'entity',
         'strategy', 'outcome', 'worker_id',
-        'proxy_ip', 'proxy_file',
+        'proxy_ip', 'proxy_port', 'proxy_file',
     ],
 )
 
@@ -651,6 +655,123 @@ class YouTubeChannel:
 
         return external_links
 
+    def _reconcile_description_external_links(self) -> None:
+        '''Add missing social and email links from the description.'''
+
+        if not self.description:
+            return
+
+        description_networks: set[str] = set()
+        for external_link in self.external_urls:
+            network_name: str | None = self._social_network_name(
+                external_link.url
+            )
+            if network_name:
+                description_networks.add(
+                    self._social_network_identity(network_name)
+                )
+
+        priority: int = max(
+            (link.priority for link in self.external_urls),
+            default=0,
+        ) + 10
+        raw_url: str
+        for raw_url in re.findall(
+            r'https?://[^\s<>"\']+', self.description
+        ):
+            url: str = raw_url.rstrip('.,;:!?)]}')
+            network_name: str | None = self._social_network_name(url)
+            if not network_name:
+                continue
+            network_identity: str = self._social_network_identity(
+                network_name
+            )
+            if network_identity in description_networks:
+                continue
+
+            external_link: YouTubeExternalLink | None = (
+                self._generate_external_link(
+                    url, priority, title=network_name,
+                )
+            )
+            if external_link:
+                self.external_urls.add(external_link)
+                description_networks.add(network_identity)
+                priority += 10
+
+        local_atom: str = r"[A-Za-z0-9!#$%&'*+=?^_`{|}~-]+"
+        local_part: str = rf'{local_atom}(?:\.{local_atom})*'
+        domain_label: str = (
+            r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
+        )
+        domain: str = rf'(?:{domain_label}\.)+[A-Za-z]{{2,63}}'
+        separator: str = (
+            r'(?:\s*@\s*|\s+at\s+|-at-|\s*\(\s*at\s*\)\s*)'
+        )
+        email_pattern: str = (
+            rf'(?<![A-Za-z0-9._%+/~-])({local_part})'
+            rf'{separator}({domain})(?![A-Za-z0-9-])'
+        )
+        existing_emails: set[str] = {
+            link.url.split(':', 1)[1].lower()
+            for link in self.external_urls
+            if link.url.lower().startswith('mailto:')
+        }
+        for email_match in re.finditer(
+            email_pattern,
+            self.description,
+            flags=re.IGNORECASE,
+        ):
+            email_address: str = (
+                f'{email_match.group(1)}@{email_match.group(2)}'
+            )
+            email_identity: str = email_address.lower()
+            if email_identity in existing_emails:
+                continue
+            self.external_urls.add(
+                YouTubeExternalLink(
+                    name='email',
+                    url=f'mailto:{email_address}',
+                    priority=priority,
+                )
+            )
+            existing_emails.add(email_identity)
+            priority += 10
+
+    @staticmethod
+    def _social_network_identity(network_name: str) -> str:
+        '''Return a stable identity for renamed social networks.'''
+
+        if network_name in ('Twitter', 'X'):
+            return 'X'
+        return network_name
+
+    @staticmethod
+    def _social_network_name(url: str) -> str | None:
+        '''Return the configured social-network name for an HTTP(S) URL.'''
+
+        try:
+            hostname: str | None = urlsplit(url).hostname
+        except ValueError:
+            return None
+        if not hostname:
+            return None
+
+        hostname = hostname.lower().removeprefix('www.')
+        if hostname in SocialNetworks:
+            return SocialNetworks[hostname]
+
+        labels: list[str] = hostname.split('.')
+        if len(labels) < 2:
+            return None
+        domain_name: str = labels[-2]
+        if (
+            labels[-1] in ('au', 'ng', 'nz', 'tt', 'uk')
+            and len(labels) >= 3
+        ):
+            domain_name = labels[-3]
+        return SocialNetworks.get(domain_name)
+
     async def scrape(
         self, save_dir: str | None = None,
         max_videos_per_channel: int = 0,
@@ -744,6 +865,7 @@ class YouTubeChannel:
                 )
         except (ValueError, RuntimeError):
             pass
+        self._reconcile_description_external_links()
 
     async def scrape_about_page(self, proxies: list[str] | str | None = None
                                 ) -> None:
@@ -766,10 +888,12 @@ class YouTubeChannel:
         if not self.browse_client:
             self._create_browse_client(proxies=proxies)
 
+        proxy: str | None = self.browse_client.proxy
         extra: dict[str, any] = {
             'channel_handle': self.channel_handle,
             'url': about_url,
-            'proxy': self.browse_client.proxy,
+            'proxy_ip': _extract_proxy_ip(proxy) if proxy else 'none',
+            'proxy_port': _extract_proxy_port(proxy) if proxy else 'none',
         }
         try:
             page_contents: str | None = await self.browse_client.get(about_url)
@@ -834,6 +958,7 @@ class YouTubeChannel:
         self._parse_thumbnails_banners(metadata, page_data)
 
         self.channel_links = YouTubeChannel.extract_linked_channels(page_data)
+        self._reconcile_description_external_links()
 
     def _find_about_renderer(self, initial_data: dict) -> dict | None:
         '''
@@ -936,11 +1061,12 @@ class YouTubeChannel:
             except IndexError:
                 pass
 
-        self.external_urls.add(
-            YouTubeExternalLink(
-                name='YouTube', url=vanity_url, priority=0,
+        if vanity_url:
+            self.external_urls.add(
+                YouTubeExternalLink(
+                    name='YouTube', url=vanity_url, priority=0,
+                )
             )
-        )
 
         self.keywords = self.keywords | split_quoted_string(
             metadata.get('keywords')
@@ -1320,6 +1446,9 @@ class YouTubeChannel:
         proxy_ip: str = (
             _extract_proxy_ip(proxy) if proxy else 'none'
         )
+        proxy_port: str = (
+            _extract_proxy_port(proxy) if proxy else 'none'
+        )
         proxy_file: str = proxy_file_label(proxy or '')
         scraper: str = _get_scraper()
         worker_id: str = get_worker_id()
@@ -1329,11 +1458,13 @@ class YouTubeChannel:
             'entity': 'channel',
             'worker_id': worker_id,
             'proxy_ip': proxy_ip,
+            'proxy_port': proxy_port,
             'proxy_file': proxy_file,
         }
         extra: dict[str, str] = {
             'channel_handle': self.channel_handle,
-            'proxy': proxy or 'none',
+            'proxy_ip': proxy_ip,
+            'proxy_port': proxy_port,
         }
 
         limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
@@ -1524,7 +1655,15 @@ class YouTubeChannel:
             _LOGGER.debug(
                 'Failed to browse channel for ID',
                 exc=exc,
-                extra={'channel_id': channel_id, 'proxy': proxy},
+                extra={
+                    'channel_id': channel_id,
+                    'proxy_ip': (
+                        _extract_proxy_ip(proxy) if proxy else 'none'
+                    ),
+                    'proxy_port': (
+                        _extract_proxy_port(proxy) if proxy else 'none'
+                    ),
+                },
             )
             return None
 

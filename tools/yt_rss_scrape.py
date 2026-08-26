@@ -68,7 +68,11 @@ from scrape_exchange.proxy_loader import (
     proxy_file_label,
     set_active_catalog,
 )
-from scrape_exchange.util import extract_proxy_ip, proxy_network_for
+from scrape_exchange.util import (
+    extract_proxy_ip,
+    extract_proxy_port,
+    proxy_network_for,
+)
 from scrape_exchange.youtube.youtube_channel import (
     YouTubeChannel,
     canonical_handle_from_browse,
@@ -105,6 +109,7 @@ from scrape_exchange.name_map import (
 )
 from scrape_exchange.creator_queue import (
     CreatorQueue,
+    DEFAULT_ORPHAN_RECOVERY_INTERVAL_SECONDS,
     FileCreatorQueue,
     RedisCreatorQueue,
     TierConfig,
@@ -217,8 +222,10 @@ METRIC_API_CALLS: Counter = Counter(
     'api_calls_total',
     'Number of API calls made by the RSS scraper, labelled '
     'by entity, api endpoint, and status.',
-    ['platform', 'scraper', 'entity', 'api', 'status',
-     'worker_id', 'proxy_ip', 'proxy_file'],
+    [
+        'platform', 'scraper', 'entity', 'api', 'status',
+        'worker_id', 'proxy_ip', 'proxy_port', 'proxy_file',
+    ],
 )
 METRIC_API_CHANNEL_CALLS: Counter = METRIC_API_CALLS
 METRIC_INNERTUBE_SUCCESS: Counter = METRIC_API_CALLS
@@ -668,11 +675,13 @@ def _get_exchange_existence_semaphore(
 # in scrape_exchange.util.extract_proxy_ip so the channel and video
 # scrapers can reuse it without a cross-tool import.
 _extract_proxy_ip = extract_proxy_ip
+_extract_proxy_port = extract_proxy_port
 
 
 def _record_rss_failure(
     reason: str,
     proxy_ip: str | None,
+    proxy_port: str | None,
     proxy_file: str,
 ) -> None:
     METRIC_RSS_FAILURES.labels(
@@ -683,6 +692,7 @@ def _record_rss_failure(
         reason=reason,
         worker_id=get_worker_id(),
         proxy_ip=proxy_ip or 'none',
+        proxy_port=proxy_port or 'none',
         proxy_file=proxy_file,
     ).inc()
 
@@ -719,7 +729,15 @@ def _rss_browser_cookies(proxy: str | None) -> dict[str, str]:
             logging.warning(
                 'Failed to load cached YouTube cookies for RSS fetch',
                 exc=exc,
-                extra={'cookie_file': cookie_file, 'proxy': proxy},
+                extra={
+                    'cookie_file': cookie_file,
+                    'proxy_ip': (
+                        _extract_proxy_ip(proxy) if proxy else 'none'
+                    ),
+                    'proxy_port': (
+                        _extract_proxy_port(proxy) if proxy else 'none'
+                    ),
+                },
             )
     cookies.setdefault('VISITOR_INFO1_LIVE', _rss_visitor_info(proxy))
     return cookies
@@ -744,14 +762,17 @@ def _handle_http_status_error(
         },
     )
     pf: str = proxy_file_label(proxy or '')
+    proxy_port: str = (
+        _extract_proxy_port(proxy) if proxy else 'none'
+    )
     status_code: int = exc.response.status_code
     if status_code == 404:
-        _record_rss_failure('not_found', proxy_ip, pf)
+        _record_rss_failure('not_found', proxy_ip, proxy_port, pf)
         raise ValueError(
             f'RSS feed not found: {rss_url}'
         ) from exc
     if 500 <= status_code < 600:
-        _record_rss_failure('server_error', proxy_ip, pf)
+        _record_rss_failure('server_error', proxy_ip, proxy_port, pf)
         raise RuntimeError(
             f'Server error fetching RSS feed: {rss_url}'
         ) from exc
@@ -785,6 +806,7 @@ async def fetch_rss(
     # so these are initialised conservatively in case acquisition
     # or proxy_ip parsing itself raises.
     fetch_status: str = 'setup_failed'
+    proxy_port: str | None = None
     try:
         extra: dict[str, object] = {'rss_url': rss_url}
 
@@ -796,16 +818,22 @@ async def fetch_rss(
         )
         try:
             proxy_ip: str | None = _extract_proxy_ip(proxy) if proxy else None
+            proxy_port = _extract_proxy_port(proxy) if proxy else None
         except ValueError as exc:
             logging.warning(
                 'Failed to parse proxy URL to get proxy_ip for metrics '
-                'labeling', exc=exc, extra={'proxy': proxy},
+                'labeling',
+                exc=exc,
+                extra={
+                    'proxy_ip': 'invalid',
+                    'proxy_port': 'invalid',
+                },
             )
             proxy_ip = None
         proxy_network: str = proxy_network_for(proxy_ip)
         extra['proxy_ip'] = proxy_ip or 'none'
+        extra['proxy_port'] = proxy_port or 'none'
         extra['proxy_network'] = proxy_network
-        extra['proxy'] = proxy or 'none'
         pfl: str = proxy_file_label(proxy or '')
         try:
             http: httpx.AsyncClient = pooled_httpx_client_for_entry(
@@ -871,7 +899,7 @@ async def fetch_rss(
                 timeout_kind = 'timeout_other'
             fetch_status = timeout_kind
             _record_rss_failure(
-                timeout_kind, proxy_ip, pfl,
+                timeout_kind, proxy_ip, proxy_port, pfl,
             )
             logging.warning(
                 'Timeout fetching RSS feed',
@@ -893,7 +921,7 @@ async def fetch_rss(
             ):
                 fetch_status = 'bind_failed'
                 _record_rss_failure(
-                    'bind_failed', proxy_ip, pfl,
+                    'bind_failed', proxy_ip, proxy_port, pfl,
                 )
                 logging.warning(
                     'Local IP not bound on this host',
@@ -902,7 +930,7 @@ async def fetch_rss(
             else:
                 fetch_status = 'network'
                 _record_rss_failure(
-                    'network', proxy_ip, pfl,
+                    'network', proxy_ip, proxy_port, pfl,
                 )
                 logging.warning(
                     'Network error fetching RSS feed',
@@ -913,7 +941,7 @@ async def fetch_rss(
             duration = monotonic() - scrape_start
             fetch_status = 'unknown'
             _record_rss_failure(
-                'unknown', proxy_ip, pfl,
+                'unknown', proxy_ip, proxy_port, pfl,
             )
             logging.warning(
                 'Getting RSS data failed',
@@ -926,7 +954,7 @@ async def fetch_rss(
             duration = monotonic() - scrape_start
             fetch_status = 'no_data'
             _record_rss_failure(
-                'no_data', proxy_ip, pfl,
+                'no_data', proxy_ip, proxy_port, pfl,
             )
             logging.warning(
                 'No data received from RSS feed',
@@ -943,7 +971,9 @@ async def fetch_rss(
             api='rss',
             worker_id=get_worker_id(),
             proxy_ip=proxy_ip or 'none',
+            proxy_port=proxy_port or 'none',
             proxy_file=pfl,
+            channel_status='none',
         ).inc()
 
         feed: untangle.Element = untangle.parse(data)
@@ -1225,10 +1255,12 @@ async def process_channel(
         YouTubeCallType.BROWSE
     )
     proxy_ip: str = _extract_proxy_ip(proxy) if proxy else 'none'
+    proxy_port: str = _extract_proxy_port(proxy) if proxy else 'none'
     extra: dict[str, str] = {
         'channel_handle': channel_handle,
         'channel_id': channel_id,
         'proxy_ip': proxy_ip,
+        'proxy_port': proxy_port,
     }
     if channel_id in CHANNEL_LAST_CHECKED:
         elapsed: float = monotonic() - CHANNEL_LAST_CHECKED[channel_id]
@@ -1644,6 +1676,7 @@ async def _write_channel(
             reason='no_channel_id',
             worker_id=get_worker_id(),
             proxy_ip='none',
+            proxy_port='none',
             proxy_file='none',
         ).inc()
         logging.warning(
@@ -1710,15 +1743,20 @@ async def update_channel(
     :raises: (none)
     '''
 
+    proxy_ip: str = _extract_proxy_ip(proxy) if proxy else 'none'
+    proxy_port: str = _extract_proxy_port(proxy) if proxy else 'none'
     try:
-        proxy_ip: str = _extract_proxy_ip(proxy) if proxy else 'none'
         tabs: YouTubeChannelTabs = YouTubeChannelTabs(channel_id, proxy)
         channel_data: dict = await tabs.browse_channel()
     except Exception as exc:
         logging.debug(
             'Failed to browse channel via InnerTube',
             exc=exc,
-            extra={'channel_handle': channel_handle, 'proxy': proxy},
+            extra={
+                'channel_handle': channel_handle,
+                'proxy_ip': proxy_ip,
+                'proxy_port': proxy_port,
+            },
         )
         METRIC_INNERTUBE_FAILURES.labels(
             platform='youtube',
@@ -1728,6 +1766,7 @@ async def update_channel(
             status='failed',
             worker_id=get_worker_id(),
             proxy_ip=proxy_ip,
+            proxy_port=proxy_port,
             proxy_file=proxy_file_label(proxy or ''),
         ).inc()
         return False, 0, None
@@ -1740,6 +1779,7 @@ async def update_channel(
         status='success',
         worker_id=get_worker_id(),
         proxy_ip=proxy_ip,
+        proxy_port=proxy_port,
         proxy_file=proxy_file_label(proxy or ''),
     ).inc()
 
@@ -2053,7 +2093,9 @@ async def _publish_queue_metrics_loop(
 
 async def _scan_and_recover_loop(
     creator_queue: CreatorQueue,
-    interval_seconds: float = 300.0,
+    interval_seconds: float = (
+        DEFAULT_ORPHAN_RECOVERY_INTERVAL_SECONDS
+    ),
 ) -> None:
     '''Periodic orphan recovery loop.
 
@@ -2540,7 +2582,9 @@ async def worker_loop(
         logging.info(
             'Started orphan-recovery and queue-metrics loops',
             extra={
-                'recovery_interval_seconds': 300,
+                'recovery_interval_seconds': (
+                    DEFAULT_ORPHAN_RECOVERY_INTERVAL_SECONDS
+                ),
                 'metrics_interval_seconds': 30,
             },
         )

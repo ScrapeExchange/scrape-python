@@ -9,6 +9,7 @@ import shutil
 import tempfile
 import unittest
 from io import StringIO
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import fakeredis.aioredis
@@ -19,10 +20,12 @@ from scrape_exchange.channel_scrape_queue import (
     ChannelState,
     RedisChannelScrapeQueue,
 )
+from scrape_exchange.file_management import AssetFileManagement
 from tools.yt_channel_queue import (
     cmd_export,
     cmd_export_rss,
     cmd_reconcile,
+    cmd_retier,
     main_async,
 )
 
@@ -91,6 +94,487 @@ class TestDispatcherStub(
         self.assertEqual(rc, 0)
         self.assertEqual(from_url.call_args.kwargs['max_connections'], 1)
         redis.aclose.assert_awaited_once()
+
+
+class TestRetierCommand(
+    unittest.IsolatedAsyncioTestCase,
+):
+
+    async def asyncSetUp(self) -> None:
+        self.redis = fakeredis.aioredis.FakeRedis(
+            decode_responses=True,
+        )
+        self.queue = RedisChannelScrapeQueue(
+            self.redis,
+            ChannelScrapeQueueSettings(
+                channel_priority_queues=(
+                    '3:1000000,30:100000,365:0'
+                ),
+            ),
+        )
+        self.tmp = tempfile.TemporaryDirectory()
+        self.fm = AssetFileManagement(self.tmp.name)
+
+    async def asyncTearDown(self) -> None:
+        await self.redis.aclose()
+        self.tmp.cleanup()
+
+    async def test_dry_run_uses_current_channel_file(
+        self,
+    ) -> None:
+        channel_id: str = 'UCaaaaaaaaaaaaaaaaaaaaaa'
+        member: str = f'i:{channel_id}'
+        await self.redis.zadd(
+            self.queue._k_scheduled(2),
+            {member: 123.0},
+        )
+        await self.redis.hset(
+            self.queue._k_tiers(), channel_id, '2',
+        )
+        await self.fm.write_file(
+            f'channel-{channel_id}.json.br',
+            {
+                'channel_id': channel_id,
+                'channel_handle': 'example',
+                'subscriber_count': 2_000_000,
+            },
+        )
+        ns = argparse.Namespace(
+            queue='channel',
+            apply=False,
+            batch_size=1000,
+            limit=None,
+        )
+        settings = SimpleNamespace(
+            channel_data_directory=self.tmp.name,
+            rss_priority_queues='1:1000000,24:0',
+            exchange_url='https://scrape.exchange',
+            api_key_id=None,
+            api_key_secret=None,
+        )
+        out = StringIO()
+        err = StringIO()
+
+        with (
+            patch(
+                'tools.yt_channel_queue.YtChannelQueueSettings',
+                return_value=settings,
+            ),
+            patch(
+                'tools.yt_channel_queue.ExchangeClient.setup',
+                new=AsyncMock(),
+            ) as setup_client,
+            patch('sys.stdout', out),
+            patch('sys.stderr', err),
+        ):
+            rc: int = await cmd_retier(ns, self.queue)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.getvalue(), '')
+        self.assertEqual(
+            await self.redis.zscore(
+                self.queue._k_scheduled(2), member,
+            ),
+            123.0,
+        )
+        self.assertIsNone(
+            await self.redis.zscore(
+                self.queue._k_scheduled(0), member,
+            ),
+        )
+        setup_client.assert_not_awaited()
+        self.assertTrue(err.getvalue().endswith(
+            '\r\033[Kretier processed=1 remaining=0 '
+            'moved=channel[2->0:1]\n',
+        ))
+
+    async def test_uses_cached_subscriber_count_before_api(
+        self,
+    ) -> None:
+        channel_id: str = 'UCcache000000000000000000'
+        member: str = f'i:{channel_id}'
+        await self.redis.zadd(
+            self.queue._k_scheduled(2),
+            {member: 123.0},
+        )
+        await self.redis.hset(
+            self.queue._k_meta(member),
+            'subscriber_count',
+            '2000000',
+        )
+        ns = argparse.Namespace(
+            queue='channel',
+            apply=False,
+            batch_size=1000,
+            limit=None,
+        )
+        settings = SimpleNamespace(
+            channel_data_directory=self.tmp.name,
+            rss_priority_queues='1:1000000,24:0',
+            exchange_url='https://scrape.exchange',
+            api_key_id='key-id',
+            api_key_secret='key-secret',
+        )
+        err = StringIO()
+
+        with (
+            patch(
+                'tools.yt_channel_queue.YtChannelQueueSettings',
+                return_value=settings,
+            ),
+            patch(
+                'tools.yt_channel_queue.ExchangeClient.setup',
+                new=AsyncMock(),
+            ) as setup_client,
+            patch('sys.stdout', StringIO()),
+            patch('sys.stderr', err),
+        ):
+            rc: int = await cmd_retier(ns, self.queue)
+
+        self.assertEqual(rc, 0)
+        setup_client.assert_not_awaited()
+        self.assertIn('moved=channel[2->0:1]', err.getvalue())
+
+    async def test_uses_uploaded_file_when_current_is_absent(
+        self,
+    ) -> None:
+        channel_id: str = 'UCbbbbbbbbbbbbbbbbbbbbbb'
+        member: str = f'i:{channel_id}'
+        filename: str = f'channel-{channel_id}.json.br'
+        await self.redis.zadd(
+            self.queue._k_scheduled(2),
+            {member: 456.0},
+        )
+        await self.fm.write_file(
+            filename,
+            {
+                'channel_id': channel_id,
+                'subscriber_count': 1_500_000,
+            },
+        )
+        await self.fm.mark_uploaded(filename)
+        ns = argparse.Namespace(
+            queue='channel',
+            apply=False,
+            batch_size=1000,
+            limit=None,
+        )
+        settings = SimpleNamespace(
+            channel_data_directory=self.tmp.name,
+            rss_priority_queues='1:1000000,24:0',
+            exchange_url='https://scrape.exchange',
+            api_key_id=None,
+            api_key_secret=None,
+        )
+        out = StringIO()
+        err = StringIO()
+
+        with (
+            patch(
+                'tools.yt_channel_queue.YtChannelQueueSettings',
+                return_value=settings,
+            ),
+            patch(
+                'tools.yt_channel_queue.ExchangeClient.setup',
+                new=AsyncMock(),
+            ) as setup_client,
+            patch('sys.stdout', out),
+            patch('sys.stderr', err),
+        ):
+            rc: int = await cmd_retier(ns, self.queue)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.getvalue(), '')
+        self.assertIn('moved=channel[2->0:1]', err.getvalue())
+        setup_client.assert_not_awaited()
+
+    async def test_calls_api_when_no_channel_file_is_available(
+        self,
+    ) -> None:
+        channel_id: str = 'UCcccccccccccccccccccccc'
+        member: str = f'i:{channel_id}'
+        await self.redis.zadd(
+            self.queue._k_scheduled(2),
+            {member: 789.0},
+        )
+        await self.redis.hset(
+            'youtube:creator_map',
+            channel_id,
+            'api-handle',
+        )
+        ns = argparse.Namespace(
+            queue='channel',
+            apply=False,
+            batch_size=1000,
+            limit=None,
+        )
+        settings = SimpleNamespace(
+            channel_data_directory=self.tmp.name,
+            rss_priority_queues='1:1000000,24:0',
+            exchange_url='https://scrape.exchange',
+            api_key_id='key-id',
+            api_key_secret='key-secret',
+        )
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {
+            'subscriber_count': 1_250_000,
+        }
+        client = AsyncMock()
+        client.exchange_url = settings.exchange_url
+        client.get.return_value = response
+        out = StringIO()
+        err = StringIO()
+
+        with (
+            patch(
+                'tools.yt_channel_queue.YtChannelQueueSettings',
+                return_value=settings,
+            ),
+            patch(
+                'tools.yt_channel_queue.ExchangeClient.setup',
+                new=AsyncMock(return_value=client),
+            ) as setup_client,
+            patch('sys.stdout', out),
+            patch('sys.stderr', err),
+        ):
+            rc: int = await cmd_retier(ns, self.queue)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.getvalue(), '')
+        self.assertIn('moved=channel[2->0:1]', err.getvalue())
+        setup_client.assert_awaited_once_with(
+            'key-id',
+            'key-secret',
+            settings.exchange_url,
+        )
+        client.get.assert_awaited_once_with(
+            'https://scrape.exchange/api/v1/data/content/'
+            'youtube/channel/api-handle',
+        )
+        client.aclose.assert_awaited_once()
+        self.assertEqual(
+            await self.redis.hget(
+                self.queue._k_meta(member),
+                'subscriber_count',
+            ),
+            '1250000',
+        )
+
+    async def test_apply_moves_channel_and_preserves_score(
+        self,
+    ) -> None:
+        channel_id: str = 'UCdddddddddddddddddddddd'
+        member: str = f'i:{channel_id}'
+        await self.redis.zadd(
+            self.queue._k_scheduled(2),
+            {member: 321.5},
+        )
+        await self.redis.hset(
+            self.queue._k_tiers(), channel_id, '2',
+        )
+        await self.fm.write_file(
+            f'channel-{channel_id}.json.br',
+            {
+                'channel_id': channel_id,
+                'subscriber_count': 1_100_000,
+            },
+        )
+        ns = argparse.Namespace(
+            queue='channel',
+            apply=True,
+            batch_size=1000,
+            limit=None,
+        )
+        settings = SimpleNamespace(
+            channel_data_directory=self.tmp.name,
+            rss_priority_queues='1:1000000,24:0',
+            exchange_url='https://scrape.exchange',
+            api_key_id=None,
+            api_key_secret=None,
+        )
+        out = StringIO()
+        err = StringIO()
+
+        with (
+            patch(
+                'tools.yt_channel_queue.YtChannelQueueSettings',
+                return_value=settings,
+            ),
+            patch('sys.stdout', out),
+            patch('sys.stderr', err),
+        ):
+            rc: int = await cmd_retier(ns, self.queue)
+
+        self.assertEqual(rc, 0)
+        self.assertIsNone(
+            await self.redis.zscore(
+                self.queue._k_scheduled(2), member,
+            ),
+        )
+        self.assertEqual(
+            await self.redis.zscore(
+                self.queue._k_scheduled(0), member,
+            ),
+            321.5,
+        )
+        self.assertEqual(
+            await self.redis.hget(
+                self.queue._k_tiers(), channel_id,
+            ),
+            '0',
+        )
+        self.assertEqual(out.getvalue(), '')
+        self.assertIn('moved=channel[2->0:1]', err.getvalue())
+
+    async def test_apply_moves_rss_and_preserves_score(
+        self,
+    ) -> None:
+        channel_id: str = 'UCeeeeeeeeeeeeeeeeeeeeee'
+        await self.redis.zadd(
+            'rss:youtube:queue:2',
+            {channel_id: 654.25},
+        )
+        await self.redis.hset(
+            'rss:youtube:tiers', channel_id, '2',
+        )
+        await self.fm.write_file(
+            f'channel-{channel_id}.json.br',
+            {
+                'channel_id': channel_id,
+                'subscriber_count': 1_100_000,
+            },
+        )
+        ns = argparse.Namespace(
+            queue='rss',
+            apply=True,
+            batch_size=1000,
+            limit=None,
+        )
+        settings = SimpleNamespace(
+            channel_data_directory=self.tmp.name,
+            rss_priority_queues='1:1000000,24:0',
+            exchange_url='https://scrape.exchange',
+            api_key_id=None,
+            api_key_secret=None,
+        )
+        out = StringIO()
+        err = StringIO()
+
+        with (
+            patch(
+                'tools.yt_channel_queue.YtChannelQueueSettings',
+                return_value=settings,
+            ),
+            patch('sys.stdout', out),
+            patch('sys.stderr', err),
+        ):
+            rc: int = await cmd_retier(ns, self.queue)
+
+        self.assertEqual(rc, 0)
+        self.assertIsNone(
+            await self.redis.zscore(
+                'rss:youtube:queue:2', channel_id,
+            ),
+        )
+        self.assertEqual(
+            await self.redis.zscore(
+                'rss:youtube:queue:1', channel_id,
+            ),
+            654.25,
+        )
+        self.assertEqual(
+            await self.redis.hget(
+                'rss:youtube:tiers', channel_id,
+            ),
+            '1',
+        )
+        self.assertEqual(out.getvalue(), '')
+        self.assertIn('moved=rss[2->1:1]', err.getvalue())
+
+    async def test_both_reuses_one_api_lookup_with_limit_one(
+        self,
+    ) -> None:
+        channel_id: str = 'UCffffffffffffffffffffff'
+        member: str = f'i:{channel_id}'
+        await self.redis.zadd(
+            self.queue._k_scheduled(2),
+            {member: 100.0},
+        )
+        await self.redis.zadd(
+            'rss:youtube:queue:2',
+            {channel_id: 200.0},
+        )
+        await self.redis.hset(
+            'youtube:creator_map', channel_id, 'shared-handle',
+        )
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {
+            'subscriber_count': 1_500_000,
+        }
+        client = AsyncMock()
+        client.exchange_url = 'https://scrape.exchange'
+        client.get.return_value = response
+        settings = SimpleNamespace(
+            channel_data_directory=self.tmp.name,
+            rss_priority_queues='1:1000000,24:0',
+            exchange_url='https://scrape.exchange',
+            api_key_id='key-id',
+            api_key_secret='key-secret',
+        )
+        ns = argparse.Namespace(
+            queue='both',
+            apply=False,
+            batch_size=1000,
+            limit=1,
+        )
+        out = StringIO()
+        err = StringIO()
+
+        with (
+            patch(
+                'tools.yt_channel_queue.YtChannelQueueSettings',
+                return_value=settings,
+            ),
+            patch(
+                'tools.yt_channel_queue.ExchangeClient.setup',
+                new=AsyncMock(return_value=client),
+            ) as setup_client,
+            patch('sys.stdout', out),
+            patch('sys.stderr', err),
+        ):
+            rc: int = await cmd_retier(ns, self.queue)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.getvalue(), '')
+        setup_client.assert_awaited_once()
+        client.get.assert_awaited_once()
+        self.assertTrue(err.getvalue().endswith(
+            '\r\033[Kretier processed=1 remaining=0 '
+            'moved=channel[2->0:1] rss[2->1:1]\n',
+        ))
+
+
+class TestRetierParser(unittest.TestCase):
+
+    def test_defaults_to_dry_run_for_both_queues(self) -> None:
+        from tools.yt_channel_queue import _build_parser
+
+        ns = _build_parser().parse_args(['retier'])
+
+        self.assertEqual(ns.queue, 'both')
+        self.assertFalse(ns.apply)
+
+    def test_accepts_apply_and_queue_selection(self) -> None:
+        from tools.yt_channel_queue import _build_parser
+
+        ns = _build_parser().parse_args([
+            'retier', '--queue', 'rss', '--apply',
+        ])
+
+        self.assertEqual(ns.queue, 'rss')
+        self.assertTrue(ns.apply)
 
 
 class TestNormaliseKey(unittest.TestCase):
@@ -984,6 +1468,58 @@ class TestImportRevivesTerminal(
         )
         self.assertIn('revived from terminal: 1', report)
 
+    async def test_does_not_revive_topic_with_whitespace_handle(
+        self,
+    ) -> None:
+        cid: str = 'UCXuqSBlHAE6Xw-yeJA0Tunw'
+        member: str = f'i:{cid}'
+        await self.queue.mark(
+            member,
+            state=ChannelState.TOPIC,
+            extra={'channel_handle': 'artist - topic'},
+        )
+
+        report: str = await self._import([
+            {'channel_id': cid, 'channel_handle': None},
+        ])
+
+        self.assertTrue(
+            await self.redis.hexists(
+                'youtube:channel:topic', member,
+            ),
+        )
+        self.assertEqual(
+            await self.queue.get_state(member),
+            ChannelState.TOPIC,
+        )
+        self.assertNotIn('revived from terminal', report)
+
+    async def test_revives_topic_without_whitespace_handle(
+        self,
+    ) -> None:
+        cid: str = 'UCabc0000000000000000000'
+        member: str = f'i:{cid}'
+        await self.queue.mark(
+            member,
+            state=ChannelState.TOPIC,
+            extra={'channel_handle': 'artist-topic'},
+        )
+
+        report: str = await self._import([
+            {'channel_id': cid, 'channel_handle': None},
+        ])
+
+        self.assertFalse(
+            await self.redis.hexists(
+                'youtube:channel:topic', member,
+            ),
+        )
+        self.assertEqual(
+            await self.queue.get_state(member),
+            ChannelState.SCHEDULED,
+        )
+        self.assertIn('revived from terminal: 1', report)
+
     async def test_new_channel_id_not_revived(
         self,
     ) -> None:
@@ -1005,6 +1541,151 @@ class TestBackfillRssCommand(
     unittest.IsolatedAsyncioTestCase,
 ):
 
+    async def test_backfill_maps_matching_rss_tiers_to_channel_tiers(
+        self,
+    ) -> None:
+        from tools.yt_channel_queue import cmd_backfill_rss
+
+        redis: fakeredis.aioredis.FakeRedis = (
+            fakeredis.aioredis.FakeRedis(
+                decode_responses=True,
+            )
+        )
+        queue: RedisChannelScrapeQueue = RedisChannelScrapeQueue(
+            redis,
+            ChannelScrapeQueueSettings(
+                channel_priority_queues=(
+                    '3:100000000,7:10000000,14:1000000,'
+                    '30:100000,90:4000,365:0'
+                ),
+            ),
+        )
+        channel_tiers: dict[str, tuple[int, int]] = {
+            'UCa0000000000000000000ab': (1, 0),
+            'UCb0000000000000000000cd': (2, 1),
+            'UCc0000000000000000000ef': (3, 2),
+            'UCd0000000000000000000gh': (4, 3),
+            'UCe0000000000000000000ij': (5, 4),
+            'UCf0000000000000000000kl': (6, 5),
+        }
+        await redis.hset(
+            'rss:youtube:creators',
+            mapping={cid: cid for cid in channel_tiers},
+        )
+        for cid, (rss_tier, _channel_tier) in (
+            channel_tiers.items()
+        ):
+            await redis.hset(
+                'rss:youtube:tiers', cid, str(rss_tier),
+            )
+            await redis.zadd(
+                f'rss:youtube:queue:{rss_tier}',
+                {cid: 123.0},
+            )
+        ns: argparse.Namespace = argparse.Namespace(
+            batch_size=1000,
+            limit=None,
+            dry_run=False,
+            source='rss_rebuild',
+        )
+        settings: SimpleNamespace = SimpleNamespace(
+            rss_priority_queues=(
+                '1:100000000,2:10000000,4:1000000,'
+                '12:100000,72:4000,168:0'
+            ),
+        )
+
+        with patch(
+            'tools.yt_channel_queue.YtChannelQueueSettings',
+            return_value=settings,
+        ):
+            rc: int = await cmd_backfill_rss(ns, queue)
+
+        self.assertEqual(rc, 0)
+        for cid, (_rss_tier, channel_tier) in (
+            channel_tiers.items()
+        ):
+            self.assertEqual(
+                await redis.hget(
+                    'youtube:channel:tiers', cid,
+                ),
+                str(channel_tier),
+            )
+            self.assertEqual(
+                await redis.zscore(
+                    'youtube:channel:queue:scheduled:'
+                    f'{channel_tier}',
+                    f'i:{cid}',
+                ),
+                0.0,
+            )
+            self.assertEqual(
+                await redis.hget(
+                    f'youtube:channel:meta:i:{cid}',
+                    'source',
+                ),
+                'rss_rebuild',
+            )
+        await redis.aclose()
+
+    async def test_backfill_uses_rss_tier_upper_bound_for_mismatch(
+        self,
+    ) -> None:
+        from tools.yt_channel_queue import cmd_backfill_rss
+
+        redis: fakeredis.aioredis.FakeRedis = (
+            fakeredis.aioredis.FakeRedis(
+                decode_responses=True,
+            )
+        )
+        queue: RedisChannelScrapeQueue = RedisChannelScrapeQueue(
+            redis,
+            ChannelScrapeQueueSettings(
+                channel_priority_queues=(
+                    '3:100000000,7:10000000,'
+                    '14:1000000,30:0'
+                ),
+            ),
+        )
+        cid: str = 'UCa0000000000000000000ab'
+        await redis.hset('rss:youtube:creators', cid, 'A')
+        await redis.hset('rss:youtube:tiers', cid, '2')
+        await redis.zadd(
+            'rss:youtube:queue:2', {cid: 123.0},
+        )
+        ns: argparse.Namespace = argparse.Namespace(
+            batch_size=1000,
+            limit=None,
+            dry_run=False,
+            source='rss_rebuild',
+        )
+        settings: SimpleNamespace = SimpleNamespace(
+            rss_priority_queues=(
+                '1:50000000,2:5000000,'
+                '4:500000,12:0'
+            ),
+        )
+
+        with patch(
+            'tools.yt_channel_queue.YtChannelQueueSettings',
+            return_value=settings,
+        ):
+            rc: int = await cmd_backfill_rss(ns, queue)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            await redis.hget('youtube:channel:tiers', cid),
+            '1',
+        )
+        self.assertEqual(
+            await redis.zscore(
+                'youtube:channel:queue:scheduled:1',
+                f'i:{cid}',
+            ),
+            0.0,
+        )
+        await redis.aclose()
+
     async def test_backfill_rss_dry_run_counts_candidates(
         self,
     ) -> None:
@@ -1018,6 +1699,7 @@ class TestBackfillRssCommand(
         queue._k_state = (
             lambda state: f'youtube:channel:{state.value}'
         )
+        queue._tier_for_sub_count = lambda count: 0
         queue._redis.hscan = AsyncMock(return_value=(
             0,
             {
@@ -1026,13 +1708,21 @@ class TestBackfillRssCommand(
                 'UCb0000000000000000000cd': 'B',
             },
         ))
-        pipe = MagicMock()
+        tier_pipe = MagicMock()
+        tier_pipe.execute = AsyncMock(return_value=[
+            '1', 0.0, None,
+            '2', None, 0.0,
+        ])
+        presence_pipe = MagicMock()
         group_size = 1 + len(ChannelState.terminal_states())
-        pipe.execute = AsyncMock(return_value=(
+        presence_pipe.execute = AsyncMock(return_value=(
             [None] * group_size
             + ['0'] + [0] * (group_size - 1)
         ))
-        queue._redis.pipeline = lambda transaction=False: pipe
+        queue._redis.pipeline = MagicMock(side_effect=[
+            tier_pipe,
+            presence_pipe,
+        ])
 
         ns = argparse.Namespace(
             batch_size=2,
@@ -1040,15 +1730,24 @@ class TestBackfillRssCommand(
             dry_run=True,
             source='rss_backfill',
         )
-        rc: int = await cmd_backfill_rss(ns, queue)
+        settings = SimpleNamespace(
+            rss_priority_queues='1:1000000,24:0',
+        )
+        with patch(
+            'tools.yt_channel_queue.YtChannelQueueSettings',
+            return_value=settings,
+        ):
+            rc: int = await cmd_backfill_rss(ns, queue)
 
         self.assertEqual(rc, 0)
-        self.assertEqual(pipe.zscore.call_count, 2)
+        self.assertEqual(tier_pipe.zscore.call_count, 4)
+        self.assertEqual(presence_pipe.zscore.call_count, 2)
         self.assertEqual(
-            pipe.hexists.call_count,
+            presence_pipe.hexists.call_count,
             2 * len(ChannelState.terminal_states()),
         )
-        pipe.execute.assert_awaited_once()
+        tier_pipe.execute.assert_awaited_once()
+        presence_pipe.execute.assert_awaited_once()
         queue._redis.eval.assert_not_called()
 
     async def test_backfill_rss_executes_lua_batch(
@@ -1065,6 +1764,9 @@ class TestBackfillRssCommand(
         queue._k_state = (
             lambda state: f'youtube:channel:{state.value}'
         )
+        queue._tier_for_sub_count = (
+            lambda count: 0 if count >= 1_000_000 else 1
+        )
         queue._redis.hscan = AsyncMock(return_value=(
             0,
             {
@@ -1073,6 +1775,14 @@ class TestBackfillRssCommand(
             },
         ))
         queue._redis.eval = AsyncMock(return_value=[2, 0])
+        tier_pipe = MagicMock()
+        tier_pipe.execute = AsyncMock(return_value=[
+            '1', 0.0, None,
+            '2', None, 0.0,
+        ])
+        queue._redis.pipeline = MagicMock(
+            return_value=tier_pipe,
+        )
 
         ns = argparse.Namespace(
             batch_size=1000,
@@ -1080,7 +1790,14 @@ class TestBackfillRssCommand(
             dry_run=False,
             source='rss_backfill',
         )
-        rc: int = await cmd_backfill_rss(ns, queue)
+        settings = SimpleNamespace(
+            rss_priority_queues='1:1000000,24:0',
+        )
+        with patch(
+            'tools.yt_channel_queue.YtChannelQueueSettings',
+            return_value=settings,
+        ):
+            rc: int = await cmd_backfill_rss(ns, queue)
 
         self.assertEqual(rc, 0)
         queue._redis.eval.assert_awaited_once()
@@ -1096,6 +1813,8 @@ class TestBackfillRssCommand(
         )
         self.assertIn('UCa0000000000000000000ab', args)
         self.assertIn('UCb0000000000000000000cd', args)
+        self.assertIn('0', args)
+        self.assertIn('1', args)
 
     async def test_replace_clears_keys_first(
         self,

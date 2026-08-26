@@ -83,6 +83,15 @@ class TestChannelScrapeQueueSettings(unittest.TestCase):
             s.channel_not_found_terminal_threshold, 3,
         )
 
+    def test_default_missing_subscriber_retry_seconds(self) -> None:
+        s: ChannelScrapeQueueSettings = (
+            ChannelScrapeQueueSettings()
+        )
+        self.assertEqual(
+            s.channel_missing_subscriber_retry_seconds,
+            24 * 60 * 60,
+        )
+
 
 class _RedisQueueTestBase(
     unittest.IsolatedAsyncioTestCase,
@@ -733,6 +742,75 @@ class TestUpdateTier(_RedisQueueTestBase):
                 )
             )
             self.assertIsNone(score)
+
+
+class TestRetryMissingSubscriberCount(_RedisQueueTestBase):
+
+    async def test_preserves_tier_and_schedules_full_retry(
+        self,
+    ) -> None:
+        settings: ChannelScrapeQueueSettings = (
+            ChannelScrapeQueueSettings(
+                channel_missing_subscriber_retry_seconds=600,
+            )
+        )
+        queue: RedisChannelScrapeQueue = (
+            RedisChannelScrapeQueue(self.redis, settings)
+        )
+        channel_id: str = 'UCa'
+        member: str = f'i:{channel_id}'
+        await self.redis.hset(
+            'youtube:channel:tiers', channel_id, '2',
+        )
+        await self.redis.zadd(
+            'youtube:channel:queue:scheduled:2',
+            {member: 0.0},
+        )
+        await queue.pop_scheduled(1, now=100.0)
+
+        await queue.retry_missing_subscriber_count(
+            channel_id=channel_id,
+            now=100.0,
+        )
+
+        score: float | None = await self.redis.zscore(
+            'youtube:channel:queue:scheduled:2', member,
+        )
+        self.assertEqual(score, 700.0)
+        tier: str | None = await self.redis.hget(
+            'youtube:channel:tiers', channel_id,
+        )
+        self.assertEqual(tier, '2')
+        meta: dict[str, str] = await self.redis.hgetall(
+            f'youtube:channel:meta:{member}',
+        )
+        self.assertEqual(meta.get('state'), 'scheduled')
+        self.assertEqual(meta.get('last_attempt_at'), '100')
+        self.assertEqual(meta.get('force_rescrape_mode'), 'full')
+        self.assertEqual(
+            meta.get('force_source'),
+            'missing_subscriber_count',
+        )
+
+    async def test_unknown_tier_uses_highest_priority_tier(
+        self,
+    ) -> None:
+        channel_id: str = 'UCa'
+        member: str = f'i:{channel_id}'
+
+        await self.queue.retry_missing_subscriber_count(
+            channel_id=channel_id,
+            now=100.0,
+        )
+
+        tier: str | None = await self.redis.hget(
+            'youtube:channel:tiers', channel_id,
+        )
+        self.assertEqual(tier, '0')
+        score: float | None = await self.redis.zscore(
+            'youtube:channel:queue:scheduled:0', member,
+        )
+        self.assertEqual(score, 100.0 + 86400.0)
 
 
 class TestRequeueWithBackoff(_RedisQueueTestBase):

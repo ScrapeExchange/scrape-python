@@ -18,6 +18,8 @@ import sys
 import asyncio
 import logging
 
+import httpx
+
 from pathlib import Path
 import random
 
@@ -44,7 +46,11 @@ from scrape_exchange.creator_map import (
 from scrape_exchange.exchange_client import ExchangeClient
 from scrape_exchange.proxy_loader import proxy_file_label
 from scrape_exchange.redis_client import redis_from_url
-from scrape_exchange.util import extract_proxy_ip, proxy_network_for
+from scrape_exchange.util import (
+    extract_proxy_ip,
+    extract_proxy_port,
+    proxy_network_for,
+)
 from scrape_exchange.worker_id import get_worker_id
 from scrape_exchange.watchdog import Watchdog
 from scrape_exchange.settings import normalize_log_level
@@ -61,6 +67,9 @@ from scrape_exchange.youtube.derived_metadata import (
 from scrape_exchange.youtube.youtube_video import YouTubeVideo
 from scrape_exchange.youtube.youtube_video import (
     DENO_PATH, PO_TOKEN_URL, YTDLP_CACHE_DIR,
+)
+from scrape_exchange.youtube.youtube_video_innertube import (
+    YouTubeBotDetectionError,
 )
 from scrape_exchange.youtube.settings import YouTubeScraperSettings
 from scrape_exchange.youtube.uploaded_video_ids import UploadedVideoIds
@@ -106,6 +115,11 @@ _ERROR_PATTERNS: list[tuple[str, list[str]]] = [
         'http 429',
         '429 too many',
         'expected string or bytes-like object',
+    ]),
+    ('bot_detection', [
+        "confirm you're not a bot",
+        'confirm you’re not a bot',
+        'confirm you are not a bot',
     ]),
     ('missing_data', [
         'missing microformat data',
@@ -202,13 +216,22 @@ def _classify_scrape_error(exc: BaseException) -> str:
     message string.
     '''
 
+    if isinstance(exc, YouTubeBotDetectionError):
+        return 'bot_detection'
     if _is_bind_failure(exc):
         return 'bind_failed'
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, httpx.TransportError):
+            return 'transient'
+        current = current.__cause__ or current.__context__
     return _classify_yt_dlp_error(str(exc))
 
 
 _TRANSIENT_REASONS: frozenset[str] = frozenset({
-    'rate_limit', 'transient', 'bind_failed',
+    'rate_limit', 'transient', 'bind_failed', 'bot_detection',
 })
 _UNAVAILABLE_REASONS: frozenset[str] = frozenset({
     'unavailable', 'premiere',
@@ -357,20 +380,20 @@ async def _scrape_one_queued(
     '''Scrape one queued video with the hybrid retry contract.
 
     - Success: ``queue.complete(video_id)``.
-    - Transient reasons (rate_limit / transient / bind_failed)
-      retry up to ``video_transient_max_attempts`` with
-      ``bump_attempts`` between each; exhaustion marks FAILED.
+    - Transient reasons (rate_limit / transient / bind_failed /
+      bot_detection) retry up to
+      ``video_transient_max_attempts`` with ``bump_attempts``
+      between each; exhaustion marks FAILED.
     - Unavailable reasons (unavailable / premiere) mark
       UNAVAILABLE immediately.
     - Anything else marks FAILED immediately.
 
-    A fresh proxy is selected per attempt when ``proxies`` is
-    non-empty so that retries don't repeatedly hit the same
-    egress IP (precisely what YouTube's rate limiter throttles
-    on a 429). An empty ``proxies`` list means direct egress
-    (e.g. scraper003) — each attempt passes ``proxy=None`` and
-    the inner scrape falls through to the rate limiter's
-    ``select_proxy``.
+    A proxy is selected per attempt when ``proxies`` is non-empty.
+    A proxy that triggered bot detection is excluded from subsequent
+    attempts until every configured proxy has been tried. An empty
+    ``proxies`` list means direct egress (e.g. scraper003) — each
+    attempt passes ``proxy=None`` and the inner scrape falls through
+    to the rate limiter's ``select_proxy``.
     '''
     try:
         is_uploaded: bool = await uploaded.contains(video_id)
@@ -394,16 +417,27 @@ async def _scrape_one_queued(
     attempts_left: int = (
         settings.video_transient_max_attempts
     )
+    bot_blocked_proxies: set[str] = set()
     last_reason: str = 'other'
     api: str = (
         'ytdlp' if settings.video_use_yt_dlp else 'innertube'
     )
     while attempts_left > 0:
+        proxy_candidates: list[str] = [
+            candidate for candidate in proxies
+            if candidate not in bot_blocked_proxies
+        ]
+        if not proxy_candidates:
+            proxy_candidates = proxies
         proxy: str | None = (
-            random.choice(proxies) if proxies else None
+            random.choice(proxy_candidates)
+            if proxy_candidates else None
         )
         proxy_ip: str = (
             extract_proxy_ip(proxy) if proxy else 'none'
+        )
+        proxy_port: str = (
+            extract_proxy_port(proxy) if proxy else 'none'
         )
         proxy_file: str = proxy_file_label(proxy or '')
         try:
@@ -421,6 +455,19 @@ async def _scrape_one_queued(
         except Exception as exc:
             reason: str = _classify_scrape_error(exc)
             last_reason = reason
+            logging.warning(
+                'YouTube video scrape failed',
+                exc_info=exc,
+                extra={
+                    'video_id': video_id,
+                    'reason': reason,
+                    'api': api,
+                    'worker_id': get_worker_id(),
+                    'proxy_ip': proxy_ip,
+                    'proxy_port': proxy_port,
+                    'proxy_file': proxy_file,
+                },
+            )
             METRIC_SCRAPE_FAILURES.labels(
                 platform='youtube',
                 scraper='video_scraper',
@@ -429,9 +476,12 @@ async def _scrape_one_queued(
                 reason=reason,
                 worker_id=get_worker_id(),
                 proxy_ip=proxy_ip,
+                proxy_port=proxy_port,
                 proxy_file=proxy_file,
             ).inc()
             if reason in _TRANSIENT_REASONS:
+                if reason == 'bot_detection' and proxy is not None:
+                    bot_blocked_proxies.add(proxy)
                 attempts_left -= 1
                 await queue.bump_attempts(
                     video_id, last_error=reason,
@@ -473,7 +523,9 @@ async def _scrape_one_queued(
                 api=api,
                 worker_id=get_worker_id(),
                 proxy_ip=proxy_ip,
+                proxy_port=proxy_port,
                 proxy_file=proxy_file,
+                channel_status='none',
             ).inc()
             VIDEO_QUEUE_OUTCOMES.labels(
                 outcome='scraped',
@@ -659,7 +711,7 @@ METRIC_RATE_LIMIT_HITS = Counter(
     'rate_limit_hits_total',
     'Number of times a proxy was rate-limited by YouTube',
     ['platform', 'scraper', 'entity', 'api',
-     'proxy_ip', 'worker_id'],
+     'proxy_ip', 'proxy_port', 'worker_id'],
 )
 
 VIDEO_STATE_SIZE: Gauge = Gauge(

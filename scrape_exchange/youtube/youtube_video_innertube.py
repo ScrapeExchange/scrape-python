@@ -12,6 +12,8 @@ import logging
 import re
 import time
 
+import httpx
+
 from collections.abc import Callable
 from datetime import datetime
 from typing import Any
@@ -21,7 +23,12 @@ from innertube.errors import RequestError as InnerTubeRequestError
 from prometheus_client import Counter
 
 from scrape_exchange.youtube.youtube_channel_tabs import (
-    pooled_innertube_for_entry,
+    borrow_pooled_innertube_for_entry,
+    borrow_pooled_player_innertube_for_entry,
+    refresh_pooled_innertube_for_entry,
+    refresh_pooled_web_innertube_for_entry,
+    release_pooled_innertube,
+    release_pooled_player_innertube,
     run_on_innertube_executor,
 )
 
@@ -30,7 +37,7 @@ from dateutil import parser as dateutil_parser
 from .youtube_caption import YouTubeCaption
 from scrape_exchange.worker_id import get_worker_id
 from scrape_exchange.proxy_loader import proxy_file_label
-from scrape_exchange.util import extract_proxy_ip
+from scrape_exchange.util import extract_proxy_ip, extract_proxy_port
 from .youtube_client import METRIC_YT_REQUEST_DURATION, _get_scraper
 from .youtube_format import YouTubeFormat
 from .youtube_rate_limiter import YouTubeRateLimiter, YouTubeCallType
@@ -43,6 +50,15 @@ if TYPE_CHECKING:
 
 
 _INNERTUBE_CALL_LOCKS: dict[int, asyncio.Lock] = {}
+
+_BOT_DETECTION_PENALTY_SECONDS: float = 300.0
+
+
+class YouTubeBotDetectionError(RuntimeError):
+    '''YouTube rejected an automated client instead of returning
+    usable player metadata. This is transient and should be retried
+    through a different proxy.'''
+
 
 # Wall-clock safety net for a single innertube player/next call. The
 # inner sync HTTP stack (httpx + curl_cffi) is supposed to enforce its
@@ -267,6 +283,7 @@ def _record_player_response(
     player_data: dict[str, Any],
     *,
     proxy_ip: str,
+    proxy_port: str,
     proxy_file: str,
 ) -> None:
     playability: dict = player_data.get('playabilityStatus', {})
@@ -296,6 +313,7 @@ def _record_player_response(
             extra={
                 'video_id': video_id,
                 'proxy_ip': proxy_ip,
+                'proxy_port': proxy_port,
                 'playability_status': status,
                 'playability_reason': playability.get('reason'),
                 'playability_reason_class': reason_class,
@@ -341,15 +359,13 @@ class InnerTubeVideoParser:
                  proxy: str | None = None) -> None:
         self.video: YouTubeVideo | None = video
 
-        self.innertube: InnerTube
-        if innertube:
-            self.innertube = innertube
-        else:
-            if not proxy:
-                logging.warning(
-                    'No proxy configured, proceeding without proxy'
-                )
-            self.innertube = pooled_innertube_for_entry(proxy)
+        self.innertube: InnerTube | None = innertube
+        self.player_innertube: InnerTube | None = innertube
+        self.next_innertube: InnerTube | None = innertube
+        if innertube is None and proxy is None:
+            logging.warning(
+                'No proxy configured, proceeding without proxy'
+            )
 
     @staticmethod
     async def scrape(video: YouTubeVideo, innertube: InnerTube | None = None,
@@ -363,6 +379,7 @@ class InnerTubeVideoParser:
         penalty: float = _PLAYER_PENALTY_INITIAL
 
         player_data: dict | None = None
+        player_client: InnerTube | None = None
         for attempt in range(1, max_retries + 1):
             proxy = await limiter.acquire(
                 YouTubeCallType.PLAYER, proxy=proxy
@@ -370,14 +387,29 @@ class InnerTubeVideoParser:
             proxy_ip: str = (
                 extract_proxy_ip(proxy) if proxy else 'none'
             )
+            proxy_port: str = (
+                extract_proxy_port(proxy) if proxy else 'none'
+            )
             proxy_file: str = proxy_file_label(proxy or '')
             start: float = time.monotonic()
+            borrowed_player: bool = self.player_innertube is None
+            player_client = (
+                borrow_pooled_player_innertube_for_entry(proxy)
+                if borrowed_player
+                else self.player_innertube
+            )
             try:
-                player_data = await _call_innertube(
-                    self.innertube,
-                    self.innertube.player,
-                    video.video_id,
-                )
+                try:
+                    player_data = await _call_innertube(
+                        player_client,
+                        player_client.player,
+                        video.video_id,
+                    )
+                finally:
+                    if borrowed_player:
+                        await release_pooled_player_innertube(
+                            player_client,
+                        )
                 duration: float = time.monotonic() - start
                 METRIC_YT_REQUEST_DURATION.labels(
                     platform='youtube',
@@ -393,8 +425,8 @@ class InnerTubeVideoParser:
                         'api': 'player',
                         'video_id': video.video_id,
                         'duration': duration,
-                        'proxy': proxy or 'none',
                         'proxy_ip': proxy_ip,
+                        'proxy_port': proxy_port,
                         'proxy_file': proxy_file,
                         'status_class': '2xx',
                     },
@@ -422,8 +454,8 @@ class InnerTubeVideoParser:
                         'api': 'player',
                         'video_id': video.video_id,
                         'duration': duration,
-                        'proxy': proxy or 'none',
                         'proxy_ip': proxy_ip,
+                        'proxy_port': proxy_port,
                         'proxy_file': proxy_file,
                         'status_class': status_class,
                     },
@@ -442,7 +474,8 @@ class InnerTubeVideoParser:
                             'attempt': attempt,
                             'max_retries': max_retries,
                             'penalty_seconds': penalty,
-                            'proxy': proxy,
+                            'proxy_ip': proxy_ip,
+                            'proxy_port': proxy_port,
                         },
                     )
                     penalty = min(penalty * 2, _PLAYER_PENALTY_MAX)
@@ -457,6 +490,13 @@ class InnerTubeVideoParser:
                         f'InnerTube API call failed: {exc}'
                     )
             except Exception as exc:
+                if borrowed_player and isinstance(
+                    exc, httpx.TransportError
+                ):
+                    await refresh_pooled_innertube_for_entry(
+                        proxy,
+                        challenged=player_client,
+                    )
                 duration = time.monotonic() - start
                 METRIC_YT_REQUEST_DURATION.labels(
                     platform='youtube',
@@ -473,32 +513,66 @@ class InnerTubeVideoParser:
                         'api': 'player',
                         'video_id': video.video_id,
                         'duration': duration,
-                        'proxy': proxy or 'none',
                         'proxy_ip': proxy_ip,
+                        'proxy_port': proxy_port,
                         'proxy_file': proxy_file,
                         'status_class': 'error',
                     },
                 )
-                raise RuntimeError(f'InnerTube API call failed: {exc}')
+                raise RuntimeError(
+                    f'InnerTube API call failed: '
+                    f'{type(exc).__name__}: {exc}'
+                ) from exc
 
         _record_player_response(
             video.video_id,
             player_data,
             proxy_ip=proxy_ip,
+            proxy_port=proxy_port,
             proxy_file=proxy_file,
         )
+        if _classify_player_reason(player_data) == 'client_block':
+            await limiter.penalise(
+                YouTubeCallType.PLAYER,
+                proxy,
+                _BOT_DETECTION_PENALTY_SECONDS,
+            )
+            await limiter.penalise(
+                YouTubeCallType.NEXT,
+                proxy,
+                _BOT_DETECTION_PENALTY_SECONDS,
+            )
+            if player_client is not None:
+                await refresh_pooled_innertube_for_entry(
+                    proxy,
+                    challenged=player_client,
+                )
+            raise YouTubeBotDetectionError(
+                f'YouTube bot detection triggered for '
+                f'video_id={video.video_id}'
+            )
         InnerTubeVideoParser._apply_player_data(video, player_data)
 
         _next_penalty: float = _PLAYER_PENALTY_INITIAL
         for attempt in range(1, max_retries + 1):
             await limiter.acquire(YouTubeCallType.NEXT, proxy=proxy)
             next_start: float = time.monotonic()
+            borrowed_next: bool = self.next_innertube is None
+            next_client: InnerTube = (
+                borrow_pooled_innertube_for_entry(proxy)
+                if borrowed_next
+                else self.next_innertube
+            )
             try:
-                next_data: dict[str, Any] = await _call_innertube(
-                    self.innertube,
-                    self.innertube.next,
-                    video.video_id,
-                )
+                try:
+                    next_data: dict[str, Any] = await _call_innertube(
+                        next_client,
+                        next_client.next,
+                        video.video_id,
+                    )
+                finally:
+                    if borrowed_next:
+                        await release_pooled_innertube(next_client)
                 duration = time.monotonic() - next_start
                 METRIC_YT_REQUEST_DURATION.labels(
                     platform='youtube',
@@ -514,8 +588,8 @@ class InnerTubeVideoParser:
                         'api': 'next',
                         'video_id': video.video_id,
                         'duration': duration,
-                        'proxy': proxy or 'none',
                         'proxy_ip': proxy_ip,
+                        'proxy_port': proxy_port,
                         'proxy_file': proxy_file,
                         'status_class': '2xx',
                     },
@@ -544,8 +618,8 @@ class InnerTubeVideoParser:
                         'api': 'next',
                         'video_id': video.video_id,
                         'duration': duration,
-                        'proxy': proxy or 'none',
                         'proxy_ip': proxy_ip,
+                        'proxy_port': proxy_port,
                         'proxy_file': proxy_file,
                         'status_class': status_class,
                     },
@@ -564,8 +638,8 @@ class InnerTubeVideoParser:
                             'attempt': attempt,
                             'max_retries': max_retries,
                             'penalty_seconds': _next_penalty,
-                            'proxy': proxy,
                             'proxy_ip': proxy_ip,
+                            'proxy_port': proxy_port,
                         },
                     )
                     _next_penalty = min(
@@ -576,6 +650,13 @@ class InnerTubeVideoParser:
                 else:
                     break  # non-429 error on NEXT: skip silently
             except Exception as exc:
+                if borrowed_next and isinstance(
+                    exc, httpx.TransportError
+                ):
+                    await refresh_pooled_web_innertube_for_entry(
+                        proxy,
+                        challenged=next_client,
+                    )
                 duration = time.monotonic() - next_start
                 METRIC_YT_REQUEST_DURATION.labels(
                     platform='youtube',
@@ -592,8 +673,8 @@ class InnerTubeVideoParser:
                         'api': 'next',
                         'video_id': video.video_id,
                         'duration': duration,
-                        'proxy': proxy or 'none',
                         'proxy_ip': proxy_ip,
+                        'proxy_port': proxy_port,
                         'proxy_file': proxy_file,
                         'status_class': 'error',
                     },

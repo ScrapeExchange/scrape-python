@@ -40,6 +40,7 @@ from scrape_exchange.creator_map import (
 )
 from scrape_exchange.creator_queue import (
     CreatorQueue,
+    DEFAULT_ORPHAN_RECOVERY_INTERVAL_SECONDS,
     RedisCreatorQueue,
     TierConfig,
     parse_priority_queues,
@@ -95,7 +96,7 @@ from scrape_exchange.tiktok.short_url import (
     is_tiktok_short_url,
     resolve_creator_short_url,
 )
-from scrape_exchange.util import extract_proxy_ip
+from scrape_exchange.util import extract_proxy_ip, extract_proxy_port
 from scrape_exchange.video_scrape_queue import (
     RedisVideoScrapeQueue,
     VideoScrapeQueueSettings,
@@ -273,7 +274,7 @@ class CreatorSettings(TikTokScraperSettings):
         description='Sleep ceiling when nothing is due.',
     )
     creator_orphan_recovery_interval_seconds: float = Field(
-        default=600.0,
+        default=DEFAULT_ORPHAN_RECOVERY_INTERVAL_SECONDS,
         validation_alias=AliasChoices(
             'TIKTOK_CREATOR_ORPHAN_RECOVERY_INTERVAL',
             'creator_orphan_recovery_interval_seconds',
@@ -852,6 +853,7 @@ async def _process_creator(
     accordingly — a bad creator never kills the worker.
     '''
     start: float = time.monotonic()
+    proxy_port: str = extract_proxy_port(proxy)
     try:
         async with pool.session_for(proxy) as api:
             creator: TikTokCreator = await _scrape_one(
@@ -882,7 +884,9 @@ async def _process_creator(
         METRIC_SCRAPES_COMPLETED.labels(
             platform=PLATFORM, scraper=SCRAPER_LABEL, entity=ENTITY,
             api=API_LABEL, worker_id=worker_id, proxy_ip=proxy_ip,
+            proxy_port=proxy_port,
             proxy_file='',
+            channel_status='none',
         ).inc()
         METRIC_SCRAPE_DURATION.labels(
             platform=PLATFORM, scraper=SCRAPER_LABEL, entity=ENTITY,
@@ -898,6 +902,7 @@ async def _process_creator(
             platform=PLATFORM, scraper=SCRAPER_LABEL, entity=ENTITY,
             api=API_LABEL, reason=reason, worker_id=worker_id,
             proxy_ip=proxy_ip, proxy_file='',
+            proxy_port=proxy_port,
         ).inc()
         METRIC_SCRAPE_DURATION.labels(
             platform=PLATFORM, scraper=SCRAPER_LABEL, entity=ENTITY,
@@ -984,6 +989,7 @@ async def _resolve_and_enqueue_short_url(
             'outcome': res.outcome.value,
             'handle': res.handle,
             'proxy_ip': proxy_ip,
+            'proxy_port': extract_proxy_port(proxy),
             'worker_id': worker_id,
         },
     )
@@ -1008,6 +1014,7 @@ async def _proxy_worker(
     worker is never reaped.
     '''
     proxy_ip: str = extract_proxy_ip(proxy)
+    proxy_port: str = extract_proxy_port(proxy)
     consecutive_bot_failures: int = 0
     circuit_events: int = 0
     _LOGGER.info(
@@ -1029,7 +1036,11 @@ async def _proxy_worker(
         except Exception as exc:
             _LOGGER.warning(
                 'claim_batch failed',
-                extra={'proxy_ip': proxy_ip, 'error': str(exc)},
+                extra={
+                    'proxy_ip': proxy_ip,
+                    'proxy_port': proxy_port,
+                    'error': str(exc),
+                },
             )
             await asyncio.sleep(
                 settings.creator_queue_idle_poll_seconds,

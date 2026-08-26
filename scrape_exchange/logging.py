@@ -12,6 +12,7 @@ based on their settings.
 
 import logging
 import logging.handlers
+import sys
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -195,7 +196,7 @@ def configure_logging(
 
     handler: logging.Handler
     if filename == '/dev/stdout':
-        handler = logging.FileHandler(filename)
+        handler = logging.StreamHandler(sys.stdout)
     else:
         handler = logging.handlers.WatchedFileHandler(filename)
     formatter: logging.Formatter

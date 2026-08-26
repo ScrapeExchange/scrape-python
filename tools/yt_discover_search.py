@@ -4,17 +4,21 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
+import errno
 import functools
 import json
 import logging
+import os
 import random
+import signal
+import stat
 import sys
 import time
-from collections import OrderedDict
+import unicodedata
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterable, Iterator
+from typing import Any, AsyncIterator, Iterable
 
 import httpx
 from innertube.errors import RequestError as InnerTubeRequestError
@@ -24,6 +28,7 @@ from pydantic_settings import CliPositionalArg, SettingsConfigDict
 
 from scrape_exchange.logging import configure_logging
 from scrape_exchange.settings import ScraperSettings
+from scrape_exchange.util import extract_proxy_ip, extract_proxy_port
 from scrape_exchange.youtube.youtube_channel import YouTubeChannel
 from scrape_exchange.youtube.youtube_channel_tabs import (
     aclose_pooled_innertube,
@@ -41,8 +46,26 @@ from scrape_exchange.youtube.youtube_rate_limiter import (
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 _DEFAULT_OUTPUT_FILE: str = 'data/searched_channels.jsonl'
-_DEFAULT_RANDOM_WORD_LANGUAGES: tuple[str, ...] = (
+_RANDOM_WORD_API_LANGUAGES: tuple[str, ...] = (
     'en', 'es', 'it', 'de', 'fr', 'zh', 'pt-br', 'ro',
+)
+# Additional languages backed by each language's Wikipedia edition.
+_WIKIMEDIA_RANDOM_WORD_LANGUAGES: tuple[str, ...] = (
+    'af', 'ar', 'az', 'be', 'bg', 'bn', 'bs', 'ca', 'cs', 'cy',
+    'da', 'el', 'eo', 'et', 'eu', 'fa', 'fi', 'ga', 'gl', 'he',
+    'hi', 'hr', 'hu', 'hy', 'id', 'is', 'ja', 'ka', 'kk', 'ko',
+    'lt', 'lv', 'mk', 'ms', 'nl', 'no', 'pl', 'ru', 'sk', 'sl',
+    'sq', 'sr', 'sv', 'sw', 'ta', 'th', 'tr', 'uk', 'ur', 'vi',
+)
+_DEFAULT_RANDOM_WORD_LANGUAGES: tuple[str, ...] = (
+    _RANDOM_WORD_API_LANGUAGES + _WIKIMEDIA_RANDOM_WORD_LANGUAGES
+)
+_WIKIMEDIA_RANDOM_WORD_URL_TEMPLATE: str = (
+    'https://{language}.wikipedia.org/w/api.php'
+)
+_WIKIMEDIA_USER_AGENT: str = (
+    'scrape-python-yt-discover-search/1.0 '
+    '(https://scrape.exchange)'
 )
 _OFFLINE_RANDOM_TERMS: tuple[str, ...] = (
     'water', 'house', 'music', 'historia', 'cocina',
@@ -69,6 +92,11 @@ _TRANSIENT_SEARCH_ERRORS: tuple[type[BaseException], ...] = (
     InnerTubeRequestError,
     InnerTubeResponseError,
 )
+_PROXY_CONNECTION_ERRORS: tuple[type[BaseException], ...] = (
+    httpx.TransportError,
+    ConnectionResetError,
+    ConnectionRefusedError,
+)
 _SEARCH_RETRY_BACKOFF_SECONDS: float = 2.0
 
 
@@ -76,6 +104,55 @@ _SEARCH_RETRY_BACKOFF_SECONDS: float = 2.0
 class DiscoveredChannel:
     channel_id: str | None
     channel_handle: str | None
+
+
+class _SearchProxyPool:
+    '''Unused proxies available to search workers for failover.'''
+
+    def __init__(self, proxies: Iterable[str]) -> None:
+        self._available: deque[str] = deque(proxies)
+
+    def take(self) -> str | None:
+        if not self._available:
+            return None
+        return self._available.popleft()
+
+    def release(self, proxy: str) -> None:
+        self._available.append(proxy)
+
+
+class _SearchProxyLease:
+    '''One worker's proxy plus access to shared unused proxies.'''
+
+    def __init__(
+        self,
+        proxy: str | None,
+        pool: _SearchProxyPool,
+    ) -> None:
+        self.proxy: str | None = proxy
+        self._pool: _SearchProxyPool = pool
+        self._reusable: bool = proxy is not None
+
+    def replace_failed(self) -> bool:
+        if self.proxy is None:
+            return False
+        self._reusable = False
+        replacement: str | None = self._pool.take()
+        if replacement is None:
+            return False
+        self.proxy = replacement
+        self._reusable = True
+        return True
+
+    def mark_success(self) -> None:
+        if self.proxy is not None:
+            self._reusable = True
+
+    def release(self) -> None:
+        if self.proxy is not None and self._reusable:
+            self._pool.release(self.proxy)
+        self.proxy = None
+        self._reusable = False
 
 
 class DiscoverSearchSettings(ScraperSettings):
@@ -112,6 +189,11 @@ class DiscoverSearchSettings(ScraperSettings):
             'write channels to stdout.'
         ),
     )
+    pid_file: str = Field(
+        default='/var/tmp/yt_discover_search.pid',
+        validation_alias=AliasChoices('PID_FILE', 'pid_file'),
+        description='File containing the running process ID.',
+    )
     youtube_search_continuations: int = Field(
         default=10,
         validation_alias=AliasChoices(
@@ -122,12 +204,27 @@ class DiscoverSearchSettings(ScraperSettings):
             'Maximum InnerTube search continuation pages per term.'
         ),
     )
+    youtube_search_concurrency: int = Field(
+        default=1,
+        ge=1,
+        validation_alias=AliasChoices(
+            'YOUTUBE_SEARCH_CONCURRENCY',
+            'youtube_search_concurrency',
+        ),
+        description=(
+            'Maximum number of search terms processed concurrently. '
+            'Limited to the proxy count when proxies are configured.'
+        ),
+    )
     random_word_url: str = Field(
         default='https://random-word-api.herokuapp.com/word',
         validation_alias=AliasChoices(
             'RANDOM_WORD_URL', 'random_word_url',
         ),
-        description='Random-word API endpoint used when no term is given.',
+        description=(
+            'Random Word API endpoint used for its eight native '
+            'languages.'
+        ),
     )
     keyword_count: int = Field(
         default=1,
@@ -146,7 +243,8 @@ class DiscoverSearchSettings(ScraperSettings):
             'RANDOM_WORD_LANGUAGES', 'random_word_languages',
         ),
         description=(
-            'Comma-separated random-word API language codes.'
+            'Comma-separated random-word language codes. Additional '
+            'languages use Wikimedia.'
         ),
     )
     random_word_language: str | None = Field(
@@ -155,8 +253,8 @@ class DiscoverSearchSettings(ScraperSettings):
             'RANDOM_WORD_LANGUAGE', 'random_word_language',
         ),
         description=(
-            'Optional random-word API language code for fallback term '
-            'selection. When omitted, one configured language is chosen.'
+            'Optional random-word language code. When omitted, one '
+            'configured language is chosen.'
         ),
     )
 
@@ -195,6 +293,45 @@ def _extract_words_from_random_payload(payload: Any) -> list[str]:
         value = payload.get('word')
         return [value] if isinstance(value, str) else []
     return [payload] if isinstance(payload, str) else []
+
+
+def _extract_words_from_wikimedia_payload(payload: Any) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+    query: Any = payload.get('query')
+    if not isinstance(query, dict):
+        return []
+    pages: Any = query.get('random')
+    if not isinstance(pages, list):
+        return []
+    words: list[str] = []
+    seen: set[str] = set()
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+        title: Any = page.get('title')
+        if not isinstance(title, str):
+            continue
+        current: list[str] = []
+        for character in title:
+            is_mark: bool = unicodedata.category(character).startswith('M')
+            if character.isalpha() or (current and is_mark):
+                current.append(character)
+                continue
+            if current:
+                word: str = ''.join(current)
+                key: str = word.casefold()
+                if key not in seen:
+                    words.append(word)
+                    seen.add(key)
+                current = []
+        if current:
+            word = ''.join(current)
+            key = word.casefold()
+            if key not in seen:
+                words.append(word)
+                seen.add(key)
+    return words
 
 
 async def choose_random_search_term(
@@ -238,11 +375,33 @@ async def choose_random_search_terms(
         params['lang'] = lang
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response: httpx.Response = await client.get(url, params=params)
-            response.raise_for_status()
-            words: list[str] = _extract_words_from_random_payload(
-                response.json(),
-            )
+            if lang in _WIKIMEDIA_RANDOM_WORD_LANGUAGES:
+                url = _WIKIMEDIA_RANDOM_WORD_URL_TEMPLATE.format(
+                    language=lang,
+                )
+                params = {
+                    'action': 'query',
+                    'list': 'random',
+                    'rnnamespace': 0,
+                    'rnlimit': max(10, min(500, count * 5)),
+                    'format': 'json',
+                    'formatversion': 2,
+                }
+                response: httpx.Response = await client.get(
+                    url,
+                    params=params,
+                    headers={'User-Agent': _WIKIMEDIA_USER_AGENT},
+                )
+                response.raise_for_status()
+                words = _extract_words_from_wikimedia_payload(
+                    response.json(),
+                )
+            else:
+                response = await client.get(url, params=params)
+                response.raise_for_status()
+                words = _extract_words_from_random_payload(
+                    response.json(),
+                )
             usable: list[str] = [word for word in words if len(word) >= 5]
             if usable:
                 if len(usable) < count:
@@ -446,29 +605,48 @@ async def _search_page_with_retry(
     continuation: str | None,
     proxy: str | None,
     limiter: YouTubeRateLimiter,
+    proxy_lease: _SearchProxyLease | None = None,
 ) -> dict[str, Any] | None:
-    '''Fetch one InnerTube search page, retrying once on a
-    transient error.
+    '''Fetch one InnerTube search page with transient retries.
 
-    Returns the search payload, or ``None`` when both the initial
-    attempt and the single retry failed with a transient error
-    (timeout / connection reset / InnerTube request error). A
-    ``None`` return tells the caller to stop paginating the
-    current term and move on; non-transient errors propagate.
+    A connection failure rotates through every unused proxy in the
+    worker pool. Other transient errors are retried once. Returns
+    ``None`` after retries are exhausted so the caller moves to the
+    next term; non-transient errors propagate.
     '''
 
-    for attempt in range(2):  # initial attempt + one retry
+    attempt: int = 0
+    retry_available: bool = True
+    while True:
+        active_proxy: str | None = (
+            proxy_lease.proxy
+            if proxy_lease is not None
+            else proxy
+        )
         try:
-            return await _innertube_search(
+            result: dict[str, Any] = await _innertube_search(
                 term,
                 continuation=continuation,
-                proxy=proxy,
+                proxy=active_proxy,
                 limiter=limiter,
             )
+            if proxy_lease is not None:
+                proxy_lease.mark_success()
+            return result
         except _TRANSIENT_SEARCH_ERRORS as exc:
-            action: str = (
-                'retrying' if attempt == 0 else 'giving up on term'
+            replaced_proxy: bool = (
+                isinstance(exc, _PROXY_CONNECTION_ERRORS)
+                and proxy_lease is not None
+                and proxy_lease.replace_failed()
             )
+            should_retry: bool = replaced_proxy or retry_available
+            if replaced_proxy:
+                action: str = 'retrying with different proxy'
+            elif retry_available:
+                action = 'retrying'
+                retry_available = False
+            else:
+                action = 'giving up on term'
             _LOGGER.warning(
                 f'InnerTube search page failed; {action}',
                 exc=exc,
@@ -477,12 +655,20 @@ async def _search_page_with_retry(
                     'error_type': type(exc).__name__,
                     'attempt': attempt,
                     'has_continuation': bool(continuation),
-                    'proxy': proxy,
+                    'proxy_ip': (
+                        extract_proxy_ip(active_proxy)
+                        if active_proxy else 'none'
+                    ),
+                    'proxy_port': (
+                        extract_proxy_port(active_proxy)
+                        if active_proxy else 'none'
+                    ),
                 },
             )
-            if attempt == 0:
-                await asyncio.sleep(_SEARCH_RETRY_BACKOFF_SECONDS)
-    return None
+            if not should_retry:
+                return None
+            attempt += 1
+            await asyncio.sleep(_SEARCH_RETRY_BACKOFF_SECONDS)
 
 
 async def discover_for_term(
@@ -490,6 +676,8 @@ async def discover_for_term(
     *,
     continuations: int,
     limiter: YouTubeRateLimiter,
+    proxy: str | None = None,
+    proxy_lease: _SearchProxyLease | None = None,
 ) -> AsyncIterator[DiscoveredChannel]:
     '''Search one term, yielding discovered channels per page.
 
@@ -499,13 +687,16 @@ async def discover_for_term(
     deduplication is the caller's responsibility (see
     :class:`_ChannelEmitter`).
 
-    A page that fails transiently (timeout / connection error /
-    InnerTube request error) is retried once; if it still fails
-    the term stops paginating and the caller continues with the
-    next term. Channels yielded from earlier pages are kept.
+    A connection failure rotates through unused proxies. Other
+    transient failures are retried once. If retries are exhausted,
+    the term stops paginating and the caller continues with the next
+    term. Channels yielded from earlier pages are kept.
     '''
 
-    proxy = limiter.select_proxy(YouTubeCallType.BROWSE)
+    if proxy_lease is not None:
+        proxy = proxy_lease.proxy
+    elif proxy is None:
+        proxy = limiter.select_proxy(YouTubeCallType.BROWSE)
     continuation: str | None = None
     pages = max(0, continuations) + 1
 
@@ -516,6 +707,7 @@ async def discover_for_term(
             continuation=continuation,
             proxy=proxy,
             limiter=limiter,
+            proxy_lease=proxy_lease,
         )
         if payload is None:
             break
@@ -533,6 +725,97 @@ async def discover_for_term(
         )
         if not continuation:
             break
+
+
+async def discover_for_terms(
+    terms: Iterable[str],
+    *,
+    continuations: int,
+    concurrency: int,
+    proxies: Iterable[str],
+    limiter: YouTubeRateLimiter,
+) -> AsyncIterator[DiscoveredChannel]:
+    '''Discover channels from one shared queue of search terms.
+
+    Each consumer receives a distinct proxy. Concurrency is capped
+    by the number of proxies, or set to one direct consumer when no
+    proxies are configured. Connection failures rotate through the
+    shared pool of proxies not currently leased by another worker.
+    '''
+
+    if concurrency < 1:
+        raise ValueError(
+            f'concurrency must be >= 1, got {concurrency!r}',
+        )
+
+    proxy_list: list[str] = list(dict.fromkeys(proxies))
+    worker_count: int
+    if proxy_list:
+        worker_count = min(concurrency, len(proxy_list))
+    else:
+        worker_count = 1
+
+    proxy_pool: _SearchProxyPool = _SearchProxyPool(proxy_list)
+    proxy_leases: list[_SearchProxyLease] = [
+        _SearchProxyLease(proxy_pool.take(), proxy_pool)
+        for _ in range(worker_count)
+    ]
+
+    term_queue: asyncio.Queue[str | None] = asyncio.Queue()
+    result_queue: asyncio.Queue[
+        DiscoveredChannel | Exception | None
+    ] = asyncio.Queue()
+    for term in terms:
+        term_queue.put_nowait(term)
+    for _ in proxy_leases:
+        term_queue.put_nowait(None)
+
+    async def worker(proxy_lease: _SearchProxyLease) -> None:
+        try:
+            while True:
+                term: str | None = await term_queue.get()
+                try:
+                    if term is None:
+                        return
+                    async for channel in discover_for_term(
+                        term,
+                        continuations=continuations,
+                        limiter=limiter,
+                        proxy_lease=proxy_lease,
+                    ):
+                        await result_queue.put(channel)
+                except Exception as exc:
+                    await result_queue.put(exc)
+                    return
+                finally:
+                    term_queue.task_done()
+        finally:
+            proxy_lease.release()
+            await result_queue.put(None)
+
+    tasks: list[asyncio.Task[None]] = [
+        asyncio.create_task(
+            worker(proxy_lease),
+            name=f'youtube-search-worker-{index}',
+        )
+        for index, proxy_lease in enumerate(proxy_leases)
+    ]
+    finished: int = 0
+    try:
+        while finished < len(tasks):
+            result: DiscoveredChannel | Exception | None = (
+                await result_queue.get()
+            )
+            if result is None:
+                finished += 1
+            elif isinstance(result, Exception):
+                raise result
+            else:
+                yield result
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def _channel_to_json(channel: DiscoveredChannel) -> str:
@@ -586,20 +869,191 @@ class _ChannelEmitter:
         return True
 
 
-@contextlib.contextmanager
-def _channel_output_stream(output_file: str) -> Iterator[Any]:
-    if output_file == '-':
-        yield sys.stdout
-        return
+class _ChannelOutputStream:
+    '''Append-only output stream that can reopen its pathname.'''
 
-    path: Path = Path(output_file).expanduser()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open('a', encoding='utf-8') as stream:
-        yield stream
+    def __init__(self, output_file: str) -> None:
+        self._path: Path | None = (
+            None
+            if output_file == '-'
+            else Path(output_file).expanduser()
+        )
+        self._stream: Any = None
+
+    def __enter__(self) -> _ChannelOutputStream:
+        if self._path is None:
+            self._stream = sys.stdout
+        else:
+            self.reopen()
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        del args
+        if self._path is not None and self._stream is not None:
+            self._stream.close()
+        self._stream = None
+
+    def reopen(self) -> None:
+        if self._path is None:
+            return
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        replacement: Any = self._path.open(
+            'a', encoding='utf-8',
+        )
+        previous: Any = self._stream
+        self._stream = replacement
+        if previous is not None:
+            previous.close()
+
+    def write(self, value: str) -> int:
+        return self._stream.write(value)
+
+    def flush(self) -> None:
+        self._stream.flush()
 
 
-async def main_async(argv: list[str] | None = None) -> int:
-    settings = DiscoverSearchSettings(_cli_parse_args=argv)
+def _channel_output_stream(
+    output_file: str,
+) -> _ChannelOutputStream:
+    return _ChannelOutputStream(output_file)
+
+
+class _PidFileError(RuntimeError):
+    pass
+
+
+class _PidFile:
+    '''Own one process-ID file for the current process lifetime.'''
+
+    def __init__(self, path: str) -> None:
+        self._path: Path = Path(path).expanduser()
+        self._identity: tuple[int, int] | None = None
+
+    def acquire(self) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        while True:
+            try:
+                fd: int = os.open(
+                    self._path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+            except FileExistsError:
+                self._remove_stale_file()
+                continue
+            try:
+                file_stat: os.stat_result = os.fstat(fd)
+                self._identity = (
+                    file_stat.st_dev,
+                    file_stat.st_ino,
+                )
+                with os.fdopen(
+                    fd, 'w', encoding='utf-8',
+                ) as stream:
+                    fd = -1
+                    stream.write(f'{os.getpid()}\n')
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+            return
+
+    @staticmethod
+    def _process_is_running(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    def _remove_stale_file(self) -> None:
+        try:
+            path_stat: os.stat_result = os.lstat(self._path)
+        except FileNotFoundError:
+            return
+        if not stat.S_ISREG(path_stat.st_mode):
+            raise _PidFileError(
+                f'{self._path} is not a regular file',
+            )
+        if path_stat.st_uid != os.geteuid():
+            raise _PidFileError(
+                f'{self._path} is not owned by the current user',
+            )
+
+        flags: int = os.O_RDONLY
+        if hasattr(os, 'O_NOFOLLOW'):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd: int = os.open(self._path, flags)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise _PidFileError(
+                    f'{self._path} is not a regular file',
+                ) from exc
+            raise
+        try:
+            file_stat: os.stat_result = os.fstat(fd)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise _PidFileError(
+                    f'{self._path} is not a regular file',
+                )
+            if file_stat.st_uid != os.geteuid():
+                raise _PidFileError(
+                    f'{self._path} is not owned by the current user',
+                )
+            with os.fdopen(
+                fd, 'r', encoding='utf-8',
+            ) as stream:
+                fd = -1
+                raw_pid: str = stream.read(128).strip()
+        finally:
+            if fd >= 0:
+                os.close(fd)
+
+        try:
+            pid: int = int(raw_pid)
+        except ValueError:
+            pid = -1
+        if pid > 0 and self._process_is_running(pid):
+            raise _PidFileError(
+                f'process {pid} from {self._path} is still running',
+            )
+
+        try:
+            current: os.stat_result = os.lstat(self._path)
+        except FileNotFoundError:
+            return
+        if (
+            current.st_dev == file_stat.st_dev
+            and current.st_ino == file_stat.st_ino
+        ):
+            self._path.unlink()
+
+    def release(self) -> None:
+        if self._identity is None:
+            return
+        try:
+            file_stat: os.stat_result = self._path.stat()
+            contents: str = self._path.read_text(
+                encoding='utf-8',
+            )
+        except FileNotFoundError:
+            return
+        identity: tuple[int, int] = (
+            file_stat.st_dev,
+            file_stat.st_ino,
+        )
+        if (
+            identity == self._identity
+            and contents.strip() == str(os.getpid())
+        ):
+            self._path.unlink()
+
+
+async def _run_discovery(settings: DiscoverSearchSettings) -> int:
     configure_logging(
         level=settings.log_level,
         filename=settings.log_file,
@@ -622,18 +1076,48 @@ async def main_async(argv: list[str] | None = None) -> int:
 
     try:
         with _channel_output_stream(settings.output_file) as stream:
-            emitter = _ChannelEmitter(stream)
-            for term in terms:
-                async for channel in discover_for_term(
-                    term,
-                    continuations=settings.youtube_search_continuations,
+            loop: asyncio.AbstractEventLoop = (
+                asyncio.get_running_loop()
+            )
+            sighup_installed: bool = False
+            if settings.output_file != '-':
+                loop.add_signal_handler(
+                    signal.SIGHUP, stream.reopen,
+                )
+                sighup_installed = True
+            try:
+                emitter = _ChannelEmitter(stream)
+                async for channel in discover_for_terms(
+                    terms,
+                    continuations=(
+                        settings.youtube_search_continuations
+                    ),
+                    concurrency=settings.youtube_search_concurrency,
+                    proxies=settings.proxies,
                     limiter=limiter,
                 ):
                     emitter.emit(channel)
+            finally:
+                if sighup_installed:
+                    loop.remove_signal_handler(signal.SIGHUP)
         return 0
     finally:
         await aclose_pooled_innertube()
         shutdown_innertube_executor()
+
+
+async def main_async(argv: list[str] | None = None) -> int:
+    settings = DiscoverSearchSettings(_cli_parse_args=argv)
+    pid_file = _PidFile(settings.pid_file)
+    try:
+        pid_file.acquire()
+    except _PidFileError as exc:
+        sys.stderr.write(f'pid file error: {exc}\n')
+        return 1
+    try:
+        return await _run_discovery(settings)
+    finally:
+        pid_file.release()
 
 
 def main() -> None:

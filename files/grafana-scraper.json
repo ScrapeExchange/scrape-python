@@ -2890,7 +2890,7 @@
         "type": "custom"
       },
       {
-        "allValue": "scrape-upload|tiktok-creator|tiktok-video|tiktok-creator-upload|tiktok-video-upload|ig-creator|instagram-creator",
+        "allValue": "scrape_upload|tiktok-creator|tiktok-video|tiktok-creator-upload|tiktok-video-upload|ig-creator|instagram-creator",
         "current": {
           "text": "All",
           "value": "$__all"
@@ -2905,7 +2905,7 @@
         "name": "job",
         "options": [],
         "query": {
-          "query": "label_values({platform=~\"$platform\",job=~\"scrape-upload|tiktok-creator|tiktok-video|tiktok-creator-upload|tiktok-video-upload|ig-creator|instagram-creator\"}, job)",
+          "query": "label_values({platform=~\"$platform\",job=~\"scrape_upload|tiktok-creator|tiktok-video|tiktok-creator-upload|tiktok-video-upload|ig-creator|instagram-creator\"}, job)",
           "refId": "StandardVariableQuery"
         },
         "refresh": 2,

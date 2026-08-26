@@ -139,6 +139,10 @@ hard threshold (`CHANNEL_UNAVAILABLE_HARD_THRESHOLD`,
 default 3) marks the channel as gone. Soft failures
 re-enter the queue after
 `CHANNEL_UNAVAILABLE_SOFT_RETRY_SECONDS` (default 24 h).
+If a successful scrape cannot determine the subscriber
+count, the scraper preserves the channel's current tier and
+schedules a full scrape after
+`CHANNEL_MISSING_SUBSCRIBER_RETRY_SECONDS` (default 24 h).
 Most "failures" in this scraper are legitimate empty
 channels (counted by `channel_no_content_found_total`) —
 subtract them before raising alarms about failure rate.

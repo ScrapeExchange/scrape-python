@@ -34,6 +34,7 @@ from pydantic import (
 )
 
 from scrape_exchange.creator_queue import (
+    DEFAULT_ORPHAN_RECOVERY_INTERVAL_SECONDS,
     RedisCreatorQueue,
     TierConfig,
     parse_priority_queues,
@@ -76,7 +77,7 @@ from scrape_exchange.settings import (
     ScraperSettings,
     normalize_log_level,
 )
-from scrape_exchange.util import extract_proxy_ip
+from scrape_exchange.util import extract_proxy_ip, extract_proxy_port
 from scrape_exchange.watchdog import Watchdog
 from scrape_exchange.worker_id import get_worker_id
 
@@ -202,7 +203,7 @@ class CreatorSettings(InstagramScraperSettings):
         description='Sleep ceiling when nothing is due.',
     )
     creator_orphan_recovery_interval_seconds: float = Field(
-        default=600.0,
+        default=DEFAULT_ORPHAN_RECOVERY_INTERVAL_SECONDS,
         validation_alias=AliasChoices(
             'IG_CREATOR_ORPHAN_RECOVERY_INTERVAL',
             'creator_orphan_recovery_interval_seconds',
@@ -545,6 +546,7 @@ async def _handle_failure(
     settings: CreatorSettings,
     worker_id: str,
     proxy_ip: str,
+    proxy_port: str,
     evidence: dict | None = None,
 ) -> str:
     reason: str = classify_instagram_error(exc)
@@ -600,6 +602,7 @@ async def _handle_failure(
             'reason': reason,
             'error': str(exc),
             'proxy_ip': proxy_ip,
+            'proxy_port': proxy_port,
             'last_url': failure_evidence.get('last_url'),
             'page_title': failure_evidence.get('page_title'),
             'http_status': failure_evidence.get('http_status'),
@@ -631,6 +634,7 @@ async def _process_creator(
     proxy_ip: str,
 ) -> str | None:
     start: float = time.monotonic()
+    proxy_port: str = extract_proxy_port(proxy)
     evidence: dict | None = None
     await queue.record_scrape_attempt(
         username, worker_id=worker_id, proxy_ip=proxy_ip,
@@ -669,7 +673,9 @@ async def _process_creator(
             api=API_LABEL,
             worker_id=worker_id,
             proxy_ip=proxy_ip,
+            proxy_port=proxy_port,
             proxy_file='',
+            channel_status='none',
         ).inc()
         METRIC_SCRAPE_DURATION.labels(
             platform=PLATFORM,
@@ -682,7 +688,8 @@ async def _process_creator(
         return None
     except Exception as exc:
         reason: str = await _handle_failure(
-            exc, username, queue, settings, worker_id, proxy_ip, evidence,
+            exc, username, queue, settings, worker_id, proxy_ip,
+            proxy_port, evidence,
         )
         METRIC_SCRAPE_FAILURES.labels(
             platform=PLATFORM,
@@ -692,6 +699,7 @@ async def _process_creator(
             reason=reason,
             worker_id=worker_id,
             proxy_ip=proxy_ip,
+            proxy_port=proxy_port,
             proxy_file='',
         ).inc()
         METRIC_SCRAPE_DURATION.labels(
@@ -715,6 +723,7 @@ async def _proxy_worker(
     worker_id: str,
 ) -> None:
     proxy_ip: str = extract_proxy_ip(proxy)
+    proxy_port: str = extract_proxy_port(proxy)
     consecutive_bot_failures: int = 0
     circuit_events: int = 0
     while not shutdown_event.is_set():
@@ -730,7 +739,11 @@ async def _proxy_worker(
         except Exception as exc:
             _LOGGER.warning(
                 'Instagram claim_batch failed',
-                extra={'proxy_ip': proxy_ip, 'error': str(exc)},
+                extra={
+                    'proxy_ip': proxy_ip,
+                    'proxy_port': proxy_port,
+                    'error': str(exc),
+                },
             )
             await asyncio.sleep(settings.creator_queue_idle_poll_seconds)
             continue
@@ -762,6 +775,7 @@ async def _proxy_worker(
             'Instagram proxy bot-detection circuit opened',
             extra={
                 'proxy_ip': proxy_ip,
+                'proxy_port': proxy_port,
                 'consecutive_failures': consecutive_bot_failures,
                 'cooldown_seconds': cooldown_seconds,
             },
@@ -778,7 +792,10 @@ async def _proxy_worker(
         if not rebuilt:
             _LOGGER.error(
                 'Instagram proxy session rebuild failed; retiring worker',
-                extra={'proxy_ip': proxy_ip},
+                extra={
+                    'proxy_ip': proxy_ip,
+                    'proxy_port': proxy_port,
+                },
             )
             return
 

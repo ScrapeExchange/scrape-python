@@ -60,7 +60,7 @@ from scrape_exchange.tiktok import (
 )
 from scrape_exchange.tiktok.settings import TikTokScraperSettings
 from scrape_exchange.tiktok.tiktok_session_pool import DIRECT_SESSION_PROXY
-from scrape_exchange.util import extract_proxy_ip
+from scrape_exchange.util import extract_proxy_ip, extract_proxy_port
 from scrape_exchange.video_scrape_queue import (
     RedisVideoScrapeQueue,
     VideoScrapeQueueSettings,
@@ -355,6 +355,11 @@ async def _scrape_one_queued(
     last_reason: str = 'other'
     worker_id: str = get_worker_id()
     proxy_ip: str = _proxy_label(proxy)
+    proxy_port: str = (
+        extract_proxy_port(proxy)
+        if proxy != DIRECT_SESSION_PROXY
+        else 'none'
+    )
     proxy_file: str = _proxy_file_label(proxy)
     while attempts_left > 0:
         started: float = time.monotonic()
@@ -372,6 +377,7 @@ async def _scrape_one_queued(
                 reason=reason,
                 worker_id=worker_id,
                 proxy_ip=proxy_ip,
+                proxy_port=proxy_port,
                 proxy_file=proxy_file,
             ).inc()
             METRIC_SCRAPE_DURATION.labels(
@@ -422,7 +428,9 @@ async def _scrape_one_queued(
                 api=API_LABEL,
                 worker_id=worker_id,
                 proxy_ip=proxy_ip,
+                proxy_port=proxy_port,
                 proxy_file=proxy_file,
+                channel_status='none',
             ).inc()
             METRIC_SCRAPE_DURATION.labels(
                 platform=PLATFORM,

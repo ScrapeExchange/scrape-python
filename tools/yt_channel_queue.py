@@ -15,6 +15,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
+from urllib.parse import quote
 from argparse import (
     ArgumentParser, Namespace,
     _SubParsersAction, _MutuallyExclusiveGroup
@@ -22,11 +23,13 @@ from argparse import (
 
 import redis.asyncio as aioredis
 from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import WatchError
 from pydantic import AliasChoices, Field
 from pydantic_settings import (
     BaseSettings,
     SettingsConfigDict,
 )
+from httpx import Response
 
 from scrape_exchange.channel_queue_reconcile import (
     ChannelQueueAuditor,
@@ -43,7 +46,13 @@ from scrape_exchange.channel_scrape_queue import (
     ChannelState,
     RedisChannelScrapeQueue,
 )
-from scrape_exchange.creator_queue import parse_priority_queues
+from scrape_exchange.creator_queue import (
+    TierConfig,
+    parse_priority_queues,
+    tier_for_subscriber_count,
+)
+from scrape_exchange.exchange_client import ExchangeClient
+from scrape_exchange.file_management import AssetFileManagement
 from scrape_exchange.metrics_server import start_metrics_server
 from scrape_exchange.redis_client import redis_from_url
 from scrape_exchange.youtube.channel_identity import (
@@ -71,15 +80,16 @@ _LUA_BACKFILL_RSS_CREATORS = '''
 -- ARGV[3] = youtube:channel:meta: prefix
 -- ARGV[4] = source
 -- ARGV[5] = created_at unix seconds
--- ARGV[6..N] = channel IDs
+-- ARGV[6..N] = channel ID, target channel tier pairs
 local added = 0
 local skipped = 0
 local scheduled_count = tonumber(ARGV[1])
 local terminal_count = tonumber(ARGV[2])
 local scheduled_start = 2
 local terminal_start = scheduled_start + scheduled_count
-for i = 6, #ARGV do
+for i = 6, #ARGV, 2 do
     local cid = ARGV[i]
+    local tier = tonumber(ARGV[i + 1]) or 0
     local member = 'i:' .. cid
     local exists = false
     for k = scheduled_start, terminal_start - 1 do
@@ -99,7 +109,6 @@ for i = 6, #ARGV do
     if exists then
         skipped = skipped + 1
     else
-        local tier = tonumber(redis.call('HGET', KEYS[1], cid) or '0')
         if tier == nil or tier < 0 or tier >= scheduled_count then
             tier = 0
         end
@@ -108,7 +117,7 @@ for i = 6, #ARGV do
             'ZADD', scheduled_key, 'NX', 0, member
         )
         if zadded == 1 then
-            redis.call('HSETNX', KEYS[1], cid, '0')
+            redis.call('HSET', KEYS[1], cid, tostring(tier))
             local meta_key = ARGV[3] .. member
             redis.call(
                 'HSET', meta_key,
@@ -139,6 +148,35 @@ class YtChannelQueueSettings(BaseSettings):
 
     redis_dsn: str = Field(
         default='redis://localhost:6379/0',
+    )
+    channel_data_directory: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            'YOUTUBE_CHANNEL_DATA_DIR',
+            'YOUTUBE_CHANNELS_DATA_DIR',
+            'channel_data_directory',
+        ),
+    )
+    exchange_url: str = Field(
+        default='https://scrape.exchange',
+        validation_alias=AliasChoices(
+            'EXCHANGE_URL',
+            'exchange_url',
+        ),
+    )
+    api_key_id: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            'API_KEY_ID',
+            'api_key_id',
+        ),
+    )
+    api_key_secret: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            'API_KEY_SECRET',
+            'api_key_secret',
+        ),
     )
     rss_priority_queues: str = Field(
         default='1:10000000,4:1000000,12:100000,24:10000,48:0',
@@ -264,9 +302,9 @@ def _build_parser() -> ArgumentParser:
         'backfill-rss',
         help=(
             'One-shot backfill from rss:youtube:creators into '
-            'youtube:channel:queue:scheduled:0. Only channel IDs '
-            'with no existing channel queue meta are inserted; '
-            'new entries are due immediately.'
+            'the subscriber-equivalent channel priority tier. '
+            'Only channel IDs with no existing channel queue '
+            'state are inserted; new entries are due immediately.'
         ),
     )
     c_backfill.add_argument(
@@ -391,6 +429,36 @@ def _build_parser() -> ArgumentParser:
         type=float,
         default=1800.0,
         help='Delay between --watch reconcile passes.',
+    )
+    c_retier: ArgumentParser = sub.add_parser(
+        'retier',
+        help=(
+            'Recompute channel and/or RSS queue tiers from current '
+            'priority definitions and stored subscriber counts. '
+            'Dry-run by default; pass --apply to move entries.'
+        ),
+    )
+    c_retier.add_argument(
+        '--queue',
+        choices=['channel', 'rss', 'both'],
+        default='both',
+    )
+    c_retier.add_argument(
+        '--apply',
+        action='store_true',
+        default=False,
+    )
+    c_retier.add_argument(
+        '--batch-size',
+        type=int,
+        default=1000,
+        help='Redis SCAN batch size. Default 1000.',
+    )
+    c_retier.add_argument(
+        '--limit',
+        type=int,
+        default=None,
+        help='Inspect at most N unique channels.',
     )
     c_export: ArgumentParser = sub.add_parser(
         'export',
@@ -1150,7 +1218,9 @@ def _parse_import_line(
 async def _revive_if_terminal(
     queue: RedisChannelScrapeQueue,
     member: str,
-) -> ChannelState | None:
+    *,
+    channel_handle: str = '',
+) -> tuple[bool, ChannelState | None]:
     '''Re-enqueue *member* if it sits in a terminal state.
 
     When an imported member is currently parked in any
@@ -1164,14 +1234,36 @@ async def _revive_if_terminal(
     member prefix. We pass an explicit normal-position
     score so revived channels do not jump to the front.
 
-    Returns the prior terminal state when a revival
-    happened, otherwise ``None``.
+    Topic members whose recorded channel handle contains
+    whitespace remain terminal. Such handles are fallback
+    display names, not valid YouTube handles.
+
+    Returns ``(terminal_found, revived_from)``. The second
+    value is ``None`` when there was no terminal state or
+    when a whitespace-handle topic was intentionally retained.
     '''
     state: ChannelState | None = await queue.get_state(member)
     if state is None or state not in ChannelState.terminal_states():
-        return None
+        return (False, None)
+    if state == ChannelState.TOPIC:
+        raw_record: str | None = await queue._redis.hget(
+            queue._k_state(ChannelState.TOPIC), member,
+        )
+        stored_handle: str = ''
+        if raw_record:
+            try:
+                record: object = json.loads(raw_record)
+            except ValueError:
+                record = None
+            if isinstance(record, dict):
+                raw_handle: object = record.get('channel_handle')
+                if isinstance(raw_handle, str):
+                    stored_handle = raw_handle
+        handle: str = stored_handle or channel_handle
+        if any(char.isspace() for char in handle):
+            return (True, None)
     await queue.unmark(member, score=time.time())
-    return state
+    return (True, state)
 
 
 async def _enqueue_import_record(
@@ -1203,10 +1295,14 @@ async def _enqueue_import_record(
             handle = cid
         cid = ''
     if cid:
-        revived: ChannelState | None = await _revive_if_terminal(
-            queue, f'i:{cid}',
+        terminal_found: bool
+        revived: ChannelState | None
+        terminal_found, revived = await _revive_if_terminal(
+            queue,
+            f'i:{cid}',
+            channel_handle=handle,
         )
-        if revived is None:
+        if not terminal_found:
             await queue.enqueue_scheduled(
                 cid, source='migration',
             )
@@ -1219,19 +1315,23 @@ async def _enqueue_import_record(
             handle,
         )
     if hit:
-        revived = await _revive_if_terminal(
-            queue, f'i:{hit}',
+        terminal_found, revived = await _revive_if_terminal(
+            queue,
+            f'i:{hit}',
+            channel_handle=handle,
         )
-        if revived is None:
+        if not terminal_found:
             await queue.enqueue_scheduled(
                 hit, source='migration',
             )
         return (1, 0, revived)
     canonical: str = queue._normalise_handle(handle)
-    revived = await _revive_if_terminal(
-        queue, f'h:{canonical}',
+    terminal_found, revived = await _revive_if_terminal(
+        queue,
+        f'h:{canonical}',
+        channel_handle=handle,
     )
-    if revived is None:
+    if not terminal_found:
         await queue.enqueue_unresolved(
             handle, source='migration',
         )
@@ -1372,6 +1472,45 @@ async def cmd_ingest_sentinels(
     return 0
 
 
+def _channel_tier_from_rss_tiers(
+    queue: RedisChannelScrapeQueue,
+    rss_tiers: list[TierConfig],
+    candidates: set[int],
+) -> int:
+    '''Map RSS tier evidence to the highest plausible channel tier.
+
+    An RSS tier's maximum subscriber count is one less than the
+    preceding, higher-priority tier's minimum. The first RSS tier is
+    unbounded above and therefore maps directly to channel tier 0.
+    Multiple candidates can occur while the RSS tier hash and sorted-set
+    placement are being reconciled; the highest implied count wins.
+    Missing or invalid RSS tier evidence is treated as unknown and gets
+    channel tier 0 so it is scraped promptly.
+    '''
+    index_by_tier: dict[int, int] = {
+        tier.tier: index
+        for index, tier in enumerate(rss_tiers)
+    }
+    channel_candidates: list[int] = []
+    for candidate in candidates:
+        index: int | None = index_by_tier.get(candidate)
+        if index is None:
+            continue
+        if index == 0:
+            channel_candidates.append(0)
+            continue
+        upper_bound: int = max(
+            0,
+            rss_tiers[index - 1].min_subscribers - 1,
+        )
+        channel_candidates.append(
+            queue._tier_for_sub_count(upper_bound)
+        )
+    if not channel_candidates:
+        return 0
+    return min(channel_candidates)
+
+
 async def cmd_backfill_rss(
     ns: Namespace,
     queue: RedisChannelScrapeQueue,
@@ -1384,6 +1523,10 @@ async def cmd_backfill_rss(
     already_known: int = 0
     added: int = 0
     batch: list[str] = []
+    settings: YtChannelQueueSettings = YtChannelQueueSettings()
+    rss_tiers: list[TierConfig] = parse_priority_queues(
+        settings.rss_priority_queues,
+    )
     scheduled_keys: list[str] = [
         queue._k_scheduled(t)
         for t in range(len(queue._tiers))
@@ -1396,13 +1539,52 @@ async def cmd_backfill_rss(
         )
     ]
 
+    async def target_channel_tiers() -> list[int]:
+        pipe: aioredis.client.Pipeline = (
+            queue._redis.pipeline(transaction=False)
+        )
+        for cid in batch:
+            pipe.hget('rss:youtube:tiers', cid)
+            for rss_tier in rss_tiers:
+                pipe.zscore(
+                    f'rss:youtube:queue:{rss_tier.tier}',
+                    cid,
+                )
+        results: list[object] = await pipe.execute()
+        group_size: int = 1 + len(rss_tiers)
+        targets: list[int] = []
+        for index in range(len(batch)):
+            group: list[object] = results[
+                index * group_size:(index + 1) * group_size
+            ]
+            candidates: set[int] = set()
+            tier_hash_value: object = group[0]
+            try:
+                candidates.add(int(str(tier_hash_value)))
+            except (TypeError, ValueError):
+                pass
+            for rss_tier, score in zip(rss_tiers, group[1:]):
+                if score is not None and score is not False:
+                    candidates.add(rss_tier.tier)
+            targets.append(
+                _channel_tier_from_rss_tiers(
+                    queue,
+                    rss_tiers,
+                    candidates,
+                )
+            )
+        return targets
+
     async def flush() -> None:
         nonlocal added, already_known, batch
         if not batch:
             return
+        channel_tiers: list[int] = await target_channel_tiers()
         if ns.dry_run:
-            pipe = queue._redis.pipeline(
-                transaction=False,
+            pipe: aioredis.client.Pipeline = (
+                queue._redis.pipeline(
+                    transaction=False,
+                )
             )
             for cid in batch:
                 member: str = f'i:{cid}'
@@ -1410,13 +1592,16 @@ async def cmd_backfill_rss(
                     pipe.zscore(key, member)
                 for key in terminal_keys:
                     pipe.hexists(key, member)
-            results: list[int] = await pipe.execute()
+            results: list[object] = await pipe.execute()
             group_size: int = (
                 len(scheduled_keys) + len(terminal_keys)
             )
             for i in range(0, len(results), group_size):
                 group = results[i:i + group_size]
-                exists = any(group)
+                exists: bool = any(
+                    value is not None and value is not False
+                    for value in group
+                )
                 if exists:
                     already_known += 1
                 else:
@@ -1434,7 +1619,11 @@ async def cmd_backfill_rss(
             'youtube:channel:meta:',
             ns.source,
             str(int(time.time())),
-            *batch,
+            *(
+                value
+                for cid, tier in zip(batch, channel_tiers)
+                for value in (cid, str(tier))
+            ),
         )
         added += int(raw[0])
         already_known += int(raw[1])
@@ -2023,6 +2212,431 @@ async def _iter_rss_hash(
             return
 
 
+async def _channel_retier_keys(
+    queue: RedisChannelScrapeQueue,
+    batch_size: int,
+) -> list[tuple[int, str]]:
+    tier_keys: list[tuple[int, str]] = []
+    async for key in queue._redis.scan_iter(
+        match='youtube:channel:queue:scheduled:*',
+        count=batch_size,
+    ):
+        suffix: str = key.rsplit(':', 1)[-1]
+        try:
+            tier_keys.append((int(suffix), key))
+        except ValueError:
+            continue
+    return sorted(tier_keys)
+
+
+async def _scan_retier_placements(
+    queue: RedisChannelScrapeQueue,
+    tier_keys: list[tuple[int, str]],
+    batch_size: int,
+) -> list[tuple[str, int, float]]:
+    '''Snapshot one placement per member before any mutation starts.'''
+    placements: dict[str, tuple[int, float]] = {}
+    for tier, key in tier_keys:
+        cursor: int = 0
+        while True:
+            cursor, items = await queue._redis.zscan(
+                key, cursor=cursor, count=batch_size,
+            )
+            for member, score in items:
+                placements.setdefault(
+                    member, (tier, float(score)),
+                )
+            if cursor == 0:
+                break
+    return [
+        (member, tier, score)
+        for member, (tier, score) in placements.items()
+    ]
+
+
+async def _move_retier_member(
+    queue: RedisChannelScrapeQueue,
+    source_key: str,
+    target_key: str,
+    tiers_key: str,
+    tier_field: str,
+    new_tier: int,
+    member: str,
+) -> float | None:
+    '''Atomically move a still-scheduled member, preserving its score.
+
+    WATCH prevents a worker claim between the read and write from
+    resurrecting an in-flight member.
+    '''
+    watched_keys: list[str] = list(dict.fromkeys(
+        [source_key, target_key],
+    ))
+    while True:
+        async with queue._redis.pipeline(
+            transaction=True,
+        ) as pipe:
+            try:
+                await pipe.watch(*watched_keys)
+                scores: list[float | None] = [
+                    await pipe.zscore(key, member)
+                    for key in watched_keys
+                ]
+                current_scores: list[float] = [
+                    float(score)
+                    for score in scores
+                    if score is not None
+                ]
+                if not current_scores:
+                    await pipe.unwatch()
+                    return None
+                score: float = min(current_scores)
+                pipe.multi()
+                for key in watched_keys:
+                    pipe.zrem(key, member)
+                pipe.zadd(target_key, {member: score})
+                pipe.hset(
+                    tiers_key,
+                    tier_field,
+                    str(new_tier),
+                )
+                await pipe.execute()
+                return score
+            except WatchError:
+                continue
+
+
+def _subscriber_count_from_data(
+    data: dict,
+) -> int | None:
+    count: object = data.get('subscriber_count')
+    if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+        return count
+    return None
+
+
+async def _read_local_subscriber_count(
+    fm: AssetFileManagement,
+    channel_id: str,
+) -> tuple[int | None, str | None]:
+    filename: str = f'channel-{channel_id}.json.br'
+    try:
+        data: dict = await fm.read_file(filename)
+        count: int | None = _subscriber_count_from_data(data)
+        if count is not None:
+            return count, 'current'
+    except Exception:
+        pass
+    try:
+        data = await fm.read_uploaded(filename)
+        count = _subscriber_count_from_data(data)
+        if count is not None:
+            return count, 'uploaded'
+    except Exception:
+        pass
+    return None, None
+
+
+class _RetierSubscriberCounts:
+    def __init__(
+        self,
+        settings: YtChannelQueueSettings,
+        queue: RedisChannelScrapeQueue,
+    ) -> None:
+        self._settings: YtChannelQueueSettings = settings
+        self._queue: RedisChannelScrapeQueue = queue
+        self._fm: AssetFileManagement = AssetFileManagement(
+            settings.channel_data_directory,
+        )
+        self._client: ExchangeClient | None = None
+        self._client_setup_attempted: bool = False
+        self._cache: dict[
+            str, tuple[int | None, str | None]
+        ] = {}
+
+    async def resolve(
+        self,
+        channel_id: str,
+    ) -> tuple[int | None, str | None]:
+        cached: tuple[int | None, str | None] | None = (
+            self._cache.get(channel_id)
+        )
+        if cached is not None:
+            return cached
+        raw_count: str | None = await self._queue._redis.hget(
+            self._queue._k_meta(f'i:{channel_id}'),
+            'subscriber_count',
+        )
+        count: int | None = None
+        if raw_count is not None:
+            try:
+                parsed_count: int = int(raw_count)
+                if parsed_count >= 0:
+                    count = parsed_count
+            except ValueError:
+                pass
+        result: tuple[int | None, str | None] = (
+            (count, 'redis')
+            if count is not None
+            else await _read_local_subscriber_count(
+                self._fm, channel_id,
+            )
+        )
+        if result[0] is None:
+            result = await self._read_api(channel_id)
+        if result[0] is not None and result[1] != 'redis':
+            await self._queue.set_meta(
+                f'i:{channel_id}',
+                subscriber_count=str(result[0]),
+            )
+        self._cache[channel_id] = result
+        return result
+
+    async def _read_api(
+        self,
+        channel_id: str,
+    ) -> tuple[int | None, str | None]:
+        if self._client is None:
+            if self._client_setup_attempted:
+                return None, None
+            self._client_setup_attempted = True
+            try:
+                self._client = await ExchangeClient.setup(
+                    self._settings.api_key_id or '',
+                    self._settings.api_key_secret or '',
+                    self._settings.exchange_url,
+                )
+            except Exception:
+                return None, None
+        identifier: str | None = await self._queue._redis.hget(
+            _CREATOR_MAP_KEY, channel_id,
+        )
+        if not identifier:
+            identifier = await self._queue._redis.hget(
+                'rss:youtube:creators', channel_id,
+            )
+        identifier = identifier or channel_id
+        url: str = (
+            f'{self._client.exchange_url.rstrip("/")}'
+            f'{ExchangeClient.GET_CONTENT_API}'
+            f'/youtube/channel/{quote(identifier, safe="@")}'
+        )
+        try:
+            response: Response = await self._client.get(url)
+            if response.status_code != 200:
+                return None, None
+            data: object = response.json()
+            if not isinstance(data, dict):
+                return None, None
+            count: int | None = _subscriber_count_from_data(data)
+            if count is None:
+                return None, None
+            return count, 'api'
+        except Exception:
+            return None, None
+
+    async def close(self) -> None:
+        if self._client is not None:
+            await self._client.aclose()
+
+
+async def cmd_retier(
+    ns: Namespace,
+    queue: RedisChannelScrapeQueue,
+) -> int:
+    '''Recompute scheduled queue tiers from subscriber counts.'''
+    settings: YtChannelQueueSettings = YtChannelQueueSettings()
+    if not settings.channel_data_directory:
+        sys.stderr.write(
+            'YOUTUBE_CHANNEL_DATA_DIR is required for retier\n',
+        )
+        return 2
+
+    resolver: _RetierSubscriberCounts = _RetierSubscriberCounts(
+        settings, queue,
+    )
+    batch_size: int = max(ns.batch_size, 1)
+    inspected: int = 0
+    inspected_ids: set[str] = set()
+    seen_placements: set[str] = set()
+    moved: dict[str, dict[tuple[int, int], int]] = {
+        'channel': {},
+        'rss': {},
+    }
+
+    def select_channel(channel_id: str) -> bool:
+        nonlocal inspected
+        if channel_id in inspected_ids:
+            return True
+        if ns.limit is not None and inspected >= ns.limit:
+            return False
+        inspected_ids.add(channel_id)
+        inspected += 1
+        return True
+
+    channel_tier_keys: list[tuple[int, str]] = []
+    channel_placements: list[tuple[str, int, float]] = []
+    if ns.queue in ('channel', 'both'):
+        channel_tier_keys = (
+            await _channel_retier_keys(
+                queue, batch_size,
+            )
+        )
+        channel_placements = await _scan_retier_placements(
+            queue, channel_tier_keys, batch_size,
+        )
+
+    rss_tier_keys: list[tuple[int, str]] = []
+    rss_placements: list[tuple[str, int, float]] = []
+    rss_tiers: list[TierConfig] = []
+    if ns.queue in ('rss', 'both'):
+        rss_tiers = parse_priority_queues(
+            settings.rss_priority_queues,
+        )
+        rss_scan_plan: list[tuple[str, str, int | None]] = (
+            await _discover_rss_queue_tiers(
+                queue, batch_size,
+            )
+        )
+        rss_tier_keys = [
+            (tier, key)
+            for key, _, tier in rss_scan_plan
+            if tier is not None
+        ]
+        rss_placements = await _scan_retier_placements(
+            queue, rss_tier_keys, batch_size,
+        )
+
+    channel_ids: set[str] = {
+        member[2:] if member.startswith('i:') else member
+        for member, _, _ in channel_placements
+    }
+    channel_ids.update(
+        channel_id for channel_id, _, _ in rss_placements
+    )
+    total: int = len(channel_ids)
+    if ns.limit is not None:
+        total = min(total, ns.limit)
+
+    def write_status() -> None:
+        move_parts: list[str] = []
+        for queue_name in ('channel', 'rss'):
+            if ns.queue not in (queue_name, 'both'):
+                continue
+            transitions: dict[tuple[int, int], int] = moved[queue_name]
+            details: str = ','.join(
+                f'{old_tier}->{new_tier}:{count}'
+                for (old_tier, new_tier), count in sorted(
+                    transitions.items(),
+                )
+            )
+            move_parts.append(
+                f'{queue_name}[{details or "none"}]'
+            )
+        remaining: int = max(total - inspected, 0)
+        sys.stderr.write(
+            f'\r\033[Kretier processed={inspected} '
+            f'remaining={remaining} '
+            f'moved={" ".join(move_parts)}',
+        )
+        sys.stderr.flush()
+
+    def record_move(
+        queue_name: str,
+        old_tier: int,
+        new_tier: int,
+    ) -> None:
+        transition: tuple[int, int] = (old_tier, new_tier)
+        transitions: dict[tuple[int, int], int] = moved[queue_name]
+        transitions[transition] = transitions.get(transition, 0) + 1
+
+    try:
+        for member, old_tier, _score in channel_placements:
+            placement_key: str = f'channel:{member}'
+            if placement_key in seen_placements:
+                continue
+            seen_placements.add(placement_key)
+            if not member.startswith('i:'):
+                if select_channel(member):
+                    write_status()
+                continue
+            channel_id: str = member[2:]
+            if not select_channel(channel_id):
+                continue
+            subscriber_count: int | None
+            subscriber_count, _ = await resolver.resolve(
+                channel_id,
+            )
+            if subscriber_count is None:
+                write_status()
+                continue
+            new_tier: int = queue._tier_for_sub_count(
+                subscriber_count,
+            )
+            if new_tier == old_tier:
+                write_status()
+                continue
+            was_applied: bool = False
+            if ns.apply:
+                moved_score: float | None = (
+                    await _move_retier_member(
+                        queue,
+                        queue._k_scheduled(old_tier),
+                        queue._k_scheduled(new_tier),
+                        queue._k_tiers(),
+                        channel_id,
+                        new_tier,
+                        member,
+                    )
+                )
+                if moved_score is not None:
+                    was_applied = True
+            if not ns.apply or was_applied:
+                record_move('channel', old_tier, new_tier)
+            write_status()
+
+        for channel_id, old_tier, _score in rss_placements:
+            placement_key = f'rss:{channel_id}'
+            if placement_key in seen_placements:
+                continue
+            seen_placements.add(placement_key)
+            if not select_channel(channel_id):
+                continue
+            subscriber_count, _ = await resolver.resolve(
+                channel_id,
+            )
+            if subscriber_count is None:
+                write_status()
+                continue
+            new_tier = tier_for_subscriber_count(
+                rss_tiers, subscriber_count,
+            )
+            if new_tier == old_tier:
+                write_status()
+                continue
+            was_applied = False
+            if ns.apply:
+                moved_score = await _move_retier_member(
+                    queue,
+                    f'rss:youtube:queue:{old_tier}',
+                    f'rss:youtube:queue:{new_tier}',
+                    'rss:youtube:tiers',
+                    channel_id,
+                    new_tier,
+                    channel_id,
+                )
+                if moved_score is not None:
+                    was_applied = True
+            if not ns.apply or was_applied:
+                record_move('rss', old_tier, new_tier)
+            write_status()
+    finally:
+        await resolver.close()
+
+    write_status()
+    sys.stderr.write('\n')
+    return 0
+
+
 _HANDLERS['count'] = cmd_count
 _HANDLERS['stats'] = cmd_stats
 _HANDLERS['show'] = cmd_show
@@ -2036,6 +2650,7 @@ _HANDLERS['import'] = cmd_import
 _HANDLERS['ingest-sentinels'] = cmd_ingest_sentinels
 _HANDLERS['backfill-rss'] = cmd_backfill_rss
 _HANDLERS['reconcile'] = cmd_reconcile
+_HANDLERS['retier'] = cmd_retier
 _HANDLERS['export'] = cmd_export
 _HANDLERS['export-rss'] = cmd_export_rss
 
