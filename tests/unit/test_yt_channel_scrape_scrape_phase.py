@@ -1342,8 +1342,11 @@ class TestForceRescrapeMode(
 class TestScrapeOneHandleOptional(
     unittest.IsolatedAsyncioTestCase,
 ):
-    '''A missing creator_map handle must not block scraping; a
-    successful scrape self-heals identity + name maps.'''
+    '''A missing creator-map handle permits scraping by channel ID.
+
+    The scrape must discover a canonical handle before persistence;
+    successful discovery self-heals the identity and name maps.
+    '''
 
     def _patches(self):
         return (
@@ -1359,35 +1362,69 @@ class TestScrapeOneHandleOptional(
             ),
         )
 
-    async def test_missing_handle_still_scrapes(self) -> None:
-        p_exists, p_scrape = self._patches()
-        with p_exists, p_scrape as mock_scrape:
-            channel = MagicMock()
-            channel.subscriber_count = 10
-            channel.channel_id = 'UCabc00000000000000000000'
-            channel.channel_handle = None
-            channel.title = None
-            mock_scrape.return_value = channel
-            queue = AsyncMock()
-            creator_map = AsyncMock()
-            creator_map.get.return_value = None  # no handle
-            from tools.yt_channel_scrape import _scrape_one_queued
+    async def test_missing_handle_moves_to_soft_unavailable(self) -> None:
+        channel_id: str = 'UCabc00000000000000000000'
+        channel: MagicMock = MagicMock()
+        channel.subscriber_count = 10
+        channel.video_count = 1
+        channel.channel_id = channel_id
+        channel.channel_handle = None
+        channel.title = None
+        channel.about_page_succeeded = True
+        queue: AsyncMock = AsyncMock()
+        creator_map: AsyncMock = AsyncMock()
+        creator_map.get.return_value = None
+        from tools.yt_channel_scrape import _scrape_one_queued
+
+        with (
+            patch(
+                'tools.yt_channel_scrape._channel_exists_on_exchange',
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
+                'tools.yt_channel_scrape.YouTubeChannel',
+                return_value=channel,
+            ),
+            patch(
+                'tools.yt_channel_scrape._try_scrape_channel_typed',
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                'tools.yt_channel_scrape'
+                '._reject_topic_channel_if_needed',
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
+                'tools.yt_channel_scrape._channel_has_no_content',
+                return_value=False,
+            ),
+            patch(
+                'tools.yt_channel_scrape._persist_scraped_channel',
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as persist,
+        ):
             await _scrape_one_queued(
-                'UCabc00000000000000000000',
+                channel_id,
                 queue=queue,
                 settings=_mock_settings(),
                 fm=MagicMock(),
                 creator_map_backend=creator_map,
                 http_client=MagicMock(),
             )
-            mock_scrape.assert_awaited_once()
-            queue.update_tier.assert_awaited_once()
-            # Must NOT mark unresolved for a missing handle.
-            for call in queue.mark.await_args_list:
-                self.assertNotEqual(
-                    call.kwargs.get('state'),
-                    ChannelState.UNRESOLVED,
-                )
+
+        persist.assert_not_awaited()
+        queue.mark_soft_unavailable.assert_awaited_once_with(
+            channel_id,
+            last_error=(
+                f'channel {channel_id!r} scraped without a '
+                'channel_handle'
+            ),
+        )
+        queue.update_tier.assert_not_awaited()
 
     async def test_self_heal_binds_and_name_maps(self) -> None:
         p_exists, p_scrape = self._patches()

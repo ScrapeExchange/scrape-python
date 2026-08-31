@@ -2784,6 +2784,12 @@ async def _do_scrape_channel_to_disk_typed(
             f'channel {channel_handle!r} scraped without a channel_id',
         )
 
+    if not channel.channel_handle:
+        raise RuntimeError(
+            f'channel {channel.channel_id!r} scraped without a '
+            'channel_handle',
+        )
+
     if not await _persist_scraped_channel(
         fm, filename, channel, channel_handle,
     ):

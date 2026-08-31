@@ -482,7 +482,18 @@ class YouTubeChannelTabs:
                 'videoRenderer', {}
             ).get('videoId')
 
-            return video_id
+            if video_id is not None:
+                return video_id
+
+            lockup_video_id: str | None = item.get(
+                'richItemRenderer', {}
+            ).get(
+                'content', {}
+            ).get(
+                'lockupViewModel', {}
+            ).get('contentId')
+
+            return lockup_video_id
 
         # Special handling for shorts
         video_url: str | None = item.get(

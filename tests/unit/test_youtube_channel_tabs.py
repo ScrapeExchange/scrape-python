@@ -58,6 +58,19 @@ class TestExtractVideoId(unittest.TestCase):
         }
         self.assertEqual(self.tabs._extract_video_id(item, 'videos'), 'abc123')
 
+    def test_regular_video_from_lockup_view_model(self) -> None:
+        item: dict[str, object] = {
+            'richItemRenderer': {
+                'content': {
+                    'lockupViewModel': {'contentId': 'WeobkbANgtI'}
+                }
+            }
+        }
+        self.assertEqual(
+            self.tabs._extract_video_id(item, 'videos'),
+            'WeobkbANgtI',
+        )
+
     def test_live_video(self) -> None:
         item = {
             'richItemRenderer': {

@@ -10,7 +10,10 @@ import tempfile
 import unittest
 
 from datetime import UTC, datetime
+from pathlib import Path
+from unittest.mock import patch
 
+from scrape_exchange import creator_queue
 from scrape_exchange.creator_queue import (
     CHANNEL_FILENAME_PREFIX,
     FileCreatorQueue,
@@ -70,6 +73,28 @@ def _now() -> float:
 class TestFileCreatorQueuePopulate(
     unittest.IsolatedAsyncioTestCase,
 ):
+
+    def test_load_skip_markers_filters_directory_snapshot(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            marker_names: set[str] = {
+                'channel-missing.not_found',
+                'channel-UCmissing.unresolved',
+            }
+            filename: str
+            for filename in marker_names | {
+                'channel-valid.json.br',
+                'channel-retry.failed',
+            }:
+                (Path(tmp) / filename).touch()
+
+            fm: AssetFileManagement = _make_fm(tmp)
+
+            self.assertEqual(
+                creator_queue._load_skip_creator_markers(fm),
+                marker_names,
+            )
 
     async def test_populate_assigns_correct_tiers(self):
         '''Creators land in the right tier by subscriber
@@ -249,6 +274,61 @@ class TestFileCreatorQueuePopulate(
             self.assertEqual(
                 await q.queue_size(), 0,
             )
+
+    async def test_populate_uses_marker_snapshot(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            q: FileCreatorQueue = _make_queue(tmp)
+            fm: AssetFileManagement = _make_fm(tmp)
+            marker: Path = (
+                Path(tmp) / 'channel-missing.not_found'
+            )
+            marker.touch()
+            creators: dict[str, str] = {
+                'UCmissing': 'missing',
+                'UCvalid': 'valid',
+            }
+
+            with patch.object(Path, 'exists', return_value=False):
+                added: int = await q.populate(
+                    creators, fm, DEFAULT_TIERS, {},
+                )
+
+            self.assertEqual(added, 1)
+            self.assertEqual(await q.queue_size(), 1)
+
+    async def test_populate_falls_back_when_marker_scan_fails(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            q: FileCreatorQueue = _make_queue(tmp)
+            fm: AssetFileManagement = _make_fm(tmp)
+            marker: Path = (
+                Path(tmp) / 'channel-missing.not_found'
+            )
+            marker.touch()
+            creators: dict[str, str] = {
+                'UCmissing': 'missing',
+            }
+
+            try:
+                with self.assertLogs(
+                    'scrape_exchange.creator_queue',
+                    level='WARNING',
+                ), patch.object(
+                    creator_queue.os,
+                    'scandir',
+                    side_effect=OSError('scan failed'),
+                ):
+                    added: int = await q.populate(
+                        creators, fm, DEFAULT_TIERS, {},
+                    )
+            except OSError:
+                added = -1
+
+            self.assertEqual(added, 0)
+            self.assertEqual(await q.queue_size(), 0)
 
 
 # ------------------------------------------------------------------
