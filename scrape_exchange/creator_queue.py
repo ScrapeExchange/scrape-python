@@ -30,7 +30,6 @@ import shutil
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any, AsyncIterator
 
 import aiofiles
@@ -58,6 +57,32 @@ _NO_FEEDS_TTL: int = 86400
 BACKUP_SUFFIX: str = 'bak'
 
 CHANNEL_FILENAME_PREFIX: str = 'channel-'
+_SKIP_MARKER_SUFFIXES: tuple[str, str] = (
+    '.not_found',
+    '.unresolved',
+)
+
+
+def _load_skip_creator_markers(
+    channel_fm: AssetFileManagement,
+) -> set[str] | None:
+    '''Load creator marker filenames from the channel directory.'''
+
+    try:
+        with os.scandir(channel_fm.base_dir) as entries:
+            return {
+                entry.name
+                for entry in entries
+                if entry.name.endswith(_SKIP_MARKER_SUFFIXES)
+            }
+    except OSError:
+        _LOGGER.warning(
+            'Failed to snapshot creator marker files; falling back '
+            'to individual path checks',
+            exc_info=True,
+            extra={'base_dir': str(channel_fm.base_dir)},
+        )
+        return None
 
 
 # -----------------------------------------------------------
@@ -157,23 +182,27 @@ def _should_skip_creator(
     creator_name: str,
     creator_id: str,
     channel_fm: AssetFileManagement,
+    skip_markers: set[str] | None,
 ) -> bool:
     '''
-    Check whether a creator has a ``.not_found`` or
-    ``.unresolved`` marker file on the local filesystem.
+    Check whether a creator has a snapshotted ``.not_found`` or
+    ``.unresolved`` marker filename.
     '''
 
-    not_found: Path = (
-        channel_fm.base_dir
-        / f'{CHANNEL_FILENAME_PREFIX}'
+    not_found: str = (
+        f'{CHANNEL_FILENAME_PREFIX}'
         f'{creator_name}.not_found'
     )
-    unresolved: Path = (
-        channel_fm.base_dir
-        / f'{CHANNEL_FILENAME_PREFIX}'
+    unresolved: str = (
+        f'{CHANNEL_FILENAME_PREFIX}'
         f'{creator_id}.unresolved'
     )
-    return not_found.exists() or unresolved.exists()
+    if skip_markers is None:
+        return (
+            (channel_fm.base_dir / not_found).exists()
+            or (channel_fm.base_dir / unresolved).exists()
+        )
+    return not_found in skip_markers or unresolved in skip_markers
 
 
 # -----------------------------------------------------------
@@ -918,6 +947,9 @@ class FileCreatorQueue(CreatorQueue):
                 existing_ids.add(cid.lower())
                 existing_names.add(name.lower())
 
+        skip_markers: set[str] | None = _load_skip_creator_markers(
+            channel_fm,
+        )
         now: float = datetime.now(UTC).timestamp()
         added: int = 0
         for cid, name in creators.items():
@@ -926,7 +958,7 @@ class FileCreatorQueue(CreatorQueue):
                     in existing_names):
                 continue
             if _should_skip_creator(
-                name, cid, channel_fm,
+                name, cid, channel_fm, skip_markers,
             ):
                 continue
             count: int | None = subscriber_counts.get(cid)
@@ -1658,10 +1690,13 @@ class RedisCreatorQueue(CreatorQueue):
 
         # Pre-filter candidates that should be skipped
         # regardless of name dedup.
+        skip_markers: set[str] | None = _load_skip_creator_markers(
+            channel_fm,
+        )
         candidates: list[tuple[str, str]] = []
         for cid, name in creators.items():
             if _should_skip_creator(
-                name, cid, channel_fm,
+                name, cid, channel_fm, skip_markers,
             ):
                 continue
             candidates.append((cid, name))
