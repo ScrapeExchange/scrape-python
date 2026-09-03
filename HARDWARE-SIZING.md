@@ -1,9 +1,8 @@
 # Hardware sizing
 
-This document gives practical sizing guidance for scrape-python
-deployments, from a single-host test setup to a larger fleet where
-supervisors launch multiple worker processes and each worker runs
-multiple async scraping tasks.
+This document gives practical sizing guidance for scrape-python deployments for larger fleet where supervisors launch multiple worker
+processes and each worker runs multiple async scraping tasks. If you
+want to just scrape a few creators, you can just launch some containers with docker compose and ignore the rest of this document.
 
 The numbers below are planning estimates. Real memory use depends on
 platform responses, Python allocator behaviour, browser versions,
@@ -79,38 +78,14 @@ For planning, treat Redis as persistent coordination state. Watch
 
 ## 3. Deployment tiers
 
-### Tiny local test
-
-Goal: validate credentials, compose wiring, schemas, and one or two
-scrapes.
-
-Suggested host:
-
-- 2-4 CPU cores
-- 8 GiB RAM
-- 20-50 GiB free disk
-- Local or remote Redis
-
-Suggested settings:
-
-- `*_NUM_PROCESSES=1`
-- `*_CONCURRENCY=1`
-- `VIDEO_USE_YT_DLP=false`
-- TikTok concurrency 1, with 1-2 proxies
-- Upload concurrency 1
-
-Run one platform at a time if using TikTok. A single TikTok creator or
-video scraper can launch a browser session per selected proxy, so a
-small host can run out of memory quickly if many proxies are selected.
-
 ### Small single-host deployment
 
 Goal: continuous scraping with modest queues and uploaders.
 
 Suggested host:
 
-- 4-8 CPU cores
-- 16-32 GiB RAM
+- 2-8 CPU cores
+- 8-32 GiB RAM
 - SSD storage sized for retention
 - Redis on the same host or a nearby host
 

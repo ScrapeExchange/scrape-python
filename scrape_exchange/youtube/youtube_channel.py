@@ -390,9 +390,6 @@ class YouTubeChannel:
             'url': self.url,
             'rss_url': self.rss_url,
             'verified': self.verified,
-            'subscriber_count': self.subscriber_count or 0,
-            'video_count': self.video_count or 0,
-            'view_count': self.view_count or 0,
             'channel_links': [
                 cl.to_dict() for cl in self.channel_links or set()
             ],
@@ -401,6 +398,13 @@ class YouTubeChannel:
             'posts': [p.to_dict() for p in self.posts or set()],
             'merch': [m.to_dict() for m in self.merch or set()],
         }
+
+        if self.subscriber_count is not None:
+            data['subscriber_count'] = self.subscriber_count
+        if self.video_count is not None:
+            data['video_count'] = self.video_count
+        if self.view_count is not None:
+            data['view_count'] = self.view_count
 
         if with_video_ids:
             data['video_ids'] = list(self.video_ids)
