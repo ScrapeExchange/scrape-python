@@ -24,7 +24,7 @@ class TestYouTubeRuntimeDependencies(unittest.TestCase):
         compose_path: Path = REPOSITORY_ROOT / 'docker-compose.yml'
         compose: str = compose_path.read_text(encoding='utf-8')
         self.assertIn(
-            'image: brainicism/bgutil-ytdlp-pot-provider:1.3.1',
+            'image: brainicism/bgutil-ytdlp-pot-provider:1.3.2',
             compose,
         )
 
