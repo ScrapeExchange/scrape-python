@@ -517,9 +517,25 @@ class TestYouTubeChannelToFromDict(unittest.TestCase):
         data = ch.to_dict(with_video_ids=False)
         self.assertNotIn('video_ids', data)
 
+    def test_to_dict_omits_only_none_counters(self) -> None:
+        unknown = YouTubeChannel(channel_handle='Unknown')
+        unknown_data: dict[str, any] = unknown.to_dict()
+        self.assertNotIn('subscriber_count', unknown_data)
+        self.assertNotIn('video_count', unknown_data)
+        self.assertNotIn('view_count', unknown_data)
+
+        zero = YouTubeChannel(channel_handle='Zero')
+        zero.subscriber_count = 0
+        zero.video_count = 0
+        zero.view_count = 0
+        zero_data: dict[str, any] = zero.to_dict()
+        self.assertEqual(zero_data['subscriber_count'], 0)
+        self.assertEqual(zero_data['video_count'], 0)
+        self.assertEqual(zero_data['view_count'], 0)
+
     def test_to_dict_none_joined_date(self) -> None:
         ch = YouTubeChannel(channel_handle='Test')
-        data = ch.to_dict()
+        data: dict[str, any] = ch.to_dict()
         self.assertIsNone(data['joined_date'])
 
     def test_round_trip_from_dict(self) -> None:
@@ -574,13 +590,13 @@ class TestExtractInitialData(unittest.TestCase):
     def test_extracts_yt_initial_data(self) -> None:
         ch = YouTubeChannel(channel_handle='Test')
         html = 'blah ytInitialData = {"key": "value"}; more stuff'
-        result = ch._extract_initial_data(html)
+        result: dict[str, any] = ch._extract_initial_data(html)
         self.assertEqual(result, {'key': 'value'})
 
     def test_extracts_window_syntax(self) -> None:
         ch = YouTubeChannel(channel_handle='Test')
         html = 'blah window["ytInitialData"] = {"k": 1}; more'
-        result = ch._extract_initial_data(html)
+        result: dict[str, any] = ch._extract_initial_data(html)
         self.assertEqual(result, {'k': 1})
 
     def test_raises_on_missing_data(self) -> None:
@@ -605,14 +621,14 @@ class TestExtractInitialData(unittest.TestCase):
 class TestExtractHandle(unittest.TestCase):
     def test_from_url(self) -> None:
         ch = YouTubeChannel(channel_handle='Test')
-        handle = ch._extract_handle(
+        handle: str | None = ch._extract_handle(
             'https://www.youtube.com/@MyHandle/videos', {}
         )
         self.assertEqual(handle, '@MyHandle')
 
     def test_from_metadata_channel_url(self) -> None:
         ch = YouTubeChannel(channel_handle='Test')
-        handle = ch._extract_handle(
+        handle: str | None = ch._extract_handle(
             'https://www.youtube.com/channel/UC123',
             {'channelUrl': 'https://www.youtube.com/@FromMeta'}
         )
@@ -667,12 +683,12 @@ class TestParseThumbnailsHelper(unittest.TestCase):
         self.ch = YouTubeChannel(channel_handle='Test')
 
     def test_three_thumbnails(self) -> None:
-        thumbs_list = [
+        thumbs_list: list[dict[str, int | str]] = [
             {'url': 'a.jpg', 'width': 88, 'height': 88},
             {'url': 'b.jpg', 'width': 176, 'height': 176},
             {'url': 'c.jpg', 'width': 900, 'height': 900},
         ]
-        result = self.ch._parse_thumbnails(thumbs_list)
+        result: dict[str, any] = self.ch._parse_thumbnails(thumbs_list)
         self.assertIn('default', result)
         self.assertIn('medium', result)
         self.assertIn('high', result)
@@ -680,21 +696,23 @@ class TestParseThumbnailsHelper(unittest.TestCase):
         self.assertEqual(result['high']['url'], 'c.jpg')
 
     def test_one_thumbnail(self) -> None:
-        result = self.ch._parse_thumbnails(
+        result: dict[str, dict[str, int | str]] = self.ch._parse_thumbnails(
             [{'url': 'only.jpg', 'width': 100, 'height': 100}]
         )
         self.assertIn('default', result)
         self.assertNotIn('medium', result)
 
     def test_empty(self) -> None:
-        result = self.ch._parse_thumbnails([])
+        result: dict[str, dict[str, int | str]] = self.ch._parse_thumbnails(
+            []
+        )
         self.assertEqual(result, {})
 
 
 class TestParseThumbnail(unittest.TestCase):
     def test_parse_single(self) -> None:
         ch = YouTubeChannel(channel_handle='Test')
-        result = ch._parse_thumbnail(
+        result: dict[str, int | str] = ch._parse_thumbnail(
             {'url': 'pic.jpg', 'width': 640, 'height': 480}
         )
         self.assertEqual(result['url'], 'pic.jpg')
@@ -707,7 +725,7 @@ class TestParseThumbnail(unittest.TestCase):
 
 class TestExtractLinks(unittest.TestCase):
     def test_extracts_from_c4_tabbed_header(self) -> None:
-        data = {
+        data: dict[str, any] = {
             'header': {
                 'c4TabbedHeaderRenderer': {
                     'headerLinks': {
@@ -727,7 +745,7 @@ class TestExtractLinks(unittest.TestCase):
                 }
             }
         }
-        links = YouTubeChannel._extract_links(data)
+        links: set[YouTubeExternalLink] = YouTubeChannel._extract_links(data)
         self.assertEqual(len(links), 1)
 
     def test_empty_when_no_header(self) -> None:
@@ -746,7 +764,7 @@ class TestExtractLinks(unittest.TestCase):
 class TestParseChannelAboutMetadata(unittest.TestCase):
     def test_parses_all_fields(self) -> None:
         ch = YouTubeChannel(channel_handle='Test')
-        metadata = {
+        metadata: dict[str, any] = {
             'externalId': 'UC123',
             'title': 'Test Title',
             'description': 'A good channel',
@@ -779,7 +797,7 @@ class TestParseChannelAboutMetadata(unittest.TestCase):
 class TestParseChannelAboutData(unittest.TestCase):
     def test_parses_joined_date(self) -> None:
         ch = YouTubeChannel(channel_handle='Test')
-        about = {
+        about: dict[str, any] = {
             'joinedDateText': {'content': 'Joined Aug 2, 2015'},
         }
         ch._parse_channel_about_data(about)
@@ -787,7 +805,7 @@ class TestParseChannelAboutData(unittest.TestCase):
 
     def test_parses_view_count(self) -> None:
         ch = YouTubeChannel(channel_handle='Test')
-        about = {
+        about: dict[str, any] = {
             'viewCountText': {'simpleText': '1,234,567 views'},
         }
         ch._parse_channel_about_data(about)
@@ -801,7 +819,7 @@ class TestParseChannelAboutData(unittest.TestCase):
 class TestFindAboutRenderer(unittest.TestCase):
     def test_finds_about_view_model(self) -> None:
         ch = YouTubeChannel(channel_handle='Test')
-        data = {
+        data: dict[str, any] = {
             'onResponseReceivedEndpoints': [
                 {
                     'showEngagementPanelEndpoint': {
@@ -836,7 +854,7 @@ class TestFindAboutRenderer(unittest.TestCase):
                 }
             ]
         }
-        result = ch._find_about_renderer(data)
+        result: dict[str, any] | None = ch._find_about_renderer(data)
         self.assertIsNotNone(result)
         self.assertIn('joinedDateText', result)
 
@@ -863,7 +881,7 @@ class TestParseChannelVideoData(unittest.TestCase):
     def test_parses_channel_info(self) -> None:
         ch = YouTubeChannel(channel_handle='Test')
 
-        page_data = {
+        page_data: dict[str, any] = {
             'metadata': {
                 'channelMetadataRenderer': {
                     'name': 'TestChannel',
@@ -931,7 +949,7 @@ class TestParseChannelVideoData(unittest.TestCase):
 
     def test_raises_on_missing_metadata(self) -> None:
         ch = YouTubeChannel(channel_handle='Test')
-        page_data = {
+        page_data: dict[str, any] = {
             'metadata': {},
             'header': {
                 'pageHeaderRenderer': {
@@ -947,7 +965,7 @@ class TestParseChannelVideoData(unittest.TestCase):
     def test_failed_video_count_parse_keeps_positive_count(self) -> None:
         ch = YouTubeChannel(channel_handle='Test')
         ch.video_count = 42
-        page_data = {
+        page_data: dict[str, any] = {
             'metadata': {
                 'channelMetadataRenderer': {
                     'name': 'TestChannel',
@@ -995,20 +1013,20 @@ class TestSetChannelVideoThumbnail(unittest.TestCase):
 class TestParseThumbnailsBanners(unittest.TestCase):
     def test_parses_metadata_avatar(self) -> None:
         ch = YouTubeChannel(channel_handle='Test')
-        metadata = {
+        metadata: dict[str, any] = {
             'avatar': {
                 'thumbnails': [
                     {'url': 'https://avatar.jpg', 'width': 88, 'height': 88}
                 ]
             }
         }
-        page_data = {'header': {}}
+        page_data: dict[str, any] = {'header': {}}
         ch._parse_thumbnails_banners(metadata, page_data)
         self.assertGreaterEqual(len(ch.channel_thumbnails), 1)
 
     def test_parses_banner_from_header(self) -> None:
         ch = YouTubeChannel(channel_handle='Test')
-        page_data = {
+        page_data: dict[str, any] = {
             'header': {
                 'pageHeaderRenderer': {
                     'content': {
@@ -1036,7 +1054,7 @@ class TestParseThumbnailsBanners(unittest.TestCase):
 
     def test_fallback_banner_from_c4_tabbed_header(self) -> None:
         ch = YouTubeChannel(channel_handle='Test')
-        page_data = {
+        page_data: dict[str, any] = {
             'header': {
                 'c4TabbedHeaderRenderer': {
                     'banner': {
@@ -1061,13 +1079,13 @@ class TestParseThumbnailsBanners(unittest.TestCase):
 
 class TestFindNestedDicts(unittest.TestCase):
     def test_finds_in_dict(self) -> None:
-        data = {'a': {'b': {'target': 'found'}}}
+        data: dict[str, any] = {'a': {'b': {'target': 'found'}}}
         self.assertEqual(
             YouTubeChannel.find_nested_dicts('target', data), 'found'
         )
 
     def test_finds_in_list(self) -> None:
-        data = [{'target': 'in_list'}]
+        data: list[dict[str, any]] = [{'target': 'in_list'}]
         self.assertEqual(
             YouTubeChannel.find_nested_dicts('target', data), 'in_list'
         )
@@ -1089,7 +1107,7 @@ class TestFindNestedDicts(unittest.TestCase):
 
 class TestFindNestedDictsTraversal(unittest.TestCase):
     def test_traverses_path(self) -> None:
-        data = {'a': {'b': {'c': 'value'}}}
+        data: dict[str, any] = {'a': {'b': {'c': 'value'}}}
         self.assertEqual(
             YouTubeChannel.find_nested_dicts('c', data),
             'value'
@@ -1112,50 +1130,57 @@ class TestFindNestedDictsTraversal(unittest.TestCase):
 
 class TestGenerateExternalLink(unittest.TestCase):
     def test_strips_http(self) -> None:
-        link = YouTubeChannel._generate_external_link(
+        link: YouTubeExternalLink | None = YouTubeChannel._generate_external_link(
             'http://twitter.com/test', 1, title='Twitter'
         )
         self.assertEqual(link.url, 'https://twitter.com/test')
 
     def test_strips_https(self) -> None:
-        link = YouTubeChannel._generate_external_link(
-            'https://instagram.com/test', 1, title='IG'
-        )
+        link: YouTubeExternalLink | None = \
+            YouTubeChannel._generate_external_link(
+                'https://instagram.com/test', 1, title='IG'
+            )
         self.assertEqual(link.url, 'https://instagram.com/test')
 
     def test_infers_name_from_two_part_domain(self) -> None:
         '''e.g. twitter.com → twitter → maps to Twitter in SocialNetworks'''
-        link = YouTubeChannel._generate_external_link(
-            'https://twitter.com/user', 1
-        )
+        link: YouTubeExternalLink | None = \
+        YouTubeChannel._generate_external_link(
+                'https://twitter.com/user', 1
+            )
         self.assertIsNotNone(link)
         self.assertEqual(link.name, 'Twitter')
 
     def test_infers_name_from_country_tld(self) -> None:
         '''e.g. bbc.co.uk → bbc'''
-        link = YouTubeChannel._generate_external_link(
-            'https://www.bbc.co.uk/news', 1
-        )
+        link: YouTubeExternalLink | None = \
+            YouTubeChannel._generate_external_link(
+                'https://www.bbc.co.uk/news', 1
+            )
         self.assertIsNotNone(link)
+        self.assertEqual(link.name, 'BBC')
 
     def test_and_prefix_returns_none(self) -> None:
         '''URLs starting with "and " are overflow text, should return None'''
-        link = YouTubeChannel._generate_external_link(
-            'and 3 more links', 1
-        )
+        link: YouTubeExternalLink | None = \
+            YouTubeChannel._generate_external_link(
+                'and 3 more links', 1
+            )
         self.assertIsNone(link)
 
     def test_unknown_domain_uses_url_as_name(self) -> None:
         '''Unrecognised multi-part domain falls through to url as name.'''
-        link = YouTubeChannel._generate_external_link(
-            'https://some.random.thing.example/path', 1
-        )
+        link: YouTubeExternalLink | None = \
+            YouTubeChannel._generate_external_link(
+                'https://some.random.thing.example/path', 1
+            )
         self.assertIsNotNone(link)
 
     def test_strips_www(self) -> None:
-        link = YouTubeChannel._generate_external_link(
-            'https://www.facebook.com/page', 1
-        )
+        link: YouTubeExternalLink | None = \
+            YouTubeChannel._generate_external_link(
+                'https://www.facebook.com/page', 1
+            )
         self.assertEqual(link.name, 'Facebook')
 
 
