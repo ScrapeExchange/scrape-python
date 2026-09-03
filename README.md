@@ -8,19 +8,20 @@
   <img src="files/grafana-scrape-small.png?raw=true" alt="Scrape Dashboard"/>
 </div>
 
-Python tooling to scrape content from various social media platforms and upload it to the [scrape.exchange](https://scrape.exchange). This repo
-is focussed on bulk scraping while avoiding bot detection. Currently supported are:
-- [YouTube](YOUTUBE.md): stable, used for scraping 650k channels and 60m videos
+Python tooling to scrape content from various social media platforms and upload it to the [scrape.exchange](https://scrape.exchange). This repo is focussed on bulk scraping while avoiding bot detection. Currently supported are:
+- [YouTube](YOUTUBE.md): stable, used for scraping 4m channels and 100m videos
 - [TikTok](TIKTOK.md): alpha, used for scraping 1k creators and 10k videos
+- [Instagram](INSTAGRAM.md): alpha, used for scraping 1k creators and 10k posts
 
-For deployment planning, see
-[HARDWARE-SIZING.md](HARDWARE-SIZING.md).
+The goal is to support additional platforms in the future.
 
-The goal is to support additional platforms in the future. The tools do not download any media such as images or videos, but they do scrape metadata about the content, such as titles, descriptions, and URLs. The scraped metadata is then uploaded to the [scrape.exchange](https://scrape.exchange), where it can be accessed by other users and applications, either through the web interface, the anonymous API, or using torrents.
+To run the tools, you need access to a Linux computer that you can run Docker containers on. If you plan to scrape at scale, there is guidance available on deployment planning, see [HARDWARE-SIZING.md](HARDWARE-SIZING.md).
+
+The tools do not download any media such as images or videos, but they do scrape metadata about the content, such as titles, descriptions, and URLs. The scraped metadata is then uploaded to the [scrape.exchange](https://scrape.exchange), where it can be accessed by other users and applications, either through the web interface, the anonymous API, or using torrents.
 
 To upload data to the exchange, you need to have a (forever-free) account and an API key. You can create an account on the [scrape.exchange](https://scrape.exchange) website, and you can download the API key from your account settings page.
 
-While the scraping tools have a lot of capabilities, they can be used with the default settings, without much configuration effort. The tools are designed to be easy to use and to require minimal setup, so you can start scraping and uploading data to the exchange with just a few steps. The tools are also designed to be flexible and configurable, so you can customize them to fit your specific needs and use cases. For example, you can configure the tools to scrape specific channels or videos, to use proxies to avoid bot detection, and to adjust rate limits to avoid getting blocked by the platforms. The tools also support running multiple worker processes in parallel while sharing the rate limits, which can help to speed up the scraping process while still respecting the rate limits of the platforms.
+While the scraping tools have a lot of capabilities, they can be used with the default settings without much configuration effort. The tools are designed to be easy to use and to require minimal setup, so you can start scraping and uploading data to the exchange with just a few steps. The tools are also designed to be flexible and configurable, so you can customize them to fit your specific needs and use cases. For example, you can configure the tools to scrape specific channels or videos, to use proxies to avoid bot detection, and to adjust rate limits to avoid getting blocked by the platforms. The tools also support running multiple worker processes in parallel while sharing the rate limits, which can help to speed up the scraping process while still respecting the rate limits of the platforms.
 
 In addition to the scraping tools, there is also a websocket listener tool that allows you to listen for new content being uploaded to the exchange in real-time. This can be useful for testing and debugging, as well as for getting real-time updates on new content being uploaded to the exchange. You can look at the  [Firehose page on the scrape.exchange](https://scrape.exchange/firehose) website for an example to see what kind of data you can collect with the listener.
 
@@ -32,95 +33,81 @@ require a Redis instance for scrape queues, identity
 maps, rate-limiter state, and uploaded-content tracking.
 All cross-tool coordination goes through Redis.
 
-1. Create an account on the
-   [scrape.exchange](https://scrape.exchange) and get
-   your API key from your account settings page.
-2. Provision a Redis instance reachable from every host
-   that will run scrapers. Redis 6.2 or newer is
-   required (the rate limiter uses the `TIME` command
-   inside Lua and `ZADD ... GT`). You can run Redis
-   separately or add a `redis` service in your local
-   Docker Compose override.
-3. Log in to a Linux machine with Docker and Docker
-   Compose installed, then run:
+1. Create an account on the [scrape.exchange](https://scrape.exchange) and get your API key from your account settings page.
+2. You need a Linux machine that has docker and docker-compose installed, as well as the Python package management tool UV:
+
+```bash
+sudo apt install docker.io docker-compose-v2
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+3. Now execute the following commands to clone the repository, create the required directories, configure your credentials and settings, and start all services:
 
 ```bash
 git clone https://github.com/scrape-python/scrape-python.git
 cd scrape-python
 
 # Create host directories for scraped data, sessions, and logs
-mkdir -p data/{channels,videos,logs,tiktok/creators,tiktok/videos,tiktok/session-state}
+mkdir -p data/{channels,videos,logs,proxies}
+mkdir -p data/{tiktok/creators,tiktok/videos,tiktok/session-state}
 
 # Configure your credentials and settings
 cp .env-example .env
 # Edit .env:
 #   - API_KEY_ID, API_KEY_SECRET   (your scrape.exchange credentials)
-#   - REDIS_DSN                    (e.g. redis://192.0.2.10:6379/0)
 # All other settings have sensible defaults — see the
 # comments in .env-example for what each one does.
+```
 
-# Start all services
-docker compose up -d
+4. If you do not have a Redis instance running, you can uncomment the Redis section in docker-compose.yml to run a Redis container alongside the scrapers. If you have a Redis instance running on the host or on another machine, you can leave the Redis section commented out and set `REDIS_DSN` in your `.env` file to point at that instance.
+
+5. Copy docker-compose.override.yml-example to docker-compose.override.yml and edit it to map the host directories you created above into the containers.
+
+6. Start all services
+
+```bash
+docker compose --profile scrape-upload up -d
 ```
 
 This starts the services defined in `docker-compose.yml`:
-- **po-token-provider** — generates PO tokens used by
-  both InnerTube and yt-dlp to look like a real browser
-- **yt-channel** — scrapes YouTube channel metadata (about page,
-  video/playlist/podcast/courses/store/community tabs)
-  via the InnerTube API
-- **yt-channel-upload** — uploads previously scraped
-  YouTube channel data to scrape.exchange
-- **yt-rss** — polls each YouTube channel's RSS feed
-  for new videos and writes lite channel-stat records
-  for the channel uploader
-- **yt-video** — scrapes per-video metadata via InnerTube
-  by default. Set `VIDEO_USE_YT_DLP=true` to
-  additionally run yt-dlp for formats, captions,
-  heatmaps, etc.
-- **yt-video-upload** — uploads previously scraped
-  YouTube video data to scrape.exchange
-- **tt-creator** — scrapes TikTok creator/profile
-  records and queues creator video URLs for the TikTok
-  video scraper
-- **tt-creator-upload** — uploads previously scraped
-  TikTok creator data to scrape.exchange
-- **tt-video** — consumes the TikTok video scrape queue
-  and writes per-video metadata files
-- **tt-video-upload** — uploads previously scraped
-  TikTok video data to scrape.exchange
+- **po-token-provider** — generates PO tokens used by   both InnerTube and yt-dlp to look like a real browser
+- **redis** — optional Redis instance for scrape queues, identity maps, rate-limiter state, and uploaded-content tracking
+- **yt-channel** — scrapes YouTube channel metadata (about page, video/playlist/podcast/courses/store/community tabs) via the InnerTube API
+- **yt-rss** — polls each YouTube channel's RSS feed for new videos and writes lite channel-stat records for the channel uploader
+- **yt-video** — scrapes per-video metadata via InnerTube by default. Set `VIDEO_USE_YT_DLP=true` to additionally run yt-dlp for additional formats, captions, heatmaps, etc.
+- **tt-creator** — scrapes TikTok creator/profile records and queues creator video URLs for the TikTok video scraper
+- **tt-video** — consumes the TikTok video scrape queue and writes per-video metadata files
+- **ig-creator** — scrapes Instagram creator/profile records
+- **scrape-upload** — watches the data directories and uploads channel, video, and creator files to the Scrape.Exchange API
 
-You can start individual services instead of the full
-fleet:
+ You can start individual services instead of the full fleet:
+
 ```bash
-# Start only the YouTube channel scraper and its dependency
-docker compose up -d po-token-provider yt-channel
+# If you have uncommented the Redis section in docker-compose.yml, you can start the Redis service:
+docker compose up -d redis
 
-# Or just the YouTube RSS scraper
-docker compose up -d yt-rss
+# Start only the YouTube channel scraper and its dependency and the uploader
+docker compose up -d po-token-provider yt-channel scrape-upload
 
-# Or the TikTok creator scraper and uploader
-docker compose up -d tt-creator tt-creator-upload
+# Or just the YouTube RSS scraper and the uploader
+docker compose up -d yt-rss scrape-upload
 
-# Or the TikTok video scraper and uploader
-docker compose up -d tt-video tt-video-upload
+# Or the TikTok creator and video scrapers and the uploader
+docker compose up -d tt-creator tt-video scrape-upload
+
+# Or the Instagram creator scraper and uploader
+docker compose up -d ig-creator scrape-upload
 ```
 
-Note: at first start the scrape queues are empty, so the
-scrapers will sit idle. Continue with "Queueing channels
-for scraping" below to feed YouTube work, or with
-"TikTok Scrapers" for TikTok creator queue examples.
+Note: at first start the scrape queues are empty, so the scrapers will sit idle. Continue with "Queueing channels
+for scraping" below to feed YouTube work, or with "TikTok Scrapers" for TikTok creator queue examples.
 
 ## Queueing channels for scraping
 
-Channels enter the system through the Redis-backed
-channel scrape queue. The `tools/yt_channel_queue.py`
-CLI is the operator interface for that queue: add,
-remove, search, mark, count, and bulk-import channels.
+Channels enter the system through the Redis-backed channel scrape queue. The `tools/yt_channel_queue.py`
+CLI is the operator interface for that queue: add, remove, search, mark, count, and bulk-import channels.
 
-The tool reads `REDIS_DSN` from `.env`, so the same
-credentials and connection string used by the scrapers
-apply.
+The tool reads `REDIS_DSN` from `.env`, so the same credentials and connection string used by the scrapers apply.
 
 ### Add a single channel
 
@@ -136,12 +123,9 @@ PYTHONPATH=. uv run tools/yt_channel_queue.py add \
     @veritasium @kurzgesagt UCHnyfMqiRRG1u-2MsSQLbXA
 ```
 
-Resolvable inputs (a full `UC…` ID, or a handle whose
-`(creator_id, handle)` mapping is already in the
-identity store) are enqueued directly on the scheduled
-queue. Bare handles that the queue can't resolve yet
-are enqueued on the unresolved queue and the channel
-scraper resolves them lazily.
+Resolvable inputs (a full `UC…` ID, or a handle whose `(creator_id, handle)` mapping is already in the
+identity store) are enqueued directly on the scheduled queue. Bare handles that the queue can't resolve yet
+are enqueued on the unresolved queue and the channel scraper resolves them lazily.
 
 ### Bulk import from a file
 
@@ -149,11 +133,7 @@ scraper resolves them lazily.
 PYTHONPATH=. uv run tools/yt_channel_queue.py import channels.lst
 ```
 
-The file contains one entry per line — a `UC…` ID, an
-`@handle`, or a JSON object with `channel_id` and/or
-`channel_handle` fields. Pass `--merge` to add to the
-existing queue (the default) or `--replace` to wipe the
-queue first.
+The file contains one entry per line — a `UC…` ID, an `@handle`, or a JSON object with `channel_id` and/or `channel_handle` fields.
 
 ### Read from stdin
 
@@ -162,9 +142,7 @@ cat channels.lst \
   | PYTHONPATH=. uv run tools/yt_channel_queue.py add -
 ```
 
-Useful for piping discovery output (see
-`tools/yt_discover_channels.py`) straight into the
-queue.
+Useful for piping discovery output (see `tools/yt_discover_channels.py`) straight into the queue.
 
 ### Inspect and manage the queue
 
@@ -223,7 +201,7 @@ docker compose run --rm yt-channel \
 By default the containers store scraped data inside the
 container filesystem, which means data is lost when the
 container is removed. To persist data on your host, you
-need to mount host directories as volumes. All cross-
+need to mount host directories as volumes. Nearly all cross-
 tool coordination state (queues, identity maps, rate
 limiter, no-feeds, uploaded-video IDs) lives in Redis
 and does not need a host mount.

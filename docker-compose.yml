@@ -16,10 +16,51 @@ x-scraper-common: &scraper-common
 
 services:
   po-token-provider:
-    image: brainicism/bgutil-ytdlp-pot-provider:1.3.1
+    image: brainicism/bgutil-ytdlp-pot-provider:1.3.2
     restart: unless-stopped
     network_mode: host
     init: true
+
+# Uncomment the redis section to run a Redis server on your host
+#  redis:
+#    container_name: "redis"
+#    image: "redis:latest"
+#    ports:
+#      - 6379:6379/tcp
+#    restart: "unless-stopped"
+#    volumes:
+#      - type: bind
+#        source: /var/tmp/scrape-redis
+#        target: /data
+#        bind:
+#          create_host_path: true
+#    environment: []
+#    command:
+#      - "redis-server"
+#      - "--appendonly"
+#      - "yes"
+#      - "--requirepass"
+#      - "<changeme>"                     # set in .env, not committed
+#      - "--rename-command"
+#      - "FLUSHDB"
+#      - ""
+#      - "--rename-command"
+#      - "FLUSHALL"
+#      - ""
+
+#
+# Uncomment the lines for the redis_exporter if you have a Prometheus server
+# to collect metrics
+#
+#  redis_exporter:
+#    container_name: redis_exporter
+#    image: oliver006/redis_exporter
+#    restart: unless-stopped
+#    pull_policy: missing
+#    ports:
+#      - 9121:9121
+#    command:
+#      - --redis.addr=redis://:topsecret@redis:6379
 
   yt-video:
     <<: *scraper-common
