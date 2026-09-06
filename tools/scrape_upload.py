@@ -15,7 +15,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,15 +45,15 @@ from scrape_exchange.creator_queue import (
     parse_priority_queues,
 )
 from scrape_exchange.exchange_client import (
-    ExchangeClient,
     METRIC_BACKGROUND_UPLOADS,
+    ExchangeClient,
 )
 from scrape_exchange.file_management import (
-    AssetFileManagement,
     CHANNEL_FILE_PREFIX,
     COMPRESSED_JSON_SUFFIX,
     VIDEO_MIN_FILE_PREFIX,
     VIDEO_YTDLP_FILE_PREFIX,
+    AssetFileManagement,
 )
 from scrape_exchange.instagram import InstagramCreator
 from scrape_exchange.logging import (
@@ -76,6 +75,7 @@ from scrape_exchange.tiktok import (
     TikTokHashtag,
     TikTokVideo,
 )
+from scrape_exchange.twitch import TwitchCreator
 from scrape_exchange.upload import (
     BulkUploadConfig,
     emit_bulk_batch_metrics,
@@ -91,11 +91,9 @@ from scrape_exchange.worker_id import get_worker_id
 from scrape_exchange.youtube.exchange_channels_set import (
     RedisExchangeChannelsSet,
 )
-from scrape_exchange.youtube.youtube_channel import YouTubeChannel
-from scrape_exchange.youtube.youtube_channel import fallback_handle
-from scrape_exchange.youtube.youtube_video import YouTubeVideo
 from scrape_exchange.youtube.uploaded_video_ids import UploadedVideoIds
-
+from scrape_exchange.youtube.youtube_channel import YouTubeChannel, fallback_handle
+from scrape_exchange.youtube.youtube_video import YouTubeVideo
 
 UploadMode = Literal['bulk', 'background']
 RecordLoader = Callable[[dict[str, Any]], dict[str, Any]]
@@ -105,6 +103,7 @@ TIKTOK_VIDEO_PREFIX: str = 'tiktok-video-'
 TIKTOK_CREATOR_PREFIX: str = 'tiktok-creator-'
 TIKTOK_HASHTAG_PREFIX: str = 'tiktok-hashtag-'
 INSTAGRAM_CREATOR_PREFIX: str = 'instagram-creator-'
+TWITCH_CREATOR_PREFIX: str = 'twitch-creator-'
 SCRAPE_UPLOAD_DEFAULT_LOG_FILE: str = (
     '/var/log/scrape/scrape_upload.log'
 )
@@ -172,7 +171,20 @@ def _instagram_creator_record(data: dict[str, Any]) -> dict[str, Any]:
     return InstagramCreator.model_validate(data).to_dict()
 
 
+def _twitch_creator_record(data: dict[str, Any]) -> dict[str, Any]:
+    return TwitchCreator.model_validate(data).to_dict()
+
+
 ASSET_DESCRIPTORS: dict[tuple[str, str], AssetDescriptor] = {
+    ('twitch', 'creator'): AssetDescriptor(
+        platform='twitch',
+        entity='creator',
+        prefixes=(TWITCH_CREATOR_PREFIX,),
+        schema_owner='drand',
+        schema_version='0.0.1',
+        filename_prefix='twitch-creators',
+        load_record=_twitch_creator_record,
+    ),
     ('youtube', 'video'): AssetDescriptor(
         platform='youtube',
         entity='video',
@@ -287,6 +299,14 @@ class ScrapeUploadSettings(ScraperSettings):
             'ig_creator_data_directory',
         ),
         description='Directory containing scraped Instagram creator data.',
+    )
+    twitch_creator_data_directory: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            'TWITCH_CREATOR_DATA_DIR',
+            'twitch_creator_data_directory',
+        ),
+        description='Directory containing scraped Twitch creator data.',
     )
     youtube_channel_map_file: str = Field(
         default='channel_map.csv',
@@ -1049,6 +1069,12 @@ def configured_asset_target_specs(
         platform='instagram',
         entity='creator',
         directories=settings.ig_creator_data_directory,
+    )
+    _append_target_specs(
+        specs,
+        platform='twitch',
+        entity='creator',
+        directories=settings.twitch_creator_data_directory,
     )
     if not specs:
         raise ValueError(

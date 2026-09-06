@@ -10,11 +10,25 @@ the official developer API, replay GraphQL requests or supply a client
 identifier. It writes metadata only; it does not download streams,
 videos, clips, images or follower lists. Uploading is a separate workflow.
 
+`scrape-upload` discovers `twitch-creator-*.json.br` files using
+`TWITCH_CREATOR_DATA_DIR` (a comma-separated list is also supported).
+Both bulk and background upload modes use the `drand` Twitch creator
+schema version `0.0.1`, which must be published on the Exchange server.
+The uploader validates records and manages uploaded files through
+`AssetFileManagement`. It requires the usual Exchange upload credentials;
+the scraper itself remains credential-free.
+
 ## Setup
 
 Install dependencies with `uv sync`. Download the browser with
 `uv run python -m camoufox fetch`. The host also needs Firefox's system
 libraries; browser startup failures can indicate a missing library.
+
+Browser startup uses public-IP discovery for GeoIP configuration. An
+`InvalidIP` error means that discovery failed. The scraper retries this
+failure up to three times, waiting two then four seconds, within the
+configured bootstrap timeout. Persistent failures require checking access
+to the lookup services through the configured proxy (or direct connection).
 
 Set `TWITCH_CREATOR_DATA_DIR` (or `--creator-data-directory`) to the
 output directory. The public website and GraphQL endpoints are fixed.

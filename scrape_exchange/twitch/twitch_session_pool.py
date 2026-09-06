@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import cast
 from urllib.parse import SplitResult, unquote, urlsplit
 
+from camoufox.exceptions import InvalidIP
 from playwright.async_api import (
     Browser,
     BrowserContext,
@@ -77,9 +78,24 @@ class TwitchSessionPool:
         if self._playwright is None:
             self._playwright = await async_playwright().start()
         browser_proxy: dict[str, str] | None = _browser_proxy(proxy)
-        options: dict = await asyncio.to_thread(
-            camoufox_launch_options, browser_proxy,
-        )
+        options: dict = {}
+        # IP discovery uses external services and can fail transiently.
+        # The bootstrap deadline still bounds all attempts and sleeps.
+        for attempt in range(3):
+            try:
+                options = await asyncio.to_thread(
+                    camoufox_launch_options, browser_proxy,
+                )
+                break
+            except InvalidIP:
+                if attempt == 2:
+                    raise
+                delay: int = 2 ** (attempt + 1)
+                _LOGGER.warning(
+                    'Twitch public-IP lookup failed; '
+                    f'retrying in {delay}s (attempt {attempt + 2}/3)',
+                )
+                await asyncio.sleep(delay)
         # Pass per-browser environment directly, avoiding process-wide
         # CAMOU_CONFIG changes while other proxy sessions are running.
         return await self._playwright.firefox.launch(
