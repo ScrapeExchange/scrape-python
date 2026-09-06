@@ -12,6 +12,7 @@ Python tooling to scrape content from various social media platforms and upload 
 - [YouTube](YOUTUBE.md): stable, used for scraping 4m channels and 100m videos
 - [TikTok](TIKTOK.md): alpha, used for scraping 1k creators and 10k videos
 - [Instagram](INSTAGRAM.md): alpha, used for scraping 1k creators and 10k posts
+- [Twitch](docs/twitch-creator-scraper.md): anonymous public profile scraper
 
 The goal is to support additional platforms in the future.
 

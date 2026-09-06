@@ -2,7 +2,7 @@
 
 import os
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from scrape_exchange.redis_client import (
     DEFAULT_MAX_CONNECTIONS,
@@ -106,6 +106,62 @@ class TestRedisFromUrl(unittest.TestCase):
 
 
 class TestRedisBusyRetry(unittest.IsolatedAsyncioTestCase):
+
+    async def test_command_recovers_after_dataset_loading(self) -> None:
+        from redis.asyncio import Redis
+        from redis.exceptions import BusyLoadingError
+
+        command: AsyncMock = AsyncMock(side_effect=[
+            BusyLoadingError('Redis is loading the dataset in memory'),
+            [1, 0],
+        ])
+        with (
+            patch.object(Redis, 'execute_command', command),
+            patch.dict(os.environ, {
+                'REDIS_BUSY_RETRIES': '2',
+                'REDIS_BUSY_RETRY_BASE_SECONDS': '0',
+            }, clear=True),
+        ):
+            client: Redis = redis_from_url(
+                'redis://localhost:6379/0', component='test',
+            )
+            try:
+                result: list[int] = await client.evalsha('sha', 0)
+            finally:
+                await client.aclose()
+
+        self.assertEqual(result, [1, 0])
+        self.assertEqual(command.await_count, 2)
+        self.assertEqual(
+            command.await_args_list[0], command.await_args_list[1],
+        )
+
+    async def test_dataset_loading_exhausts_bounded_backoff(self) -> None:
+        from redis.exceptions import BusyLoadingError
+
+        attempts: int = 0
+        sleeps: list[float] = []
+
+        async def operation() -> str:
+            nonlocal attempts
+            attempts += 1
+            raise BusyLoadingError('Redis is loading the dataset in memory')
+
+        async def sleep(delay: float) -> None:
+            sleeps.append(delay)
+
+        with (
+            patch.dict(os.environ, {
+                'REDIS_BUSY_RETRIES': '3',
+                'REDIS_BUSY_RETRY_BASE_SECONDS': '0.25',
+                'REDIS_BUSY_RETRY_MAX_SECONDS': '0.5',
+            }, clear=True),
+            self.assertRaises(BusyLoadingError),
+        ):
+            await call_with_redis_busy_retry(operation, sleep=sleep)
+
+        self.assertEqual(attempts, 4)
+        self.assertEqual(sleeps, [0.25, 0.5, 0.5])
 
     async def test_retries_busy_script_response(
         self,

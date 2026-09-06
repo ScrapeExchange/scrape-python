@@ -1,0 +1,230 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://scrape.exchange/schemas/drand-twitch-creator-0.0.1",
+  "$defs": {
+    "TwitchLink": {
+      "additionalProperties": false,
+      "properties": {
+        "url": {
+          "title": "Url",
+          "type": "string",
+          "minLength": 1
+        },
+        "title": {
+          "title": "Title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "url"
+      ],
+      "title": "TwitchLink",
+      "type": "object"
+    },
+    "TwitchPanel": {
+      "additionalProperties": false,
+      "properties": {
+        "title": {
+          "title": "Title",
+          "type": "string"
+        },
+        "description": {
+          "title": "Description",
+          "type": "string"
+        },
+        "image_url": {
+          "title": "Image Url",
+          "type": "string"
+        },
+        "link_url": {
+          "title": "Link Url",
+          "type": "string"
+        }
+      },
+      "title": "TwitchPanel",
+      "type": "object",
+      "minProperties": 1
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "username": {
+      "title": "Username",
+      "type": "string",
+      "description": "Lowercase Twitch username without @; may change.",
+      "x-scrape-field": "platform_creator_id",
+      "x-scrape-normalize": "lowercase",
+      "minLength": 1,
+      "maxLength": 25,
+      "pattern": "^[a-z0-9_]+$"
+    },
+    "url": {
+      "title": "Url",
+      "type": "string",
+      "description": "Canonical public profile URL.",
+      "x-scrape-field": "source_url",
+      "format": "uri"
+    },
+    "scraped_timestamp": {
+      "format": "date-time",
+      "title": "Scraped Timestamp",
+      "type": "string",
+      "description": "Timestamp at which the profile was scraped."
+    },
+    "user_id": {
+      "title": "User Id",
+      "type": "string",
+      "description": "Stable account ID, stored as a string when observed.",
+      "x-scrape-field": "platform_content_id"
+    },
+    "display_name": {
+      "title": "Display Name",
+      "type": "string",
+      "description": "Public display name."
+    },
+    "biography": {
+      "title": "Biography",
+      "type": "string",
+      "description": "Public biography; an empty string is a known empty bio."
+    },
+    "avatar_url": {
+      "title": "Avatar Url",
+      "type": "string",
+      "description": "Profile avatar image URL.",
+      "x-scrape-field": "platform_creator_thumbnail_url",
+      "format": "uri"
+    },
+    "banner_url": {
+      "title": "Banner Url",
+      "type": "string",
+      "description": "Profile banner image URL."
+    },
+    "follower_count": {
+      "title": "Follower Count",
+      "minimum": 0,
+      "type": "integer",
+      "description": "Observed followers; omitted when unknown. Zero is valid.",
+      "x-scrape-gauge": true
+    },
+    "follower_count_is_approximate": {
+      "default": false,
+      "title": "Follower Count Is Approximate",
+      "type": "boolean",
+      "description": "True for counts parsed from rounded display text."
+    },
+    "partner": {
+      "title": "Partner",
+      "type": "boolean",
+      "description": "Observed partner status; omitted when unknown."
+    },
+    "affiliate": {
+      "title": "Affiliate",
+      "type": "boolean",
+      "description": "Observed affiliate status; omitted when unknown."
+    },
+    "social_links": {
+      "items": {
+        "$ref": "#/$defs/TwitchLink"
+      },
+      "title": "Social Links",
+      "type": "array",
+      "description": "Public social links; empty when none were collected.",
+      "uniqueItems": true
+    },
+    "panels": {
+      "items": {
+        "$ref": "#/$defs/TwitchPanel"
+      },
+      "title": "Panels",
+      "type": "array",
+      "description": "Standard public About panels collected from the profile.",
+      "uniqueItems": true
+    },
+    "extractor_version": {
+      "default": "twitch-profile-v1",
+      "title": "Extractor Version",
+      "type": "string",
+      "description": "Version of the extractor that wrote the record.",
+      "const": "twitch-profile-v1"
+    },
+    "sources": {
+      "items": {
+        "type": "string",
+        "enum": [
+          "structured",
+          "html"
+        ]
+      },
+      "title": "Sources",
+      "type": "array",
+      "description": "Extraction sources used, such as structured or html.",
+      "minItems": 1,
+      "maxItems": 2,
+      "uniqueItems": true
+    },
+    "completeness": {
+      "default": "partial",
+      "enum": [
+        "partial",
+        "complete"
+      ],
+      "title": "Completeness",
+      "type": "string",
+      "description": "Whether the core profile fields were observed."
+    }
+  },
+  "required": [
+    "username",
+    "url",
+    "scraped_timestamp",
+    "follower_count_is_approximate",
+    "social_links",
+    "panels",
+    "extractor_version",
+    "sources",
+    "completeness"
+  ],
+  "title": "Twitch Creator Metadata",
+  "type": "object",
+  "description": "Saved Twitch profiles; unknown fields are omitted.",
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "completeness": {
+            "const": "complete"
+          }
+        },
+        "required": [
+          "completeness"
+        ]
+      },
+      "then": {
+        "required": [
+          "user_id",
+          "display_name",
+          "biography",
+          "avatar_url",
+          "follower_count"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "follower_count_is_approximate": {
+            "const": true
+          }
+        },
+        "required": [
+          "follower_count_is_approximate"
+        ]
+      },
+      "then": {
+        "required": [
+          "follower_count"
+        ]
+      }
+    }
+  ]
+}

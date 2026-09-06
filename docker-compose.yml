@@ -94,6 +94,12 @@ services:
     command: ["tools/ig_creator_scrape.py"]
     container_name: ig-creator
 
+  tw-creator:
+    <<: *scraper-common
+    command: ["tools/tw_creator_scrape.py"]
+    container_name: tw-creator
+    init: true
+
   scrape-upload:
     <<: *scraper-common
     command: ["tools/scrape_upload.py"]

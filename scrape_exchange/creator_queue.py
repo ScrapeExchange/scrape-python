@@ -2387,23 +2387,24 @@ class RedisCreatorQueue(CreatorQueue):
         self,
         creator_id: str,
         *,
-        follower_count: int,
+        follower_count: int | None,
         worker_id: str = '',
         proxy_ip: str = '',
         evidence: dict[str, Any] | None = None,
     ) -> None:
-        '''Record a successful creator scrape.'''
+        '''Record success; keep the last count when the new one is unknown.'''
         state: dict[str, Any] = await self.get_scrape_state(creator_id)
         now: str = self._utc_now_iso()
         state.update({
             'scrape_status': 'scraped',
             'last_attempt_at': now,
             'last_success_at': now,
-            'last_follower_count': int(follower_count),
             'failure_count': 0,
             'worker_id': worker_id,
             'proxy_ip': proxy_ip,
         })
+        if follower_count is not None:
+            state['last_follower_count'] = int(follower_count)
         state.pop('last_error', None)
         if evidence:
             state.update(evidence)
