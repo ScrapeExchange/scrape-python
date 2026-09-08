@@ -72,6 +72,7 @@ def _settings(**overrides: object) -> SimpleNamespace:
         'scrape_upload_concurrency': 2,
         'upload_mode': 'bulk',
         'background_drain_timeout_seconds': 1.0,
+        'twitch_creator_data_directory': None,
         'instagram_creator_priority_queues': (
             '72:10000000,168:1000000,336:100000,720:10000,4320:0'
         ),

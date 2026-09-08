@@ -59,6 +59,13 @@ class QueueToolSettings(BaseSettings):
             'creator_priority_queues',
         ),
     )
+    twitch_creator_priority_queues: str = Field(
+        default='24:1000000,72:100000,168:10000,336:0',
+        validation_alias=AliasChoices(
+            'TWITCH_CREATOR_PRIORITY_QUEUES',
+            'twitch_creator_priority_queues',
+        ),
+    )
     instagram_creator_priority_queues: str = Field(
         default='72:10000000,168:1000000,336:100000,720:10000,4320:0',
         validation_alias=AliasChoices(

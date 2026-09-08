@@ -37,6 +37,7 @@ from dateutil import parser as dateutil_parser
 from .youtube_caption import YouTubeCaption
 from scrape_exchange.worker_id import get_worker_id
 from scrape_exchange.proxy_loader import proxy_file_label
+from .youtube_video_badges import extract_video_badges
 from scrape_exchange.util import extract_proxy_ip, extract_proxy_port
 from .youtube_client import METRIC_YT_REQUEST_DURATION, _get_scraper
 from .youtube_format import YouTubeFormat
@@ -952,6 +953,8 @@ class InnerTubeVideoParser:
 
         :returns: dict with like_count, comment_count, chapters, categories.
         '''
+
+        self.video.badges = extract_video_badges(next_data)
 
         def _find(contents: list[dict], key: str) -> dict | None:
             '''

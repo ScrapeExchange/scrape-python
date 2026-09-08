@@ -48,6 +48,11 @@ x-scraper-volumes: &scraper-volumes
     bind:
       create_host_path: true
   - type: bind
+    source: /path/to/twitch/creators
+    target: /data/twitch/creators
+    bind:
+      create_host_path: true
+  - type: bind
     source: /path/to/scrape/logs
     target: /var/log/scrape
     bind:
@@ -65,6 +70,8 @@ services:
   tt-video:
     volumes: *scraper-volumes
   ig-creator:
+    volumes: *scraper-volumes
+  tw-creator:
     volumes: *scraper-volumes
   scrape-upload:
     volumes: *scraper-volumes
