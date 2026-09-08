@@ -30,6 +30,7 @@ from scrape_exchange.redis_client import redis_from_url
 from scrape_exchange.tiktok.short_url import (
     normalize_tiktok_short_url,
 )
+from scrape_exchange.twitch.normalization import normalize_creator
 from scrape_exchange.video_scrape_queue import (
     RedisVideoScrapeQueue,
     VideoScrapeQueueSettings,
@@ -547,15 +548,16 @@ class InstagramCreatorQueueAdapter(TikTokCreatorQueueAdapter):
     entity: str = 'creator'
     member_label: str = 'username'
 
+    def normalize(self, value: str) -> str | None:
+        return normalize_instagram_creator_handle(value)
+
     async def add(
         self, members: list[tuple[str, int]],
     ) -> int:
         weight: int = self._fallback_weight()
         added: int = 0
         for member_id, requested_weight in members:
-            handle: str | None = normalize_instagram_creator_handle(
-                member_id,
-            )
+            handle: str | None = self.normalize(member_id)
             if handle is None:
                 continue
             member_weight: int = requested_weight or weight
@@ -598,8 +600,8 @@ class InstagramCreatorQueueAdapter(TikTokCreatorQueueAdapter):
                         or obj.get('creator_id')
                         or obj.get('handle')
                     )
-                handle: str | None = normalize_instagram_creator_handle(
-                    str(raw),
+                handle: str | None = (
+                    self.normalize(raw) if isinstance(raw, str) else None
                 )
                 if handle is None:
                     report.invalid += 1
@@ -609,6 +611,44 @@ class InstagramCreatorQueueAdapter(TikTokCreatorQueueAdapter):
                 else:
                     report.duplicates += 1
         return report
+
+
+class TwitchCreatorQueueAdapter(InstagramCreatorQueueAdapter):
+    '''Reuse handle-based creator operations with Twitch normalization.'''
+
+    platform: str = 'twitch'
+
+    def normalize(self, value: str) -> str | None:
+        return normalize_creator(value)
+
+    async def show(self, member_id: str) -> dict | None:
+        handle: str | None = self.normalize(member_id)
+        return await super().show(handle) if handle else None
+
+    async def remove(self, member_id: str) -> bool:
+        handle: str | None = self.normalize(member_id)
+        return await super().remove(handle) if handle else False
+
+    async def rescrape(self, member_ids: list[str]) -> int:
+        handles: list[str] = [
+            handle for value in member_ids
+            if (handle := self.normalize(value)) is not None
+        ]
+        return await super().rescrape(handles)
+
+
+def _build_twitch_creator_adapter(settings: Any) -> OperatorQueue:
+    tiers: list[TierConfig] = parse_priority_queues(
+        getattr(settings, 'twitch_creator_priority_queues',
+                '24:1000000,72:100000,168:10000,336:0'),
+    )
+    queue: RedisCreatorQueue = RedisCreatorQueue(
+        settings.redis_dsn, getattr(settings, 'worker_id', '0'),
+        'twitch', key_namespace='scrape',
+    )
+    queue._tiers = tiers
+    queue._key_queues = queue._build_queue_keys(tiers)
+    return TwitchCreatorQueueAdapter(queue, tiers)
 
 
 def _build_tiktok_creator_adapter(
@@ -668,6 +708,7 @@ def _build_instagram_creator_adapter(settings: Any) -> OperatorQueue:
 ADAPTERS: dict[
     tuple[str, str], Callable[[Any], OperatorQueue]
 ] = {
+    ('twitch', 'creator'): _build_twitch_creator_adapter,
     ('instagram', 'creator'): _build_instagram_creator_adapter,
     ('tiktok', 'creator'): _build_tiktok_creator_adapter,
     ('tiktok', 'video'): _build_tiktok_video_adapter,

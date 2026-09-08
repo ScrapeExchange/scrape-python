@@ -5,6 +5,25 @@
     "description": "Schema representing a YouTube video and its associated metadata, including identifiers, descriptive fields, statistics, availability, media information, and related channel data.",
     "type": "object",
     "properties": {
+        "badges": {
+            "type": "array",
+            "description": "YouTube labels attached to this video",
+            "uniqueItems": true,
+            "items": {
+                "type": "object",
+                "minProperties": 1,
+                "properties": {
+                    "label": { "type": "string", "minLength": 1 },
+                    "style": { "type": "string", "minLength": 1 },
+                    "icon": { "type": "string", "minLength": 1 },
+                    "tooltip": { "type": "string", "minLength": 1 },
+                    "accessibility_label": {
+                        "type": "string", "minLength": 1
+                    }
+                },
+                "additionalProperties": false
+            }
+        },
         "video_id": {
             "type": [
                 "string",
@@ -64,6 +83,7 @@
         },
         "channel_country": {
             "type": ["string", "null"],
+            "x-scrape-field": "country",
             "description": "ISO2 country code associated with the channel"
         },
         "channel_is_verified": {

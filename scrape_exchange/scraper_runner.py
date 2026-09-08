@@ -119,6 +119,10 @@ class ScraperRunner:
 
     Does NOT own: the worker loop, domain models,
     upload payloads, platform-specific setup.
+
+    ``client_enabled=False`` skips Exchange initialization and supervisor
+    authentication entirely. ``client_required=False`` merely tolerates
+    initialization failures for tools that still optionally upload.
     '''
 
     def __init__(
@@ -138,6 +142,7 @@ class ScraperRunner:
         split_proxy_pool: bool = False,
         concurrency_env_var: str | None = None,
         child_concurrencies: list[int] | None = None,
+        client_enabled: bool = True,
     ) -> None:
         self._settings: ScraperSettings = settings
         self._scraper_label: str = scraper_label
@@ -151,6 +156,7 @@ class ScraperRunner:
             [ScraperSettings], RateLimiter
         ] = rate_limiter_factory
         self._client_required: bool = client_required
+        self._client_enabled: bool = client_enabled
         self._split_proxy_pool: bool = split_proxy_pool
         self._concurrency_env_var: str | None = concurrency_env_var
         self._child_concurrencies: list[int] | None = child_concurrencies
@@ -201,9 +207,11 @@ class ScraperRunner:
                 child_concurrencies=self._child_concurrencies,
                 api_key_id=(
                     self._settings.api_key_id
+                    if self._client_enabled else None
                 ),
                 api_key_secret=(
                     self._settings.api_key_secret
+                    if self._client_enabled else None
                 ),
                 exchange_url=(
                     self._settings.exchange_url
@@ -288,18 +296,20 @@ class ScraperRunner:
         post_rate: float = float(max(
             1, self._num_processes * self._concurrency,
         ))
-        ScrapeExchangeRateLimiter.get(
-            state_dir=(self._settings.rate_limiter_state_dir),
-            post_rate=post_rate, redis_dsn=self._settings.redis_dsn,
-        )
+        if self._client_enabled:
+            ScrapeExchangeRateLimiter.get(
+                state_dir=(self._settings.rate_limiter_state_dir),
+                post_rate=post_rate, redis_dsn=self._settings.redis_dsn,
+            )
 
         client: ExchangeClient | None = None
         try:
-            client = await ExchangeClient.setup(
-                api_key_id=(self._settings.api_key_id),
-                api_key_secret=(self._settings.api_key_secret),
-                exchange_url=(self._settings.exchange_url),
-            )
+            if self._client_enabled:
+                client = await ExchangeClient.setup(
+                    api_key_id=(self._settings.api_key_id),
+                    api_key_secret=(self._settings.api_key_secret),
+                    exchange_url=(self._settings.exchange_url),
+                )
         except Exception as exc:
             if self._client_required:
                 logging.critical(

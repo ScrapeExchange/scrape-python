@@ -76,11 +76,20 @@ def is_redis_busy_script_error(error: BaseException) -> bool:
     )
 
 
+def _is_redis_loading_error(error: BaseException) -> bool:
+    try:
+        from redis.exceptions import BusyLoadingError
+    except ImportError:
+        return False
+    return isinstance(error, BusyLoadingError)
+
+
 async def call_with_redis_busy_retry(
     operation: Callable[[], Awaitable[_T]],
     *,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> _T:
+    '''Retry commands rejected while Redis runs a script or loads data.'''
     retries, base_delay, max_delay = redis_busy_retry_settings()
     attempt: int = 0
     while True:
@@ -88,7 +97,10 @@ async def call_with_redis_busy_retry(
             return await operation()
         except Exception as exc:
             if (
-                not is_redis_busy_script_error(exc)
+                not (
+                    is_redis_busy_script_error(exc)
+                    or _is_redis_loading_error(exc)
+                )
                 or attempt >= retries
             ):
                 raise

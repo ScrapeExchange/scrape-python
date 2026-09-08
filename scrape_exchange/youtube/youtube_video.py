@@ -54,6 +54,7 @@ from .youtube_thumbnail import YouTubeThumbnail
 from .youtube_videochapter import YouTubeVideoChapter
 from .youtube_rate_limiter import YouTubeRateLimiter, YouTubeCallType
 from .youtube_video_innertube import InnerTubeVideoParser
+from .youtube_video_badges import BadgeYoutubeIE
 
 _LOGGER: Logger = getLogger(__name__)
 
@@ -187,6 +188,7 @@ class YouTubeVideo:
 
         self.tags: set[str] = set()
         self.annotations: set[str] = set()
+        self.badges: list[dict[str, str]] = []
         self.category: str | None = None
         self.keywords: set[str] = set()
         self.privacy_status: str = 'public'
@@ -225,6 +227,7 @@ class YouTubeVideo:
             and self.category == other.category
             and self.default_audio_language == other.default_audio_language
             and self.privacy_status == other.privacy_status
+            and self.badges == other.badges
         )
         if not same:
             return False
@@ -292,6 +295,7 @@ class YouTubeVideo:
             'default_audio_language': self.default_audio_language,
             'tags': list(self.tags),
             'annotations': list(self.annotations),
+            'badges': [dict(badge) for badge in self.badges],
             'keywords': list(self.keywords),
             'category': self.category,
             'privacy_status': self.privacy_status
@@ -393,6 +397,7 @@ class YouTubeVideo:
         video.category = data.get('category')
         video.tags = set(data.get('tags', []))
         video.annotations = set(data.get('annotations', []))
+        video.badges = [dict(badge) for badge in data.get('badges', [])]
         video.keywords = set(data.get('keywords', []))
         video.privacy_status = data.get('privacy_status', 'public')
         if isinstance(video.privacy_status, bool):
@@ -498,6 +503,7 @@ class YouTubeVideo:
             info.get('media_type'),
         )
         video.description = info.get('description')
+        video.badges = [dict(badge) for badge in info.get('badges', [])]
         video.title = info.get('title')
         video.long_title = info.get('fulltitle')
         video.view_count = info.get('view_count')
@@ -980,6 +986,7 @@ class YouTubeVideo:
                 ytdlp_opts['cookiefile'] = cookie_file
 
             download_client = YoutubeDL(ytdlp_opts)
+            download_client.add_info_extractor(BadgeYoutubeIE())
         return download_client
 
     def _extract_initial_data(self, html_content: str) -> dict:
@@ -1322,6 +1329,7 @@ class YouTubeVideo:
             self.media_type = None
 
         self.description = video_info.get('description')
+        self.badges = [dict(badge) for badge in video_info.get('badges', [])]
         self.title = video_info.get('title')
         self.view_count = video_info.get('view_count')
         self.like_count = video_info.get('like_count')
