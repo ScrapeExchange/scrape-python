@@ -5,8 +5,6 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-EXTRACTOR_VERSION: str = 'twitch-profile-v2'
-
 
 class TwitchLink(BaseModel):
     model_config = ConfigDict(extra='forbid')
@@ -22,20 +20,6 @@ class TwitchPanel(BaseModel):
     description: str | None = None
     image_url: str | None = None
     link_url: str | None = None
-
-
-class TwitchChannelSettings(BaseModel):
-    '''Observed channel configuration, independent of a broadcast record.'''
-
-    model_config = ConfigDict(extra='forbid')
-
-    title: str | None = None
-    category_id: str | None = Field(default=None, pattern=r'^[0-9]+$')
-    category_name: str | None = None
-    language: str | None = Field(default=None, min_length=1)
-    primary_color_hex: str | None = Field(
-        default=None, pattern=r'^[0-9A-F]{6}$',
-    )
 
 
 class TwitchCreator(BaseModel):
@@ -55,8 +39,13 @@ class TwitchCreator(BaseModel):
     affiliate: bool | None = None
     social_links: list[TwitchLink] = Field(default_factory=list)
     panels: list[TwitchPanel] = Field(default_factory=list)
-    channel_settings: TwitchChannelSettings | None = None
-    extractor_version: str = EXTRACTOR_VERSION
+    title: str | None = None
+    category_id: str | None = Field(default=None, pattern=r'^[0-9]+$')
+    category_name: str | None = None
+    language: str | None = Field(default=None, min_length=1)
+    primary_color_hex: str | None = Field(
+        default=None, pattern=r'^[0-9A-F]{6}$',
+    )
     sources: list[str] = Field(default_factory=list)
     completeness: Literal['partial', 'complete'] = 'partial'
 

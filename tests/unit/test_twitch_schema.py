@@ -11,6 +11,30 @@ from scrape_exchange.twitch.twitch_profile_extractor import extract_profile
 
 
 class TestTwitchSchema(unittest.TestCase):
+    def test_extractor_version_is_not_part_of_creator_records(self) -> None:
+        self.assertNotIn('extractor_version', self.record)
+        self.assertNotIn('extractor_version',
+                         self.validator.schema['properties'])
+        self.assertNotIn('extractor_version',
+                         self.validator.schema['required'])
+        self.assertFalse(self.validator.is_valid({
+            **self.record, 'extractor_version': 'twitch-profile-v3',
+        }))
+
+    def test_category_annotation_and_optional_flat_settings(self) -> None:
+        schema: dict = self.validator.schema
+        properties: dict = schema['properties']
+        self.assertNotIn('channel_settings', properties)
+        self.assertEqual(properties['category_name']['x-scrape-tags'],
+                         'categories')
+        self.assertNotIn('x-scrape-field', properties['language'])
+        for name in (
+            'title', 'category_id', 'category_name', 'language',
+            'primary_color_hex',
+        ):
+            self.assertIn(name, properties)
+            self.assertNotIn(name, schema['required'])
+
     def setUp(self) -> None:
         path: Path = (
             Path(__file__).resolve().parents[1] / 'collateral'
@@ -55,24 +79,21 @@ class TestTwitchSchema(unittest.TestCase):
     def test_settings_schema_accepts_old_records_and_checks_new_fields(
         self,
     ) -> None:
+        self.validator.validate(self.record)
         self.validator.validate({
-            **self.record, 'extractor_version': 'twitch-profile-v1',
-        })
-        self.validator.validate({
-            **self.record, 'channel_settings': {
-                'title': '', 'category_id': '42', 'language': 'en',
-                'category_name': 'Category', 'primary_color_hex': 'ABCDEF',
-            },
+            **self.record, 'title': '', 'category_id': '42',
+            'language': 'en', 'category_name': 'Category',
+            'primary_color_hex': 'ABCDEF',
         })
         for settings in (
-            {}, {'language': None}, {'language': ''}, {'category_id': 42},
+            {'channel_settings': {'language': 'en'}}, {'language': None}, {'language': ''}, {'category_id': 42},
             {'category_id': 'bad'}, {'primary_color_hex': '#ABCDEF'},
             {'content_classification_labels': ['Gambling']},
             {'is_branded_content': True},
         ):
             with self.subTest(settings=settings):
                 self.assertFalse(self.validator.is_valid({
-                    **self.record, 'channel_settings': settings,
+                    **self.record, **settings,
                 }))
 
     def test_html_fallback_without_id_remains_valid(self) -> None:

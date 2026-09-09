@@ -61,6 +61,7 @@ from scrape_exchange.logging import (
 )
 from scrape_exchange.metrics_server import start_metrics_server
 from scrape_exchange.name_map import NameMap, NullNameMap, RedisNameMap
+from scrape_exchange.onlyfans.onlyfans_creator import OnlyFansCreator
 from scrape_exchange.redis_client import redis_from_url
 from scrape_exchange.schema_validator import SchemaValidator, fetch_schema_dict
 from scrape_exchange.scraper_metrics import (
@@ -104,6 +105,7 @@ TIKTOK_CREATOR_PREFIX: str = 'tiktok-creator-'
 TIKTOK_HASHTAG_PREFIX: str = 'tiktok-hashtag-'
 INSTAGRAM_CREATOR_PREFIX: str = 'instagram-creator-'
 TWITCH_CREATOR_PREFIX: str = 'twitch-creator-'
+ONLYFANS_CREATOR_PREFIX: str = 'onlyfans-creator-'
 SCRAPE_UPLOAD_DEFAULT_LOG_FILE: str = (
     '/var/log/scrape/scrape_upload.log'
 )
@@ -175,7 +177,20 @@ def _twitch_creator_record(data: dict[str, Any]) -> dict[str, Any]:
     return TwitchCreator.model_validate(data).to_dict()
 
 
+def _onlyfans_creator_record(data: dict[str, Any]) -> dict[str, Any]:
+    return OnlyFansCreator.model_validate(data).to_dict()
+
+
 ASSET_DESCRIPTORS: dict[tuple[str, str], AssetDescriptor] = {
+    ('onlyfans', 'creator'): AssetDescriptor(
+        platform='onlyfans',
+        entity='creator',
+        prefixes=(ONLYFANS_CREATOR_PREFIX,),
+        schema_owner='drand',
+        schema_version='0.0.1',
+        filename_prefix='onlyfans-creators',
+        load_record=_onlyfans_creator_record,
+    ),
     ('twitch', 'creator'): AssetDescriptor(
         platform='twitch',
         entity='creator',
@@ -307,6 +322,14 @@ class ScrapeUploadSettings(ScraperSettings):
             'twitch_creator_data_directory',
         ),
         description='Directory containing scraped Twitch creator data.',
+    )
+    onlyfans_creator_data_directory: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            'ONLYFANS_CREATOR_DATA_DIR',
+            'onlyfans_creator_data_directory',
+        ),
+        description='Directories containing scraped OnlyFans creator data.',
     )
     youtube_channel_map_file: str = Field(
         default='channel_map.csv',
@@ -1075,6 +1098,12 @@ def configured_asset_target_specs(
         platform='twitch',
         entity='creator',
         directories=settings.twitch_creator_data_directory,
+    )
+    _append_target_specs(
+        specs,
+        platform='onlyfans',
+        entity='creator',
+        directories=settings.onlyfans_creator_data_directory,
     )
     if not specs:
         raise ValueError(

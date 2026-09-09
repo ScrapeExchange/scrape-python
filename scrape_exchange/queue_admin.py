@@ -26,6 +26,15 @@ from scrape_exchange.creator_queue import (
     TierConfig,
     parse_priority_queues,
 )
+from scrape_exchange.onlyfans.onlyfans_creator import (
+    normalize_creator as normalize_onlyfans_creator,
+)
+from scrape_exchange.onlyfans.settings import (
+    DEFAULT_PRIORITY_QUEUES as ONLYFANS_PRIORITY_QUEUES,
+)
+from scrape_exchange.onlyfans.settings import (
+    parse_like_priority_queues,
+)
 from scrape_exchange.redis_client import redis_from_url
 from scrape_exchange.tiktok.short_url import (
     normalize_tiktok_short_url,
@@ -36,7 +45,6 @@ from scrape_exchange.video_scrape_queue import (
     VideoScrapeQueueSettings,
     VideoState,
 )
-
 
 _TIKTOK_VIDEO_ID_RE: re.Pattern[str] = re.compile(r'^\d{5,}$')
 _TIKTOK_VIDEO_URL_RE: re.Pattern[str] = re.compile(
@@ -651,6 +659,35 @@ def _build_twitch_creator_adapter(settings: Any) -> OperatorQueue:
     return TwitchCreatorQueueAdapter(queue, tiers)
 
 
+class OnlyFansCreatorQueueAdapter(TwitchCreatorQueueAdapter):
+    '''Handle operations using like counts as the queue weight.'''
+
+    platform: str = 'onlyfans'
+
+    def normalize(self, value: str) -> str | None:
+        try:
+            return normalize_onlyfans_creator(value)
+        except ValueError:
+            return None
+
+    def _fallback_weight(self) -> int:
+        return 0
+
+
+def _build_onlyfans_creator_adapter(settings: Any) -> OperatorQueue:
+    tiers: list[TierConfig] = parse_like_priority_queues(
+        getattr(settings, 'onlyfans_creator_priority_queues',
+                ONLYFANS_PRIORITY_QUEUES),
+    )
+    queue: RedisCreatorQueue = RedisCreatorQueue(
+        settings.redis_dsn, getattr(settings, 'worker_id', '0'),
+        'onlyfans', key_namespace='scrape',
+    )
+    queue._tiers = tiers
+    queue._key_queues = queue._build_queue_keys(tiers)
+    return OnlyFansCreatorQueueAdapter(queue, tiers)
+
+
 def _build_tiktok_creator_adapter(
     settings: Any,
 ) -> OperatorQueue:
@@ -708,6 +745,7 @@ def _build_instagram_creator_adapter(settings: Any) -> OperatorQueue:
 ADAPTERS: dict[
     tuple[str, str], Callable[[Any], OperatorQueue]
 ] = {
+    ('onlyfans', 'creator'): _build_onlyfans_creator_adapter,
     ('twitch', 'creator'): _build_twitch_creator_adapter,
     ('instagram', 'creator'): _build_instagram_creator_adapter,
     ('tiktok', 'creator'): _build_tiktok_creator_adapter,

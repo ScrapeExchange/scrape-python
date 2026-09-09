@@ -115,11 +115,13 @@ biography, image URLs, followers, partner/affiliate flags, social links,
 and standard About panels. Interactive extension panels are not executed
 to extract their data. Missing fields are omitted from JSON.
 
-The optional `channel_settings` object captures configured title, category
-ID/name, broadcast language, and channel brand color. Values are observed
-at `scraped_timestamp` and can remain set while the channel is offline.
-Missing settings are omitted, rather than inferred from the latest stream
-or a recorded broadcast. Channel settings do not affect profile completeness.
+Optional top-level fields `title`, `category_id`, `category_name`,
+`language`, and `primary_color_hex` capture channel configuration.
+Values are observed at `scraped_timestamp` and can remain set offline.
+Missing settings are omitted rather than inferred from broadcast records.
+`category_name` uses `x-scrape-tags: "categories"`. Broadcast language does
+not identify the creator's country and has no country annotation.
+These fields do not affect profile completeness.
 
 Content classification labels and branded-content disclosures describe
 streams, so they are excluded from creator records. Classification choices
@@ -128,12 +130,15 @@ See [Twitch's label documentation][twitch-labels].
 
 [twitch-labels]: https://help.twitch.tv/s/article/content-classification-labels
 Tags have not been verified in an anonymous account-settings response;
-stream tags are not copied into this object.
+stream tags are not copied into creator settings.
 
-Extractor `twitch-profile-v2` adds channel settings. Schema version
-`0.0.1` is updated in place to accept both old records and the new
-optional fields. Update the API server schema before deploying the
-updated scraper; the previous schema definition rejects the new field.
+Extractor `twitch-profile-v3` writes channel settings as top-level fields.
+Schema `0.0.1` is updated in place; the fields remain optional. The uploader
+accepts older files containing `channel_settings` and flattens them before
+validation and upload. Explicit top-level values take precedence when a
+file contains both forms. The API schema accepts only the flat output.
+Update the API schema and deploy the updated scraper and uploader together;
+an older uploader or cached schema may reject these fields.
 
 The output schema is
 [`drand-twitch-creator-schema.json`](../tests/collateral/drand-twitch-creator-schema.json).
@@ -145,7 +150,7 @@ uv run python -m tools.jsonschema_validate \
   /path/to/twitch-creator-example.json.br
 ```
 
-Each record includes the scrape timestamp, extractor version, sources
+Each record includes the scrape timestamp, sources
 and completeness. `complete` means the core identity, biography, avatar
 and follower fields were observed; optional panels and links may be empty.
 An offline channel is a valid profile and needs no live broadcast.
@@ -154,7 +159,7 @@ The schema requires account ID, display name, biography, avatar URL and
 follower count for `complete` records. These fields remain optional for
 `partial` records, including HTML fallback results without an account ID.
 It also validates username syntax, extraction sources, unique links and
-panels, nonempty panels, and the extractor version. An approximate count
+panels and nonempty panels. An approximate count
 must include `follower_count`; zero followers and empty biographies remain
 valid. Timestamp format validation requires a JSON Schema validator with
 RFC 3339 format checking enabled.

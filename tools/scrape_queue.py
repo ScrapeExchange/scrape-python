@@ -26,12 +26,13 @@ from pydantic_settings import (
     SettingsConfigDict,
 )
 
+from scrape_exchange.onlyfans.settings import DEFAULT_PRIORITY_QUEUES
 from scrape_exchange.queue_admin import (
     ImportReport,
-    normalize_instagram_creator_handle,
-    normalize_tiktok_creator_submission,
     OperatorQueue,
     get_adapter,
+    normalize_instagram_creator_handle,
+    normalize_tiktok_creator_submission,
 )
 
 
@@ -72,6 +73,14 @@ class QueueToolSettings(BaseSettings):
             'IG_CREATOR_PRIORITY_QUEUES',
             'instagram_creator_priority_queues',
         ),
+    )
+    onlyfans_creator_priority_queues: str = Field(
+        default=DEFAULT_PRIORITY_QUEUES,
+        validation_alias=AliasChoices(
+            'ONLYFANS_CREATOR_PRIORITY_QUEUES',
+            'onlyfans_creator_priority_queues',
+        ),
+        description='OnlyFans refresh hours:minimum_likes tiers.',
     )
 
 

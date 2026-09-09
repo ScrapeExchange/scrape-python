@@ -10,7 +10,6 @@ from bs4 import BeautifulSoup, PageElement, Tag
 
 from scrape_exchange.twitch.normalization import normalize_creator
 from scrape_exchange.twitch.twitch_creator import (
-    TwitchChannelSettings,
     TwitchCreator,
     TwitchLink,
     TwitchPanel,
@@ -73,14 +72,8 @@ def _apply_channel_settings(
             category_name: str | None = _string(game.get('name'))
             if category_name is not None:
                 values['category_name'] = category_name
-    if values:
-        previous: dict = (
-            creator.channel_settings.model_dump(exclude_none=True)
-            if creator.channel_settings is not None else {}
-        )
-        creator.channel_settings = TwitchChannelSettings.model_validate(
-            previous | values,
-        )
+    for field, value in values.items():
+        setattr(creator, field, value)
 
 
 def _apply_user(creator: TwitchCreator, user: dict[str, Any]) -> None:

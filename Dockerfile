@@ -114,6 +114,7 @@ RUN mkdir -p /data/videos /data/channels \
     /data/tiktok/session-state \
     /data/instagram/creators /data/instagram/session-state \
     /data/twitch/creators \
+    /data/onlyfans/creators \
     /var/log/scrape/scraper \
     /var/tmp/yt_dlp_cache
 
@@ -126,6 +127,7 @@ ENV YOUTUBE_VIDEO_DATA_DIR=/data/videos \
     IG_CREATOR_DATA_DIR=/data/instagram/creators \
     IG_SESSION_STATE_DIR=/data/instagram/session-state \
     TWITCH_CREATOR_DATA_DIR=/data/twitch/creators \
+    ONLYFANS_CREATOR_DATA_DIR=/data/onlyfans/creators \
     YOUTUBE_CHANNEL_LIST=/data/channels.lst \
     YOUTUBE_CHANNEL_MAP_FILE=/data/channel_map.csv \
     RSS_QUEUE_FILE=/data/rss-queue.json \

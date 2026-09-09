@@ -15,6 +15,24 @@ from tools import scrape_upload
 
 
 class TestTwitchUpload(unittest.IsolatedAsyncioTestCase):
+    def test_retired_fields_are_rejected(self) -> None:
+        descriptor: scrape_upload.AssetDescriptor = (
+            scrape_upload.descriptor_for('twitch', 'creator')
+        )
+        record: dict = {
+            'username': 'example', 'url': 'https://localhost/example',
+            'scraped_timestamp': '2026-09-08T00:00:00Z',
+            'sources': ['structured'],
+        }
+        retired: dict
+        for retired in (
+            {'extractor_version': 'twitch-profile-v2'},
+            {'channel_settings': {'title': 'Old title'}},
+            {'channel_settings': None},
+        ):
+            with self.subTest(retired=retired), self.assertRaises(ValueError):
+                descriptor.load_record({**record, **retired})
+
     def test_directory_environment_selects_twitch_schema(self) -> None:
         with patch.dict(os.environ, {
             'TWITCH_CREATOR_DATA_DIR': '/data/twitch/a,/data/twitch/b',
@@ -59,10 +77,10 @@ class TestTwitchUpload(unittest.IsolatedAsyncioTestCase):
             <link rel="canonical" href="https://localhost/example">
             <h1 data-a-target="user-display-name">Example</h1>
         ''', 'example', 'https://localhost').to_dict()
-        record['channel_settings'] = {
+        record.update({
             'title': 'Example title', 'language': 'en',
             'category_id': '42', 'category_name': 'Example category',
-        }
+        })
         filename: str = 'twitch-creator-example.json.br'
         for mode in ('bulk', 'background'):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:

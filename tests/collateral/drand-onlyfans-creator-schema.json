@@ -1,0 +1,316 @@
+{
+  "additionalProperties": false,
+  "description": "Anonymous public profiles; unavailable fields are null.",
+  "properties": {
+    "username": {
+      "description": "Profile username without @.",
+      "pattern": "^[a-z0-9_.-]{1,64}$",
+      "title": "Username",
+      "type": "string",
+      "x-scrape-field": "platform_creator_id",
+      "x-scrape-normalize": "lowercase"
+    },
+    "handle": {
+      "pattern": "^@[a-z0-9_.-]{1,64}$",
+      "title": "Handle",
+      "type": "string"
+    },
+    "user_id": {
+      "pattern": "^[1-9][0-9]*$",
+      "title": "User Id",
+      "type": "string",
+      "x-scrape-field": "platform_content_id"
+    },
+    "url": {
+      "format": "uri",
+      "pattern": "^https?://",
+      "title": "Url",
+      "type": "string",
+      "x-scrape-field": "source_url"
+    },
+    "scraped_timestamp": {
+      "format": "date-time",
+      "pattern": "^\\d{4}(-\\d{2}){2}T.+(Z|[+-]\\d{2}:\\d{2})$",
+      "title": "Scraped Timestamp",
+      "type": "string"
+    },
+    "display_name": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Human-readable profile name.",
+      "title": "Display Name"
+    },
+    "verified": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Verified"
+    },
+    "like_count": {
+      "default": null,
+      "description": "Likes received, not likes given.",
+      "minimum": 0,
+      "title": "Like Count",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "x-scrape-gauge": true
+    },
+    "photo_count": {
+      "default": null,
+      "minimum": 0,
+      "title": "Photo Count",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "x-scrape-gauge": true
+    },
+    "video_count": {
+      "default": null,
+      "minimum": 0,
+      "title": "Video Count",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "x-scrape-gauge": true
+    },
+    "audio_count": {
+      "default": null,
+      "minimum": 0,
+      "title": "Audio Count",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "x-scrape-gauge": true
+    },
+    "banner_url": {
+      "anyOf": [
+        {
+          "format": "uri",
+          "pattern": "^https?://",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Banner Url"
+    },
+    "avatar_url": {
+      "default": null,
+      "format": "uri",
+      "pattern": "^https?://",
+      "title": "Avatar Url",
+      "type": [
+        "string",
+        "null"
+      ],
+      "x-scrape-field": "platform_creator_thumbnail_url"
+    },
+    "fan_count": {
+      "default": null,
+      "description": "Fans, only when visibility is opted in.",
+      "minimum": 0,
+      "title": "Fan Count",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "x-scrape-gauge": true
+    },
+    "fan_count_visible": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Fan Count Visible"
+    },
+    "biography": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Biography"
+    },
+    "subscription_price": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Regular monthly price, before promotions.",
+      "title": "Subscription Price"
+    },
+    "subscription_currency": {
+      "anyOf": [
+        {
+          "const": "USD",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Subscription Currency"
+    },
+    "subscription_status": {
+      "anyOf": [
+        {
+          "enum": [
+            "free",
+            "paid"
+          ],
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Subscription Status"
+    },
+    "extractor_version": {
+      "const": "onlyfans-profile-v1",
+      "default": "onlyfans-profile-v1",
+      "title": "Extractor Version",
+      "type": "string"
+    }
+  },
+  "required": [
+    "username",
+    "handle",
+    "user_id",
+    "url",
+    "scraped_timestamp",
+    "display_name",
+    "verified",
+    "like_count",
+    "photo_count",
+    "video_count",
+    "audio_count",
+    "banner_url",
+    "avatar_url",
+    "fan_count",
+    "fan_count_visible",
+    "biography",
+    "subscription_price",
+    "subscription_currency",
+    "subscription_status",
+    "extractor_version"
+  ],
+  "title": "OnlyFans Creator Metadata",
+  "type": "object",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://scrape.exchange/schemas/drand-onlyfans-creator-0.0.1",
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "fan_count": {
+            "type": "integer"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "fan_count_visible": {
+            "const": true
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "subscription_price": {
+            "type": "null"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "subscription_currency": {
+            "type": "null"
+          },
+          "subscription_status": {
+            "type": "null"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "subscription_currency": {
+            "const": "USD"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "subscription_price": {
+            "const": 0
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "subscription_status": {
+            "const": "free"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "subscription_price": {
+            "type": "number",
+            "exclusiveMinimum": 0
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "subscription_status": {
+            "const": "paid"
+          }
+        }
+      }
+    }
+  ]
+}

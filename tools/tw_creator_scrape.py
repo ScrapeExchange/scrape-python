@@ -144,7 +144,6 @@ async def process_creator(
             username, follower_count=creator.follower_count,
             worker_id=worker_id, evidence={
                 'user_id': creator.user_id,
-                'extractor_version': creator.extractor_version,
                 'completeness': creator.completeness,
                 'sources': creator.sources,
                 'follower_count_known': creator.follower_count is not None,

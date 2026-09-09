@@ -44,42 +44,6 @@
       "title": "TwitchPanel",
       "type": "object",
       "minProperties": 1
-    },
-    "TwitchChannelSettings": {
-      "additionalProperties": false,
-      "description": "Channel configuration observed at scraped_timestamp.",
-      "properties": {
-        "title": {
-          "title": "Title",
-          "type": "string",
-          "description": "Configured channel title; may persist while offline."
-        },
-        "category_id": {
-          "title": "Category Id",
-          "pattern": "^[0-9]+$",
-          "type": "string",
-          "description": "Configured category ID."
-        },
-        "category_name": {
-          "title": "Category Name",
-          "type": "string"
-        },
-        "language": {
-          "title": "Language",
-          "minLength": 1,
-          "type": "string",
-          "description": "Configured language, normalized to lowercase."
-        },
-        "primary_color_hex": {
-          "title": "Primary Color Hex",
-          "pattern": "^[0-9A-F]{6}$",
-          "type": "string",
-          "description": "Channel brand color as six uppercase hex digits."
-        }
-      },
-      "title": "TwitchChannelSettings",
-      "type": "object",
-      "minProperties": 1
     }
   },
   "additionalProperties": false,
@@ -176,16 +140,6 @@
       "description": "Standard public About panels collected from the profile.",
       "uniqueItems": true
     },
-    "extractor_version": {
-      "default": "twitch-profile-v2",
-      "title": "Extractor Version",
-      "type": "string",
-      "description": "Version of the extractor that wrote the record.",
-      "enum": [
-        "twitch-profile-v1",
-        "twitch-profile-v2"
-      ]
-    },
     "sources": {
       "items": {
         "type": "string",
@@ -211,9 +165,33 @@
       "type": "string",
       "description": "Whether the core profile fields were observed."
     },
-    "channel_settings": {
-      "$ref": "#/$defs/TwitchChannelSettings",
-      "description": "Observed settings; absent fields are unknown."
+    "title": {
+      "title": "Title",
+      "type": "string",
+      "description": "Configured channel title; may persist while offline."
+    },
+    "category_id": {
+      "title": "Category Id",
+      "pattern": "^[0-9]+$",
+      "type": "string",
+      "description": "Configured category ID."
+    },
+    "category_name": {
+      "title": "Category Name",
+      "type": "string",
+      "x-scrape-tags": "categories"
+    },
+    "language": {
+      "title": "Language",
+      "minLength": 1,
+      "type": "string",
+      "description": "Configured language, normalized to lowercase."
+    },
+    "primary_color_hex": {
+      "title": "Primary Color Hex",
+      "pattern": "^[0-9A-F]{6}$",
+      "type": "string",
+      "description": "Channel brand color as six uppercase hex digits."
     }
   },
   "required": [
@@ -223,7 +201,6 @@
     "follower_count_is_approximate",
     "social_links",
     "panels",
-    "extractor_version",
     "sources",
     "completeness"
   ],
