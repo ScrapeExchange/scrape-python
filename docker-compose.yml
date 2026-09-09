@@ -100,9 +100,13 @@ services:
     container_name: tw-creator
     init: true
 
+  of-creator:
+    <<: *scraper-common
+    command: ["tools/of_creator_scrape.py"]
+    container_name: of-creator
+    init: true
+
   scrape-upload:
     <<: *scraper-common
     command: ["tools/scrape_upload.py"]
     container_name: scrape-upload
-    profiles:
-      - scrape-upload

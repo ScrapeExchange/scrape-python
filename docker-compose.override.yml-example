@@ -53,6 +53,11 @@ x-scraper-volumes: &scraper-volumes
     bind:
       create_host_path: true
   - type: bind
+    source: /path/to/onlyfans
+    target: /data/onlyfans
+    bind:
+      create_host_path: true
+  - type: bind
     source: /path/to/scrape/logs
     target: /var/log/scrape
     bind:
@@ -72,6 +77,8 @@ services:
   ig-creator:
     volumes: *scraper-volumes
   tw-creator:
+    volumes: *scraper-volumes
+  of-creator:
     volumes: *scraper-volumes
   scrape-upload:
     volumes: *scraper-volumes

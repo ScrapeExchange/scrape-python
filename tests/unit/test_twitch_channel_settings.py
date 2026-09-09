@@ -35,7 +35,11 @@ class TestChannelSettings(unittest.TestCase):
                 'broadcastSettings': {'title': 'Other creator'},
             }}},
         ], '', 'example', 'https://localhost')
-        self.assertEqual(creator.to_dict()['channel_settings'], {
+        self.assertNotIn('channel_settings', creator.to_dict())
+        self.assertEqual({key: creator.to_dict()[key] for key in (
+            'title', 'category_id', 'category_name', 'language',
+            'primary_color_hex',
+        )}, {
             'title': '', 'category_id': '42',
             'category_name': 'Example category', 'language': 'en',
             'primary_color_hex': 'AB12CD',
@@ -54,7 +58,9 @@ class TestChannelSettings(unittest.TestCase):
                             'broadcastSettings': {'title': 'Recorded'}}],
             }}},
         ], '', 'example', 'https://localhost')
-        self.assertNotIn('channel_settings', creator.to_dict())
+        self.assertIsNone(creator.title)
+        self.assertIsNone(creator.language)
+        self.assertIsNone(creator.category_id)
 
     def test_malformed_or_mismatched_settings_are_omitted(self) -> None:
         for settings in (
@@ -69,7 +75,9 @@ class TestChannelSettings(unittest.TestCase):
                         'broadcastSettings': settings,
                     }}},
                 ], '', 'example', 'https://localhost')
-                self.assertNotIn('channel_settings', creator.to_dict())
+                self.assertIsNone(creator.title)
+                self.assertIsNone(creator.language)
+                self.assertIsNone(creator.primary_color_hex)
 
     def test_website_settings_operations_are_selected_by_owner(self) -> None:
         for operation, variable in (
