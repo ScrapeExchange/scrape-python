@@ -79,6 +79,41 @@ services:
     command: ["tools/yt_rss_scrape.py"]
     container_name: yt-rss
 
+  yt-discover-search:
+    <<: *scraper-common
+    profiles: ["discovery"]
+    container_name: yt-discover-search
+    init: true
+    command:
+      - tools/yt_discover_search.py
+      - --proxy-files
+      - /data/proxies/vpn.proxies.lst
+      - --keyword-count
+      - "360000"
+      - --pid-file
+      - /run/discovery/yt_discover_search.pid
+      - --output-file
+      - /data/discovery/searched_channels.jsonl
+      - --log-file
+      - /dev/stdout
+      - --youtube-search-concurrency
+      - "2"
+    # Clear the PID file on restart; container PIDs can be reused.
+    tmpfs:
+      - /run/discovery
+    volumes:
+      - type: bind
+        source: ${HOME}/proxies
+        target: /data/proxies
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./data
+        target: /data/discovery
+        bind:
+          create_host_path: false
+
   tt-creator:
     <<: *scraper-common
     command: ["tools/tt_creator_scrape.py"]
