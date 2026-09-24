@@ -838,7 +838,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "p50 / p95 of the TCP handshake to the proxy on RSS fetches. Histograms only record fresh connection establishment — keep-alive reuse skips the trace event, so _count reflects new tunnels, not total fetches.",
+      "description": "p50 / p95 of the TCP handshake to the proxy on RSS fetches. Histograms only record fresh connection establishment \u2014 keep-alive reuse skips the trace event, so _count reflects new tunnels, not total fetches.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -949,7 +949,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "p50 / p95 of the HTTP CONNECT exchange (proxy dialing YouTube on our behalf) on RSS fetches. The gap between connect_tcp.complete and start_tls.started — i.e. the proxy backend's dial-out queue.",
+      "description": "p50 / p95 of the HTTP CONNECT exchange (proxy dialing YouTube on our behalf) on RSS fetches. The gap between connect_tcp.complete and start_tls.started \u2014 i.e. the proxy backend's dial-out queue.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1058,7 +1058,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "p50 / p95 of the TLS handshake to YouTube via the proxy tunnel on RSS fetches. Slowness here — with fast TCP and HTTP CONNECT — indicates YouTube is throttling TLS from the proxy's egress IP rather than provider-side queueing.",
+      "description": "p50 / p95 of the TLS handshake to YouTube via the proxy tunnel on RSS fetches. Slowness here \u2014 with fast TCP and HTTP CONNECT \u2014 indicates YouTube is throttling TLS from the proxy's egress IP rather than provider-side queueing.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1180,7 +1180,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "p50 / p95 of the TCP handshake to the proxy on YouTube HTML fetches (channel about-page, home, search, session warm-up). Sourced from curl's CURLINFO_CONNECT_TIME minus CURLINFO_NAMELOOKUP_TIME. Histograms only record fresh connection establishment — keep-alive reuse skips because curl reports 0 for the connect-related fields on reuse.",
+      "description": "p50 / p95 of the TCP handshake to the proxy on YouTube HTML fetches (channel about-page, home, search, session warm-up). Sourced from curl's CURLINFO_CONNECT_TIME minus CURLINFO_NAMELOOKUP_TIME. Histograms only record fresh connection establishment \u2014 keep-alive reuse skips because curl reports 0 for the connect-related fields on reuse.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1289,7 +1289,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "p50 / p95 of the TLS handshake (plus HTTP CONNECT tunnel exchange for proxied requests) on YouTube HTML fetches. Sourced from curl's CURLINFO_APPCONNECT_TIME minus CURLINFO_CONNECT_TIME. Note: curl reports app-connect cumulatively, so the HTTP CONNECT exchange cannot be split out separately as it is on RSS — both are bundled here. Slowness with fast TCP indicates YouTube is throttling TLS from the proxy's egress IP or the provider's CONNECT-tunnel queue is backed up.",
+      "description": "p50 / p95 of the TLS handshake (plus HTTP CONNECT tunnel exchange for proxied requests) on YouTube HTML fetches. Sourced from curl's CURLINFO_APPCONNECT_TIME minus CURLINFO_CONNECT_TIME. Note: curl reports app-connect cumulatively, so the HTTP CONNECT exchange cannot be split out separately as it is on RSS \u2014 both are bundled here. Slowness with fast TCP indicates YouTube is throttling TLS from the proxy's egress IP or the provider's CONNECT-tunnel queue is backed up.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1411,7 +1411,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "p50 / p95 of the TCP handshake to the proxy on InnerTube calls (channel.browse / video.player). Sourced from httpcore trace events on the third-party innertube library's httpx.Client session. Histograms only record fresh connection establishment — keep-alive reuse skips the trace event.",
+      "description": "p50 / p95 of the TCP handshake to the proxy on InnerTube calls (channel.browse / video.player). Sourced from httpcore trace events on the third-party innertube library's httpx.Client session. Histograms only record fresh connection establishment \u2014 keep-alive reuse skips the trace event.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1520,7 +1520,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "p50 / p95 of the HTTP CONNECT exchange (proxy dialing YouTube on our behalf) on InnerTube calls. Gap between connect_tcp.complete and start_tls.started — the proxy backend's dial-out queue.",
+      "description": "p50 / p95 of the HTTP CONNECT exchange (proxy dialing YouTube on our behalf) on InnerTube calls. Gap between connect_tcp.complete and start_tls.started \u2014 the proxy backend's dial-out queue.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1854,7 +1854,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Average requests per fresh TCP connection. A value of 1 means every request opens a fresh connection (worst case — full handshake cost per fetch). 10 means each connection serves 10 requests on average before the pool retires it. Higher is better; large differences across proxy_files indicate that some providers terminate the keep-alive earlier than others.",
+      "description": "Average requests per fresh TCP connection. A value of 1 means every request opens a fresh connection (worst case \u2014 full handshake cost per fetch). 10 means each connection serves 10 requests on average before the pool retires it. Higher is better; large differences across proxy_files indicate that some providers terminate the keep-alive earlier than others.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2307,7 +2307,7 @@
           "refId": "B"
         }
       ],
-      "title": "scrape.exchange API request p50/p95 by method × status_class",
+      "title": "scrape.exchange API request p50/p95 by method \u00d7 status_class",
       "type": "timeseries"
     },
     {
@@ -2315,7 +2315,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Number of yt-dlp extract_info calls currently in the thread pool. Pins near executor ceiling (≈12 per process) when GIL / executor is the bottleneck.",
+      "description": "Number of yt-dlp extract_info calls currently in the thread pool. Pins near executor ceiling (\u224812 per process) when GIL / executor is the bottleneck.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -3090,7 +3090,7 @@
           "refId": "B"
         }
       ],
-      "title": "RSS tier SLA — on-time vs overdue rate",
+      "title": "RSS tier SLA \u2014 on-time vs overdue rate",
       "type": "timeseries"
     },
     {
@@ -3321,7 +3321,7 @@
           "refId": "D"
         }
       ],
-      "title": "RSS — orphans / no-feed-limit / circuit-breaker",
+      "title": "RSS \u2014 orphans / no-feed-limit / circuit-breaker",
       "type": "timeseries"
     },
     {
@@ -3741,12 +3741,324 @@
       "type": "timeseries"
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Full channel scrape attempts completed in each hour: success, failure, terminal or superseded. A full scrape runs on every tenth successful channel refresh per the per-channel cadence stored in the queue.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 146
+      },
+      "id": 97,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (increase(channel_full_scrapes_total{job=~\"$job\",instance=~\"$instance\"}[1h]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Channel full scrapes (1h) by outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Histogram of video IDs added to the scrape queue per full channel scrape attempt, including zero. Wide spikes mean a large channel was successfully enumerated.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 146
+      },
+      "id": 98,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(channel_full_scrape_video_ids_added_bucket{job=~\"$job\",instance=~\"$instance\"}[1h])))",
+          "legendFormat": "p50",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(channel_full_scrape_video_ids_added_bucket{job=~\"$job\",instance=~\"$instance\"}[1h])))",
+          "legendFormat": "p95",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Channel full scrape: IDs added per attempt (p50/p95)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Video IDs processed by full channel scrapes per second, labelled found, existing, added, queue_known or failed. A climbing failed rate while added stays flat means queue or exchange delivery problems.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 154
+      },
+      "id": 99,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (rate(channel_full_scrape_video_ids_total{job=~\"$job\",instance=~\"$instance\"}[15m]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Channel full scrape: video IDs /s by outcome",
+      "type": "timeseries"
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 146
+        "y": 162
       },
       "id": 89,
       "panels": [],
@@ -3820,7 +4132,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 147
+        "y": 163
       },
       "id": 90,
       "options": {
@@ -3921,7 +4233,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 147
+        "y": 163
       },
       "id": 91,
       "options": {
@@ -3961,7 +4273,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 155
+        "y": 171
       },
       "id": 28,
       "panels": [],
@@ -4035,7 +4347,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 156
+        "y": 172
       },
       "id": 29,
       "options": {
@@ -4136,7 +4448,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 156
+        "y": 172
       },
       "id": 30,
       "options": {
@@ -4237,7 +4549,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 164
+        "y": 180
       },
       "id": 31,
       "options": {
@@ -4338,7 +4650,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 164
+        "y": 180
       },
       "id": 32,
       "options": {
@@ -4452,7 +4764,7 @@
   },
   "timepicker": {},
   "timezone": "",
-  "title": "YouTube scrapers — progress, failures & latency",
+  "title": "YouTube scrapers \u2014 progress, failures & latency",
   "uid": "scrape-youtube",
   "version": 62
 }

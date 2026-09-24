@@ -79,9 +79,14 @@ from scrape_exchange.youtube.exchange_channels_set import (
     RedisExchangeChannelsSet,
 )
 from scrape_exchange.channel_scrape_queue import (
+    ChannelScrapeProgress,
     ChannelScrapeQueueSettings,
     ChannelState,
     RedisChannelScrapeQueue,
+)
+from scrape_exchange.youtube.channel_video_refresh import (
+    FullScrapeSummary,
+    queue_channel_videos,
 )
 from scrape_exchange.youtube.settings import YouTubeScraperSettings
 from scrape_exchange.youtube.derived_metadata import (
@@ -293,7 +298,7 @@ class ChannelSettings(YouTubeScraperSettings):
         description=(
             'Delay before retrying a successful channel scrape '
             'that did not return a subscriber count. The retry '
-            'uses a full scrape and preserves the current tier.'
+            'refreshes metadata and preserves the current tier.'
         ),
     )
     channel_unavailable_soft_retry_seconds: int = Field(
@@ -628,6 +633,13 @@ async def _run_worker(
             httpx.AsyncClient(
                 timeout=10.0,
                 follow_redirects=True,
+                # worker_count scrapes (96) × per-scrape phases share
+                # this client; the default 100-connection pool caused
+                # PoolTimeout bursts during video existence checks.
+                limits=httpx.Limits(
+                    max_connections=192,
+                    max_keepalive_connections=64,
+                ),
             )
         )
         try:
@@ -1738,6 +1750,9 @@ async def _scrape_one_queued(
             outcome='error',
         ).inc()
         existence = None
+    progress: ChannelScrapeProgress = await queue.get_scrape_progress(
+        channel_id, existing=existence is True,
+    )
     scrape_decision: str
     channel_status: str
     if existence is True:
@@ -1750,8 +1765,16 @@ async def _scrape_one_queued(
         metadata_only = False
         scrape_decision = 'forced_full'
     elif force_mode == 'metadata':
-        metadata_only = True
-        scrape_decision = 'forced_metadata'
+        metadata_only = not (
+            meta.get('force_source') == 'missing_subscriber_count'
+            and progress.full_scrape_due
+        )
+        scrape_decision = (
+            'forced_metadata' if metadata_only else 'periodic_full'
+        )
+    elif existence is True and progress.full_scrape_due:
+        metadata_only = False
+        scrape_decision = 'periodic_full'
     else:
         if existence is None:
             metadata_only = False
@@ -1772,133 +1795,145 @@ async def _scrape_one_queued(
     }
     if force_mode:
         extra['force_rescrape_mode'] = force_mode
+    summary: FullScrapeSummary = FullScrapeSummary(channel_id)
+    full_outcome: str = 'failure'
     try:
-        channel: YouTubeChannel = (
-            await _do_scrape_channel_to_disk_typed(
-                settings, fm, handle, filename, extra,
-                metadata_only=metadata_only,
+        try:
+            channel: YouTubeChannel = (
+                await _do_scrape_channel_to_disk_typed(
+                    settings, fm, handle, filename, extra,
+                    metadata_only=metadata_only,
+                )
             )
-        )
-    except TopicChannelError as exc:
-        await _mark_topic_channel_queued(
-            queue, member, handle, force_mode,
-            last_error=str(exc),
-        )
-        return
-    except ChannelNoContentError as exc:
-        end_state: ChannelState | None = _channel_end_state(
-            exc.channel,
-        )
-        if end_state is not None:
-            await _mark_channel_end_state(
-                queue, member, channel_id, exc.channel, end_state,
-                force_mode=force_mode,
+        except TopicChannelError as exc:
+            await _mark_topic_channel_queued(
+                queue, member, handle, force_mode,
                 last_error=str(exc),
             )
             return
-        await queue.mark_soft_unavailable(
-            channel_id, last_error=str(exc),
-        )
-        CHANNEL_SCRAPE_OUTCOMES.labels(
-            outcome='soft_unavailable',
-        ).inc()
-        if force_mode:
-            CHANNEL_FORCE_RESCRAPE_TOTAL.labels(
-                mode=force_mode,
+        except ChannelNoContentError as exc:
+            end_state: ChannelState | None = _channel_end_state(
+                exc.channel,
+            )
+            if end_state is not None:
+                full_outcome = 'terminal'
+                await _mark_channel_end_state(
+                    queue, member, channel_id, exc.channel, end_state,
+                    force_mode=force_mode,
+                    last_error=str(exc),
+                )
+                return
+            await queue.mark_soft_unavailable(
+                channel_id, last_error=str(exc),
+            )
+            CHANNEL_SCRAPE_OUTCOMES.labels(
                 outcome='soft_unavailable',
             ).inc()
-        return
-    except ChannelNotFoundError as exc:
-        terminal: bool = await queue.mark_not_found_confirmed(
-            member,
-            last_error=str(exc),
-        )
-        CHANNEL_SCRAPE_OUTCOMES.labels(
-            outcome='not_found' if terminal else 'backoff',
-        ).inc()
-        if force_mode:
-            CHANNEL_FORCE_RESCRAPE_TOTAL.labels(
-                mode=force_mode,
-                outcome='not_found',
+            if force_mode:
+                CHANNEL_FORCE_RESCRAPE_TOTAL.labels(
+                    mode=force_mode,
+                    outcome='soft_unavailable',
+                ).inc()
+            return
+        except ChannelNotFoundError as exc:
+            terminal: bool = await queue.mark_not_found_confirmed(
+                member,
+                last_error=str(exc),
+            )
+            CHANNEL_SCRAPE_OUTCOMES.labels(
+                outcome='not_found' if terminal else 'backoff',
             ).inc()
-        return
-    except ChannelTerminatedError as exc:
-        await queue.mark(
-            member,
-            state=ChannelState.TERMINATED,
-            last_error=str(exc),
-        )
-        CHANNEL_SCRAPE_OUTCOMES.labels(
-            outcome='terminated',
-        ).inc()
-        if force_mode:
-            CHANNEL_FORCE_RESCRAPE_TOTAL.labels(
-                mode=force_mode,
+            if force_mode:
+                CHANNEL_FORCE_RESCRAPE_TOTAL.labels(
+                    mode=force_mode,
+                    outcome='not_found',
+                ).inc()
+            return
+        except ChannelTerminatedError as exc:
+            await queue.mark(
+                member,
+                state=ChannelState.TERMINATED,
+                last_error=str(exc),
+            )
+            CHANNEL_SCRAPE_OUTCOMES.labels(
                 outcome='terminated',
             ).inc()
-        return
-    except (RuntimeError, OSError) as exc:
-        await queue.mark_soft_unavailable(
-            channel_id, last_error=str(exc),
-        )
-        CHANNEL_SCRAPE_OUTCOMES.labels(
-            outcome='soft_unavailable',
-        ).inc()
-        if force_mode:
-            CHANNEL_FORCE_RESCRAPE_TOTAL.labels(
-                mode=force_mode,
+            if force_mode:
+                CHANNEL_FORCE_RESCRAPE_TOTAL.labels(
+                    mode=force_mode,
+                    outcome='terminated',
+                ).inc()
+            return
+        except (RuntimeError, OSError) as exc:
+            await queue.mark_soft_unavailable(
+                channel_id, last_error=str(exc),
+            )
+            CHANNEL_SCRAPE_OUTCOMES.labels(
                 outcome='soft_unavailable',
             ).inc()
-        return
-    await _self_heal_identity(channel, identity, name_map)
-    if channel.subscriber_count is not None:
-        await queue.set_meta(
-            member,
-            subscriber_count=str(channel.subscriber_count),
-        )
-    end_state: ChannelState | None = _channel_end_state(channel)
-    if end_state is not None:
-        await _mark_channel_end_state(
-            queue, member, channel_id, channel, end_state,
-            force_mode=force_mode,
-        )
-        return
-    if channel.subscriber_count is None:
-        logging.warning(
-            'Channel scrape returned no subscriber count; '
-            'scheduling a full retry',
-            extra={
-                'channel_id': channel_id,
-                'channel_handle': channel.channel_handle or '',
-            },
-        )
-        await queue.retry_missing_subscriber_count(
-            channel_id=channel_id,
+            if force_mode:
+                CHANNEL_FORCE_RESCRAPE_TOTAL.labels(
+                    mode=force_mode,
+                    outcome='soft_unavailable',
+                ).inc()
+            return
+        summary.video_ids_found = len(channel.video_ids)
+        await _self_heal_identity(channel, identity, name_map)
+        if channel.subscriber_count is not None:
+            await queue.set_meta(
+                member,
+                subscriber_count=str(channel.subscriber_count),
+            )
+        end_state: ChannelState | None = _channel_end_state(channel)
+        if end_state is not None:
+            full_outcome = 'terminal'
+            await _mark_channel_end_state(
+                queue, member, channel_id, channel, end_state,
+                force_mode=force_mode,
+            )
+            return
+        if not metadata_only:
+            await queue_channel_videos(
+                channel,
+                redis=creator_map_backend.redis_client,
+                http_client=http_client,
+                exchange_url=settings.exchange_url,
+                video_fm=AssetFileManagement(settings.video_data_directory),
+                summary=summary,
+            )
+        committed: bool | None = await queue.update_tier(
+            channel_id,
+            sub_count=channel.subscriber_count,
             now=time.time(),
+            progress=progress,
+            full_scrape=not metadata_only,
         )
-        CHANNEL_SCRAPE_OUTCOMES.labels(
-            outcome='subscriber_count_missing',
-        ).inc()
+        if committed is False:
+            full_outcome = 'superseded'
+            return
+        if channel.subscriber_count is None:
+            logging.info(
+                'Channel scrape completed without subscriber count; '
+                'scheduling a metadata refresh',
+                extra=extra,
+            )
+        elif force_mode:
+            await queue.clear_force_rescrape(member)
         if force_mode:
             CHANNEL_FORCE_RESCRAPE_TOTAL.labels(
                 mode=force_mode,
-                outcome='subscriber_count_missing',
+                outcome='scraped',
             ).inc()
-        return
-    await queue.update_tier(
-        channel_id,
-        sub_count=channel.subscriber_count,
-        now=time.time(),
-    )
-    if force_mode:
-        await queue.clear_force_rescrape(member)
-        CHANNEL_FORCE_RESCRAPE_TOTAL.labels(
-            mode=force_mode,
-            outcome='scraped',
+        CHANNEL_SCRAPE_OUTCOMES.labels(
+            outcome=(
+                'subscriber_count_missing'
+                if channel.subscriber_count is None else 'scraped'
+            ),
         ).inc()
-    CHANNEL_SCRAPE_OUTCOMES.labels(
-        outcome='scraped',
-    ).inc()
+        full_outcome = 'success'
+    finally:
+        if not metadata_only:
+            summary.report(full_outcome)
 
 
 def normalize_channel_name(channel_handle: str) -> str:
@@ -2332,6 +2367,7 @@ async def _try_scrape_channel_typed(
             max_videos_per_channel=0,
             proxies=settings.proxies,
             with_video_ids=not metadata_only,
+            require_complete_video_ids=not metadata_only,
         )
     except ValueError as exc:
         logging.debug(

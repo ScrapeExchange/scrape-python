@@ -112,6 +112,7 @@ SocialNetworks: dict[str, str] = {
     'soundcloud': 'SoundCloud',
     'onlyfans': 'OnlyFans',
     'vevo': 'Vevo',
+    'bbc': 'BBC',
     'vk': 'VK',
     'threads': 'Threads',
     'zoom': 'Zoom',
