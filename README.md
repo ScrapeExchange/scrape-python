@@ -107,95 +107,7 @@ for scraping" below to feed YouTube work, or with "TikTok Scrapers" for TikTok c
 
 Channels enter the system through the Redis-backed channel scrape queue. The `tools/yt_channel_queue.py`
 CLI is the operator interface for that queue: add, remove, search, mark, count, and bulk-import channels.
-
-The tool reads `REDIS_DSN` from `.env`, so the same credentials and connection string used by the scrapers apply.
-
-### Add a single channel
-
-```bash
-# By handle (with or without the leading @)
-PYTHONPATH=. uv run tools/yt_channel_queue.py add @veritasium
-
-# By channel ID
-PYTHONPATH=. uv run tools/yt_channel_queue.py add UCHnyfMqiRRG1u-2MsSQLbXA
-
-# Multiple entries in one call
-PYTHONPATH=. uv run tools/yt_channel_queue.py add \
-    @veritasium @kurzgesagt UCHnyfMqiRRG1u-2MsSQLbXA
-```
-
-Resolvable inputs (a full `UC…` ID, or a handle whose `(creator_id, handle)` mapping is already in the
-identity store) are enqueued directly on the scheduled queue. Bare handles that the queue can't resolve yet
-are enqueued on the unresolved queue and the channel scraper resolves them lazily.
-
-### Bulk import from a file
-
-```bash
-PYTHONPATH=. uv run tools/yt_channel_queue.py import channels.lst
-```
-
-The file contains one entry per line — a `UC…` ID, an `@handle`, or a JSON object with `channel_id` and/or `channel_handle` fields.
-
-### Read from stdin
-
-```bash
-cat channels.lst \
-  | PYTHONPATH=. uv run tools/yt_channel_queue.py add -
-```
-
-Useful for piping discovery output (see `tools/yt_discover_channels.py`) straight into the queue.
-
-### Inspect and manage the queue
-
-```bash
-# Counts across all states
-PYTHONPATH=. uv run tools/yt_channel_queue.py stats
-
-# How many channels in tier 0 (highest priority)?
-PYTHONPATH=. uv run tools/yt_channel_queue.py count --tier 0
-
-# Show metadata for one channel
-PYTHONPATH=. uv run tools/yt_channel_queue.py show @veritasium
-
-# Search by handle / channel_id / name
-PYTHONPATH=. uv run tools/yt_channel_queue.py search --by handle veri
-
-# Re-scrape a channel even if it was recently scraped
-PYTHONPATH=. uv run tools/yt_channel_queue.py rescrape @veritasium
-
-# Force a full channel-content scrape, including video_ids
-PYTHONPATH=. uv run tools/yt_channel_queue.py rescrape \
-    --mode full @veritasium
-
-# Force a metadata-only scrape, without video_ids
-PYTHONPATH=. uv run tools/yt_channel_queue.py rescrape \
-    --mode metadata @veritasium
-
-# Remove from the queue
-PYTHONPATH=. uv run tools/yt_channel_queue.py remove @veritasium
-
-# Mark a terminal state (not_found, terminated, topic,
-# no_videos, low_subs, etc.)
-PYTHONPATH=. uv run tools/yt_channel_queue.py mark @veritasium not_found
-```
-
-Run `yt_channel_queue.py --help` for the full
-subcommand list.
-
-For bulk operator workflows, the channel scraper also drains its
-priority directory. Drop a bare `UC...` channel ID, `@handle`, or
-bare handle filename there to resolve and enqueue it at priority;
-Redis-mode drains rename accepted entries to `.processed` and
-resolution failures to `.failed` for audit.
-
-### Running the CLI in a container
-
-If you don't want to install `uv` on the host, run the
-CLI inside the existing `yt-channel` image:
-```bash
-docker compose run --rm yt-channel \
-    tools/yt_channel_queue.py add @veritasium
-```
+See [YOUTUBE.md](YOUTUBE.md) for the full CLI walkthrough and examples.
 
 ## Mapping host directories into containers
 
@@ -516,92 +428,13 @@ PYTHONPATH=. uv run tools/listen_messages.py
 The first time you run one of the tools, or after you pull new changes from the repository, `uv` will automatically install any new dependencies specified in the `pyproject.toml` file. After that, it will run the tool using the installed dependencies.
 
 ## YouTube Scrapers
-There are five tools available in this repository for scraping YouTube content and uploading it to the [scrape.exchange](https://scrape.exchange): three scrapers (`yt_channel_scrape.py`, `yt_rss_scrape.py`, `yt_video_scrape.py`) and two uploaders (`yt_channel_upload.py`, `yt_video_upload.py`).
 
-To scrape one or more YouTube channels, you enqueue them on the Redis-backed channel scrape queue with `tools/yt_channel_queue.py` (see "Queueing channels for scraping" above). Each entry is a `UC…` channel-ID, an `@handle`, or a JSON object combining both. The channel scraper pops entries off this queue, resolves identity through the shared Redis identity maps (`youtube:creator_map`, `youtube:handle_map`, `youtube:name_map`), and saves the scraped channel data to `YOUTUBE_CHANNEL_DATA_DIR`. The RSS scraper polls each known channel's RSS feed for newly published videos and enqueues their IDs onto the Redis video scrape queue. The video scraper consumes that queue and writes per-video JSON files to `YOUTUBE_VIDEO_DATA_DIR`. The channel and video uploaders then POST the scraped files to the Scrape.Exchange API.
-
-The data flow between the tools is:
-
-```
-yt_channel_queue.py  -> Redis channel scrape queue
-                                │
-                                ▼
-                       yt_channel_scrape.py -> YOUTUBE_CHANNEL_DATA_DIR
-                                                       │
-                                                       ▼
-                                              yt_channel_upload.py -> scrape.exchange
-
-RSS feeds  -> yt_rss_scrape.py  -> Redis video scrape queue
-                                          │
-                                          ▼
-                                  yt_video_scrape.py  -> YOUTUBE_VIDEO_DATA_DIR
-                                                                │
-                                                                ▼
-                                                       yt_video_upload.py -> scrape.exchange
-```
-
-The data directories store files after scraping. Upon successful upload of the data to the API, the files are moved to a subdirectory called "uploaded", so you can keep track of which data has been uploaded and which is still pending. The uploaders also run in watch mode by default (`CHANNEL_UPLOAD_WATCH=true`, `VIDEO_UPLOAD_WATCH=true`), so any new files dropped into the data directories are picked up automatically.
-
-Data is stored in these directories in compressed JSON files with the .json.br extension. The files are compressed using Brotli to save disk space. Each file contains the metadata for a single channel or video. The filename format is `channel-<channel_handle>.json.br` for channels, `video-min-<video_id>.json.br` for InnerTube-only video records, and `video-dlp-<video_id>.json.br` for records augmented with yt-dlp. By default the video scraper produces "min" files only; set `VIDEO_USE_YT_DLP=true` to additionally run yt-dlp and produce "dlp" files (formats, captions, heatmaps, etc.). You will also see files in the data directory with extensions like `.unresolved`, `.not_found`, and `_failed`, which indicate channels or videos that could not be scraped successfully.
-
-These scripts share a set of command line arguments, which can also be set using environment variables. They also support `.env` files, which is easiest to use. A sample .env file is included in the repository as `.env-example`.
-- **yt_channel_queue.py** (operator CLI): Adds, removes, searches and inspects entries on the Redis channel scrape queue. This is how channels enter the system.
-- **yt_channel_scrape.py**: Pops channels from the Redis channel scrape queue, scrapes them (about page, video/playlist/community tabs, merch, etc.) using the InnerTube API, and saves the scraped metadata as JSON files in `YOUTUBE_CHANNEL_DATA_DIR`.
-- **yt_channel_upload.py**: Watches `YOUTUBE_CHANNEL_DATA_DIR` (and its priority sub-directory) and uploads channel files to the Scrape.Exchange API.
-- **yt_rss_scrape.py**: For each known channel, polls the YouTube RSS feed for newly published videos and enqueues their IDs onto the Redis video scrape queue. It also writes lite channel-stat records (subscriber/view/video counts) as `channel-rss-<handle>.json.br` into `YOUTUBE_CHANNEL_DATA_DIR` for the channel uploader to POST.
-- **yt_video_scrape.py**: Consumes the Redis video scrape queue and writes per-video JSON files to `YOUTUBE_VIDEO_DATA_DIR`. Uses InnerTube by default; opts in to yt-dlp via `VIDEO_USE_YT_DLP=true`.
-- **yt_video_upload.py**: Watches `YOUTUBE_VIDEO_DATA_DIR` (and its priority sub-directory) and uploads video files to the Scrape.Exchange API.
-
-These scripts use a rate limiter to avoid making too many requests to YouTube in a short period of time, which can trigger bot detection and lead to temporary or permanent bans. The rate limiter is implemented in the `YouTubeRateLimiter` class in the `youtube_rate_limiter.py` module. The rate limiter uses a token bucket algorithm to limit the number of requests that can be made in a given time period. The rate limits are based on the observed behavior of YouTube's bot detection mechanisms, but they may need to be adjusted over time as YouTube changes its algorithms.
-The rate limiter is tuned to comply with the soft-limits from this table:
-
-### YouTube Rate Limits (Observed / Reverse-Engineered)
-
-> **Note:** YouTube does not publish official rate limits. All values below are
-> community-observed and subject to change without notice.
-
-## Rate Limit Summary
-
-| Method | Soft Limit | Hard Limit | Ban Type | yt_channel_scrape | yt_rss_scrape | yt_video_scrape |
-|---|---|---|---|---|---|---|
-| HTTP GET (no cookies) | ~1 req/s | ~5k/day/IP | Silent degradation | — | `RSS` | — |
-| HTTP GET (with cookies) | ~3–5 req/s | ~20k/day/IP | Captcha redirect | `HTML` | — | — |
-| Innertube (no context) | ~60 req/min | Variable | HTTP 429 | — | — | — |
-| Innertube (valid context) | ~300–600 req/min | ~10 min sliding window | HTTP 429, recoverable | `BROWSE` | `BROWSE` `PLAYER` `NEXT` | `PLAYER` `NEXT` |
-| yt-dlp (no cookies) | ~500 channels/hr | Variable | HTTP 429 + IP block | — | — | — |
-| yt-dlp (with cookies) | ~1,000 channels/hr | Variable | HTTP 429, recoverable | — | — | `PLAYER` |
-| Data API v3 | ~100 req/s | 10,000 units/day | Hard 429 until midnight PT reset | — | — | — |
-
-### Rate Limiter Token Buckets
-
-The `YouTubeRateLimiter` enforces a separate token bucket per call type, plus a shared global bucket across all types. Each scraping tool draws from the buckets shown below.
-
-| Token | Burst | Sustained rate | Jitter | yt_channel_scrape | yt_rss_scrape | yt_video_scrape | Endpoint |
-|---|---|---|---|---|---|---|---|
-| `BROWSE` | 20 | ~150 req/min | 0.3–1.2 s | ✓ channel tabs | ✓ channel update | — | InnerTube `browse` |
-| `PLAYER` | 3 | ~20 req/min¹ | 1.0–3.0 s | — | ✓ per-video | ✓ per-video | InnerTube `player` + yt-dlp |
-| `NEXT` | 20 | ~150 req/min | 0.3–1.0 s | — | ✓ per-video | ✓ per-video | InnerTube `next` |
-| `HTML` | 10 | ~90 req/min | 1.5–4.0 s | ✓ about page | — | — | HTTP page scrape |
-| `RSS` | 15 | ~60 req/min | 0.2–0.8 s | — | ✓ per channel | — | YouTube RSS XML feed |
-| *(global)* | 30 | ~300 req/min | none | shared | shared | shared | aggregate IP ceiling |
-
-> ¹ yt-dlp issues ~5 sub-requests per `extract_info` call, so the PLAYER bucket is sized for 20 tokens/min ≈ 100 actual YouTube requests/min at steady state.
-
-## Notes
-
-- **HTTP GETs** rarely return a hard 429 — YouTube silently serves degraded or
-  bot-detected pages instead, making failures invisible without response validation.
-- **Innertube** limits are per-IP on a sliding ~10-minute window. A valid
-  `INNERTUBE_CONTEXT` (matching browser fingerprint, cookies, consent state)
-  significantly raises effective limits.
-- **yt-dlp** with `--cookies-from-browser chrome` is the single biggest factor
-  in raising limits — it makes requests indistinguishable from a real browser session.
-- **Data API v3** quota resets daily at midnight Pacific Time. `search.list`
-  costs 100 units/call and should be avoided for bulk work; `channels.list`
-  costs 1 unit/call with up to 50 IDs per request.
-- **with cookies** means using a valid browser cookie jar with consent cookies and optionally authenticated session cookies.
-- Datacenter IPs are penalised much more aggressively than residential IPs
-  across all methods.
+The YouTube tooling — three scrapers (`yt_channel_scrape.py`,
+`yt_rss_scrape.py`, `yt_video_scrape.py`), two uploaders
+(`yt_channel_upload.py`, `yt_video_upload.py`), and the operator CLI
+(`yt_channel_queue.py`) — is documented in [YOUTUBE.md](YOUTUBE.md),
+including the pipeline data flow, the observed rate limits and
+token-bucket configuration, and the scraping strategy for each tool.
 
 ## TikTok Scrapers
 
@@ -681,6 +514,57 @@ TikTok upload schema selection is configured with
 uploaders pass `platform=tiktok` and the relevant entity
 (`creator` or `video`) when fetching the JSON Schema from
 the exchange.
+
+## The generic scrape queue CLI (`scrape_queue.py`)
+
+`tools/scrape_queue.py` is the platform-agnostic operator
+CLI for scrape queues. It holds no platform logic of its
+own: it resolves a `(platform, entity)` adapter from
+`scrape_exchange.queue_admin` and dispatches subcommands
+to it. It defaults to `--platform tiktok --entity
+creator`; use `--platform`/`--entity` to target other
+platforms (Twitch and Instagram creators, OnlyFans
+creators, and so on).
+
+> **Do not use `scrape_queue.py` for YouTube.** The
+> YouTube queues have their own dedicated operator CLI,
+> `tools/yt_channel_queue.py`, which understands YouTube's
+> tiered priority queues, channel identity resolution, and
+> re-scrape modes. `scrape_queue.py` has no YouTube
+> adapter and cannot manage the YouTube channel or video
+> scrape queues. See [YOUTUBE.md](YOUTUBE.md) for
+> `yt_channel_queue.py` usage.
+
+### Usage
+
+```bash
+PYTHONPATH=. uv run tools/scrape_queue.py -h
+
+# Add entries (defaults to the TikTok creator queue)
+PYTHONPATH=. uv run tools/scrape_queue.py add @username
+
+# Target a specific platform/entity
+PYTHONPATH=. uv run tools/scrape_queue.py \
+    --platform twitch --entity creator add somecreator
+
+# Queue statistics and per-entry inspection
+PYTHONPATH=. uv run tools/scrape_queue.py stats
+PYTHONPATH=. uv run tools/scrape_queue.py show @username
+PYTHONPATH=. uv run tools/scrape_queue.py search --by handle someuser
+
+# Remove an entry or schedule a re-scrape
+PYTHONPATH=. uv run tools/scrape_queue.py remove @username
+PYTHONPATH=. uv run tools/scrape_queue.py rescrape @username
+
+# Bulk import / export
+PYTHONPATH=. uv run tools/scrape_queue.py import creators.lst
+PYTHONPATH=. uv run tools/scrape_queue.py export creators-out.lst
+```
+
+The tool reads `REDIS_DSN` from `.env`, so the same
+credentials and connection string used by the scrapers
+apply. Run `<subcommand> -h` for the options of each
+subcommand.
 
 ## Websocket listener
 With tools/listen_messages.py, you can listen to the websocket for new channels and videos being uploaded to the [scrape.exchange](https://scrape.exchange). This is useful for testing and debugging, as well as for getting real-time updates on new content being uploaded to the exchange. Depending on your filtering criteria, this can be a very high volume of messages, so use it with caution.

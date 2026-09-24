@@ -746,7 +746,7 @@ class TestUpdateTier(_RedisQueueTestBase):
 
 class TestRetryMissingSubscriberCount(_RedisQueueTestBase):
 
-    async def test_preserves_tier_and_schedules_full_retry(
+    async def test_preserves_tier_and_schedules_metadata_retry(
         self,
     ) -> None:
         settings: ChannelScrapeQueueSettings = (
@@ -786,7 +786,7 @@ class TestRetryMissingSubscriberCount(_RedisQueueTestBase):
         )
         self.assertEqual(meta.get('state'), 'scheduled')
         self.assertEqual(meta.get('last_attempt_at'), '100')
-        self.assertEqual(meta.get('force_rescrape_mode'), 'full')
+        self.assertEqual(meta.get('force_rescrape_mode'), 'metadata')
         self.assertEqual(
             meta.get('force_source'),
             'missing_subscriber_count',

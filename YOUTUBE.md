@@ -147,6 +147,64 @@ Most "failures" in this scraper are legitimate empty
 channels (counted by `channel_no_content_found_total`) —
 subtract them before raising alarms about failure rate.
 
+### Periodic channel video discovery
+
+The Redis channel scraper enumerates all video IDs on the
+initial successful scrape, then on successful scrapes 11,
+21, and so on. Other refreshes fetch channel metadata.
+Redis stores `successful_scrapes` and `next_full_scrape` in
+`youtube:channel:meta:i:<channel_id>`, shared across
+workers and hosts. Existing channels without these fields
+start with an initial-scrape baseline; their tenth
+successful refresh after rollout performs full enumeration.
+
+Each full scrape adds missing videos to the Redis video
+scrape queue. Uploaded IDs, local video output files, and
+videos already present on scrape.exchange are skipped.
+Normal enqueue also preserves existing queue entries and
+terminal states. Enumeration, persistence, lookup, or
+enqueue failures do not advance the cadence. Partial
+delivery is safe to retry. Only successful, schedulable
+channel scrapes advance the counter; terminal channels
+retain their existing workflow behavior.
+
+Forced full scrapes also discover missing videos without
+shifting an upcoming periodic refresh. Forced metadata
+scrapes leave a due full scrape pending for the next
+ordinary refresh.
+
+A missing subscriber count does not block video discovery
+or completion. The scraper preserves the current tier and
+any previously known count, and retries metadata after
+`CHANNEL_MISSING_SUBSCRIBER_RETRY_SECONDS` (default:
+24 hours). These automatic metadata retries still respect
+the periodic full-scrape cadence. Missing counts remain
+unknown, not zero.
+
+Every full attempt logs its `channel_id`, outcome,
+`video_ids_found`, `video_ids_existing`,
+`video_ids_added`, `video_ids_queue_known`, and
+`video_ids_failed`. The message includes the actual number
+added, including zero and partial additions before a
+failure. Prometheus exposes:
+
+- `channel_full_scrapes_total{outcome}`: completed,
+  failed, terminal, or superseded attempts (`success`,
+  `failure`, `terminal`, `superseded`).
+- `channel_full_scrape_video_ids_total{outcome}`: counts
+  labelled `found`, `existing`, `added`, `queue_known`, or
+  `failed`.
+- `channel_full_scrape_video_ids_added`: histogram of IDs
+  added per full attempt, including zero; `_sum` gives
+  total additions.
+
+Channel IDs appear only in logs, not metric labels. To
+inspect additions:
+
+```promql
+sum(rate(channel_full_scrape_video_ids_total{outcome="added"}[15m]))
+```
+
 ## 3. RSS scraper (`yt_rss_scrape.py`)
 
 ### What it does
@@ -340,6 +398,64 @@ file backend on the local host, and beyond that to
 per-process in-memory buckets. Multi-host coordination
 requires Redis.
 
+### Rate limits (observed / reverse-engineered)
+
+> **Note:** YouTube does not publish official rate
+> limits. All values below are community-observed and
+> subject to change without notice.
+
+| Method | Soft Limit | Hard Limit | Ban Type | yt_channel_scrape | yt_rss_scrape | yt_video_scrape |
+|---|---|---|---|---|---|---|
+| HTTP GET (no cookies) | ~1 req/s | ~5k/day/IP | Silent degradation | — | `RSS` | — |
+| HTTP GET (with cookies) | ~3–5 req/s | ~20k/day/IP | Captcha redirect | `HTML` | — | — |
+| Innertube (no context) | ~60 req/min | Variable | HTTP 429 | — | — | — |
+| Innertube (valid context) | ~300–600 req/min | ~10 min sliding window | HTTP 429, recoverable | `BROWSE` | `BROWSE` `PLAYER` `NEXT` | `PLAYER` `NEXT` |
+| yt-dlp (no cookies) | ~500 channels/hr | Variable | HTTP 429 + IP block | — | — | — |
+| yt-dlp (with cookies) | ~1,000 channels/hr | Variable | HTTP 429, recoverable | — | — | `PLAYER` |
+| Data API v3 | ~100 req/s | 10,000 units/day | Hard 429 until midnight PT reset | — | — | — |
+
+### Rate limiter token buckets
+
+The `YouTubeRateLimiter` enforces a separate token bucket
+per call type, plus a shared global bucket across all
+types. Each scraping tool draws from the buckets shown
+below.
+
+| Token | Burst | Sustained rate | Jitter | yt_channel_scrape | yt_rss_scrape | yt_video_scrape | Endpoint |
+|---|---|---|---|---|---|---|---|
+| `BROWSE` | 20 | ~150 req/min | 0.3–1.2 s | ✓ channel tabs | ✓ channel update | — | InnerTube `browse` |
+| `PLAYER` | 3 | ~20 req/min¹ | 1.0–3.0 s | — | ✓ per-video | ✓ per-video | InnerTube `player` + yt-dlp |
+| `NEXT` | 20 | ~150 req/min | 0.3–1.0 s | — | ✓ per-video | ✓ per-video | InnerTube `next` |
+| `HTML` | 10 | ~90 req/min | 1.5–4.0 s | ✓ about page | — | — | HTTP page scrape |
+| `RSS` | 15 | ~60 req/min | 0.2–0.8 s | — | ✓ per channel | — | YouTube RSS XML feed |
+| *(global)* | 30 | ~300 req/min | none | shared | shared | shared | aggregate IP ceiling |
+
+> ¹ yt-dlp issues ~5 sub-requests per `extract_info` call,
+> so the PLAYER bucket is sized for 20 tokens/min ≈ 100
+> actual YouTube requests/min at steady state.
+
+Notes:
+
+- **HTTP GETs** rarely return a hard 429 — YouTube
+  silently serves degraded or bot-detected pages instead,
+  making failures invisible without response validation.
+- **Innertube** limits are per-IP on a sliding ~10-minute
+  window. A valid `INNERTUBE_CONTEXT` (matching browser
+  fingerprint, cookies, consent state) significantly
+  raises effective limits.
+- **yt-dlp** with `--cookies-from-browser chrome` is the
+  single biggest factor in raising limits — it makes
+  requests indistinguishable from a real browser session.
+- **Data API v3** quota resets daily at midnight Pacific
+  Time. `search.list` costs 100 units/call and should be
+  avoided for bulk work; `channels.list` costs 1
+  unit/call with up to 50 IDs per request.
+- **with cookies** means using a valid browser cookie jar
+  with consent cookies and optionally authenticated
+  session cookies.
+- Datacenter IPs are penalised much more aggressively
+  than residential IPs across all methods.
+
 ### Proxy slicing
 
 When `*_NUM_PROCESSES > 1`, the supervisor splits the
@@ -360,7 +476,111 @@ maps; the video scraper trusts the RSS scraper to stamp
 them onto each video. The uploaders trust whatever is on
 disk. See `CONTEXT.md` for the full identity model.
 
-## 6. Observability
+## 6. Operator queue CLI (`yt_channel_queue.py`)
+
+Channels enter the system through the Redis-backed
+channel scrape queue. The `tools/yt_channel_queue.py` CLI
+is the operator interface for that queue: add, remove,
+search, mark, count, and bulk-import channels. It reads
+`REDIS_DSN` from `.env`, so the same credentials and
+connection string used by the scrapers apply.
+
+### Add a single YouTube channel
+
+```bash
+# By handle (with or without the leading @)
+PYTHONPATH=. uv run tools/yt_channel_queue.py add @veritasium
+
+# By channel ID
+PYTHONPATH=. uv run tools/yt_channel_queue.py add UCHnyfMqiRRG1u-2MsSQLbXA
+
+# Multiple entries in one call
+PYTHONPATH=. uv run tools/yt_channel_queue.py add \
+    @veritasium @kurzgesagt UCHnyfMqiRRG1u-2MsSQLbXA
+```
+
+Resolvable inputs (a full `UC…` ID, or a handle whose
+`(creator_id, handle)` mapping is already in the identity
+store) are enqueued directly on the scheduled queue. Bare
+handles that the queue can't resolve yet are enqueued on
+the unresolved queue and the channel scraper resolves them
+lazily.
+
+### Bulk import from a file
+
+```bash
+PYTHONPATH=. uv run tools/yt_channel_queue.py import channels.lst
+```
+
+The file contains one entry per line — a `UC…` ID, an
+`@handle`, or a JSON object with `channel_id` and/or
+`channel_handle` fields.
+
+### Read from stdin
+
+```bash
+cat channels.lst \
+  | PYTHONPATH=. uv run tools/yt_channel_queue.py add -
+```
+
+Useful for piping discovery output (see
+`tools/yt_discover_channels.py`) straight into the queue.
+
+### Inspect and manage the queue
+
+```bash
+# Counts across all states
+PYTHONPATH=. uv run tools/yt_channel_queue.py stats
+
+# How many channels in tier 0 (highest priority)?
+PYTHONPATH=. uv run tools/yt_channel_queue.py count --tier 0
+
+# Show metadata for one channel
+PYTHONPATH=. uv run tools/yt_channel_queue.py show @veritasium
+
+# Search by handle / channel_id / name
+PYTHONPATH=. uv run tools/yt_channel_queue.py search --by handle veri
+
+# Re-scrape a channel even if it was recently scraped
+PYTHONPATH=. uv run tools/yt_channel_queue.py rescrape @veritasium
+
+# Force a full channel-content scrape, including video_ids
+PYTHONPATH=. uv run tools/yt_channel_queue.py rescrape \
+    --mode full @veritasium
+
+# Force a metadata-only scrape, without video_ids
+PYTHONPATH=. uv run tools/yt_channel_queue.py rescrape \
+    --mode metadata @veritasium
+
+# Remove from the queue
+PYTHONPATH=. uv run tools/yt_channel_queue.py remove @veritasium
+
+# Mark a terminal state (not_found, terminated, topic,
+# no_videos, low_subs, etc.)
+PYTHONPATH=. uv run tools/yt_channel_queue.py mark @veritasium not_found
+```
+
+Run `yt_channel_queue.py --help` for the full subcommand
+list.
+
+For bulk operator workflows, the channel scraper also
+drains its priority directory. Drop a bare `UC...` channel
+ID, `@handle`, or bare handle filename there to resolve
+and enqueue it at priority; Redis-mode drains rename
+accepted entries to `.processed` and resolution failures
+to `.failed` for audit.
+
+### Running the CLI in a container
+
+If you don't want to install `uv` on the host, run the CLI
+inside the existing `yt-channel` image:
+
+```bash
+docker compose run --rm yt-channel \
+    tools/yt_channel_queue.py add @veritasium
+```
+
+## 7. Observability
 
 Per-scraper KPI walkthroughs (which Prometheus panels to
 read, in what order, when throughput drops or queues

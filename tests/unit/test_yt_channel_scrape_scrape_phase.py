@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from scrape_exchange.channel_scrape_queue import (
+    ChannelScrapeProgress,
     ChannelState,
 )
 from scrape_exchange.file_management import AssetFileManagement
@@ -14,6 +15,22 @@ from scrape_exchange.youtube.channel_identity import (
     ChannelNotFoundError,
 )
 from scrape_exchange.watchdog import Watchdog
+
+
+def _mock_queue() -> AsyncMock:
+    queue: AsyncMock = AsyncMock()
+    queue.get_scrape_progress.return_value = ChannelScrapeProgress(1, 11)
+    return queue
+
+
+class ScrapePhaseTestCase(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        # These tests isolate channel outcomes. Real video delivery and
+        # Redis progress are covered in test_channel_video_refresh.
+        self.enterContext(patch(
+            'tools.yt_channel_scrape.queue_channel_videos',
+            new_callable=AsyncMock,
+        ))
 
 
 def _mock_settings() -> MagicMock:
@@ -66,14 +83,14 @@ class TestChannelEndState(unittest.TestCase):
 
 
 class TestScrapeOne(
-    unittest.IsolatedAsyncioTestCase,
+    ScrapePhaseTestCase,
 ):
 
     async def test_topic_handle_marks_invalid_without_scrape(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            queue = AsyncMock()
+            queue = _mock_queue()
             creator_map = AsyncMock()
             creator_map.get.return_value = 'Artist - Topic'
             fm = AssetFileManagement(tmp)
@@ -135,7 +152,7 @@ class TestScrapeOne(
         mock_exists.return_value = False
         channel = _mock_channel(subscriber_count=1_000_000)
         mock_scrape.return_value = channel
-        queue = AsyncMock()
+        queue = _mock_queue()
         creator_map = AsyncMock()
         creator_map.get.return_value = 'foo'
         from tools.yt_channel_scrape import (
@@ -167,7 +184,7 @@ class TestScrapeOne(
         '._do_scrape_channel_to_disk_typed',
         new_callable=AsyncMock,
     )
-    async def test_missing_subscriber_count_schedules_full_retry(
+    async def test_missing_subscriber_count_completes_scrape(
         self,
         mock_scrape: AsyncMock,
         mock_exists: AsyncMock,
@@ -176,7 +193,7 @@ class TestScrapeOne(
         mock_scrape.return_value = _mock_channel(
             subscriber_count=None,
         )
-        queue = AsyncMock()
+        queue = _mock_queue()
         creator_map = AsyncMock()
         creator_map.get.return_value = 'foo'
         from tools.yt_channel_scrape import (
@@ -192,16 +209,9 @@ class TestScrapeOne(
             http_client=MagicMock(),
         )
 
-        queue.retry_missing_subscriber_count.assert_awaited_once()
-        retry_kwargs = (
-            queue.retry_missing_subscriber_count.await_args.kwargs
-        )
-        self.assertEqual(
-            retry_kwargs['channel_id'],
-            'UCabc00000000000000000000',
-        )
-        self.assertIsInstance(retry_kwargs['now'], float)
-        queue.update_tier.assert_not_awaited()
+        queue.update_tier.assert_awaited_once()
+        self.assertIsNone(queue.update_tier.await_args.kwargs['sub_count'])
+        queue.retry_missing_subscriber_count.assert_not_awaited()
         queue.set_meta.assert_not_awaited()
         queue.clear_force_rescrape.assert_not_awaited()
 
@@ -224,7 +234,7 @@ class TestScrapeOne(
         mock_scrape.return_value = _mock_channel(
             subscriber_count=9,
         )
-        queue = AsyncMock()
+        queue = _mock_queue()
         creator_map = AsyncMock()
         creator_map.get.return_value = 'foo'
         from tools.yt_channel_scrape import (
@@ -264,7 +274,7 @@ class TestScrapeOne(
         mock_scrape.return_value = _mock_channel(
             subscriber_count=10,
         )
-        queue = AsyncMock()
+        queue = _mock_queue()
         creator_map = AsyncMock()
         creator_map.get.return_value = 'foo'
         from tools.yt_channel_scrape import (
@@ -302,7 +312,7 @@ class TestScrapeOne(
             title='Example - Topic',
             video_count=0,
         )
-        queue = AsyncMock()
+        queue = _mock_queue()
         creator_map = AsyncMock()
         creator_map.get.return_value = 'example-topic'
         from tools.yt_channel_scrape import (
@@ -343,7 +353,7 @@ class TestScrapeOne(
             title='Example',
             channel_handle='example-topic',
         )
-        queue = AsyncMock()
+        queue = _mock_queue()
         creator_map = AsyncMock()
         creator_map.get.return_value = 'example-topic'
         from tools.yt_channel_scrape import (
@@ -383,7 +393,7 @@ class TestScrapeOne(
             subscriber_count=10,
             video_count=0,
         )
-        queue = AsyncMock()
+        queue = _mock_queue()
         creator_map = AsyncMock()
         creator_map.get.return_value = 'foo'
         from tools.yt_channel_scrape import (
@@ -427,7 +437,7 @@ class TestScrapeOne(
         channel.channel_handle = 'artist-topic'
         channel.title = 'Artist'
         mock_scrape.return_value = channel
-        queue = AsyncMock()
+        queue = _mock_queue()
         creator_map = AsyncMock()
         creator_map.get.return_value = 'artist'
         from tools.yt_channel_scrape import (
@@ -466,7 +476,7 @@ class TestScrapeOne(
         mock_scrape.side_effect = ChannelNotFoundError(
             '404',
         )
-        queue = AsyncMock()
+        queue = _mock_queue()
         creator_map = AsyncMock()
         creator_map.get.return_value = 'foo'
         from tools.yt_channel_scrape import (
@@ -519,7 +529,7 @@ class TestScrapeOne(
             'scraped but has no content',
             channel,
         )
-        queue = AsyncMock()
+        queue = _mock_queue()
         creator_map = AsyncMock()
         creator_map.get.return_value = 'empty'
         await _scrape_one_queued(
@@ -568,7 +578,7 @@ class TestScrapeOne(
             'scraped but has no content',
             channel,
         )
-        queue = AsyncMock()
+        queue = _mock_queue()
         creator_map = AsyncMock()
         creator_map.get.return_value = 'active'
         await _scrape_one_queued(
@@ -617,7 +627,7 @@ class TestScrapeOne(
             'scraped but has no content',
             channel,
         )
-        queue = AsyncMock()
+        queue = _mock_queue()
         creator_map = AsyncMock()
         creator_map.get.return_value = 'empty'
         await _scrape_one_queued(
@@ -653,7 +663,7 @@ class TestScrapeOne(
     ) -> None:
         mock_exists.return_value = False
         mock_scrape.side_effect = OSError('timeout')
-        queue = AsyncMock()
+        queue = _mock_queue()
         creator_map = AsyncMock()
         creator_map.get.return_value = 'foo'
         from tools.yt_channel_scrape import (
@@ -690,7 +700,7 @@ class TestScrapeOne(
         )
         mock_exists.return_value = False
         mock_scrape.side_effect = RuntimeError(message)
-        queue = AsyncMock()
+        queue = _mock_queue()
         creator_map = AsyncMock()
         creator_map.get.return_value = 'foo'
         from tools.yt_channel_scrape import (
@@ -734,7 +744,7 @@ class TestScrapeOne(
         channel.channel_handle = None
         channel.title = None
         mock_scrape.return_value = channel
-        queue = AsyncMock()
+        queue = _mock_queue()
         creator_map = AsyncMock()
         creator_map.get.return_value = None
         from tools.yt_channel_scrape import (
@@ -809,7 +819,7 @@ class TestScrapeWorkers(
         settings = _mock_settings()
         settings.channel_queue_idle_poll_seconds = 0.01
         shutdown_event: asyncio.Event = asyncio.Event()
-        queue = AsyncMock()
+        queue = _mock_queue()
         queue.pop_scheduled.side_effect = pop_scheduled
         active_started_at: dict[str, float] = {}
         completed_count: int = 0
@@ -862,7 +872,7 @@ class TestScrapeWorkers(
         settings = _mock_settings()
         settings.channel_queue_idle_poll_seconds = 0.01
         shutdown_event: asyncio.Event = asyncio.Event()
-        queue = AsyncMock()
+        queue = _mock_queue()
         queue.pop_scheduled.return_value = ['UC1']
         active_started_at: dict[str, float] = {}
 
@@ -1047,7 +1057,7 @@ class TestTypedScrape(
 
 
 class TestExistenceCheck(
-    unittest.IsolatedAsyncioTestCase,
+    ScrapePhaseTestCase,
 ):
 
     async def test_not_found_response_returns_missing(self) -> None:
@@ -1101,7 +1111,7 @@ class TestExistenceCheck(
         mock_channel: MagicMock = MagicMock()
         mock_channel.subscriber_count = 1_000_000
         mock_typed.return_value = mock_channel
-        queue: AsyncMock = AsyncMock()
+        queue: AsyncMock = _mock_queue()
         creator_map: AsyncMock = AsyncMock()
         creator_map.get.return_value = 'foo'
         http_client: MagicMock = MagicMock()
@@ -1141,7 +1151,7 @@ class TestExistenceCheck(
         mock_channel: MagicMock = MagicMock()
         mock_channel.subscriber_count = 0
         mock_typed.return_value = mock_channel
-        queue: AsyncMock = AsyncMock()
+        queue: AsyncMock = _mock_queue()
         creator_map: AsyncMock = AsyncMock()
         creator_map.get.return_value = 'bar'
         http_client: MagicMock = MagicMock()
@@ -1185,7 +1195,7 @@ class TestExistenceCheck(
         mock_channel: MagicMock = MagicMock()
         mock_channel.subscriber_count = 500
         mock_typed.return_value = mock_channel
-        queue: AsyncMock = AsyncMock()
+        queue: AsyncMock = _mock_queue()
         creator_map: AsyncMock = AsyncMock()
         creator_map.get.return_value = 'baz'
         http_client: MagicMock = MagicMock()
@@ -1208,7 +1218,7 @@ class TestExistenceCheck(
 
 
 class TestForceRescrapeMode(
-    unittest.IsolatedAsyncioTestCase,
+    ScrapePhaseTestCase,
 ):
 
     @patch(
@@ -1230,7 +1240,7 @@ class TestForceRescrapeMode(
         mock_channel: MagicMock = MagicMock()
         mock_channel.subscriber_count = 250
         mock_typed.return_value = mock_channel
-        queue: AsyncMock = AsyncMock()
+        queue: AsyncMock = _mock_queue()
         queue.get_meta.return_value = {
             'force_rescrape_mode': 'full',
         }
@@ -1275,7 +1285,7 @@ class TestForceRescrapeMode(
         mock_channel: MagicMock = MagicMock()
         mock_channel.subscriber_count = 250
         mock_typed.return_value = mock_channel
-        queue: AsyncMock = AsyncMock()
+        queue: AsyncMock = _mock_queue()
         queue.get_meta.return_value = {
             'force_rescrape_mode': 'metadata',
         }
@@ -1318,7 +1328,7 @@ class TestForceRescrapeMode(
     ) -> None:
         mock_exists.return_value = True
         mock_typed.side_effect = RuntimeError('timeout')
-        queue: AsyncMock = AsyncMock()
+        queue: AsyncMock = _mock_queue()
         queue.get_meta.return_value = {
             'force_rescrape_mode': 'full',
         }
@@ -1340,7 +1350,7 @@ class TestForceRescrapeMode(
 
 
 class TestScrapeOneHandleOptional(
-    unittest.IsolatedAsyncioTestCase,
+    ScrapePhaseTestCase,
 ):
     '''A missing creator-map handle permits scraping by channel ID.
 
@@ -1371,7 +1381,7 @@ class TestScrapeOneHandleOptional(
         channel.channel_handle = None
         channel.title = None
         channel.about_page_succeeded = True
-        queue: AsyncMock = AsyncMock()
+        queue: AsyncMock = _mock_queue()
         creator_map: AsyncMock = AsyncMock()
         creator_map.get.return_value = None
         from tools.yt_channel_scrape import _scrape_one_queued
@@ -1435,7 +1445,7 @@ class TestScrapeOneHandleOptional(
             channel.channel_handle = 'discovered'
             channel.title = 'Discovered Title'
             mock_scrape.return_value = channel
-            queue = AsyncMock()
+            queue = _mock_queue()
             creator_map = AsyncMock()
             creator_map.get.return_value = None
             identity = AsyncMock()
@@ -1472,7 +1482,7 @@ class TestScrapeOneHandleOptional(
             channel.channel_handle = 'discovered'
             channel.title = None
             mock_scrape.return_value = channel
-            queue = AsyncMock()
+            queue = _mock_queue()
             creator_map = AsyncMock()
             creator_map.get.return_value = None
             identity = AsyncMock()

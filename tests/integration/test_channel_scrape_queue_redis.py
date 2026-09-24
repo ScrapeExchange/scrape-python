@@ -6,12 +6,14 @@ clears them before/after each test so the test does
 not collide with any other use of db 1.
 '''
 
+import asyncio
 import time
 import unittest
 
 import redis.asyncio as aioredis
 
 from scrape_exchange.channel_scrape_queue import (
+    ChannelScrapeProgress,
     ChannelScrapeQueueSettings,
     ChannelState,
     RedisChannelScrapeQueue,
@@ -124,3 +126,50 @@ class TestRedisChannelScrapeQueueIntegration(
         self.assertEqual(
             state_after, ChannelState.SCHEDULED,
         )
+
+    async def test_full_scrape_progress_commits_once_with_schedule(
+        self,
+    ) -> None:
+        channel_id: str = 'UCrefresh'
+        await self.queue.enqueue_scheduled(channel_id, source='test')
+        progress: ChannelScrapeProgress = (
+            await self.queue.get_scrape_progress(channel_id, existing=False)
+        )
+        # Read one record before testing the atomic completion transition.
+        before: dict[str, str] = await self.queue.get_meta(f'i:{channel_id}')
+        self.assertEqual(before['successful_scrapes'], '0')
+        now: float = time.time()
+        results: list[bool | None] = await asyncio.gather(*[
+            self.queue.update_tier(
+                channel_id, sub_count=50_000, now=now,
+                progress=progress, full_scrape=True,
+            ) for _ in range(2)
+        ])
+        self.assertEqual(results.count(True), 1)
+        self.assertEqual(results.count(False), 1)
+        after: dict[str, str] = await self.queue.get_meta(f'i:{channel_id}')
+        self.assertEqual(after['successful_scrapes'], '1')
+        self.assertEqual(after['next_full_scrape'], '11')
+        self.assertEqual(await self.queue.pop_scheduled(10, now=now), [])
+        self.assertEqual(
+            await self.queue.pop_scheduled(10, now=now + 365 * 86400),
+            [channel_id],
+        )
+
+    async def test_progress_survives_a_new_queue_instance(self) -> None:
+        await self.queue.enqueue_scheduled('UCrefresh', source='test')
+        progress: ChannelScrapeProgress = (
+            await self.queue.get_scrape_progress('UCrefresh', existing=True)
+        )
+        await self.queue.update_tier(
+            'UCrefresh', sub_count=50_000, now=time.time(),
+            progress=progress,
+        )
+        other: RedisChannelScrapeQueue = RedisChannelScrapeQueue(
+            self.redis, ChannelScrapeQueueSettings(),
+        )
+        resumed: ChannelScrapeProgress = await other.get_scrape_progress(
+            'UCrefresh', existing=False,
+        )
+        self.assertEqual(resumed.successful_scrapes, 2)
+        self.assertEqual(resumed.next_full_scrape, 11)

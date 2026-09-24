@@ -25,6 +25,53 @@ KEY_PREFIX: str = 'youtube:channel'
 
 
 @dataclass(frozen=True)
+class ChannelScrapeProgress:
+    '''Durable successful-scrape cadence, shared across the fleet.'''
+
+    successful_scrapes: int
+    next_full_scrape: int
+
+    @property
+    def full_scrape_due(self) -> bool:
+        return self.successful_scrapes + 1 >= self.next_full_scrape
+
+
+_COMPLETE_SCRAPE_LUA: str = '''
+-- Compare the snapshot before committing progress and scheduling together.
+-- KEYS: metadata, tier map, then every scheduled tier.
+-- ARGV: id, expected count, new count, next full, tier, interval, now.
+-- A negative tier preserves the current tier and requests metadata only.
+local state = redis.call('HGET', KEYS[1], 'state')
+if state ~= 'scheduled' then return 0 end
+if redis.call('HGET', KEYS[1], 'successful_scrapes') ~= ARGV[2] then
+    return 0
+end
+local tier = tonumber(ARGV[5])
+if tier < 0 then
+    tier = tonumber(redis.call('HGET', KEYS[2], ARGV[1])) or 0
+    if tier < 0 or tier >= #KEYS - 2 then tier = 0 end
+    redis.call('HSET', KEYS[1],
+        'last_subscriber_count_missing_at', ARGV[7],
+        'force_rescrape_mode', 'metadata',
+        'force_requested_at', ARGV[7],
+        'force_source', 'missing_subscriber_count')
+end
+local member = 'i:' .. ARGV[1]
+for k = 3, #KEYS do redis.call('ZREM', KEYS[k], member) end
+if tonumber(ARGV[6]) >= 0 then
+    redis.call('ZADD', KEYS[3 + tier],
+        tonumber(ARGV[7]) + tonumber(ARGV[6]), member)
+end
+redis.call('HSET', KEYS[2], ARGV[1], tostring(tier))
+redis.call('HSET', KEYS[1],
+    'successful_scrapes', ARGV[3], 'next_full_scrape', ARGV[4],
+    'last_attempt_at', ARGV[7])
+redis.call('HDEL', KEYS[1], 'unavailable_attempts')
+return 1
+'''
+
+
+@dataclass(frozen=True)
 class ChannelTierConfig:
     '''Configuration for one channel-queue priority tier.
 
@@ -394,9 +441,11 @@ class ChannelScrapeQueue(ABC):
         self,
         channel_id: str,
         *,
-        sub_count: int,
+        sub_count: int | None,
         now: float,
-    ) -> None: ...
+        progress: ChannelScrapeProgress | None = None,
+        full_scrape: bool = False,
+    ) -> bool | None: ...
 
     @abstractmethod
     async def retry_missing_subscriber_count(
@@ -727,13 +776,66 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
             remaining -= len(members)
         return out
 
+    async def get_scrape_progress(
+        self, channel_id: str, *, existing: bool,
+    ) -> ChannelScrapeProgress:
+        '''Initialize once before scraping, including before any failure.
+
+        Existing channels start with an initial-scrape baseline; their
+        tenth successful refresh after rollout performs full enumeration.
+        '''
+        key: str = self._k_meta(f'i:{channel_id}')
+        async with self._redis.pipeline(transaction=True) as pipe:
+            pipe.hsetnx(key, 'successful_scrapes', '1' if existing else '0')
+            pipe.hsetnx(key, 'next_full_scrape', '11' if existing else '1')
+            pipe.hmget(key, ['successful_scrapes', 'next_full_scrape'])
+            results: list[Any] = await pipe.execute()
+        return ChannelScrapeProgress(
+            successful_scrapes=int(results[-1][0]),
+            next_full_scrape=int(results[-1][1]),
+        )
+
     async def update_tier(
         self,
         channel_id: str,
         *,
-        sub_count: int,
+        sub_count: int | None,
         now: float,
-    ) -> None:
+        progress: ChannelScrapeProgress | None = None,
+        full_scrape: bool = False,
+    ) -> bool | None:
+        if progress is not None:
+            completed_tier: int = (
+                self._tier_for_sub_count(sub_count)
+                if sub_count is not None else -1
+            )
+            completed_interval: int = (
+                self._tiers[completed_tier].interval_seconds
+                if sub_count is not None else
+                self._settings.channel_missing_subscriber_retry_seconds
+            )
+            next_full: int = progress.next_full_scrape
+            if full_scrape and progress.full_scrape_due:
+                # Multiple forced metadata scrapes may leave us overdue.
+                while next_full <= progress.successful_scrapes + 1:
+                    next_full += 10
+            keys: list[str] = [
+                self._k_meta(f'i:{channel_id}'), self._k_tiers(),
+                *[self._k_scheduled(tier.tier) for tier in self._tiers],
+            ]
+            return bool(await self._redis.execute_command(
+                'EVAL', _COMPLETE_SCRAPE_LUA, len(keys), *keys,
+                channel_id, str(progress.successful_scrapes),
+                str(progress.successful_scrapes + 1), str(next_full),
+                str(completed_tier),
+                str(completed_interval),
+                str(int(now)),
+            ))
+        if sub_count is None:
+            await self.retry_missing_subscriber_count(
+                channel_id=channel_id, now=now,
+            )
+            return
         member: str = f'i:{channel_id}'
         # If an operator (or scrape-phase auto-mark) put
         # this channel into a terminal state while the
@@ -798,13 +900,13 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
         channel_id: str,
         now: float,
     ) -> None:
-        '''Preserve the current tier and request a delayed full scrape.
+        '''Preserve the current tier and request a delayed metadata refresh.
 
         A missing subscriber count is unknown data, not evidence that the
         channel belongs in the zero-subscriber catch-all tier. The channel
         has already been popped, so this transition must explicitly put it
-        back in its current tier. A full retry avoids repeating the
-        metadata-only path when the best-effort About request failed.
+        back in its current tier. Missing metadata does not require
+        repeating a completed video enumeration.
         '''
         member: str = f'i:{channel_id}'
         current: ChannelState | None = await self.get_state(member)
@@ -850,7 +952,7 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
                 'state': ChannelState.SCHEDULED.value,
                 'last_attempt_at': str(int(now)),
                 'last_subscriber_count_missing_at': str(int(now)),
-                'force_rescrape_mode': 'full',
+                'force_rescrape_mode': 'metadata',
                 'force_requested_at': str(int(now)),
                 'force_source': 'missing_subscriber_count',
             },

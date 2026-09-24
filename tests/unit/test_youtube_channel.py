@@ -878,6 +878,40 @@ class TestFindAboutRenderer(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestParseChannelVideoData(unittest.TestCase):
+    def test_missing_header_preserves_known_subscriber_count(self) -> None:
+        channel: YouTubeChannel = YouTubeChannel(
+            channel_handle='Test', with_download_client=False,
+        )
+        count: int
+        for count in (0, 1200):
+            with self.subTest(count=count):
+                channel.subscriber_count = count
+                channel.parse_channel_video_data({
+                    'metadata': {'channelMetadataRenderer': {'title': 'Test'}},
+                })
+                self.assertEqual(channel.subscriber_count, count)
+
+    def test_about_without_count_preserves_known_zero(self) -> None:
+        channel: YouTubeChannel = YouTubeChannel(
+            channel_handle='Test', with_download_client=False,
+        )
+        channel.subscriber_count = 0
+        channel._parse_channel_about_data({})
+        self.assertEqual(channel.subscriber_count, 0)
+
+    def test_blank_subscriber_metadata_is_unknown(self) -> None:
+        self.assertIsNone(YouTubeChannel.parse_subscriber_count(
+            _make_metadata_rows('   '),
+        ))
+
+    def test_singular_subscriber_count(self) -> None:
+        self.assertEqual(
+            YouTubeChannel.parse_subscriber_count(
+                _make_metadata_rows('1 subscriber'),
+            ),
+            1,
+        )
+
     def test_parses_channel_info(self) -> None:
         ch = YouTubeChannel(channel_handle='Test')
 

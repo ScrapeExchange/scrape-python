@@ -472,9 +472,22 @@ class TestQueueCommandExecution(unittest.TestCase):
 
     def test_console_script_reaches_cli_error_path(self) -> None:
         root: Path = Path(__file__).parents[2]
+        # Resolve the console script from the running interpreter's
+        # venv rather than relying on PATH: the venv bin directory is
+        # often not on PATH during test runs, and on WSL a
+        # non-searchable Windows directory on PATH turns the expected
+        # FileNotFoundError into a misleading PermissionError.
+        script: Path = Path(sys.prefix) / 'bin' / 'scrape-queue'
+        if not script.exists():
+            # Windows venvs use Scripts\ instead of bin/
+            script = Path(sys.prefix) / 'Scripts' / 'scrape-queue.exe'
+        self.assertTrue(
+            script.exists(),
+            f'console script not found at {script}',
+        )
         proc: subprocess.CompletedProcess[str] = subprocess.run(
             [
-                'scrape-queue',
+                str(script),
                 '--platform',
                 'nope',
                 'count',

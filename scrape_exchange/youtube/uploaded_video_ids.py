@@ -1,6 +1,9 @@
 '''Redis-backed set of YouTube video IDs already uploaded.'''
 
-from typing import ClassVar, Iterable
+from collections.abc import Iterable
+from typing import ClassVar
+
+import redis.asyncio as aioredis
 
 from scrape_exchange.redis_client import redis_from_url
 
@@ -10,8 +13,12 @@ class UploadedVideoIds:
 
     _KEY: ClassVar[str] = 'youtube:video:uploaded'
 
-    def __init__(self, redis_dsn: str) -> None:
-        self._client = redis_from_url(
+    def __init__(
+        self, redis_dsn: str, *, redis_client: aioredis.Redis | None = None,
+    ) -> None:
+        self._client: aioredis.Redis = redis_client if (
+            redis_client is not None
+        ) else redis_from_url(
             redis_dsn,
             component='youtube-uploaded-video-ids',
             decode_responses=True,

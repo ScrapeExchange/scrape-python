@@ -782,6 +782,7 @@ class YouTubeChannel:
         with_about_page: bool = False,
         proxies: list[str] | str | None = None,
         with_video_ids: bool = True,
+        require_complete_video_ids: bool = False,
     ) -> None:
         '''
         Scrapes the channel page for information. This does not include data
@@ -801,6 +802,8 @@ class YouTubeChannel:
         fetched. Use when the platform already has the
         channel's video list and a metadata-only refresh
         is sufficient.
+        :param require_complete_video_ids: propagate enumeration failures
+        so callers do not acknowledge an incomplete full scrape.
         :returns: dict of the scraped data
         :raises: ValueError if no data could be scraped or parsed
         '''
@@ -867,8 +870,12 @@ class YouTubeChannel:
                         max_videos_per_channel
                     ),
                 )
-        except (ValueError, RuntimeError):
-            pass
+        except (ValueError, RuntimeError) as exc:
+            if require_complete_video_ids:
+                # A bad continuation is not evidence of a missing channel.
+                raise RuntimeError(
+                    f'Incomplete channel video enumeration: {exc}',
+                ) from exc
         self._reconcile_description_external_links()
 
     async def scrape_about_page(self, proxies: list[str] | str | None = None
@@ -1101,11 +1108,12 @@ class YouTubeChannel:
             self._extract_simple_text(about_renderer.get('videoCountText'))
         )
 
-        self.subscriber_count = self.subscriber_count or convert_number_string(
-            self._extract_simple_text(
-                about_renderer.get('subscriberCountText')
+        if self.subscriber_count is None:
+            self.subscriber_count = convert_number_string(
+                self._extract_simple_text(
+                    about_renderer.get('subscriberCountText'),
+                ),
             )
-        )
 
         self.external_urls = self.external_urls | \
             YouTubeChannel.parse_external_urls(
@@ -1144,8 +1152,11 @@ class YouTubeChannel:
         self.banners: set[YouTubeThumbnail] = self.banners | \
             YouTubeChannel.parse_banners(page_data)
 
-        self.subscriber_count = \
+        parsed_subscriber_count: int | None = (
             YouTubeChannel.parse_subscriber_count(page_data)
+        )
+        if parsed_subscriber_count is not None:
+            self.subscriber_count = parsed_subscriber_count
 
         parsed_video_count: int | None = (
             YouTubeChannel.parse_video_count(page_data)
@@ -2013,7 +2024,9 @@ class YouTubeChannel:
             for metadata_part in metadata_parts:
                 if isinstance(metadata_part.get('text'), dict):
                     content: str = metadata_part['text'].get('content', '')
-                    if content and 'subscribers' in content:
+                    if content and content.rstrip().endswith((
+                        ' subscriber', ' subscribers',
+                    )):
                         youtube_subs_count: int | None = \
                             convert_number_string(content)
                         return youtube_subs_count
@@ -2196,7 +2209,9 @@ class YouTubeChannel:
                     )
                     name = url
 
-            title = SocialNetworks.get(name.lower(), 'www')
+            # Fall back to the inferred domain label so unknown
+            # sites are self-describing instead of 'www'.
+            title = SocialNetworks.get(name.lower(), name)
             _LOGGER.debug(
                 'Parsed external link label ouf of URL',
                 extra={'name': name, 'url': url}
