@@ -8,6 +8,7 @@ from typing import Any
 import fakeredis.aioredis
 
 from scrape_exchange.video_scrape_queue import (
+    TERMINAL_META_TTL_SECONDS,
     RedisVideoScrapeQueue,
     VideoScrapeQueue,
     VideoScrapeQueueEntry,
@@ -505,6 +506,80 @@ class TestMark(_RedisQueueTestBase):
         )
         self.assertIsNone(failed)
         self.assertIsNotNone(unavail)
+
+
+class TestGetStates(_RedisQueueTestBase):
+
+    async def test_get_states_batched(self) -> None:
+        await self.queue.enqueue('aaa', source='rss')
+        await self.queue.enqueue('bbb', source='rss')
+        await self.queue.mark('bbb', state=VideoState.FAILED)
+        states: dict = await self.queue.get_states(
+            ['aaa', 'bbb', 'ccc'],
+        )
+        self.assertEqual(states['aaa'], VideoState.QUEUED)
+        self.assertEqual(states['bbb'], VideoState.FAILED)
+        self.assertIsNone(states['ccc'])
+
+    async def test_get_states_empty(self) -> None:
+        self.assertEqual(await self.queue.get_states([]), {})
+
+
+class TestTerminalMetaTtl(_RedisQueueTestBase):
+    '''Terminal marks arm a TTL on the meta hash; reviving the
+    record (unmark / force_enqueue) must clear it again.'''
+
+    async def test_mark_arms_meta_ttl(self) -> None:
+        await self.queue.enqueue('aaa', source='rss')
+        await self.queue.mark(
+            'aaa', state=VideoState.UNAVAILABLE,
+            last_error='private',
+        )
+        ttl: int = await self.redis.ttl(
+            'youtube:video:meta:aaa',
+        )
+        self.assertGreater(ttl, 0)
+        self.assertLessEqual(
+            ttl, TERMINAL_META_TTL_SECONDS,
+        )
+
+    async def test_queued_meta_has_no_ttl(self) -> None:
+        await self.queue.enqueue('aaa', source='rss')
+        ttl: int = await self.redis.ttl(
+            'youtube:video:meta:aaa',
+        )
+        self.assertEqual(ttl, -1)
+
+    async def test_unmark_persists_meta(self) -> None:
+        await self.queue.enqueue('aaa', source='rss')
+        await self.queue.mark(
+            'aaa', state=VideoState.FAILED,
+        )
+        await self.queue.unmark('aaa')
+        state: str | None = await self.redis.hget(
+            'youtube:video:meta:aaa', 'state',
+        )
+        self.assertEqual(state, 'queued')
+        ttl: int = await self.redis.ttl(
+            'youtube:video:meta:aaa',
+        )
+        self.assertEqual(ttl, -1)
+
+    async def test_force_enqueue_revive_persists_meta(
+        self,
+    ) -> None:
+        await self.queue.enqueue('aaa', source='rss')
+        await self.queue.mark(
+            'aaa', state=VideoState.REMOVED,
+        )
+        outcome: str = await self.queue.force_enqueue(
+            'aaa', source='rss',
+        )
+        self.assertEqual(outcome, 'revived')
+        ttl: int = await self.redis.ttl(
+            'youtube:video:meta:aaa',
+        )
+        self.assertEqual(ttl, -1)
 
 
 class TestUnmark(_RedisQueueTestBase):

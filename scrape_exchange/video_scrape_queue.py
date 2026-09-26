@@ -23,6 +23,18 @@ from pydantic_settings import (
 
 KEY_PREFIX: str = 'youtube:video'
 
+# TTL applied to a video's meta hash when it is marked with a
+# terminal state (unavailable/failed/removed). The state-hash
+# entry remains as a compact tombstone, so enqueue() keeps
+# reporting the video as known; only the per-key meta hash
+# expires. Without this the meta hashes of dead videos
+# accumulate forever — tens of millions of keys, minutes of
+# AOF loading per Redis restart, and OOM pressure on the
+# shared host. The TTL bounds re-scrape retries of dead
+# videos to once per TTL window while keeping recent
+# failures inspectable.
+TERMINAL_META_TTL_SECONDS: int = 30 * 24 * 3600
+
 _MARK_LUA: str = '''
 -- KEYS[1] = meta hash
 -- KEYS[2] = target state hash
@@ -33,6 +45,7 @@ _MARK_LUA: str = '''
 -- ARGV[1] = video_id
 -- ARGV[2] = state value
 -- ARGV[3] = record JSON
+-- ARGV[4] = terminal meta TTL seconds (0 disables expiry)
 local vid = ARGV[1]
 local state = ARGV[2]
 local record = ARGV[3]
@@ -42,6 +55,10 @@ for i = 4, 6 do
 end
 redis.call('HSET', KEYS[2], vid, record)
 redis.call('HSET', KEYS[1], 'state', state)
+local ttl = tonumber(ARGV[4])
+if ttl ~= nil and ttl > 0 then
+    redis.call('EXPIRE', KEYS[1], ttl)
+end
 return 1
 '''
 
@@ -62,6 +79,10 @@ redis.call(
     ARGV[2], vid
 )
 redis.call('HSET', KEYS[1], 'state', 'queued')
+-- Reviving a terminal record must clear the terminal TTL that
+-- mark() armed: a queued video must not have its meta hash
+-- (source, channel context) expire while it waits in the queue.
+redis.call('PERSIST', KEYS[1])
 -- Clear any force tag so reviving a terminal record never
 -- re-arms a stale force into a later non-force scrape.
 redis.call('HDEL', KEYS[1], 'force')
@@ -85,6 +106,9 @@ _FORCE_ENQUEUE_LUA: str = '''
 -- ARGV[8] = channel_is_verified
 local vid = ARGV[1]
 local state = redis.call('HGET', KEYS[2], 'state')
+-- A revived or re-armed record must not carry a terminal TTL:
+-- clear any expiry the previous terminal mark armed.
+redis.call('PERSIST', KEYS[2])
 local is_terminal = (
     state == 'unavailable'
     or state == 'failed'
@@ -543,6 +567,7 @@ class RedisVideoScrapeQueue(VideoScrapeQueue):
             self._k_state(VideoState.FAILED),
             self._k_state(VideoState.REMOVED),
             video_id, state.value, json.dumps(record),
+            str(TERMINAL_META_TTL_SECONDS),
         )
 
     async def unmark(self, video_id: str) -> None:
@@ -586,6 +611,31 @@ class RedisVideoScrapeQueue(VideoScrapeQueue):
             return VideoState(raw)
         except ValueError:
             return None
+
+    async def get_states(
+        self, video_ids: list[str],
+    ) -> dict[str, VideoState | None]:
+        '''Batched :meth:`get_state`: pipelined HGETs so one
+        round-trip covers a whole candidate batch. Ids without a
+        meta hash map to ``None``.'''
+        out: dict[str, VideoState | None] = {}
+        if not video_ids:
+            return out
+        pipe: aioredis.client.Pipeline = (
+            self._redis.pipeline(transaction=False)
+        )
+        for video_id in video_ids:
+            pipe.hget(self._k_meta(video_id), 'state')
+        raw: list[str | None] = await pipe.execute()
+        for video_id, state in zip(video_ids, raw):
+            if state is None:
+                out[video_id] = None
+                continue
+            try:
+                out[video_id] = VideoState(state)
+            except ValueError:
+                out[video_id] = None
+        return out
 
     async def get_meta(
         self, video_id: str,

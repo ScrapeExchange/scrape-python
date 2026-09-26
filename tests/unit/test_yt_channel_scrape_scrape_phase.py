@@ -1094,6 +1094,140 @@ class TestExistenceCheck(
 
     @patch(
         'tools.yt_channel_scrape'
+        '._EXCHANGE_CHECK_RETRY_BACKOFF_SECONDS',
+        0,
+    )
+    async def test_transport_error_retried_then_success(
+        self,
+    ) -> None:
+        http_client: AsyncMock = AsyncMock()
+        missing: MagicMock = MagicMock()
+        missing.status_code = 404
+        http_client.get.side_effect = [
+            OSError('network error'),
+            missing,
+        ]
+        from tools.yt_channel_scrape import (
+            _channel_exists_on_exchange,
+        )
+
+        result: bool | None = await _channel_exists_on_exchange(
+            http_client,
+            'https://api.scrape.exchange',
+            'UCabc00000000000000000000',
+        )
+
+        self.assertIs(result, False)
+        self.assertEqual(http_client.get.await_count, 2)
+
+    @patch(
+        'tools.yt_channel_scrape'
+        '._EXCHANGE_CHECK_RETRY_BACKOFF_SECONDS',
+        0,
+    )
+    async def test_transport_error_both_attempts_fail(
+        self,
+    ) -> None:
+        http_client: AsyncMock = AsyncMock()
+        http_client.get.side_effect = OSError('network error')
+        from tools.yt_channel_scrape import (
+            _channel_exists_on_exchange,
+        )
+
+        result: bool | None = await _channel_exists_on_exchange(
+            http_client,
+            'https://api.scrape.exchange',
+            'UCabc00000000000000000000',
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(http_client.get.await_count, 2)
+
+    @patch(
+        'tools.yt_channel_scrape'
+        '._EXCHANGE_CHECK_RETRY_BACKOFF_SECONDS',
+        0,
+    )
+    async def test_transient_502_retried_then_exists(
+        self,
+    ) -> None:
+        http_client: AsyncMock = AsyncMock()
+        bad_gateway: MagicMock = MagicMock()
+        bad_gateway.status_code = 502
+        exists: MagicMock = MagicMock()
+        exists.status_code = 200
+        exists.json.return_value = {'total_count': 1}
+        http_client.get.side_effect = [bad_gateway, exists]
+        from tools.yt_channel_scrape import (
+            _channel_exists_on_exchange,
+        )
+
+        result: bool | None = await _channel_exists_on_exchange(
+            http_client,
+            'https://api.scrape.exchange',
+            'UCabc00000000000000000000',
+        )
+
+        self.assertIs(result, True)
+        self.assertEqual(http_client.get.await_count, 2)
+
+    async def test_unexpected_status_not_retried(self) -> None:
+        http_client: AsyncMock = AsyncMock()
+        server_error: MagicMock = MagicMock()
+        server_error.status_code = 500
+        http_client.get.return_value = server_error
+        from tools.yt_channel_scrape import (
+            _channel_exists_on_exchange,
+        )
+
+        result: bool | None = await _channel_exists_on_exchange(
+            http_client,
+            'https://api.scrape.exchange',
+            'UCabc00000000000000000000',
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(http_client.get.await_count, 1)
+
+    async def test_not_found_not_retried(self) -> None:
+        http_client: AsyncMock = AsyncMock()
+        missing: MagicMock = MagicMock()
+        missing.status_code = 404
+        http_client.get.return_value = missing
+        from tools.yt_channel_scrape import (
+            _channel_exists_on_exchange,
+        )
+
+        result: bool | None = await _channel_exists_on_exchange(
+            http_client,
+            'https://api.scrape.exchange',
+            'UCabc00000000000000000000',
+        )
+
+        self.assertIs(result, False)
+        self.assertEqual(http_client.get.await_count, 1)
+
+    async def test_malformed_json_not_retried(self) -> None:
+        http_client: AsyncMock = AsyncMock()
+        bad_body: MagicMock = MagicMock()
+        bad_body.status_code = 200
+        bad_body.json.side_effect = ValueError('not JSON')
+        http_client.get.return_value = bad_body
+        from tools.yt_channel_scrape import (
+            _channel_exists_on_exchange,
+        )
+
+        result: bool | None = await _channel_exists_on_exchange(
+            http_client,
+            'https://api.scrape.exchange',
+            'UCabc00000000000000000000',
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(http_client.get.await_count, 1)
+
+    @patch(
+        'tools.yt_channel_scrape'
         '._do_scrape_channel_to_disk_typed',
         new_callable=AsyncMock,
     )

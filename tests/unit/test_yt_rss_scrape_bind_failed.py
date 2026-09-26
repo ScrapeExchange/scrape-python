@@ -11,7 +11,7 @@ from pathlib import Path
 from types import ModuleType
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
+import httpx2 as httpx
 
 from scrape_exchange.proxy_loader import (
     ProxyCatalog,

@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 from typing import Awaitable, Callable, Iterator
 
-import httpx
+import httpx2 as httpx  # ExchangeClient raises httpx2 exception classes
 import redis.asyncio as aioredis
 from pydantic import AliasChoices, Field
 from pydantic_settings import (

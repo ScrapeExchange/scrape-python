@@ -41,7 +41,7 @@ import asyncio
 import logging
 import sys
 
-from httpx import Response, Timeout
+from httpx2 import Response, Timeout
 from pydantic import AliasChoices, Field
 
 from scrape_exchange.exchange_client import ExchangeClient

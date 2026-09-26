@@ -5,6 +5,7 @@ from tempfile import TemporaryDirectory
 
 from scrape_exchange.brotli import brotli_write_async
 from scrape_exchange.youtube.derived_metadata import (
+    CATEGORY_COUNTS_TTL_SECONDS,
     CHANNEL_CATEGORY_COUNTS_PREFIX,
     CHANNEL_COUNTRY_HASH,
     enrich_channel_category,
@@ -20,6 +21,13 @@ class FakeRedis:
     def __init__(self) -> None:
         self.hashes: dict[str, dict[str, str]] = {}
         self.sets: dict[str, set[str]] = {}
+        self.ttls: dict[str, int] = {}
+
+    async def expire(self, key: str, seconds: int) -> bool:
+        if key not in self.hashes and key not in self.sets:
+            return False
+        self.ttls[key] = seconds
+        return True
 
     async def hget(self, key: str, field: str) -> str | None:
         return self.hashes.get(key, {}).get(field)
@@ -132,6 +140,9 @@ class TestDerivedMetadata(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(channel.category, 'Education')
         key: str = f'{CHANNEL_CATEGORY_COUNTS_PREFIX}UC123'
         self.assertEqual(redis.hashes[key]['Education'], '21')
+        self.assertEqual(
+            redis.ttls[key], CATEGORY_COUNTS_TTL_SECONDS,
+        )
 
     async def test_channel_category_does_not_double_count_local_counts(
         self,

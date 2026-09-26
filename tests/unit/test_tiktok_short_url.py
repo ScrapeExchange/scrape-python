@@ -111,7 +111,7 @@ class TestClassifyResolution(unittest.TestCase):
         self.assertIs(res.outcome, su.ShortUrlOutcome.UNAVAILABLE)
 
 
-import httpx
+import httpx2 as httpx
 from unittest.mock import AsyncMock, MagicMock, patch
 
 

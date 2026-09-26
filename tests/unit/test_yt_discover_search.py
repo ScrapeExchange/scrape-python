@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import httpx
+import httpx2 as httpx
 from innertube.errors import RequestError as InnerTubeRequestError
 from innertube.errors import ResponseError as InnerTubeResponseError
 

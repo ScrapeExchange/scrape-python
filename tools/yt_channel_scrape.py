@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Callable
 
 import aiofiles
-import httpx
+import httpx2 as httpx  # exchange API traffic runs on httpx2 (HTTP/2)
 import redis.asyncio as aioredis
 
 from prometheus_client import Counter, Gauge
@@ -50,6 +50,7 @@ from scrape_exchange.youtube.channel_identity import (
     resolve_channel_id,
     resolve_channel_handle,
 )
+from scrape_exchange.youtube.youtube_types import YouTubeChannelLink
 from scrape_exchange.channel_list_parsing import (
     dedupe_preserving_case,
     parse_channel_handle,
@@ -301,6 +302,34 @@ class ChannelSettings(YouTubeScraperSettings):
             'refreshes metadata and preserves the current tier.'
         ),
     )
+    channel_discover_linked_channels: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            'CHANNEL_DISCOVER_LINKED_CHANNELS',
+            'channel_discover_linked_channels',
+        ),
+        description=(
+            'After a successful channel scrape, resolve the channels '
+            'featured on the channel home page and enqueue the ones '
+            'that are neither known to the creator_map nor already '
+            'present on scrape.exchange. Set to false to keep the '
+            'scraper from growing its own queue via channel-to-'
+            'channel discovery.'
+        ),
+    )
+    channel_discovery_min_subscribers: int = Field(
+        default=0,
+        ge=0,
+        validation_alias=AliasChoices(
+            'CHANNEL_DISCOVERY_MIN_SUBSCRIBERS',
+            'channel_discovery_min_subscribers',
+        ),
+        description=(
+            'Featured-channel links with a known subscriber count '
+            'below this threshold are not enqueued. 0 enqueues '
+            'every linked channel.'
+        ),
+    )
     channel_unavailable_soft_retry_seconds: int = Field(
         default=3 * 86400,
     )
@@ -418,6 +447,12 @@ CHANNEL_EXCHANGE_EXISTENCE_CHECK: Counter = Counter(
     'channel_exchange_existence_check_total',
     'Outcomes of scrape.exchange existence checks '
     'done before scraping a channel from the queue.',
+    ['outcome'],
+)
+CHANNEL_LINK_DISCOVERY: Counter = Counter(
+    'channel_link_discovery_outcomes_total',
+    'Outcomes of channel-to-channel discovery from the '
+    'featured channels found on a scraped channel.',
     ['outcome'],
 )
 CHANNEL_FORCE_RESCRAPE_TOTAL: Counter = Counter(
@@ -633,12 +668,18 @@ async def _run_worker(
             httpx.AsyncClient(
                 timeout=10.0,
                 follow_redirects=True,
-                # worker_count scrapes (96) × per-scrape phases share
-                # this client; the default 100-connection pool caused
-                # PoolTimeout bursts during video existence checks.
+                # HTTP/2 multiplexes concurrent exchange checks onto
+                # one warm connection: the 64-wide video-existence
+                # sweeps would otherwise open dozens of TCP
+                # connections per second and saturate per-host
+                # session limits on intermediate NAT gateways.
+                # keepalive_expiry keeps the connection warm across
+                # idle gaps between sweep cycles.
+                http2=True,
                 limits=httpx.Limits(
-                    max_connections=192,
-                    max_keepalive_connections=64,
+                    max_connections=16,
+                    max_keepalive_connections=8,
+                    keepalive_expiry=300.0,
                 ),
             )
         )
@@ -1597,29 +1638,59 @@ async def _channel_exists_on_exchange(
     /api/v1/data/content/youtube/channel/<channel_id>.
 
     A 404 response means the channel is confirmed missing.
-    On any error (network failure, unexpected non-200 response,
-    malformed JSON), returns None and increments the error
-    metric. This keeps an unavailable existence check distinct
-    from a confirmed missing channel.
+    Transient failures (network errors, 502/503/504) are
+    retried once after a short backoff: the dominant failure
+    mode is a slow TCP connect on the scraper host's route to
+    the exchange, which a single retry absorbs. On a final
+    error, returns None and increments the error metric. This
+    keeps an unavailable existence check distinct from a
+    confirmed missing channel.
     '''
     url: str = (
         f'{exchange_url.rstrip("/")}'
         f'/api/v1/data/content/youtube/channel/'
         f'{channel_id}'
     )
-    try:
-        resp: httpx.Response = await http_client.get(
-            url,
-        )
-    except Exception as exc:
+    resp: httpx.Response | None = None
+    for attempt in range(_EXCHANGE_CHECK_MAX_ATTEMPTS):
+        if attempt:
+            await asyncio.sleep(
+                _EXCHANGE_CHECK_RETRY_BACKOFF_SECONDS,
+            )
+        try:
+            resp = await http_client.get(
+                url,
+            )
+        except Exception as exc:
+            resp = None
+            logging.debug(
+                'channel existence check attempt failed',
+                exc_info=exc,
+                extra={
+                    'channel_id': channel_id,
+                    'attempt': attempt + 1,
+                },
+            )
+            continue
+        if resp.status_code in (
+            502, 503, 504,
+        ) and attempt < _EXCHANGE_CHECK_MAX_ATTEMPTS - 1:
+            logging.debug(
+                'channel existence check got a transient '
+                'status; retrying',
+                extra={
+                    'channel_id': channel_id,
+                    'attempt': attempt + 1,
+                    'status': resp.status_code,
+                },
+            )
+            resp = None
+            continue
+        break
+    if resp is None:
         CHANNEL_EXCHANGE_EXISTENCE_CHECK.labels(
             outcome='error',
         ).inc()
-        logging.debug(
-            'channel existence check failed',
-            exc_info=exc,
-            extra={'channel_id': channel_id},
-        )
         return None
     if resp.status_code == 404:
         CHANNEL_EXCHANGE_EXISTENCE_CHECK.labels(
@@ -1680,6 +1751,221 @@ async def _self_heal_identity(
                 exc_info=True,
                 extra={'channel_id': cid},
             )
+
+
+# Upper bound on concurrent InnerTube handle resolutions during
+# channel-to-channel discovery, so a channel with a large featured
+# channels list does not monopolise the worker's event loop.
+_DISCOVERY_RESOLVE_CONCURRENCY: int = 4
+
+# Existence-check retry: the dominant failure mode on hosts with a
+# lossy direct route to the exchange is a slow TCP connect, which a
+# single retry after a short backoff absorbs. The check blocks the
+# scrape decision (and discovery fan-out), so attempts stay at two
+# with a small delay rather than a long retry ladder.
+_EXCHANGE_CHECK_MAX_ATTEMPTS: int = 2
+_EXCHANGE_CHECK_RETRY_BACKOFF_SECONDS: float = 1.0
+
+
+async def _resolve_discovered_link_id(
+    link_handle: str,
+    identity: ChannelIdentityStore | None,
+) -> str | None:
+    '''Resolve a featured-channel link identifier to a channel_id.
+
+    ``extract_linked_channels`` yields bare handles but can also
+    produce ``channel/UC...`` paths when a featured entry links by
+    id. A bare UC-id is returned unchanged, a ``channel/UC...``
+    path is unwrapped, anything else must be a valid handle which is
+    resolved via the shared handle_map first and then InnerTube
+    ``resolve_channel_handle``. Returns ``None`` when the link
+    cannot be resolved; never raises.
+    '''
+    token: str = link_handle or ''
+    if 'channel/' in token:
+        token = token.split('channel/')[-1]
+    token = token.removeprefix('@').strip()
+    if not token:
+        return None
+    if _CHANNEL_ID_RE.fullmatch(token):
+        return token
+    if not _is_valid_input_channel_handle(token):
+        return None
+    if identity is not None:
+        try:
+            mapped: str | None = await identity.handle_map.get(token)
+        except Exception:
+            mapped = None
+        if mapped:
+            return mapped
+    try:
+        return await resolve_channel_handle(token)
+    except Exception as exc:
+        logging.debug(
+            'discovery: handle resolution raised',
+            exc_info=exc,
+            extra={'channel_handle': token},
+        )
+        return None
+
+
+async def _enqueue_discovered_channel_links(
+    channel: YouTubeChannel,
+    *,
+    queue: RedisChannelScrapeQueue,
+    settings: ChannelSettings,
+    creator_map_backend: CreatorMap,
+    http_client: httpx.AsyncClient,
+    identity: ChannelIdentityStore | None = None,
+) -> None:
+    '''Queue featured-channel links found on a scraped channel.
+
+    Each linked channel is resolved to its channel_id, then skipped
+    when the parent scrape itself found it (self link), when the
+    creator_map already knows it, or when scrape.exchange already
+    has a record for it. Otherwise the channel is added to the
+    scheduled scrape queue with source ``discovered_link``.
+
+    Per-link failures are logged and counted, never propagated:
+    discovery must not fail the parent scrape.
+    '''
+    if not settings.channel_discover_linked_channels:
+        return
+
+    links: list = list(channel.channel_links or [])
+    if not links:
+        return
+
+    parent_id: str | None = channel.channel_id
+    extra: dict[str, str] = {
+        'channel_id': parent_id or '',
+        'channel_handle': channel.channel_handle or '',
+    }
+    # Redis-first: the id-keyed ``youtube:exchange_channels`` set
+    # (maintained by the bulk-upload write-back) answers
+    # "already on the exchange" without an HTTP round-trip.
+    exchange_set_redis = creator_map_backend.redis_client
+    exchange_set: RedisExchangeChannelsSet | None = (
+        RedisExchangeChannelsSet(exchange_set_redis)
+        if exchange_set_redis is not None else None
+    )
+    semaphore: asyncio.Semaphore = asyncio.Semaphore(
+        _DISCOVERY_RESOLVE_CONCURRENCY,
+    )
+
+    async def process_link(link: YouTubeChannelLink) -> str:
+        link_extra: dict[str, str] = {
+            **extra,
+            'link_channel_handle': link.channel_handle,
+        }
+        subs: int | None = link.subscriber_count
+        if (subs is not None
+                and subs < settings.channel_discovery_min_subscribers):
+            CHANNEL_LINK_DISCOVERY.labels(
+                outcome='below_min_subscribers',
+            ).inc()
+            return 'below_min_subscribers'
+
+        async with semaphore:
+            link_id: str | None = await _resolve_discovered_link_id(
+                link.channel_handle, identity,
+            )
+        if not link_id:
+            CHANNEL_LINK_DISCOVERY.labels(
+                outcome='resolve_failed',
+            ).inc()
+            return 'resolve_failed'
+        link_extra['link_channel_id'] = link_id
+        if link_id == parent_id:
+            CHANNEL_LINK_DISCOVERY.labels(
+                outcome='self_link',
+            ).inc()
+            return 'self_link'
+
+        try:
+            known: str | None = await creator_map_backend.get(link_id)
+        except Exception:
+            known = None
+        if known:
+            CHANNEL_LINK_DISCOVERY.labels(
+                outcome='already_scraped',
+            ).inc()
+            return 'already_scraped'
+
+        if exchange_set is not None:
+            try:
+                membered: dict[str, bool] = (
+                    await exchange_set.contains_many([link_id])
+                )
+            except Exception:
+                membered = {}
+            if membered.get(link_id):
+                CHANNEL_LINK_DISCOVERY.labels(
+                    outcome='on_exchange',
+                ).inc()
+                return 'on_exchange'
+
+        exists: bool | None = await _channel_exists_on_exchange(
+            http_client, settings.exchange_url, link_id,
+        )
+        if exists is True:
+            CHANNEL_LINK_DISCOVERY.labels(
+                outcome='on_exchange',
+            ).inc()
+            return 'on_exchange'
+        if exists is None:
+            # The exchange check failed; do not enqueue blindly, the
+            # link will be rediscovered on the next full scrape.
+            CHANNEL_LINK_DISCOVERY.labels(
+                outcome='exchange_check_failed',
+            ).inc()
+            return 'exchange_check_failed'
+
+        await queue.enqueue_scheduled(
+            link_id,
+            source='discovered_link',
+        )
+        CHANNEL_LINK_DISCOVERY.labels(
+            outcome='enqueued',
+        ).inc()
+        logging.info(
+            'discovery: enqueued linked channel',
+            extra=link_extra,
+        )
+        return 'enqueued'
+
+    tally: dict[str, int] = {}
+    outcomes: list = await asyncio.gather(
+        *(process_link(link) for link in links),
+        return_exceptions=True,
+    )
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException):
+            tally['processing_error'] = (
+                tally.get('processing_error', 0) + 1
+            )
+            logging.warning(
+                'discovery: per-link processing failed',
+                exc_info=outcome,
+                extra=extra,
+            )
+        else:
+            tally[outcome] = tally.get(outcome, 0) + 1
+    summary_extra: dict[str, object] = {
+        **extra,
+        'links_found': len(links),
+        'links_enqueued': tally.get('enqueued', 0),
+        'links_known': (
+            tally.get('already_scraped', 0)
+            + tally.get('on_exchange', 0)
+        ),
+    }
+    for outcome, count in sorted(tally.items()):
+        summary_extra[f'outcome_{outcome}'] = count
+    logging.info(
+        'discovery: channel link summary',
+        extra=summary_extra,
+    )
 
 
 async def _scrape_one_queued(
@@ -1879,6 +2165,23 @@ async def _scrape_one_queued(
             return
         summary.video_ids_found = len(channel.video_ids)
         await _self_heal_identity(channel, identity, name_map)
+        try:
+            await _enqueue_discovered_channel_links(
+                channel,
+                queue=queue,
+                settings=settings,
+                creator_map_backend=creator_map_backend,
+                http_client=http_client,
+                identity=identity,
+            )
+        except Exception:
+            # Discovery is best-effort: it must never fail the
+            # parent scrape.
+            logging.warning(
+                'channel link discovery failed; scrape continues',
+                exc_info=True,
+                extra=extra,
+            )
         if channel.subscriber_count is not None:
             await queue.set_meta(
                 member,

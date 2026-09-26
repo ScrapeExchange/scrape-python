@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterable
 
-import httpx
+import httpx2 as httpx  # word-source fetches migrated to httpx2
 from innertube.errors import RequestError as InnerTubeRequestError
 from innertube.errors import ResponseError as InnerTubeResponseError
 from pydantic import AliasChoices, Field
@@ -374,7 +374,7 @@ async def choose_random_search_terms(
     if lang != 'en':
         params['lang'] = lang
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=10.0, http2=True) as client:
             if lang in _WIKIMEDIA_RANDOM_WORD_LANGUAGES:
                 url = _WIKIMEDIA_RANDOM_WORD_URL_TEMPLATE.format(
                     language=lang,

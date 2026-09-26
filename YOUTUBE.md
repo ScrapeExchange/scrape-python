@@ -89,6 +89,68 @@ due immediately. `full` forces the channel-content path and writes
 the force fields only after a successful scrape, so transient retries
 continue to honor the operator request.
 
+### Channel-to-channel discovery
+
+After every successful scrape, the featured channels found on the
+channel home page (`channel_links`, parsed from the "Featured
+Channels" shelf by `extract_linked_channels`) feed channel-to-channel
+discovery. Each linked channel is resolved to its channel_id (bare
+`UC…` ids and `channel/UC…` paths pass through; bare handles resolve
+via the shared handle_map, falling back to an InnerTube call) and then:
+
+1. skipped when it links to itself,
+2. skipped when the creator_map already knows it (already scraped),
+3. skipped when scrape.exchange already has a record for it
+   (the same `/api/v1/data/content/youtube/channel/<id>` existence
+   check the scrape decision uses) — also skipped when that check
+   fails with a network error, so a flaky exchange never floods the
+   queue; the link is simply rediscovered on the next full scrape.
+   The check retries transient failures (network errors and
+   502/503/504) once after a one-second backoff, absorbing the
+   slow-connect errors seen on hosts with a lossy direct route to
+   the exchange; the link is simply rediscovered on the next full
+   scrape,
+4. otherwise enqueued on the scheduled scrape queue with
+   `source=discovered_link` (non-priority).
+
+All scrape.exchange traffic (the `ExchangeClient` uploads/GETs, the
+worker's existence-check client) — the proxy fetch stack
+(`proxy_loader` pooled clients, RSS fetching, TikTok short-URL
+resolution, `derived_metadata`, `yt_video_scrape`/`yt_video_queue`
+error classification) — and the discovery word-source clients run on
+**httpx2** with `http2=True` (servers without h2 fall back to
+HTTP/1.1 via ALPN; proxied connections negotiate h2 inside the
+CONNECT tunnel). Pool caps plus long `keepalive_expiry` mean
+concurrent sweeps multiplex onto one warm connection instead of
+opening dozens of TCP connections per second. Still on httpx
+0.23.3: the curl_cffi-impersonated YouTube client
+(`youtube_client.py`, `youtube_cookiejar.py`) and the
+innertube-package-coupled modules (`youtube_channel_tabs.py`,
+`youtube_video_innertube.py`, pinned via the `h11` override in
+`pyproject.toml`). Exception classes are NOT shared — code touching
+httpx2 clients must catch `httpx2.TimeoutException`/
+`httpx2.TransportError`, not the httpx equivalents. Note httpcore2
+requires the `trace` extension callback to be an async function
+(the RSS phase-trace callback already is; the sync InnerTube
+callback stays on httpx).
+
+Links whose subscriber count is below
+`CHANNEL_DISCOVERY_MIN_SUBSCRIBERS` (default 0, i.e. all links) are
+never enqueued. Discovery is capped at 4 concurrent handle resolutions
+per scrape and is best-effort: a per-link failure is logged and
+counted but never fails the parent scrape. Set
+`CHANNEL_DISCOVER_LINKED_CHANNELS=false` to turn the fan-out off, e.g.
+to let the dedicated `yt_discover_channels.py` BFS tool own channel
+discovery instead.
+
+Outcomes are visible in `channel_link_discovery_outcomes_total{outcome}`
+with labels `below_min_subscribers`, `resolve_failed`, `self_link`,
+`already_scraped`, `on_exchange`, `exchange_check_failed`, and
+`enqueued`. Each scraped channel with featured-channel links also
+logs a `discovery: channel link summary` record with `links_found`,
+`links_enqueued`, `links_known`, and a per-outcome
+`outcome_<name>` count.
+
 ### Parallelism: across tabs, not within a tab
 
 All channel tabs are dispatched with `asyncio.gather()`,

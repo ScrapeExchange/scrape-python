@@ -17,7 +17,7 @@ import logging
 
 from typing import Any, Awaitable, Callable, Self, TYPE_CHECKING
 
-from httpx import AsyncClient, Response
+from httpx2 import AsyncClient, Limits, Response, URL
 from prometheus_client import Counter, Gauge, Histogram
 
 from scrape_exchange.scrape_exchange_rate_limiter import (
@@ -235,8 +235,21 @@ class ExchangeClient(AsyncClient):
         # emitting the multipart boundary, leaving the server to
         # parse multipart bytes as JSON and reject every field as
         # missing.
+        # HTTP/2 multiplexes every stream onto one warm connection:
+        # the scrapers' concurrent exchange sweeps (up to 64-wide
+        # video existence checks) otherwise open dozens of TCP
+        # connections per second, which saturates per-host session
+        # limits on intermediate NAT gateways. keepalive_expiry is
+        # raised well above httpx's 5s default so the connection
+        # survives idle gaps between sweep cycles.
         super().__init__(
             trust_env=False,
+            http2=True,
+            limits=Limits(
+                max_connections=16,
+                max_keepalive_connections=8,
+                keepalive_expiry=300.0,
+            ),
         )
 
     @property
@@ -368,7 +381,7 @@ class ExchangeClient(AsyncClient):
         '''
 
         async with AsyncClient(
-            trust_env=False, timeout=30.0,
+            trust_env=False, timeout=30.0, http2=True,
         ) as client:
             response: Response = await client.post(
                 f'{api_url}{TOKEN_ENDPOINT}',
@@ -422,7 +435,7 @@ class ExchangeClient(AsyncClient):
     async def _refresh_jwt_after_rejection(
         self,
         failed_auth_header: str | None,
-        url: str,
+        url: str | URL,
     ) -> bool:
         api_key_id: str | None = getattr(self, '_api_key_id', None)
         api_key_secret: str | None = getattr(
@@ -474,7 +487,7 @@ class ExchangeClient(AsyncClient):
             return True
 
     async def get(
-        self, url: str, retries: int = 3,
+        self, url: str | URL, retries: int = 3,
         delay: float = 1.0, _auth_retry: bool = True, **kwargs,
     ) -> Response:
         '''
@@ -596,7 +609,7 @@ class ExchangeClient(AsyncClient):
         return result
 
     async def post(
-        self, url: str, retries: int = 3,
+        self, url: str | URL, retries: int = 3,
         delay: float = 1.0, _auth_retry: bool = True, **kwargs,
     ) -> Response:
         '''

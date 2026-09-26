@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import fakeredis.aioredis
-import httpx
+import httpx2 as httpx
 from prometheus_client import Counter
 
 from scrape_exchange.channel_scrape_queue import (
@@ -59,7 +59,9 @@ class TestChannelVideoRefresh(unittest.IsolatedAsyncioTestCase):
         self.existing: bool = False
         self.modes: list[bool] = []
         self.requests: list[str] = []
-        self.status: int = 404
+        self.status: int = 200
+        # Video IDs the mock exchange reports for the filter query.
+        self.exchange_video_ids: set[str] = set()
         self.http: httpx.AsyncClient = httpx.AsyncClient(
             transport=httpx.MockTransport(self.respond),
         )
@@ -71,6 +73,22 @@ class TestChannelVideoRefresh(unittest.IsolatedAsyncioTestCase):
 
     def respond(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request.url.path)
+        if request.method == 'POST' and (
+            request.url.path == '/api/v1/filter'
+        ):
+            if self.status != 200:
+                return httpx.Response(self.status)
+            edges: list[dict[str, dict[str, str]]] = [
+                {'node': {'platform_content_id': video_id}}
+                for video_id in sorted(self.exchange_video_ids)
+            ]
+            return httpx.Response(200, json={
+                'total_count': len(edges),
+                'edges': edges,
+                'page_info': {
+                    'has_next_page': False, 'end_cursor': None,
+                },
+            })
         return httpx.Response(self.status)
 
     async def scrape(self, **kwargs: object) -> None:
@@ -150,6 +168,20 @@ class TestChannelVideoRefresh(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         self.channel.subscriber_count = None
         self.status = 503
+        # A filter-query failure is all-or-nothing: the scrape fails
+        # and the refresh stays due, no partial accounting.
+        with self.assertRaises(RuntimeError):
+            await self.run_scrape()
+        self.assertEqual(
+            await self.redis.zrange('youtube:video:queue', 0, -1),
+            [],
+        )
+        meta: dict[str, str] = await self.queue.get_meta('i:UCexample')
+        self.assertEqual(meta['successful_scrapes'], '0')
+        self.assertNotIn('force_rescrape_mode', meta)
+        # A working filter query on the next scrape succeeds and
+        # forces the metadata re-scrape for the missing count.
+        self.status = 200
         with self.assertLogs(level='INFO') as logs:
             await self.run_scrape()
         summaries: list[logging.LogRecord] = [
@@ -157,12 +189,7 @@ class TestChannelVideoRefresh(unittest.IsolatedAsyncioTestCase):
             if hasattr(record, 'video_ids_added')
         ]
         self.assertEqual(summaries[-1].outcome, 'success')
-        self.assertEqual(summaries[-1].video_ids_failed, 1)
-        self.assertEqual(
-            await self.redis.zrange('youtube:video:queue', 0, -1),
-            [],
-        )
-        meta: dict[str, str] = await self.queue.get_meta('i:UCexample')
+        meta = await self.queue.get_meta('i:UCexample')
         self.assertEqual(meta['successful_scrapes'], '1')
         self.assertEqual(meta['force_rescrape_mode'], 'metadata')
         self.assertEqual(meta['force_source'], 'missing_subscriber_count')
@@ -250,7 +277,7 @@ class TestChannelVideoRefresh(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(meta['successful_scrapes'], '0')
         self.assertEqual(meta['next_full_scrape'], '1')
         self.existing = True
-        self.status = 404
+        self.status = 200
         await self.run_scrape()
         self.assertEqual(self.modes, [False, False])
 
@@ -259,22 +286,25 @@ class TestChannelVideoRefresh(unittest.IsolatedAsyncioTestCase):
 
         def respond(request: httpx.Request) -> httpx.Response:
             attempts.append(request.url.path)
-            status: int = 503 if len(attempts) < 3 else 404
+            status: int = 503 if len(attempts) < 3 else 200
+            if status == 200:
+                return httpx.Response(200, json={
+                    'total_count': 0, 'edges': [],
+                    'page_info': {
+                        'has_next_page': False, 'end_cursor': None,
+                    },
+                })
             return httpx.Response(status)
 
         self.http._transport = httpx.MockTransport(respond)
         await self.run_scrape()
+        self.assertEqual(len(attempts), 3)
         meta: dict[str, str] = await self.queue.get_meta('i:UCexample')
         self.assertEqual(meta['successful_scrapes'], '1')
         self.assertEqual(
             await self.redis.zrange('youtube:video:queue', 0, -1),
             ['new-video'],
         )
-
-    async def test_existence_gate_is_shared_per_event_loop(self) -> None:
-        gate: asyncio.Semaphore = refresh._get_existence_gate()
-        self.assertIs(gate, refresh._get_existence_gate())
-        self.assertEqual(gate._value, refresh.EXISTENCE_CONCURRENCY)
 
     async def test_filters_known_videos_and_reports_actual_additions(
         self,
@@ -349,25 +379,22 @@ class TestChannelVideoRefresh(unittest.IsolatedAsyncioTestCase):
             ):
                 await self.channel.scrape(require_complete_video_ids=True)
 
-    async def test_partial_delivery_retries_without_duplicate_additions(
+    async def test_filter_failure_retries_without_duplicate_additions(
         self,
     ) -> None:
         self.channel.video_ids = {'good', 'retry'}
 
         def respond(request: httpx.Request) -> httpx.Response:
-            if request.url.path.endswith('/retry'):
-                return httpx.Response(503)
-            return httpx.Response(404)
+            return httpx.Response(503)
 
         await self.http.aclose()
         self.http = httpx.AsyncClient(transport=httpx.MockTransport(respond))
-        with self.assertLogs(level='INFO') as logs:
+        # A filter failure raises: no enqueues happen at all.
+        with self.assertRaises(RuntimeError):
             await self.run_scrape()
-        summary: logging.LogRecord = [r for r in logs.records
-                   if hasattr(r, 'video_ids_added')][-1]
-        self.assertEqual(summary.video_ids_added, 1)
-        self.assertEqual(summary.video_ids_failed, 1)
-        self.assertEqual(summary.outcome, 'success')
+        self.assertEqual(
+            await self.redis.zcard('youtube:video:queue'), 0,
+        )
         await self.http.aclose()
         self.http = httpx.AsyncClient(
             transport=httpx.MockTransport(self.respond),
@@ -376,9 +403,17 @@ class TestChannelVideoRefresh(unittest.IsolatedAsyncioTestCase):
             await self.run_scrape()
         summary: logging.LogRecord = [r for r in logs.records
                    if hasattr(r, 'video_ids_added')][-1]
-        self.assertEqual(summary.video_ids_added, 1)
-        self.assertEqual(summary.video_ids_queue_known, 1)
+        self.assertEqual(summary.video_ids_added, 2)
         self.assertEqual(summary.outcome, 'success')
+        # Re-scrape: the same IDs are now queue-known, not re-added.
+        with self.assertLogs(level='INFO') as logs:
+            await self.run_scrape()
+        summary = [r for r in logs.records
+                   if hasattr(r, 'video_ids_added')][-1]
+        self.assertEqual(summary.video_ids_added, 0)
+        self.assertEqual(summary.video_ids_queue_known, 2)
+        self.assertEqual(summary.outcome, 'success')
+        # The failed run did not count as a successful scrape.
         meta: dict[str, str] = await self.queue.get_meta('i:UCexample')
         self.assertEqual(meta['successful_scrapes'], '2')
 
@@ -411,6 +446,32 @@ class TestChannelVideoRefresh(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary.video_ids_added, 0)
         self.assertEqual(summary.video_ids_queue_known, 1)
 
+    async def test_redis_tracked_ids_dedupe_without_data_gets(
+        self,
+    ) -> None:
+        # Queue-tracked (queued and terminal) IDs are resolved by the
+        # single filter query plus local queue dedupe — no per-video
+        # existence GETs against /api/v1/data/content.
+        queue: RedisVideoScrapeQueue = RedisVideoScrapeQueue(
+            self.redis, VideoScrapeQueueSettings(),
+        )
+        await queue.enqueue('queued-already', source='test')
+        await queue.mark(
+            'terminal-one', state=VideoState.UNAVAILABLE,
+        )
+        self.channel.video_ids = {'queued-already', 'terminal-one'}
+        with self.assertLogs(level='INFO') as logs:
+            await self.run_scrape()
+        self.assertEqual(
+            [p for p in self.requests if 'data/content' in p],
+            [],
+        )
+        summary: logging.LogRecord = [r for r in logs.records
+                   if hasattr(r, 'video_ids_added')][-1]
+        self.assertEqual(summary.video_ids_queue_known, 2)
+        self.assertEqual(summary.video_ids_added, 0)
+        self.assertEqual(summary.video_ids_failed, 0)
+
     async def test_api_existing_and_tombstoned_ids_are_not_added(
         self,
     ) -> None:
@@ -423,7 +484,7 @@ class TestChannelVideoRefresh(unittest.IsolatedAsyncioTestCase):
         await self.run_scrape()
         self.assertEqual(await self.redis.zcard('youtube:video:queue'), 0)
         self.channel.video_ids = {'api-existing'}
-        self.status = 200
+        self.exchange_video_ids = {'api-existing'}
         await self.queue.set_meta('i:UCexample', force_rescrape_mode='full')
         await self.run_scrape()
         self.assertEqual(await self.redis.zcard('youtube:video:queue'), 0)

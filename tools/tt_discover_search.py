@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote_plus, urljoin, urlparse
 
-import httpx
+import httpx2 as httpx  # word-source fetches migrated to httpx2
 from pydantic import AliasChoices, Field
 from pydantic_settings import SettingsConfigDict
 
@@ -523,7 +523,7 @@ async def choose_random_search_terms(
     if language != 'en':
         params['lang'] = language
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=10.0, http2=True) as client:
             response: httpx.Response = await client.get(url, params=params)
             response.raise_for_status()
             words: list[str] = _extract_words_from_random_payload(
