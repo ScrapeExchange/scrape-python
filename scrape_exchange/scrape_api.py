@@ -154,7 +154,7 @@ async def get_data_by_item_id(
 ) -> GetDataResponseModel:
     '''``GET /api/v1/data/item_id/{item_id}`` -> one record.
 
-    :raises httpx.HTTPStatusError: On non-2xx (e.g. 404).
+    :raises httpx2.HTTPStatusError: On non-2xx (e.g. 404).
     '''
     response = await client.get(
         f'{client.exchange_url.rstrip("/")}{_API_PREFIX}/data/item_id/{item_id}',

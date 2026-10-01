@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
 
-import httpx
+import httpx2 as httpx  # proxy fetch paths migrated to httpx2 (HTTP/2)
 
 
 _ALLOWED_URL_SCHEMES: Final[tuple[str, ...]] = ('http://', 'https://')
@@ -288,14 +288,16 @@ def httpx_client_for_entry(
     """
 
     if entry is None:
-        return httpx.AsyncClient(**kwargs)
+        return httpx.AsyncClient(http2=True, **kwargs)
     if entry.startswith(_LOCAL_SCHEME):
         ip: str = entry.removeprefix(_LOCAL_SCHEME)
         return httpx.AsyncClient(
-            transport=httpx.AsyncHTTPTransport(local_address=ip),
+            transport=httpx.AsyncHTTPTransport(
+                local_address=ip, http2=True,
+            ),
             **kwargs,
         )
-    return httpx.AsyncClient(proxies=entry, **kwargs)
+    return httpx.AsyncClient(proxy=entry, http2=True, **kwargs)
 
 
 from scrape_exchange._lazy_async_pool import _LazyAsyncPool
@@ -337,18 +339,22 @@ def _make_pooled_httpx_client_for_entry(
 
     if entry is None:
         return httpx.AsyncClient(
+            http2=True,
             limits=_POOLED_HTTPX_LIMITS,
             timeout=_POOLED_HTTPX_DEFAULT_TIMEOUT,
         )
     if entry.startswith(_LOCAL_SCHEME):
         ip: str = entry.removeprefix(_LOCAL_SCHEME)
         return httpx.AsyncClient(
-            transport=httpx.AsyncHTTPTransport(local_address=ip),
+            transport=httpx.AsyncHTTPTransport(
+                local_address=ip, http2=True,
+            ),
             limits=_POOLED_HTTPX_LIMITS,
             timeout=_POOLED_HTTPX_DEFAULT_TIMEOUT,
         )
     return httpx.AsyncClient(
-        proxies=entry,
+        proxy=entry,
+        http2=True,
         limits=_POOLED_HTTPX_LIMITS,
         timeout=_POOLED_HTTPX_DEFAULT_TIMEOUT,
     )

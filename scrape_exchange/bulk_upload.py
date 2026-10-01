@@ -31,7 +31,7 @@ from uuid import uuid4
 import aiofiles.os
 import orjson
 import websockets
-from httpx import Response, Timeout
+from httpx2 import Response, Timeout
 
 from .exchange_client import ExchangeClient
 from .file_management import AssetFileManagement, atomic_write_bytes

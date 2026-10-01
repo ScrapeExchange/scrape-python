@@ -12,7 +12,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from httpx import HTTPStatusError
+from httpx2 import HTTPStatusError
 
 from scrape_exchange.file_management import (
     AssetFileManagement,
@@ -36,6 +36,13 @@ LOGGER: logging.Logger = logging.getLogger(__name__)
 
 CATEGORY_THRESHOLD: int = 20
 CHANNEL_CATEGORY_COUNTS_PREFIX: str = 'youtube:channel_category_counts:'
+
+# The category-count hashes are derived data: recomputed from
+# exchange records on every channel scrape that still needs a
+# category. Without an expiry they accumulate for every channel
+# ever seen (1.2M+ keys) long after the last scrape. The TTL
+# keeps active channels warm and lets stale ones age out.
+CATEGORY_COUNTS_TTL_SECONDS: int = 90 * 24 * 3600
 CHANNELS_WITH_CATEGORY_COUNTS: str = 'youtube:channels_with_category_counts'
 CHANNEL_COUNTRY_HASH: str = 'youtube:channel_country'
 SCHEMA_VERSION: str = '0.0.2'
@@ -307,6 +314,7 @@ async def merge_category_counts_into_redis(
                     current_count = 0
             if count > current_count:
                 await redis.hset(key, category, str(count))
+    await redis.expire(key, CATEGORY_COUNTS_TTL_SECONDS)
     await redis.sadd(CHANNELS_WITH_CATEGORY_COUNTS, channel_id)
 
 

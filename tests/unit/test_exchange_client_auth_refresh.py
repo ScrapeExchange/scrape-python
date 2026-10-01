@@ -8,7 +8,7 @@ import unittest
 from collections.abc import Callable
 from unittest.mock import AsyncMock, patch
 
-import httpx
+import httpx2 as httpx
 
 from scrape_exchange.exchange_client import ExchangeClient
 

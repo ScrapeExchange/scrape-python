@@ -94,6 +94,7 @@ class TestProcessChannelCircuitContract(unittest.TestCase):
                 channel_validator=channel_validator,
                 tier=1,
                 video_queue=video_queue,
+                uploaded_videos=MagicMock(),
             ))
 
             # set_no_feeds suppressed.
@@ -169,6 +170,7 @@ class TestProcessChannelNon404Errors(unittest.TestCase):
                 channel_validator=channel_validator,
                 tier=1,
                 video_queue=video_queue,
+                uploaded_videos=MagicMock(),
             ))
 
     def test_5xx_does_not_contact_breaker(self) -> None:

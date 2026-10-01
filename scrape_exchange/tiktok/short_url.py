@@ -16,7 +16,7 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 
-import httpx
+import httpx2 as httpx  # proxy fetch paths migrated to httpx2 (HTTP/2)
 
 _SHORT_URL_RE: re.Pattern[str] = re.compile(
     r'^https?://(?:www\.)?(vm|vt)\.tiktok\.com/'
@@ -127,7 +127,8 @@ async def resolve_creator_short_url(
     headers: dict[str, str] = {'User-Agent': user_agent}
     try:
         async with httpx.AsyncClient(
-            proxies=proxy,
+            proxy=proxy,
+            http2=True,
             follow_redirects=True,
             timeout=timeout,
             headers=headers,

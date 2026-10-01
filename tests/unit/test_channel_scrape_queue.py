@@ -297,6 +297,50 @@ class TestEnqueueScheduled(_RedisQueueTestBase):
         )
         self.assertEqual(cid, 'UCabc123')
 
+    async def test_refuses_terminal_state_atomically(
+        self,
+    ) -> None:
+        # Discovery re-enqueue over an operator removal must be
+        # refused: no queue entry, and the meta state stays
+        # removed (no queued-but-removed split record).
+        await self.queue.enqueue_scheduled(
+            'UCabc123', source='cli',
+        )
+        await self.queue.mark(
+            'i:UCabc123', state=ChannelState.REMOVED,
+        )
+        enqueued: bool = await self.queue.enqueue_scheduled(
+            'UCabc123', source='discovered_link',
+        )
+        self.assertFalse(enqueued)
+        self.assertIsNone(await self.redis.zscore(
+            'youtube:channel:queue:scheduled:0',
+            'i:UCabc123',
+        ))
+        self.assertEqual(
+            await self.redis.hget(
+                'youtube:channel:meta:i:UCabc123', 'state',
+            ),
+            'removed',
+        )
+
+    async def test_non_terminal_state_still_enqueues(
+        self,
+    ) -> None:
+        # Idempotent re-enqueue over an active (non-terminal)
+        # state keeps returning True.
+        await self.queue.enqueue_scheduled(
+            'UCabc123', source='cli',
+        )
+        enqueued: bool = await self.queue.enqueue_scheduled(
+            'UCabc123', source='discovered_link',
+        )
+        self.assertTrue(enqueued)
+        self.assertIsNotNone(await self.redis.zscore(
+            'youtube:channel:queue:scheduled:0',
+            'i:UCabc123',
+        ))
+
     async def test_existing_tier_is_respected(
         self,
     ) -> None:

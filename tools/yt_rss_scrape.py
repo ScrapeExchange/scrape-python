@@ -28,8 +28,8 @@ from scrape_exchange.brotli import brotli_read, brotli_write_async
 import orjson
 import untangle
 
-import httpx
-from httpx import Response
+import httpx2 as httpx  # proxy fetch paths migrated to httpx2 (HTTP/2)
+from httpx2 import Response
 
 import redis.asyncio as aioredis
 
@@ -120,6 +120,7 @@ from scrape_exchange.video_scrape_queue import (
     RedisVideoScrapeQueue,
     VideoScrapeQueueSettings,
 )
+from scrape_exchange.youtube.uploaded_video_ids import UploadedVideoIds
 
 
 CHANNEL_FILENAME_PREFIX: str = 'channel-'
@@ -1226,6 +1227,7 @@ async def process_channel(
     channel_validator: SchemaValidator,
     tier: int,
     video_queue: RedisVideoScrapeQueue,
+    uploaded_videos: UploadedVideoIds,
 ) -> bool | None:
     '''
     Fetches the RSS feed for one channel and checks or stores each video.
@@ -1502,6 +1504,58 @@ async def process_channel(
     # is timed under ``check_existence`` — when there are many
     # candidates the slowest exchange API call dominates, which
     # is the right thing to measure for capacity planning.
+    #
+    # Redis-first: videos the fleet already uploaded (uploaded
+    # set) are on the exchange, and videos the scrape queue
+    # already tracks (queued or terminal meta) cannot be —
+    # uploads delete the queue record on completion. Neither
+    # needs an existence GET.
+    redis_uploaded: set[str] = set()
+    redis_tracked: set[str] = set()
+    redis_tracked_videos: list[YouTubeVideo] = []
+    try:
+        candidate_ids: list[str] = [
+            str(v.video_id) for v in candidates
+        ]
+        uploaded_flags: dict[str, bool] = (
+            await uploaded_videos.contains_many(candidate_ids)
+        )
+        queue_states: dict = await video_queue.get_states(
+            candidate_ids,
+        )
+        redis_uploaded = {
+            video_id
+            for video_id, flag in uploaded_flags.items()
+            if flag
+        }
+        redis_tracked = {
+            video_id
+            for video_id, state in queue_states.items()
+            if state is not None
+        }
+    except Exception as exc:
+        logging.debug(
+            'Redis existence pre-check failed; checking '
+            'scrape.exchange for all candidates',
+            exc_info=exc, extra=extra,
+        )
+    to_check: list[YouTubeVideo] = []
+    for video in candidates:
+        video_id_str: str = str(video.video_id)
+        if video_id_str in redis_uploaded:
+            logging.debug(
+                'Video already uploaded per Redis, skipping',
+                extra=extra | {'video_id': video.video_id},
+            )
+            videos_existing += 1
+        elif video_id_str in redis_tracked:
+            # Already in the scrape queue: not on the exchange,
+            # and the queue enqueue below dedupes. No GET needed.
+            redis_tracked_videos.append(video)
+        else:
+            to_check.append(video)
+    candidates = to_check
+
     exist_started: float = monotonic()
     existence_gate: asyncio.Semaphore = (
         _get_exchange_existence_semaphore(settings)
@@ -1538,6 +1592,11 @@ async def process_channel(
             videos_existing += 1
         else:
             new_videos.append(video)
+
+    # Redis-tracked videos skip the existence GET entirely and
+    # rejoin the queue phase here; their enqueue dedupes against
+    # the existing queue record.
+    new_videos.extend(redis_tracked_videos)
 
     if not new_videos:
         logging.info(
@@ -2363,6 +2422,7 @@ async def _stream_processor(
     channel_validator: SchemaValidator,
     settings: RssSettings,
     video_queue: RedisVideoScrapeQueue,
+    uploaded_videos: UploadedVideoIds,
 ) -> None:
     '''Single-channel streaming processor.
 
@@ -2421,6 +2481,7 @@ async def _stream_processor(
                     channel_validator,
                     claim_tier,
                     video_queue,
+                    uploaded_videos,
                 )
             except Exception as exc:
                 result = exc
@@ -2482,6 +2543,7 @@ async def worker_loop(
     name_map_backend: NameMap,
     channel_validator: SchemaValidator,
     video_queue: RedisVideoScrapeQueue,
+    uploaded_videos: UploadedVideoIds,
 ) -> None:
     '''
     Runs indefinitely, processing channels in priority order.
@@ -2647,6 +2709,7 @@ async def worker_loop(
                 channel_validator=channel_validator,
                 settings=settings,
                 video_queue=video_queue,
+                uploaded_videos=uploaded_videos,
             ),
         )
         for i in range(effective_concurrency)
@@ -2739,6 +2802,11 @@ async def _run_worker(
             VideoScrapeQueueSettings(),
         )
     )
+    # One shared wrapper over the worker's pool: the per-channel
+    # Redis existence pre-check must not open its own connection.
+    uploaded_videos: UploadedVideoIds = UploadedVideoIds(
+        '', redis_client=video_queue_redis,
+    )
 
     creator_map_backend: CreatorMap
     if settings.redis_dsn:
@@ -2788,6 +2856,7 @@ async def _run_worker(
         creator_map_backend, name_map_backend,
         channel_validator,
         video_queue,
+        uploaded_videos,
     )
 
 

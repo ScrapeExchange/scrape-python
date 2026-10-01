@@ -3,7 +3,7 @@
 import asyncio
 import unittest
 
-import httpx
+import httpx2 as httpx
 
 from scrape_exchange.proxy_loader import httpx_client_for_entry
 
