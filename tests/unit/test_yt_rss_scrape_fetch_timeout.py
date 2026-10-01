@@ -85,7 +85,7 @@ class TestFetchRssTimeout(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(timeout.connect, 5.0)
 
 
-import httpx
+import httpx2 as httpx
 
 
 class TestFetchRssTimeoutCircuitWiring(

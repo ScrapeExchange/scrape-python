@@ -1,12 +1,16 @@
 '''Unit tests for shared Redis client construction.'''
 
+import asyncio
 import os
 import unittest
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from scrape_exchange.redis_client import (
     DEFAULT_MAX_CONNECTIONS,
+    RedisConnectRetrySettings,
     call_with_redis_busy_retry,
+    call_with_redis_connect_retry,
     is_redis_busy_script_error,
     redis_client_name,
     redis_from_url,
@@ -53,6 +57,7 @@ class TestRedisFromUrl(unittest.TestCase):
         self.assertEqual(
             kwargs['max_connections'],
             DEFAULT_MAX_CONNECTIONS,
+    RedisConnectRetrySettings,
         )
         self.assertEqual(
             kwargs['client_name'],
@@ -282,3 +287,381 @@ class TestRedisBusyRetry(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, ['ok'])
         self.assertEqual(attempts, 2)
+
+
+class TestRedisConnectionRetry(unittest.IsolatedAsyncioTestCase):
+
+    async def test_timeout_retries_with_doubling_backoff(self) -> None:
+        from redis.exceptions import TimeoutError as RedisTimeoutError
+
+        attempts: int = 0
+        sleeps: list[float] = []
+
+        async def operation() -> str:
+            nonlocal attempts
+            attempts += 1
+            if attempts <= 3:
+                raise RedisTimeoutError('Timeout reading from socket')
+            return 'ok'
+
+        async def sleep(delay: float) -> None:
+            sleeps.append(delay)
+
+        result: str = await call_with_redis_connect_retry(
+            operation, sleep=sleep,
+        )
+
+        self.assertEqual(result, 'ok')
+        self.assertEqual(attempts, 4)
+        self.assertEqual(sleeps, [1.0, 2.0, 4.0])
+
+    async def test_stops_when_backoff_exceeds_256s(self) -> None:
+        from redis.exceptions import ConnectionError as RedisConnectionError
+
+        attempts: int = 0
+        sleeps: list[float] = []
+
+        async def operation() -> str:
+            nonlocal attempts
+            attempts += 1
+            raise RedisConnectionError('Connection refused')
+
+        async def sleep(delay: float) -> None:
+            sleeps.append(delay)
+
+        with self.assertRaises(RedisConnectionError):
+            await call_with_redis_connect_retry(operation, sleep=sleep)
+
+        # Delays 1..256 — 512 would exceed the 256s cap. Each delay
+        # is slept in watchdog-paced slices of at most 30s.
+        self.assertEqual(sleeps[:5], [1.0, 2.0, 4.0, 8.0, 16.0])
+        self.assertTrue(all(s <= 30.0 for s in sleeps))
+        self.assertEqual(sum(sleeps), 511.0)
+        self.assertEqual(attempts, 10)
+
+    async def test_recovers_mid_sequence_after_drop(self) -> None:
+        from redis.exceptions import ConnectionError as RedisConnectionError
+        from redis.exceptions import TimeoutError as RedisTimeoutError
+
+        attempts: int = 0
+        sleeps: list[float] = []
+
+        async def operation() -> int:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RedisTimeoutError('timed out')
+            if attempts == 2:
+                raise OSError('Network is unreachable')
+            if attempts == 3:
+                raise RedisConnectionError('Connection closed by server')
+            return attempts
+
+        async def sleep(delay: float) -> None:
+            sleeps.append(delay)
+
+        result: int = await call_with_redis_connect_retry(
+            operation, sleep=sleep,
+        )
+
+        self.assertEqual(result, 4)
+        self.assertEqual(sleeps, [1.0, 2.0, 4.0])
+
+    async def test_auth_error_is_not_retried(self) -> None:
+        from redis.exceptions import AuthenticationError
+
+        attempts: int = 0
+
+        async def operation() -> str:
+            nonlocal attempts
+            attempts += 1
+            raise AuthenticationError('WRONGPASS')
+
+        async def sleep(delay: float) -> None:
+            sleeps.append(delay)
+
+        sleeps: list[float] = []
+
+        with self.assertRaises(AuthenticationError):
+            await call_with_redis_connect_retry(operation, sleep=sleep)
+
+        self.assertEqual(attempts, 1)
+
+    async def test_backoff_caps_at_env_max(self) -> None:
+        from redis.exceptions import ConnectionError as RedisConnectionError
+
+        attempts: int = 0
+        sleeps: list[float] = []
+
+        async def operation() -> str:
+            nonlocal attempts
+            attempts += 1
+            raise RedisConnectionError('Connection refused')
+
+        async def sleep(delay: float) -> None:
+            sleeps.append(delay)
+
+        with (
+            patch.dict(os.environ, {
+                'REDIS_CONNECT_RETRY_BASE_SECONDS': '0.5',
+                'REDIS_CONNECT_RETRY_MAX_SECONDS': '3',
+            }, clear=True),
+            self.assertRaises(RedisConnectionError),
+        ):
+            await call_with_redis_connect_retry(operation, sleep=sleep)
+
+        # 0.5, 1, 2 — the next delay of 4 would exceed the 3s cap.
+        self.assertEqual(sleeps, [0.5, 1.0, 2.0])
+
+    async def test_lost_responses_do_not_replay_commands(self) -> None:
+        from fakeredis import FakeServer
+        from fakeredis.aioredis import FakeAsyncRedisConnection
+        from redis.exceptions import TimeoutError as RedisTimeoutError
+
+        # Exercise ordinary commands and both pipeline modes. The fake
+        # server executes each mutation before we discard its response.
+        read_response: Any = FakeAsyncRedisConnection.read_response
+        mode: str
+        for mode in ('command', 'pipeline', 'transaction'):
+            with self.subTest(mode=mode):
+                client: Any = redis_from_url(
+                    'redis://localhost:6379/0', component='test',
+                    connection_class=FakeAsyncRedisConnection,
+                    decode_responses=True, server=FakeServer(),
+                )
+                await client.zadd('queue', {'first': 1, 'second': 2})
+                failed: bool = False
+
+                async def lose_response(
+                    connection: FakeAsyncRedisConnection,
+                    *args: Any, **kwargs: Any,
+                ) -> Any:
+                    nonlocal failed
+                    result: Any = await read_response(
+                        connection, *args, **kwargs,
+                    )
+                    if not failed:
+                        failed = True
+                        raise RedisTimeoutError('Response lost')
+                    return result
+
+                try:
+                    with (
+                        patch.object(
+                            FakeAsyncRedisConnection, 'read_response',
+                            lose_response,
+                        ),
+                        patch(
+                            'scrape_exchange.redis_client.asyncio.sleep',
+                            new_callable=AsyncMock,
+                        ),
+                        patch.dict(os.environ, {
+                            'REDIS_CONNECT_RETRY_BASE_SECONDS': '0.001',
+                        }, clear=True),self.assertRaises(RedisTimeoutError)
+                    ):
+                        if mode == 'command':
+                            await client.zpopmin('queue', 1)
+                        else:
+                            pipe: Any = client.pipeline(
+                                transaction=mode == 'transaction',
+                            )
+                            pipe.zpopmin('queue', 1)
+                            await pipe.execute()
+                    self.assertEqual(
+                        await client.zrange('queue', 0, -1), ['second'],
+                    )
+                finally:
+                    await client.aclose()
+                    await client.connection_pool.disconnect()
+
+    async def test_connect_failure_recovers_before_submission(self) -> None:
+        from fakeredis import FakeServer
+        from fakeredis.aioredis import FakeAsyncRedisConnection
+        from redis.exceptions import ConnectionError as RedisConnectionError
+
+        connect: Any = FakeAsyncRedisConnection.connect
+        pipeline: bool
+        for pipeline in (False, True):
+            with self.subTest(pipeline=pipeline):
+                client: Any = redis_from_url(
+                    'redis://localhost:6379/0', component='test',
+                    connection_class=FakeAsyncRedisConnection,
+                    decode_responses=True, server=FakeServer(),
+                )
+                failed: bool = False
+
+                async def fail_connect_once(
+                    connection: FakeAsyncRedisConnection,
+                ) -> None:
+                    nonlocal failed
+                    if not failed:
+                        failed = True
+                        raise RedisConnectionError('Connection refused')
+                    await connect(connection)
+
+                try:
+                    with (
+                        patch.object(
+                            FakeAsyncRedisConnection, 'connect',
+                            fail_connect_once,
+                        ),
+                        patch(
+                            'scrape_exchange.redis_client.asyncio.sleep',
+                            new_callable=AsyncMock,
+                        ),
+                    ):
+                        if pipeline:
+                            pipe: Any = client.pipeline()
+                            pipe.incr('counter')
+                            self.assertEqual(await pipe.execute(), [1])
+                        else:
+                            self.assertEqual(await client.incr('counter'), 1)
+                    self.assertEqual(await client.get('counter'), '1')
+                finally:
+                    await client.aclose()
+                    await client.connection_pool.disconnect()
+
+    async def test_cancelled_connect_releases_pool_slot(self) -> None:
+        from fakeredis import FakeServer
+        from fakeredis.aioredis import FakeAsyncRedisConnection
+        from redis.exceptions import ConnectionError as RedisConnectionError
+
+        client: Any = redis_from_url(
+            'redis://localhost:6379/0', component='test',
+            connection_class=FakeAsyncRedisConnection,
+            server=FakeServer(), max_connections=1,
+        )
+        try:
+            with (
+                patch.object(
+                    FakeAsyncRedisConnection, 'connect',
+                    side_effect=RedisConnectionError('Connection refused'),
+                ),
+                patch(
+                    'scrape_exchange.redis_client.asyncio.sleep',
+                    side_effect=asyncio.CancelledError,
+                ),self.assertRaises(asyncio.CancelledError)
+            ):
+                await client.ping()
+            self.assertTrue(await asyncio.wait_for(client.ping(), timeout=1))
+        finally:
+            await client.aclose()
+            await client.connection_pool.disconnect()
+
+
+class TestRedisConnectRetrySettings(unittest.TestCase):
+    def test_environment_overrides(self) -> None:
+        with patch.dict(os.environ, {
+            'REDIS_CONNECT_RETRY_BASE_SECONDS': '0.5',
+            'REDIS_CONNECT_RETRY_MAX_SECONDS': '3',
+        }, clear=True):
+            settings: RedisConnectRetrySettings = RedisConnectRetrySettings()
+        self.assertEqual(settings.base_seconds, 0.5)
+        self.assertEqual(settings.max_seconds, 3)
+
+    def test_rejects_unbounded_or_invalid_backoff(self) -> None:
+        from pydantic import ValidationError
+
+        name: str
+        values: tuple[str, ...]
+        value: str
+        for name, values in (
+            ('BASE', ('0', '-1', 'nan', 'inf', 'invalid')),
+            ('MAX', ('-1', 'nan', 'inf', 'invalid')),
+        ):
+            for value in values:
+                with (
+                    self.subTest(name=name, value=value),
+                    patch.dict(os.environ, {
+                        f'REDIS_CONNECT_RETRY_{name}_SECONDS': value,
+                    }, clear=True),
+                    self.assertRaises(ValidationError),
+                ):
+                    RedisConnectRetrySettings()
+
+
+class TestWatchdogPacedBackoff(unittest.IsolatedAsyncioTestCase):
+    '''Reconnect backoff must pulse the watchdog work signal, or the
+    180s work-signal timeout kills a healthy-but-reconnecting scraper
+    (2026-09-26 watchdog terminations).'''
+
+    async def test_long_backoff_touches_work_per_slice(self) -> None:
+        from redis.exceptions import ConnectionError as RedisConnectionError
+        from scrape_exchange.redis_client import _WATCHDOG_TOUCH_SLICE_SECONDS
+
+        attempts: int = 0
+        sleeps: list[float] = []
+        touches: int = 0
+
+        async def operation() -> str:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RedisConnectionError('Connection refused')
+            return 'ok'
+
+        async def sleep(delay: float) -> None:
+            sleeps.append(delay)
+            # Simulate the watchdog firing mid-slice if the signal
+            # goes stale: a 256s single sleep would breach the 180s
+            # timeout, slices of <=30s must not.
+            self.assertLessEqual(
+                delay, _WATCHDOG_TOUCH_SLICE_SECONDS,
+            )
+
+        def touch_work() -> None:
+            nonlocal touches
+            touches += 1
+
+        from scrape_exchange.redis_client import RedisConnectRetrySettings
+        result: str = await call_with_redis_connect_retry(
+            operation, sleep=sleep, touch_work=touch_work,
+            settings=RedisConnectRetrySettings(
+                base_seconds=256.0, max_seconds=256.0,
+            ),
+        )
+
+        self.assertEqual(result, 'ok')
+        # 256s delay paced as 30s slices: the signal never goes
+        # stale, and every slice boundary pulses it.
+        self.assertEqual(sleeps, [30.0] * 8 + [16.0])
+        self.assertEqual(touches, len(sleeps) + 1)
+
+    async def test_backoff_walk_slices_long_delays(self) -> None:
+        from redis.exceptions import TimeoutError as RedisTimeoutError
+
+        sleeps: list[float] = []
+        touches: int = 0
+
+        async def operation() -> str:
+            raise RedisTimeoutError('timed out')
+
+        async def sleep(delay: float) -> None:
+            sleeps.append(delay)
+
+        def touch_work() -> None:
+            nonlocal touches
+            touches += 1
+
+        with self.assertRaises(RedisTimeoutError):
+            await call_with_redis_connect_retry(
+                operation, sleep=sleep, touch_work=touch_work,
+            )
+
+        # The full 1..256 walk, every slice <= 30s.
+        self.assertEqual(sum(sleeps), 511.0)
+        self.assertTrue(all(s <= 30.0 for s in sleeps))
+        self.assertGreaterEqual(touches, len(sleeps))
+
+    def test_default_touch_resolves_installed_watchdog(self) -> None:
+        from scrape_exchange.redis_client import _default_touch_work
+        from scrape_exchange.watchdog import Watchdog
+
+        watchdog: Watchdog = Watchdog(
+            loop_timeout=0.0, work_timeout=0.0,
+        )
+        try:
+            Watchdog.set_instance(watchdog)
+            self.assertEqual(_default_touch_work(), watchdog.touch_work)
+        finally:
+            Watchdog.reset()

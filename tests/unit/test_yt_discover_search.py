@@ -8,7 +8,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import httpx
+import httpx  # original: InnerTube raises these classes
+import httpx2  # word-source fetches migrated to httpx2
 from innertube.errors import RequestError as InnerTubeRequestError
 from innertube.errors import ResponseError as InnerTubeResponseError
 
@@ -142,7 +143,7 @@ class TestRandomSearchTerms(unittest.IsolatedAsyncioTestCase):
         client.get.return_value = response
 
         with mock.patch(
-            'tools.yt_discover_search.httpx.AsyncClient',
+            'tools.yt_discover_search.httpx2.AsyncClient',
         ) as client_type:
             client_type.return_value.__aenter__.return_value = client
             terms = await choose_random_search_terms(
@@ -174,7 +175,7 @@ class TestRandomSearchTerms(unittest.IsolatedAsyncioTestCase):
         client.get.return_value = response
 
         with mock.patch(
-            'tools.yt_discover_search.httpx.AsyncClient',
+            'tools.yt_discover_search.httpx2.AsyncClient',
         ) as client_type:
             client_type.return_value.__aenter__.return_value = client
             terms = await choose_random_search_terms(
@@ -188,10 +189,10 @@ class TestRandomSearchTerms(unittest.IsolatedAsyncioTestCase):
     async def test_wikimedia_failure_uses_offline_fallback(self) -> None:
         settings = DiscoverSearchSettings(_cli_parse_args=[])
         client = mock.AsyncMock()
-        client.get.side_effect = httpx.ReadTimeout('slow')
+        client.get.side_effect = httpx2.ReadTimeout('slow')
 
         with mock.patch(
-            'tools.yt_discover_search.httpx.AsyncClient',
+            'tools.yt_discover_search.httpx2.AsyncClient',
         ) as client_type, mock.patch(
             'tools.yt_discover_search.random.choice',
             return_value='water',

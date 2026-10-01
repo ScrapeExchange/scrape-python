@@ -20,7 +20,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterable
 
-import httpx
+import httpx  # InnerTube still runs on original httpx: its exception
+# classes must be caught as httpx.*, not httpx2.*
+import httpx2  # word-source fetches migrated to httpx2
 from innertube.errors import RequestError as InnerTubeRequestError
 from innertube.errors import ResponseError as InnerTubeResponseError
 from pydantic import AliasChoices, Field
@@ -93,6 +95,7 @@ _TRANSIENT_SEARCH_ERRORS: tuple[type[BaseException], ...] = (
     InnerTubeResponseError,
 )
 _PROXY_CONNECTION_ERRORS: tuple[type[BaseException], ...] = (
+    # Original httpx: the InnerTube client raises these.
     httpx.TransportError,
     ConnectionResetError,
     ConnectionRefusedError,
@@ -374,7 +377,9 @@ async def choose_random_search_terms(
     if lang != 'en':
         params['lang'] = lang
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx2.AsyncClient(
+            timeout=10.0, http2=True,
+        ) as client:
             if lang in _WIKIMEDIA_RANDOM_WORD_LANGUAGES:
                 url = _WIKIMEDIA_RANDOM_WORD_URL_TEMPLATE.format(
                     language=lang,
@@ -387,7 +392,7 @@ async def choose_random_search_terms(
                     'format': 'json',
                     'formatversion': 2,
                 }
-                response: httpx.Response = await client.get(
+                response: httpx2.Response = await client.get(
                     url,
                     params=params,
                     headers={'User-Agent': _WIKIMEDIA_USER_AGENT},

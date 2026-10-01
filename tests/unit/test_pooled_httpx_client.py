@@ -2,7 +2,7 @@
 
 import unittest
 
-import httpx
+import httpx2 as httpx
 
 import scrape_exchange.proxy_loader as proxy_loader
 from scrape_exchange.proxy_loader import (

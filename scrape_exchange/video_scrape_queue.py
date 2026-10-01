@@ -10,8 +10,9 @@ import enum
 import json
 import time
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import Any, AsyncIterator
+from typing import Any
 
 import redis.asyncio as aioredis
 from pydantic import Field
@@ -20,8 +21,18 @@ from pydantic_settings import (
     SettingsConfigDict,
 )
 
-
 KEY_PREFIX: str = 'youtube:video'
+
+# TTL applied to a video's meta hash when it is marked with a
+# terminal state (unavailable/failed/removed). The state-hash
+# entry remains as a compact tombstone, so enqueue() keeps
+# reporting the video as known; only the per-key meta hash
+# expires. Without this the meta hashes of dead videos
+# accumulate forever — tens of millions of keys, minutes of
+# AOF loading per Redis restart, and OOM pressure on the
+# shared host. The TTL bounds diagnostic retention; terminal
+# membership continues to prevent automatic re-enqueueing.
+TERMINAL_META_TTL_SECONDS: int = 30 * 24 * 3600
 
 _MARK_LUA: str = '''
 -- KEYS[1] = meta hash
@@ -33,6 +44,7 @@ _MARK_LUA: str = '''
 -- ARGV[1] = video_id
 -- ARGV[2] = state value
 -- ARGV[3] = record JSON
+-- ARGV[4] = terminal meta TTL seconds (0 disables expiry)
 local vid = ARGV[1]
 local state = ARGV[2]
 local record = ARGV[3]
@@ -42,6 +54,10 @@ for i = 4, 6 do
 end
 redis.call('HSET', KEYS[2], vid, record)
 redis.call('HSET', KEYS[1], 'state', state)
+local ttl = tonumber(ARGV[4])
+if ttl ~= nil and ttl > 0 then
+    redis.call('EXPIRE', KEYS[1], ttl)
+end
 return 1
 '''
 
@@ -62,6 +78,10 @@ redis.call(
     ARGV[2], vid
 )
 redis.call('HSET', KEYS[1], 'state', 'queued')
+-- Reviving a terminal record must clear the terminal TTL that
+-- mark() armed: a queued video must not have its meta hash
+-- (source, channel context) expire while it waits in the queue.
+redis.call('PERSIST', KEYS[1])
 -- Clear any force tag so reviving a terminal record never
 -- re-arms a stale force into a later non-force scrape.
 redis.call('HDEL', KEYS[1], 'force')
@@ -85,17 +105,29 @@ _FORCE_ENQUEUE_LUA: str = '''
 -- ARGV[8] = channel_is_verified
 local vid = ARGV[1]
 local state = redis.call('HGET', KEYS[2], 'state')
+-- A revived or re-armed record must not carry a terminal TTL:
+-- clear any expiry the previous terminal mark armed.
+redis.call('PERSIST', KEYS[2])
 local is_terminal = (
     state == 'unavailable'
     or state == 'failed'
     or state == 'removed'
 )
+if not state then
+    for i = 3, 5 do
+        if redis.call('HEXISTS', KEYS[i], vid) == 1 then
+            is_terminal = true
+        end
+    end
+end
 if is_terminal then
     redis.call('HDEL', KEYS[3], vid)
     redis.call('HDEL', KEYS[4], vid)
     redis.call('HDEL', KEYS[5], vid)
     redis.call('ZADD', KEYS[1], ARGV[3], vid)
     redis.call('HSET', KEYS[2], 'state', ARGV[4])
+    redis.call('HSETNX', KEYS[2], 'source', ARGV[2])
+    redis.call('HSETNX', KEYS[2], 'created_at', ARGV[3])
     redis.call('HSET', KEYS[2], 'force', '1')
     if ARGV[5] ~= '' then redis.call('HSET', KEYS[2], 'channel_id', ARGV[5]) end
     if ARGV[6] ~= '' then redis.call('HSET', KEYS[2], 'channel_handle', ARGV[6]) end
@@ -144,6 +176,7 @@ return 0
 _ENQUEUE_LUA: str = '''
 -- KEYS[1] = queue_key
 -- KEYS[2] = meta_key
+-- KEYS[3..5] = terminal state hashes
 -- ARGV[1] = video_id, ARGV[2] = source
 -- ARGV[3] = now (string), ARGV[4] = queued_state
 -- ARGV[5] = channel_id
@@ -159,6 +192,11 @@ local existing_state = redis.call(
 -- `unmark` returns terminal records to the queue.
 if existing_state ~= false then
     return 0
+end
+for i = 3, 5 do
+    if redis.call('HEXISTS', KEYS[i], ARGV[1]) == 1 then
+        return 0
+    end
 end
 local added = redis.call('ZADD', KEYS[1], 'NX', ARGV[3], ARGV[1])
 if added == 0 then
@@ -178,6 +216,20 @@ if ARGV[6] ~= '' then redis.call('HSET', KEYS[2], 'channel_handle', ARGV[6]) end
 if ARGV[7] ~= '' then redis.call('HSET', KEYS[2], 'channel_url', ARGV[7]) end
 if ARGV[8] ~= '' then redis.call('HSET', KEYS[2], 'channel_is_verified', ARGV[8]) end
 return added
+'''
+
+_GET_STATE_LUA: str = '''
+-- KEYS: metadata, unavailable, failed, removed
+-- ARGV[1]: video ID
+local state = redis.call('HGET', KEYS[1], 'state')
+if state then return state end
+local states = {'unavailable', 'failed', 'removed'}
+for i = 2, 4 do
+    if redis.call('HEXISTS', KEYS[i], ARGV[1]) == 1 then
+        return states[i - 1]
+    end
+end
+return false
 '''
 
 _POP_LUA: str = '''
@@ -202,7 +254,7 @@ class VideoState(str, enum.Enum):
     @classmethod
     def terminal_states(
         cls,
-    ) -> frozenset['VideoState']:
+    ) -> frozenset[VideoState]:
         return frozenset({
             cls.UNAVAILABLE,
             cls.FAILED,
@@ -315,7 +367,7 @@ class VideoScrapeQueue(ABC):
     @abstractmethod
     async def count_by_state(
         self,
-    ) -> dict['VideoState', int]: ...
+    ) -> dict[VideoState, int]: ...
 
     @abstractmethod
     async def search_meta(
@@ -403,9 +455,12 @@ class RedisVideoScrapeQueue(VideoScrapeQueue):
             raise ValueError('empty video_id')
         now: float = time.time()
         added: int = int(await self._redis.eval(
-            _ENQUEUE_LUA, 2,
+            _ENQUEUE_LUA, 5,
             self._k_queue(),
             self._k_meta(video_id),
+            self._k_state(VideoState.UNAVAILABLE),
+            self._k_state(VideoState.FAILED),
+            self._k_state(VideoState.REMOVED),
             video_id, source,
             str(int(now)),
             VideoState.QUEUED.value,
@@ -543,6 +598,7 @@ class RedisVideoScrapeQueue(VideoScrapeQueue):
             self._k_state(VideoState.FAILED),
             self._k_state(VideoState.REMOVED),
             video_id, state.value, json.dumps(record),
+            str(TERMINAL_META_TTL_SECONDS),
         )
 
     async def unmark(self, video_id: str) -> None:
@@ -577,22 +633,52 @@ class RedisVideoScrapeQueue(VideoScrapeQueue):
     async def get_state(
         self, video_id: str,
     ) -> VideoState | None:
-        raw: str | None = await self._redis.hget(
-            self._k_meta(video_id), 'state',
+        return (await self.get_states([video_id]))[video_id]
+
+    async def get_states(
+        self, video_ids: list[str],
+    ) -> dict[str, VideoState | None]:
+        '''Read states atomically per video, including tombstones.
+
+        Pipeline lookups so one round-trip covers a candidate batch.
+        '''
+        out: dict[str, VideoState | None] = {}
+        if not video_ids:
+            return out
+        pipe: aioredis.client.Pipeline = (
+            self._redis.pipeline(transaction=False)
         )
-        if raw is None:
-            return None
-        try:
-            return VideoState(raw)
-        except ValueError:
-            return None
+        for video_id in video_ids:
+            pipe.eval(
+                _GET_STATE_LUA, 4,
+                self._k_meta(video_id),
+                self._k_state(VideoState.UNAVAILABLE),
+                self._k_state(VideoState.FAILED),
+                self._k_state(VideoState.REMOVED),
+                video_id,
+            )
+        raw: list[str | None] = await pipe.execute()
+        for video_id, state in zip(video_ids, raw):
+            if state is None:
+                out[video_id] = None
+                continue
+            try:
+                out[video_id] = VideoState(state)
+            except ValueError:
+                out[video_id] = None
+        return out
 
     async def get_meta(
         self, video_id: str,
     ) -> dict[str, str]:
-        return await self._redis.hgetall(
+        '''Return retained diagnostics, or the surviving terminal state.'''
+        meta: dict[str, str] = await self._redis.hgetall(
             self._k_meta(video_id),
         )
+        if meta:
+            return meta
+        state: VideoState | None = await self.get_state(video_id)
+        return {'state': state.value} if state is not None else {}
 
     async def set_meta(
         self, video_id: str, **fields: str,
@@ -672,9 +758,11 @@ class RedisVideoScrapeQueue(VideoScrapeQueue):
         return out
 
     async def iter_members(self) -> AsyncIterator[dict]:
-        '''Yield ``{'video_id': ..., **meta}`` for every member that
-        still has a meta hash (terminal/removed members keep theirs;
-        only ``complete()`` deletes it). Streams via ``SCAN``.'''
+        '''Stream members with retained metadata via SCAN.
+
+        Expired or compacted terminal records are absent from this view;
+        count_by_state and direct state lookups still include them.
+        '''
         cursor: int = 0
         while True:
             cursor, keys = await self._redis.scan(

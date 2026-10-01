@@ -11,7 +11,7 @@ fall through to ``other``.
 import errno
 import unittest
 
-import httpx
+import httpx2 as httpx
 
 from tools.yt_video_scrape import (
     _classify_scrape_error,

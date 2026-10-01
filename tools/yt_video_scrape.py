@@ -18,7 +18,7 @@ import sys
 import asyncio
 import logging
 
-import httpx
+import httpx2 as httpx  # exchange client raises httpx2 exception classes
 
 from pathlib import Path
 import random

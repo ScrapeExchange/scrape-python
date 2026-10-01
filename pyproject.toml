@@ -9,6 +9,7 @@ dependencies = [
     "brotli>=1.2.0",
     "country-converter>=1.3.2",
     "httpx[http2,socks]>=0.23.3",
+    "httpx2[http2]>=2.13.0",
     "innertube>=2.1.19",
     "jsonschema>=4.26.0",
     "orjson>=3.11.7",
@@ -42,6 +43,12 @@ tt-video-scrape = "tools.tt_video_scrape:main"
 
 [tool.uv]
 package = true
+# httpx2 (exchange API path) needs httpcore2 -> h11>=0.16, while the
+# pinned innertube package drags in httpx<0.24 -> httpcore 0.16.3 with
+# h11<0.15. Verified empirically (2026-09-25): httpcore 0.16.3 works
+# against h11 0.16 for HTTP/1.1 GET + keep-alive, so force the newer
+# h11 for both stacks until innertube relaxes its httpx pin.
+override-dependencies = ["h11>=0.16"]
 
 [tool.setuptools.packages.find]
 include = ["scrape_exchange*", "tools*"]

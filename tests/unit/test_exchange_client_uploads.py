@@ -10,7 +10,7 @@ Unit tests for the fire-and-forget background upload queue added to
 import asyncio
 import unittest
 
-import httpx
+import httpx2 as httpx
 
 from scrape_exchange.exchange_client import ExchangeClient
 

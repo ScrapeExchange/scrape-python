@@ -303,6 +303,38 @@ return 1
 '''
 
 
+_ENQUEUE_SCHEDULED_LUA: str = '''
+-- KEYS[1] = meta hash
+-- KEYS[2] = target scheduled queue
+-- ARGV[1] = member
+-- ARGV[2] = score
+-- ARGV[3] = channel_id
+-- ARGV[4] = source
+-- ARGV[5] = created_at
+-- ARGV[6] = initial state
+-- ARGV[7..] = terminal state values
+-- Refuses to enqueue a member parked in a terminal state: discovery
+-- must not reschedule removed/terminated channels. The state read
+-- and the queue/meta writes are one atomic script, so a state that
+-- changes concurrently with this enqueue is either fully honoured
+-- or fully ignored.
+local state = redis.call('HGET', KEYS[1], 'state')
+if state then
+    for i = 7, #ARGV do
+        if state == ARGV[i] then
+            return 0
+        end
+    end
+end
+redis.call('ZADD', KEYS[2], 'NX', ARGV[2], ARGV[1])
+redis.call('HSETNX', KEYS[1], 'channel_id', ARGV[3])
+redis.call('HSETNX', KEYS[1], 'source', ARGV[4])
+redis.call('HSETNX', KEYS[1], 'created_at', ARGV[5])
+redis.call('HSETNX', KEYS[1], 'state', ARGV[6])
+return 1
+'''
+
+
 class ChannelState(str, enum.Enum):
     PENDING_RESOLUTION = 'pending_resolution'
     SCHEDULED = 'scheduled'
@@ -419,7 +451,9 @@ class ChannelScrapeQueue(ABC):
         *,
         source: str,
         priority: bool = False,
-    ) -> None: ...
+    ) -> bool:
+        '''Enqueue for scheduled scraping; ``False`` when the member
+        sits in a terminal state and was left alone.'''
 
     @abstractmethod
     async def pop_unresolved(
@@ -656,7 +690,14 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
         *,
         source: str,
         priority: bool = False,
-    ) -> None:
+    ) -> bool:
+        '''Atomically enqueue *channel_id* unless it sits in a
+        terminal state (``removed``, ``terminated``, ...): the state
+        read and the queue/meta writes are one Lua script, so a
+        concurrent terminal marking cannot produce a split record of
+        queued-but-removed. Returns ``True`` when enqueued,
+        ``False`` when skipped as terminal.
+        '''
         if not channel_id.startswith('UC'):
             raise ValueError(
                 f'channel_id must start with UC: '
@@ -671,21 +712,21 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
         score: float = 0.0 if priority else now
         queue_key: str = self._k_scheduled(tier)
         meta_key: str = self._k_meta(member)
-        pipe: aioredis.client.Pipeline = (
-            self._redis.pipeline(transaction=True)
-        )
-        pipe.zadd(queue_key, {member: score}, nx=True)
-        pipe.hsetnx(meta_key, 'channel_id', channel_id)
-        pipe.hsetnx(meta_key, 'source', source)
-        pipe.hsetnx(
-            meta_key, 'created_at', str(int(now)),
-        )
-        pipe.hsetnx(
-            meta_key,
-            'state',
+        enqueued: int = await self._redis.eval(
+            _ENQUEUE_SCHEDULED_LUA,
+            2, meta_key, queue_key,
+            member,
+            str(score),
+            channel_id,
+            source,
+            str(int(now)),
             ChannelState.SCHEDULED.value,
+            *[
+                state.value
+                for state in ChannelState.terminal_states()
+            ],
         )
-        await pipe.execute()
+        return bool(enqueued)
 
     async def pop_unresolved(
         self, batch: int,

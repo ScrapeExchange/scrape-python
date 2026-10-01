@@ -3,8 +3,9 @@
 import asyncio
 import logging
 from dataclasses import dataclass
+from typing import Any
 
-import httpx
+import httpx2 as httpx  # exchange API traffic runs on httpx2 (HTTP/2)
 import redis.asyncio as aioredis
 from prometheus_client import Counter, Histogram
 
@@ -19,37 +20,13 @@ from scrape_exchange.youtube.youtube_channel import YouTubeChannel
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 BATCH_SIZE: int = 100
-DELIVER_CONCURRENCY: int = 10
-# Process-wide cap on concurrent exchange existence GETs. Without this,
-# worker_count scrapes × DELIVER_CONCURRENCY each oversubscribe the
-# shared httpx client's default 100-connection pool and every surplus
-# request dies with httpx.PoolTimeout after the 10s pool deadline.
-EXISTENCE_CONCURRENCY: int = 64
 DELIVER_ATTEMPTS: int = 3
 DELIVER_BACKOFF_SECONDS: tuple[float, ...] = (0.5, 1.0, 2.0)
 # Transient upstream statuses worth retrying.
 RETRYABLE_STATUSES: frozenset[int] = frozenset({502, 503, 504})
-# A batch only aborts the scrape when failures look systemic: at least
-# this many failures AND more than half the batch's candidates failed.
-# Isolated timeouts are logged and tolerated so a single 10s timeout
-# does not discard an otherwise successful full channel scrape.
-SYSTEMIC_FAILURE_MINIMUM: int = 5
-
-_EXISTENCE_GATES: dict[tuple[int, int], asyncio.Semaphore] = {}
-
-
-def _get_existence_gate(
-    limit: int = EXISTENCE_CONCURRENCY,
-) -> asyncio.Semaphore:
-    '''Return the per-event-loop gate for exchange existence GETs.'''
-
-    loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
-    key: tuple[int, int] = (id(loop), limit)
-    gate: asyncio.Semaphore | None = _EXISTENCE_GATES.get(key)
-    if gate is None:
-        gate = asyncio.Semaphore(limit)
-        _EXISTENCE_GATES[key] = gate
-    return gate
+# Page size for POST /api/v1/filter. The server caps pages at 1000
+# records; a channel's full video inventory is typically 1-3 pages.
+FILTER_PAGE_SIZE: int = 1000
 
 
 FULL_SCRAPES: Counter = Counter(
@@ -106,6 +83,90 @@ class FullScrapeSummary:
         )
 
 
+class FilterQueryError(RuntimeError):
+    '''The /api/v1/filter query failed after all retries.'''
+
+
+async def fetch_exchange_video_ids(
+    http_client: httpx.AsyncClient,
+    exchange_url: str,
+    channel_id: str,
+) -> set[str]:
+    '''Return the platform_content_ids the exchange already holds
+    for *channel_id*, via paginated ``POST /api/v1/filter``.
+
+    One filter query per 1000-record page replaces the old one-GET-
+    per-video existence sweep. Retries transient failures (timeouts,
+    transport errors, 502/503/504) with backoff; other non-200
+    statuses and exhausted retries raise :class:`FilterQueryError`
+    so the caller keeps the refresh due.
+
+    Caveat: records uploaded without a ``platform_creator_id`` do
+    not match the filter and are treated as missing — harmless,
+    since the video consumer rechecks uploaded membership before
+    scraping and the uploaded set prevents re-upload.
+    '''
+    url: str = f'{exchange_url.rstrip("/")}/api/v1/filter'
+    base_body: dict[str, Any] = {
+        'platform': 'youtube',
+        'entity': 'video',
+        'platform_creator_id': channel_id,
+        'first': FILTER_PAGE_SIZE,
+    }
+    existing: set[str] = set()
+    attempt: int
+    for attempt in range(1, DELIVER_ATTEMPTS + 1):
+        after: str | None = None
+        while True:
+            body: dict[str, Any] = dict(base_body)
+            if after is not None:
+                body['after'] = after
+            try:
+                response: httpx.Response | None = (
+                    await http_client.post(url, json=body)
+                )
+            except (httpx.TimeoutException, httpx.TransportError):
+                response = None
+            if response is not None:
+                if response.status_code == 200:
+                    data: dict[str, Any] = response.json()
+                    edge: dict[str, Any]
+                    for edge in data.get('edges', []):
+                        node: dict[str, Any] = edge.get('node') or {}
+                        content_id: str | None = (
+                            node.get('platform_content_id')
+                        )
+                        if content_id:
+                            existing.add(content_id)
+                    page_info: dict[str, Any] = (
+                        data.get('page_info') or {}
+                    )
+                    if not page_info.get('has_next_page'):
+                        return existing
+                    after = page_info.get('end_cursor')
+                    if not after:
+                        return existing
+                    continue
+                if response.status_code not in RETRYABLE_STATUSES:
+                    raise FilterQueryError(
+                        f'Video filter query returned '
+                        f'{response.status_code} for {channel_id}: '
+                        f'{response.text[:200]}',
+                    )
+            # Transient: fall through to the retry backoff.
+            if attempt < DELIVER_ATTEMPTS:
+                await asyncio.sleep(
+                    DELIVER_BACKOFF_SECONDS[
+                        min(attempt - 1, len(DELIVER_BACKOFF_SECONDS) - 1)
+                    ],
+                )
+            break
+    raise FilterQueryError(
+        f'Video filter query failed after {DELIVER_ATTEMPTS} '
+        f'attempts for {channel_id}',
+    )
+
+
 async def queue_channel_videos(
     channel: YouTubeChannel,
     *,
@@ -115,111 +176,66 @@ async def queue_channel_videos(
     video_fm: AssetFileManagement,
     summary: FullScrapeSummary,
 ) -> None:
-    '''Deliver missing IDs in bounded batches; systemic errors keep
-    refresh due.
+    '''Queue the channel's video IDs the exchange does not have.
 
-    Normal enqueue preserves existing queue entries and tombstones. The
-    video consumer also rechecks uploaded membership to cover races with
-    another host's upload after this producer's existence checks.
+    The exchange's per-channel video inventory is fetched with ONE
+    paginated ``POST /api/v1/filter`` (filter:
+    ``platform_creator_id=<channel_id>``) instead of one existence
+    GET per video, so a full scrape costs a couple of API requests
+    regardless of channel size. Locally-known IDs (uploaded set,
+    scrape output files) are filtered first and never hit the API.
 
-    Transient failures (httpx timeouts/transport errors, 502/503/504)
-    are retried with backoff. Isolated failures are tolerated so a
-    single 10s timeout does not discard an otherwise successful scrape;
-    only systemic batch failures (most candidates failing) re-raise and
-    keep the refresh due.
+    Normal enqueue preserves existing queue entries and tombstones,
+    so IDs that are neither on the exchange nor locally known are
+    deduped by the queue itself; the video consumer rechecks
+    uploaded membership to cover races with another host's upload.
+    A filter-query failure raises and keeps the refresh due.
     '''
     uploaded: UploadedVideoIds = UploadedVideoIds('', redis_client=redis)
     queue: RedisVideoScrapeQueue = RedisVideoScrapeQueue(
         redis, VideoScrapeQueueSettings(),
     )
+    if not channel.channel_id:
+        raise ValueError(
+            'queue_channel_videos requires a channel with a channel_id',
+        )
     ids: list[str] = sorted(channel.video_ids)
     summary.video_ids_found = len(ids)
-    gate: asyncio.Semaphore = asyncio.Semaphore(DELIVER_CONCURRENCY)
-    existence_gate: asyncio.Semaphore = _get_existence_gate()
-    exchange_prefix: str = exchange_url.rstrip('/')
 
-    async def deliver(video_id: str) -> None:
-        try:
-            url: str = (
-                f'{exchange_prefix}/api/v1/data/content/youtube/video/'
-                f'{video_id}'
-            )
-            attempt: int
-            for attempt in range(1, DELIVER_ATTEMPTS + 1):
-                try:
-                    async with gate:
-                        async with existence_gate:
-                            response: httpx.Response = (
-                                await http_client.get(url)
-                            )
-                    if response.status_code == 200:
-                        summary.video_ids_existing += 1
-                        return
-                    if response.status_code == 404:
-                        added: bool = await queue.enqueue(
-                            video_id, source='channel',
-                            channel_id=channel.channel_id,
-                            channel_handle=channel.channel_handle,
-                        )
-                        if added:
-                            summary.video_ids_added += 1
-                        else:
-                            summary.video_ids_queue_known += 1
-                        return
-                    if response.status_code not in RETRYABLE_STATUSES:
-                        raise RuntimeError(
-                            f'Video existence check returned '
-                            f'{response.status_code} for {video_id}',
-                        )
-                except (httpx.TimeoutException, httpx.TransportError):
-                    pass
-                if attempt < DELIVER_ATTEMPTS:
-                    await asyncio.sleep(
-                        DELIVER_BACKOFF_SECONDS[
-                            min(attempt - 1, len(DELIVER_BACKOFF_SECONDS) - 1)
-                        ],
-                    )
-            raise RuntimeError(
-                f'Video existence check failed after {DELIVER_ATTEMPTS} '
-                f'attempts for {video_id}',
-            )
-        except Exception:
-            summary.video_ids_failed += 1
-            raise
-
+    # Local filtering: the uploaded set and scrape output files
+    # already answer "handled" for these IDs without any API call.
+    known: set[str] = set()
     start: int
-    video_id: str
-    result: None | BaseException
     for start in range(0, len(ids), BATCH_SIZE):
         batch: list[str] = ids[start:start + BATCH_SIZE]
-        known: dict[str, bool] = await uploaded.contains_many(batch)
-        candidates: list[str] = []
+        flags: dict[str, bool] = await uploaded.contains_many(batch)
+        video_id: str
         for video_id in batch:
-            if known[video_id] or video_fm.video_scrape_output_exists(
-                video_id,
+            if flags.get(video_id) or (
+                video_fm.video_scrape_output_exists(video_id)
             ):
-                summary.video_ids_existing += 1
-            else:
-                candidates.append(video_id)
-        results: list[None | BaseException] = await asyncio.gather(
-            *(deliver(video_id) for video_id in candidates),
-            return_exceptions=True,
-        )
-        failures: list[BaseException] = [
-            result for result in results
-            if isinstance(result, BaseException)
-        ]
-        if not failures:
+                known.add(video_id)
+    summary.video_ids_existing = len(known)
+    candidates: list[str] = [
+        video_id for video_id in ids if video_id not in known
+    ]
+    if not candidates:
+        return
+
+    exchange_ids: set[str] = await fetch_exchange_video_ids(
+        http_client, exchange_url, channel.channel_id,
+    )
+
+    for video_id in candidates:
+        if video_id in exchange_ids:
+            summary.video_ids_existing += 1
             continue
-        if (len(failures) >= SYSTEMIC_FAILURE_MINIMUM
-                and len(failures) * 2 > len(candidates)):
-            raise failures[0]
-        _LOGGER.warning(
-            f'{len(failures)} of {len(candidates)} video existence '
-            f'checks failed for {channel.channel_id} after retries; '
-            'skipping those IDs until the next full scrape',
-            extra={
-                'channel_id': channel.channel_id,
-                'video_ids_failed': len(failures),
-            },
+        added: bool = await queue.enqueue(
+            video_id, source='channel',
+            channel_id=channel.channel_id,
+            channel_handle=channel.channel_handle,
         )
+        if added:
+            summary.video_ids_added += 1
+        else:
+            summary.video_ids_queue_known += 1
