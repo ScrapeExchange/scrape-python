@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import errno
 import functools
 import json
@@ -16,9 +17,18 @@ import sys
 import time
 import unicodedata
 from collections import OrderedDict, deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterable
+from typing import (
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterable,
+    Iterator,
+    TypeVar,
+)
 
 import httpx  # InnerTube still runs on original httpx: its exception
 # classes must be caught as httpx.*, not httpx2.*
@@ -28,7 +38,13 @@ from innertube.errors import ResponseError as InnerTubeResponseError
 from pydantic import AliasChoices, Field
 from pydantic_settings import CliPositionalArg, SettingsConfigDict
 
+from scrape_exchange.channel_scrape_queue import (
+    ChannelScrapeQueueSettings,
+    RedisChannelScrapeQueue,
+)
+from scrape_exchange.creator_map import CreatorMap, RedisCreatorMap
 from scrape_exchange.logging import configure_logging
+from scrape_exchange.redis_client import redis_from_url
 from scrape_exchange.settings import ScraperSettings
 from scrape_exchange.util import extract_proxy_ip, extract_proxy_port
 from scrape_exchange.youtube.youtube_channel import YouTubeChannel
@@ -36,6 +52,7 @@ from scrape_exchange.youtube.youtube_channel_tabs import (
     aclose_pooled_innertube,
     configure_innertube_executor,
     pooled_innertube_for_entry,
+    pooled_innertube_localized_for_entry,
     run_on_innertube_executor,
     shutdown_innertube_executor,
 )
@@ -102,11 +119,148 @@ _PROXY_CONNECTION_ERRORS: tuple[type[BaseException], ...] = (
 )
 _SEARCH_RETRY_BACKOFF_SECONDS: float = 2.0
 
+# InnerTube SEARCH result sort/filter params. Verified against the
+# live search UI: the sort is the protobuf field-1 enum (3 == the
+# 'Popularity' / view-count option) and the result-type filter is the
+# nested field-2 message (2 == channels). ``_encode_search_params``
+# reproduces exactly what the web client emits, so the tool never
+# hardcodes an opaque base64 literal.
+_SEARCH_SORT_POPULARITY: int = 3
+_SEARCH_TYPE_VIDEO: int = 1
+_SEARCH_TYPE_CHANNEL: int = 2
+
+_SUBS_MULTIPLIERS: dict[str, int] = {
+    'K': 1_000,
+    'M': 1_000_000,
+    'B': 1_000_000_000,
+}
+
+# Prioritised markets (densest 10M-100M channel populations first),
+# as ``GL:hl`` pairs. Overridable via DISCOVER_MARKETS.
+_DEFAULT_MARKETS: str = (
+    'IN:hi, US:en, BR:pt, ID:id, MX:es, RU:ru, TR:tr, EG:ar, '
+    'SA:ar, KR:ko, JP:ja, PH:fil, VN:vi, TH:th, PK:ur, BD:bn, '
+    'NG:en, DE:de, GB:en, FR:fr, IT:it, ES:es, AR:es, CO:es, '
+    'PL:pl, UA:uk, DZ:ar, MA:ar, IQ:ar, TW:zh-TW'
+)
+
+
+def _encode_varint(value: int) -> bytes:
+    '''Encode a protobuf base-128 varint.'''
+
+    out: bytearray = bytearray()
+    while True:
+        byte: int = value & 0x7F
+        value >>= 7
+        if value:
+            out.append(byte | 0x80)
+        else:
+            out.append(byte)
+            return bytes(out)
+
+
+def _encode_varint_field(field: int, value: int) -> bytes:
+    '''Encode a protobuf ``varint`` field (wire type 0).'''
+
+    return _encode_varint(field << 3) + _encode_varint(value)
+
+
+def _encode_len_field(field: int, payload: bytes) -> bytes:
+    '''Encode a protobuf length-delimited field (wire type 2).'''
+
+    return (
+        _encode_varint((field << 3) | 2)
+        + _encode_varint(len(payload))
+        + payload
+    )
+
+
+def _encode_search_params(
+    *,
+    sort: int | None = None,
+    upload_date: int | None = None,
+    media_type: int | None = None,
+    duration: int | None = None,
+) -> str:
+    '''Build the base64 InnerTube SEARCH ``params`` blob.
+
+    ``sort`` is the outer field-1 enum; ``upload_date``,
+    ``media_type`` and ``duration`` are fields of the nested
+    field-2 filter message. Returns ``''`` when no option is
+    given, so callers can omit ``params`` entirely.
+    '''
+
+    nested: bytes = b''
+    if upload_date is not None:
+        nested += _encode_varint_field(1, upload_date)
+    if media_type is not None:
+        nested += _encode_varint_field(2, media_type)
+    if duration is not None:
+        nested += _encode_varint_field(3, duration)
+    outer: bytes = b''
+    if sort is not None:
+        outer += _encode_varint_field(1, sort)
+    if nested:
+        outer += _encode_len_field(2, nested)
+    if not outer:
+        return ''
+    return base64.b64encode(outer).decode('ascii')
+
+
+# Sort-by-view-count search params ('CAM=' and 'CAMSAhAC' today).
+POPULARITY_VIDEO_PARAMS: str = _encode_search_params(
+    sort=_SEARCH_SORT_POPULARITY,
+)
+POPULARITY_CHANNEL_PARAMS: str = _encode_search_params(
+    sort=_SEARCH_SORT_POPULARITY,
+    media_type=_SEARCH_TYPE_CHANNEL,
+)
+
+
+def _parse_subscriber_text(text: str | None) -> int | None:
+    '''Parse a subscriber label such as ``12.3M subscribers`` into
+    an integer; ``None`` when it has no leading number.'''
+
+    if not text:
+        return None
+    token: str = text.strip().split(' ')[0].replace(',', '')
+    if not token:
+        return None
+    suffix: str = token[-1].upper()
+    try:
+        if suffix in _SUBS_MULTIPLIERS:
+            return int(float(token[:-1]) * _SUBS_MULTIPLIERS[suffix])
+        return int(token)
+    except ValueError:
+        return None
+
+
+def _parse_markets(raw: str) -> list[tuple[str, str]]:
+    '''Parse a ``GL:hl`` comma-separated market list into
+    ``(gl, hl)`` pairs, preserving order and dropping invalid or
+    duplicate entries. An empty language defaults to ``en``.'''
+
+    markets: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for part in raw.split(','):
+        token: str = part.strip()
+        if not token:
+            continue
+        gl, _, hl = token.partition(':')
+        gl = gl.strip().upper()
+        hl = hl.strip() or 'en'
+        if len(gl) != 2 or not gl.isalpha() or gl in seen:
+            continue
+        seen.add(gl)
+        markets.append((gl, hl))
+    return markets
+
 
 @dataclass(frozen=True)
 class DiscoveredChannel:
     channel_id: str | None
     channel_handle: str | None
+    subscriber_count: int | None = None
 
 
 class _SearchProxyPool:
@@ -215,8 +369,10 @@ class DiscoverSearchSettings(ScraperSettings):
             'youtube_search_concurrency',
         ),
         description=(
-            'Maximum number of search terms processed concurrently. '
-            'Limited to the proxy count when proxies are configured.'
+            'Maximum number of searches processed concurrently, '
+            'each worker using its own proxy. Applies to both the '
+            'term search and the popularity-scoped pass. Limited '
+            'to the proxy count when proxies are configured.'
         ),
     )
     random_word_url: str = Field(
@@ -258,6 +414,63 @@ class DiscoverSearchSettings(ScraperSettings):
         description=(
             'Optional random-word language code. When omitted, one '
             'configured language is chosen.'
+        ),
+    )
+    popular_search: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            'POPULAR_SEARCH', 'popular_search',
+        ),
+        description=(
+            'Run the market x term popularity-scoped search pass '
+            '(the default). Enumerates the highest-subscriber '
+            'channels per country by sorting search results by '
+            'view count. Set to false for the plain term search.'
+        ),
+    )
+    discover_markets: str = Field(
+        default=_DEFAULT_MARKETS,
+        validation_alias=AliasChoices(
+            'DISCOVER_MARKETS', 'discover_markets',
+        ),
+        description=(
+            'Comma-separated GL:hl market pairs for the '
+            'popularity-scoped pass, ordered by priority.'
+        ),
+    )
+    discover_popular_continuations: int = Field(
+        default=5,
+        ge=0,
+        validation_alias=AliasChoices(
+            'DISCOVER_POPULAR_CONTINUATIONS',
+            'discover_popular_continuations',
+        ),
+        description=(
+            'Continuation pages fetched per term per market in the '
+            'popularity-scoped pass.'
+        ),
+    )
+    discover_min_subscribers: int = Field(
+        default=4000,
+        ge=0,
+        validation_alias=AliasChoices(
+            'DISCOVER_MIN_SUBSCRIBERS', 'discover_min_subscribers',
+        ),
+        description=(
+            'Skip discovered channels whose known subscriber count '
+            'is below this. Channels without a known count are '
+            'still enqueued. 0 enqueues every discovered channel '
+            '(the scrape records the real count and tier).'
+        ),
+    )
+    discover_source: str = Field(
+        default='discovered_popular',
+        validation_alias=AliasChoices(
+            'DISCOVER_SOURCE', 'discover_source',
+        ),
+        description=(
+            'Queue source label set on channels enqueued by the '
+            'popularity-scoped pass.'
         ),
     )
 
@@ -522,8 +735,14 @@ def extract_channels(payload: dict[str, Any]) -> list[DiscoveredChannel]:
                     .get('browseEndpoint', {})
                     .get('canonicalBaseUrl')
                 )
+                subs = _parse_subscriber_text(
+                    (renderer.get('subscriberCountText') or {})
+                    .get('simpleText')
+                )
                 if cid or handle:
-                    candidates.append(DiscoveredChannel(cid, handle))
+                    candidates.append(
+                        DiscoveredChannel(cid, handle, subs),
+                    )
         if 'browseEndpoint' in value and isinstance(
             value['browseEndpoint'], dict,
         ):
@@ -564,6 +783,7 @@ def _dedupe_channels(
             channel = DiscoveredChannel(
                 existing.channel_id or channel.channel_id,
                 existing.channel_handle or channel.channel_handle,
+                existing.subscriber_count or channel.subscriber_count,
             )
         by_key[key] = channel
         if channel.channel_handle is not None:
@@ -604,15 +824,15 @@ async def _innertube_search(
     return result
 
 
-async def _search_page_with_retry(
-    term: str,
+async def _fetch_page_with_retry(
+    fetch: Callable[[str | None], Awaitable[dict[str, Any]]],
     *,
-    continuation: str | None,
     proxy: str | None,
-    limiter: YouTubeRateLimiter,
-    proxy_lease: _SearchProxyLease | None = None,
+    proxy_lease: _SearchProxyLease | None,
+    log_extra: dict[str, Any],
 ) -> dict[str, Any] | None:
-    '''Fetch one InnerTube search page with transient retries.
+    '''Call ``fetch(proxy)`` for one search page with transient
+    retries.
 
     A connection failure rotates through every unused proxy in the
     worker pool. Other transient errors are retried once. Returns
@@ -629,12 +849,7 @@ async def _search_page_with_retry(
             else proxy
         )
         try:
-            result: dict[str, Any] = await _innertube_search(
-                term,
-                continuation=continuation,
-                proxy=active_proxy,
-                limiter=limiter,
-            )
+            result: dict[str, Any] = await fetch(active_proxy)
             if proxy_lease is not None:
                 proxy_lease.mark_success()
             return result
@@ -656,10 +871,9 @@ async def _search_page_with_retry(
                 f'InnerTube search page failed; {action}',
                 exc=exc,
                 extra={
-                    'search_term': term,
+                    **log_extra,
                     'error_type': type(exc).__name__,
                     'attempt': attempt,
-                    'has_continuation': bool(continuation),
                     'proxy_ip': (
                         extract_proxy_ip(active_proxy)
                         if active_proxy else 'none'
@@ -674,6 +888,36 @@ async def _search_page_with_retry(
                 return None
             attempt += 1
             await asyncio.sleep(_SEARCH_RETRY_BACKOFF_SECONDS)
+
+
+async def _search_page_with_retry(
+    term: str,
+    *,
+    continuation: str | None,
+    proxy: str | None,
+    limiter: YouTubeRateLimiter,
+    proxy_lease: _SearchProxyLease | None = None,
+) -> dict[str, Any] | None:
+    '''Fetch one InnerTube search page with transient retries; see
+    :func:`_fetch_page_with_retry`.'''
+
+    async def fetch(active_proxy: str | None) -> dict[str, Any]:
+        return await _innertube_search(
+            term,
+            continuation=continuation,
+            proxy=active_proxy,
+            limiter=limiter,
+        )
+
+    return await _fetch_page_with_retry(
+        fetch,
+        proxy=proxy,
+        proxy_lease=proxy_lease,
+        log_extra={
+            'search_term': term,
+            'has_continuation': bool(continuation),
+        },
+    )
 
 
 async def discover_for_term(
@@ -732,20 +976,28 @@ async def discover_for_term(
             break
 
 
-async def discover_for_terms(
-    terms: Iterable[str],
+_Job = TypeVar('_Job')
+
+
+async def _run_search_workers(
+    jobs: Iterable[_Job],
     *,
-    continuations: int,
     concurrency: int,
     proxies: Iterable[str],
-    limiter: YouTubeRateLimiter,
+    run_job: Callable[
+        [_Job, _SearchProxyLease], AsyncIterator[DiscoveredChannel]
+    ],
+    worker_name: str,
 ) -> AsyncIterator[DiscoveredChannel]:
-    '''Discover channels from one shared queue of search terms.
+    '''Run *jobs* from one shared queue across concurrent workers.
 
-    Each consumer receives a distinct proxy. Concurrency is capped
-    by the number of proxies, or set to one direct consumer when no
-    proxies are configured. Connection failures rotate through the
-    shared pool of proxies not currently leased by another worker.
+    Each worker receives a distinct proxy lease and calls
+    ``run_job(job, lease)`` for every job it takes, forwarding the
+    yielded channels. Concurrency is capped by the number of
+    proxies, or set to one direct worker when no proxies are
+    configured. Connection failures rotate through the shared pool
+    of proxies not currently leased by another worker. A
+    non-transient exception in any worker stops the whole run.
     '''
 
     if concurrency < 1:
@@ -766,34 +1018,29 @@ async def discover_for_terms(
         for _ in range(worker_count)
     ]
 
-    term_queue: asyncio.Queue[str | None] = asyncio.Queue()
+    job_queue: asyncio.Queue[_Job | None] = asyncio.Queue()
     result_queue: asyncio.Queue[
         DiscoveredChannel | Exception | None
     ] = asyncio.Queue()
-    for term in terms:
-        term_queue.put_nowait(term)
+    for job in jobs:
+        job_queue.put_nowait(job)
     for _ in proxy_leases:
-        term_queue.put_nowait(None)
+        job_queue.put_nowait(None)
 
     async def worker(proxy_lease: _SearchProxyLease) -> None:
         try:
             while True:
-                term: str | None = await term_queue.get()
+                job: _Job | None = await job_queue.get()
                 try:
-                    if term is None:
+                    if job is None:
                         return
-                    async for channel in discover_for_term(
-                        term,
-                        continuations=continuations,
-                        limiter=limiter,
-                        proxy_lease=proxy_lease,
-                    ):
+                    async for channel in run_job(job, proxy_lease):
                         await result_queue.put(channel)
                 except Exception as exc:
                     await result_queue.put(exc)
                     return
                 finally:
-                    term_queue.task_done()
+                    job_queue.task_done()
         finally:
             proxy_lease.release()
             await result_queue.put(None)
@@ -801,7 +1048,7 @@ async def discover_for_terms(
     tasks: list[asyncio.Task[None]] = [
         asyncio.create_task(
             worker(proxy_lease),
-            name=f'youtube-search-worker-{index}',
+            name=f'{worker_name}-{index}',
         )
         for index, proxy_lease in enumerate(proxy_leases)
     ]
@@ -821,6 +1068,397 @@ async def discover_for_terms(
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def discover_for_terms(
+    terms: Iterable[str],
+    *,
+    continuations: int,
+    concurrency: int,
+    proxies: Iterable[str],
+    limiter: YouTubeRateLimiter,
+) -> AsyncIterator[DiscoveredChannel]:
+    '''Discover channels from one shared queue of search terms;
+    see :func:`_run_search_workers` for the concurrency model.'''
+
+    def run_job(
+        term: str, proxy_lease: _SearchProxyLease,
+    ) -> AsyncIterator[DiscoveredChannel]:
+        return discover_for_term(
+            term,
+            continuations=continuations,
+            limiter=limiter,
+            proxy_lease=proxy_lease,
+        )
+
+    async for channel in _run_search_workers(
+        terms,
+        concurrency=concurrency,
+        proxies=proxies,
+        run_job=run_job,
+        worker_name='youtube-search-worker',
+    ):
+        yield channel
+
+
+async def _innertube_search_localized(
+    term: str,
+    *,
+    params: str | None,
+    continuation: str | None,
+    proxy: str | None,
+    gl: str,
+    hl: str,
+    limiter: YouTubeRateLimiter,
+) -> dict[str, Any]:
+    '''One market-scoped InnerTube SEARCH call.'''
+
+    await limiter.acquire(YouTubeCallType.BROWSE, proxy=proxy)
+    client = pooled_innertube_localized_for_entry(proxy, gl, hl)
+    if continuation:
+        fn = functools.partial(client.search, continuation=continuation)
+    else:
+        fn = functools.partial(client.search, query=term, params=params)
+    return await run_on_innertube_executor(fn)
+
+
+async def _search_page_localized_with_retry(
+    term: str,
+    *,
+    params: str | None,
+    continuation: str | None,
+    proxy: str | None,
+    gl: str,
+    hl: str,
+    limiter: YouTubeRateLimiter,
+    proxy_lease: _SearchProxyLease | None = None,
+) -> dict[str, Any] | None:
+    '''Fetch one market-scoped search page with transient retries;
+    see :func:`_fetch_page_with_retry`.'''
+
+    async def fetch(active_proxy: str | None) -> dict[str, Any]:
+        return await _innertube_search_localized(
+            term,
+            params=params,
+            continuation=continuation,
+            proxy=active_proxy,
+            gl=gl,
+            hl=hl,
+            limiter=limiter,
+        )
+
+    return await _fetch_page_with_retry(
+        fetch,
+        proxy=proxy,
+        proxy_lease=proxy_lease,
+        log_extra={
+            'search_term': term,
+            'gl': gl,
+            'hl': hl,
+            'has_continuation': bool(continuation),
+        },
+    )
+
+
+async def discover_popular_for_market(
+    term: str,
+    *,
+    params: str,
+    gl: str,
+    hl: str,
+    continuations: int,
+    limiter: YouTubeRateLimiter,
+    proxy: str | None = None,
+    proxy_lease: _SearchProxyLease | None = None,
+) -> AsyncIterator[DiscoveredChannel]:
+    '''Search *term* in the ``(gl, hl)`` market with *params* (a
+    sort/filter blob such as :data:`POPULARITY_CHANNEL_PARAMS`),
+    yielding discovered channels per page.
+
+    This is the market-scoped, popularity-ordered enumeration that
+    replaces the retired trending feed: YouTube's trending/explore
+    browseIds now return HTTP 400 and ``/feed/trending`` redirects
+    to Home, so the only surface that still orders results by
+    popularity per country is search with the sort param.
+
+    Channels are yielded in discovery order; cross-page and
+    cross-term deduplication is the caller's responsibility (see
+    :class:`_ChannelEmitter`).
+    '''
+
+    if proxy_lease is not None:
+        proxy = proxy_lease.proxy
+    elif proxy is None:
+        proxy = limiter.select_proxy(YouTubeCallType.BROWSE)
+    continuation: str | None = None
+    pages: int = max(0, continuations) + 1
+    for page in range(pages):
+        start: float = time.monotonic()
+        payload: dict[str, Any] | None = (
+            await _search_page_localized_with_retry(
+                term,
+                params=params,
+                continuation=continuation,
+                proxy=proxy,
+                gl=gl,
+                hl=hl,
+                limiter=limiter,
+                proxy_lease=proxy_lease,
+            )
+        )
+        if payload is None:
+            break
+        for channel in extract_channels(payload):
+            yield channel
+        continuation = _get_continuation_token(payload)
+        _LOGGER.info(
+            'Market search page processed',
+            extra={
+                'search_term': term,
+                'gl': gl,
+                'hl': hl,
+                'page': page,
+                'duration': time.monotonic() - start,
+                'has_continuation': bool(continuation),
+            },
+        )
+        if not continuation:
+            break
+
+
+async def _channel_exists_on_exchange(
+    http_client: Any,
+    exchange_url: str,
+    channel_id: str,
+) -> bool | None:
+    '''Return True/False when the exchange answers 200/404 for the
+    channel record, ``None`` on any other outcome.'''
+
+    url: str = (
+        f'{exchange_url.rstrip("/")}'
+        f'/api/v1/data/content/youtube/channel/{channel_id}'
+    )
+    try:
+        response = await http_client.get(url)
+    except Exception as exc:
+        _LOGGER.debug(
+            'exchange channel existence check failed',
+            exc=exc,
+            extra={'channel_id': channel_id},
+        )
+        return None
+    if response.status_code == 404:
+        return False
+    if response.status_code == 200:
+        return True
+    return None
+
+
+async def enqueue_discovered_channels(
+    channels: Iterable[DiscoveredChannel],
+    *,
+    creator_map: CreatorMap,
+    queue: RedisChannelScrapeQueue,
+    http_client: Any,
+    exchange_url: str,
+    source: str,
+    min_subscribers: int = 0,
+) -> dict[str, int]:
+    '''Enqueue discovered channels that are neither already scraped
+    nor already present on scrape.exchange.
+
+    Dedupe mirrors the channel scraper's link discovery: a channel
+    in the ``creator_map`` (already scraped) or on the exchange is
+    skipped, and a failed existence check skips the channel rather
+    than enqueuing blind. ``enqueue_scheduled`` refuses terminal
+    channels atomically, surfaced here as ``terminal_skipped``.
+    Returns per-outcome counts.
+    '''
+
+    counts: dict[str, int] = {
+        'enqueued': 0,
+        'already_scraped': 0,
+        'on_exchange': 0,
+        'check_failed': 0,
+        'below_min_subscribers': 0,
+        'no_channel_id': 0,
+        'terminal_skipped': 0,
+    }
+    for channel in channels:
+        channel_id: str | None = channel.channel_id
+        if not channel_id or not YouTubeChannel.is_channel_id(channel_id):
+            counts['no_channel_id'] += 1
+            continue
+        subs: int | None = channel.subscriber_count
+        if subs is not None and subs < min_subscribers:
+            counts['below_min_subscribers'] += 1
+            continue
+        try:
+            known: str | None = await creator_map.get(channel_id)
+        except Exception:
+            known = None
+        if known:
+            counts['already_scraped'] += 1
+            continue
+        exists: bool | None = await _channel_exists_on_exchange(
+            http_client, exchange_url, channel_id,
+        )
+        if exists is True:
+            counts['on_exchange'] += 1
+            continue
+        if exists is None:
+            counts['check_failed'] += 1
+            continue
+        try:
+            enqueued: bool = await queue.enqueue_scheduled(
+                channel_id, source=source,
+            )
+        except Exception as exc:
+            _LOGGER.warning(
+                'failed to enqueue discovered channel',
+                exc=exc,
+                extra={'channel_id': channel_id},
+            )
+            continue
+        if enqueued:
+            counts['enqueued'] += 1
+        else:
+            counts['terminal_skipped'] += 1
+    return counts
+
+
+async def _build_queue_backends(
+    settings: DiscoverSearchSettings,
+) -> tuple[
+    RedisCreatorMap | None,
+    RedisChannelScrapeQueue | None,
+    Any,
+]:
+    '''Build the creator_map, channel queue, and Redis client when
+    ``REDIS_DSN`` is set; otherwise return ``(None, None, None)`` so
+    discovery still runs but nothing is enqueued.'''
+
+    if not settings.redis_dsn:
+        _LOGGER.info(
+            'REDIS_DSN not set; discovered channels will not be '
+            'enqueued',
+        )
+        return None, None, None
+    redis = redis_from_url(
+        settings.redis_dsn,
+        component='yt_discover_search',
+        decode_responses=True,
+    )
+    creator_map: RedisCreatorMap = RedisCreatorMap(
+        settings.redis_dsn, platform='youtube',
+    )
+    queue: RedisChannelScrapeQueue = RedisChannelScrapeQueue(
+        redis, ChannelScrapeQueueSettings(),
+    )
+    return creator_map, queue, redis
+
+
+@dataclass(frozen=True)
+class _PopularSearchJob:
+    '''One market x term x facet search of the popularity pass.'''
+
+    gl: str
+    hl: str
+    term: str
+    params: str
+
+
+async def _run_popular_discovery(
+    settings: DiscoverSearchSettings,
+    limiter: YouTubeRateLimiter,
+    terms: list[str],
+) -> int:
+    '''Run the market x term popularity-scoped discovery pass.
+
+    Every market x term x facet (channel and video) search is a job
+    on one shared queue, processed by up to
+    ``YOUTUBE_SEARCH_CONCURRENCY`` workers, each holding its own
+    proxy (see :func:`_run_search_workers`). Jobs are queued in
+    market priority order. Every discovered channel is emitted to
+    the output stream and, when Redis is configured, each job's
+    channels are enqueued on the channel scrape queue after the
+    known/on-exchange dedupe. SIGHUP reopens the output file.
+    '''
+
+    markets: list[tuple[str, str]] = _parse_markets(
+        settings.discover_markets,
+    )
+    creator_map, queue, redis = await _build_queue_backends(settings)
+    continuations: int = settings.discover_popular_continuations
+    jobs: list[_PopularSearchJob] = [
+        _PopularSearchJob(gl, hl, term, params)
+        for gl, hl in markets
+        for term in terms
+        for params in (
+            POPULARITY_CHANNEL_PARAMS,
+            POPULARITY_VIDEO_PARAMS,
+        )
+    ]
+    totals: dict[str, int] = {}
+    async with httpx2.AsyncClient(
+        timeout=30.0, http2=True,
+    ) as http_client:
+
+        async def run_job(
+            job: _PopularSearchJob,
+            proxy_lease: _SearchProxyLease,
+        ) -> AsyncIterator[DiscoveredChannel]:
+            batch: list[DiscoveredChannel] = []
+            async for channel in discover_popular_for_market(
+                job.term,
+                params=job.params,
+                gl=job.gl,
+                hl=job.hl,
+                continuations=continuations,
+                limiter=limiter,
+                proxy_lease=proxy_lease,
+            ):
+                batch.append(channel)
+                yield channel
+            if queue is None or creator_map is None:
+                return
+            counts: dict[str, int] = (
+                await enqueue_discovered_channels(
+                    batch,
+                    creator_map=creator_map,
+                    queue=queue,
+                    http_client=http_client,
+                    exchange_url=settings.exchange_url,
+                    source=settings.discover_source,
+                    min_subscribers=settings.discover_min_subscribers,
+                )
+            )
+            for key, value in counts.items():
+                totals[key] = totals.get(key, 0) + value
+
+        with _channel_output_stream(
+            settings.output_file,
+        ) as stream, _reopen_on_sighup(stream, settings.output_file):
+            emitter: _ChannelEmitter = _ChannelEmitter(stream)
+            async for channel in _run_search_workers(
+                jobs,
+                concurrency=settings.youtube_search_concurrency,
+                proxies=settings.proxies,
+                run_job=run_job,
+                worker_name='youtube-popular-search-worker',
+            ):
+                emitter.emit(channel)
+    _LOGGER.info(
+        'Popular discovery pass complete',
+        extra={
+            'markets': len(markets),
+            'terms': len(terms),
+            'totals': totals,
+        },
+    )
+    if redis is not None:
+        await redis.aclose()
+    return 0
 
 
 def _channel_to_json(channel: DiscoveredChannel) -> str:
@@ -921,6 +1559,25 @@ def _channel_output_stream(
     output_file: str,
 ) -> _ChannelOutputStream:
     return _ChannelOutputStream(output_file)
+
+
+@contextmanager
+def _reopen_on_sighup(
+    stream: _ChannelOutputStream,
+    output_file: str,
+) -> Iterator[None]:
+    '''Reopen *stream* on SIGHUP so logrotate can move the output
+    file; a no-op when writing to stdout (``-``).'''
+
+    if output_file == '-':
+        yield
+        return
+    loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGHUP, stream.reopen)
+    try:
+        yield
+    finally:
+        loop.remove_signal_handler(signal.SIGHUP)
 
 
 class _PidFileError(RuntimeError):
@@ -1080,31 +1737,22 @@ async def _run_discovery(settings: DiscoverSearchSettings) -> int:
         )
 
     try:
-        with _channel_output_stream(settings.output_file) as stream:
-            loop: asyncio.AbstractEventLoop = (
-                asyncio.get_running_loop()
+        if settings.popular_search:
+            return await _run_popular_discovery(
+                settings, limiter, terms,
             )
-            sighup_installed: bool = False
-            if settings.output_file != '-':
-                loop.add_signal_handler(
-                    signal.SIGHUP, stream.reopen,
-                )
-                sighup_installed = True
-            try:
-                emitter = _ChannelEmitter(stream)
-                async for channel in discover_for_terms(
-                    terms,
-                    continuations=(
-                        settings.youtube_search_continuations
-                    ),
-                    concurrency=settings.youtube_search_concurrency,
-                    proxies=settings.proxies,
-                    limiter=limiter,
-                ):
-                    emitter.emit(channel)
-            finally:
-                if sighup_installed:
-                    loop.remove_signal_handler(signal.SIGHUP)
+        with _channel_output_stream(
+            settings.output_file,
+        ) as stream, _reopen_on_sighup(stream, settings.output_file):
+            emitter = _ChannelEmitter(stream)
+            async for channel in discover_for_terms(
+                terms,
+                continuations=settings.youtube_search_continuations,
+                concurrency=settings.youtube_search_concurrency,
+                proxies=settings.proxies,
+                limiter=limiter,
+            ):
+                emitter.emit(channel)
         return 0
     finally:
         await aclose_pooled_innertube()

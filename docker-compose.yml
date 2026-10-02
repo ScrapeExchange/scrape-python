@@ -88,8 +88,6 @@ services:
       - tools/yt_discover_search.py
       - --proxy-files
       - /data/proxies/vpn.proxies.lst
-      - --keyword-count
-      - "360000"
       - --pid-file
       - /run/discovery/yt_discover_search.pid
       - --output-file
@@ -98,6 +96,24 @@ services:
       - /dev/stdout
       - --youtube-search-concurrency
       - "2"
+      # Market x term popularity-scoped pass: sorts search results by
+      # view count per country to enumerate the highest-subscriber
+      # channels (the retired trending feed's replacement).
+      - --discover-markets
+      - >-
+        IN:hi,US:en,BR:pt,ID:id,MX:es,RU:ru,TR:tr,EG:ar,SA:ar,KR:ko,
+        JP:ja,PH:fil,VN:vi,TH:th,PK:ur,BD:bn,NG:en,DE:de,GB:en,FR:fr,
+        IT:it,ES:es,AR:es,CO:es,PL:pl,UA:uk,DZ:ar,MA:ar,IQ:ar,TW:zh-TW
+      - --discover-popular-continuations
+      - "5"
+      - --discover-min-subscribers
+      - "4000"
+      - --discover-source
+      - discovered_popular
+      # Random-word term count searched in EVERY market by the
+      # popularity pass (markets x terms x 2 facets) — keep it small.
+      - --keyword-count
+      - "1000"
     # Clear the PID file on restart; container PIDs can be reused.
     tmpfs:
       - /run/discovery

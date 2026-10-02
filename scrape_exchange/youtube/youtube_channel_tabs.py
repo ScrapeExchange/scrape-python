@@ -23,6 +23,7 @@ from prometheus_client import Counter, Histogram
 
 from innertube import InnerTube
 from innertube.errors import RequestError as InnerTubeRequestError
+from innertube.locale import Locale
 
 from scrape_exchange._lazy_async_pool import _LazyAsyncPool
 from scrape_exchange.datatypes import MAX_KEEPALIVE_REQUESTS
@@ -1052,6 +1053,7 @@ def build_innertube_with_pool_limits(
     client_name: str = 'WEB',
     client_version: str = INNERTUBE_CLIENT_VERSION,
     user_agent: str | None = None,
+    locale: Locale | None = None,
 ) -> InnerTube:
     '''Construct an :class:`InnerTube` whose underlying
     ``httpx.Client`` carries our shared pool limits
@@ -1072,17 +1074,15 @@ def build_innertube_with_pool_limits(
     then closes).
     '''
 
-    if user_agent is None:
-        client: InnerTube = InnerTube(
-            client_name, client_version, proxies=entry,
-        )
-    else:
-        client = InnerTube(
-            client_name,
-            client_version,
-            user_agent=user_agent,
-            proxies=entry,
-        )
+    kwargs: dict[str, Any] = {}
+    if user_agent is not None:
+        kwargs['user_agent'] = user_agent
+    if locale is not None:
+        kwargs['locale'] = locale
+    kwargs['proxies'] = entry
+    client: InnerTube = InnerTube(
+        client_name, client_version, **kwargs,
+    )
     old_session: httpx.Client = client.adaptor.session
     client.adaptor.session = httpx.Client(
         base_url=old_session.base_url,
@@ -1161,6 +1161,62 @@ _PLAYER_INNERTUBE_POOL: _LazyAsyncPool[
     factory=_make_pooled_player_innertube_for_entry,
     aclose_attr='close',
 )
+
+
+def _make_pooled_localized_innertube_for_key(
+    key: tuple[str | None, str, str],
+) -> InnerTube:
+    '''Pool factory for country/language-scoped Web clients.
+
+    Same setup as :func:`_make_pooled_innertube_for_entry` except
+    the InnerTube context carries the requested ``gl``/``hl``
+    (:class:`Locale`) so the BROWSE/SEARCH responses are scoped to
+    that market. The locale is fixed at construction — InnerTube has
+    no per-request context override — which is why this pool is keyed
+    by ``(entry, gl, hl)`` rather than by proxy entry alone.
+    '''
+
+    entry, gl, hl = key
+    client: InnerTube = build_innertube_with_pool_limits(
+        entry, locale=Locale(hl, gl),
+    )
+    YouTubeCookieJar.get().load_into_session(
+        client.adaptor.session, entry,
+    )
+    visitor_id: str = generate_visitor_info()
+    client.adaptor.session.cookies.set(
+        'VISITOR_INFO1_LIVE', visitor_id,
+        domain='.youtube.com', path='/',
+    )
+    client.adaptor.session.headers[
+        'X-YouTube-Client-Name'
+    ] = INNERTUBE_CLIENT_NAME
+    client.adaptor.session.headers[
+        'X-YouTube-Client-Version'
+    ] = INNERTUBE_CLIENT_VERSION
+    install_innertube_phase_tracing(
+        client.adaptor.session,
+        proxy_file=proxy_file_label(entry or ''),
+    )
+    return client
+
+
+_LOCALIZED_INNERTUBE_POOL: _LazyAsyncPool[
+    tuple[str | None, str, str], InnerTube,
+] = _LazyAsyncPool(
+    factory=_make_pooled_localized_innertube_for_key,
+    aclose_attr='close',
+)
+
+
+def pooled_innertube_localized_for_entry(
+    entry: str | None, gl: str, hl: str,
+) -> InnerTube:
+    '''Return the long-lived pooled Web client scoped to the
+    ``(gl, hl)`` market. Same instance across calls for the same
+    ``(entry, gl, hl)`` key.'''
+
+    return _LOCALIZED_INNERTUBE_POOL.get((entry, gl, hl))
 
 
 def pooled_innertube_for_entry(entry: str | None) -> InnerTube:
@@ -1247,6 +1303,7 @@ async def aclose_pooled_innertube() -> None:
 
     await _INNERTUBE_POOL.aclose_all()
     await _PLAYER_INNERTUBE_POOL.aclose_all()
+    await _LOCALIZED_INNERTUBE_POOL.aclose_all()
 
 
 def _reset_pool_for_tests() -> None:
@@ -1255,3 +1312,4 @@ def _reset_pool_for_tests() -> None:
 
     _INNERTUBE_POOL.reset_for_tests()
     _PLAYER_INNERTUBE_POOL.reset_for_tests()
+    _LOCALIZED_INNERTUBE_POOL.reset_for_tests()
