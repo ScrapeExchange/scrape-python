@@ -1,6 +1,7 @@
 '''Unit tests for scrape_exchange.channel_scrape_queue.'''
 
 import json
+import random
 import time
 import unittest
 from typing import Any
@@ -12,6 +13,8 @@ from scrape_exchange.channel_scrape_queue import (
     ChannelScrapeQueueSettings,
     ChannelState,
     RedisChannelScrapeQueue,
+    parse_channel_priority_queues,
+    parse_channel_priority_weights,
 )
 
 
@@ -459,7 +462,7 @@ class TestPopUnresolved(_RedisQueueTestBase):
 
 class TestPopScheduled(_RedisQueueTestBase):
 
-    async def test_drains_tier_zero_before_one(
+    async def test_batch_fills_from_multiple_tiers(
         self,
     ) -> None:
         await self.redis.zadd(
@@ -475,7 +478,7 @@ class TestPopScheduled(_RedisQueueTestBase):
                 2, now=1.0,
             )
         )
-        self.assertEqual(
+        self.assertCountEqual(
             popped, ['UCt0a', 'UCt1a'],
         )
 
@@ -516,6 +519,195 @@ class TestPopScheduled(_RedisQueueTestBase):
             )
         )
         self.assertEqual(popped, [])
+
+
+class TestParseChannelPriorityWeights(unittest.TestCase):
+
+    def setUp(self) -> None:
+        self.tiers = parse_channel_priority_queues(
+            '3:100000000,7:10000000,365:0',
+        )
+
+    def test_default_is_inverse_interval_days(self) -> None:
+        weights: list[float] = parse_channel_priority_weights(
+            '', self.tiers,
+        )
+        self.assertEqual(weights, [1 / 3, 1 / 7, 1 / 365])
+
+    def test_no_respawn_tier_defaults_to_one(self) -> None:
+        tiers = parse_channel_priority_queues('-1:1000,30:0')
+        self.assertEqual(
+            parse_channel_priority_weights('', tiers),
+            [1.0, 1 / 30],
+        )
+
+    def test_explicit_weights(self) -> None:
+        self.assertEqual(
+            parse_channel_priority_weights(
+                '5, 2.5,1', self.tiers,
+            ),
+            [5.0, 2.5, 1.0],
+        )
+
+    def test_wrong_count_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_channel_priority_weights('1,1', self.tiers)
+
+    def test_non_positive_raises(self) -> None:
+        bad: str
+        for bad in ('1,0,1', '1,-2,1', '1,x,1', '1,nan,1', '1,inf,1'):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    parse_channel_priority_weights(
+                        bad, self.tiers,
+                    )
+
+    def test_queue_rejects_bad_weights(self) -> None:
+        settings: ChannelScrapeQueueSettings = (
+            ChannelScrapeQueueSettings(
+                _env_file=None,
+                channel_priority_queues='7:1000,365:0',
+                channel_priority_weights='1',
+            )
+        )
+        with self.assertRaises(ValueError):
+            RedisChannelScrapeQueue(
+                fakeredis.aioredis.FakeRedis(), settings,
+            )
+
+
+class TestPopScheduledWeighted(unittest.IsolatedAsyncioTestCase):
+
+    async def asyncSetUp(self) -> None:
+        self.redis: fakeredis.aioredis.FakeRedis = (
+            fakeredis.aioredis.FakeRedis(decode_responses=True)
+        )
+
+    async def asyncTearDown(self) -> None:
+        await self.redis.aclose()
+
+    def _queue(self, weights: str) -> RedisChannelScrapeQueue:
+        settings: ChannelScrapeQueueSettings = (
+            ChannelScrapeQueueSettings(
+                _env_file=None,
+                channel_priority_queues='3:1000,365:0',
+                channel_priority_weights=weights,
+            )
+        )
+        return RedisChannelScrapeQueue(
+            self.redis, settings, rng=random.Random(42),
+        )
+
+    async def _fill(self, tier: int, count: int) -> None:
+        await self.redis.zadd(
+            f'youtube:channel:queue:scheduled:{tier}',
+            {f'i:UC{tier}x{i:020}': 0.0 for i in range(count)},
+        )
+
+    async def test_share_follows_weights(self) -> None:
+        queue: RedisChannelScrapeQueue = self._queue('3,1')
+        await self._fill(0, 2000)
+        await self._fill(1, 2000)
+        tier0: int = 0
+        _: int
+        for _ in range(1000):
+            popped: list[str] = await queue.pop_scheduled(
+                1, now=1.0,
+            )
+            self.assertEqual(len(popped), 1)
+            if popped[0].startswith('UC0x'):
+                tier0 += 1
+        self.assertGreater(tier0, 700)
+        self.assertLess(tier0, 800)
+
+    async def test_lower_tier_not_starved(self) -> None:
+        queue: RedisChannelScrapeQueue = self._queue('')
+        await self._fill(0, 500)
+        await self._fill(1, 1)
+        popped: list[str] = []
+        _: int
+        for _ in range(400):
+            popped.extend(await queue.pop_scheduled(1, now=1.0))
+        self.assertIn('UC1x' + f'{0:020}', popped)
+
+    async def test_empty_tier_share_goes_to_others(self) -> None:
+        queue: RedisChannelScrapeQueue = self._queue('1000,1')
+        await self._fill(1, 5)
+        await self.redis.zadd(
+            'youtube:channel:queue:scheduled:0',
+            {'i:UCnotdue': 50.0},
+        )
+        popped: list[str] = []
+        _: int
+        for _ in range(5):
+            popped.extend(await queue.pop_scheduled(1, now=1.0))
+        self.assertEqual(len(popped), 5)
+        self.assertTrue(all(m.startswith('UC1x') for m in popped))
+
+
+class TestEnqueueNew(_RedisQueueTestBase):
+    '''enqueue_new only adds channels the queue has never seen.'''
+
+    async def test_enqueues_unknown_channel(self) -> None:
+        result: str = await self.queue.enqueue_new(
+            'UCnew0001', source='discovered_popular',
+        )
+        self.assertEqual(result, 'enqueued')
+        self.assertIsNotNone(await self.redis.zscore(
+            'youtube:channel:queue:scheduled:0', 'i:UCnew0001',
+        ))
+        meta: dict[str, str] = await self.redis.hgetall(
+            'youtube:channel:meta:i:UCnew0001',
+        )
+        self.assertEqual(meta['state'], 'scheduled')
+        self.assertEqual(meta['source'], 'discovered_popular')
+
+    async def test_leaves_scheduled_channel_untouched(self) -> None:
+        await self.queue.enqueue_scheduled('UCknown001', source='cli')
+        await self.redis.zadd(
+            'youtube:channel:queue:scheduled:0', {'i:UCknown001': 999.0},
+        )
+        result: str = await self.queue.enqueue_new(
+            'UCknown001', source='discovered_popular',
+        )
+        self.assertEqual(result, 'known')
+        self.assertEqual(await self.redis.zscore(
+            'youtube:channel:queue:scheduled:0', 'i:UCknown001',
+        ), 999.0)
+        self.assertEqual(await self.redis.hget(
+            'youtube:channel:meta:i:UCknown001', 'source',
+        ), 'cli')
+
+    async def test_does_not_requeue_channel_being_scraped(self) -> None:
+        await self.queue.enqueue_scheduled('UCflight01', source='cli')
+        popped: list[str] = await self.queue.pop_scheduled(
+            1, now=time.time() + 1,
+        )
+        self.assertEqual(popped, ['UCflight01'])
+        result: str = await self.queue.enqueue_new(
+            'UCflight01', source='discovered_popular',
+        )
+        self.assertEqual(result, 'known')
+        tier: int
+        for tier in range(6):
+            self.assertIsNone(await self.redis.zscore(
+                f'youtube:channel:queue:scheduled:{tier}', 'i:UCflight01',
+            ))
+
+    async def test_reports_terminal_channel(self) -> None:
+        await self.queue.enqueue_scheduled('UCgone0001', source='cli')
+        await self.queue.mark('i:UCgone0001', state=ChannelState.LOW_SUBS)
+        result: str = await self.queue.enqueue_new(
+            'UCgone0001', source='discovered_popular',
+        )
+        self.assertEqual(result, 'terminal')
+        self.assertEqual(await self.redis.hget(
+            'youtube:channel:meta:i:UCgone0001', 'state',
+        ), 'low_subs')
+
+    async def test_rejects_non_channel_id(self) -> None:
+        with self.assertRaises(ValueError):
+            await self.queue.enqueue_new('handle', source='x')
 
 
 class TestPromoteToScheduled(_RedisQueueTestBase):
@@ -1669,3 +1861,28 @@ class TestReadOps(_RedisQueueTestBase):
             await self.queue.get_meta('h:foo')
         )
         self.assertEqual(meta.get('note'), 'reviewed')
+
+
+class TestAwaitingFirstFullScrape(unittest.TestCase):
+
+    def test_rule(self) -> None:
+        from scrape_exchange.channel_scrape_queue import (
+            awaiting_first_full_scrape,
+        )
+        cases: list[tuple[tuple[str | None, ...], bool]] = [
+            ((None, None, None), False),
+            (('scheduled', '0', None), True),
+            (('scheduled', '0', '1786000000'), True),
+            (('scheduled', None, None), True),
+            (('low_subs', None, None), True),
+            (('scheduled', None, '1786000000'), False),
+            (('scheduled', '1', None), False),
+            (('scheduled', '12', '1786000000'), False),
+        ]
+        fields: tuple[str | None, ...]
+        expected: bool
+        for fields, expected in cases:
+            with self.subTest(fields=fields):
+                self.assertEqual(
+                    awaiting_first_full_scrape(*fields), expected,
+                )

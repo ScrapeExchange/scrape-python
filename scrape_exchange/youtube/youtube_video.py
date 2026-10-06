@@ -792,7 +792,8 @@ class YouTubeVideo:
         download_client: YoutubeDL | None = None,
         debug: bool = False, save_dir: str | None = None,
         filename_prefix: str = '', with_formats: bool = True,
-        proxies: list[str] = []
+        proxies: list[str] = [],
+        max_rate_limit_wait: float | None = None,
     ) -> Self | None:
         '''
         Collects data about a video using InnerTube API and optionally yt-dlp
@@ -826,7 +827,9 @@ class YouTubeVideo:
             download_client=download_client,
         )
 
-        await self.from_innertube(proxy=proxy)
+        await self.from_innertube(
+            proxy=proxy, max_rate_limit_wait=max_rate_limit_wait,
+        )
 
         if with_formats:
             # This invokes yt-dlp to get additional metadata but requires a
@@ -1397,9 +1400,11 @@ class YouTubeVideo:
 
     async def from_innertube(self, innertube: InnerTube | None = None,
                              proxy: str | None = None,
+                             max_rate_limit_wait: float | None = None,
                              ) -> None:
         await InnerTubeVideoParser.scrape(
-            self, innertube, proxy=proxy
+            self, innertube, proxy=proxy,
+            max_rate_limit_wait=max_rate_limit_wait,
         )
 
     def classify(self) -> str | None:

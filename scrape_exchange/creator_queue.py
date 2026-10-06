@@ -39,6 +39,7 @@ from scrape_exchange.file_management import (
     AssetFileManagement,
 )
 from scrape_exchange.redis_client import redis_from_url
+from scrape_exchange.watchdog import Watchdog
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -1504,6 +1505,11 @@ class RedisCreatorQueue(CreatorQueue):
             if cursor == 0:
                 break
 
+    @property
+    def redis_client(self) -> Any:
+        '''The queue's Redis client (shared Redis instance).'''
+        return self._redis
+
     def _queue_key(self, tier: int) -> str:
         return f'{self._key_prefix}:queue:{tier}'
 
@@ -1708,6 +1714,10 @@ class RedisCreatorQueue(CreatorQueue):
         for i in range(
             0, len(candidates), chunk_size,
         ):
+            # Startup runs before any streamer touches the
+            # watchdog; over a high-latency Redis link this loop
+            # can outlast the work timeout while progressing.
+            Watchdog.get().touch_work()
             chunk: list[tuple[str, str]] = (
                 candidates[i:i + chunk_size]
             )
@@ -1762,6 +1772,50 @@ class RedisCreatorQueue(CreatorQueue):
 
         added += await self._recover_orphans()
         return added
+
+    async def add_creator(
+        self,
+        creator_id: str,
+        creator_name: str,
+        tiers: list[TierConfig],
+        subscriber_count: int | None,
+        channel_fm: AssetFileManagement,
+    ) -> bool:
+        '''
+        Enqueue one creator without the startup work of
+        :meth:`populate` (legacy migration, names backfill, orphan
+        scan). Used by the channel scraper once a new channel's first
+        full scrape has completed.
+
+        :param creator_id: the creator (channel) ID
+        :param creator_name: display name used for name dedup
+        :param tiers: the queue's tier configuration
+        :param subscriber_count: picks the tier; None for unknown
+        :param channel_fm: checked for skip-marker files
+        :returns: True when the creator was added, False when it was
+            already known, operator-excluded or skip-marked.
+        '''
+
+        if _should_skip_creator(
+            creator_name, creator_id, channel_fm, None,
+        ):
+            return False
+        pipe = self._redis.pipeline(transaction=False)
+        pipe.hexists(self._key_creators, creator_id)
+        pipe.sismember(self._key_names, creator_name.lower())
+        pipe.sismember(self._key_excluded, creator_id)
+        known, named, excluded = await pipe.execute()
+        if known or named or excluded:
+            return False
+        tier: int = tier_for_subscriber_count(tiers, subscriber_count)
+        now: float = datetime.now(UTC).timestamp()
+        pipe = self._redis.pipeline(transaction=True)
+        pipe.zadd(self._queue_key(tier), {creator_id: now}, nx=True)
+        pipe.hset(self._key_creators, creator_id, creator_name)
+        pipe.hset(self._key_tiers, creator_id, str(tier))
+        pipe.sadd(self._key_names, creator_name.lower())
+        results: list[Any] = await pipe.execute()
+        return bool(results[0])
 
     async def claim_batch(
         self,
@@ -2149,6 +2203,9 @@ class RedisCreatorQueue(CreatorQueue):
         recovered: int = 0
 
         while True:
+            # Also runs at boot from populate(), before any
+            # streamer touches the watchdog.
+            Watchdog.get().touch_work()
             cursor, data = await self._redis.hscan(
                 self._key_tiers,
                 cursor,

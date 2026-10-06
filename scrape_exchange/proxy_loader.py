@@ -382,6 +382,36 @@ def pooled_httpx_client_for_entry(
     return _HTTPX_POOL.get(entry)
 
 
+def borrow_pooled_httpx_client_for_entry(
+    entry: str | None,
+) -> httpx.AsyncClient:
+    """Borrow the pooled client for ``entry`` for one request.
+
+    Pair with :func:`release_pooled_httpx_client`. A borrowed client
+    that is retired by :func:`retire_pooled_httpx_client` stays open
+    until its last borrower releases it."""
+
+    return _HTTPX_POOL.borrow(entry)
+
+
+async def release_pooled_httpx_client(client: httpx.AsyncClient) -> None:
+    """Release a client borrowed for one request."""
+
+    await _HTTPX_POOL.release(client)
+
+
+async def retire_pooled_httpx_client(
+    entry: str | None,
+    *,
+    expected: httpx.AsyncClient,
+) -> bool:
+    """Replace the pooled client for ``entry`` if it is still
+    ``expected``, e.g. after a failed proxy tunnel that may have
+    leaked a connection slot. New requests get a fresh client."""
+
+    return await _HTTPX_POOL.retire_key(entry, expected=expected)
+
+
 async def aclose_pooled_httpx_clients() -> None:
     """Close every pooled httpx client and empty the pool. Called
     from the scraper shutdown drain."""

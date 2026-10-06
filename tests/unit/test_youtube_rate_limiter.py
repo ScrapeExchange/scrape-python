@@ -11,7 +11,13 @@ import os
 import unittest
 from unittest.mock import patch
 
-from scrape_exchange.rate_limiter import _ProxyBuckets, _InProcessBackend
+import time
+
+from scrape_exchange.rate_limiter import (
+    RateLimitWaitExceeded,
+    _InProcessBackend,
+    _ProxyBuckets,
+)
 from scrape_exchange.youtube.youtube_rate_limiter import (
     YouTubeRateLimiter,
     YouTubeCallType,
@@ -233,6 +239,70 @@ class TestAcquireWithProxy(unittest.IsolatedAsyncioTestCase):
             pb.buckets[YouTubeCallType.BROWSE].tokens,
             burst - 1,
             delta=0.1,
+        )
+
+    async def test_max_wait_raises_when_bucket_stays_empty(self) -> None:
+        '''A penalised bucket would need seconds to refill: with a
+        smaller max_wait, acquire() gives up at once and leaves the
+        bucket alone.'''
+        limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
+        proxy: str = 'http://a:3128'
+        backend: _InProcessBackend = _in_process_backend(limiter)
+        pb: _ProxyBuckets = backend._get_or_create(proxy)
+        pb.buckets[YouTubeCallType.PLAYER].tokens = -2.0
+        start: float = time.monotonic()
+        with self.assertRaises(RateLimitWaitExceeded) as ctx:
+            await limiter.acquire(
+                YouTubeCallType.PLAYER, proxy=proxy, max_wait=0.5,
+            )
+        self.assertLess(time.monotonic() - start, 0.5)
+        self.assertEqual(ctx.exception.proxy, proxy)
+        self.assertEqual(ctx.exception.call_type, 'player')
+        self.assertLess(pb.buckets[YouTubeCallType.PLAYER].tokens, 0)
+
+    async def test_max_wait_allows_short_wait(self) -> None:
+        limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
+        proxy: str = 'http://a:3128'
+        backend: _InProcessBackend = _in_process_backend(limiter)
+        pb: _ProxyBuckets = backend._get_or_create(proxy)
+        rate: float = _DEFAULT_CONFIGS[YouTubeCallType.PLAYER].refill_rate
+        # About 50 ms short of one token.
+        pb.buckets[YouTubeCallType.PLAYER].tokens = 1.0 - 0.05 * rate
+        self.assertEqual(
+            await limiter.acquire(
+                YouTubeCallType.PLAYER, proxy=proxy, max_wait=5.0,
+            ),
+            proxy,
+        )
+
+    async def test_no_max_wait_keeps_waiting(self) -> None:
+        '''Without max_wait the old behaviour holds: sleep until a
+        token is available.'''
+        limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
+        proxy: str = 'http://a:3128'
+        backend: _InProcessBackend = _in_process_backend(limiter)
+        pb: _ProxyBuckets = backend._get_or_create(proxy)
+        rate: float = _DEFAULT_CONFIGS[YouTubeCallType.PLAYER].refill_rate
+        pb.buckets[YouTubeCallType.PLAYER].tokens = 1.0 - 0.05 * rate
+        self.assertEqual(
+            await limiter.acquire(YouTubeCallType.PLAYER, proxy=proxy),
+            proxy,
+        )
+
+    async def test_select_proxy_from_skips_cooldown(self) -> None:
+        limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
+        cold: str = 'http://a:3128'
+        warm: str = 'http://b:3128'
+        limiter._health._state(cold).cooldown_until = time.time() + 60
+        for _ in range(20):
+            self.assertEqual(
+                limiter.select_proxy_from(
+                    YouTubeCallType.PLAYER, [cold, warm],
+                ),
+                warm,
+            )
+        self.assertIsNone(
+            limiter.select_proxy_from(YouTubeCallType.PLAYER, []),
         )
 
     async def test_acquire_no_proxy_no_pool_returns_none(self) -> None:

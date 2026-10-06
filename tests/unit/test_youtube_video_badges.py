@@ -152,6 +152,7 @@ class TestScrapeVideoBadges(unittest.IsolatedAsyncioTestCase):
         }
         limiter: MagicMock = MagicMock()
         limiter.acquire = AsyncMock(return_value=None)
+        limiter.report_proxy_result = AsyncMock()
         limiter.get_cookie_file_cached.return_value = None
         video: YouTubeVideo = YouTubeVideo(
             video_id='example', download_client=client,

@@ -12,12 +12,14 @@ import httpx2 as httpx
 from prometheus_client import Counter
 
 from scrape_exchange.channel_scrape_queue import (
+    VIDEO_IDS_ENUMERATED_FIELD,
     ChannelScrapeProgress,
     ChannelScrapeQueueSettings,
     ChannelState,
     RedisChannelScrapeQueue,
 )
 from scrape_exchange.file_management import AssetFileManagement
+from scrape_exchange.youtube.uploaded_video_ids import UploadedVideoIds
 from scrape_exchange.video_scrape_queue import (
     RedisVideoScrapeQueue,
     VideoScrapeQueueSettings,
@@ -261,10 +263,42 @@ class TestChannelVideoRefresh(unittest.IsolatedAsyncioTestCase):
 
     async def test_existing_channel_rollout_waits_ten_successes(self) -> None:
         self.existing = True
+        await self.redis.hset(
+            'youtube:channel:meta:i:UCexample',
+            VIDEO_IDS_ENUMERATED_FIELD, '1790000000',
+        )
         index: int
         for index in range(10):
             await self.run_scrape()
         self.assertEqual(self.modes, [True] * 9 + [False])
+
+    async def test_unenumerated_channel_gets_one_full_pass(self) -> None:
+        '''An existing channel never fully enumerated pages every tab
+        on its first re-scrape, without the known-ID early stop, then
+        returns to the normal cadence.'''
+        self.existing = True
+        await self.redis.hset('youtube:channel:meta:i:UCexample', mapping={
+            'successful_scrapes': '3', 'next_full_scrape': '11',
+        })
+        captured: list[object] = await self._scrape_capturing_known()
+        self.assertEqual(self.modes, [False])
+        self.assertIsNone(captured[0])
+        meta: dict[str, str] = await self.queue.get_meta('i:UCexample')
+        self.assertIn(VIDEO_IDS_ENUMERATED_FIELD, meta)
+        await self.run_scrape()
+        self.assertEqual(self.modes, [False, True])
+
+    async def test_incomplete_full_pass_is_retried(self) -> None:
+        self.existing = True
+        self.channel.video_ids_complete = False
+        await self.redis.hset('youtube:channel:meta:i:UCexample', mapping={
+            'successful_scrapes': '3', 'next_full_scrape': '11',
+        })
+        await self.run_scrape()
+        meta: dict[str, str] = await self.queue.get_meta('i:UCexample')
+        self.assertNotIn(VIDEO_IDS_ENUMERATED_FIELD, meta)
+        await self.run_scrape()
+        self.assertEqual(self.modes, [False, False])
 
     async def test_systemic_lookup_failure_keeps_first_full_scrape_due(
             self,
@@ -306,11 +340,195 @@ class TestChannelVideoRefresh(unittest.IsolatedAsyncioTestCase):
             ['new-video'],
         )
 
+    async def _scrape_capturing_known(self) -> list[object]:
+        captured: list[object] = []
+        self.captured_known: list[object] = captured
+        original = self.scrape
+
+        async def scrape(**kwargs: object) -> None:
+            captured.append(kwargs.get('known_video_ids'))
+            await original(**kwargs)
+
+        self.scrape = scrape
+        await self.run_scrape()
+        return captured
+
+    async def test_periodic_full_rescrape_pages_incrementally(
+        self,
+    ) -> None:
+        self.existing = True
+        await self.redis.hset('youtube:channel:meta:i:UCexample', mapping={
+            'successful_scrapes': '10', 'next_full_scrape': '11',
+            VIDEO_IDS_ENUMERATED_FIELD: '1790000000',
+        })
+        captured: list[object] = await self._scrape_capturing_known()
+        self.assertEqual(self.modes, [False])
+        self.assertIsInstance(captured[0], refresh.KnownVideoIds)
+        # The prefetched exchange IDs are reused: one filter query.
+        self.assertEqual(self.requests.count('/api/v1/filter'), 1)
+
+    async def test_first_full_scrape_pages_whole_tab(self) -> None:
+        captured: list[object] = await self._scrape_capturing_known()
+        self.assertEqual(self.modes, [False])
+        self.assertIsNone(captured[0])
+
+    async def test_forced_full_pages_whole_tab(self) -> None:
+        self.existing = True
+        await self.redis.hset('youtube:channel:meta:i:UCexample', mapping={
+            'successful_scrapes': '3', 'next_full_scrape': '11',
+        })
+        await self.queue.force_rescrape('i:UCexample', mode='full')
+        captured: list[object] = await self._scrape_capturing_known()
+        self.assertEqual(self.modes, [False])
+        self.assertIsNone(captured[0])
+
+    async def test_filter_failure_disables_incremental_paging(
+        self,
+    ) -> None:
+        self.existing = True
+        await self.redis.hset('youtube:channel:meta:i:UCexample', mapping={
+            'successful_scrapes': '10', 'next_full_scrape': '11',
+        })
+        self.status = 500
+        with self.assertRaises(RuntimeError):
+            await self._scrape_capturing_known()
+        self.assertEqual(self.modes, [False])
+        self.assertEqual(self.captured_known, [None])
+
+    async def test_merge_previous_video_ids(self) -> None:
+        filename: str = 'channel-UCexample.json.br'
+        await self.fm.write_file(filename, {'video_ids': ['old1', 'old2']})
+        self.channel.video_ids = {'new1'}
+        self.channel.video_ids_complete = False
+        await scraper._merge_previous_video_ids(
+            self.fm, filename, self.channel, {'exch1'},
+        )
+        self.assertEqual(
+            self.channel.video_ids, {'new1', 'old1', 'old2', 'exch1'},
+        )
+
+    async def test_merge_without_previous_file(self) -> None:
+        self.channel.video_ids = {'new1'}
+        await scraper._merge_previous_video_ids(
+            self.fm, 'channel-UCnone.json.br', self.channel, set(),
+        )
+        self.assertEqual(self.channel.video_ids, {'new1'})
+
+    async def _scrape_capturing(
+        self, rss_queue: AsyncMock | None = None,
+    ) -> list[dict[str, object]]:
+        captured: list[dict[str, object]] = []
+        original = self.scrape
+
+        async def scrape(**kwargs: object) -> None:
+            captured.append(dict(kwargs))
+            await original(**kwargs)
+
+        self.scrape = scrape
+        rss: AsyncMock = rss_queue or AsyncMock()
+        with patch.object(scraper, '_rss_queue_for', return_value=rss):
+            await self.run_scrape()
+        return captured
+
+    async def test_first_scrape_is_oldest_first_and_capped(self) -> None:
+        rss: AsyncMock = AsyncMock()
+        captured: list[dict[str, object]] = await self._scrape_capturing(
+            rss,
+        )
+        self.assertEqual(captured[0]['oldest_first_limit'], 200)
+        self.assertIsNone(captured[0]['known_video_ids'])
+        rss.add_creator.assert_awaited_once()
+        args: tuple = rss.add_creator.await_args.args
+        self.assertEqual(args[0], 'UCexample')
+        self.assertEqual(args[3], 1000)
+
+    async def test_rescrape_is_not_capped_or_added_to_rss(self) -> None:
+        self.existing = True
+        await self.redis.hset('youtube:channel:meta:i:UCexample', mapping={
+            'successful_scrapes': '10', 'next_full_scrape': '11',
+        })
+        rss: AsyncMock = AsyncMock()
+        captured: list[dict[str, object]] = await self._scrape_capturing(
+            rss,
+        )
+        self.assertEqual(captured[0]['oldest_first_limit'], 0)
+        rss.add_creator.assert_not_awaited()
+
+    async def test_forced_full_first_scrape_is_uncapped(self) -> None:
+        await self.queue.force_rescrape('i:UCexample', mode='full')
+        rss: AsyncMock = AsyncMock()
+        captured: list[dict[str, object]] = await self._scrape_capturing(
+            rss,
+        )
+        self.assertEqual(captured[0]['oldest_first_limit'], 0)
+        rss.add_creator.assert_awaited_once()
+
+    async def test_terminal_first_scrape_is_not_added_to_rss(self) -> None:
+        self.channel.subscriber_count = 3
+        rss: AsyncMock = AsyncMock()
+        await self._scrape_capturing(rss)
+        rss.add_creator.assert_not_awaited()
+
+    async def test_filter_no_data_404_queues_all_videos(self) -> None:
+        '''The exchange answers a filter matching no records with a
+        404 "Data not found" body: the channel has no videos on the
+        exchange yet, which is not a failure.'''
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(404, json={
+                'detail': refresh.EXCHANGE_DATA_NOT_FOUND,
+            })
+
+        self.http._transport = httpx.MockTransport(respond)
+        await self.run_scrape()
+        meta: dict[str, str] = await self.queue.get_meta('i:UCexample')
+        self.assertEqual(meta['successful_scrapes'], '1')
+        self.assertNotEqual(meta['state'], 'soft_unavailable')
+        self.assertEqual(
+            await self.redis.zrange('youtube:video:queue', 0, -1),
+            ['new-video'],
+        )
+
+    async def test_filter_other_404_still_raises(self) -> None:
+        def respond(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(404, json={'detail': 'Not Found'})
+
+        self.http._transport = httpx.MockTransport(respond)
+        with self.assertRaises(refresh.FilterQueryError):
+            await refresh.fetch_exchange_video_ids(
+                self.http, 'https://scrape.exchange', 'UCexample',
+            )
+
+    async def test_filter_no_data_404_on_later_page_keeps_ids(
+        self,
+    ) -> None:
+        def respond(request: httpx.Request) -> httpx.Response:
+            if b'"after"' in request.content:
+                return httpx.Response(404, json={
+                    'detail': refresh.EXCHANGE_DATA_NOT_FOUND,
+                })
+            return httpx.Response(200, json={
+                'edges': [{'node': {'platform_content_id': 'v1'}}],
+                'page_info': {
+                    'has_next_page': True, 'end_cursor': 'c1',
+                },
+            })
+
+        self.http._transport = httpx.MockTransport(respond)
+        self.assertEqual(
+            await refresh.fetch_exchange_video_ids(
+                self.http, 'https://scrape.exchange', 'UCexample',
+            ),
+            {'v1'},
+        )
+
     async def test_filters_known_videos_and_reports_actual_additions(
         self,
     ) -> None:
         self.channel.video_ids = {'uploaded', 'local', 'new-video'}
-        await self.redis.sadd('youtube:video:uploaded', 'uploaded')
+        await UploadedVideoIds('', redis_client=self.redis).add(
+            'uploaded',
+        )
         local: Path = self.fm.base_dir / 'video-min-local.json.br'
         local.touch()
         with self.assertLogs(level='INFO') as logs:
@@ -326,6 +544,7 @@ class TestChannelVideoRefresh(unittest.IsolatedAsyncioTestCase):
         await self.queue.set_meta(
             'i:UCexample', successful_scrapes='10',
             next_full_scrape='11', force_rescrape_mode='metadata',
+            **{VIDEO_IDS_ENUMERATED_FIELD: '1790000000'},
         )
         self.existing = True
         await self.run_scrape()
@@ -505,3 +724,79 @@ class TestChannelVideoRefresh(unittest.IsolatedAsyncioTestCase):
                    if hasattr(r, 'video_ids_added')][-1]
         self.assertEqual(summary.video_ids_added, 0)
         self.assertEqual(summary.outcome, 'failure')
+
+
+class TestKnownVideoIds(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.redis: fakeredis.aioredis.FakeRedis = (
+            fakeredis.aioredis.FakeRedis(decode_responses=True)
+        )
+        self.directory: tempfile.TemporaryDirectory = (
+            tempfile.TemporaryDirectory()
+        )
+        self.addCleanup(self.directory.cleanup)
+        self.fm: AssetFileManagement = AssetFileManagement(
+            self.directory.name,
+        )
+        self.filter_calls: int = 0
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            self.filter_calls += 1
+            return httpx.Response(200, json={
+                'edges': [{'node': {'platform_content_id': 'on-exchange'}}],
+                'page_info': {'has_next_page': False},
+            })
+
+        self.http: httpx.AsyncClient = httpx.AsyncClient(
+            transport=httpx.MockTransport(respond),
+        )
+
+    async def asyncTearDown(self) -> None:
+        await self.http.aclose()
+        await self.redis.aclose()
+
+    async def test_known_sources(self) -> None:
+        await UploadedVideoIds('', redis_client=self.redis).add(
+            'uploaded',
+        )
+        queue: RedisVideoScrapeQueue = RedisVideoScrapeQueue(
+            self.redis, VideoScrapeQueueSettings(),
+        )
+        await queue.enqueue('queued', source='test')
+        (self.fm.base_dir / 'video-min-local.json.br').touch()
+        known: refresh.KnownVideoIds = refresh.KnownVideoIds(
+            redis=self.redis, http_client=self.http,
+            exchange_url='https://scrape.exchange',
+            channel_id='UCexample', video_fm=self.fm,
+        )
+        await known.load()
+        self.assertEqual(known.exchange_ids, {'on-exchange'})
+        result: set[str] = await known([
+            'on-exchange', 'uploaded', 'queued', 'local', 'new',
+        ])
+        self.assertEqual(
+            result, {'on-exchange', 'uploaded', 'queued', 'local'},
+        )
+        self.assertEqual(self.filter_calls, 1)
+
+    async def test_queue_channel_videos_reuses_exchange_ids(
+        self,
+    ) -> None:
+        channel: YouTubeChannel = YouTubeChannel(
+            'example', channel_id='UCexample',
+            with_download_client=False,
+        )
+        channel.video_ids = {'on-exchange', 'new'}
+        summary: refresh.FullScrapeSummary = refresh.FullScrapeSummary(
+            'UCexample',
+        )
+        await refresh.queue_channel_videos(
+            channel, redis=self.redis, http_client=self.http,
+            exchange_url='https://scrape.exchange', video_fm=self.fm,
+            summary=summary, exchange_ids={'on-exchange'},
+        )
+        self.assertEqual(self.filter_calls, 0)
+        self.assertEqual(
+            await self.redis.zrange('youtube:video:queue', 0, -1),
+            ['new'],
+        )

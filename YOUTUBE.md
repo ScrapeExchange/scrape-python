@@ -134,9 +134,9 @@ requires the `trace` extension callback to be an async function
 (the RSS phase-trace callback already is; the sync InnerTube
 callback stays on httpx).
 
-Links whose subscriber count is below
-`CHANNEL_DISCOVERY_MIN_SUBSCRIBERS` (default 0, i.e. all links) are
-never enqueued. Discovery is capped at 4 concurrent handle resolutions
+Links with a known subscriber count below `MIN_CHANNEL_SUBSCRIBERS`
+(10) are never enqueued. Links with an unknown count remain eligible.
+Discovery is capped at 4 concurrent handle resolutions
 per scrape and is best-effort: a per-link failure is logged and
 counted but never fails the parent scrape. Set
 `CHANNEL_DISCOVER_LINKED_CHANNELS=false` to turn the fan-out off, e.g.
@@ -229,6 +229,21 @@ enqueue failures do not advance the cadence. Partial
 delivery is safe to retry. Only successful, schedulable
 channel scrapes advance the counter; terminal channels
 retain their existing workflow behavior.
+
+A channel's first scrape pages the videos, shorts and live
+tabs in 'Oldest' order, capped at
+`CHANNEL_FIRST_SCRAPE_MAX_VIDEOS` IDs per tab. Later full
+scrapes page in 'Latest' order and stop at the first page
+whose IDs are all known. Because both can stop before the
+end of a tab, each channel gets one exhaustive pass: until
+`video_ids_enumerated_at` is set in its meta hash, every
+re-scrape (even one that would otherwise fetch metadata
+only) pages every tab to the end without stopping early.
+The field is set, to a unix timestamp, by any successful
+scrape that reached the end of every tab, including a small
+channel's capped first scrape. If a pass stops early it is
+retried on the next scrape. Prometheus counts the passes in
+`channel_full_enumeration_total{outcome="completed"|"incomplete"}`.
 
 Forced full scrapes also discover missing videos without
 shifting an upcoming periodic refresh. Forced metadata
@@ -407,6 +422,41 @@ again. Already-uploaded videos are filtered out at
 pop-time against a Redis-backed set of uploaded IDs —
 the per-process frozenset cache was retired because it
 ballooned memory on the production server.
+
+### MongoDB backlog and the Redis hot window
+
+Producers (channel scraper, RSS scraper, imports) add
+videos far faster than they can be scraped, so the full
+queue does not fit in Redis. With `MONGO_DSN` set:
+
+- **MongoDB is the source of truth.** The
+  `<platform>_videos` collection holds one document per
+  known video: `queued`, `hot` (copied into Redis) or a
+  terminal state (`unavailable`, `failed`, `removed`)
+  with its diagnostic record. Producers insert into
+  MongoDB; a duplicate ID means "already known".
+- **Redis holds only the hot window**: the oldest queued
+  videos, which the scrapers pop from as before.
+- **`tools/yt_video_queue_refill.py`** (compose service
+  `yt-video-queue-refill`, profile `refill`; run one per
+  platform) copies the oldest queued documents into
+  Redis whenever it holds fewer than
+  `VIDEO_QUEUE_LOW_WATERMARK` (10M) videos, up to
+  `VIDEO_QUEUE_HIGH_WATERMARK` (20M). Metrics on port
+  `REFILL_METRICS_PORT` (9560).
+- **Forced re-scrapes** (`--force`, corrupt files) go
+  straight to the front of the Redis hot window.
+- A scraped video's document is deleted; the
+  uploaded-videos Bloom filter keeps it from being
+  queued again.
+
+Set `MONGO_DSN` on every host that runs a video producer
+or video scraper, or on none: a producer without it
+writes straight into Redis and bypasses the backlog.
+`tools/video_queue_offload.py` moves an existing
+Redis-only queue into MongoDB (steps `terminal`,
+`backlog`, `hot`, in that order, with producers and
+scrapers stopped).
 
 ### Two backends, two cost profiles
 

@@ -374,6 +374,10 @@ class AsyncYouTubeClient(AsyncClient):
                 ConnectTimeout, ConnectionResetError,
                 ConnectionRefusedError) as exc:
             duration = time.monotonic() - start
+            if not isinstance(exc, ReadTimeout):
+                await YouTubeRateLimiter.get().report_proxy_result(
+                    self.proxy, False,
+                )
             METRIC_YT_REQUEST_DURATION.labels(
                 platform='youtube',
                 scraper=_get_scraper(),
@@ -442,6 +446,7 @@ class AsyncYouTubeClient(AsyncClient):
             raise RuntimeError(f'Timeout fetching URL {url}') from exc
 
         duration = time.monotonic() - start
+        await YouTubeRateLimiter.get().report_proxy_result(self.proxy, True)
         METRIC_YT_REQUEST_DURATION.labels(
             platform='youtube',
             scraper=_get_scraper(),

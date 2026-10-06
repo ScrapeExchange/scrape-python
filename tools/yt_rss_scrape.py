@@ -64,7 +64,9 @@ from scrape_exchange.proxy_phase_metrics import (
 from scrape_exchange.proxy_loader import (
     jitter_pool_warmup,
     load_proxy_catalog,
-    pooled_httpx_client_for_entry,
+    borrow_pooled_httpx_client_for_entry,
+    release_pooled_httpx_client,
+    retire_pooled_httpx_client,
     proxy_file_label,
     set_active_catalog,
 )
@@ -77,6 +79,7 @@ from scrape_exchange.youtube.youtube_channel import (
     YouTubeChannel,
     canonical_handle_from_browse,
     fallback_handle,
+    record_subscriber_count_parse,
 )
 from scrape_exchange.youtube.youtube_channel_tabs import (
     YouTubeChannelTabs,
@@ -116,6 +119,10 @@ from scrape_exchange.creator_queue import (
     parse_priority_queues,
 )
 from scrape_exchange.redis_client import redis_from_url
+from scrape_exchange.channel_scrape_queue import (
+    KEY_PREFIX as CHANNEL_QUEUE_KEY_PREFIX,
+    awaiting_first_full_scrape,
+)
 from scrape_exchange.video_scrape_queue import (
     RedisVideoScrapeQueue,
     VideoScrapeQueueSettings,
@@ -780,6 +787,18 @@ def _handle_http_status_error(
     raise exc
 
 
+# Connection-establishment failures after which the pooled feed
+# client for the proxy is replaced. Read timeouts are excluded: they
+# are common on healthy connections and recycling would discard
+# working keep-alive tunnels.
+_POOL_RETIRING_ERRORS: tuple[type[Exception], ...] = (
+    httpx.PoolTimeout,
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.ProxyError,
+)
+
+
 async def fetch_rss(
     rss_url: str,
     channel_handle: str,
@@ -837,28 +856,41 @@ async def fetch_rss(
         extra['proxy_network'] = proxy_network
         pfl: str = proxy_file_label(proxy or '')
         try:
-            http: httpx.AsyncClient = pooled_httpx_client_for_entry(
-                proxy,
+            http: httpx.AsyncClient = (
+                borrow_pooled_httpx_client_for_entry(proxy)
             )
-            # Stagger the first CONNECT tunnel from this worker
-            # to *proxy* by a random 0-3s. Cold-start
-            # coincidence across N worker processes was the
-            # dominant timeout_connect source.
-            await jitter_pool_warmup(proxy)
-            response: Response = await http.get(
-                rss_url,
-                headers=_rss_browser_headers(),
-                cookies=_rss_browser_cookies(proxy),
-                timeout=httpx.Timeout(
-                    HTTP_REQUEST_TIMEOUT,
-                    connect=HTTP_CONNECT_TIMEOUT,
-                ),
-                extensions={
-                    'trace': make_rss_phase_trace(
-                        proxy_file=pfl,
+            try:
+                # Stagger the first CONNECT tunnel from this worker
+                # to *proxy* by a random 0-3s. Cold-start
+                # coincidence across N worker processes was the
+                # dominant timeout_connect source.
+                await jitter_pool_warmup(proxy)
+                response: Response = await http.get(
+                    rss_url,
+                    headers=_rss_browser_headers(),
+                    cookies=_rss_browser_cookies(proxy),
+                    timeout=httpx.Timeout(
+                        HTTP_REQUEST_TIMEOUT,
+                        connect=HTTP_CONNECT_TIMEOUT,
                     ),
-                },
-            )
+                    extensions={
+                        'trace': make_rss_phase_trace(
+                            proxy_file=pfl,
+                        ),
+                    },
+                )
+            except _POOL_RETIRING_ERRORS:
+                # A failed proxy tunnel can stay in the pool; once
+                # enough pile up every fetch raises PoolTimeout.
+                await retire_pooled_httpx_client(proxy, expected=http)
+                await YouTubeRateLimiter.get().report_proxy_result(
+                    proxy, False,
+                )
+                raise
+            finally:
+                await release_pooled_httpx_client(http)
+            # Any HTTP response (even a 404) proves the proxy works.
+            await YouTubeRateLimiter.get().report_proxy_result(proxy, True)
             response.raise_for_status()
             duration: float = monotonic() - scrape_start
             data: str = response.text
@@ -1893,11 +1925,13 @@ async def update_channel(
         )
     description: str = metadata.get('description', '')
 
-    subscriber_count: int = (
-        YouTubeChannel.parse_subscriber_count(
-            channel_data,
-        ) or 0
+    parsed_subscriber_count: int | None = (
+        YouTubeChannel.parse_subscriber_count(channel_data)
     )
+    record_subscriber_count_parse(
+        'innertube', parsed_subscriber_count,
+    )
+    subscriber_count: int = parsed_subscriber_count or 0
     # YouTube no longer surfaces lifetime views on the channel
     # header — they only appear on the About tab, which the
     # RSS scraper does not fetch. ``parse_view_count`` returns
@@ -2283,6 +2317,50 @@ async def _enrich_subscriber_counts(
         )
 
 
+async def _hold_back_unscraped_channels(
+    redis: aioredis.Redis,
+    channel_map: dict[str, str],
+    known_ids: set[str],
+) -> int:
+    '''Remove channels from *channel_map* (in place) that the channel
+    scraper queue knows but has not completed a first full scrape for.
+
+    New channels join the RSS queue only after their first full scrape
+    (the channel scraper adds them then), so RSS cannot make their
+    newest videos 'known' and cut that scrape short. Channels already
+    in the RSS queue (*known_ids*) and channels the channel queue has
+    never seen are left alone.
+
+    :returns: number of channels held back
+    '''
+    candidates: list[str] = [
+        cid for cid in channel_map if cid not in known_ids
+    ]
+    held: int = 0
+    chunk_size: int = 1000
+    start: int
+    for start in range(0, len(candidates), chunk_size):
+        # Runs at startup before any streamer touches the watchdog;
+        # over a high-latency Redis link it can outlast the work
+        # timeout while still making progress.
+        Watchdog.get().touch_work()
+        chunk: list[str] = candidates[start:start + chunk_size]
+        pipe: aioredis.client.Pipeline = redis.pipeline(transaction=False)
+        cid: str
+        for cid in chunk:
+            pipe.hmget(
+                f'{CHANNEL_QUEUE_KEY_PREFIX}:meta:i:{cid}',
+                ['state', 'successful_scrapes', 'last_attempt_at'],
+            )
+        results: list[list[str | None]] = await pipe.execute()
+        fields: list[str | None]
+        for cid, fields in zip(chunk, results):
+            if awaiting_first_full_scrape(*fields):
+                del channel_map[cid]
+                held += 1
+    return held
+
+
 async def _seed_queue_from_uploaded_channels(
     creator_queue: CreatorQueue,
     channel_fm: AssetFileManagement,
@@ -2569,6 +2647,15 @@ async def worker_loop(
     known_ids: set[str] = (
         await creator_queue.known_creator_ids()
     )
+    if isinstance(creator_queue, RedisCreatorQueue):
+        held: int = await _hold_back_unscraped_channels(
+            creator_queue.redis_client, channel_map_data, known_ids,
+        )
+        logging.info(
+            'Held back channels awaiting their first full channel '
+            'scrape',
+            extra={'held_back': held},
+        )
     if settings.rss_enrich_subscriber_counts:
         await _enrich_subscriber_counts(
             client, channel_map_data, subscriber_counts,

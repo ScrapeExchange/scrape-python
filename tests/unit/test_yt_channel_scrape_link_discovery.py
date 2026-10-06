@@ -3,6 +3,8 @@
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from scrape_exchange.channel_scrape_queue import ChannelScrapeProgress
+
 from scrape_exchange.youtube.youtube_types import (
     YouTubeChannelLink,
 )
@@ -11,7 +13,6 @@ from scrape_exchange.youtube.youtube_types import (
 def _discovery_settings(**overrides) -> MagicMock:
     settings: MagicMock = MagicMock()
     settings.channel_discover_linked_channels = True
-    settings.channel_discovery_min_subscribers = 0
     settings.exchange_url = 'https://scrape.exchange'
     for key, value in overrides.items():
         setattr(settings, key, value)
@@ -139,6 +140,8 @@ class TestEnqueueDiscoveredChannelLinks(
         queue: AsyncMock = AsyncMock()
         creator_map: AsyncMock = AsyncMock()
         creator_map.get.return_value = creator_map_value
+        # No Redis: existence falls back to the patched API check.
+        creator_map.redis_client = None
         http_client: MagicMock = MagicMock()
         with (
             patch(
@@ -190,12 +193,25 @@ class TestEnqueueDiscoveredChannelLinks(
 
     async def test_link_below_min_subscribers_skipped(self) -> None:
         queue: AsyncMock = await self._run(
-            [YouTubeChannelLink('somenewchannel', 5)],
-            settings=_discovery_settings(
-                channel_discovery_min_subscribers=100,
-            ),
+            [YouTubeChannelLink('somenewchannel', 9)],
         )
         queue.enqueue_scheduled.assert_not_awaited()
+
+    async def test_link_at_min_subscribers_enqueued(self) -> None:
+        from tools.yt_channel_scrape import MIN_CHANNEL_SUBSCRIBERS
+
+        queue: AsyncMock = await self._run(
+            [YouTubeChannelLink(
+                'somenewchannel', MIN_CHANNEL_SUBSCRIBERS,
+            )],
+        )
+        queue.enqueue_scheduled.assert_awaited_once()
+
+    async def test_link_unknown_subscribers_enqueued(self) -> None:
+        queue: AsyncMock = await self._run(
+            [YouTubeChannelLink('somenewchannel', None)],
+        )
+        queue.enqueue_scheduled.assert_awaited_once()
 
     async def test_self_link_skipped(self) -> None:
         queue: AsyncMock = await self._run(
@@ -305,6 +321,7 @@ class TestEnqueueDiscoveredChannelLinks(
             queue: AsyncMock = AsyncMock()
             creator_map: AsyncMock = AsyncMock()
             creator_map.get.return_value = None
+            creator_map.redis_client = None
             links: list[YouTubeChannelLink] = [
                 # new and missing on the exchange: enqueued
                 YouTubeChannelLink('newchannel', 1000),
@@ -318,9 +335,7 @@ class TestEnqueueDiscoveredChannelLinks(
             await _enqueue_discovered_channel_links(
                 _mock_channel(links),
                 queue=queue,
-                settings=_discovery_settings(
-                    channel_discovery_min_subscribers=100,
-                ),
+                settings=_discovery_settings(),
                 creator_map_backend=creator_map,
                 http_client=MagicMock(),
                 identity=None,
@@ -358,6 +373,7 @@ class TestEnqueueDiscoveredChannelLinks(
             queue: AsyncMock = AsyncMock()
             creator_map: AsyncMock = AsyncMock()
             creator_map.get.return_value = None
+            creator_map.redis_client = None
             await _enqueue_discovered_channel_links(
                 _mock_channel([
                     YouTubeChannelLink('newchannel', 1000),
@@ -415,11 +431,8 @@ class TestDiscoveryInScrapeOne(
         ]
         settings: MagicMock = _mock_settings()
         settings.channel_discover_linked_channels = True
-        settings.channel_discovery_min_subscribers = 0
         queue: AsyncMock = AsyncMock()
-        queue.get_scrape_progress.return_value = MagicMock(
-            full_scrape_due=False,
-        )
+        queue.get_scrape_progress.return_value = ChannelScrapeProgress(0, 11)
         creator_map: AsyncMock = AsyncMock()
         creator_map.get.return_value = None
         with (
@@ -472,11 +485,8 @@ class TestDiscoveryInScrapeOne(
         channel.channel_links = []
         settings: MagicMock = _mock_settings()
         settings.channel_discover_linked_channels = True
-        settings.channel_discovery_min_subscribers = 0
         queue: AsyncMock = AsyncMock()
-        queue.get_scrape_progress.return_value = MagicMock(
-            full_scrape_due=False,
-        )
+        queue.get_scrape_progress.return_value = ChannelScrapeProgress(0, 11)
         creator_map: AsyncMock = AsyncMock()
         creator_map.get.return_value = None
         with (

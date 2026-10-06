@@ -17,6 +17,7 @@ def _mock_settings() -> MagicMock:
     s: MagicMock = MagicMock()
     s.video_transient_max_attempts = 3
     s.video_transient_backoff_seconds = 0
+    s.video_proxy_max_wait_seconds = 15.0
     return s
 
 
@@ -215,7 +216,7 @@ class TestScrapeOneQueued(
 
         from tools.yt_video_scrape import _scrape_one_queued
         with patch(
-            'tools.yt_video_scrape.random.choice',
+            'tools.yt_video_scrape._choose_proxy',
             side_effect=choose,
         ):
             await _scrape_one_queued(
@@ -248,6 +249,89 @@ class TestScrapeOneQueued(
         )
         queue.complete.assert_awaited_once_with('aaa')
         queue.mark.assert_not_called()
+
+    @patch(
+        'tools.yt_video_scrape._scrape_to_disk',
+        new_callable=AsyncMock,
+    )
+    async def test_rate_limit_wait_switches_proxy_for_free(
+        self, mock_scrape: AsyncMock,
+    ) -> None:
+        '''A proxy whose bucket stays empty past the wait cap is
+        avoided for this video without using up an attempt.'''
+        from scrape_exchange.rate_limiter import RateLimitWaitExceeded
+        slow: str = 'http://localhost:8080'
+        fast: str = 'http://scrape.exchange:8080'
+        mock_scrape.side_effect = [
+            RateLimitWaitExceeded('player', slow, 15.0, 15.0),
+            None,
+        ]
+        queue: AsyncMock = AsyncMock()
+        selections: list[list[str]] = []
+
+        def choose(candidates: list[str]) -> str:
+            selections.append(candidates.copy())
+            return candidates[0]
+
+        from tools.yt_video_scrape import _scrape_one_queued
+        with patch(
+            'tools.yt_video_scrape._choose_proxy', side_effect=choose,
+        ):
+            await _scrape_one_queued(
+                'aaa', queue=queue, settings=_mock_settings(),
+                proxies=[slow, fast], uploaded=_mock_uploaded(),
+                creator_map_backend=_creator_map(),
+            )
+        self.assertEqual(selections, [[slow, fast], [fast]])
+        self.assertEqual(
+            mock_scrape.await_args_list[0].kwargs['max_rate_limit_wait'],
+            15.0,
+        )
+        queue.bump_attempts.assert_not_awaited()
+        queue.complete.assert_awaited_once_with('aaa')
+
+    @patch(
+        'tools.yt_video_scrape._scrape_to_disk',
+        new_callable=AsyncMock,
+    )
+    async def test_every_proxy_too_slow_counts_as_attempt(
+        self, mock_scrape: AsyncMock,
+    ) -> None:
+        from scrape_exchange.rate_limiter import RateLimitWaitExceeded
+        proxies: list[str] = [
+            'http://localhost:8080', 'http://scrape.exchange:8080',
+        ]
+        mock_scrape.side_effect = RateLimitWaitExceeded(
+            'player', None, 15.0, 15.0,
+        )
+        queue: AsyncMock = AsyncMock()
+        from tools.yt_video_scrape import _scrape_one_queued
+        with patch(
+            'tools.yt_video_scrape._choose_proxy',
+            side_effect=lambda c: c[0],
+        ):
+            await _scrape_one_queued(
+                'aaa', queue=queue, settings=_mock_settings(),
+                proxies=proxies, uploaded=_mock_uploaded(),
+                creator_map_backend=_creator_map(),
+            )
+        # 3 attempts, each after trying every proxy once more.
+        self.assertEqual(mock_scrape.await_count, 3 * 3)
+        self.assertEqual(queue.bump_attempts.await_count, 3)
+        queue.bump_attempts.assert_awaited_with(
+            'aaa', last_error='rate_limit_wait',
+        )
+        queue.mark.assert_awaited_once()
+        self.assertEqual(
+            queue.mark.await_args.kwargs['state'], VideoState.FAILED,
+        )
+
+    async def test_zero_max_wait_disables_cap(self) -> None:
+        from tools.yt_video_scrape import _max_rate_limit_wait
+        settings: MagicMock = _mock_settings()
+        self.assertEqual(_max_rate_limit_wait(settings), 15.0)
+        settings.video_proxy_max_wait_seconds = 0
+        self.assertIsNone(_max_rate_limit_wait(settings))
 
     @patch(
         'tools.yt_video_scrape._scrape_to_disk',

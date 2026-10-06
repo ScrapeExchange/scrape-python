@@ -16,17 +16,26 @@ from innertube.errors import ResponseError as InnerTubeResponseError
 from tools.yt_discover_search import (
     DiscoverSearchSettings,
     DiscoveredChannel,
+    POPULARITY_CHANNEL_PARAMS,
+    POPULARITY_VIDEO_PARAMS,
     _ChannelEmitter,
     _PidFile,
+    _SearchProxyLease,
+    _SearchProxyPool,
     _channel_output_stream,
     _dedupe_channels,
+    _encode_search_params,
     _get_continuation_token,
     _extract_words_from_random_payload,
     _normalise_handle,
-    _search_page_with_retry,
+    _parse_markets,
+    _parse_subscriber_text,
+    _run_popular_discovery,
+    _run_search_workers,
+    _search_page_localized_with_retry,
     choose_random_search_terms,
-    discover_for_term,
-    discover_for_terms,
+    discover_popular_for_market,
+    enqueue_discovered_channels,
     extract_channels,
     main_async,
 )
@@ -46,20 +55,21 @@ class TestDiscoverSearchSettings(unittest.TestCase):
     def test_cli_settings_flags(self) -> None:
         settings = DiscoverSearchSettings(
             _cli_parse_args=[
-                '--youtube-search-continuations', '3',
                 '--random-word-language', 'de',
                 '--keyword-count', '4',
             ],
         )
 
-        self.assertEqual(settings.youtube_search_continuations, 3)
         self.assertEqual(settings.random_word_language, 'de')
         self.assertEqual(settings.keyword_count, 4)
 
-    def test_keyword_count_defaults_to_one(self) -> None:
-        settings = DiscoverSearchSettings(_cli_parse_args=[])
+    def test_keyword_count_defaults_to_unlimited(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            settings = DiscoverSearchSettings(
+                _cli_parse_args=[], _env_file=None,
+            )
 
-        self.assertEqual(settings.keyword_count, 1)
+        self.assertIsNone(settings.keyword_count)
 
     def test_youtube_search_concurrency_cli_setting(self) -> None:
         settings: DiscoverSearchSettings = DiscoverSearchSettings(
@@ -70,13 +80,13 @@ class TestDiscoverSearchSettings(unittest.TestCase):
 
         self.assertEqual(settings.youtube_search_concurrency, 4)
 
-    def test_output_file_defaults_to_searched_channels_jsonl(self) -> None:
-        settings = DiscoverSearchSettings(_cli_parse_args=[])
+    def test_output_file_defaults_to_none(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            settings = DiscoverSearchSettings(
+                _cli_parse_args=[], _env_file=None,
+            )
 
-        self.assertEqual(
-            settings.output_file,
-            'data/searched_channels.jsonl',
-        )
+        self.assertIsNone(settings.output_file)
 
     def test_pid_file_defaults_to_var_tmp(self) -> None:
         settings = DiscoverSearchSettings(_cli_parse_args=[])
@@ -503,17 +513,29 @@ async def _drain(agen) -> list:
     return [item async for item in agen]
 
 
-class TestSearchPageWithRetry(unittest.IsolatedAsyncioTestCase):
+async def _localized_page(**kwargs: object) -> dict | None:
+    return await _search_page_localized_with_retry(
+        'term',
+        params=POPULARITY_CHANNEL_PARAMS,
+        continuation=None,
+        proxy=None,
+        gl='US',
+        hl='en',
+        limiter=_FakeLimiter(),
+        **kwargs,
+    )
+
+
+class TestSearchPageLocalizedWithRetry(
+    unittest.IsolatedAsyncioTestCase,
+):
     async def test_returns_payload_on_first_attempt(self) -> None:
         payload = {'ok': True}
         with mock.patch(
-            'tools.yt_discover_search._innertube_search',
+            'tools.yt_discover_search._innertube_search_localized',
             new=mock.AsyncMock(return_value=payload),
         ) as search:
-            result = await _search_page_with_retry(
-                'term', continuation=None, proxy=None,
-                limiter=_FakeLimiter(),
-            )
+            result = await _localized_page()
         self.assertEqual(result, payload)
         self.assertEqual(search.await_count, 1)
 
@@ -523,15 +545,13 @@ class TestSearchPageWithRetry(unittest.IsolatedAsyncioTestCase):
             side_effect=[httpx.ReadTimeout('slow'), payload],
         )
         with mock.patch(
-            'tools.yt_discover_search._innertube_search', new=search,
+            'tools.yt_discover_search._innertube_search_localized',
+            new=search,
         ), mock.patch(
             'tools.yt_discover_search.asyncio.sleep',
             new=mock.AsyncMock(),
         ) as sleep:
-            result = await _search_page_with_retry(
-                'term', continuation=None, proxy=None,
-                limiter=_FakeLimiter(),
-            )
+            result = await _localized_page()
         self.assertEqual(result, payload)
         self.assertEqual(search.await_count, 2)
         sleep.assert_awaited_once()
@@ -546,15 +566,13 @@ class TestSearchPageWithRetry(unittest.IsolatedAsyncioTestCase):
             ],
         )
         with mock.patch(
-            'tools.yt_discover_search._innertube_search', new=search,
+            'tools.yt_discover_search._innertube_search_localized',
+            new=search,
         ), mock.patch(
             'tools.yt_discover_search.asyncio.sleep',
             new=mock.AsyncMock(),
         ):
-            result = await _search_page_with_retry(
-                'term', continuation=None, proxy=None,
-                limiter=_FakeLimiter(),
-            )
+            result = await _localized_page()
         self.assertIsNone(result)
         self.assertEqual(search.await_count, 2)
 
@@ -569,15 +587,13 @@ class TestSearchPageWithRetry(unittest.IsolatedAsyncioTestCase):
             ],
         )
         with mock.patch(
-            'tools.yt_discover_search._innertube_search', new=search,
+            'tools.yt_discover_search._innertube_search_localized',
+            new=search,
         ), mock.patch(
             'tools.yt_discover_search.asyncio.sleep',
             new=mock.AsyncMock(),
         ):
-            result = await _search_page_with_retry(
-                'term', continuation=None, proxy=None,
-                limiter=_FakeLimiter(),
-            )
+            result = await _localized_page()
         self.assertIsNone(result)
         self.assertEqual(search.await_count, 2)
 
@@ -585,45 +601,38 @@ class TestSearchPageWithRetry(unittest.IsolatedAsyncioTestCase):
         '''YouTube can return an HTML interstitial where InnerTube
         expects JSON; skip the current term instead of crashing.'''
 
+        error: str = (
+            "Expected JSON response, got 'text/html; charset=UTF-8'"
+        )
         search = mock.AsyncMock(
             side_effect=[
-                InnerTubeResponseError(
-                    "Expected JSON response, got "
-                    "'text/html; charset=UTF-8'",
-                ),
-                InnerTubeResponseError(
-                    "Expected JSON response, got "
-                    "'text/html; charset=UTF-8'",
-                ),
+                InnerTubeResponseError(error),
+                InnerTubeResponseError(error),
             ],
         )
         with mock.patch(
-            'tools.yt_discover_search._innertube_search', new=search,
+            'tools.yt_discover_search._innertube_search_localized',
+            new=search,
         ), mock.patch(
             'tools.yt_discover_search.asyncio.sleep',
             new=mock.AsyncMock(),
         ):
-            result = await _search_page_with_retry(
-                'term', continuation=None, proxy=None,
-                limiter=_FakeLimiter(),
-            )
+            result = await _localized_page()
         self.assertIsNone(result)
         self.assertEqual(search.await_count, 2)
 
     async def test_non_transient_error_propagates(self) -> None:
         search = mock.AsyncMock(side_effect=ValueError('bug'))
         with mock.patch(
-            'tools.yt_discover_search._innertube_search', new=search,
+            'tools.yt_discover_search._innertube_search_localized',
+            new=search,
         ):
             with self.assertRaises(ValueError):
-                await _search_page_with_retry(
-                    'term', continuation=None, proxy=None,
-                    limiter=_FakeLimiter(),
-                )
+                await _localized_page()
         self.assertEqual(search.await_count, 1)
 
 
-class TestDiscoverForTermFailure(
+class TestDiscoverPopularForMarketFailure(
     unittest.IsolatedAsyncioTestCase,
 ):
     async def test_stops_term_when_page_gives_up(self) -> None:
@@ -644,12 +653,17 @@ class TestDiscoverForTermFailure(
         # the second page exhausts its retry and returns None.
         retry = mock.AsyncMock(side_effect=[page_one, None])
         with mock.patch(
-            'tools.yt_discover_search._search_page_with_retry',
+            'tools.yt_discover_search.'
+            '_search_page_localized_with_retry',
             new=retry,
         ):
             channels = await _drain(
-                discover_for_term(
-                    'term', continuations=5,
+                discover_popular_for_market(
+                    'term',
+                    params=POPULARITY_CHANNEL_PARAMS,
+                    gl='US',
+                    hl='en',
+                    continuations=5,
                     limiter=_FakeLimiter(),
                 )
             )
@@ -661,7 +675,35 @@ class TestDiscoverForTermFailure(
         self.assertEqual(retry.await_count, 2)
 
 
-class TestDiscoverForTerms(unittest.IsolatedAsyncioTestCase):
+def _search_terms_with_workers(
+    terms: list[str],
+    *,
+    concurrency: int,
+    proxies: list[str],
+):
+    '''Run one market search per term through the worker pool.'''
+
+    def run_job(term: str, proxy_lease):
+        return discover_popular_for_market(
+            term,
+            params=POPULARITY_CHANNEL_PARAMS,
+            gl='US',
+            hl='en',
+            continuations=0,
+            limiter=_FakeLimiter(),
+            proxy_lease=proxy_lease,
+        )
+
+    return _run_search_workers(
+        terms,
+        concurrency=concurrency,
+        proxies=proxies,
+        run_job=run_job,
+        worker_name='test-worker',
+    )
+
+
+class TestRunSearchWorkers(unittest.IsolatedAsyncioTestCase):
     async def test_searches_queue_concurrently_with_unique_proxies(
         self,
     ) -> None:
@@ -670,18 +712,11 @@ class TestDiscoverForTerms(unittest.IsolatedAsyncioTestCase):
         calls: list[tuple[str, str | None]] = []
         overlap: asyncio.Event = asyncio.Event()
 
-        async def search(
-            term: str,
-            *,
-            continuation: str | None,
-            proxy: str | None,
-            limiter: object,
-        ) -> dict[str, object]:
-            del continuation, limiter
+        async def search(term: str, **kwargs: object) -> dict:
             nonlocal active, max_active
             active += 1
             max_active = max(max_active, active)
-            calls.append((term, proxy))
+            calls.append((term, kwargs['proxy']))
             try:
                 if len(calls) == 1:
                     await overlap.wait()
@@ -697,16 +732,14 @@ class TestDiscoverForTerms(unittest.IsolatedAsyncioTestCase):
                 active -= 1
 
         with mock.patch(
-            'tools.yt_discover_search._innertube_search',
+            'tools.yt_discover_search._innertube_search_localized',
             new=search,
         ):
             channels: list[DiscoveredChannel] = await _drain(
-                discover_for_terms(
+                _search_terms_with_workers(
                     ['one', 'two', 'three'],
-                    continuations=0,
                     concurrency=2,
                     proxies=['proxy-1', 'proxy-2', 'proxy-3'],
-                    limiter=_FakeLimiter(),
                 )
             )
 
@@ -723,18 +756,12 @@ class TestDiscoverForTerms(unittest.IsolatedAsyncioTestCase):
         max_active: int = 0
         proxies_seen: set[str | None] = set()
 
-        async def search(
-            term: str,
-            *,
-            continuation: str | None,
-            proxy: str | None,
-            limiter: object,
-        ) -> dict[str, object]:
-            del term, continuation, limiter
+        async def search(term: str, **kwargs: object) -> dict:
+            del term
             nonlocal active, max_active
             active += 1
             max_active = max(max_active, active)
-            proxies_seen.add(proxy)
+            proxies_seen.add(kwargs['proxy'])
             try:
                 await asyncio.sleep(0)
                 return {}
@@ -742,16 +769,14 @@ class TestDiscoverForTerms(unittest.IsolatedAsyncioTestCase):
                 active -= 1
 
         with mock.patch(
-            'tools.yt_discover_search._innertube_search',
+            'tools.yt_discover_search._innertube_search_localized',
             new=search,
         ):
             await _drain(
-                discover_for_terms(
+                _search_terms_with_workers(
                     ['one', 'two', 'three', 'four'],
-                    continuations=0,
                     concurrency=5,
                     proxies=['proxy-1', 'proxy-2'],
-                    limiter=_FakeLimiter(),
                 )
             )
 
@@ -763,18 +788,12 @@ class TestDiscoverForTerms(unittest.IsolatedAsyncioTestCase):
         max_active: int = 0
         proxies_seen: set[str | None] = set()
 
-        async def search(
-            term: str,
-            *,
-            continuation: str | None,
-            proxy: str | None,
-            limiter: object,
-        ) -> dict[str, object]:
-            del term, continuation, limiter
+        async def search(term: str, **kwargs: object) -> dict:
+            del term
             nonlocal active, max_active
             active += 1
             max_active = max(max_active, active)
-            proxies_seen.add(proxy)
+            proxies_seen.add(kwargs['proxy'])
             try:
                 await asyncio.sleep(0)
                 return {}
@@ -782,35 +801,36 @@ class TestDiscoverForTerms(unittest.IsolatedAsyncioTestCase):
                 active -= 1
 
         with mock.patch(
-            'tools.yt_discover_search._innertube_search',
+            'tools.yt_discover_search._innertube_search_localized',
             new=search,
         ):
             await _drain(
-                discover_for_terms(
+                _search_terms_with_workers(
                     ['one', 'two'],
-                    continuations=0,
                     concurrency=5,
                     proxies=[],
-                    limiter=_FakeLimiter(),
                 )
             )
 
         self.assertEqual(max_active, 1)
         self.assertEqual(proxies_seen, {None})
 
+    async def test_rejects_concurrency_below_one(self) -> None:
+        with self.assertRaises(ValueError):
+            await _drain(
+                _search_terms_with_workers(
+                    ['one'], concurrency=0, proxies=[],
+                )
+            )
+
     async def test_connection_failures_rotate_through_spare_proxies(
         self,
     ) -> None:
         proxies_seen: list[str | None] = []
 
-        async def search(
-            term: str,
-            *,
-            continuation: str | None,
-            proxy: str | None,
-            limiter: object,
-        ) -> dict[str, object]:
-            del term, continuation, limiter
+        async def search(term: str, **kwargs: object) -> dict:
+            del term
+            proxy: object = kwargs['proxy']
             proxies_seen.append(proxy)
             if proxy != 'proxy-3':
                 raise httpx.ProxyError('connection failed')
@@ -821,19 +841,17 @@ class TestDiscoverForTerms(unittest.IsolatedAsyncioTestCase):
             }
 
         with mock.patch(
-            'tools.yt_discover_search._innertube_search',
+            'tools.yt_discover_search._innertube_search_localized',
             new=search,
         ), mock.patch(
             'tools.yt_discover_search.asyncio.sleep',
             new=mock.AsyncMock(),
         ):
             channels: list[DiscoveredChannel] = await _drain(
-                discover_for_terms(
+                _search_terms_with_workers(
                     ['term'],
-                    continuations=0,
                     concurrency=1,
                     proxies=['proxy-1', 'proxy-2', 'proxy-3'],
-                    limiter=_FakeLimiter(),
                 )
             )
 
@@ -844,16 +862,10 @@ class TestDiscoverForTerms(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(channels), 1)
 
     async def test_failover_does_not_take_an_active_proxy(self) -> None:
-        calls: list[tuple[str, str | None]] = []
+        calls: list[tuple[str, object]] = []
 
-        async def search(
-            term: str,
-            *,
-            continuation: str | None,
-            proxy: str | None,
-            limiter: object,
-        ) -> dict[str, object]:
-            del continuation, limiter
+        async def search(term: str, **kwargs: object) -> dict:
+            proxy: object = kwargs['proxy']
             calls.append((term, proxy))
             if proxy == 'proxy-1':
                 raise httpx.ProxyError('connection failed')
@@ -861,19 +873,17 @@ class TestDiscoverForTerms(unittest.IsolatedAsyncioTestCase):
             return {}
 
         with mock.patch(
-            'tools.yt_discover_search._innertube_search',
+            'tools.yt_discover_search._innertube_search_localized',
             new=search,
         ), mock.patch(
             'tools.yt_discover_search.asyncio.sleep',
             new=mock.AsyncMock(),
         ):
             await _drain(
-                discover_for_terms(
+                _search_terms_with_workers(
                     ['one', 'two'],
-                    continuations=0,
                     concurrency=2,
                     proxies=['proxy-1', 'proxy-2', 'proxy-3'],
-                    limiter=_FakeLimiter(),
                 )
             )
 
@@ -947,14 +957,13 @@ class TestMainConcurrency(unittest.IsolatedAsyncioTestCase):
             output_path: Path = Path(tmp) / 'channels.jsonl'
             pid_path: Path = Path(tmp) / 'discover.pid'
 
-            async def discover(*args, **kwargs):
+            async def discover(*args, **kwargs) -> int:
                 del args, kwargs
                 self.assertEqual(
                     pid_path.read_text(encoding='utf-8'),
                     f'{os.getpid()}\n',
                 )
-                if False:
-                    yield
+                return 0
 
             limiter: mock.Mock = mock.Mock()
             with mock.patch(
@@ -965,7 +974,7 @@ class TestMainConcurrency(unittest.IsolatedAsyncioTestCase):
                 'tools.yt_discover_search.YouTubeRateLimiter.get',
                 return_value=limiter,
             ), mock.patch(
-                'tools.yt_discover_search.discover_for_terms',
+                'tools.yt_discover_search._run_popular_discovery',
                 new=discover,
             ), mock.patch(
                 'tools.yt_discover_search.aclose_pooled_innertube',
@@ -982,97 +991,12 @@ class TestMainConcurrency(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result, 0)
             self.assertFalse(pid_path.exists())
 
-    async def test_sighup_reopens_output_file(self) -> None:
-        callbacks: dict[int, object] = {}
-        loop: mock.Mock = mock.Mock()
-        loop.add_signal_handler.side_effect = (
-            lambda sig, callback: callbacks.__setitem__(
-                sig, callback,
-            )
-        )
-
-        with tempfile.TemporaryDirectory() as tmp:
-            path: Path = Path(tmp) / 'channels.jsonl'
-            rotated: Path = Path(tmp) / 'channels.jsonl.1'
-
-            async def discover(*args, **kwargs):
-                del args, kwargs
-                yield DiscoveredChannel('UCfirst', '@first')
-                path.rename(rotated)
-                path.write_text(
-                    '{"existing":true}\n',
-                    encoding='utf-8',
-                )
-                callback: object = callbacks[signal.SIGHUP]
-                self.assertTrue(callable(callback))
-                callback()
-                yield DiscoveredChannel('UCsecond', '@second')
-
-            limiter: mock.Mock = mock.Mock()
-            with mock.patch(
-                'tools.yt_discover_search.configure_logging',
-            ), mock.patch(
-                'tools.yt_discover_search.configure_innertube_executor',
-            ), mock.patch(
-                'tools.yt_discover_search.YouTubeRateLimiter.get',
-                return_value=limiter,
-            ), mock.patch(
-                'tools.yt_discover_search.discover_for_terms',
-                new=discover,
-            ), mock.patch(
-                'tools.yt_discover_search.asyncio.get_running_loop',
-                return_value=loop,
-            ), mock.patch(
-                'tools.yt_discover_search.aclose_pooled_innertube',
-                new=mock.AsyncMock(),
-            ), mock.patch(
-                'tools.yt_discover_search.shutdown_innertube_executor',
-            ):
-                result: int = await main_async([
-                    '--output-file', str(path),
-                    '--pid-file', str(
-                        Path(tmp) / 'discover.pid'
-                    ),
-                    'one',
-                ])
-
-            self.assertEqual(result, 0)
-            self.assertEqual(
-                rotated.read_text(encoding='utf-8').splitlines(),
-                [
-                    '{"channel_id":"UCfirst",'
-                    '"channel_handle":"@first"}',
-                ],
-            )
-            self.assertEqual(
-                path.read_text(encoding='utf-8').splitlines(),
-                [
-                    '{"existing":true}',
-                    '{"channel_id":"UCsecond",'
-                    '"channel_handle":"@second"}',
-                ],
-            )
-        loop.add_signal_handler.assert_called_once()
-        self.assertEqual(
-            loop.add_signal_handler.call_args.args[0],
-            signal.SIGHUP,
-        )
-        loop.remove_signal_handler.assert_called_once_with(
-            signal.SIGHUP,
-        )
-
     async def test_cli_concurrency_runs_searches_in_parallel(self) -> None:
         active: int = 0
         max_active: int = 0
 
-        async def search(
-            term: str,
-            *,
-            continuation: str | None,
-            proxy: str | None,
-            limiter: object,
-        ) -> dict[str, object]:
-            del term, continuation, proxy, limiter
+        async def search(*args: object, **kwargs: object) -> dict:
+            del args, kwargs
             nonlocal active, max_active
             active += 1
             max_active = max(max_active, active)
@@ -1083,6 +1007,7 @@ class TestMainConcurrency(unittest.IsolatedAsyncioTestCase):
                 active -= 1
 
         limiter: mock.Mock = mock.Mock()
+        limiter.report_proxy_result = mock.AsyncMock()
         with tempfile.TemporaryDirectory() as tmp, mock.patch(
             'tools.yt_discover_search.configure_logging',
         ), mock.patch(
@@ -1091,8 +1016,11 @@ class TestMainConcurrency(unittest.IsolatedAsyncioTestCase):
             'tools.yt_discover_search.YouTubeRateLimiter.get',
             return_value=limiter,
         ), mock.patch(
-            'tools.yt_discover_search._innertube_search',
+            'tools.yt_discover_search._innertube_search_localized',
             new=search,
+        ), mock.patch(
+            'tools.yt_discover_search._build_queue_backends',
+            new=mock.AsyncMock(return_value=(None, None, None)),
         ), mock.patch(
             'tools.yt_discover_search.aclose_pooled_innertube',
             new=mock.AsyncMock(),
@@ -1102,6 +1030,7 @@ class TestMainConcurrency(unittest.IsolatedAsyncioTestCase):
             result: int = await main_async([
                 '--output-file', str(Path(tmp) / 'channels.jsonl'),
                 '--pid-file', str(Path(tmp) / 'discover.pid'),
+                '--discover-markets', 'US:en',
                 '--youtube-search-concurrency', '2',
                 '--proxies', (
                     'http://localhost:8001,'
@@ -1114,5 +1043,663 @@ class TestMainConcurrency(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(max_active, 2)
 
 
+class TestSearchParamsEncoding(unittest.TestCase):
+    '''_encode_search_params must reproduce YouTube's live params.'''
+
+    def test_reproduces_live_values(self) -> None:
+        self.assertEqual(
+            _encode_search_params(media_type=1), 'EgIQAQ==',
+        )
+        self.assertEqual(
+            _encode_search_params(media_type=2), 'EgIQAg==',
+        )
+        self.assertEqual(
+            _encode_search_params(upload_date=2), 'EgIIAg==',
+        )
+        self.assertEqual(
+            _encode_search_params(duration=4), 'EgIYBA==',
+        )
+        self.assertEqual(_encode_search_params(sort=3), 'CAM=')
+
+    def test_popularity_constants(self) -> None:
+        self.assertEqual(POPULARITY_VIDEO_PARAMS, 'CAM=')
+        self.assertEqual(POPULARITY_CHANNEL_PARAMS, 'CAMSAhAC')
+
+    def test_empty_returns_empty_string(self) -> None:
+        self.assertEqual(_encode_search_params(), '')
+
+
+class TestParseMarkets(unittest.TestCase):
+    def test_preserves_order_and_dedupes(self) -> None:
+        markets = _parse_markets('IN:hi, US:en, IN:hi, BR:pt')
+
+        self.assertEqual(
+            markets, [('IN', 'hi'), ('US', 'en'), ('BR', 'pt')],
+        )
+
+    def test_uppercases_and_defaults_language(self) -> None:
+        self.assertEqual(
+            _parse_markets('in, de:'), [('IN', 'en'), ('DE', 'en')],
+        )
+
+    def test_drops_invalid_entries(self) -> None:
+        self.assertEqual(
+            _parse_markets(' , usa:en, X:en, JP:ja, '),
+            [('JP', 'ja')],
+        )
+
+
+class TestParseSubscriberText(unittest.TestCase):
+    def test_suffixed_and_plain_values(self) -> None:
+        self.assertEqual(
+            _parse_subscriber_text('12.3M subscribers'), 12_300_000,
+        )
+        self.assertEqual(
+            _parse_subscriber_text('1,234 subscribers'), 1234,
+        )
+        self.assertEqual(_parse_subscriber_text('1.5K'), 1500)
+
+    def test_non_numeric_and_empty(self) -> None:
+        self.assertIsNone(_parse_subscriber_text(None))
+        self.assertIsNone(_parse_subscriber_text(''))
+        self.assertIsNone(_parse_subscriber_text('No subscribers'))
+
+
+class TestPopularSearchSettings(unittest.TestCase):
+    def test_defaults(self) -> None:
+        settings = DiscoverSearchSettings(_cli_parse_args=[])
+
+        self.assertEqual(settings.discover_source, 'discovered_popular')
+        self.assertEqual(settings.discover_popular_continuations, 5)
+        self.assertEqual(settings.discover_min_subscribers, 4000)
+        self.assertEqual(len(_parse_markets(settings.discover_markets)), 30)
+
+    def test_cli_flags(self) -> None:
+        settings = DiscoverSearchSettings(
+            _cli_parse_args=[
+                '--discover-markets', 'IN:hi,US:en',
+                '--discover-min-subscribers', '10000000',
+                '--discover-source', 'discovered_trending',
+            ],
+        )
+
+        self.assertEqual(
+            _parse_markets(settings.discover_markets),
+            [('IN', 'hi'), ('US', 'en')],
+        )
+        self.assertEqual(settings.discover_min_subscribers, 10_000_000)
+        self.assertEqual(settings.discover_source, 'discovered_trending')
+
+
+def _channel_payload(channel_id: str, handle: str,
+                     subs: str | None = None,
+                     token: str | None = None) -> dict:
+    renderer: dict = {
+        'channelId': channel_id,
+        'navigationEndpoint': {
+            'browseEndpoint': {'canonicalBaseUrl': f'/@{handle}'},
+        },
+    }
+    if subs is not None:
+        renderer['subscriberCountText'] = {'simpleText': subs}
+    payload: dict = {'contents': {'x': {'channelRenderer': renderer}}}
+    if token is not None:
+        payload['continuationItemRenderer'] = {
+            'continuationEndpoint': {
+                'continuationCommand': {'token': token},
+            },
+        }
+    return payload
+
+
+class _LimiterStub:
+    async def acquire(self, *args: object, **kwargs: object) -> None:
+        return None
+
+    def select_proxy(self, *args: object, **kwargs: object) -> None:
+        return None
+
+
+class TestDiscoverPopularForMarket(unittest.IsolatedAsyncioTestCase):
+    async def test_yields_channels_across_pages(self) -> None:
+        cid_a = 'UC' + 'a1' * 11
+        cid_b = 'UC' + 'b2' * 11
+        pages = [
+            _channel_payload(cid_a, 'alpha', '12M subscribers',
+                             token='TOK'),
+            _channel_payload(cid_b, 'beta', '8M subscribers'),
+        ]
+        with mock.patch(
+            'tools.yt_discover_search.'
+            '_search_page_localized_with_retry',
+            new=mock.AsyncMock(side_effect=pages),
+        ):
+            found: list[DiscoveredChannel] = []
+            async for channel in discover_popular_for_market(
+                'music',
+                params=POPULARITY_CHANNEL_PARAMS,
+                gl='IN',
+                hl='hi',
+                continuations=5,
+                limiter=_LimiterStub(),
+            ):
+                found.append(channel)
+
+        self.assertEqual(
+            [(c.channel_id, c.channel_handle) for c in found],
+            [(cid_a, '@alpha'), (cid_b, '@beta')],
+        )
+        self.assertEqual(found[0].subscriber_count, 12_000_000)
+
+    async def test_stops_when_page_fails(self) -> None:
+        with mock.patch(
+            'tools.yt_discover_search.'
+            '_search_page_localized_with_retry',
+            new=mock.AsyncMock(return_value=None),
+        ):
+            found: list[DiscoveredChannel] = []
+            async for channel in discover_popular_for_market(
+                'music',
+                params=POPULARITY_VIDEO_PARAMS,
+                gl='US',
+                hl='en',
+                continuations=5,
+                limiter=_LimiterStub(),
+            ):
+                found.append(channel)
+
+        self.assertEqual(found, [])
+
+
+class TestPopularForMarketFailover(unittest.IsolatedAsyncioTestCase):
+    async def test_connection_failure_rotates_proxy(self) -> None:
+        cid: str = 'UC' + 'a1' * 11
+        proxies_seen: list[str | None] = []
+
+        async def search(
+            term: str, *, params: str | None,
+            continuation: str | None, proxy: str | None,
+            gl: str, hl: str, limiter: object,
+        ) -> dict:
+            del term, params, continuation, gl, hl, limiter
+            proxies_seen.append(proxy)
+            if proxy == 'proxy-1':
+                raise httpx.ProxyError('connection failed')
+            return _channel_payload(cid, 'alpha')
+
+        pool: _SearchProxyPool = _SearchProxyPool(['proxy-2'])
+        lease: _SearchProxyLease = _SearchProxyLease('proxy-1', pool)
+        with mock.patch(
+            'tools.yt_discover_search._innertube_search_localized',
+            new=search,
+        ), mock.patch(
+            'tools.yt_discover_search.asyncio.sleep',
+            new=mock.AsyncMock(),
+        ):
+            found: list[DiscoveredChannel] = await _drain(
+                discover_popular_for_market(
+                    'music',
+                    params=POPULARITY_CHANNEL_PARAMS,
+                    gl='IN',
+                    hl='hi',
+                    continuations=0,
+                    limiter=_LimiterStub(),
+                    proxy_lease=lease,
+                )
+            )
+
+        self.assertEqual(proxies_seen, ['proxy-1', 'proxy-2'])
+        self.assertEqual([c.channel_id for c in found], [cid])
+
+
+class TestRunPopularDiscovery(unittest.IsolatedAsyncioTestCase):
+    def _settings(self, output_file: str | None, concurrency: int,
+                  proxies: tuple[str, ...]) -> mock.Mock:
+        settings: mock.Mock = mock.Mock()
+        settings.discover_markets = 'IN:hi,US:en'
+        settings.discover_popular_continuations = 0
+        settings.youtube_search_concurrency = concurrency
+        settings.proxies = proxies
+        settings.output_file = output_file
+        settings.exchange_url = 'https://scrape.exchange'
+        settings.discover_source = 'discovered_popular'
+        settings.discover_min_subscribers = 0
+        return settings
+
+    async def test_runs_jobs_concurrently_and_enqueues(self) -> None:
+        active: int = 0
+        max_active: int = 0
+        calls: list[tuple[str, str, str | None]] = []
+        overlap: asyncio.Event = asyncio.Event()
+
+        async def search(
+            term: str, *, params: str | None,
+            continuation: str | None, proxy: str | None,
+            gl: str, hl: str, limiter: object,
+        ) -> dict:
+            del continuation, limiter, hl
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            calls.append((gl, term, proxy))
+            try:
+                if len(calls) == 1:
+                    await overlap.wait()
+                else:
+                    overlap.set()
+                await asyncio.sleep(0)
+                facet: str = (
+                    'c' if params == POPULARITY_CHANNEL_PARAMS else 'v'
+                )
+                cid: str = 'UC' + f'{gl}{term}{facet}'.ljust(22, 'x')
+                return _channel_payload(cid, f'{gl}{term}{facet}')
+            finally:
+                active -= 1
+
+        creator_map: mock.Mock = mock.Mock()
+        queue: mock.Mock = mock.Mock()
+        enqueue: mock.AsyncMock = mock.AsyncMock(
+            return_value={'enqueued': 1},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            output: Path = Path(tmp) / 'channels.jsonl'
+            settings: mock.Mock = self._settings(
+                str(output), 2, ('proxy-1', 'proxy-2', 'proxy-3'),
+            )
+            with mock.patch(
+                'tools.yt_discover_search._innertube_search_localized',
+                new=search,
+            ), mock.patch(
+                'tools.yt_discover_search._build_queue_backends',
+                new=mock.AsyncMock(
+                    return_value=(creator_map, queue, None),
+                ),
+            ), mock.patch(
+                'tools.yt_discover_search.enqueue_discovered_channels',
+                new=enqueue,
+            ):
+                result: int = await _run_popular_discovery(
+                    settings, _LimiterStub(), ['a', 'b'],
+                )
+            lines: list[str] = output.read_text(
+                encoding='utf-8',
+            ).splitlines()
+
+        self.assertEqual(result, 0)
+        # 2 markets x 2 terms x 2 facets
+        self.assertEqual(len(calls), 8)
+        self.assertEqual(len(lines), 8)
+        self.assertEqual(max_active, 2)
+        self.assertEqual(
+            {proxy for _, _, proxy in calls},
+            {'proxy-1', 'proxy-2'},
+        )
+        # Market priority order is kept: IN jobs are taken first.
+        self.assertEqual(
+            [gl for gl, _, _ in calls[:4]], ['IN'] * 4,
+        )
+        self.assertEqual(enqueue.await_count, 8)
+        for call in enqueue.await_args_list:
+            self.assertEqual(len(call.args[0]), 1)
+
+    async def test_without_output_file_writes_nothing(self) -> None:
+        async def search(
+            term: str, *, params: str | None,
+            continuation: str | None, proxy: str | None,
+            gl: str, hl: str, limiter: object,
+        ) -> dict:
+            cid: str = 'UC' + f'{gl}{term}'.ljust(22, 'x')
+            return _channel_payload(cid, f'{gl}{term}')
+
+        enqueue: mock.AsyncMock = mock.AsyncMock(
+            return_value={'enqueued': 1},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd: str = os.getcwd()
+            os.chdir(tmp)
+            try:
+                settings: mock.Mock = self._settings(None, 1, ('proxy-1',))
+                with mock.patch(
+                    'tools.yt_discover_search._innertube_search_localized',
+                    new=search,
+                ), mock.patch(
+                    'tools.yt_discover_search._build_queue_backends',
+                    new=mock.AsyncMock(
+                        return_value=(mock.Mock(), mock.Mock(), None),
+                    ),
+                ), mock.patch(
+                    'tools.yt_discover_search.enqueue_discovered_channels',
+                    new=enqueue,
+                ):
+                    result: int = await _run_popular_discovery(
+                        settings, _LimiterStub(), ['a'],
+                    )
+                written: list[str] = [
+                    str(path) for path in Path(tmp).rglob('*')
+                ]
+            finally:
+                os.chdir(cwd)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(written, [])
+        self.assertEqual(enqueue.await_count, 4)
+
+    async def test_without_redis_skips_enqueue(self) -> None:
+        async def search(*args: object, **kwargs: object) -> dict:
+            del args, kwargs
+            return _channel_payload('UC' + 'a1' * 11, 'alpha')
+
+        enqueue: mock.AsyncMock = mock.AsyncMock()
+        with tempfile.TemporaryDirectory() as tmp:
+            output: Path = Path(tmp) / 'channels.jsonl'
+            with mock.patch(
+                'tools.yt_discover_search._innertube_search_localized',
+                new=search,
+            ), mock.patch(
+                'tools.yt_discover_search._build_queue_backends',
+                new=mock.AsyncMock(return_value=(None, None, None)),
+            ), mock.patch(
+                'tools.yt_discover_search.enqueue_discovered_channels',
+                new=enqueue,
+            ):
+                await _run_popular_discovery(
+                    self._settings(str(output), 4, ()),
+                    _LimiterStub(),
+                    ['a'],
+                )
+            lines: list[str] = output.read_text(
+                encoding='utf-8',
+            ).splitlines()
+
+        self.assertEqual(len(lines), 1)
+        enqueue.assert_not_awaited()
+
+
+class TestRunPopularDiscoverySighup(unittest.IsolatedAsyncioTestCase):
+    async def test_sighup_reopens_output_file(self) -> None:
+        callbacks: dict[int, object] = {}
+        loop: mock.Mock = mock.Mock()
+        loop.add_signal_handler.side_effect = (
+            lambda sig, callback: callbacks.__setitem__(
+                sig, callback,
+            )
+        )
+        cids: list[str] = ['UC' + 'a1' * 11, 'UC' + 'b2' * 11]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path: Path = Path(tmp) / 'channels.jsonl'
+            rotated: Path = Path(tmp) / 'channels.jsonl.1'
+
+            calls: int = 0
+
+            async def search(*args: object, **kwargs: object) -> dict:
+                del args, kwargs
+                nonlocal calls
+                calls += 1
+                if not callbacks:
+                    raise AssertionError('SIGHUP handler not installed')
+                # Second search: once the channel facet's line is
+                # written, rotate the file before the video facet.
+                if calls == 2:
+                    while not path.read_text(encoding='utf-8'):
+                        await asyncio.sleep(0)
+                    path.rename(rotated)
+                    callback: object = callbacks[signal.SIGHUP]
+                    self.assertTrue(callable(callback))
+                    callback()
+                    return _channel_payload(cids[1], 'beta')
+                return _channel_payload(cids[0], 'alpha')
+
+            settings: mock.Mock = mock.Mock()
+            settings.discover_markets = 'IN:hi'
+            settings.discover_popular_continuations = 0
+            settings.youtube_search_concurrency = 1
+            settings.proxies = ()
+            settings.output_file = str(path)
+
+            with mock.patch(
+                'tools.yt_discover_search._innertube_search_localized',
+                new=search,
+            ), mock.patch(
+                'tools.yt_discover_search._build_queue_backends',
+                new=mock.AsyncMock(return_value=(None, None, None)),
+            ), mock.patch(
+                'tools.yt_discover_search.asyncio.get_running_loop',
+                return_value=loop,
+            ):
+                result: int = await _run_popular_discovery(
+                    settings, _LimiterStub(), ['music'],
+                )
+
+            rotated_lines: list[str] = rotated.read_text(
+                encoding='utf-8',
+            ).splitlines()
+            new_lines: list[str] = path.read_text(
+                encoding='utf-8',
+            ).splitlines()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(len(rotated_lines), 1)
+        self.assertIn(cids[0], rotated_lines[0])
+        self.assertEqual(len(new_lines), 1)
+        self.assertIn(cids[1], new_lines[0])
+        loop.remove_signal_handler.assert_called_once_with(
+            signal.SIGHUP,
+        )
+
+
+class TestEnqueueDiscoveredChannels(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.creator_map: mock.Mock = mock.Mock()
+        self.creator_map.get = mock.AsyncMock(return_value=None)
+        self.queue: mock.Mock = mock.Mock()
+        self.queue.enqueue_new = mock.AsyncMock(return_value='enqueued')
+
+    async def _enqueue(self, channels: list[DiscoveredChannel],
+                       exists: bool | None = False,
+                       min_subscribers: int = 0) -> dict[str, int]:
+        with mock.patch(
+            'tools.yt_discover_search._channel_exists_on_exchange',
+            new=mock.AsyncMock(return_value=exists),
+        ):
+            return await enqueue_discovered_channels(
+                channels,
+                creator_map=self.creator_map,
+                queue=self.queue,
+                http_client=object(),
+                exchange_url='https://scrape.exchange',
+                source='discovered_popular',
+                min_subscribers=min_subscribers,
+            )
+
+    def _channel(self, cid: str = 'UC' + 'a1' * 11,
+                 subs: int | None = None) -> DiscoveredChannel:
+        return DiscoveredChannel(cid, 'alpha', subs)
+
+    async def test_enqueues_unknown_channel(self) -> None:
+        counts = await self._enqueue([self._channel()])
+
+        self.assertEqual(counts['enqueued'], 1)
+        self.queue.enqueue_new.assert_awaited_once_with(
+            'UC' + 'a1' * 11, source='discovered_popular',
+        )
+
+    async def test_skips_channel_already_in_channel_queue(self) -> None:
+        self.queue.enqueue_new = mock.AsyncMock(return_value='known')
+
+        counts = await self._enqueue([self._channel()])
+
+        self.assertEqual(counts['already_queued'], 1)
+        self.assertEqual(counts['enqueued'], 0)
+
+    async def test_skips_already_scraped(self) -> None:
+        self.creator_map.get = mock.AsyncMock(return_value='alpha')
+
+        counts = await self._enqueue([self._channel()])
+
+        self.assertEqual(counts['already_scraped'], 1)
+        self.queue.enqueue_new.assert_not_awaited()
+
+    async def test_skips_on_exchange(self) -> None:
+        counts = await self._enqueue([self._channel()], exists=True)
+
+        self.assertEqual(counts['on_exchange'], 1)
+        self.queue.enqueue_new.assert_not_awaited()
+
+    async def test_skips_when_check_fails(self) -> None:
+        counts = await self._enqueue([self._channel()], exists=None)
+
+        self.assertEqual(counts['check_failed'], 1)
+        self.queue.enqueue_new.assert_not_awaited()
+
+    async def test_skips_below_min_subscribers(self) -> None:
+        counts = await self._enqueue(
+            [self._channel(subs=5_000_000)],
+            min_subscribers=10_000_000,
+        )
+
+        self.assertEqual(counts['below_min_subscribers'], 1)
+        self.queue.enqueue_new.assert_not_awaited()
+
+    async def test_reports_terminal_skip(self) -> None:
+        self.queue.enqueue_new = mock.AsyncMock(return_value='terminal')
+
+        counts = await self._enqueue([self._channel()])
+
+        self.assertEqual(counts['terminal_skipped'], 1)
+        self.assertEqual(counts['enqueued'], 0)
+
+    async def test_ignores_non_channel_ids(self) -> None:
+        counts = await self._enqueue([
+            DiscoveredChannel(None, 'alpha'),
+            DiscoveredChannel('not-a-channel', 'beta'),
+        ])
+
+        self.assertEqual(counts['no_channel_id'], 2)
+        self.queue.enqueue_new.assert_not_awaited()
+
+
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestSearchUsesSearchTokens(unittest.IsolatedAsyncioTestCase):
+    '''Search pages acquire the dedicated SEARCH rate-limit token.'''
+
+    async def test_acquires_search_token(self) -> None:
+        from scrape_exchange.youtube.youtube_rate_limiter import (
+            YouTubeCallType,
+        )
+        from tools import yt_discover_search
+
+        limiter: mock.Mock = mock.Mock()
+        limiter.acquire = mock.AsyncMock()
+        client: mock.Mock = mock.Mock()
+        client.search.return_value = {'ok': 1}
+
+        async def run(fn: object) -> dict:
+            return fn()
+
+        with mock.patch.object(
+            yt_discover_search, 'pooled_innertube_localized_for_entry',
+            return_value=client,
+        ), mock.patch.object(
+            yt_discover_search, 'run_on_innertube_executor', side_effect=run,
+        ):
+            search = yt_discover_search._innertube_search_localized
+            result: dict = await search(
+                'term', params=None, continuation=None,
+                proxy='http://p.test:3128', gl='US', hl='en',
+                limiter=limiter,
+            )
+        self.assertEqual(result, {'ok': 1})
+        limiter.acquire.assert_awaited_once_with(
+            YouTubeCallType.SEARCH, proxy='http://p.test:3128',
+        )
+
+
+class TestRunDiscoveryRounds(unittest.IsolatedAsyncioTestCase):
+    '''Without --keyword-count or explicit terms, discovery runs
+    rounds of random keywords indefinitely.'''
+
+    async def _run(
+        self, argv: list[str], *, stop_after: int = 0,
+        stdin_terms: list[str] | None = None,
+    ) -> tuple[mock.AsyncMock, mock.AsyncMock]:
+        from tools import yt_discover_search
+
+        settings: DiscoverSearchSettings = DiscoverSearchSettings(
+            _cli_parse_args=argv, _env_file=None,
+        )
+        calls: list[int] = []
+
+        async def run_pass(*args: object, **kwargs: object) -> int:
+            calls.append(1)
+            if stop_after and len(calls) >= stop_after:
+                raise asyncio.CancelledError()
+            return 0
+
+        choose: mock.AsyncMock = mock.AsyncMock(
+            side_effect=lambda *a, count, **k: [f'w{i}' for i in range(count)],
+        )
+        run: mock.AsyncMock = mock.AsyncMock(side_effect=run_pass)
+        with mock.patch.object(
+            yt_discover_search, 'configure_logging',
+        ), mock.patch.object(
+            yt_discover_search, '_start_metrics',
+        ), mock.patch.object(
+            yt_discover_search, 'configure_innertube_executor',
+        ), mock.patch.object(
+            yt_discover_search.YouTubeRateLimiter, 'get',
+        ), mock.patch.object(
+            yt_discover_search, 'aclose_pooled_innertube', mock.AsyncMock(),
+        ), mock.patch.object(
+            yt_discover_search, 'shutdown_innertube_executor',
+        ), mock.patch.object(
+            yt_discover_search, '_stdin_terms',
+            return_value=stdin_terms or [],
+        ), mock.patch.object(
+            yt_discover_search, 'choose_random_search_terms', choose,
+        ), mock.patch.object(
+            yt_discover_search, '_run_popular_discovery', run,
+        ):
+            try:
+                await yt_discover_search._run_discovery(settings)
+            except asyncio.CancelledError:
+                pass
+        return choose, run
+
+    async def test_unlimited_runs_rounds_until_stopped(self) -> None:
+        from tools import yt_discover_search
+
+        choose: mock.AsyncMock
+        run: mock.AsyncMock
+        choose, run = await self._run([], stop_after=3)
+        self.assertEqual(run.await_count, 3)
+        self.assertEqual(choose.await_count, 3)
+        self.assertEqual(
+            choose.await_args.kwargs['count'],
+            yt_discover_search.UNLIMITED_KEYWORD_BATCH,
+        )
+
+    async def test_keyword_count_runs_one_pass(self) -> None:
+        choose: mock.AsyncMock
+        run: mock.AsyncMock
+        choose, run = await self._run(['--keyword-count', '7'])
+        self.assertEqual(run.await_count, 1)
+        self.assertEqual(choose.await_args.kwargs['count'], 7)
+
+    async def test_explicit_terms_run_one_pass(self) -> None:
+        choose: mock.AsyncMock
+        run: mock.AsyncMock
+        choose, run = await self._run(['cats', 'dogs'])
+        self.assertEqual(run.await_count, 1)
+        choose.assert_not_awaited()
+        self.assertEqual(run.await_args.args[2], ['cats', 'dogs'])
+
+    async def test_stdin_terms_run_one_pass(self) -> None:
+        choose: mock.AsyncMock
+        run: mock.AsyncMock
+        choose, run = await self._run([], stdin_terms=['fish'])
+        self.assertEqual(run.await_count, 1)
+        choose.assert_not_awaited()

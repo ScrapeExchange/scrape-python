@@ -405,6 +405,7 @@ class TestBotDetectionResponseHandling(
         innertube: MagicMock = MagicMock()
         limiter: MagicMock = MagicMock()
         limiter.acquire = AsyncMock(return_value=proxy)
+        limiter.report_proxy_result = AsyncMock()
         limiter.penalise = AsyncMock()
 
         with (
@@ -454,6 +455,12 @@ class TestBotDetectionResponseHandling(
             proxy,
             challenged=innertube,
         )
+        # A bot-check response is a proxy failure for proxy health,
+        # and must not also be reported as a success.
+        self.assertEqual(
+            limiter.report_proxy_result.await_args_list,
+            [call(proxy, False)],
+        )
 
 
 class TestInnerTubeClientRouting(unittest.IsolatedAsyncioTestCase):
@@ -465,6 +472,7 @@ class TestInnerTubeClientRouting(unittest.IsolatedAsyncioTestCase):
         web_client: MagicMock = MagicMock()
         limiter: MagicMock = MagicMock()
         limiter.acquire = AsyncMock(return_value=proxy)
+        limiter.report_proxy_result = AsyncMock()
         player_data: dict = {
             'playabilityStatus': {'status': 'OK'},
             'videoDetails': {'title': 'Title'},
@@ -519,6 +527,11 @@ class TestInnerTubeClientRouting(unittest.IsolatedAsyncioTestCase):
                 call(web_client, web_client.next, 'vid123'),
             ],
         )
+        # Usable player and next responses are proxy successes.
+        self.assertEqual(
+            limiter.report_proxy_result.await_args_list,
+            [call(proxy, True), call(proxy, True)],
+        )
 
     async def test_failed_player_call_releases_borrowed_client(
         self,
@@ -527,6 +540,7 @@ class TestInnerTubeClientRouting(unittest.IsolatedAsyncioTestCase):
         player_client: MagicMock = MagicMock()
         limiter: MagicMock = MagicMock()
         limiter.acquire = AsyncMock(return_value=proxy)
+        limiter.report_proxy_result = AsyncMock()
 
         with patch.object(
             innertube_mod,
@@ -564,6 +578,7 @@ class TestInnerTubeClientRouting(unittest.IsolatedAsyncioTestCase):
         player_client: MagicMock = MagicMock()
         limiter: MagicMock = MagicMock()
         limiter.acquire = AsyncMock(return_value=proxy)
+        limiter.report_proxy_result = AsyncMock()
 
         with patch.object(
             innertube_mod,
@@ -606,6 +621,7 @@ class TestInnerTubeClientRouting(unittest.IsolatedAsyncioTestCase):
         web_client: MagicMock = MagicMock()
         limiter: MagicMock = MagicMock()
         limiter.acquire = AsyncMock(return_value=proxy)
+        limiter.report_proxy_result = AsyncMock()
         player_data: dict = {
             'playabilityStatus': {'status': 'OK'},
             'videoDetails': {'title': 'Title'},
@@ -659,6 +675,7 @@ class TestInnerTubeClientRouting(unittest.IsolatedAsyncioTestCase):
         injected: MagicMock = MagicMock()
         limiter: MagicMock = MagicMock()
         limiter.acquire = AsyncMock(return_value=proxy)
+        limiter.report_proxy_result = AsyncMock()
         call_api: AsyncMock = AsyncMock(
             side_effect=[
                 {

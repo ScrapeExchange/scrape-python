@@ -2,6 +2,8 @@
 
 report.md
 
+MagicMock/
+
 docker-compose.override.yml
 
 tests/collateral/youtube_videos

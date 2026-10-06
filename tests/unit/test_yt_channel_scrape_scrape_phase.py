@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from scrape_exchange.channel_scrape_queue import (
+    VIDEO_IDS_ENUMERATED_FIELD,
     ChannelScrapeProgress,
     ChannelState,
 )
@@ -17,9 +18,15 @@ from scrape_exchange.youtube.channel_identity import (
 from scrape_exchange.watchdog import Watchdog
 
 
+# A channel that has been scraped before and already had its one full
+# enumeration, so re-scrapes follow the normal decision logic.
+_ENUMERATED: dict[str, str] = {VIDEO_IDS_ENUMERATED_FIELD: '1790000000'}
+
+
 def _mock_queue() -> AsyncMock:
     queue: AsyncMock = AsyncMock()
     queue.get_scrape_progress.return_value = ChannelScrapeProgress(1, 11)
+    queue.get_meta.return_value = dict(_ENUMERATED)
     return queue
 
 
@@ -53,6 +60,7 @@ def _mock_channel(
     channel.subscriber_count = subscriber_count
     channel.video_count = video_count
     channel.video_ids = {'video-id'}
+    channel.video_ids_complete = True
     channel.channel_id = 'UCabc00000000000000000000'
     channel.channel_handle = channel_handle
     channel.title = title
@@ -1376,7 +1384,7 @@ class TestForceRescrapeMode(
         mock_typed.return_value = mock_channel
         queue: AsyncMock = _mock_queue()
         queue.get_meta.return_value = {
-            'force_rescrape_mode': 'full',
+            'force_rescrape_mode': 'full', **_ENUMERATED,
         }
         creator_map: AsyncMock = AsyncMock()
         creator_map.get.return_value = 'foo'
@@ -1421,7 +1429,7 @@ class TestForceRescrapeMode(
         mock_typed.return_value = mock_channel
         queue: AsyncMock = _mock_queue()
         queue.get_meta.return_value = {
-            'force_rescrape_mode': 'metadata',
+            'force_rescrape_mode': 'metadata', **_ENUMERATED,
         }
         creator_map: AsyncMock = AsyncMock()
         creator_map.get.return_value = 'foo'
@@ -1464,7 +1472,7 @@ class TestForceRescrapeMode(
         mock_typed.side_effect = RuntimeError('timeout')
         queue: AsyncMock = _mock_queue()
         queue.get_meta.return_value = {
-            'force_rescrape_mode': 'full',
+            'force_rescrape_mode': 'full', **_ENUMERATED,
         }
         creator_map: AsyncMock = AsyncMock()
         creator_map.get.return_value = 'foo'
@@ -1634,3 +1642,109 @@ class TestScrapeOneHandleOptional(
             )
             # Bind raised, but the scrape still counts as success.
             queue.update_tier.assert_awaited_once()
+
+
+class TestFullEnumeration(ScrapePhaseTestCase):
+    '''One exhaustive pass of videos, shorts and live per channel.'''
+
+    async def _run(
+        self, *, meta: dict[str, str], progress: ChannelScrapeProgress,
+        exists: bool, complete: bool = True,
+    ) -> tuple[AsyncMock, AsyncMock]:
+        queue: AsyncMock = _mock_queue()
+        queue.get_meta.return_value = meta
+        queue.get_scrape_progress.return_value = progress
+        queue.update_tier.return_value = True
+        channel: MagicMock = _mock_channel()
+        channel.video_ids_complete = complete
+        creator_map: AsyncMock = AsyncMock()
+        creator_map.get.return_value = 'foo'
+        with patch(
+            'tools.yt_channel_scrape._channel_exists_on_exchange',
+            new_callable=AsyncMock, return_value=exists,
+        ), patch(
+            'tools.yt_channel_scrape._do_scrape_channel_to_disk_typed',
+            new_callable=AsyncMock, return_value=channel,
+        ) as mock_scrape, patch(
+            'tools.yt_channel_scrape._load_known_video_ids',
+            new_callable=AsyncMock, return_value=MagicMock(),
+        ), patch(
+            'tools.yt_channel_scrape._add_channel_to_rss_queue',
+            new_callable=AsyncMock,
+        ):
+            settings: MagicMock = _mock_settings()
+            settings.channel_first_scrape_max_videos = 200
+            from tools.yt_channel_scrape import _scrape_one_queued
+            await _scrape_one_queued(
+                'UCabc00000000000000000000', queue=queue,
+                settings=settings, fm=MagicMock(),
+                creator_map_backend=creator_map,
+                http_client=MagicMock(),
+            )
+        return queue, mock_scrape
+
+    def _enumerated_marked(self, queue: AsyncMock) -> bool:
+        return any(
+            VIDEO_IDS_ENUMERATED_FIELD in call.kwargs
+            for call in queue.set_meta.await_args_list
+        )
+
+    async def test_rescrape_without_marker_pages_everything(self) -> None:
+        '''An existing channel would normally get a metadata-only
+        scrape; without the marker it pages all tabs, without the
+        known-ID early stop or a cap, and is then marked.'''
+        queue, mock_scrape = await self._run(
+            meta={}, progress=ChannelScrapeProgress(3, 11), exists=True,
+        )
+        kwargs: dict = mock_scrape.await_args.kwargs
+        self.assertFalse(kwargs['metadata_only'])
+        self.assertIsNone(kwargs['known_video_ids'])
+        self.assertEqual(kwargs['oldest_first_limit'], 0)
+        extra: dict[str, str] = mock_scrape.await_args.args[4]
+        self.assertEqual(extra['scrape_decision'], 'full_enumeration')
+        self.assertTrue(self._enumerated_marked(queue))
+        self.assertTrue(
+            queue.update_tier.await_args.kwargs['full_scrape'],
+        )
+
+    async def test_incomplete_pass_is_retried(self) -> None:
+        queue, _ = await self._run(
+            meta={}, progress=ChannelScrapeProgress(3, 11), exists=True,
+            complete=False,
+        )
+        self.assertFalse(self._enumerated_marked(queue))
+
+    async def test_marked_channel_uses_existing_logic(self) -> None:
+        queue, mock_scrape = await self._run(
+            meta=dict(_ENUMERATED), progress=ChannelScrapeProgress(3, 11),
+            exists=True,
+        )
+        self.assertTrue(mock_scrape.await_args.kwargs['metadata_only'])
+        self.assertFalse(self._enumerated_marked(queue))
+
+    async def test_marked_channel_keeps_known_id_early_stop(self) -> None:
+        _, mock_scrape = await self._run(
+            meta=dict(_ENUMERATED), progress=ChannelScrapeProgress(3, 11),
+            exists=False,
+        )
+        kwargs: dict = mock_scrape.await_args.kwargs
+        self.assertFalse(kwargs['metadata_only'])
+        self.assertIsNotNone(kwargs['known_video_ids'])
+
+    async def test_first_scrape_reaching_every_tab_end_counts(self) -> None:
+        '''A small channel's capped first scrape that saw every tab
+        to its end needs no second pass.'''
+        queue, mock_scrape = await self._run(
+            meta={}, progress=ChannelScrapeProgress(0, 1), exists=False,
+        )
+        self.assertGreater(
+            mock_scrape.await_args.kwargs['oldest_first_limit'], 0,
+        )
+        self.assertTrue(self._enumerated_marked(queue))
+
+    async def test_capped_first_scrape_is_not_marked(self) -> None:
+        queue, _ = await self._run(
+            meta={}, progress=ChannelScrapeProgress(0, 1), exists=False,
+            complete=False,
+        )
+        self.assertFalse(self._enumerated_marked(queue))

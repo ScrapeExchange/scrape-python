@@ -21,7 +21,6 @@ import logging
 import httpx2 as httpx  # exchange client raises httpx2 exception classes
 
 from pathlib import Path
-import random
 
 from prometheus_client import Counter, Gauge
 
@@ -58,7 +57,11 @@ from scrape_exchange.scraper_runner import (
     ScraperRunContext,
     ScraperRunner,
 )
-from scrape_exchange.youtube.youtube_rate_limiter import YouTubeRateLimiter
+from scrape_exchange.rate_limiter import RateLimitWaitExceeded
+from scrape_exchange.youtube.youtube_rate_limiter import (
+    YouTubeCallType,
+    YouTubeRateLimiter,
+)
 from scrape_exchange.youtube.youtube_channel import YouTubeChannel
 from scrape_exchange.youtube.derived_metadata import (
     enrich_video_channel_country,
@@ -249,6 +252,7 @@ async def _scrape_to_disk(
     redis: aioredis.Redis | None = None,
     exchange_client: ExchangeClient | None = None,
     exchange_username: str | None = None,
+    max_rate_limit_wait: float | None = None,
 ) -> None:
     '''Single-attempt scrape that raises on any failure.
 
@@ -275,6 +279,7 @@ async def _scrape_to_disk(
         debug=settings.log_level == 'DEBUG',
         proxies=[proxy] if proxy else [],
         with_formats=settings.video_use_yt_dlp,
+        max_rate_limit_wait=max_rate_limit_wait,
     )
     if channel_context is not None:
         _apply_queue_channel_context(video, channel_context)
@@ -364,6 +369,21 @@ async def _resolve_video_channel_handle(
     await creator_map_backend.put(video.channel_id, resolved)
 
 
+def _choose_proxy(candidates: list[str]) -> str | None:
+    '''Pick a proxy for one scrape attempt with the rate limiter's
+    health-aware chooser: proxies in fleet-wide cooldown (e.g. after
+    repeated bot detection) are skipped unless every candidate is.'''
+    return YouTubeRateLimiter.get().select_proxy_from(
+        YouTubeCallType.PLAYER, candidates,
+    )
+
+
+def _max_rate_limit_wait(settings: 'VideoSettings') -> float | None:
+    '''The per-attempt rate-limit wait cap; 0 disables it.'''
+    wait: float = float(settings.video_proxy_max_wait_seconds)
+    return wait if wait > 0 else None
+
+
 async def _scrape_one_queued(
     video_id: str,
     *,
@@ -418,6 +438,11 @@ async def _scrape_one_queued(
         settings.video_transient_max_attempts
     )
     bot_blocked_proxies: set[str] = set()
+    # Proxies whose token bucket stayed empty past the wait cap.
+    # Switching away from them does not use up an attempt, at most
+    # once per configured proxy.
+    slow_proxies: set[str] = set()
+    proxy_switches: int = 0
     last_reason: str = 'other'
     api: str = (
         'ytdlp' if settings.video_use_yt_dlp else 'innertube'
@@ -426,11 +451,12 @@ async def _scrape_one_queued(
         proxy_candidates: list[str] = [
             candidate for candidate in proxies
             if candidate not in bot_blocked_proxies
+            and candidate not in slow_proxies
         ]
         if not proxy_candidates:
             proxy_candidates = proxies
         proxy: str | None = (
-            random.choice(proxy_candidates)
+            _choose_proxy(proxy_candidates)
             if proxy_candidates else None
         )
         proxy_ip: str = (
@@ -451,7 +477,43 @@ async def _scrape_one_queued(
                 redis=redis,
                 exchange_client=exchange_client,
                 exchange_username=exchange_username,
+                max_rate_limit_wait=_max_rate_limit_wait(settings),
             )
+        except RateLimitWaitExceeded as exc:
+            proxy_switches += 1
+            VIDEO_PROXY_SWITCHES.labels(
+                reason='rate_limit_wait',
+            ).inc()
+            logging.info(
+                'Proxy rate-limit wait exceeded; switching proxy',
+                extra={
+                    'video_id': video_id,
+                    'call_type': exc.call_type,
+                    'waited': exc.waited,
+                    'proxy_ip': proxy_ip,
+                    'proxy_port': proxy_port,
+                    'proxy_file': proxy_file,
+                },
+            )
+            if proxy is not None:
+                slow_proxies.add(proxy)
+            if proxy_switches <= len(proxies):
+                continue
+            # Every proxy has been too slow: back off like any
+            # other transient failure and start over.
+            last_reason = 'rate_limit_wait'
+            slow_proxies.clear()
+            proxy_switches = 0
+            attempts_left -= 1
+            await queue.bump_attempts(
+                video_id, last_error=last_reason,
+            )
+            VIDEO_QUEUE_OUTCOMES.labels(outcome='retried').inc()
+            if attempts_left > 0:
+                await asyncio.sleep(
+                    settings.video_transient_backoff_seconds,
+                )
+            continue
         except Exception as exc:
             reason: str = _classify_scrape_error(exc)
             last_reason = reason
@@ -725,6 +787,12 @@ VIDEO_QUEUE_OUTCOMES: Counter = Counter(
     'Outcomes per scrape attempt.',
     ['outcome'],
 )
+VIDEO_PROXY_SWITCHES: Counter = Counter(
+    'video_scrape_proxy_switches_total',
+    'Scrape attempts moved to another proxy without using up an '
+    'attempt, by reason.',
+    ['reason'],
+)
 
 
 class VideoSettings(YouTubeScraperSettings):
@@ -855,6 +923,20 @@ class VideoSettings(YouTubeScraperSettings):
         description=(
             'Maximum number of attempts for a video that hits a '
             'transient failure before it is marked FAILED.'
+        ),
+    )
+    video_proxy_max_wait_seconds: float = Field(
+        default=15.0, ge=0,
+        validation_alias=AliasChoices(
+            'VIDEO_PROXY_MAX_WAIT_SECONDS',
+            'video_proxy_max_wait_seconds',
+        ),
+        description=(
+            'Longest a scrape attempt waits for a rate-limit token on '
+            'its proxy before switching to another proxy; 0 waits '
+            'indefinitely. Keeps workers from queueing behind a '
+            'proxy whose bucket stays empty, e.g. one that YouTube '
+            'keeps bot-blocking.'
         ),
     )
     video_transient_backoff_seconds: int = Field(

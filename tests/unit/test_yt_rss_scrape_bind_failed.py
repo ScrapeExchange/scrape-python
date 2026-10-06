@@ -90,6 +90,7 @@ class TestFetchRssBindFailed(unittest.IsolatedAsyncioTestCase):
         rate_limiter.acquire = AsyncMock(
             return_value='local://192.0.2.99',
         )
+        rate_limiter.report_proxy_result = AsyncMock()
         rate_limiter.report_rss_success = MagicMock()
 
         with patch.object(
@@ -98,7 +99,7 @@ class TestFetchRssBindFailed(unittest.IsolatedAsyncioTestCase):
             fake_record,
         ), patch.object(
             yt_rss_scrape,
-            'pooled_httpx_client_for_entry',
+            'borrow_pooled_httpx_client_for_entry',
             lambda entry: _ConnFailClient(),
         ), patch.object(
             yt_rss_scrape.YouTubeRateLimiter,
