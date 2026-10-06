@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 
 from prometheus_client import Counter, Gauge, Histogram
 
+from scrape_exchange.proxy_health import ProxyHealth
 from scrape_exchange.redis_client import redis_from_url
 from scrape_exchange.util import extract_proxy_ip, extract_proxy_port
 from scrape_exchange.worker_id import get_worker_id
@@ -53,6 +54,12 @@ METRIC_WAIT_EVENTS: Counter = Counter(
     'Total number of rate-limit sleep waits',
     _METRIC_LABELS,
 )
+METRIC_WAIT_EXCEEDED: Counter = Counter(
+    'rate_limit_wait_exceeded_total',
+    'acquire() calls that gave up because the wait for a token '
+    'would exceed the caller\'s max_wait',
+    _METRIC_LABELS,
+)
 METRIC_SLEEP_SECONDS: Histogram = Histogram(
     'rate_limit_sleep_seconds',
     'Duration of rate-limit sleep waits in seconds',
@@ -71,6 +78,29 @@ METRIC_GLOBAL_BUCKET_TOKENS: Gauge = Gauge(
     ['proxy', 'script', 'platform', 'worker_id'],
     multiprocess_mode='livemostrecent',
 )
+
+
+class RateLimitWaitExceeded(Exception):
+    ''':meth:`RateLimiter.acquire` would have to wait longer than
+    the caller's ``max_wait`` for a token on this proxy. The caller
+    should use another proxy rather than queue behind one whose
+    bucket stays empty (for example because every request through
+    it is penalised).'''
+
+    def __init__(
+        self, call_type: str, proxy: str | None, waited: float,
+        max_wait: float,
+    ) -> None:
+        super().__init__(
+            f'{call_type} token on '
+            f'{extract_proxy_ip(proxy) if proxy else "none"} not '
+            f'available within {max_wait:.1f}s '
+            f'(waited {waited:.1f}s)'
+        )
+        self.call_type: str = call_type
+        self.proxy: str | None = proxy
+        self.waited: float = waited
+        self.max_wait: float = max_wait
 
 
 @dataclass
@@ -1122,6 +1152,12 @@ class RateLimiter(ABC, Generic[CallTypeT]):
                 'Rate limiter using in-process backend',
             )
         self._backend: _Backend[CallTypeT] = backend
+        # Proxy health is fleet-wide when the Redis backend is used.
+        self._health: ProxyHealth = ProxyHealth(
+            backend._redis if isinstance(backend, _RedisBackend)
+            else None,
+            platform,
+        )
 
     @property
     @abstractmethod
@@ -1175,25 +1211,56 @@ class RateLimiter(ABC, Generic[CallTypeT]):
 
     def select_proxy(self, call_type: CallTypeT) -> str | None:
         '''
-        Return the proxy with the most tokens currently available
-        for *call_type*, without consuming any tokens.
+        Choose a proxy for *call_type* without consuming tokens.
 
-        This is a non-blocking peek. Under the shared-file backend
-        the value may be slightly stale relative to other processes
-        — it's advisory; :meth:`acquire` is still authoritative.
+        Power of two choices over the healthy proxies, scored by this
+        process's recent selections, fleet-wide failure rate and the
+        token bucket level; see :mod:`scrape_exchange.proxy_health`.
+        Proxies in cooldown are skipped unless all are. Health comes
+        from the snapshot :meth:`acquire` refreshes; :meth:`acquire`
+        remains authoritative for the rate limits.
         '''
         if not self._proxies:
             return None
-        best_tokens: float = -1.0
-        best_proxies: list[str] = []
-        for p in self._proxies:
-            tokens: float = self._backend.peek_tokens(call_type, p)
-            if tokens > best_tokens:
-                best_tokens = tokens
-                best_proxies = [p]
-            elif tokens == best_tokens:
-                best_proxies.append(p)
-        return random.choice(best_proxies)
+        return self._select_from(call_type, self._proxies)
+
+    def select_proxy_from(
+        self, call_type: CallTypeT, candidates: list[str],
+    ) -> str | None:
+        '''
+        Choose one of *candidates* the way :meth:`select_proxy` does
+        (power of two choices, skipping proxies in fleet-wide
+        cooldown unless all are). For callers that restrict the
+        choice, e.g. to exclude proxies that already failed a request.
+        '''
+        if not candidates:
+            return None
+        return self._select_from(call_type, candidates)
+
+    def _select_from(
+        self, call_type: CallTypeT, candidates: list[str],
+    ) -> str:
+        burst: float = float(self.default_configs[call_type].burst)
+
+        def token_fraction(proxy: str) -> float:
+            if burst <= 0:
+                return 1.0
+            return self._backend.peek_tokens(call_type, proxy) / burst
+
+        return self._health.choose(candidates, token_fraction)
+
+    async def report_proxy_result(
+        self, proxy: str | None, ok: bool,
+    ) -> None:
+        '''
+        Record the outcome of a request made through *proxy*.
+
+        Report ``ok=False`` only for transport-level failures
+        (connection, tunnel, pool, TLS errors) and ``ok=True`` for
+        completed requests; HTTP status errors and read timeouts are
+        not about the proxy and should not be reported.
+        '''
+        await self._health.report(proxy, ok)
 
     def _labels(
         self, call_type: CallTypeT, proxy: str | None,
@@ -1218,15 +1285,23 @@ class RateLimiter(ABC, Generic[CallTypeT]):
 
     async def acquire(
         self, call_type: CallTypeT, proxy: str | None = None,
+        max_wait: float | None = None,
     ) -> str | None:
         '''
         Wait until a request of *call_type* is permitted, then
         consume one token from both the per-type and global
         buckets.
 
+        :param max_wait: give up instead of sleeping past this many
+            seconds in total; None waits as long as it takes.
         :returns: the proxy that was used (useful when
             auto-selected).
+        :raises RateLimitWaitExceeded: the next sleep would take the
+            total wait past *max_wait*.
         '''
+        # Cheap timestamp check; reloads fleet-wide proxy health
+        # every few seconds for select_proxy() callers.
+        await self._health.refresh_if_stale(self._proxies)
         if proxy is None:
             proxy = self.select_proxy(call_type)
 
@@ -1235,6 +1310,7 @@ class RateLimiter(ABC, Generic[CallTypeT]):
         global_labels: dict[str, str] = self._global_labels(proxy)
         lock: asyncio.Lock = self._get_lock(proxy)
 
+        waited: float = 0.0
         async with lock:
             while True:
                 wait: float
@@ -1255,6 +1331,11 @@ class RateLimiter(ABC, Generic[CallTypeT]):
                 ).set(global_tokens)
                 if wait <= 0:
                     break
+                if max_wait is not None and waited + wait > max_wait:
+                    METRIC_WAIT_EXCEEDED.labels(**labels).inc()
+                    raise RateLimitWaitExceeded(
+                        call_type.value, proxy, waited, max_wait,
+                    )
                 METRIC_WAIT_EVENTS.labels(**labels).inc()
                 _LOGGER.debug(
                     'Rate limiter waiting',
@@ -1275,6 +1356,7 @@ class RateLimiter(ABC, Generic[CallTypeT]):
                         wait
                     )
                     await asyncio.sleep(wait)
+                    waited += wait
                 finally:
                     await lock.acquire()
 

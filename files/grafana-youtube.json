@@ -18,7 +18,7 @@
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
-  "id": 0,
+  "id": 46,
   "links": [],
   "panels": [
     {
@@ -90,8 +90,10 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
+          "editorMode": "code",
           "expr": "sum by (entity) (increase(scrapes_completed_total{job=~\"$job\",instance=~\"$instance\"}[1h]))",
           "legendFormat": "{{entity}}",
+          "range": true,
           "refId": "A"
         }
       ],
@@ -155,10 +157,10 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(max by (state) (scrape_queue_size{scraper=\"rss_scraper\",entity=\"rss_feed\",job=~\"$job\",instance=~\"$instance\"}))",
-          "legendFormat": "RSS",
+          "expr": "sum(max by (tier) (channel_queue_tier_size{job=~\"$job\",instance=~\"$instance\"}))",
+          "legendFormat": "Channel",
           "range": true,
-          "refId": "A"
+          "refId": "B"
         },
         {
           "datasource": {
@@ -166,10 +168,10 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(max by (tier) (channel_queue_tier_size{job=~\"$job\",instance=~\"$instance\"}))",
-          "legendFormat": "Channel",
+          "expr": "sum(max by (state) (scrape_queue_size{scraper=\"rss_scraper\",entity=\"rss_feed\",job=~\"$job\",instance=~\"$instance\"}))",
+          "legendFormat": "RSS",
           "range": true,
-          "refId": "B"
+          "refId": "A"
         },
         {
           "datasource": {
@@ -184,6 +186,161 @@
         }
       ],
       "title": "Total queue depth",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "New channels added to the channel scrape queue by yt_discover_search.py over the last 24h.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 1
+      },
+      "id": 116,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(discover_enqueue_outcomes_total{outcome=\"enqueued\",job=~\"$job\",instance=~\"$instance\"}[24h]))",
+          "legendFormat": "enqueued",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Channels discovered (24h)",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Current queue size divided by the assets scraped in the last day, in days.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 1,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "d"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 1
+      },
+      "id": 117,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(max by (state) (scrape_queue_size{scraper=\"rss_scraper\",entity=\"rss_feed\",job=~\"$job\",instance=~\"$instance\"})) / clamp_min(sum(increase(scrapes_completed_total{scraper=\"rss_scraper\",job=~\"$job\",instance=~\"$instance\"}[1h])), 1) / 168",
+          "legendFormat": "RSS",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(max by (tier) (channel_queue_tier_size{job=~\"$job\",instance=~\"$instance\"})) / clamp_min(sum(increase(scrapes_completed_total{scraper=\"channel_scraper\",job=~\"$job\",instance=~\"$instance\"}[1h])), 1) / 168",
+          "legendFormat": "Channel",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "max(video_state_size{state=\"queued\",job=~\"$job\",instance=~\"$instance\"}) / clamp_min(sum(increase(scrapes_completed_total{scraper=\"video_scraper\",job=~\"$job\",instance=~\"$instance\"}[1h])), 1) / 168",
+          "legendFormat": "Video",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Days to process the queue at last day's rate",
       "type": "stat"
     },
     {
@@ -336,6 +493,19 @@
           "legendFormat": "{{entity}} - undetermined",
           "range": true,
           "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum (rate(video_queue_outcomes_total{job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "videos",
+          "range": true,
+          "refId": "E"
         }
       ],
       "title": "Scrapes per second by entity",
@@ -432,7 +602,7 @@
             "uid": "b2ee3b55-9017-40c3-9e1e-e2c68921f97c"
           },
           "editorMode": "code",
-          "expr": "sum(rate(redis_commands_total{instance=\"192.168.1.13:9121\"} [5m])) by (cmd)",
+          "expr": "sum(rate(redis_commands_total{service=\"scraper\"} [5m])) by (cmd)",
           "format": "time_series",
           "interval": "",
           "intervalFactor": 2,
@@ -821,12 +991,216 @@
       "type": "timeseries"
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Fraction (5m) of scraped YouTube channel pages from which no subscriber count could be parsed. source=innertube is the pageHeaderRenderer metadata rows of the InnerTube browse response (channel + RSS scraper); source=about_page is subscriberCountText on the /about HTML page (channel scraper). A jump usually means YouTube changed the page layout.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "max": 1,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 0.2
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 34
+      },
+      "id": 101,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (scraper, source) (rate(channel_subscriber_count_parse_total{outcome=\"missing\",job=~\"$job\",instance=~\"$instance\"}[5m])) / sum by (scraper, source) (rate(channel_subscriber_count_parse_total{job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{scraper}} {{source}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Subscriber count parse failure ratio by scraper / source",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Rate (5m) of subscriber count parse attempts on scraped YouTube channel pages, split into found and missing.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 34
+      },
+      "id": 102,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (scraper, source, outcome) (rate(channel_subscriber_count_parse_total{job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{scraper}} {{source}} {{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Subscriber count parses /s by scraper / source / outcome",
+      "type": "timeseries"
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 34
+        "y": 42
       },
       "id": 70,
       "panels": [],
@@ -838,7 +1212,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "p50 / p95 of the TCP handshake to the proxy on RSS fetches. Histograms only record fresh connection establishment \u2014 keep-alive reuse skips the trace event, so _count reflects new tunnels, not total fetches.",
+      "description": "p50 / p95 of the TCP handshake to the proxy on RSS fetches. Histograms only record fresh connection establishment — keep-alive reuse skips the trace event, so _count reflects new tunnels, not total fetches.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -900,7 +1274,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 35
+        "y": 43
       },
       "id": 71,
       "options": {
@@ -949,7 +1323,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "p50 / p95 of the HTTP CONNECT exchange (proxy dialing YouTube on our behalf) on RSS fetches. The gap between connect_tcp.complete and start_tls.started \u2014 i.e. the proxy backend's dial-out queue.",
+      "description": "p50 / p95 of the HTTP CONNECT exchange (proxy dialing YouTube on our behalf) on RSS fetches. The gap between connect_tcp.complete and start_tls.started — i.e. the proxy backend's dial-out queue.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1011,7 +1385,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 35
+        "y": 43
       },
       "id": 72,
       "options": {
@@ -1058,7 +1432,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "p50 / p95 of the TLS handshake to YouTube via the proxy tunnel on RSS fetches. Slowness here \u2014 with fast TCP and HTTP CONNECT \u2014 indicates YouTube is throttling TLS from the proxy's egress IP rather than provider-side queueing.",
+      "description": "p50 / p95 of the TLS handshake to YouTube via the proxy tunnel on RSS fetches. Slowness here — with fast TCP and HTTP CONNECT — indicates YouTube is throttling TLS from the proxy's egress IP rather than provider-side queueing.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1120,7 +1494,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 35
+        "y": 43
       },
       "id": 73,
       "options": {
@@ -1168,7 +1542,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 43
+        "y": 51
       },
       "id": 74,
       "panels": [],
@@ -1180,7 +1554,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "p50 / p95 of the TCP handshake to the proxy on YouTube HTML fetches (channel about-page, home, search, session warm-up). Sourced from curl's CURLINFO_CONNECT_TIME minus CURLINFO_NAMELOOKUP_TIME. Histograms only record fresh connection establishment \u2014 keep-alive reuse skips because curl reports 0 for the connect-related fields on reuse.",
+      "description": "p50 / p95 of the TCP handshake to the proxy on YouTube HTML fetches (channel about-page, home, search, session warm-up). Sourced from curl's CURLINFO_CONNECT_TIME minus CURLINFO_NAMELOOKUP_TIME. Histograms only record fresh connection establishment — keep-alive reuse skips because curl reports 0 for the connect-related fields on reuse.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1242,7 +1616,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 44
+        "y": 52
       },
       "id": 75,
       "options": {
@@ -1289,7 +1663,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "p50 / p95 of the TLS handshake (plus HTTP CONNECT tunnel exchange for proxied requests) on YouTube HTML fetches. Sourced from curl's CURLINFO_APPCONNECT_TIME minus CURLINFO_CONNECT_TIME. Note: curl reports app-connect cumulatively, so the HTTP CONNECT exchange cannot be split out separately as it is on RSS \u2014 both are bundled here. Slowness with fast TCP indicates YouTube is throttling TLS from the proxy's egress IP or the provider's CONNECT-tunnel queue is backed up.",
+      "description": "p50 / p95 of the TLS handshake (plus HTTP CONNECT tunnel exchange for proxied requests) on YouTube HTML fetches. Sourced from curl's CURLINFO_APPCONNECT_TIME minus CURLINFO_CONNECT_TIME. Note: curl reports app-connect cumulatively, so the HTTP CONNECT exchange cannot be split out separately as it is on RSS — both are bundled here. Slowness with fast TCP indicates YouTube is throttling TLS from the proxy's egress IP or the provider's CONNECT-tunnel queue is backed up.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1351,7 +1725,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 44
+        "y": 52
       },
       "id": 76,
       "options": {
@@ -1399,7 +1773,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 52
+        "y": 60
       },
       "id": 77,
       "panels": [],
@@ -1411,7 +1785,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "p50 / p95 of the TCP handshake to the proxy on InnerTube calls (channel.browse / video.player). Sourced from httpcore trace events on the third-party innertube library's httpx.Client session. Histograms only record fresh connection establishment \u2014 keep-alive reuse skips the trace event.",
+      "description": "p50 / p95 of the TCP handshake to the proxy on InnerTube calls (channel.browse / video.player). Sourced from httpcore trace events on the third-party innertube library's httpx.Client session. Histograms only record fresh connection establishment — keep-alive reuse skips the trace event.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1473,7 +1847,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 53
+        "y": 61
       },
       "id": 78,
       "options": {
@@ -1520,7 +1894,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "p50 / p95 of the HTTP CONNECT exchange (proxy dialing YouTube on our behalf) on InnerTube calls. Gap between connect_tcp.complete and start_tls.started \u2014 the proxy backend's dial-out queue.",
+      "description": "p50 / p95 of the HTTP CONNECT exchange (proxy dialing YouTube on our behalf) on InnerTube calls. Gap between connect_tcp.complete and start_tls.started — the proxy backend's dial-out queue.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1582,7 +1956,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 53
+        "y": 61
       },
       "id": 79,
       "options": {
@@ -1691,7 +2065,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 53
+        "y": 61
       },
       "id": 80,
       "options": {
@@ -1739,7 +2113,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 61
+        "y": 69
       },
       "id": 81,
       "panels": [],
@@ -1815,7 +2189,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 62
+        "y": 70
       },
       "id": 82,
       "options": {
@@ -1854,7 +2228,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Average requests per fresh TCP connection. A value of 1 means every request opens a fresh connection (worst case \u2014 full handshake cost per fetch). 10 means each connection serves 10 requests on average before the pool retires it. Higher is better; large differences across proxy_files indicate that some providers terminate the keep-alive earlier than others.",
+      "description": "Average requests per fresh TCP connection. A value of 1 means every request opens a fresh connection (worst case — full handshake cost per fetch). 10 means each connection serves 10 requests on average before the pool retires it. Higher is better; large differences across proxy_files indicate that some providers terminate the keep-alive earlier than others.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1913,7 +2287,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 62
+        "y": 70
       },
       "id": 83,
       "options": {
@@ -1952,7 +2326,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 70
+        "y": 78
       },
       "id": 13,
       "panels": [],
@@ -2026,7 +2400,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 71
+        "y": 79
       },
       "id": 14,
       "options": {
@@ -2146,7 +2520,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 71
+        "y": 79
       },
       "id": 16,
       "options": {
@@ -2261,7 +2635,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 79
+        "y": 87
       },
       "id": 17,
       "options": {
@@ -2307,7 +2681,7 @@
           "refId": "B"
         }
       ],
-      "title": "scrape.exchange API request p50/p95 by method \u00d7 status_class",
+      "title": "scrape.exchange API request p50/p95 by method × status_class",
       "type": "timeseries"
     },
     {
@@ -2315,7 +2689,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Number of yt-dlp extract_info calls currently in the thread pool. Pins near executor ceiling (\u224812 per process) when GIL / executor is the bottleneck.",
+      "description": "Number of yt-dlp extract_info calls currently in the thread pool. Pins near executor ceiling (≈12 per process) when GIL / executor is the bottleneck.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2377,7 +2751,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 79
+        "y": 87
       },
       "id": 15,
       "options": {
@@ -2478,7 +2852,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 87
+        "y": 95
       },
       "id": 94,
       "options": {
@@ -2591,7 +2965,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 87
+        "y": 95
       },
       "id": 95,
       "options": {
@@ -2693,7 +3067,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 95
+        "y": 103
       },
       "id": 96,
       "options": {
@@ -2734,7 +3108,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 103
+        "y": 111
       },
       "id": 18,
       "panels": [],
@@ -2808,7 +3182,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 104
+        "y": 112
       },
       "id": 19,
       "options": {
@@ -2875,7 +3249,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 112
+        "y": 120
       },
       "id": 23,
       "panels": [],
@@ -2949,7 +3323,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 113
+        "y": 121
       },
       "id": 24,
       "options": {
@@ -3050,7 +3424,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 113
+        "y": 121
       },
       "id": 25,
       "options": {
@@ -3090,7 +3464,7 @@
           "refId": "B"
         }
       ],
-      "title": "RSS tier SLA \u2014 on-time vs overdue rate",
+      "title": "RSS tier SLA — on-time vs overdue rate",
       "type": "timeseries"
     },
     {
@@ -3160,7 +3534,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 121
+        "y": 129
       },
       "id": 26,
       "options": {
@@ -3263,7 +3637,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 121
+        "y": 129
       },
       "id": 27,
       "options": {
@@ -3321,7 +3695,7 @@
           "refId": "D"
         }
       ],
-      "title": "RSS \u2014 orphans / no-feed-limit / circuit-breaker",
+      "title": "RSS — orphans / no-feed-limit / circuit-breaker",
       "type": "timeseries"
     },
     {
@@ -3330,7 +3704,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 129
+        "y": 137
       },
       "id": 92,
       "panels": [],
@@ -3404,7 +3778,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 130
+        "y": 138
       },
       "id": 85,
       "options": {
@@ -3504,7 +3878,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 130
+        "y": 138
       },
       "id": 86,
       "options": {
@@ -3605,7 +3979,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 138
+        "y": 146
       },
       "id": 87,
       "options": {
@@ -3706,7 +4080,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 138
+        "y": 146
       },
       "id": 88,
       "options": {
@@ -3807,7 +4181,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 146
+        "y": 154
       },
       "id": 97,
       "options": {
@@ -3906,7 +4280,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 146
+        "y": 154
       },
       "id": 98,
       "options": {
@@ -4016,7 +4390,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 154
+        "y": 162
       },
       "id": 99,
       "options": {
@@ -4115,7 +4489,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 154
+        "y": 162
       },
       "id": 100,
       "options": {
@@ -4157,7 +4531,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 162
+        "y": 170
       },
       "id": 89,
       "panels": [],
@@ -4231,7 +4605,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 163
+        "y": 171
       },
       "id": 90,
       "options": {
@@ -4332,7 +4706,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 163
+        "y": 171
       },
       "id": 91,
       "options": {
@@ -4358,8 +4732,10 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
+          "editorMode": "code",
           "expr": "sum by (outcome) (rate(video_queue_outcomes_total{job=~\"$job\",instance=~\"$instance\"}[5m]))",
           "legendFormat": "{{outcome}}",
+          "range": true,
           "refId": "A"
         }
       ],
@@ -4372,7 +4748,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 171
+        "y": 179
       },
       "id": 28,
       "panels": [],
@@ -4446,7 +4822,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 172
+        "y": 180
       },
       "id": 29,
       "options": {
@@ -4547,7 +4923,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 172
+        "y": 180
       },
       "id": 30,
       "options": {
@@ -4648,7 +5024,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 180
+        "y": 188
       },
       "id": 31,
       "options": {
@@ -4749,7 +5125,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 180
+        "y": 188
       },
       "id": 32,
       "options": {
@@ -4782,6 +5158,2157 @@
       ],
       "title": "Global bucket tokens (per proxy network)",
       "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 196
+      },
+      "id": 103,
+      "panels": [],
+      "title": "Proxy health",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Rate (5m) at which the rate limiter picks each proxy (power of two choices over healthy proxies). With even spreading every proxy carries a similar share; a proxy near zero is in cooldown or failing.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 197
+      },
+      "id": 104,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (proxy) (rate(proxy_selected_total{job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{proxy}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Proxy selections /s by proxy",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Fleet-wide exponentially weighted transport failure rate (connection, tunnel, pool, TLS errors) per proxy, as last seen by each process. Above 0.5 a failure puts the proxy in cooldown.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "max": 1,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "orange",
+                "value": 0.25
+              },
+              {
+                "color": "red",
+                "value": 0.5
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 197
+      },
+      "id": 105,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "max by (proxy) (proxy_health_fail_ewma{job=~\"$job\",instance=~\"$instance\"}) > 0.01",
+          "legendFormat": "{{proxy}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Proxy transport failure rate (EWMA) by proxy",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Proxies currently skipped by proxy selection after transport failures (30 s cooldown, doubling per reopening up to 10 min). \"total\" is the number of proxies in cooldown.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 205
+      },
+      "id": 106,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "max by (proxy) (proxy_health_in_cooldown{job=~\"$job\",instance=~\"$instance\"}) > 0",
+          "legendFormat": "{{proxy}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(max by (proxy) (proxy_health_in_cooldown{job=~\"$job\",instance=~\"$instance\"})) > 0",
+          "legendFormat": "total",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Proxies in cooldown",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Number of times each proxy was put in cooldown over the last hour. A proxy that keeps reopening has a broken tunnel or exit node.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 3
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 205
+      },
+      "id": 107,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (proxy) (increase(proxy_health_cooldowns_total{job=~\"$job\",instance=~\"$instance\"}[1h])) > 0",
+          "legendFormat": "{{proxy}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Proxy cooldowns (1h) by proxy",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 213
+      },
+      "id": 108,
+      "panels": [],
+      "title": "Search discovery",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "InnerTube search result pages requested by yt_discover_search.py (5m rate), by outcome and page type. failed = no page after retries.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 25,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 214
+      },
+      "id": 109,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome, page_type) (rate(discover_search_pages_total{job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{outcome}} {{page_type}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Search pages /s by outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Failed search request attempts by exception type (5m rate). Transport errors point at proxies; InnerTube request/response errors at YouTube.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 214
+      },
+      "id": 110,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (error_type) (rate(discover_search_errors_total{job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{error_type}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Search errors /s by type",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Duration of one InnerTube search call, excluding the rate-limiter wait.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 222
+      },
+      "id": 111,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le, page_type) (rate(discover_search_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\"}[10m])))",
+          "legendFormat": "p50 {{page_type}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, page_type) (rate(discover_search_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\"}[10m])))",
+          "legendFormat": "p95 {{page_type}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Search latency p50/p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Channels extracted from search pages by facet (before dedupe), next to what happened when they were offered to the channel scrape queue: enqueued (new), already_scraped / on_exchange (known), below_min_subscribers, ...",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 222
+      },
+      "id": 112,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (facet) (rate(discover_channels_found_total{job=~\"$job\",instance=~\"$instance\"}[15m]))",
+          "legendFormat": "found {{facet}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (rate(discover_enqueue_outcomes_total{job=~\"$job\",instance=~\"$instance\"}[15m]))",
+          "legendFormat": "enqueue {{outcome}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Discovery yield: channels found vs enqueue outcome /s",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Channels newly enqueued per successful search page (1h). The best single measure of whether discovery earns its search budget; expect it to fall as markets get exhausted.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 230
+      },
+      "id": 113,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(discover_enqueue_outcomes_total{outcome=\"enqueued\",job=~\"$job\",instance=~\"$instance\"}[1h])) / sum(rate(discover_search_pages_total{outcome=\"success\",job=~\"$job\",instance=~\"$instance\"}[1h]))",
+          "legendFormat": "enqueued / page",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "New channels enqueued per search page",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Fraction of search pages that failed after retries, per market (gl), over 1h; the 10 worst markets.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "max": 1,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 230
+      },
+      "id": 114,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "topk(10, sum by (market) (rate(discover_search_pages_total{outcome=\"failed\",job=~\"$job\",instance=~\"$instance\"}[1h])) / sum by (market) (rate(discover_search_pages_total{job=~\"$job\",instance=~\"$instance\"}[1h])))",
+          "legendFormat": "{{market}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Search page failure ratio by market (top 10)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Market x term x facet search jobs completed per hour, and the jobs planned in the current round.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 230
+      },
+      "id": 115,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(discover_jobs_completed_total{job=~\"$job\",instance=~\"$instance\"}[1h])) * 3600",
+          "legendFormat": "completed / h",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "max(discover_jobs_planned{job=~\"$job\",instance=~\"$instance\"})",
+          "legendFormat": "planned this round",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Discovery jobs completed /h",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 238
+      },
+      "id": 118,
+      "panels": [],
+      "title": "Video backlog (MongoDB)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Videos waiting in the Redis queue that the video scrapers pop from. tools/yt_video_queue_refill.py refills it from MongoDB below 10M, up to 20M.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 0,
+        "y": 239
+      },
+      "id": 119,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "max(video_queue_hot_size{platform=\"youtube\"})",
+          "legendFormat": "Hot window (Redis)",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Hot window (Redis)",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Queued videos still in MongoDB, not yet copied into the Redis hot window.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 6,
+        "y": 239
+      },
+      "id": 120,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "max(video_queue_backlog_size{platform=\"youtube\",state=\"queued\"}) - max(video_queue_hot_size{platform=\"youtube\"})",
+          "legendFormat": "Cold backlog (MongoDB)",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Cold backlog (MongoDB)",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "How long until the hot window drops below the 10M low watermark at the last hour's scrape rate.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 12,
+        "y": 239
+      },
+      "id": 121,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "clamp_min(max(video_queue_hot_size{platform=\"youtube\"}) - 10000000, 0) / sum(rate(video_queue_outcomes_total{outcome!=\"retried\"}[1h]))",
+          "legendFormat": "Time until refill starts",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Time until refill starts",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Failed refill iterations in the last hour; see the yt-video-queue-refill container logs.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 18,
+        "y": 239
+      },
+      "id": 122,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(video_queue_refill_errors_total[1h])) or vector(0)",
+          "legendFormat": "Refill errors (1h)",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Refill errors (1h)",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Redis hot-window size against the refill watermarks (VIDEO_QUEUE_LOW_WATERMARK / VIDEO_QUEUE_HIGH_WATERMARK, drawn at their 10M / 20M defaults).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 244
+      },
+      "id": 123,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "max(video_queue_hot_size{platform=\"youtube\"})",
+          "legendFormat": "hot window",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "vector(10000000)",
+          "legendFormat": "low watermark (refill starts)",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "vector(20000000)",
+          "legendFormat": "high watermark (refill target)",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Hot window vs watermarks",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Known videos in MongoDB per state; queued includes the hot window. Counts are refreshed every 5 minutes.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 244
+      },
+      "id": 124,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "max by (state) (video_queue_backlog_size{platform=\"youtube\"})",
+          "legendFormat": "{{state}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Backlog size by state",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Videos copied from MongoDB into Redis, and hot documents returned to the backlog by the startup reconcile.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 252
+      },
+      "id": 125,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(video_queue_refill_moved_total[5m])) or vector(0)",
+          "legendFormat": "moved to Redis",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(video_queue_refill_reconciled_total[5m]))",
+          "legendFormat": "reconciled back to backlog",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Refill throughput",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Operations per second on the scraper video-backlog MongoDB: inserts are producer enqueues, deletes are completed scrapes, queries are state lookups and refill reads.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 252
+      },
+      "id": 126,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (legacy_op_type) (rate(mongodb_ss_opcounters{service=\"scraper\"}[5m]))",
+          "legendFormat": "{{legacy_op_type}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "MongoDB operations (scraper backlog)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Average server-side latency per operation type.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 260
+      },
+      "id": 127,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (op_type) (rate(mongodb_ss_opLatencies_latency{service=\"scraper\",op_type=~\"reads|writes|commands\"}[5m])) / sum by (op_type) (rate(mongodb_ss_opLatencies_ops{service=\"scraper\",op_type=~\"reads|writes|commands\"}[5m])) / 1e6",
+          "legendFormat": "{{op_type}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "MongoDB latency (scraper backlog)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Open connections (limit maxIncomingConnections 1000; scrapers cap their pools with maxPoolSize) and WiredTiger cache fill.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "cache fill"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": 1
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 260
+      },
+      "id": 128,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "max(mongodb_ss_connections{service=\"scraper\",conn_type=\"current\"})",
+          "legendFormat": "connections",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "max(mongodb_ss_wt_cache_bytes_currently_in_the_cache{service=\"scraper\"}) / max(mongodb_ss_wt_cache_maximum_bytes_configured{service=\"scraper\"})",
+          "legendFormat": "cache fill",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "MongoDB connections and cache (scraper backlog)",
+      "type": "timeseries"
     }
   ],
   "preload": false,
@@ -4807,7 +7334,7 @@
         "type": "datasource"
       },
       {
-        "allValue": "youtube_video|youtube_channel|youtube_rss",
+        "allValue": "youtube_video|youtube_channel|youtube_rss|youtube_discover_search",
         "current": {
           "text": "All",
           "value": "$__all"
@@ -4822,7 +7349,7 @@
         "name": "job",
         "options": [],
         "query": {
-          "query": "label_values({job=~\"youtube_video|youtube_channel|youtube_rss\"}, job)",
+          "query": "label_values({job=~\"youtube_video|youtube_channel|youtube_rss|youtube_discover_search\"}, job)",
           "refId": "StandardVariableQuery"
         },
         "refresh": 2,
@@ -4858,12 +7385,13 @@
     ]
   },
   "time": {
-    "from": "now-15m",
+    "from": "now-6h",
     "to": "now"
   },
   "timepicker": {},
   "timezone": "",
-  "title": "YouTube scrapers \u2014 progress, failures & latency",
+  "title": "YouTube scrapers — progress, failures & latency",
   "uid": "scrape-youtube",
-  "version": 63
+  "version": 85,
+  "weekStart": ""
 }

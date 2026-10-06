@@ -67,12 +67,13 @@ class TestFetchRssLatency(unittest.IsolatedAsyncioTestCase):
     async def test_success_path_records_observation(self) -> None:
         rate_limiter: MagicMock = MagicMock()
         rate_limiter.acquire = AsyncMock(return_value=None)
+        rate_limiter.report_proxy_result = AsyncMock()
         rate_limiter.report_rss_success = MagicMock()
         with patch.object(
             yt_rss_scrape, 'METRIC_SCRAPE_DURATION',
         ) as duration, patch.object(
             yt_rss_scrape,
-            'pooled_httpx_client_for_entry',
+            'borrow_pooled_httpx_client_for_entry',
             lambda entry: _StubClient(),
         ), patch.object(
             yt_rss_scrape.YouTubeRateLimiter,
@@ -106,12 +107,13 @@ class TestFetchRssLatency(unittest.IsolatedAsyncioTestCase):
 
         rate_limiter: MagicMock = MagicMock()
         rate_limiter.acquire = AsyncMock(return_value='proxy-a')
+        rate_limiter.report_proxy_result = AsyncMock()
         rate_limiter.get_cookie_file_cached = MagicMock(return_value=None)
         rate_limiter.report_rss_success = MagicMock()
 
         with patch.object(
             yt_rss_scrape,
-            'pooled_httpx_client_for_entry',
+            'borrow_pooled_httpx_client_for_entry',
             lambda entry: _CapturingClient(),
         ), patch.object(
             yt_rss_scrape.YouTubeRateLimiter,
@@ -138,12 +140,13 @@ class TestFetchRssLatency(unittest.IsolatedAsyncioTestCase):
     async def test_failure_path_records_observation(self) -> None:
         rate_limiter: MagicMock = MagicMock()
         rate_limiter.acquire = AsyncMock(return_value=None)
+        rate_limiter.report_proxy_result = AsyncMock()
         rate_limiter.report_rss_success = MagicMock()
         with patch.object(
             yt_rss_scrape, 'METRIC_SCRAPE_DURATION',
         ) as duration, patch.object(
             yt_rss_scrape,
-            'pooled_httpx_client_for_entry',
+            'borrow_pooled_httpx_client_for_entry',
             lambda entry: _RaisingClient(),
         ), patch.object(
             yt_rss_scrape.YouTubeRateLimiter,

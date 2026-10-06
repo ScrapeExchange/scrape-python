@@ -31,6 +31,8 @@ class TestValidateSettingsRedisMode(unittest.TestCase):
         s.redis_dsn = redis_dsn
         s.channel_list = channel_list
         s.channel_data_directory = channel_data_directory
+        s.channel_priority_queues = '7:1000,365:0'
+        s.channel_priority_weights = ''
         return s
 
     def test_redis_mode_does_not_require_channel_list(
@@ -121,6 +123,22 @@ class TestValidateSettingsRedisMode(unittest.TestCase):
         )
         with self.assertRaises(SystemExit) as ctx:
             _validate_settings(settings)
+        self.assertEqual(ctx.exception.code, 1)
+
+    def test_redis_mode_rejects_bad_priority_weights(
+        self,
+    ) -> None:
+        from tools.yt_channel_scrape import _validate_settings
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings: MagicMock = self._settings(
+                redis_dsn='redis://localhost:6379/0',
+                channel_list='',
+                channel_data_directory=tmp,
+            )
+            settings.channel_priority_weights = '1,2,3'
+            with self.assertRaises(SystemExit) as ctx:
+                _validate_settings(settings)
         self.assertEqual(ctx.exception.code, 1)
 
 

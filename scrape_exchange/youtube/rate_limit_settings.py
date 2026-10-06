@@ -22,9 +22,15 @@ the 2026-05-12 rate-limit review:
 * HTML    — 9/min   (intentional anti-bot ceiling)
 * RSS     — 30/min  (raised from 9.6/min — was saturated,
   3.6s p95 sleep)
+* SEARCH  — 60/min  (InnerTube search by yt_discover_search.py;
+  ``YOUTUBE_SEARCH_PER_MIN``)
+* OVERALL — 400/min per proxy across all call types (raised
+  from 250/min on 2026-10-04: no 429s observed while the
+  per-proxy budget was ~85% used)
 
 Override any of them in production via the matching env var
-(``PLAYER_REFILL_PER_MIN`` etc.) without a code change. The
+(``PLAYER_REFILL_PER_MIN`` etc., ``YOUTUBE_OVERALL_RATE_LIMIT``
+for the overall cap) without a code change. The
 limiter reads :data:`YT_RATE_LIMITS` once at module import
 so a config change requires a restart.
 '''
@@ -109,6 +115,33 @@ class YouTubeRateLimitSettings(BaseSettings):
             '30/min (raised from 9.6/min on 2026-05-12 '
             'after diagnosing 3.6s p95 sleep was draining '
             'the keep-alive pool).'
+        ),
+    )
+    search_refill_per_min: float = Field(
+        default=60.0,
+        validation_alias=AliasChoices(
+            'YOUTUBE_SEARCH_PER_MIN',
+            'search_refill_per_min',
+        ),
+        description=(
+            'Token-bucket refill rate for InnerTube search calls '
+            '(yt_discover_search.py), in requests per minute per '
+            'proxy. Separate from browse so channel discovery '
+            'cannot use up the channel scrapers\' browse budget. '
+            'Default 60/min.'
+        ),
+    )
+    overall_refill_per_min: float = Field(
+        default=400.0,
+        validation_alias=AliasChoices(
+            'YOUTUBE_OVERALL_RATE_LIMIT',
+            'overall_refill_per_min',
+        ),
+        description=(
+            'Token-bucket refill rate of the global bucket that '
+            'caps all YouTube call types combined, in requests '
+            'per minute per proxy. Checked in addition to the '
+            'per-type buckets. Default 400/min.'
         ),
     )
 

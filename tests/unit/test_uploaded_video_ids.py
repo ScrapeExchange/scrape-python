@@ -54,8 +54,31 @@ class TestUploadedVideoIds(unittest.IsolatedAsyncioTestCase):
         await self.uploaded.add('dQw4w9WgXcQ')
         await self.uploaded.add('dQw4w9WgXcQ')
         self.assertEqual(
-            await self.redis.scard(UploadedVideoIds._KEY),
+            await self.redis.execute_command(
+                'BF.CARD', UploadedVideoIds._KEY,
+            ),
             1,
+        )
+
+    async def test_add_many_and_key_is_bloom_filter(self) -> None:
+        await self.uploaded.add_many(['aaa111bbb22', 'ccc333ddd44', ''])
+        self.assertEqual(
+            await self.uploaded.contains_many(
+                ['aaa111bbb22', 'ccc333ddd44', 'eee555fff66'],
+            ),
+            {
+                'aaa111bbb22': True, 'ccc333ddd44': True,
+                'eee555fff66': False,
+            },
+        )
+        self.assertEqual(
+            UploadedVideoIds._KEY, 'youtube:video:uploaded_bf',
+        )
+
+    async def test_add_many_empty_is_noop(self) -> None:
+        await self.uploaded.add_many([])
+        self.assertEqual(
+            await self.redis.exists(UploadedVideoIds._KEY), 0,
         )
 
     async def test_redis_error_propagates(self) -> None:
@@ -66,7 +89,7 @@ class TestUploadedVideoIds(unittest.IsolatedAsyncioTestCase):
 
 class _BrokenRedis:
 
-    async def sismember(self, key: str, member: str) -> bool:
+    async def execute_command(self, *args: object) -> object:
         raise ConnectionError('redis unavailable')
 
 

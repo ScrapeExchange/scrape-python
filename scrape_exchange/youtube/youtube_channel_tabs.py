@@ -16,16 +16,16 @@ from logging import Logger
 from logging import getLogger
 import logging
 import time
-from typing import Any, Callable, Final
+from typing import Any, Awaitable, Callable, Final
 
 import httpx
 from prometheus_client import Counter, Histogram
 
 from innertube import InnerTube
 from innertube.errors import RequestError as InnerTubeRequestError
+from innertube.locale import Locale
 
 from scrape_exchange._lazy_async_pool import _LazyAsyncPool
-from scrape_exchange.datatypes import MAX_KEEPALIVE_REQUESTS
 from scrape_exchange.proxy_loader import _POOLED_HTTPX_LIMITS
 from scrape_exchange.youtube.youtube_types import YouTubeChannelPageType
 
@@ -88,6 +88,25 @@ CHANNEL_TAB_ITEMS: Counter = Counter(
     ],
 )
 
+CHANNEL_TAB_EARLY_STOPS: Counter = Counter(
+    'channel_tab_early_stops_total',
+    'Channel tabs whose paging stopped before the last page: '
+    'reason=known (Latest order, a page held only known IDs) or '
+    'reason=limit (Oldest order, first-scrape ID cap reached).',
+    ['platform', 'scraper', 'entity', 'tab', 'reason', 'worker_id'],
+)
+
+# Returns the subset of the given video IDs that are already known
+# (on the exchange, uploaded, queued or scraped locally).
+KnownVideoIdsFn = Callable[[list[str]], Awaitable[set[str]]]
+
+# Tabs whose items can be ordered newest-first via the 'Latest' chip.
+LATEST_ORDERED_TABS: Final[frozenset[str]] = frozenset(
+    {'videos', 'shorts', 'live'},
+)
+LATEST_CHIP_TEXT: Final[str] = 'latest'
+OLDEST_CHIP_TEXT: Final[str] = 'oldest'
+
 _KNOWN_TAB_LABELS: Final[set[str]] = {
     'courses',
     'live',
@@ -120,16 +139,49 @@ def _tab_metric_base(tab: str) -> dict[str, str]:
 
 
 class YouTubeChannelTabs:
-    def __init__(self, channel_id: str, proxy: str | None = None
-                 ) -> None:
+    def __init__(
+        self, channel_id: str, proxy: str | None = None,
+        known_video_ids: KnownVideoIdsFn | None = None,
+        oldest_first_limit: int = 0,
+    ) -> None:
+        '''
+        :param known_video_ids: when set, the videos, shorts and live
+            tabs are paged in 'Latest' order and paging stops after
+            the first page whose video IDs are all known.
+        :param oldest_first_limit: when > 0, the videos, shorts and
+            live tabs are paged in 'Oldest' order and each yields at
+            most this many video IDs. Takes precedence over
+            ``known_video_ids``.
+        '''
         self.channel_id: str = channel_id
         self.proxy: str | None = (
             proxy
             or YouTubeRateLimiter.get().select_proxy(YouTubeCallType.BROWSE)
         )
-        self.client: InnerTube = self.get_innertube_client()
+        # None: every request borrows the proxy's current pooled
+        # client (see :attr:`client`). Assigning ``client`` pins one.
+        self._client: InnerTube | None = None
+        # Warm up the pooled client (cookie jar, visitor id).
+        self.get_innertube_client()
         self.client_request_count: int = 0
         self.tabs: list[dict[str, any]] = []
+        self.known_video_ids: KnownVideoIdsFn | None = known_video_ids
+        self.oldest_first_limit: int = max(0, oldest_first_limit)
+        # False when at least one tab stopped paging early, so the
+        # scraped video IDs are not the channel's full inventory.
+        self.enumeration_complete: bool = True
+
+    @property
+    def client(self) -> InnerTube:
+        '''The pinned client, else the proxy's current pooled client.'''
+
+        if self._client is not None:
+            return self._client
+        return pooled_innertube_for_entry(self.proxy)
+
+    @client.setter
+    def client(self, value: InnerTube) -> None:
+        self._client = value
 
     def get_innertube_client(self) -> InnerTube:
         '''
@@ -379,6 +431,24 @@ class YouTubeChannelTabs:
                 )
                 return video_ids, podcast_ids, set(), set(), set(), set()
 
+            latest_order: bool = False
+            id_limit: int = 0
+            if title in LATEST_ORDERED_TABS and self.oldest_first_limit:
+                id_limit = self.oldest_first_limit
+                active_page_type = 'sort'
+                contents, _ = await self._sorted_contents(
+                    page_tab, contents, metric_base, OLDEST_CHIP_TEXT,
+                )
+                active_page_type = None
+            elif self.known_video_ids and title in LATEST_ORDERED_TABS:
+                active_page_type = 'sort'
+                contents, latest_order = await self._sorted_contents(
+                    page_tab, contents, metric_base, LATEST_CHIP_TEXT,
+                )
+                active_page_type = None
+            if not contents:
+                return video_ids, set(), set(), set(), set(), set()
+
             continuation_token: str = self.get_continuation_token(
                 contents[-1],
             )
@@ -389,10 +459,16 @@ class YouTubeChannelTabs:
                 'Parsed videos or shorts',
                 extra=extra | {'contents_length': len(contents)}
             )
+            page_ids: list[str] = []
             for content in contents:
                 video_id = self._extract_video_id(content, title)
                 if video_id:
-                    video_ids.add(video_id)
+                    page_ids.append(video_id)
+            if await self._stop_after_page(
+                page_ids, video_ids, continuation_token,
+                latest_order, id_limit, metric_base, title,
+            ):
+                continuation_token = ''
 
             # Subsequent pages for one tab keep their tab-local order.
             while continuation_token:
@@ -435,12 +511,18 @@ class YouTubeChannelTabs:
                         )
                     }
                 )
+                page_ids = []
                 for item in continuation_items:
                     video_id: str | None = self._extract_video_id(
                         item, title,
                     )
                     if video_id:
-                        video_ids.add(video_id)
+                        page_ids.append(video_id)
+                if await self._stop_after_page(
+                    page_ids, video_ids, continuation_token,
+                    latest_order, id_limit, metric_base, title,
+                ):
+                    break
 
             CHANNEL_TAB_ITEMS.labels(
                 **metric_base,
@@ -461,6 +543,119 @@ class YouTubeChannelTabs:
                 **metric_base,
                 outcome=outcome,
             ).observe(time.monotonic() - started_at)
+
+    async def _sorted_contents(
+        self, page_tab: dict[str, any], contents: list,
+        metric_base: dict[str, str], chip_text: str,
+    ) -> tuple[list, bool]:
+        '''Return the tab's first page sorted by the *chip_text* chip
+        ('latest' or 'oldest').
+
+        Returns ``(contents, True)`` when that chip is already
+        selected or could be selected, and the original
+        ``(contents, False)`` when the tab has no such chip or
+        selecting it returned nothing usable.
+        '''
+
+        chips: list = page_tab.get(
+            'content', {},
+        ).get(
+            'richGridRenderer', {},
+        ).get(
+            'header', {},
+        ).get(
+            'chipBarViewModel', {},
+        ).get('chips', []) or []
+        chip_entry: dict[str, any]
+        for chip_entry in chips:
+            chip: dict[str, any] = chip_entry.get('chipViewModel') or {}
+            text: str = str(chip.get('text') or '').strip().casefold()
+            if text != chip_text:
+                continue
+            if chip.get('selected'):
+                return contents, True
+            token: str = chip.get(
+                'tapCommand', {},
+            ).get(
+                'innertubeCommand', {},
+            ).get(
+                'continuationCommand', {},
+            ).get('token', '')
+            if not token:
+                return contents, False
+            data: dict = await self._browse(continuation_token=token)
+            CHANNEL_TAB_PAGES.labels(
+                **metric_base,
+                page_type='sort',
+                outcome='success',
+            ).inc()
+            action: dict[str, any]
+            for action in data.get('onResponseReceivedActions') or []:
+                items: list = action.get(
+                    'reloadContinuationItemsCommand', {},
+                ).get('continuationItems') or []
+                if any(
+                    'richItemRenderer' in item
+                    or 'continuationItemRenderer' in item
+                    for item in items
+                ):
+                    return items, True
+            return contents, False
+        return contents, False
+
+    async def _stop_after_page(
+        self, page_ids: list[str], video_ids: set[str],
+        continuation_token: str, latest_order: bool, id_limit: int,
+        metric_base: dict[str, str], title: str,
+    ) -> bool:
+        '''Add one page's IDs to *video_ids*; True when paging stops.
+
+        With *id_limit* the page is truncated so the tab yields at
+        most that many IDs. Otherwise a 'Latest'-ordered tab stops
+        after a page whose IDs are all known.
+        '''
+
+        if id_limit:
+            new_ids: list[str] = [
+                video_id for video_id in dict.fromkeys(page_ids)
+                if video_id not in video_ids
+            ]
+            room: int = id_limit - len(video_ids)
+            video_ids.update(new_ids[:room])
+            if len(video_ids) >= id_limit and (
+                continuation_token or len(new_ids) > room
+            ):
+                self._record_early_stop(metric_base, title, 'limit')
+                return True
+            return False
+        video_ids.update(page_ids)
+        if continuation_token and latest_order and (
+            await self._page_all_known(page_ids)
+        ):
+            self._record_early_stop(metric_base, title, 'known')
+            return True
+        return False
+
+    async def _page_all_known(self, page_ids: list[str]) -> bool:
+        '''True when every video ID on a page is already known.'''
+
+        if not page_ids or self.known_video_ids is None:
+            return False
+        known: set[str] = await self.known_video_ids(page_ids)
+        return set(page_ids) <= known
+
+    def _record_early_stop(
+        self, metric_base: dict[str, str], title: str, reason: str,
+    ) -> None:
+        self.enumeration_complete = False
+        CHANNEL_TAB_EARLY_STOPS.labels(**metric_base, reason=reason).inc()
+        _LOGGER.debug(
+            'Stopped paging channel tab early',
+            extra={
+                'channel_id': self.channel_id, 'title': title,
+                'reason': reason,
+            },
+        )
 
     def _extract_video_id(self, item: dict[str, any], tab_title: str
                           ) -> str | None:
@@ -695,45 +890,28 @@ class YouTubeChannelTabs:
         }
         for attempt in range(1, max_retries + 1):
             self.client_request_count += 1
-            if self.client_request_count > MAX_KEEPALIVE_REQUESTS:
-                _LOGGER.debug(
-                    'Client request count exceeded threshold, '
-                    'creating new client',
-                    extra=extra | {
-                        'client_request_count': (
-                            self.client_request_count
-                        ),
-                    }
-                )
-                self.client = self.get_innertube_client()
 
             await limiter.acquire(YouTubeCallType.BROWSE, proxy=self.proxy)
 
+            # Borrow the current pooled generation per request so a
+            # transport error can retire it (see below) without
+            # closing it under concurrent borrowers.
+            pinned: InnerTube | None = self._client
+            client: InnerTube = (
+                pinned if pinned is not None
+                else borrow_pooled_innertube_for_entry(self.proxy)
+            )
             start: float = time.monotonic()
             try:
                 result: dict
-                if not params:
-                    if not continuation_token:
-                        result = await _call_innertube_browse(
-                            self.client.browse,
-                            self.channel_id,
-                        )
-                    else:
-                        result = await _call_innertube_browse(
-                            functools.partial(
-                                self.client.browse,
-                                self.channel_id,
-                                continuation=continuation_token,
-                            ),
-                        )
-                else:
-                    result = await _call_innertube_browse(
-                        functools.partial(
-                            self.client.browse,
-                            self.channel_id,
-                            params=params,
-                        ),
+                try:
+                    result = await self._browse_once(
+                        client, params, continuation_token,
                     )
+                finally:
+                    if pinned is None:
+                        await release_pooled_innertube(client)
+                await limiter.report_proxy_result(self.proxy, True)
                 duration: float = time.monotonic() - start
                 METRIC_YT_REQUEST_DURATION.labels(
                     platform='youtube',
@@ -799,15 +977,6 @@ class YouTubeChannelTabs:
                             'penalty_seconds': penalty,
                         },
                     )
-                    penalty = min(penalty * 2, _PENALTY_MAX)
-                    if attempt < max_retries:
-                        await AsyncYouTubeClient._delay(penalty, penalty)
-                    _LOGGER.error(
-                        'InnerTube BROWSE error',
-                        exc=exc, extra=extra | {
-                            'attempt': attempt, 'max_retries': max_retries,
-                        },
-                    )
                     if attempt < max_retries:
                         await AsyncYouTubeClient._delay(
                             penalty - 1, penalty
@@ -815,6 +984,19 @@ class YouTubeChannelTabs:
                     penalty = min(penalty * 2, _PENALTY_MAX)
             except Exception as exc:
                 Watchdog.get().touch_work()
+                if isinstance(
+                    exc, (httpx.TransportError, asyncio.TimeoutError),
+                ) and not isinstance(exc, httpx.ReadTimeout):
+                    await limiter.report_proxy_result(self.proxy, False)
+                if pinned is None and isinstance(
+                    exc, (httpx.TransportError, asyncio.TimeoutError),
+                ):
+                    # httpcore 0.16 leaves failed proxy tunnels in the
+                    # pool until it is exhausted (PoolTimeout on every
+                    # request); a fresh client drops them.
+                    await refresh_pooled_web_innertube_for_entry(
+                        self.proxy, challenged=client,
+                    )
                 duration = time.monotonic() - start
                 METRIC_YT_REQUEST_DURATION.labels(
                     platform='youtube',
@@ -847,6 +1029,29 @@ class YouTubeChannelTabs:
 
         raise RuntimeError(
             f'Failed to fetch tabbed data after {max_retries} attempts'
+        )
+
+    async def _browse_once(
+        self, client: InnerTube, params: str, continuation_token: str,
+    ) -> dict:
+        '''Run one InnerTube browse call for this channel.'''
+
+        if params:
+            return await _call_innertube_browse(
+                functools.partial(
+                    client.browse, self.channel_id, params=params,
+                ),
+            )
+        if continuation_token:
+            return await _call_innertube_browse(
+                functools.partial(
+                    client.browse,
+                    self.channel_id,
+                    continuation=continuation_token,
+                ),
+            )
+        return await _call_innertube_browse(
+            client.browse, self.channel_id,
         )
 
     async def get_page_tabs(self) -> list[dict[str, any]]:
@@ -1052,6 +1257,7 @@ def build_innertube_with_pool_limits(
     client_name: str = 'WEB',
     client_version: str = INNERTUBE_CLIENT_VERSION,
     user_agent: str | None = None,
+    locale: Locale | None = None,
 ) -> InnerTube:
     '''Construct an :class:`InnerTube` whose underlying
     ``httpx.Client`` carries our shared pool limits
@@ -1072,17 +1278,15 @@ def build_innertube_with_pool_limits(
     then closes).
     '''
 
-    if user_agent is None:
-        client: InnerTube = InnerTube(
-            client_name, client_version, proxies=entry,
-        )
-    else:
-        client = InnerTube(
-            client_name,
-            client_version,
-            user_agent=user_agent,
-            proxies=entry,
-        )
+    kwargs: dict[str, Any] = {}
+    if user_agent is not None:
+        kwargs['user_agent'] = user_agent
+    if locale is not None:
+        kwargs['locale'] = locale
+    kwargs['proxies'] = entry
+    client: InnerTube = InnerTube(
+        client_name, client_version, **kwargs,
+    )
     old_session: httpx.Client = client.adaptor.session
     client.adaptor.session = httpx.Client(
         base_url=old_session.base_url,
@@ -1161,6 +1365,62 @@ _PLAYER_INNERTUBE_POOL: _LazyAsyncPool[
     factory=_make_pooled_player_innertube_for_entry,
     aclose_attr='close',
 )
+
+
+def _make_pooled_localized_innertube_for_key(
+    key: tuple[str | None, str, str],
+) -> InnerTube:
+    '''Pool factory for country/language-scoped Web clients.
+
+    Same setup as :func:`_make_pooled_innertube_for_entry` except
+    the InnerTube context carries the requested ``gl``/``hl``
+    (:class:`Locale`) so the BROWSE/SEARCH responses are scoped to
+    that market. The locale is fixed at construction — InnerTube has
+    no per-request context override — which is why this pool is keyed
+    by ``(entry, gl, hl)`` rather than by proxy entry alone.
+    '''
+
+    entry, gl, hl = key
+    client: InnerTube = build_innertube_with_pool_limits(
+        entry, locale=Locale(hl, gl),
+    )
+    YouTubeCookieJar.get().load_into_session(
+        client.adaptor.session, entry,
+    )
+    visitor_id: str = generate_visitor_info()
+    client.adaptor.session.cookies.set(
+        'VISITOR_INFO1_LIVE', visitor_id,
+        domain='.youtube.com', path='/',
+    )
+    client.adaptor.session.headers[
+        'X-YouTube-Client-Name'
+    ] = INNERTUBE_CLIENT_NAME
+    client.adaptor.session.headers[
+        'X-YouTube-Client-Version'
+    ] = INNERTUBE_CLIENT_VERSION
+    install_innertube_phase_tracing(
+        client.adaptor.session,
+        proxy_file=proxy_file_label(entry or ''),
+    )
+    return client
+
+
+_LOCALIZED_INNERTUBE_POOL: _LazyAsyncPool[
+    tuple[str | None, str, str], InnerTube,
+] = _LazyAsyncPool(
+    factory=_make_pooled_localized_innertube_for_key,
+    aclose_attr='close',
+)
+
+
+def pooled_innertube_localized_for_entry(
+    entry: str | None, gl: str, hl: str,
+) -> InnerTube:
+    '''Return the long-lived pooled Web client scoped to the
+    ``(gl, hl)`` market. Same instance across calls for the same
+    ``(entry, gl, hl)`` key.'''
+
+    return _LOCALIZED_INNERTUBE_POOL.get((entry, gl, hl))
 
 
 def pooled_innertube_for_entry(entry: str | None) -> InnerTube:
@@ -1247,6 +1507,7 @@ async def aclose_pooled_innertube() -> None:
 
     await _INNERTUBE_POOL.aclose_all()
     await _PLAYER_INNERTUBE_POOL.aclose_all()
+    await _LOCALIZED_INNERTUBE_POOL.aclose_all()
 
 
 def _reset_pool_for_tests() -> None:
@@ -1255,3 +1516,4 @@ def _reset_pool_for_tests() -> None:
 
     _INNERTUBE_POOL.reset_for_tests()
     _PLAYER_INNERTUBE_POOL.reset_for_tests()
+    _LOCALIZED_INNERTUBE_POOL.reset_for_tests()

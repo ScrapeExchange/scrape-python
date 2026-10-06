@@ -30,7 +30,8 @@ unauthenticated browser cookies acquired via :class:`YouTubeCookieJar`
             (halved from 60/min after sustained
              HTTP 404 soft-ban pressure on
              VPN-tunneled proxies)
-    global – ~250 req/min aggregate across all types
+    global – 400 req/min aggregate across all types
+             (YOUTUBE_OVERALL_RATE_LIMIT)
             (83% of 300/min valid-context IP ceiling)
 
 :maintainer : Boinko <boinko@scrape.exchange>
@@ -40,7 +41,6 @@ unauthenticated browser cookies acquired via :class:`YouTubeCookieJar`
 
 import os
 import time
-import random
 import asyncio
 import logging
 
@@ -114,6 +114,7 @@ class YouTubeCallType(str, Enum):
     NEXT = 'next'
     HTML = 'html'
     RSS = 'rss'
+    SEARCH = 'search'
 
 
 # Per-type defaults — refill rates come from
@@ -164,12 +165,20 @@ _DEFAULT_CONFIGS: dict[YouTubeCallType, _BucketConfig] = {
         refill_rate=YT_RATE_LIMITS.rss_refill_per_min / 60,
         jitter_min=0.2, jitter_max=0.8,
     ),
+    # InnerTube search (yt_discover_search.py). Its own bucket so
+    # discovery cannot use up the channel scrapers' browse budget;
+    # still counted against the per-proxy overall cap.
+    YouTubeCallType.SEARCH: _BucketConfig(
+        burst=10,
+        refill_rate=YT_RATE_LIMITS.search_refill_per_min / 60,
+        jitter_min=0.3, jitter_max=1.2,
+    ),
 }
 
 _GLOBAL_CONFIG: _BucketConfig = _BucketConfig(
-    # ~250 req/min aggregate (83% of 300/min
-    # valid-context IP ceiling)
-    burst=20, refill_rate=250 / 60,
+    # Aggregate per-proxy cap across all call types; set via
+    # YOUTUBE_OVERALL_RATE_LIMIT (requests per minute).
+    burst=20, refill_rate=YT_RATE_LIMITS.overall_refill_per_min / 60,
     # jitter applied per-type only
     jitter_min=0.0, jitter_max=0.0,
 )
@@ -417,7 +426,7 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
 
         For non-RSS call types, delegates to the base
         implementation. For RSS, excludes proxies whose circuit
-        is currently open from the token-richness comparison. If
+        is currently open before the base selection. If
         every proxy's circuit is open, returns the one with the
         earliest reopen time so :meth:`acquire` can sleep it out.
         '''
@@ -433,25 +442,18 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
                 self._proxies,
                 key=self._proxy_timeout_open_until,
             )
-        best_tokens: float = -float('inf')
-        best: list[str] = []
-        for p in candidates:
-            tokens: float = self._backend.peek_tokens(call_type, p)
-            if tokens > best_tokens:
-                best_tokens = tokens
-                best = [p]
-            elif tokens == best_tokens:
-                best.append(p)
-        return random.choice(best)
+        return self._select_from(call_type, candidates)
 
     async def acquire(
         self,
         call_type: YouTubeCallType,
         proxy: str | None = None,
+        max_wait: float | None = None,
     ) -> str | None:
         '''
         Wait until a request of *call_type* is
         permitted, then return the selected proxy.
+        *max_wait* is passed to :meth:`RateLimiter.acquire`.
 
         For RSS acquisitions without an explicit proxy, loops
         :meth:`select_proxy` and sleeps if every proxy's circuit
@@ -465,6 +467,7 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
             and proxy is None
             and self._proxies
         ):
+            await self._health.refresh_if_stale(self._proxies)
             while True:
                 proxy = self.select_proxy(call_type)
                 open_until: float = (
@@ -488,7 +491,7 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
                 )
                 await asyncio.sleep(wait)
         return await super().acquire(
-            call_type, proxy=proxy,
+            call_type, proxy=proxy, max_wait=max_wait,
         )
 
     def get_cookie_file_cached(

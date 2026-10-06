@@ -295,19 +295,135 @@ groups:
 
       # --- FLEET-WIDE ------------------------------------------------
 
-      - alert: YtScraperSupervisorMissing
+      # Supervisors do not export scrape-able metrics; the worker
+      # series are what Prometheus actually sees, so alert when no
+      # worker of a scraper type reports anywhere in the fleet.
+      - alert: YtScraperWorkersMissing
         expr: |
-          absent(scraper_num_processes{role="supervisor",scraper="video"})
+          absent(scraper_num_processes{role="worker",scraper="video"})
           or
-          absent(scraper_num_processes{role="supervisor",scraper="rss"})
+          absent(scraper_num_processes{role="worker",scraper="rss"})
           or
-          absent(scraper_num_processes{role="supervisor",scraper="channel"})
+          absent(scraper_num_processes{role="worker",scraper="channel"})
         for: 5m
         labels:
           severity: critical
         annotations:
-          summary: "One or more YouTube scraper supervisors is missing"
+          summary: "No workers reporting for a YouTube scraper"
           description: |
-            No supervisor metrics seen for at least one scraper
-            (video, rss, or channel) in the last 5m. Process
-            died or Prometheus scrape target is unreachable.
+            No worker metrics seen anywhere in the fleet for at least
+            one scraper (video, rss, or channel) in the last 5m. All
+            its processes died or every Prometheus scrape target for
+            it is unreachable.
+
+  # --- SEARCH DISCOVERY (yt_discover_search.py) ----------------------
+  #
+  # Evidence that YouTube is rate limiting or blocking InnerTube
+  # searches. Metrics come from the youtube_discover_search job
+  # (port 9550); searches use the YOUTUBE_SEARCH_PER_MIN bucket.
+
+  - name: youtube_discover_search
+    interval: 30s
+    rules:
+
+      - alert: YtSearchRateLimited
+        expr: |
+          sum(rate(discover_search_http_errors_total{status="429"}[10m]))
+          > 0
+        for: 10m
+        labels:
+          severity: warning
+          scraper: discover
+        annotations:
+          summary: "YouTube is answering searches with HTTP 429"
+          description: |
+            {{ $value | humanize }} search requests/s rejected with
+            HTTP 429 for 10m. YouTube is rate limiting searches; lower
+            YOUTUBE_SEARCH_PER_MIN or YOUTUBE_SEARCH_CONCURRENCY.
+
+      - alert: YtSearchRateLimitedCritical
+        expr: |
+          sum(rate(discover_search_http_errors_total{status="429"}[10m]))
+          /
+          (
+            sum(rate(discover_search_pages_total{outcome="success"}[10m]))
+            +
+            sum(rate(discover_search_errors_total[10m]))
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: critical
+          scraper: discover
+        annotations:
+          summary: "Over 5% of searches rejected with HTTP 429"
+          description: |
+            {{ $value | humanizePercentage }} of search attempts got
+            HTTP 429 over 10m. Sustained 429s risk longer blocks of
+            the proxies' IPs for all YouTube scrapers; reduce
+            YOUTUBE_SEARCH_PER_MIN now.
+
+      - alert: YtSearchForbidden
+        expr: |
+          sum(rate(discover_search_http_errors_total{status="403"}[15m]))
+          > 0.01
+        for: 15m
+        labels:
+          severity: warning
+          scraper: discover
+        annotations:
+          summary: "YouTube is answering searches with HTTP 403"
+          description: |
+            {{ $value | humanize }} search requests/s rejected with
+            HTTP 403 for 15m: a block of the requesting IPs or
+            client. Check the proxy health panels for the affected
+            proxies.
+
+      - alert: YtSearchBotCheckResponses
+        expr: |
+          sum(rate(discover_search_errors_total{
+            error_type="ResponseError"
+          }[15m])) > 0.01
+        for: 15m
+        labels:
+          severity: warning
+          scraper: discover
+        annotations:
+          summary: "Search responses are not JSON (bot check / interstitial)"
+          description: |
+            {{ $value | humanize }} search responses/s were not
+            InnerTube JSON for 15m, typically a consent or bot-check
+            interstitial page. YouTube is challenging the search
+            client; reduce the search rate.
+
+      - alert: YtSearchPageFailureRatioHigh
+        expr: |
+          sum(rate(discover_search_pages_total{outcome="failed"}[20m]))
+          /
+          sum(rate(discover_search_pages_total[20m])) > 0.20
+        for: 20m
+        labels:
+          severity: warning
+          scraper: discover
+        annotations:
+          summary: "Over 20% of search pages fail after retries"
+          description: |
+            {{ $value | humanizePercentage }} of search pages failed
+            after retries over 20m. Check "Search errors /s by type":
+            RequestError/ResponseError point at YouTube throttling,
+            transport errors at proxies.
+
+      - alert: YtSearchLatencyDegraded
+        expr: |
+          histogram_quantile(0.95, sum by (le) (
+            rate(discover_search_duration_seconds_bucket[15m])
+          )) > 15
+        for: 30m
+        labels:
+          severity: warning
+          scraper: discover
+        annotations:
+          summary: "Search p95 latency above 15s"
+          description: |
+            InnerTube search p95 is {{ $value | humanize }}s (rate
+            limiter wait excluded) for 30m. Slow responses can be
+            YouTube throttling before outright 429s, or slow proxies.

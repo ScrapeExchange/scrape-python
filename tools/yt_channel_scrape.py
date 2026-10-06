@@ -21,7 +21,7 @@ import time
 
 from random import shuffle
 from pathlib import Path
-from typing import Callable
+from typing import Awaitable, Callable
 
 import aiofiles
 import httpx2 as httpx  # exchange API traffic runs on httpx2 (HTTP/2)
@@ -79,14 +79,23 @@ from scrape_exchange.watchdog import Watchdog
 from scrape_exchange.youtube.exchange_channels_set import (
     RedisExchangeChannelsSet,
 )
+from scrape_exchange.creator_queue import (
+    RedisCreatorQueue,
+    TierConfig,
+    parse_priority_queues,
+)
 from scrape_exchange.channel_scrape_queue import (
+    VIDEO_IDS_ENUMERATED_FIELD,
     ChannelScrapeProgress,
     ChannelScrapeQueueSettings,
     ChannelState,
     RedisChannelScrapeQueue,
+    parse_channel_priority_queues,
+    parse_channel_priority_weights,
 )
 from scrape_exchange.youtube.channel_video_refresh import (
     FullScrapeSummary,
+    KnownVideoIds,
     queue_channel_videos,
 )
 from scrape_exchange.youtube.settings import YouTubeScraperSettings
@@ -254,6 +263,19 @@ class ChannelSettings(YouTubeScraperSettings):
             'RSS scraper\'s RSS_PRIORITY_QUEUES, but in days.'
         ),
     )
+    channel_priority_weights: str = Field(
+        default='',
+        validation_alias=AliasChoices(
+            'CHANNEL_PRIORITY_WEIGHTS',
+            'channel_priority_weights',
+        ),
+        description=(
+            'Comma-separated weights, one per tier in '
+            'CHANNEL_PRIORITY_QUEUES, for sharing scrape capacity '
+            'between tiers with due channels. Empty (default) '
+            'weights each tier by 1/interval_days.'
+        ),
+    )
     channel_queue_resolve_batch: int = Field(default=25)
     channel_queue_scrape_batch: int = Field(default=50)
     channel_queue_idle_poll_seconds: float = Field(
@@ -317,17 +339,29 @@ class ChannelSettings(YouTubeScraperSettings):
             'channel discovery.'
         ),
     )
-    channel_discovery_min_subscribers: int = Field(
-        default=0,
+    channel_first_scrape_max_videos: int = Field(
+        default=200,
         ge=0,
         validation_alias=AliasChoices(
-            'CHANNEL_DISCOVERY_MIN_SUBSCRIBERS',
-            'channel_discovery_min_subscribers',
+            'CHANNEL_FIRST_SCRAPE_MAX_VIDEOS',
+            'channel_first_scrape_max_videos',
         ),
         description=(
-            'Featured-channel links with a known subscriber count '
-            'below this threshold are not enqueued. 0 enqueues '
-            'every linked channel.'
+            'A new channel\'s first full scrape pages the videos, '
+            'shorts and live tabs oldest-first and keeps at most this '
+            'many IDs per tab; newer videos are found by RSS and '
+            'later full scrapes. 0 pages every tab completely.'
+        ),
+    )
+    rss_priority_queues: str = Field(
+        default='1:10_000_000,4:1_000_000,12:100_000,72:10_000,168:0',
+        validation_alias=AliasChoices(
+            'RSS_PRIORITY_QUEUES', 'rss_priority_queues',
+        ),
+        description=(
+            'RSS scraper tier spec (interval_hours:min_subscribers). '
+            'Used to add a channel to the RSS queue once its first '
+            'full scrape has completed; must match the RSS scraper.'
         ),
     )
     channel_unavailable_soft_retry_seconds: int = Field(
@@ -460,6 +494,13 @@ CHANNEL_FORCE_RESCRAPE_TOTAL: Counter = Counter(
     'Forced channel re-scrape requests consumed by workers.',
     ['mode', 'outcome'],
 )
+CHANNEL_FULL_ENUMERATION: Counter = Counter(
+    'channel_full_enumeration_total',
+    'One-time full enumerations of a channel\'s videos, shorts and '
+    'live broadcasts. outcome=completed when the channel was marked '
+    'enumerated, incomplete when paging stopped early.',
+    ['outcome'],
+)
 
 
 def _validate_settings(settings: ChannelSettings) -> None:
@@ -487,6 +528,19 @@ def _validate_settings(settings: ChannelSettings) -> None:
         )
         os.makedirs(settings.channel_data_directory, exist_ok=True)
     if settings.redis_dsn:
+        try:
+            parse_channel_priority_weights(
+                settings.channel_priority_weights,
+                parse_channel_priority_queues(
+                    settings.channel_priority_queues,
+                ),
+            )
+        except ValueError as exc:
+            print(
+                f'Error: invalid CHANNEL_PRIORITY_QUEUES or '
+                f'CHANNEL_PRIORITY_WEIGHTS: {exc}'
+            )
+            sys.exit(1)
         return
     if not settings.channel_list:
         print(
@@ -596,6 +650,9 @@ async def _run_worker(
             ChannelScrapeQueueSettings(
                 channel_priority_queues=(
                     settings.channel_priority_queues
+                ),
+                channel_priority_weights=(
+                    settings.channel_priority_weights
                 ),
                 channel_queue_resolve_batch=(
                     settings.channel_queue_resolve_batch
@@ -1859,8 +1916,7 @@ async def _enqueue_discovered_channel_links(
             'link_channel_handle': link.channel_handle,
         }
         subs: int | None = link.subscriber_count
-        if (subs is not None
-                and subs < settings.channel_discovery_min_subscribers):
+        if subs is not None and subs < MIN_CHANNEL_SUBSCRIBERS:
             CHANNEL_LINK_DISCOVERY.labels(
                 outcome='below_min_subscribers',
             ).inc()
@@ -2086,6 +2142,15 @@ async def _scrape_one_queued(
                 if existence
                 else 'exchange_missing'
             )
+    needs_full_enumeration: bool = _needs_full_enumeration(
+        meta, progress,
+    )
+    if needs_full_enumeration:
+        # One exhaustive pass per channel: earlier scrapes may have
+        # stopped early (first-scrape cap, known-ID stop) and missed
+        # videos; page everything once before trusting early stops.
+        metadata_only = False
+        scrape_decision = 'full_enumeration'
     extra: dict[str, str] = {
         'channel_id': channel_id,
         'channel_handle': handle or '',
@@ -2096,6 +2161,22 @@ async def _scrape_one_queued(
     if force_mode:
         extra['force_rescrape_mode'] = force_mode
     summary: FullScrapeSummary = FullScrapeSummary(channel_id)
+    first_full_scrape: bool = (
+        not metadata_only and progress.successful_scrapes == 0
+    )
+    oldest_first_limit: int = (
+        settings.channel_first_scrape_max_videos
+        if first_full_scrape and force_mode != 'full' else 0
+    )
+    known_video_ids: KnownVideoIds | None = None
+    if not needs_full_enumeration and _allow_incremental_enumeration(
+        metadata_only=metadata_only, force_mode=force_mode,
+        progress=progress,
+    ):
+        known_video_ids = await _load_known_video_ids(
+            settings, creator_map_backend, http_client, channel_id,
+            extra,
+        )
     full_outcome: str = 'failure'
     try:
         try:
@@ -2103,6 +2184,8 @@ async def _scrape_one_queued(
                 await _do_scrape_channel_to_disk_typed(
                     settings, fm, handle, filename, extra,
                     metadata_only=metadata_only,
+                    known_video_ids=known_video_ids,
+                    oldest_first_limit=oldest_first_limit,
                 )
             )
         except TopicChannelError as exc:
@@ -2217,6 +2300,10 @@ async def _scrape_one_queued(
                 exchange_url=settings.exchange_url,
                 video_fm=AssetFileManagement(settings.video_data_directory),
                 summary=summary,
+                exchange_ids=(
+                    known_video_ids.exchange_ids
+                    if known_video_ids is not None else None
+                ),
             )
         committed: bool | None = await queue.update_tier(
             channel_id,
@@ -2228,6 +2315,17 @@ async def _scrape_one_queued(
         if committed is False:
             full_outcome = 'superseded'
             return
+        await _record_full_enumeration(
+            queue, member, meta, channel,
+            metadata_only=metadata_only,
+            needs_full_enumeration=needs_full_enumeration,
+            extra=extra,
+        )
+        if first_full_scrape:
+            # New channels join the RSS queue only now, so RSS cannot
+            # make their newest videos 'known' before the first full
+            # scrape has enumerated the back catalogue.
+            await _add_channel_to_rss_queue(settings, fm, channel, extra)
         if channel.subscriber_count is None:
             logging.info(
                 'Channel scrape completed without subscriber count; '
@@ -2658,6 +2756,8 @@ async def _try_scrape_channel_typed(
     extra: dict[str, str],
     *,
     metadata_only: bool = False,
+    known_video_ids: KnownVideoIds | None = None,
+    oldest_first_limit: int = 0,
 ) -> str | None:
     '''Run ``channel.scrape()`` and surface failures as typed
     exceptions for the queue-driven path.  Returns the proxy used
@@ -2685,6 +2785,8 @@ async def _try_scrape_channel_typed(
             proxies=settings.proxies,
             with_video_ids=not metadata_only,
             require_complete_video_ids=not metadata_only,
+            known_video_ids=known_video_ids,
+            oldest_first_limit=oldest_first_limit,
         )
     except ValueError as exc:
         logging.debug(
@@ -2793,6 +2895,187 @@ def _channel_has_no_content(
         },
     )
     return True
+
+
+_RSS_QUEUE: RedisCreatorQueue | None = None
+_RSS_TIERS: list[TierConfig] = []
+
+
+def _rss_queue_for(settings: ChannelSettings) -> RedisCreatorQueue | None:
+    '''Return the process-wide RSS queue handle (None without Redis).'''
+
+    global _RSS_QUEUE, _RSS_TIERS
+    if _RSS_QUEUE is None and settings.redis_dsn:
+        _RSS_TIERS = parse_priority_queues(settings.rss_priority_queues)
+        _RSS_QUEUE = RedisCreatorQueue(
+            settings.redis_dsn, get_worker_id(), platform='youtube',
+        )
+    return _RSS_QUEUE
+
+
+async def _add_channel_to_rss_queue(
+    settings: ChannelSettings,
+    fm: AssetFileManagement,
+    channel: YouTubeChannel,
+    extra: dict[str, str],
+) -> None:
+    '''Add a channel to the RSS queue after its first full scrape.
+
+    Best-effort: a failure is logged and the RSS scraper's startup
+    population picks the channel up later.
+    '''
+    if not channel.channel_id:
+        return
+    try:
+        rss_queue: RedisCreatorQueue | None = _rss_queue_for(settings)
+        if rss_queue is None:
+            return
+        added: bool = await rss_queue.add_creator(
+            channel.channel_id,
+            channel.channel_handle or channel.channel_id,
+            _RSS_TIERS,
+            channel.subscriber_count,
+            fm,
+        )
+    except Exception:
+        logging.warning(
+            'Failed to add channel to the RSS queue',
+            exc_info=True, extra=extra,
+        )
+        return
+    logging.debug(
+        'Added channel to the RSS queue after its first full scrape',
+        extra=extra | {'rss_added': str(added)},
+    )
+
+
+def _needs_full_enumeration(
+    meta: dict[str, str], progress: ChannelScrapeProgress,
+) -> bool:
+    '''Whether this re-scrape must page every video, short and live
+    broadcast: true until a scrape has recorded a complete
+    enumeration of the channel. A channel's first scrape keeps its
+    capped 'Oldest' enumeration.'''
+    return (
+        progress.successful_scrapes >= 1
+        and not meta.get(VIDEO_IDS_ENUMERATED_FIELD)
+    )
+
+
+async def _record_full_enumeration(
+    queue: RedisChannelScrapeQueue,
+    member: str,
+    meta: dict[str, str],
+    channel: YouTubeChannel,
+    *,
+    metadata_only: bool,
+    needs_full_enumeration: bool,
+    extra: dict[str, str],
+) -> None:
+    '''Mark the channel enumerated once a committed scrape paged
+    every tab to its end, so later re-scrapes may stop at known IDs.
+    Any complete enumeration counts, including a small channel's
+    capped first scrape that reached the end of every tab.'''
+    if metadata_only or meta.get(VIDEO_IDS_ENUMERATED_FIELD):
+        return
+    if not channel.video_ids_complete:
+        if needs_full_enumeration:
+            CHANNEL_FULL_ENUMERATION.labels(outcome='incomplete').inc()
+            logging.warning(
+                'Full enumeration stopped early; retrying on the next '
+                'scrape',
+                extra=extra,
+            )
+        return
+    await queue.set_meta(
+        member, **{VIDEO_IDS_ENUMERATED_FIELD: str(int(time.time()))},
+    )
+    if needs_full_enumeration:
+        CHANNEL_FULL_ENUMERATION.labels(outcome='completed').inc()
+        logging.info(
+            'Full enumeration of channel videos completed',
+            extra=extra | {
+                'video_ids_found': str(len(channel.video_ids)),
+            },
+        )
+
+
+def _allow_incremental_enumeration(
+    *,
+    metadata_only: bool,
+    force_mode: str | None,
+    progress: ChannelScrapeProgress,
+) -> bool:
+    '''Whether a full scrape may stop paging at already-known IDs.
+
+    Only re-scrapes of channels that completed an earlier full
+    enumeration qualify: a first scrape pages every tab so videos
+    already known from RSS or search cannot hide the back catalogue,
+    and an operator-forced full scrape always pages everything.
+    '''
+    return (
+        not metadata_only
+        and force_mode != 'full'
+        and progress.successful_scrapes >= 1
+    )
+
+
+async def _load_known_video_ids(
+    settings: ChannelSettings,
+    creator_map_backend: CreatorMap,
+    http_client: httpx.AsyncClient,
+    channel_id: str,
+    extra: dict[str, str],
+) -> KnownVideoIds | None:
+    '''Prefetch the known-ID lookup for incremental tab paging.
+
+    Returns None (page every tab) when the exchange lookup fails for
+    any reason; it is only an optimisation, so the scrape then
+    proceeds as a normal full scrape.
+    '''
+    known: KnownVideoIds = KnownVideoIds(
+        redis=creator_map_backend.redis_client,
+        http_client=http_client,
+        exchange_url=settings.exchange_url,
+        channel_id=channel_id,
+        video_fm=AssetFileManagement(settings.video_data_directory),
+    )
+    try:
+        await known.load()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logging.warning(
+            'Exchange video lookup failed; paging all channel tabs',
+            exc_info=True,
+            extra=extra,
+        )
+        return None
+    return known
+
+
+async def _merge_previous_video_ids(
+    fm: AssetFileManagement,
+    filename: str,
+    channel: YouTubeChannel,
+    exchange_ids: set[str],
+) -> None:
+    '''Restore the full video_ids list after an early-stopped scrape.
+
+    Adds the video_ids of the channel's previous file (current copy,
+    else the uploaded copy) and the exchange's IDs for the channel to
+    the newly scraped ones, so the written record stays complete.
+    '''
+    previous: set[str] = set()
+    reader: Callable[[str], Awaitable[dict]]
+    for reader in (fm.read_file, fm.read_uploaded):
+        try:
+            data: dict = await reader(filename)
+        except Exception:
+            continue
+        previous = set(data.get('video_ids') or [])
+        break
+    channel.video_ids |= previous | exchange_ids
 
 
 async def _persist_scraped_channel(
@@ -3047,6 +3330,8 @@ async def _do_scrape_channel_to_disk_typed(
     extra: dict[str, str],
     *,
     metadata_only: bool = False,
+    known_video_ids: KnownVideoIds | None = None,
+    oldest_first_limit: int = 0,
 ) -> YouTubeChannel:
     '''Typed-exception variant of
     :func:`_do_scrape_channel_to_disk` for the
@@ -3062,6 +3347,12 @@ async def _do_scrape_channel_to_disk_typed(
         skips the no-content check (an existing
         channel without new video_ids is the expected
         outcome, not a failure).
+    :param known_video_ids: when set, tab paging stops at
+        already-known IDs and the channel's earlier video_ids
+        are merged back in before the file is written.
+    :param oldest_first_limit: when > 0, tabs are paged oldest-first
+        and capped at this many IDs each (a new channel's first
+        full scrape).
 
     Raises:
         ChannelNotFoundError: channel returned 404.
@@ -3087,6 +3378,8 @@ async def _do_scrape_channel_to_disk_typed(
             await _try_scrape_channel_typed(
                 channel, settings, extra,
                 metadata_only=metadata_only,
+                known_video_ids=known_video_ids,
+                oldest_first_limit=oldest_first_limit,
             )
         )
     except ChannelNotFoundError:
@@ -3141,6 +3434,13 @@ async def _do_scrape_channel_to_disk_typed(
         raise RuntimeError(
             f'channel {channel.channel_id!r} scraped without a '
             'channel_handle',
+        )
+
+    if not channel.video_ids_complete:
+        await _merge_previous_video_ids(
+            fm, filename, channel,
+            known_video_ids.exchange_ids
+            if known_video_ids is not None else set(),
         )
 
     if not await _persist_scraped_channel(

@@ -36,9 +36,43 @@ class TestRateLimitSettingsDefaults(unittest.TestCase):
                 r.YT_RATE_LIMITS.rss_refill_per_min,
                 30.0,
             )
+            self.assertEqual(
+                r.YT_RATE_LIMITS.overall_refill_per_min,
+                400.0,
+            )
+            self.assertEqual(
+                r.YT_RATE_LIMITS.search_refill_per_min,
+                60.0,
+            )
 
 
 class TestRateLimitSettingsEnvOverride(unittest.TestCase):
+
+    def test_search_override(self) -> None:
+        with mock.patch.dict(
+            'os.environ',
+            {'YOUTUBE_SEARCH_PER_MIN': '30'},
+            clear=True,
+        ):
+            import scrape_exchange.youtube.rate_limit_settings as r
+            importlib.reload(r)
+            self.assertEqual(
+                r.YT_RATE_LIMITS.search_refill_per_min,
+                30.0,
+            )
+
+    def test_overall_override(self) -> None:
+        with mock.patch.dict(
+            'os.environ',
+            {'YOUTUBE_OVERALL_RATE_LIMIT': '320'},
+            clear=True,
+        ):
+            import scrape_exchange.youtube.rate_limit_settings as r
+            importlib.reload(r)
+            self.assertEqual(
+                r.YT_RATE_LIMITS.overall_refill_per_min,
+                320.0,
+            )
 
     def test_player_override(self) -> None:
         with mock.patch.dict(
@@ -98,6 +132,24 @@ class TestDefaultConfigsUseSettings(unittest.TestCase):
                 yrl.YouTubeCallType.BROWSE
             ].refill_rate,
             150.0 / 60,
+            places=6,
+        )
+
+    def test_overall_default_in_global_config(self) -> None:
+        import scrape_exchange.youtube.youtube_rate_limiter as yrl
+        self.assertAlmostEqual(
+            yrl._GLOBAL_CONFIG.refill_rate,
+            400.0 / 60,
+            places=6,
+        )
+
+    def test_search_default_in_configs(self) -> None:
+        import scrape_exchange.youtube.youtube_rate_limiter as yrl
+        self.assertAlmostEqual(
+            yrl._DEFAULT_CONFIGS[
+                yrl.YouTubeCallType.SEARCH
+            ].refill_rate,
+            60.0 / 60,
             places=6,
         )
 

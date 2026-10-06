@@ -130,12 +130,15 @@ class TestKeyPrefixes(_RedisQueueTestBase):
         self.assertEqual(
             await self.redis.zcard('tiktok:video:queue'), 1,
         )
+        meta: dict[str, str] = await tiktok_queue.get_meta(
+            '7000000000000000001',
+        )
+        self.assertEqual(meta['source'], 'tt')
+        bucket: str = tiktok_queue._k_qmeta('7000000000000000001')
+        self.assertTrue(bucket.startswith('tiktok:video:qmeta:'))
         self.assertEqual(
-            await self.redis.hget(
-                'tiktok:video:meta:7000000000000000001',
-                'source',
-            ),
-            'tt',
+            await self.redis.hget(bucket, '7000000000000000001'),
+            'tt|||',
         )
 
 
@@ -172,21 +175,28 @@ class TestEnqueue(_RedisQueueTestBase):
             'youtube:video:queue',
         )
         self.assertEqual(size, 1)
-        meta_source: str | None = await self.redis.hget(
-            'youtube:video:meta:dQw4w9WgXcQ', 'source',
+        meta: dict[str, str] = await self.queue.get_meta(
+            'dQw4w9WgXcQ',
         )
-        self.assertEqual(meta_source, 'rss')
+        self.assertEqual(meta['source'], 'rss')
 
     async def test_writes_meta(self) -> None:
         await self.queue.enqueue(
             'dQw4w9WgXcQ', source='rss',
         )
-        meta: dict[str, str] = await self.redis.hgetall(
-            'youtube:video:meta:dQw4w9WgXcQ',
+        meta: dict[str, str] = await self.queue.get_meta(
+            'dQw4w9WgXcQ',
         )
         self.assertEqual(meta.get('source'), 'rss')
         self.assertEqual(meta.get('state'), 'queued')
         self.assertIn('created_at', meta)
+        # No per-video meta key for a plain queued video.
+        self.assertEqual(
+            await self.redis.exists(
+                'youtube:video:meta:dQw4w9WgXcQ',
+            ),
+            0,
+        )
 
     async def test_writes_optional_channel_context(
         self,
@@ -207,10 +217,8 @@ class TestEnqueue(_RedisQueueTestBase):
             meta['channel_id'], 'UC1234567890abcdefghij',
         )
         self.assertEqual(meta['channel_handle'], 'SomeHandle')
-        self.assertEqual(
-            meta['channel_url'],
-            'https://www.youtube.com/@SomeHandle',
-        )
+        # channel_url is derivable and deliberately not stored.
+        self.assertNotIn('channel_url', meta)
         self.assertEqual(meta['channel_is_verified'], '1')
 
     async def test_omits_missing_channel_context(self) -> None:
@@ -280,12 +288,11 @@ class TestEnqueue(_RedisQueueTestBase):
             'youtube:video:failed', 'dQw4w9WgXcQ',
         )
         self.assertIsNotNone(record)
-        # meta.state must remain terminal.
-        state: str | None = await self.redis.hget(
-            'youtube:video:meta:dQw4w9WgXcQ',
-            'state',
+        # The state must remain terminal.
+        self.assertEqual(
+            await self.queue.get_state('dQw4w9WgXcQ'),
+            VideoState.FAILED,
         )
-        self.assertEqual(state, 'failed')
 
     async def test_empty_video_id_raises(self) -> None:
         with self.assertRaises(ValueError):
@@ -351,10 +358,7 @@ class TestPop(_RedisQueueTestBase):
             entry.channel.channel_id, 'UC1234567890abcdefghij',
         )
         self.assertEqual(entry.channel.channel_handle, 'SomeHandle')
-        self.assertEqual(
-            entry.channel.channel_url,
-            'https://www.youtube.com/@SomeHandle',
-        )
+        self.assertIsNone(entry.channel.channel_url)
         self.assertFalse(entry.channel.channel_is_verified)
 
 
@@ -373,6 +377,10 @@ class TestComplete(_RedisQueueTestBase):
             'youtube:video:meta:aaa',
         )
         self.assertEqual(meta_exists, 0)
+        self.assertIsNone(
+            await self.redis.hget(self.queue._k_qmeta('aaa'), 'aaa'),
+        )
+        self.assertIsNone(await self.queue.get_state('aaa'))
 
     async def test_complete_no_terminal_hash_entry(
         self,
@@ -425,10 +433,17 @@ class TestMark(_RedisQueueTestBase):
             'youtube:video:unavailable', 'aaa',
         )
         self.assertIsNotNone(record)
-        state: str | None = await self.redis.hget(
-            'youtube:video:meta:aaa', 'state',
+        self.assertEqual(
+            await self.queue.get_state('aaa'),
+            VideoState.UNAVAILABLE,
         )
-        self.assertEqual(state, 'unavailable')
+        # The bucket entry is gone; no meta hash is created.
+        self.assertIsNone(
+            await self.redis.hget(self.queue._k_qmeta('aaa'), 'aaa'),
+        )
+        self.assertEqual(
+            await self.redis.exists('youtube:video:meta:aaa'), 0,
+        )
 
     async def test_mark_preserves_channel_context(self) -> None:
         await self.queue.enqueue(
@@ -455,10 +470,7 @@ class TestMark(_RedisQueueTestBase):
             record['channel_id'], 'UC1234567890abcdefghij',
         )
         self.assertEqual(record['channel_handle'], 'SomeHandle')
-        self.assertEqual(
-            record['channel_url'],
-            'https://www.youtube.com/@SomeHandle',
-        )
+        self.assertNotIn('channel_url', record)
         self.assertEqual(record['channel_is_verified'], '1')
 
     async def test_mark_records_fields(self) -> None:
@@ -531,6 +543,8 @@ class TestTerminalMetaTtl(_RedisQueueTestBase):
 
     async def test_mark_arms_meta_ttl(self) -> None:
         await self.queue.enqueue('aaa', source='rss')
+        # Retry diagnostics create the sparse meta hash.
+        await self.queue.bump_attempts('aaa', last_error='timeout')
         await self.queue.mark(
             'aaa', state=VideoState.UNAVAILABLE,
             last_error='private',
@@ -542,9 +556,23 @@ class TestTerminalMetaTtl(_RedisQueueTestBase):
         self.assertLessEqual(
             ttl, TERMINAL_META_TTL_SECONDS,
         )
+        self.assertEqual(
+            await self.redis.hget('youtube:video:meta:aaa', 'state'),
+            'unavailable',
+        )
+
+    async def test_mark_without_diagnostics_creates_no_meta(
+        self,
+    ) -> None:
+        await self.queue.enqueue('aaa', source='rss')
+        await self.queue.mark('aaa', state=VideoState.FAILED)
+        self.assertEqual(
+            await self.redis.exists('youtube:video:meta:aaa'), 0,
+        )
 
     async def test_queued_meta_has_no_ttl(self) -> None:
         await self.queue.enqueue('aaa', source='rss')
+        await self.queue.bump_attempts('aaa', last_error='timeout')
         ttl: int = await self.redis.ttl(
             'youtube:video:meta:aaa',
         )
@@ -552,6 +580,7 @@ class TestTerminalMetaTtl(_RedisQueueTestBase):
 
     async def test_unmark_persists_meta(self) -> None:
         await self.queue.enqueue('aaa', source='rss')
+        await self.queue.bump_attempts('aaa', last_error='timeout')
         await self.queue.mark(
             'aaa', state=VideoState.FAILED,
         )
@@ -559,7 +588,10 @@ class TestTerminalMetaTtl(_RedisQueueTestBase):
         state: str | None = await self.redis.hget(
             'youtube:video:meta:aaa', 'state',
         )
-        self.assertEqual(state, 'queued')
+        self.assertIsNone(state)
+        self.assertEqual(
+            await self.queue.get_state('aaa'), VideoState.QUEUED,
+        )
         ttl: int = await self.redis.ttl(
             'youtube:video:meta:aaa',
         )
@@ -569,6 +601,7 @@ class TestTerminalMetaTtl(_RedisQueueTestBase):
         self,
     ) -> None:
         await self.queue.enqueue('aaa', source='rss')
+        await self.queue.bump_attempts('aaa', last_error='timeout')
         await self.queue.mark(
             'aaa', state=VideoState.REMOVED,
         )
@@ -600,10 +633,10 @@ class TestUnmark(_RedisQueueTestBase):
             'youtube:video:queue', 'aaa',
         )
         self.assertIsNotNone(score)
-        state: str | None = await self.redis.hget(
-            'youtube:video:meta:aaa', 'state',
-        )
-        self.assertEqual(state, 'queued')
+        meta: dict[str, str] = await self.queue.get_meta('aaa')
+        self.assertEqual(meta['state'], 'queued')
+        # The terminal record's context survives the round trip.
+        self.assertEqual(meta['source'], 'rss')
 
     async def test_unmark_clears_all_terminal(
         self,
@@ -651,9 +684,7 @@ class TestForceEnqueue(_RedisQueueTestBase):
             'youtube:video:queue', 'aaa',
         )
         self.assertIsNotNone(score)
-        meta: dict[str, str] = await self.redis.hgetall(
-            'youtube:video:meta:aaa',
-        )
+        meta: dict[str, str] = await self.queue.get_meta('aaa')
         self.assertEqual(meta.get('state'), 'queued')
         self.assertEqual(meta.get('force'), '1')
         self.assertEqual(meta.get('source'), 'cli')
@@ -677,11 +708,11 @@ class TestForceEnqueue(_RedisQueueTestBase):
             'youtube:video:queue', 'aaa',
         )
         self.assertIsNotNone(score)
-        meta: dict[str, str] = await self.redis.hgetall(
-            'youtube:video:meta:aaa',
-        )
+        meta: dict[str, str] = await self.queue.get_meta('aaa')
         self.assertEqual(meta.get('state'), 'queued')
         self.assertEqual(meta.get('force'), '1')
+        # The original source survives the revive.
+        self.assertEqual(meta.get('source'), 'rss')
 
     async def test_terminal_revive_updates_channel_context(
         self,
@@ -704,10 +735,7 @@ class TestForceEnqueue(_RedisQueueTestBase):
             meta['channel_id'], 'UC1234567890abcdefghij',
         )
         self.assertEqual(meta['channel_handle'], 'ForcedHandle')
-        self.assertEqual(
-            meta['channel_url'],
-            'https://www.youtube.com/@ForcedHandle',
-        )
+        self.assertNotIn('channel_url', meta)
         self.assertEqual(meta['channel_is_verified'], '1')
 
     async def test_queued_waiting_sets_force(self) -> None:

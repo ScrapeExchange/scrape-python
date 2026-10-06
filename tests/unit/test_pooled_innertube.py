@@ -8,6 +8,7 @@ from scrape_exchange.youtube.youtube_channel_tabs import (
     aclose_pooled_innertube,
     build_innertube_with_pool_limits,
     pooled_innertube_for_entry,
+    pooled_innertube_localized_for_entry,
     pooled_player_innertube_for_entry,
 )
 
@@ -42,6 +43,63 @@ class TestPooledInnerTube(unittest.IsolatedAsyncioTestCase):
             '2.20260708.00.00',
             proxies=None,
         )
+
+    def test_localized_factory_passes_locale(self) -> None:
+        from innertube.locale import Locale
+
+        old_session: MagicMock = MagicMock()
+        old_session.headers = {}
+        client: MagicMock = MagicMock(
+            adaptor=MagicMock(session=old_session),
+        )
+        with patch.object(
+            youtube_channel_tabs,
+            'InnerTube',
+            return_value=client,
+        ) as innertube_type, patch.object(
+            youtube_channel_tabs.httpx,
+            'Client',
+            return_value=MagicMock(),
+        ), patch.object(
+            youtube_channel_tabs.YouTubeCookieJar, 'get',
+            return_value=MagicMock(load_into_session=MagicMock()),
+        ), patch.object(
+            youtube_channel_tabs, 'generate_visitor_info',
+            return_value='visitor',
+        ), patch.object(
+            youtube_channel_tabs, 'install_innertube_phase_tracing',
+        ):
+            pooled_innertube_localized_for_entry(None, 'IN', 'hi')
+
+        innertube_type.assert_called_once_with(
+            'WEB',
+            '2.20260708.00.00',
+            locale=Locale('hi', 'IN'),
+            proxies=None,
+        )
+
+    async def test_localized_pool_keys_by_market(self) -> None:
+        created: dict = {}
+
+        def _factory(key: object) -> MagicMock:
+            created.setdefault(key, MagicMock())
+            return created[key]
+
+        with patch.object(
+            youtube_channel_tabs,
+            '_make_pooled_localized_innertube_for_key',
+            side_effect=_factory,
+        ), patch.object(
+            youtube_channel_tabs._LOCALIZED_INNERTUBE_POOL,
+            'factory',
+            _factory,
+        ):
+            first = pooled_innertube_localized_for_entry(None, 'IN', 'hi')
+            again = pooled_innertube_localized_for_entry(None, 'IN', 'hi')
+            other = pooled_innertube_localized_for_entry(None, 'US', 'en')
+
+        self.assertIs(first, again)
+        self.assertIsNot(first, other)
 
     async def test_same_entry_returns_same_instance(self) -> None:
         with patch.object(

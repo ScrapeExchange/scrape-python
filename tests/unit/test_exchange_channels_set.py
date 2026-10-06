@@ -62,8 +62,8 @@ class TestRedisExchangeChannelsSet(
     async def test_contains_many_before_add_is_all_false(
         self,
     ) -> None:
-        '''Cold-start scenario: the SET key has never been
-        written, so SISMEMBER returns False for every
+        '''Cold-start scenario: the filter has never been
+        written, so BF.MEXISTS returns False for every
         handle.'''
         result: dict[str, bool] = (
             await self.s.contains_many(
@@ -78,7 +78,7 @@ class TestRedisExchangeChannelsSet(
         self,
     ) -> None:
         '''Adding the same handle twice does not change the
-        SET cardinality.'''
+        filter's cardinality.'''
         await self.s.add_many(['alpha', 'bravo'])
         await self.s.add_many(['alpha'])
         self.assertEqual(await self.s.size(), 2)

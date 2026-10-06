@@ -371,7 +371,15 @@ class InnerTubeVideoParser:
     @staticmethod
     async def scrape(video: YouTubeVideo, innertube: InnerTube | None = None,
                      proxy: str | None = None,
-                     max_retries: int = 4) -> None:
+                     max_retries: int = 4,
+                     max_rate_limit_wait: float | None = None) -> None:
+        '''Scrape *video* via InnerTube player + next.
+
+        :param max_rate_limit_wait: passed to the rate limiter as
+            ``max_wait``; a token wait longer than this raises
+            :class:`RateLimitWaitExceeded` so the caller can switch
+            proxy.
+        '''
         self = InnerTubeVideoParser(video, innertube, proxy)
         limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
 
@@ -383,7 +391,8 @@ class InnerTubeVideoParser:
         player_client: InnerTube | None = None
         for attempt in range(1, max_retries + 1):
             proxy = await limiter.acquire(
-                YouTubeCallType.PLAYER, proxy=proxy
+                YouTubeCallType.PLAYER, proxy=proxy,
+                max_wait=max_rate_limit_wait,
             )
             proxy_ip: str = (
                 extract_proxy_ip(proxy) if proxy else 'none'
@@ -491,6 +500,10 @@ class InnerTubeVideoParser:
                         f'InnerTube API call failed: {exc}'
                     )
             except Exception as exc:
+                if isinstance(exc, httpx.TransportError) and not (
+                    isinstance(exc, httpx.ReadTimeout)
+                ):
+                    await limiter.report_proxy_result(proxy, False)
                 if borrowed_player and isinstance(
                     exc, httpx.TransportError
                 ):
@@ -533,6 +546,10 @@ class InnerTubeVideoParser:
             proxy_file=proxy_file,
         )
         if _classify_player_reason(player_data) == 'client_block':
+            # A bot check is YouTube blocking this proxy's IP: count it
+            # as a proxy failure so proxy health moves traffic away
+            # from IPs that keep getting challenged.
+            await limiter.report_proxy_result(proxy, False)
             await limiter.penalise(
                 YouTubeCallType.PLAYER,
                 proxy,
@@ -552,11 +569,15 @@ class InnerTubeVideoParser:
                 f'YouTube bot detection triggered for '
                 f'video_id={video.video_id}'
             )
+        await limiter.report_proxy_result(proxy, True)
         InnerTubeVideoParser._apply_player_data(video, player_data)
 
         _next_penalty: float = _PLAYER_PENALTY_INITIAL
         for attempt in range(1, max_retries + 1):
-            await limiter.acquire(YouTubeCallType.NEXT, proxy=proxy)
+            await limiter.acquire(
+                YouTubeCallType.NEXT, proxy=proxy,
+                max_wait=max_rate_limit_wait,
+            )
             next_start: float = time.monotonic()
             borrowed_next: bool = self.next_innertube is None
             next_client: InnerTube = (
@@ -574,6 +595,7 @@ class InnerTubeVideoParser:
                 finally:
                     if borrowed_next:
                         await release_pooled_innertube(next_client)
+                await limiter.report_proxy_result(proxy, True)
                 duration = time.monotonic() - next_start
                 METRIC_YT_REQUEST_DURATION.labels(
                     platform='youtube',
@@ -651,6 +673,10 @@ class InnerTubeVideoParser:
                 else:
                     break  # non-429 error on NEXT: skip silently
             except Exception as exc:
+                if isinstance(exc, httpx.TransportError) and not (
+                    isinstance(exc, httpx.ReadTimeout)
+                ):
+                    await limiter.report_proxy_result(proxy, False)
                 if borrowed_next and isinstance(
                     exc, httpx.TransportError
                 ):

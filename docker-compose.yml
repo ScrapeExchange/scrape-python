@@ -62,6 +62,29 @@ services:
 #    command:
 #      - --redis.addr=redis://:topsecret@redis:6379
 
+# Uncomment the mongodb section to run a MongoDB server on your host for
+# the video scrape queue backlog (MONGO_DSN). The root user is created
+# on the first start, when /var/tmp/scrape-mongodb is still empty.
+# mongo:8.x refuses to start on Linux kernels 6.19 and newer
+# (SERVER-121912); mongo:7 does not have that restriction.
+#  mongodb:
+#    container_name: "mongodb"
+#    image: "mongo:7"
+#    ports:
+#      - 27017:27017/tcp
+#    restart: "unless-stopped"
+#    environment:
+#      - MONGO_INITDB_ROOT_USERNAME=root
+#      - MONGO_INITDB_ROOT_PASSWORD=<changeme>    # not committed
+#    volumes:
+#      - type: bind
+#        source: /var/tmp/scrape-mongodb
+#        target: /data/db
+#        bind:
+#          create_host_path: true
+#    command: ["mongod", "--wiredTigerCacheSizeGB", "4",
+#              "--maxConns", "1000"]
+
   yt-video:
     <<: *scraper-common
     command: ["tools/yt_video_scrape.py"]
@@ -86,18 +109,25 @@ services:
     init: true
     command:
       - tools/yt_discover_search.py
-      - --proxy-files
-      - /data/proxies/vpn.proxies.lst
-      - --keyword-count
-      - "360000"
       - --pid-file
       - /run/discovery/yt_discover_search.pid
-      - --output-file
-      - /data/discovery/searched_channels.jsonl
       - --log-file
-      - /dev/stdout
+      - /var/log/scrape/yt_discover_search.log
       - --youtube-search-concurrency
       - "2"
+      # Market x term popularity-scoped pass: sorts search results by
+      # view count per country to enumerate the highest-subscriber
+      # channels (the retired trending feed's replacement).
+      - --discover-markets
+      - >-
+        IN:hi,US:en,BR:pt,ID:id,MX:es,RU:ru,TR:tr,EG:ar,SA:ar,KR:ko,
+        JP:ja,PH:fil,VN:vi,TH:th,PK:ur,BD:bn,NG:en,DE:de,GB:en,FR:fr,
+        IT:it,ES:es,AR:es,CO:es,PL:pl,UA:uk,DZ:ar,MA:ar,IQ:ar,TW:zh-TW
+      - --discover-popular-continuations
+      - "5"
+      - --discover-source
+      - discovered_popular
+
     # Clear the PID file on restart; container PIDs can be reused.
     tmpfs:
       - /run/discovery
@@ -113,6 +143,14 @@ services:
         target: /data/discovery
         bind:
           create_host_path: false
+
+  # Keeps the Redis hot window of the video queue filled from the
+  # MongoDB backlog (needs MONGO_DSN). Run on exactly one host.
+  yt-video-queue-refill:
+    <<: *scraper-common
+    profiles: ["refill"]
+    command: ["tools/yt_video_queue_refill.py", "--platform", "youtube"]
+    container_name: yt-video-queue-refill
 
   tt-creator:
     <<: *scraper-common

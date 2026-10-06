@@ -58,11 +58,12 @@ class TestFetchRssTimeout(unittest.IsolatedAsyncioTestCase):
 
         rate_limiter: MagicMock = MagicMock()
         rate_limiter.acquire = AsyncMock(return_value=None)
+        rate_limiter.report_proxy_result = AsyncMock()
         rate_limiter.report_rss_success = MagicMock()
 
         with patch.object(
             yt_rss_scrape,
-            'pooled_httpx_client_for_entry',
+            'borrow_pooled_httpx_client_for_entry',
             lambda entry: _StubClient(),
         ), patch.object(
             yt_rss_scrape.YouTubeRateLimiter,
@@ -101,6 +102,7 @@ class TestFetchRssTimeoutCircuitWiring(
     ) -> MagicMock:
         rate_limiter: MagicMock = MagicMock()
         rate_limiter.acquire = AsyncMock(return_value=None)
+        rate_limiter.report_proxy_result = AsyncMock()
         rate_limiter.report_rss_success = MagicMock()
         rate_limiter.report_rss_failure = MagicMock()
         rate_limiter.report_rss_timeout = MagicMock()
@@ -113,7 +115,7 @@ class TestFetchRssTimeoutCircuitWiring(
 
         with patch.object(
             yt_rss_scrape,
-            'pooled_httpx_client_for_entry',
+            'borrow_pooled_httpx_client_for_entry',
             lambda entry: _RaisingClient(),
         ), patch.object(
             yt_rss_scrape.YouTubeRateLimiter,
@@ -168,6 +170,65 @@ class TestFetchRssTimeoutCircuitWiring(
         self.assertEqual(
             rate_limiter.report_rss_timeout.call_count, 0,
         )
+
+
+class TestFetchRssRetiresPooledClient(unittest.IsolatedAsyncioTestCase):
+    '''Connection-establishment failures retire the pooled feed client
+    generation so leaked proxy tunnels cannot exhaust its pool; read
+    timeouts keep the healthy keep-alive client.'''
+
+    async def _run(self, exc: BaseException) -> AsyncMock:
+        rate_limiter: MagicMock = MagicMock()
+        rate_limiter.acquire = AsyncMock(return_value='http://p.test:3128')
+        rate_limiter.report_proxy_result = AsyncMock()
+        rate_limiter.report_rss_timeout = MagicMock()
+
+        class _RaisingClient:
+            async def get(self, url: str, **kwargs: object) -> None:
+                raise exc
+
+        client: _RaisingClient = _RaisingClient()
+        retire: AsyncMock = AsyncMock(return_value=True)
+        release: AsyncMock = AsyncMock()
+        with patch.object(
+            yt_rss_scrape, 'borrow_pooled_httpx_client_for_entry',
+            lambda entry: client,
+        ), patch.object(
+            yt_rss_scrape, 'release_pooled_httpx_client', release,
+        ), patch.object(
+            yt_rss_scrape, 'retire_pooled_httpx_client', retire,
+        ), patch.object(
+            yt_rss_scrape, 'jitter_pool_warmup', AsyncMock(),
+        ), patch.object(
+            yt_rss_scrape.YouTubeRateLimiter, 'get',
+            return_value=rate_limiter,
+        ):
+            with self.assertRaises(Exception):
+                await yt_rss_scrape.fetch_rss(
+                    rss_url=(
+                        'https://example/feeds/videos.xml?channel_id=UC0'
+                    ),
+                    channel_handle='Test',
+                )
+        release.assert_awaited_once_with(client)
+        retire.client = client
+        return retire
+
+    async def test_connection_failures_retire(self) -> None:
+        exc: BaseException
+        for exc in (
+            httpx.PoolTimeout('pool'), httpx.ConnectError('down'),
+            httpx.ConnectTimeout('slow'), httpx.ProxyError('proxy'),
+        ):
+            with self.subTest(exc=type(exc).__name__):
+                retire: AsyncMock = await self._run(exc)
+                retire.assert_awaited_once_with(
+                    'http://p.test:3128', expected=retire.client,
+                )
+
+    async def test_read_timeout_keeps_client(self) -> None:
+        retire: AsyncMock = await self._run(httpx.ReadTimeout('read'))
+        retire.assert_not_awaited()
 
 
 if __name__ == '__main__':

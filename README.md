@@ -30,9 +30,17 @@ In addition to the scraping tools, there is also a websocket listener tool that 
 The fastest way to get started with scraping and uploading data
 is using Docker Compose, which can run all scrapers, their uploaders
 and the YouTube PO token provider in containers. The scrapers
-require a Redis instance for scrape queues, identity
-maps, rate-limiter state, and uploaded-content tracking.
-All cross-tool coordination goes through Redis.
+require two servers:
+
+- **Redis** for scrape queues, identity maps, rate-limiter
+  state, and uploaded-content tracking. All cross-tool
+  coordination goes through Redis.
+- **MongoDB** (7.x) for the video scrape queue backlog. The
+  channel and RSS scrapers discover videos far faster than
+  they can be scraped; MongoDB holds every known video while
+  Redis keeps only the next batch the video scrapers work
+  on. Without `MONGO_DSN` the whole video queue lives in
+  Redis, which only fits smaller deployments.
 
 1. Create an account on the [scrape.exchange](https://scrape.exchange) and get your API key from your account settings page.
 2. You need a Linux machine that has docker and docker-compose installed, as well as the Python package management tool UV:
@@ -62,6 +70,8 @@ cp .env-example .env
 
 4. If you do not have a Redis instance running, you can uncomment the Redis section in docker-compose.yml to run a Redis container alongside the scrapers. If you have a Redis instance running on the host or on another machine, you can leave the Redis section commented out and set `REDIS_DSN` in your `.env` file to point at that instance.
 
+   Do the same for MongoDB: uncomment the MongoDB section in docker-compose.yml (replace `<changeme>` with a password first), or use an existing MongoDB 7.x server. Then set `MONGO_DSN` in your `.env` file, for example `MONGO_DSN=mongodb://root:<password>@127.0.0.1:27017/scraper?authSource=admin&maxPoolSize=10`. The scrapers create their collections and indexes in the database named in the DSN (`scraper` here). Set `MONGO_DSN` on every host that runs a YouTube or TikTok scraper or uploader, or on none of them.
+
 5. Copy docker-compose.override.yml-example to docker-compose.override.yml and edit it to map the host directories you created above into the containers.
 
 6. Start all services
@@ -73,6 +83,8 @@ docker compose --profile scrape-upload up -d
 This starts the services defined in `docker-compose.yml`:
 - **po-token-provider** — generates PO tokens used by   both InnerTube and yt-dlp to look like a real browser
 - **redis** — optional Redis instance for scrape queues, identity maps, rate-limiter state, and uploaded-content tracking
+- **mongodb** — optional MongoDB instance for the video scrape queue backlog
+- **yt-video-queue-refill** — keeps the Redis part of the video queue filled from the MongoDB backlog (profile `refill`; run it on exactly one host)
 - **yt-channel** — scrapes YouTube channel metadata (about page, video/playlist/podcast/courses/store/community tabs) via the InnerTube API
 - **yt-rss** — polls each YouTube channel's RSS feed for new videos and writes lite channel-stat records for the channel uploader
 - **yt-video** — scrapes per-video metadata via InnerTube by default. Set `VIDEO_USE_YT_DLP=true` to additionally run yt-dlp for additional formats, captions, heatmaps, etc.
@@ -84,8 +96,11 @@ This starts the services defined in `docker-compose.yml`:
  You can start individual services instead of the full fleet:
 
 ```bash
-# If you have uncommented the Redis section in docker-compose.yml, you can start the Redis service:
-docker compose up -d redis
+# If you have uncommented the Redis and MongoDB sections in docker-compose.yml, start them first:
+docker compose up -d redis mongodb
+
+# Keep the video queue filled from MongoDB (on one host only)
+docker compose --profile refill up -d yt-video-queue-refill
 
 # Start only the YouTube channel scraper and its dependency and the uploader
 docker compose up -d po-token-provider yt-channel scrape-upload
@@ -116,8 +131,9 @@ container filesystem, which means data is lost when the
 container is removed. To persist data on your host, you
 need to mount host directories as volumes. Nearly all cross-
 tool coordination state (queues, identity maps, rate
-limiter, no-feeds, uploaded-video IDs) lives in Redis
-and does not need a host mount.
+limiter, no-feeds, uploaded-video IDs) lives in Redis,
+and the video queue backlog lives in MongoDB; neither
+needs a host mount for the scrapers.
 
 The containers expect data in these paths:
 
@@ -143,9 +159,9 @@ is included as `docker-compose.override.yml-example`:
 cp docker-compose.override.yml-example docker-compose.override.yml
 ```
 
-The override file is also a good place to add a Redis
-service if you want everything self-contained on one
-host:
+The override file is also a good place to add Redis and
+MongoDB services if you want everything self-contained on
+one host:
 ```yaml
 x-data-volumes: &data-volumes
   - type: bind
@@ -209,6 +225,17 @@ services:
     volumes:
       - ./data/redis:/data
 
+  mongodb:
+    image: mongo:7
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+    command: ["mongod", "--wiredTigerCacheSizeGB", "4", "--maxConns", "1000"]
+    volumes:
+      - ./data/mongodb:/data/db
+
   yt-video:
     volumes: *data-volumes
   yt-video-upload:
@@ -234,6 +261,18 @@ With Redis on the same host, set
 For a remote Redis, point `REDIS_DSN` at the host
 that runs it and omit the `redis` service from the
 override.
+
+For MongoDB on the same host, set `MONGO_ROOT_PASSWORD` and
+`MONGO_DSN=mongodb://root:<password>@127.0.0.1:27017/scraper?authSource=admin&maxPoolSize=10`
+in your `.env`. The root user is only created on the first
+start, while `./data/mongodb` is still empty. MongoDB needs
+about 120 bytes of disk per known video, data plus indexes
+(roughly 20 GB for 170 million videos), and works best when its
+cache (`--wiredTigerCacheSizeGB`) can hold the indexes, which
+are about two thirds of that. Keep `maxPoolSize` in the DSN
+small: every scraper process opens its own connection pool,
+and `--maxConns` caps the total. Don't expose port 27017 to
+the internet; reach a remote MongoDB over a VPN or SSH tunnel.
 
 You can also use the override file to tune parallelism
 per service:
@@ -270,9 +309,10 @@ As you can see from the contents of the `.env` file, there
 are many configuration options available for the scrapers,
 but you can get started with changing just a few of them.
 The required settings are the Scrape.Exchange API key
-(`API_KEY_ID`, `API_KEY_SECRET`) and the Redis DSN
-(`REDIS_DSN`). The data directories are handled by the
-container configuration automatically. The other settings
+(`API_KEY_ID`, `API_KEY_SECRET`), the Redis DSN
+(`REDIS_DSN`) and the MongoDB DSN (`MONGO_DSN`). The data
+directories are handled by the container configuration
+automatically. The other settings
 can be left at their default values for now, and you can
 adjust them later as you become more familiar with the
 scrapers and based on your specific use case.

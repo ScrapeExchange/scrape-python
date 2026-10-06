@@ -60,13 +60,14 @@ class TestExpiredVideoMetadata(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(
             await self.redis.hexists('youtube:video:failed', 'old-video'),
         )
+        # created_at comes from the queue score while waiting.
+        meta: dict[str, str] = await self.queue.get_meta('old-video')
+        self.assertEqual(meta.get('source'), 'cli')
+        self.assertIsNotNone(meta.get('created_at'))
         self.assertEqual(await self.queue.pop(1), ['old-video'])
         self.assertEqual(
             await self.queue.get_state('old-video'), VideoState.QUEUED,
         )
-        meta: dict[str, str] = await self.queue.get_meta('old-video')
-        self.assertEqual(meta.get('source'), 'cli')
-        self.assertIsNotNone(meta.get('created_at'))
 
 
 if __name__ == '__main__':

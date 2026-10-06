@@ -8,6 +8,8 @@ FileChannelScrapeQueue is planned for v2.
 
 import enum
 import json
+import math
+import random
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -22,6 +24,12 @@ from pydantic_settings import (
 
 
 KEY_PREFIX: str = 'youtube:channel'
+
+# Channel meta field set (to a unix timestamp) once a scrape has paged
+# every video, short and live broadcast of the channel to the end.
+# Until it is set, every re-scrape pages all tabs without stopping at
+# already-known IDs; afterwards re-scrapes may stop early.
+VIDEO_IDS_ENUMERATED_FIELD: str = 'video_ids_enumerated_at'
 
 
 @dataclass(frozen=True)
@@ -90,6 +98,36 @@ class ChannelTierConfig:
     interval_seconds: int
 
 
+def awaiting_first_full_scrape(
+    state: str | None,
+    successful_scrapes: str | None,
+    last_attempt_at: str | None,
+) -> bool:
+    '''
+    Whether a channel known to the channel queue has not completed a
+    first full scrape, from its meta hash fields.
+
+    ``successful_scrapes == '0'`` means the scrape-progress counter was
+    initialised but no scrape completed. A missing counter with a
+    recorded attempt is a channel scraped before progress tracking
+    existed, when every scrape enumerated the whole channel, so it
+    counts as fully scraped. A channel without a meta hash (*state* is
+    None) is unknown to the channel queue and returns False.
+
+    :param state: the meta ``state`` field
+    :param successful_scrapes: the meta ``successful_scrapes`` field
+    :param last_attempt_at: the meta ``last_attempt_at`` field
+    :returns: True when the first full scrape is still outstanding
+    :raises: (none)
+    '''
+
+    if state is None:
+        return False
+    if successful_scrapes is None:
+        return last_attempt_at is None
+    return successful_scrapes == '0'
+
+
 def parse_channel_priority_queues(
     spec: str,
 ) -> list[ChannelTierConfig]:
@@ -145,6 +183,54 @@ def parse_channel_priority_queues(
             f'{tiers[-1].min_subscribers}',
         )
     return tiers
+
+
+def parse_channel_priority_weights(
+    spec: str,
+    tiers: list[ChannelTierConfig],
+) -> list[float]:
+    '''Parse the per-tier pop weights for ``pop_scheduled``.
+
+    *spec* is a comma-separated list of positive numbers, one per
+    tier in *tiers*, e.g. ``'10,5,2,1,0.5,0.1'``. An empty *spec*
+    defaults every tier to ``1 / interval_days``, so tiers that
+    must be refreshed more often get a larger share of the scrape
+    capacity. Tiers with the ``-1`` no-respawn interval default to
+    weight ``1.0``.
+
+    :raises ValueError: when the number of weights does not match
+        the number of tiers or a weight is not a positive number.
+    '''
+
+    if not spec.strip():
+        return [
+            86400 / tier.interval_seconds
+            if tier.interval_seconds > 0 else 1.0
+            for tier in tiers
+        ]
+    parts: list[str] = [part.strip() for part in spec.split(',')]
+    if len(parts) != len(tiers):
+        raise ValueError(
+            f'channel_priority_weights has {len(parts)} weights '
+            f'but channel_priority_queues defines {len(tiers)} '
+            f'tiers',
+        )
+    weights: list[float] = []
+    part: str
+    for part in parts:
+        try:
+            weight: float = float(part)
+        except ValueError as exc:
+            raise ValueError(
+                f'Invalid channel priority weight {part!r}',
+            ) from exc
+        if not math.isfinite(weight) or weight <= 0:
+            raise ValueError(
+                f'Channel priority weight must be a finite number '
+                f'> 0, got {part!r}',
+            )
+        weights.append(weight)
+    return weights
 
 
 _POP_SCHEDULED_LUA: str = '''
@@ -335,6 +421,39 @@ return 1
 '''
 
 
+_ENQUEUE_NEW_LUA: str = '''
+-- KEYS[1] = meta hash
+-- KEYS[2] = target scheduled queue
+-- ARGV[1] = member
+-- ARGV[2] = score
+-- ARGV[3] = channel_id
+-- ARGV[4] = source
+-- ARGV[5] = created_at
+-- ARGV[6] = initial state
+-- ARGV[7..] = terminal state values
+-- Enqueue only a channel the queue has never seen. Any meta hash
+-- means it is already queued, being scraped (popped from its zset),
+-- pending, or terminal; none of those may be touched by discovery.
+local state = redis.call('HGET', KEYS[1], 'state')
+if state then
+    for i = 7, #ARGV do
+        if state == ARGV[i] then
+            return 'terminal'
+        end
+    end
+    return 'known'
+end
+if redis.call('EXISTS', KEYS[1]) == 1 then
+    return 'known'
+end
+redis.call('ZADD', KEYS[2], 'NX', ARGV[2], ARGV[1])
+redis.call('HSET', KEYS[1],
+    'channel_id', ARGV[3], 'source', ARGV[4],
+    'created_at', ARGV[5], 'state', ARGV[6])
+return 'enqueued'
+'''
+
+
 class ChannelState(str, enum.Enum):
     PENDING_RESOLUTION = 'pending_resolution'
     SCHEDULED = 'scheduled'
@@ -390,6 +509,15 @@ class ChannelScrapeQueueSettings(BaseSettings):
             'successful scrape. The last tier must have '
             'min_subscribers=0 (catch-all). Mirrors the '
             'RSS scraper\'s RSS_PRIORITY_QUEUES, but in days.'
+        ),
+    )
+    channel_priority_weights: str = Field(
+        default='',
+        description=(
+            'Comma-separated pop weights, one per tier in '
+            'channel_priority_queues. Each pop picks a tier with '
+            'due channels with probability proportional to its '
+            'weight. Empty means 1/interval_days per tier.'
         ),
     )
     channel_queue_resolve_batch: int = Field(default=25)
@@ -454,6 +582,16 @@ class ChannelScrapeQueue(ABC):
     ) -> bool:
         '''Enqueue for scheduled scraping; ``False`` when the member
         sits in a terminal state and was left alone.'''
+
+    @abstractmethod
+    async def enqueue_new(
+        self,
+        channel_id: str,
+        *,
+        source: str,
+    ) -> str:
+        '''Enqueue only a channel the queue has never seen; returns
+        ``'enqueued'``, ``'known'`` or ``'terminal'``.'''
 
     @abstractmethod
     async def pop_unresolved(
@@ -604,6 +742,7 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
         self,
         redis: aioredis.Redis,
         settings: ChannelScrapeQueueSettings,
+        rng: random.Random | None = None,
     ) -> None:
         self._redis: aioredis.Redis = redis
         self._settings: ChannelScrapeQueueSettings = (
@@ -614,6 +753,24 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
                 settings.channel_priority_queues,
             )
         )
+        self._tier_weights: list[float] = (
+            parse_channel_priority_weights(
+                settings.channel_priority_weights, self._tiers,
+            )
+        )
+        self._rng: random.Random = rng or random.Random()
+
+    def _weighted_tier_order(self) -> list[int]:
+        '''Return all tier indexes in a random order where each
+        tier's chance of coming first is proportional to its weight
+        (Efraimidis-Spirakis weighted sampling without replacement).
+        '''
+        keys: list[tuple[float, int]] = [
+            (self._rng.random() ** (1.0 / weight), tier)
+            for tier, weight in enumerate(self._tier_weights)
+        ]
+        keys.sort(reverse=True)
+        return [tier for _, tier in keys]
 
     def _tier_for_sub_count(self, sub_count: int) -> int:
         '''Map a subscriber count to a tier index.
@@ -728,6 +885,46 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
         )
         return bool(enqueued)
 
+    async def enqueue_new(
+        self,
+        channel_id: str,
+        *,
+        source: str,
+    ) -> str:
+        '''Atomically enqueue *channel_id* for scheduled scraping only
+        when the queue has no record of it.
+
+        Unlike :meth:`enqueue_scheduled`, a channel that is already
+        queued, being scraped (popped from its zset, meta still
+        ``scheduled``), pending or terminal is left untouched, so
+        discovery cannot cause duplicate scrapes or re-schedule
+        channels.
+
+        :returns: ``'enqueued'``, ``'known'`` or ``'terminal'``
+        :raises ValueError: when *channel_id* is not a ``UC`` id
+        '''
+        if not channel_id.startswith('UC'):
+            raise ValueError(
+                f'channel_id must start with UC: {channel_id!r}'
+            )
+        member: str = f'i:{channel_id}'
+        now: float = time.time()
+        result: str | bytes = await self._redis.eval(
+            _ENQUEUE_NEW_LUA,
+            2, self._k_meta(member), self._k_scheduled(0),
+            member,
+            str(now),
+            channel_id,
+            source,
+            str(int(now)),
+            ChannelState.SCHEDULED.value,
+            *[
+                state.value
+                for state in ChannelState.terminal_states()
+            ],
+        )
+        return result.decode() if isinstance(result, bytes) else result
+
     async def pop_unresolved(
         self, batch: int,
     ) -> list[str]:
@@ -796,10 +993,20 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
     async def pop_scheduled(
         self, batch: int, *, now: float,
     ) -> list[str]:
+        '''Pop up to *batch* due channel IDs.
+
+        Tiers are visited in a weighted random order (see
+        ``channel_priority_weights``) instead of strict priority, so
+        a large backlog in one tier cannot starve the others. A tier
+        without due channels passes its turn to the next tier in the
+        order. Workers pop one channel at a time, so over many pops
+        each tier with due work gets a share proportional to its
+        weight.
+        '''
         out: list[str] = []
         remaining: int = batch
-        num_tiers: int = len(self._tiers)
-        for tier in range(num_tiers):
+        tier: int
+        for tier in self._weighted_tier_order():
             if remaining <= 0:
                 break
             members: list[str] = await self._redis.eval(

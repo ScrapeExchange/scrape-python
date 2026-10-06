@@ -13,6 +13,7 @@ from scrape_exchange.file_management import AssetFileManagement
 from scrape_exchange.video_scrape_queue import (
     RedisVideoScrapeQueue,
     VideoScrapeQueueSettings,
+    VideoState,
 )
 from scrape_exchange.youtube.uploaded_video_ids import UploadedVideoIds
 from scrape_exchange.youtube.youtube_channel import YouTubeChannel
@@ -27,6 +28,26 @@ RETRYABLE_STATUSES: frozenset[int] = frozenset({502, 503, 504})
 # Page size for POST /api/v1/filter. The server caps pages at 1000
 # records; a channel's full video inventory is typically 1-3 pages.
 FILTER_PAGE_SIZE: int = 1000
+# ``detail`` of the exchange's 404 for a query that matched no
+# records. Other 404s (e.g. an unknown route) remain errors.
+EXCHANGE_DATA_NOT_FOUND: str = (
+    'Data not found for the specified parameters.'
+)
+
+
+def _is_no_data_response(response: httpx.Response) -> bool:
+    '''True when *response* is the exchange's "no matching records"
+    404 rather than a missing route or other failure.'''
+    if response.status_code != 404:
+        return False
+    try:
+        body: object = response.json()
+    except ValueError:
+        return False
+    return (
+        isinstance(body, dict)
+        and body.get('detail') == EXCHANGE_DATA_NOT_FOUND
+    )
 
 
 FULL_SCRAPES: Counter = Counter(
@@ -97,9 +118,11 @@ async def fetch_exchange_video_ids(
 
     One filter query per 1000-record page replaces the old one-GET-
     per-video existence sweep. Retries transient failures (timeouts,
-    transport errors, 502/503/504) with backoff; other non-200
-    statuses and exhausted retries raise :class:`FilterQueryError`
-    so the caller keeps the refresh due.
+    transport errors, 502/503/504) with backoff. The exchange's
+    "Data not found" 404 means no (further) matching records and
+    ends the scan normally. Other non-200 statuses and exhausted
+    retries raise :class:`FilterQueryError` so the caller keeps the
+    refresh due.
 
     Caveat: records uploaded without a ``platform_creator_id`` do
     not match the filter and are treated as missing — harmless,
@@ -147,6 +170,10 @@ async def fetch_exchange_video_ids(
                     if not after:
                         return existing
                     continue
+                if _is_no_data_response(response):
+                    # No (further) videos for this channel on the
+                    # exchange, e.g. a channel never scraped before.
+                    return existing
                 if response.status_code not in RETRYABLE_STATUSES:
                     raise FilterQueryError(
                         f'Video filter query returned '
@@ -167,6 +194,73 @@ async def fetch_exchange_video_ids(
     )
 
 
+class KnownVideoIds:
+    '''Answers "is this video ID already known?" for one channel.
+
+    Used to stop paging a 'Latest'-ordered channel tab once a page
+    holds only known IDs. A video is known when it is on the exchange
+    for this channel, in the uploaded set, in the video queue in any
+    state (including tombstones) or has a local scrape output file.
+    Call :meth:`load` once before use; it runs the exchange filter
+    query, whose result :func:`queue_channel_videos` can reuse.
+    '''
+
+    def __init__(
+        self,
+        *,
+        redis: aioredis.Redis,
+        http_client: httpx.AsyncClient,
+        exchange_url: str,
+        channel_id: str,
+        video_fm: AssetFileManagement,
+    ) -> None:
+        self._http_client: httpx.AsyncClient = http_client
+        self._exchange_url: str = exchange_url
+        self._channel_id: str = channel_id
+        self._video_fm: AssetFileManagement = video_fm
+        self._uploaded: UploadedVideoIds = UploadedVideoIds(
+            '', redis_client=redis,
+        )
+        self._queue: RedisVideoScrapeQueue = RedisVideoScrapeQueue(
+            redis, VideoScrapeQueueSettings(),
+        )
+        self.exchange_ids: set[str] = set()
+
+    async def load(self) -> None:
+        '''Fetch the exchange's video IDs for the channel.
+
+        :raises FilterQueryError: when the filter query fails.
+        '''
+        self.exchange_ids = await fetch_exchange_video_ids(
+            self._http_client, self._exchange_url, self._channel_id,
+        )
+
+    async def __call__(self, video_ids: list[str]) -> set[str]:
+        '''Return the subset of *video_ids* that is already known.'''
+        known: set[str] = {
+            video_id for video_id in video_ids
+            if video_id in self.exchange_ids
+            or self._video_fm.video_scrape_output_exists(video_id)
+        }
+        rest: list[str] = [
+            video_id for video_id in video_ids if video_id not in known
+        ]
+        if not rest:
+            return known
+        uploaded: dict[str, bool] = await self._uploaded.contains_many(rest)
+        known.update(video_id for video_id in rest if uploaded.get(video_id))
+        rest = [video_id for video_id in rest if video_id not in known]
+        if rest:
+            states: dict[str, VideoState | None] = (
+                await self._queue.get_states(rest)
+            )
+            known.update(
+                video_id for video_id, state in states.items()
+                if state is not None
+            )
+        return known
+
+
 async def queue_channel_videos(
     channel: YouTubeChannel,
     *,
@@ -175,6 +269,7 @@ async def queue_channel_videos(
     exchange_url: str,
     video_fm: AssetFileManagement,
     summary: FullScrapeSummary,
+    exchange_ids: set[str] | None = None,
 ) -> None:
     '''Queue the channel's video IDs the exchange does not have.
 
@@ -190,6 +285,10 @@ async def queue_channel_videos(
     deduped by the queue itself; the video consumer rechecks
     uploaded membership to cover races with another host's upload.
     A filter-query failure raises and keeps the refresh due.
+
+    :param exchange_ids: the exchange's video IDs for the channel when
+        already fetched (see :class:`KnownVideoIds`); skips the filter
+        query.
     '''
     uploaded: UploadedVideoIds = UploadedVideoIds('', redis_client=redis)
     queue: RedisVideoScrapeQueue = RedisVideoScrapeQueue(
@@ -222,9 +321,10 @@ async def queue_channel_videos(
     if not candidates:
         return
 
-    exchange_ids: set[str] = await fetch_exchange_video_ids(
-        http_client, exchange_url, channel.channel_id,
-    )
+    if exchange_ids is None:
+        exchange_ids = await fetch_exchange_video_ids(
+            http_client, exchange_url, channel.channel_id,
+        )
 
     for video_id in candidates:
         if video_id in exchange_ids:
