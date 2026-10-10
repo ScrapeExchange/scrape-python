@@ -148,6 +148,49 @@ class TestInstagramCreatorSettings(unittest.TestCase):
         )
 
 
+class TestInstagramCreatorBrowserCap(unittest.TestCase):
+
+    def _settings(self, **env: str) -> tool.CreatorSettings:
+        with patch.dict(os.environ, env, clear=True):
+            return tool.CreatorSettings(
+                _env_file=None,
+                _cli_parse_args=[],
+            )
+
+    def test_default_max_browsers_is_twelve(self) -> None:
+        self.assertEqual(self._settings().creator_max_browsers, 12)
+
+    def test_auto_concurrency_is_capped_by_max_browsers(self) -> None:
+        settings = self._settings()
+        self.assertEqual(
+            tool._resolve_creator_concurrency(settings, 67), 12,
+        )
+
+    def test_auto_concurrency_below_cap_uses_proxy_count(self) -> None:
+        settings = self._settings()
+        self.assertEqual(
+            tool._resolve_creator_concurrency(settings, 5), 5,
+        )
+
+    def test_max_browsers_env_overrides_default(self) -> None:
+        settings = self._settings(IG_CREATOR_MAX_BROWSERS='20')
+        self.assertEqual(
+            tool._resolve_creator_concurrency(settings, 67), 20,
+        )
+
+    def test_zero_max_browsers_disables_cap(self) -> None:
+        settings = self._settings(IG_CREATOR_MAX_BROWSERS='0')
+        self.assertEqual(
+            tool._resolve_creator_concurrency(settings, 67), 67,
+        )
+
+    def test_explicit_concurrency_is_not_capped(self) -> None:
+        settings = self._settings(IG_CREATOR_CONCURRENCY='30')
+        self.assertEqual(
+            tool._resolve_creator_concurrency(settings, 67), 30,
+        )
+
+
 class TestInstagramCreatorFailureHandling(unittest.IsolatedAsyncioTestCase):
 
     async def test_fetch_waits_for_hydrated_profile_json(self) -> None:

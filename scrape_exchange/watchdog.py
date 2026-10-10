@@ -21,7 +21,10 @@ On breach the daemon thread terminates the process with ``os._exit(1)``
 so the supervisor respawns it. Termination must not block: a wedged
 worker thread may hold a ``logging`` handler lock, so the watchdog never
 calls ``logging`` — it writes the reason straight to the stderr fd and
-dumps all thread stacks via :mod:`faulthandler`.
+dumps all thread stacks via :mod:`faulthandler`. When the scraper logs
+to a file, one termination line is also appended to that file with raw
+``os`` calls (see :func:`make_log_file_writer`), so the reason survives
+the container's stderr.
 
 :author     : boinko <boinko@scrape.exchange>
 :copyright  : Copyright 2026
@@ -29,12 +32,14 @@ dumps all thread stacks via :mod:`faulthandler`.
 '''
 
 import faulthandler
+import json
 import os
 import sys
 import threading
 import time
 
 from collections.abc import Callable
+from datetime import datetime, timezone
 from typing import ClassVar
 
 
@@ -91,6 +96,75 @@ def _default_cancel_backstop() -> None:
         pass
 
 
+# Log targets that are not regular files; stderr already gets the
+# termination message, so there is nothing to add for these.
+_NON_FILE_LOG_TARGETS: frozenset[str] = frozenset({
+    '', '/dev/stdout', '/dev/stderr', '-',
+})
+
+
+def format_termination_line(
+    signal: str, stale: float, pid: int, log_format: str,
+    now: datetime | None = None,
+) -> str:
+    '''One log line, matching the scraper log format, recording a
+    watchdog termination. Pure; no I/O.'''
+    ts: datetime = now or datetime.now(timezone.utc)
+    message: str = (
+        f'Watchdog terminating process: {signal} signal stale '
+        f'for {stale:.0f}s'
+    )
+    if log_format == 'json':
+        return json.dumps({
+            'timestamp': ts.isoformat(),
+            'level': 'CRITICAL',
+            'logger': 'scrape_exchange.watchdog',
+            'file': 'watchdog.py',
+            'func': '_terminate',
+            'message': message,
+            'signal': signal,
+            'stale_seconds': round(stale, 1),
+            'pid': pid,
+        }) + '\n'
+    return (
+        f'CRITICAL:{ts.isoformat()}:watchdog.py:_terminate():0:'
+        f'{message} (pid {pid})\n'
+    )
+
+
+def make_log_file_writer(
+    path: str, log_format: str,
+) -> Callable[[str, float], None] | None:
+    '''
+    Return a ``log_fn`` for :class:`Watchdog` that appends a
+    termination line to the scraper log file at *path*, or ``None``
+    when *path* is not a regular file target.
+
+    The writer opens, writes and closes the file with raw ``os`` calls
+    at termination time: it never takes a ``logging`` lock (a wedged
+    thread may hold one) and it follows log rotation.
+    '''
+    if path in _NON_FILE_LOG_TARGETS:
+        return None
+
+    def _write(signal: str, stale: float) -> None:
+        try:
+            line: str = format_termination_line(
+                signal, stale, os.getpid(), log_format,
+            )
+            fd: int = os.open(
+                path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644,
+            )
+            try:
+                os.write(fd, line.encode('utf-8', 'replace'))
+            finally:
+                os.close(fd)
+        except Exception:
+            pass
+
+    return _write
+
+
 class Watchdog:
     '''Dual-signal liveness watchdog.
 
@@ -113,6 +187,7 @@ class Watchdog:
         metric_inc: Callable[[str], None] = _default_metric_inc,
         arm_backstop: Callable[[float], None] = _default_arm_backstop,
         cancel_backstop: Callable[[], None] = _default_cancel_backstop,
+        log_fn: Callable[[str, float], None] | None = None,
     ) -> None:
         self._loop_timeout: float = loop_timeout
         self._work_timeout: float = work_timeout
@@ -123,6 +198,7 @@ class Watchdog:
         self._metric_inc: Callable[[str], None] = metric_inc
         self._arm_backstop: Callable[[float], None] = arm_backstop
         self._cancel_backstop: Callable[[], None] = cancel_backstop
+        self._log_fn: Callable[[str, float], None] | None = log_fn
         now: float = clock()
         self._loop_ts: float = now
         self._work_ts: float = now
@@ -188,6 +264,8 @@ class Watchdog:
             f'watchdog: {signal} signal stale for {stale:.0f}s; '
             f'terminating pid {os.getpid()}\n'
         )
+        if self._log_fn is not None:
+            self._log_fn(signal, stale)
         self._dump_fn()
         self._metric_inc(signal)
         self._exit_fn(1)

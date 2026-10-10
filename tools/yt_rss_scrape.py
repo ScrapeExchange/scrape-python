@@ -128,6 +128,10 @@ from scrape_exchange.video_scrape_queue import (
     VideoScrapeQueueSettings,
 )
 from scrape_exchange.youtube.uploaded_video_ids import UploadedVideoIds
+from scrape_exchange.youtube.channel_video_refresh import (
+    VIDEOS_SKIPPED_MIN_SUBSCRIBERS,
+    below_min_subscribers,
+)
 
 
 CHANNEL_FILENAME_PREFIX: str = 'channel-'
@@ -1379,7 +1383,7 @@ async def process_channel(
         platform='youtube',
     ).observe(wait_seconds)
 
-    update_result: tuple[bool, int, str | None]
+    update_result: tuple[bool, int | None, str | None]
     rss_result: list[YouTubeVideo] | None | Exception
     update_result, rss_result = await asyncio.gather(
         _timed(
@@ -1401,7 +1405,8 @@ async def process_channel(
         ),
     )
     update_ok: bool = update_result[0]
-    sub_count: int = update_result[1]
+    # None when InnerTube did not expose a subscriber count.
+    sub_count: int | None = update_result[1]
     resolved_handle: str | None = update_result[2]
 
     if not update_ok:
@@ -1412,7 +1417,7 @@ async def process_channel(
             channel_id, rss_url, channel_handle, 1,
         )
         return False
-    await creator_queue.update_tier(channel_id, sub_count)
+    await creator_queue.update_tier(channel_id, sub_count or 0)
 
     # Bind had_feed once; used by both error and success paths.
     had_feed: bool = await creator_queue.has_had_feed(channel_id)
@@ -1642,6 +1647,25 @@ async def process_channel(
         )
         return True
 
+    if below_min_subscribers(
+        sub_count, settings.channel_min_subscribers,
+    ):
+        VIDEOS_SKIPPED_MIN_SUBSCRIBERS.labels(
+            scraper='rss_scraper',
+        ).inc(len(new_videos))
+        logging.info(
+            MSG_PROCESSED_VIDEOS,
+            extra=extra | {
+                'videos_uploaded': 0,
+                'videos_existing': videos_existing,
+                'videos_failed': 0,
+                'videos_skipped_min_subscribers': len(new_videos),
+                'subscriber_count': sub_count,
+                'video_count': len(videos),
+            },
+        )
+        return True
+
     # --- Phase 3: queue new videos for the video scraper ---
     # update_ok was True above, so resolved_handle is set; assert for
     # the type-checker.
@@ -1814,7 +1838,7 @@ async def update_channel(
     proxy: str | None = None,
     *,
     settings: RssSettings,
-) -> tuple[bool, int, str | None]:
+) -> tuple[bool, int | None, str | None]:
     '''
     Fetches channel metadata via InnerTube and updates the channel
     data on Scrape Exchange via a priority file.
@@ -1830,7 +1854,9 @@ async def update_channel(
     :param proxy: Optional proxy URL for the InnerTube request.
     :returns: Tuple of (success, subscriber_count, resolved_handle).
         ``success`` is True if the channel data was fetched and
-        uploaded. ``resolved_handle`` is None when fetch failed.
+        uploaded. ``subscriber_count`` is None when it could not be
+        determined (the uploaded record still carries 0).
+        ``resolved_handle`` is None when fetch failed.
     :raises: (none)
     '''
 
@@ -1860,7 +1886,7 @@ async def update_channel(
             proxy_port=proxy_port,
             proxy_file=proxy_file_label(proxy or ''),
         ).inc()
-        return False, 0, None
+        return False, None, None
 
     METRIC_INNERTUBE_SUCCESS.labels(
         platform='youtube',
@@ -1984,7 +2010,7 @@ async def update_channel(
                 'validation_error': err,
             },
         )
-        return False, subscriber_count, resolved_handle
+        return False, parsed_subscriber_count, resolved_handle
 
     await _write_channel(record_dict, settings)
     METRIC_CHANNEL_PRIORITY_WRITES.labels(
@@ -1993,7 +2019,7 @@ async def update_channel(
         worker_id=get_worker_id(),
     ).inc()
 
-    return True, subscriber_count, resolved_handle
+    return True, parsed_subscriber_count, resolved_handle
 
 
 def read_channel_file(filepath: str) -> dict[str, any]:

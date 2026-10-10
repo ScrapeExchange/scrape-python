@@ -338,6 +338,17 @@ METRIC_UPLOAD_BATCHES: Counter = Counter(
 )
 
 # ---------------------------------------------------------------------------
+# bulk_jobs_in_flight
+#   Bulk jobs POSTed by the uploader but not yet reconciled, per target.
+# ---------------------------------------------------------------------------
+METRIC_BULK_JOBS_IN_FLIGHT: Gauge = Gauge(
+    'bulk_jobs_in_flight',
+    'Bulk-upload jobs POSTed and not yet reconciled.',
+    ['platform', 'scraper', 'entity', 'worker_id'],
+    multiprocess_mode='livemostrecent',
+)
+
+# ---------------------------------------------------------------------------
 # watcher_files_detected_total / watcher_files_skipped_total /
 # watcher_batches_total
 #   File-system watcher events for the upload-only watcher path.

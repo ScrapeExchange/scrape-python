@@ -199,9 +199,21 @@ class CreatorSettings(TikTokScraperSettings):
         ),
         description=(
             'Fleet-wide async worker upper bound. Set to 0 or leave '
-            'unset to use the proxy count. In multi-process mode this '
+            'unset to use the proxy count, capped by '
+            'TIKTOK_CREATOR_MAX_BROWSERS. In multi-process mode this '
             'budget is split across child processes; each proxy still '
             'allows at most one in-flight TikTok call.'
+        ),
+    )
+    creator_max_browsers: int = Field(
+        default=12,
+        validation_alias=AliasChoices(
+            'TIKTOK_CREATOR_MAX_BROWSERS', 'creator_max_browsers',
+        ),
+        description=(
+            'Cap on browser sessions (one per proxy) when '
+            'TIKTOK_CREATOR_CONCURRENCY is 0. Each Camoufox browser '
+            'uses roughly 250-300 MB of RAM. 0 = no cap.'
         ),
     )
     creator_num_processes: int = Field(
@@ -477,9 +489,13 @@ def _resolve_creator_concurrency(
     requested: int = int(settings.creator_concurrency)
     if requested > 0:
         return requested
-    return _auto_creator_concurrency(
+    auto: int = _auto_creator_concurrency(
         proxy_count, settings.creator_num_processes,
     )
+    max_browsers: int = int(settings.creator_max_browsers)
+    if max_browsers > 0:
+        return min(auto, max_browsers)
+    return auto
 
 
 def _effective_process_count(
@@ -1412,6 +1428,7 @@ def main() -> None:
         split_proxy_pool=True,
         concurrency_env_var='TIKTOK_CREATOR_CONCURRENCY',
         child_concurrencies=child_concurrencies,
+        browser_tmpdir=True,
     )
     sys.exit(runner.run_sync(_run_worker))
 

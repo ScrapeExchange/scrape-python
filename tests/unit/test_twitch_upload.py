@@ -11,6 +11,7 @@ from scrape_exchange.bulk_upload import BulkBatchOutcome
 from scrape_exchange.file_management import AssetFileManagement
 from scrape_exchange.schema_validator import SchemaValidator
 from scrape_exchange.twitch.twitch_profile_extractor import extract_profile
+from tests.unit._bulk_upload_fakes import FakeBulkExchange
 from tools import scrape_upload
 
 
@@ -94,38 +95,18 @@ class TestTwitchUpload(unittest.IsolatedAsyncioTestCase):
                 await fm.write_file(filename, record)
                 client: MagicMock = MagicMock()
                 if mode == 'bulk':
-                    async def uploaded(
-                        *args: object, fm: AssetFileManagement,
-                        **kwargs: object,
-                    ) -> BulkBatchOutcome:
-                        await fm.mark_uploaded(filename)
-                        return BulkBatchOutcome(
-                            status='completed', job_id='job', success=1,
-                            failed=0, missing=0, success_ids={'example'},
-                        )
-
-                    upload: AsyncMock = AsyncMock(side_effect=uploaded)
-                    with patch(
-                        'tools.scrape_upload.upload_prepared_bulk_batch',
-                        upload,
-                    ), patch(
-                        'tools.scrape_upload.resume_pending_bulk_uploads',
-                        new_callable=AsyncMock,
-                    ):
+                    fake: FakeBulkExchange = FakeBulkExchange()
+                    with fake.patched():
                         await scrape_upload.drain_bulk_directory(
                             settings=settings, descriptor=descriptor,
                             client=client, fm=fm, validator=validator,
                         )
-                    upload.assert_awaited_once()
-                    self.assertEqual(json.loads(upload.call_args.args[0]),
-                                     record)
-                    self.assertEqual(upload.call_args.args[1], [
-                        ('example', filename),
-                    ])
-                    self.assertEqual(upload.call_args.args[2].platform,
-                                     'twitch')
-                    self.assertEqual(upload.call_args.args[2].schema_owner,
-                                     'drand')
+                    self.assertEqual(len(fake.posts), 1)
+                    config, batch_buf, records = fake.posts[0]
+                    self.assertEqual(json.loads(batch_buf), record)
+                    self.assertEqual(records, [('example', filename)])
+                    self.assertEqual(config.platform, 'twitch')
+                    self.assertEqual(config.schema_owner, 'drand')
                     self.assertTrue(
                         (Path(tmp) / 'uploaded' / filename).exists(),
                     )

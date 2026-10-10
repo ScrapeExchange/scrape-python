@@ -26,6 +26,7 @@ from scrape_exchange.video_backlog import (
     STATE_HOT,
     STATE_QUEUED,
     MongoVideoBacklog,
+    backlog_document,
 )
 
 KEY_PREFIX: str = 'youtube:video'
@@ -326,6 +327,10 @@ class VideoQueueChannelContext:
     channel_handle: str | None = None
     channel_url: str | None = None
     channel_is_verified: bool | None = None
+
+
+# Videos per MongoDB insert_many in enqueue_many.
+ENQUEUE_MANY_CHUNK_SIZE: int = 1_000
 
 
 @dataclass(frozen=True)
@@ -632,6 +637,56 @@ class RedisVideoScrapeQueue(VideoScrapeQueue):
             str(int(now)),
         ))
         return added == 1
+
+    async def enqueue_many(
+        self,
+        video_ids: list[str],
+        *,
+        source: str,
+        channel_id: str | None = None,
+        channel_handle: str | None = None,
+        channel_is_verified: bool | None = None,
+        chunk_size: int = ENQUEUE_MANY_CHUNK_SIZE,
+    ) -> int:
+        '''Queue every ID in *video_ids* that is not already known,
+        with the same semantics as :meth:`enqueue` per ID.
+
+        With a MongoDB backlog the IDs are inserted *chunk_size* at a
+        time with one unordered ``insert_many`` each (duplicates are
+        skipped), instead of one ``insert_one`` round trip per video.
+        Redis-only mode falls back to :meth:`enqueue` per ID.
+
+        :returns: number of IDs newly queued.
+        '''
+        if any(not video_id for video_id in video_ids):
+            raise ValueError('empty video_id')
+        if chunk_size < 1:
+            raise ValueError('chunk_size must be positive')
+        added: int = 0
+        video_id: str
+        if self._backlog is None:
+            for video_id in video_ids:
+                if await self.enqueue(
+                    video_id, source=source, channel_id=channel_id,
+                    channel_handle=channel_handle,
+                    channel_is_verified=channel_is_verified,
+                ):
+                    added += 1
+            return added
+        now: float = time.time()
+        start: int
+        for start in range(0, len(video_ids), chunk_size):
+            docs: list[dict[str, Any]] = [
+                backlog_document(
+                    video_id, state=STATE_QUEUED, enqueued_at=now,
+                    source=source, channel_id=channel_id,
+                    channel_handle=channel_handle,
+                    channel_is_verified=channel_is_verified,
+                )
+                for video_id in video_ids[start:start + chunk_size]
+            ]
+            added += await self._backlog.add_many(docs)
+        return added
 
     async def force_enqueue(
         self,

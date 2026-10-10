@@ -113,6 +113,10 @@ class TestRssRedisFirstExistence(unittest.TestCase):
                 settings.redis_dsn = 'redis://fake'
                 settings.exchange_url = 'https://scrape.exchange'
                 settings.video_data_directory = data_dir
+                # This test is about the existence pre-check, not the
+                # CHANNEL_MIN_SUBSCRIBERS filter (the mocked channel
+                # reports 0 subscribers).
+                settings.channel_min_subscribers = 0
 
                 client = MagicMock()
                 client.get = AsyncMock(return_value=Response(404))

@@ -8,9 +8,18 @@ injected side-effect callables so the tests are deterministic — no real
 threads, no real ``os._exit``, no wall-clock sleeps.
 '''
 
+import json
+import os
+import tempfile
 import unittest
 
-from scrape_exchange.watchdog import Watchdog
+from datetime import datetime, timezone
+
+from scrape_exchange.watchdog import (
+    Watchdog,
+    format_termination_line,
+    make_log_file_writer,
+)
 
 
 class _FakeClock:
@@ -124,6 +133,67 @@ class TestWatchdogTerminate(unittest.TestCase):
         wd.run_once()
         self.assertEqual(sink['metrics'], ['loop'])
         self.assertEqual(sink['exits'], [1])
+
+
+class TestWatchdogLogFile(unittest.TestCase):
+    def test_log_fn_receives_signal_and_stale_seconds(self) -> None:
+        clock = _FakeClock()
+        calls: list[tuple[str, float]] = []
+        wd: Watchdog = Watchdog(
+            loop_timeout=60.0,
+            work_timeout=180.0,
+            clock=clock,
+            exit_fn=lambda code: None,
+            write_fn=lambda msg: None,
+            dump_fn=lambda: None,
+            metric_inc=lambda sig: None,
+            arm_backstop=lambda t: None,
+            cancel_backstop=lambda: None,
+            log_fn=lambda sig, stale: calls.append((sig, stale)),
+        )
+        clock.advance(75.0)
+        wd.run_once()
+        self.assertEqual(calls, [('loop', 75.0)])
+
+    def test_json_line_matches_scraper_log_fields(self) -> None:
+        now: datetime = datetime(2026, 10, 7, 4, 21, tzinfo=timezone.utc)
+        line: str = format_termination_line(
+            'loop', 75.4, 1234, 'json', now=now,
+        )
+        self.assertTrue(line.endswith('\n'))
+        record: dict = json.loads(line)
+        self.assertEqual(record['level'], 'CRITICAL')
+        self.assertEqual(record['signal'], 'loop')
+        self.assertEqual(record['stale_seconds'], 75.4)
+        self.assertEqual(record['pid'], 1234)
+        self.assertEqual(record['timestamp'], now.isoformat())
+        self.assertIn('loop signal stale for 75s', record['message'])
+
+    def test_text_line_starts_with_level(self) -> None:
+        line: str = format_termination_line('work', 200.0, 7, 'text')
+        self.assertTrue(line.startswith('CRITICAL:'))
+        self.assertIn('work signal stale for 200s', line)
+
+    def test_no_writer_for_stream_targets(self) -> None:
+        for target in ('', '/dev/stdout', '/dev/stderr', '-'):
+            self.assertIsNone(make_log_file_writer(target, 'json'))
+
+    def test_writer_appends_line_to_existing_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path: str = os.path.join(tmp, 'scraper.log')
+            with open(path, 'w') as fd:
+                fd.write('{"message": "earlier"}\n')
+            writer = make_log_file_writer(path, 'json')
+            self.assertIsNotNone(writer)
+            writer('work', 190.0)
+            with open(path) as fd:
+                lines: list[str] = fd.read().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(json.loads(lines[1])['signal'], 'work')
+
+    def test_writer_swallows_errors(self) -> None:
+        writer = make_log_file_writer('/nonexistent-dir/x.log', 'json')
+        writer('loop', 61.0)  # must not raise
 
 
 class TestWatchdogStop(unittest.TestCase):

@@ -8,19 +8,28 @@ import io
 import json
 import logging
 import os
+import signal
 import sys
 import tempfile
 import unittest
 
 import brotli
+from prometheus_client import REGISTRY
 
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
-from scrape_exchange.bulk_upload import BulkBatchOutcome
+from scrape_exchange.bulk_upload import (
+    BulkBatchOutcome,
+    BulkUploadState,
+    delete_bulk_state,
+    list_bulk_states,
+    write_bulk_state,
+)
 from scrape_exchange.file_management import AssetFileManagement
 from scrape_exchange.schema_validator import SchemaValidator
+from tests.unit._bulk_upload_fakes import FakeBulkExchange
 from tools import scrape_upload
 
 
@@ -342,6 +351,39 @@ class TestScrapeUploadHelpers(unittest.TestCase):
                 for handler in logging.getLogger().handlers:
                     handler.close()
                     logging.getLogger().removeHandler(handler)
+
+    def test_settings_max_active_bulk_jobs_defaults_to_three(
+        self,
+    ) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            settings = scrape_upload.ScrapeUploadSettings(
+                _env_file=None,
+            )
+
+        self.assertEqual(settings.max_active_bulk_jobs, 3)
+
+    def test_settings_read_bulk_max_active_jobs_env(self) -> None:
+        with patch.dict(
+            os.environ, {'BULK_MAX_ACTIVE_JOBS': '2'}, clear=True,
+        ):
+            settings = scrape_upload.ScrapeUploadSettings(
+                _env_file=None,
+            )
+
+        self.assertEqual(settings.max_active_bulk_jobs, 2)
+
+    def test_settings_pending_count_interval(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            default = scrape_upload.ScrapeUploadSettings(_env_file=None)
+        with patch.dict(
+            os.environ,
+            {'SCRAPE_UPLOAD_PENDING_COUNT_INTERVAL': '60'},
+            clear=True,
+        ):
+            custom = scrape_upload.ScrapeUploadSettings(_env_file=None)
+
+        self.assertEqual(default.pending_count_interval_seconds, 600.0)
+        self.assertEqual(custom.pending_count_interval_seconds, 60.0)
 
 
 class TestPrepareAssetLine(unittest.IsolatedAsyncioTestCase):
@@ -701,52 +743,26 @@ class TestPrepareAssetLine(unittest.IsolatedAsyncioTestCase):
         )
 
 
+def _batch_count(outcome: str) -> float:
+    return REGISTRY.get_sample_value('upload_batches_total', {
+        'platform': 'example', 'scraper': scrape_upload.SCRAPER_LABEL,
+        'entity': 'thing', 'mode': 'bulk',
+        'worker_id': scrape_upload.get_worker_id(), 'outcome': outcome,
+    }) or 0.0
+
+
 class TestDrainDirectories(unittest.IsolatedAsyncioTestCase):
 
     async def test_bulk_upload_rotates_between_targets(self) -> None:
         descriptor_a: scrape_upload.AssetDescriptor = _descriptor()
         descriptor_b: scrape_upload.AssetDescriptor = _other_descriptor()
-        calls: list[tuple[str, str, list[str]]] = []
 
-        async def fake_upload(
-            batch_buf: bytes,
-            batch_records: list[tuple[str, str]],
-            config,
-            client,
-            fm: AssetFileManagement,
-            *,
-            id_from_filename=None,
-        ) -> BulkBatchOutcome:
-            del batch_buf
-            del client
-            del id_from_filename
-            calls.append((
-                config.platform,
-                config.entity,
-                [content_id for content_id, _ in batch_records],
-            ))
-            for _content_id, filename in batch_records:
-                await fm.mark_uploaded(filename)
-            return BulkBatchOutcome(
-                status='completed',
-                job_id='job',
-                success=len(batch_records),
-                failed=0,
-                missing=0,
-                success_ids={r[0] for r in batch_records},
-            )
+        fake: FakeBulkExchange = FakeBulkExchange()
 
         with (
             tempfile.TemporaryDirectory() as dir_a,
             tempfile.TemporaryDirectory() as dir_b,
-            patch(
-                'tools.scrape_upload.upload_prepared_bulk_batch',
-                side_effect=fake_upload,
-            ),
-            patch(
-                'tools.scrape_upload.resume_pending_bulk_uploads',
-                new=AsyncMock(),
-            ),
+            fake.patched(),
         ):
             fm_a: AssetFileManagement = AssetFileManagement(
                 dir_a,
@@ -787,7 +803,10 @@ class TestDrainDirectories(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(
-            [call[:2] for call in calls],
+            [
+                (config.platform, config.entity)
+                for config, _b, _r in fake.posts
+            ],
             [
                 ('example', 'thing'),
                 ('other', 'item'),
@@ -800,41 +819,12 @@ class TestDrainDirectories(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         descriptor: scrape_upload.AssetDescriptor = _descriptor()
 
-        async def fake_upload(
-            batch_buf: bytes,
-            batch_records: list[tuple[str, str]],
-            config,
-            client,
-            fm: AssetFileManagement,
-            *,
-            id_from_filename=None,
-        ) -> BulkBatchOutcome:
-            del batch_buf
-            del config
-            del client
-            del id_from_filename
-            for _content_id, filename in batch_records:
-                await fm.mark_uploaded(filename)
-            return BulkBatchOutcome(
-                status='completed',
-                job_id='job',
-                success=len(batch_records),
-                failed=0,
-                missing=0,
-                success_ids={r[0] for r in batch_records},
-            )
+        fake: FakeBulkExchange = FakeBulkExchange()
 
         with (
             tempfile.TemporaryDirectory() as dir_a,
             tempfile.TemporaryDirectory() as dir_b,
-            patch(
-                'tools.scrape_upload.upload_prepared_bulk_batch',
-                side_effect=fake_upload,
-            ),
-            patch(
-                'tools.scrape_upload.resume_pending_bulk_uploads',
-                new=AsyncMock(),
-            ),
+            fake.patched(),
         ):
             fm_a: AssetFileManagement = AssetFileManagement(
                 dir_a,
@@ -914,6 +904,649 @@ class TestDrainDirectories(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[0]['entity'], 'thing')
         self.assertEqual(calls[0]['json']['platform'], 'example')
         self.assertEqual(calls[0]['json']['entity'], 'thing')
+
+
+class TestOverlappingBulkUpload(unittest.IsolatedAsyncioTestCase):
+
+    async def _write(
+        self, fm: AssetFileManagement, *ids: str,
+    ) -> None:
+        for asset_id in ids:
+            await fm.write_file(
+                f'asset-{asset_id}.json.br',
+                {'id': asset_id, 'url': f'https://scrape.exchange/{asset_id}'},
+            )
+
+    def _target(
+        self, fm: AssetFileManagement,
+        descriptor: scrape_upload.AssetDescriptor | None = None,
+    ) -> scrape_upload.AssetUploadTarget:
+        return scrape_upload.AssetUploadTarget(
+            descriptor=descriptor or _descriptor(), fm=fm,
+            validator=_validator(),
+        )
+
+    async def test_posts_next_batch_before_first_finalizes(self) -> None:
+        fake: FakeBulkExchange = FakeBulkExchange(hold_finalize=True)
+        with tempfile.TemporaryDirectory() as tmp, fake.patched():
+            fm = AssetFileManagement(
+                tmp, prefix_rankings=_descriptor().prefix_rankings,
+            )
+            await self._write(fm, 'a', 'b', 'c')
+            drain = asyncio.create_task(
+                scrape_upload.drain_targets_round_robin(
+                    settings=_settings(
+                        bulk_batch_size=1, max_active_bulk_jobs=2,
+                    ),
+                    targets=[self._target(fm)], client=object(),
+                ),
+            )
+            for _ in range(50):
+                await asyncio.sleep(0.01)
+                if len(fake.posts) >= 2:
+                    break
+            self.assertEqual(len(fake.posts), 2)
+            self.assertEqual(fake.finalized, [])
+            fake.release.set()
+            await asyncio.wait_for(drain, 5)
+
+        self.assertEqual(len(fake.posts), 3)
+        self.assertLessEqual(fake.max_in_finalize, 2)
+
+    async def test_cap_does_not_block_other_target(self) -> None:
+        fake: FakeBulkExchange = FakeBulkExchange(hold_finalize=True)
+        with (
+            tempfile.TemporaryDirectory() as dir_a,
+            tempfile.TemporaryDirectory() as dir_b,
+            fake.patched(),
+        ):
+            fm_a = AssetFileManagement(
+                dir_a, prefix_rankings=_descriptor().prefix_rankings,
+            )
+            fm_b = AssetFileManagement(
+                dir_b, prefix_rankings=_other_descriptor().prefix_rankings,
+            )
+            await self._write(fm_a, 'a1', 'a2', 'a3')
+            await fm_b.write_file(
+                'other-b1.json.br',
+                {'id': 'b1', 'url': 'https://scrape.exchange/b1'},
+            )
+            drain = asyncio.create_task(
+                scrape_upload.drain_targets_round_robin(
+                    settings=_settings(
+                        bulk_batch_size=1, max_active_bulk_jobs=1,
+                    ),
+                    targets=[
+                        self._target(fm_a),
+                        self._target(fm_b, _other_descriptor()),
+                    ],
+                    client=object(),
+                ),
+            )
+            for _ in range(50):
+                await asyncio.sleep(0.01)
+                if len(fake.posts) >= 2:
+                    break
+            entities: list[str] = [c.entity for c, _b, _r in fake.posts]
+            self.assertEqual(sorted(entities), ['item', 'thing'])
+            fake.release.set()
+            await asyncio.wait_for(drain, 5)
+
+    async def test_in_flight_files_not_resent(self) -> None:
+        fake: FakeBulkExchange = FakeBulkExchange(hold_finalize=True)
+        with tempfile.TemporaryDirectory() as tmp, fake.patched():
+            fm = AssetFileManagement(
+                tmp, prefix_rankings=_descriptor().prefix_rankings,
+            )
+            await self._write(fm, 'a')
+            target = self._target(fm)
+            settings = _settings(max_active_bulk_jobs=3)
+            first: int = await scrape_upload.drain_bulk_target_once(
+                settings=settings, target=target, client=object(),
+            )
+            # Same file rewritten while its batch is in flight.
+            await self._write(fm, 'a')
+            for _ in range(3):
+                await scrape_upload.drain_bulk_target_once(
+                    settings=settings, target=target, client=object(),
+                )
+            fake.release.set()
+            await asyncio.gather(*target.upload.in_flight_jobs)
+
+        self.assertEqual(first, 1)
+        self.assertEqual(len(fake.posts), 1)
+
+    async def test_finalize_error_counts_and_releases(self) -> None:
+        fake: FakeBulkExchange = FakeBulkExchange()
+        fake.finalize_error = RuntimeError('boom')
+        with tempfile.TemporaryDirectory() as tmp, fake.patched():
+            fm = AssetFileManagement(
+                tmp, prefix_rankings=_descriptor().prefix_rankings,
+            )
+            await self._write(fm, 'a')
+            target = self._target(fm)
+            before: float = _batch_count('finalize_error')
+            with self.assertLogs(level='ERROR'):
+                await scrape_upload.drain_bulk_target_once(
+                    settings=_settings(), target=target, client=object(),
+                )
+                await asyncio.gather(
+                    *target.upload.in_flight_jobs, return_exceptions=True,
+                )
+                await asyncio.sleep(0)
+
+            self.assertEqual(_batch_count('finalize_error') - before, 1)
+            self.assertEqual(target.upload.in_flight_jobs, set())
+            self.assertEqual(target.upload.in_flight_files, set())
+            fake.finalize_error = None
+            await scrape_upload.drain_targets_round_robin(
+                settings=_settings(), targets=[target], client=object(),
+                resume_bulk=False,
+            )
+
+        self.assertEqual(len(fake.posts), 2)
+
+    async def test_waits_for_finalize_instead_of_spinning(self) -> None:
+        fake: FakeBulkExchange = FakeBulkExchange(hold_finalize=True)
+        with tempfile.TemporaryDirectory() as tmp, fake.patched():
+            fm = AssetFileManagement(
+                tmp, prefix_rankings=_descriptor().prefix_rankings,
+            )
+            await self._write(fm, 'a', 'b')
+            target = self._target(fm)
+            calls: int = 0
+            real = scrape_upload.drain_bulk_target_once
+
+            async def counting(**kwargs: object) -> int:
+                nonlocal calls
+                calls += 1
+                return await real(**kwargs)
+
+            with patch.object(
+                scrape_upload, 'drain_bulk_target_once', counting,
+            ):
+                drain = asyncio.create_task(
+                    scrape_upload.drain_targets_round_robin(
+                        settings=_settings(
+                            bulk_batch_size=1, max_active_bulk_jobs=1,
+                        ),
+                        targets=[target], client=object(),
+                    ),
+                )
+                await asyncio.sleep(0.2)
+                calls_while_blocked: int = calls
+                fake.release.set()
+                await asyncio.wait_for(drain, 5)
+
+        self.assertLessEqual(calls_while_blocked, 3)
+
+    async def test_batch_overflow_keeps_remaining_names(self) -> None:
+        fake: FakeBulkExchange = FakeBulkExchange()
+        with tempfile.TemporaryDirectory() as tmp, fake.patched():
+            fm = AssetFileManagement(
+                tmp, prefix_rankings=_descriptor().prefix_rankings,
+            )
+            await self._write(fm, 'a', 'b', 'c', 'd', 'e')
+            await scrape_upload.drain_targets_round_robin(
+                settings=_settings(
+                    bulk_batch_size=2, scrape_upload_concurrency=4,
+                ),
+                targets=[self._target(fm)], client=object(),
+            )
+
+        sent: list[str] = sorted(
+            cid for _c, _b, records in fake.posts for cid, _f in records
+        )
+        self.assertEqual(sent, ['a', 'b', 'c', 'd', 'e'])
+
+    async def test_vanished_file_is_skipped_quietly(self) -> None:
+        fake: FakeBulkExchange = FakeBulkExchange()
+        with tempfile.TemporaryDirectory() as tmp, fake.patched():
+            fm = AssetFileManagement(
+                tmp, prefix_rankings=_descriptor().prefix_rankings,
+            )
+            await self._write(fm, 'a', 'b')
+            target = self._target(fm)
+            # Prime the listing, then remove one listed file.
+            names: list[str] = await scrape_upload._next_upload_names(
+                target, 10,
+            )
+            target.upload.pending.extendleft(reversed(names))
+            os.remove(os.path.join(tmp, 'asset-a.json.br'))
+            with self.assertNoLogs(level='WARNING'):
+                await scrape_upload.drain_targets_round_robin(
+                    settings=_settings(), targets=[target],
+                    client=object(), resume_bulk=False,
+                )
+
+        sent: list[str] = [
+            cid for _c, _b, records in fake.posts for cid, _f in records
+        ]
+        self.assertEqual(sent, ['b'])
+
+    async def test_post_exception_leaves_nothing_in_flight(self) -> None:
+        fake: FakeBulkExchange = FakeBulkExchange()
+        fake.post_error = RuntimeError('network')
+        with tempfile.TemporaryDirectory() as tmp, fake.patched():
+            fm = AssetFileManagement(
+                tmp, prefix_rankings=_descriptor().prefix_rankings,
+            )
+            await self._write(fm, 'a')
+            target = self._target(fm)
+            with self.assertRaises(RuntimeError):
+                await scrape_upload.drain_bulk_target_once(
+                    settings=_settings(), target=target, client=object(),
+                )
+
+        self.assertEqual(target.upload.in_flight_jobs, set())
+        self.assertEqual(target.upload.in_flight_files, set())
+
+    async def test_cap_reached_without_blocking_or_resume(self) -> None:
+        self.assertFalse(hasattr(scrape_upload, 'reserve_bulk_upload_slot'))
+        fake: FakeBulkExchange = FakeBulkExchange(hold_finalize=True)
+        with tempfile.TemporaryDirectory() as tmp, fake.patched():
+            fm = AssetFileManagement(
+                tmp, prefix_rankings=_descriptor().prefix_rankings,
+            )
+            await self._write(fm, 'a', 'b', 'c', 'd')
+            real_post = fake.post
+
+            async def post_with_state(
+                batch_buf: bytes, batch_records: list[tuple[str, str]],
+                config: object, client: object, fm: AssetFileManagement,
+            ) -> tuple[str, str, BulkBatchOutcome | None]:
+                result = await real_post(
+                    batch_buf, batch_records, config, client, fm,
+                )
+                await write_bulk_state(fm, BulkUploadState(
+                    job_id=result[0], batch_id=result[1],
+                    schema_owner='owner', schema_version='1.0.0',
+                    platform='example', entity='thing',
+                    upload_filename='x', batch_records=batch_records,
+                ))
+                return result
+
+            resume: AsyncMock = AsyncMock()
+            with (
+                patch(
+                    'tools.scrape_upload.post_prepared_bulk_batch',
+                    side_effect=post_with_state,
+                ),
+                patch(
+                    'tools.scrape_upload.resume_pending_bulk_uploads',
+                    resume,
+                ),
+            ):
+                drain = asyncio.create_task(
+                    scrape_upload.drain_targets_round_robin(
+                        settings=_settings(
+                            bulk_batch_size=1, max_active_bulk_jobs=3,
+                        ),
+                        targets=[self._target(fm)], client=object(),
+                        resume_bulk=False,
+                    ),
+                )
+                for _ in range(50):
+                    await asyncio.sleep(0.01)
+                    if len(fake.posts) >= 3:
+                        break
+                self.assertEqual(len(fake.posts), 3)
+                await asyncio.sleep(0.05)
+                self.assertEqual(len(fake.posts), 3)
+                resume.assert_not_called()
+                fake.release.set()
+                await asyncio.wait_for(drain, 5)
+
+        self.assertEqual(len(fake.posts), 4)
+        resume.assert_not_called()
+
+    async def test_every_record_posted_exactly_once(self) -> None:
+        fake: FakeBulkExchange = FakeBulkExchange()
+        with tempfile.TemporaryDirectory() as tmp, fake.patched():
+            fm = AssetFileManagement(
+                tmp, prefix_rankings=_descriptor().prefix_rankings,
+            )
+            await self._write(fm, 'a', 'b', 'c', 'd', 'e')
+            await asyncio.wait_for(
+                scrape_upload.drain_targets_round_robin(
+                    settings=_settings(
+                        bulk_batch_size=50, scrape_upload_concurrency=2,
+                    ),
+                    targets=[self._target(fm)], client=object(),
+                ),
+                5,
+            )
+
+        sent: list[str] = sorted(
+            cid for _c, _b, records in fake.posts for cid, _f in records
+        )
+        self.assertEqual(sent, ['a', 'b', 'c', 'd', 'e'])
+
+
+    async def test_publish_pending_counts_sets_gauge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fm = AssetFileManagement(
+                tmp, prefix_rankings=_descriptor().prefix_rankings,
+            )
+            await self._write(fm, 'a', 'b')
+            Path(tmp, 'asset-c.json.br.invalid').write_text('x')
+            with self.assertLogs(level='INFO') as logs:
+                await scrape_upload.publish_pending_counts(
+                    [self._target(fm)],
+                )
+
+        records: list[logging.LogRecord] = [
+            record for record in logs.records
+            if record.getMessage() == 'Files pending upload'
+        ]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].levelno, logging.INFO)
+        self.assertEqual(records[0].platform, 'example')
+        self.assertEqual(records[0].entity, 'thing')
+        self.assertEqual(records[0].count, 2)
+
+        value: float | None = REGISTRY.get_sample_value(
+            'files_pending_upload', {
+                'platform': 'example', 'scraper': scrape_upload.SCRAPER_LABEL,
+                'entity': 'thing', 'worker_id': scrape_upload.get_worker_id(),
+            },
+        )
+        self.assertEqual(value, 2.0)
+
+    async def test_drain_in_flight_cancels_after_timeout(self) -> None:
+        fake: FakeBulkExchange = FakeBulkExchange(hold_finalize=True)
+        with tempfile.TemporaryDirectory() as tmp, fake.patched():
+            fm = AssetFileManagement(
+                tmp, prefix_rankings=_descriptor().prefix_rankings,
+            )
+            await self._write(fm, 'a')
+            target = self._target(fm)
+            await scrape_upload.drain_bulk_target_once(
+                settings=_settings(), target=target, client=object(),
+            )
+            tasks: set[asyncio.Task] = set(target.upload.in_flight_jobs)
+            await scrape_upload.drain_in_flight([target], 0.05)
+
+            self.assertTrue(all(task.done() for task in tasks))
+            self.assertTrue(all(task.cancelled() for task in tasks))
+            self.assertIsNone(target.upload.listing)
+            # The file is still on disk for the resume / next run.
+            self.assertTrue(Path(tmp, 'asset-a.json.br').exists())
+
+    async def test_drain_in_flight_waits_for_quick_jobs(self) -> None:
+        fake: FakeBulkExchange = FakeBulkExchange()
+        with tempfile.TemporaryDirectory() as tmp, fake.patched():
+            fm = AssetFileManagement(
+                tmp, prefix_rankings=_descriptor().prefix_rankings,
+            )
+            await self._write(fm, 'a')
+            target = self._target(fm)
+            await scrape_upload.drain_bulk_target_once(
+                settings=_settings(), target=target, client=object(),
+            )
+            await scrape_upload.drain_in_flight([target], 5.0)
+
+        self.assertEqual(fake.finalized, ['job1'])
+
+    async def test_orphaned_jobs_bounded_then_resumed(self) -> None:
+        fake: FakeBulkExchange = FakeBulkExchange()
+        fake.write_state = True
+        fake.finalize_status = 'progress_failed'
+        posts_at_resume: list[int] = []
+
+        async def resume(
+            fm: AssetFileManagement, *args: object, **kwargs: object,
+        ) -> None:
+            posts_at_resume.append(len(fake.posts))
+            for state in list_bulk_states(fm):
+                await delete_bulk_state(fm, state.job_id)
+
+        with tempfile.TemporaryDirectory() as tmp, fake.patched():
+            fm = AssetFileManagement(
+                tmp, prefix_rankings=_descriptor().prefix_rankings,
+            )
+            await self._write(fm, 'a', 'b', 'c', 'd', 'e', 'f')
+            target = self._target(fm)
+            with (
+                patch(
+                    'tools.scrape_upload.resume_pending_bulk_uploads',
+                    side_effect=resume,
+                ),
+                self.assertLogs(level='WARNING') as logs,
+            ):
+                await asyncio.wait_for(
+                    scrape_upload.drain_targets_round_robin(
+                        settings=_settings(
+                            bulk_batch_size=1, max_active_bulk_jobs=2,
+                        ),
+                        targets=[target], client=object(),
+                        resume_bulk=False,
+                    ),
+                    5,
+                )
+            orphans: int = len(list_bulk_states(fm))
+
+        # Two POSTs fill the cap; their state files stay behind, so
+        # one resume runs; after it two more POSTs fill the cap again
+        # and the drain ends instead of re-posting forever.
+        self.assertEqual(posts_at_resume, [2])
+        self.assertIn(
+            'Orphaned bulk jobs reached the cap; resuming them',
+            [record.getMessage() for record in logs.records],
+        )
+        self.assertEqual(len(fake.posts), 4)
+        self.assertEqual(orphans, 2)
+        self.assertEqual(target.upload.in_flight_jobs, set())
+        self.assertEqual(target.upload.in_flight_job_ids, {})
+
+    async def test_idle_target_scans_once_per_call(self) -> None:
+        calls: int = 0
+        real = scrape_upload.StreamingListing.next_chunk
+
+        async def counting(
+            listing: scrape_upload.StreamingListing,
+        ) -> tuple[list[str], bool]:
+            nonlocal calls
+            calls += 1
+            return await real(listing)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fm = AssetFileManagement(
+                tmp, prefix_rankings=_descriptor().prefix_rankings,
+            )
+            target = self._target(fm)
+            with patch.object(
+                scrape_upload.StreamingListing, 'next_chunk', counting,
+            ):
+                posted: int = await scrape_upload.drain_bulk_target_once(
+                    settings=_settings(), target=target, client=object(),
+                )
+            target.upload.listing.close()
+
+        self.assertEqual(posted, 0)
+        self.assertEqual(calls, 1)
+
+    async def test_round_robin_repolls_while_job_hangs(self) -> None:
+        fake: FakeBulkExchange = FakeBulkExchange(hold_finalize=True)
+        with tempfile.TemporaryDirectory() as tmp, fake.patched():
+            fm = AssetFileManagement(
+                tmp, prefix_rankings=_descriptor().prefix_rankings,
+            )
+            await self._write(fm, 'a')
+            calls: int = 0
+            real = scrape_upload.drain_bulk_target_once
+
+            async def counting(**kwargs: object) -> int:
+                nonlocal calls
+                calls += 1
+                return await real(**kwargs)
+
+            with (
+                patch.object(
+                    scrape_upload, 'drain_bulk_target_once', counting,
+                ),
+                patch.object(
+                    scrape_upload, 'ROUND_ROBIN_POLL_SECONDS', 0.02,
+                    create=True,
+                ),
+            ):
+                drain = asyncio.create_task(
+                    scrape_upload.drain_targets_round_robin(
+                        settings=_settings(max_active_bulk_jobs=1),
+                        targets=[self._target(fm)], client=object(),
+                        resume_bulk=False,
+                    ),
+                )
+                await asyncio.sleep(0.3)
+                calls_while_hung: int = calls
+                fake.release.set()
+                await asyncio.wait_for(drain, 5)
+
+        self.assertGreaterEqual(calls_while_hung, 4)
+
+    async def test_post_error_outcome_is_not_progress(self) -> None:
+        fake: FakeBulkExchange = FakeBulkExchange()
+        fake.post_outcome = BulkBatchOutcome(
+            status='post_rejected', job_id=None,
+            success=0, failed=0, missing=0,
+        )
+        with tempfile.TemporaryDirectory() as tmp, fake.patched():
+            fm = AssetFileManagement(
+                tmp, prefix_rankings=_descriptor().prefix_rankings,
+            )
+            await self._write(fm, 'a')
+            target = self._target(fm)
+            before: float = _batch_count('post_rejected')
+            posted: int = await scrape_upload.drain_bulk_target_once(
+                settings=_settings(), target=target, client=object(),
+            )
+            await asyncio.wait_for(
+                scrape_upload.drain_targets_round_robin(
+                    settings=_settings(), targets=[target],
+                    client=object(), resume_bulk=False,
+                ),
+                2,
+            )
+
+        self.assertEqual(posted, 0)
+        self.assertEqual(_batch_count('post_rejected') - before, 2)
+        self.assertEqual(len(fake.posts), 2)
+
+    async def test_drain_terminates_when_no_file_prepares(self) -> None:
+        fake: FakeBulkExchange = FakeBulkExchange()
+        with tempfile.TemporaryDirectory() as tmp, fake.patched():
+            fm = AssetFileManagement(
+                tmp, prefix_rankings=_descriptor().prefix_rankings,
+            )
+            for asset_id in ('x', 'y', 'z'):
+                # Schema-invalid: no 'url'.
+                await fm.write_file(
+                    f'asset-{asset_id}.json.br', {'id': asset_id},
+                )
+            with self.assertLogs(level='WARNING'):
+                await asyncio.wait_for(
+                    scrape_upload.drain_targets_round_robin(
+                        settings=_settings(bulk_batch_size=1),
+                        targets=[self._target(fm)], client=object(),
+                    ),
+                    5,
+                )
+
+        self.assertEqual(fake.posts, [])
+
+    async def test_drain_in_flight_closes_all_listings_on_error(
+        self,
+    ) -> None:
+        with (
+            tempfile.TemporaryDirectory() as dir_a,
+            tempfile.TemporaryDirectory() as dir_b,
+        ):
+            target_a = self._target(AssetFileManagement(dir_a))
+            target_b = self._target(AssetFileManagement(dir_b))
+            broken: MagicMock = MagicMock()
+            broken.close.side_effect = OSError('close failed')
+            healthy: MagicMock = MagicMock()
+            target_a.upload.listing = broken
+            target_b.upload.listing = healthy
+            with self.assertLogs(level='WARNING'):
+                await scrape_upload.drain_in_flight(
+                    [target_a, target_b], 0.1,
+                )
+
+        healthy.close.assert_called_once()
+        self.assertIsNone(target_a.upload.listing)
+        self.assertIsNone(target_b.upload.listing)
+
+
+class TestShutdown(unittest.IsolatedAsyncioTestCase):
+
+    async def test_sigterm_cancels_run_and_drains_clamped(self) -> None:
+        loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+        handlers: dict[int, object] = {}
+        entered: asyncio.Event = asyncio.Event()
+
+        async def block(**kwargs: object) -> None:
+            entered.set()
+            await asyncio.Event().wait()
+
+        client: SimpleNamespace = SimpleNamespace(aclose=AsyncMock())
+        drain: AsyncMock = AsyncMock()
+        settings: SimpleNamespace = _settings(
+            api_key_id='id', api_key_secret='secret', metrics_port=0,
+            pending_count_interval_seconds=600.0,
+            background_drain_timeout_seconds=300.0,
+            scrape_upload_watch=False,
+        )
+        with (
+            patch.object(
+                loop, 'add_signal_handler',
+                side_effect=lambda sig, cb: handlers.update({sig: cb}),
+            ),
+            patch.object(loop, 'remove_signal_handler'),
+            patch.object(scrape_upload, 'configure_logging'),
+            patch.object(scrape_upload, 'start_metrics_server'),
+            patch.object(
+                scrape_upload.ExchangeClient, 'setup',
+                AsyncMock(return_value=client),
+            ),
+            patch.object(
+                scrape_upload, 'build_upload_targets',
+                AsyncMock(return_value=['t']),
+            ),
+            patch.object(scrape_upload, 'pending_count_loop', AsyncMock()),
+            patch.object(scrape_upload, 'drain_targets_round_robin', block),
+            patch.object(scrape_upload, 'drain_in_flight', drain),
+        ):
+            task: asyncio.Task = asyncio.create_task(
+                scrape_upload.run(settings),
+            )
+            await asyncio.wait_for(entered.wait(), 1)
+            self.assertIn(signal.SIGINT, handlers)
+            handlers[signal.SIGTERM]()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        drain.assert_awaited_once_with(
+            ['t'], scrape_upload.BULK_SHUTDOWN_DRAIN_SECONDS,
+        )
+        self.assertEqual(scrape_upload.BULK_SHUTDOWN_DRAIN_SECONDS, 45.0)
+        client.aclose.assert_awaited_once()
+
+    def test_main_exits_cleanly_when_cancelled(self) -> None:
+        async def cancelled(settings: object) -> None:
+            raise asyncio.CancelledError()
+
+        with (
+            patch.object(scrape_upload, 'ScrapeUploadSettings'),
+            patch.object(scrape_upload, 'run', cancelled),
+            self.assertLogs(level='INFO') as logs,
+        ):
+            self.assertIsNone(scrape_upload.main())
+
+        self.assertIn(
+            'scrape_upload stopped by signal',
+            [record.getMessage() for record in logs.records],
+        )
 
 
 if __name__ == '__main__':

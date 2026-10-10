@@ -301,6 +301,20 @@ class TestEnqueue(_RedisQueueTestBase):
             )
 
 
+class TestEnqueueManyRedisOnly(_RedisQueueTestBase):
+
+    async def test_falls_back_to_per_id_enqueue(self) -> None:
+        await self.queue.enqueue('aaa', source='rss')
+        added: int = await self.queue.enqueue_many(
+            ['aaa', 'bbb', 'ccc'], source='channel', channel_id='UCx',
+        )
+        self.assertEqual(added, 2)
+        self.assertEqual(
+            sorted(await self.redis.zrange('youtube:video:queue', 0, -1)),
+            ['aaa', 'bbb', 'ccc'],
+        )
+
+
 class TestPop(_RedisQueueTestBase):
 
     async def test_returns_oldest_first(self) -> None:

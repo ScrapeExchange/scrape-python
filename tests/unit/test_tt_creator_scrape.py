@@ -110,6 +110,7 @@ def _settings(**overrides: object) -> MagicMock:
         'session_bootstrap_timeout_ms', 90000,
     )
     s.creator_concurrency = overrides.get('creator_concurrency', 0)
+    s.creator_max_browsers = overrides.get('creator_max_browsers', 12)
     s.creator_num_processes = overrides.get('creator_num_processes', 1)
     s.creator_retry_interval_seconds = overrides.get(
         'creator_retry_interval_seconds', 300,
@@ -203,6 +204,29 @@ class TestCreatorSettings(unittest.TestCase):
         self.assertEqual(tool._auto_creator_concurrency(18, 2), 18)
         self.assertEqual(tool._auto_creator_concurrency(18, 4), 18)
         self.assertEqual(tool._auto_creator_concurrency(0, 4), 1)
+
+    def test_auto_creator_concurrency_capped_by_max_browsers(
+        self,
+    ) -> None:
+        s: MagicMock = _settings()
+        self.assertEqual(
+            tool._resolve_creator_concurrency(s, proxy_count=67), 12,
+        )
+        self.assertEqual(
+            tool._resolve_creator_concurrency(s, proxy_count=5), 5,
+        )
+
+    def test_zero_max_browsers_disables_creator_cap(self) -> None:
+        s: MagicMock = _settings(creator_max_browsers=0)
+        self.assertEqual(
+            tool._resolve_creator_concurrency(s, proxy_count=67), 67,
+        )
+
+    def test_explicit_creator_concurrency_not_capped(self) -> None:
+        s: MagicMock = _settings(creator_concurrency=30)
+        self.assertEqual(
+            tool._resolve_creator_concurrency(s, proxy_count=67), 30,
+        )
 
     def test_explicit_creator_concurrency_wins(self) -> None:
         s: MagicMock = _settings(

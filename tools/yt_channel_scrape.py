@@ -96,9 +96,13 @@ from scrape_exchange.channel_scrape_queue import (
 from scrape_exchange.youtube.channel_video_refresh import (
     FullScrapeSummary,
     KnownVideoIds,
+    below_min_subscribers,
     queue_channel_videos,
 )
-from scrape_exchange.youtube.settings import YouTubeScraperSettings
+from scrape_exchange.youtube.settings import (
+    DEFAULT_CHANNEL_MIN_SUBSCRIBERS,
+    YouTubeScraperSettings,
+)
 from scrape_exchange.youtube.derived_metadata import (
     enrich_channel_category,
     set_channel_country,
@@ -117,14 +121,13 @@ CHANNEL_FILE_POSTFIX = '.json.br'
 TOPIC_CHANNEL_SUFFIX: str = ' - topic'
 TOPIC_HANDLE_SUFFIX: str = '-topic'
 TOPIC_CHANNEL_LAST_ERROR: str = 'topic channel skipped'
-MIN_CHANNEL_SUBSCRIBERS: int = 10
+MIN_CHANNEL_SUBSCRIBERS: int = DEFAULT_CHANNEL_MIN_SUBSCRIBERS
 CHANNEL_BATCH_PROGRESS_INTERVAL_SECONDS: float = 30.0
 
 PRIORITY_MAX_RETRIES: int = 5
 
 MAX_NEW_CHANNELS: int = 1000
 MAX_RESOLVED_CHANNELS: int = 100
-MIN_CHANNEL_SUBSCRIBERS: int = 10
 
 
 class TopicChannelError(RuntimeError):
@@ -1915,8 +1918,9 @@ async def _enqueue_discovered_channel_links(
             **extra,
             'link_channel_handle': link.channel_handle,
         }
-        subs: int | None = link.subscriber_count
-        if subs is not None and subs < MIN_CHANNEL_SUBSCRIBERS:
+        if below_min_subscribers(
+            link.subscriber_count, settings.channel_min_subscribers,
+        ):
             CHANNEL_LINK_DISCOVERY.labels(
                 outcome='below_min_subscribers',
             ).inc()
@@ -2196,7 +2200,7 @@ async def _scrape_one_queued(
             return
         except ChannelNoContentError as exc:
             end_state: ChannelState | None = _channel_end_state(
-                exc.channel,
+                exc.channel, settings.channel_min_subscribers,
             )
             if end_state is not None:
                 full_outcome = 'terminal'
@@ -2284,7 +2288,9 @@ async def _scrape_one_queued(
                 member,
                 subscriber_count=str(channel.subscriber_count),
             )
-        end_state: ChannelState | None = _channel_end_state(channel)
+        end_state: ChannelState | None = _channel_end_state(
+            channel, settings.channel_min_subscribers,
+        )
         if end_state is not None:
             full_outcome = 'terminal'
             await _mark_channel_end_state(
@@ -2436,10 +2442,11 @@ def _is_topic_channel_scrape(channel: YouTubeChannel) -> bool:
 
 
 def _channel_has_low_subscribers(
-    channel: YouTubeChannel,
+    channel: YouTubeChannel, min_subscribers: int,
 ) -> bool:
-    count: int | None = channel.subscriber_count
-    return count is not None and count < MIN_CHANNEL_SUBSCRIBERS
+    return below_min_subscribers(
+        channel.subscriber_count, min_subscribers,
+    )
 
 
 def _channel_has_no_videos(channel: YouTubeChannel) -> bool:
@@ -2448,10 +2455,11 @@ def _channel_has_no_videos(channel: YouTubeChannel) -> bool:
 
 def _channel_end_state(
     channel: YouTubeChannel,
+    min_subscribers: int = MIN_CHANNEL_SUBSCRIBERS,
 ) -> ChannelState | None:
     if _is_topic_channel_scrape(channel):
         return ChannelState.TOPIC
-    if _channel_has_low_subscribers(channel):
+    if _channel_has_low_subscribers(channel, min_subscribers):
         return ChannelState.LOW_SUBS
     if _channel_has_no_videos(channel):
         return ChannelState.NO_VIDEOS

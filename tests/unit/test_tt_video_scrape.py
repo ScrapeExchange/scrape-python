@@ -53,6 +53,7 @@ def _settings(**overrides: object) -> MagicMock:
         'video_transient_backoff_seconds', 0,
     )
     settings.video_concurrency = overrides.get('video_concurrency', 0)
+    settings.video_max_browsers = overrides.get('video_max_browsers', 12)
     settings.video_queue_batch = overrides.get('video_queue_batch', 50)
     settings.video_queue_idle_poll_seconds = overrides.get(
         'video_queue_idle_poll_seconds', 2.0,
@@ -84,6 +85,31 @@ class TestVideoSettings(unittest.TestCase):
                 _cli_parse_args=[],
             )
         self.assertEqual(settings.video_concurrency, 4)
+
+
+class TestVideoBrowserCap(unittest.TestCase):
+
+    def test_default_max_browsers_is_twelve(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            settings = tool.VideoSettings(
+                _env_file=None,
+                _cli_parse_args=[],
+            )
+        self.assertEqual(settings.video_max_browsers, 12)
+
+    def test_auto_concurrency_capped_by_max_browsers(self) -> None:
+        s: MagicMock = _settings()
+        self.assertEqual(tool._resolve_video_concurrency(s, 67), 12)
+        self.assertEqual(tool._resolve_video_concurrency(s, 5), 5)
+        self.assertEqual(tool._resolve_video_concurrency(s, 0), 1)
+
+    def test_zero_max_browsers_disables_cap(self) -> None:
+        s: MagicMock = _settings(video_max_browsers=0)
+        self.assertEqual(tool._resolve_video_concurrency(s, 67), 67)
+
+    def test_explicit_concurrency_not_capped(self) -> None:
+        s: MagicMock = _settings(video_concurrency=30)
+        self.assertEqual(tool._resolve_video_concurrency(s, 67), 30)
 
 
 class TestMain(unittest.TestCase):

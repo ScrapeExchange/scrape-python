@@ -50,6 +50,27 @@ def _is_no_data_response(response: httpx.Response) -> bool:
     )
 
 
+VIDEOS_SKIPPED_MIN_SUBSCRIBERS: Counter = Counter(
+    'channel_videos_skipped_min_subscribers_total',
+    'Videos not queued because their channel is below '
+    'CHANNEL_MIN_SUBSCRIBERS',
+    ['scraper'],
+)
+
+
+def below_min_subscribers(
+    subscriber_count: int | None, minimum: int,
+) -> bool:
+    '''True when a channel's videos must not be queued: the check is
+    enabled (*minimum* > 0) and the subscriber count is known and
+    below it. An unknown count never blocks queuing.'''
+    return (
+        minimum > 0
+        and subscriber_count is not None
+        and subscriber_count < minimum
+    )
+
+
 FULL_SCRAPES: Counter = Counter(
     'channel_full_scrapes_total',
     'Full channel scrape outcomes including video queue delivery',
@@ -326,16 +347,18 @@ async def queue_channel_videos(
             http_client, exchange_url, channel.channel_id,
         )
 
+    to_queue: list[str] = []
     for video_id in candidates:
         if video_id in exchange_ids:
             summary.video_ids_existing += 1
             continue
-        added: bool = await queue.enqueue(
-            video_id, source='channel',
-            channel_id=channel.channel_id,
-            channel_handle=channel.channel_handle,
-        )
-        if added:
-            summary.video_ids_added += 1
-        else:
-            summary.video_ids_queue_known += 1
+        to_queue.append(video_id)
+    # One insert_many per 1000 IDs instead of one insert per video:
+    # full enumerations of large channels queue tens of thousands.
+    added: int = await queue.enqueue_many(
+        to_queue, source='channel',
+        channel_id=channel.channel_id,
+        channel_handle=channel.channel_handle,
+    )
+    summary.video_ids_added += added
+    summary.video_ids_queue_known += len(to_queue) - added

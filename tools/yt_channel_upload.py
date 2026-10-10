@@ -161,9 +161,7 @@ class ChannelUploadSettings(YouTubeScraperSettings):
     )
     max_active_bulk_jobs: int = Field(
         default=10,
-        validation_alias=AliasChoices(
-            'MAX_ACTIVE_BULK_JOBS', 'max_active_bulk_jobs',
-        ),
+        validation_alias='BULK_MAX_ACTIVE_JOBS',
         description=(
             'Maximum number of accepted bulk-upload jobs tracked '
             'in the local .bulk state directory that may be in '

@@ -50,7 +50,9 @@ from scrape_exchange.youtube.youtube_channel_tabs import (
     configure_innertube_executor,
     shutdown_innertube_executor,
 )
-from scrape_exchange.watchdog import Watchdog
+from scrape_exchange.watchdog import Watchdog, make_log_file_writer
+from scrape_exchange.worker_id import get_worker_id
+from scrape_exchange.browser_tmpdir import isolate_browser_tmpdir
 from scrape_exchange.settings import ScraperSettings
 
 
@@ -123,6 +125,11 @@ class ScraperRunner:
     ``client_enabled=False`` skips Exchange initialization and supervisor
     authentication entirely. ``client_required=False`` merely tolerates
     initialization failures for tools that still optionally upload.
+
+    ``browser_tmpdir=True`` gives each worker process its own ``TMPDIR``
+    (wiped at startup) so browser profiles leaked by a crashed worker
+    are reclaimed when its slot restarts. Set it for scrapers that
+    launch Playwright/Camoufox browsers.
     '''
 
     def __init__(
@@ -143,6 +150,7 @@ class ScraperRunner:
         concurrency_env_var: str | None = None,
         child_concurrencies: list[int] | None = None,
         client_enabled: bool = True,
+        browser_tmpdir: bool = False,
     ) -> None:
         self._settings: ScraperSettings = settings
         self._scraper_label: str = scraper_label
@@ -160,6 +168,7 @@ class ScraperRunner:
         self._split_proxy_pool: bool = split_proxy_pool
         self._concurrency_env_var: str | None = concurrency_env_var
         self._child_concurrencies: list[int] | None = child_concurrencies
+        self._browser_tmpdir: bool = browser_tmpdir
 
     def run_sync(
         self,
@@ -265,6 +274,9 @@ class ScraperRunner:
             },
         )
 
+        if self._browser_tmpdir:
+            isolate_browser_tmpdir(self._scraper_label, get_worker_id())
+
         _start_metrics_server_or_skip(self._metrics_port)
         publish_config_metrics(
             role='worker', scraper_label=self._scraper_label, num_processes=1,
@@ -284,6 +296,9 @@ class ScraperRunner:
                 ),
                 work_timeout=(
                     self._settings.watchdog_work_timeout_seconds
+                ),
+                log_fn=make_log_file_writer(
+                    self._log_file, self._settings.log_format,
                 ),
             )
             Watchdog.set_instance(watchdog)

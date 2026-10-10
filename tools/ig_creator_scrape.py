@@ -135,7 +135,24 @@ class CreatorSettings(InstagramScraperSettings):
             'INSTAGRAM_CREATOR_CONCURRENCY',
             'creator_concurrency',
         ),
-        description='Fleet-wide async worker upper bound.',
+        description=(
+            'Fleet-wide async worker upper bound; each worker runs its '
+            'own browser. 0 = one per proxy, capped by '
+            'IG_CREATOR_MAX_BROWSERS.'
+        ),
+    )
+    creator_max_browsers: int = Field(
+        default=12,
+        validation_alias=AliasChoices(
+            'IG_CREATOR_MAX_BROWSERS',
+            'INSTAGRAM_CREATOR_MAX_BROWSERS',
+            'creator_max_browsers',
+        ),
+        description=(
+            'Cap on browsers (one per worker) when '
+            'IG_CREATOR_CONCURRENCY is 0. Each Camoufox browser uses '
+            'roughly 250-300 MB of RAM. 0 = no cap.'
+        ),
     )
     creator_num_processes: int = Field(
         default=1,
@@ -336,7 +353,11 @@ def _resolve_creator_concurrency(
     requested: int = int(settings.creator_concurrency)
     if requested > 0:
         return requested
-    return _auto_creator_concurrency(proxy_count)
+    auto: int = _auto_creator_concurrency(proxy_count)
+    max_browsers: int = int(settings.creator_max_browsers)
+    if max_browsers > 0:
+        return min(auto, max_browsers)
+    return auto
 
 
 def _effective_creator_concurrency(
@@ -1015,6 +1036,7 @@ def main() -> None:
         split_proxy_pool=True,
         concurrency_env_var='IG_CREATOR_CONCURRENCY',
         child_concurrencies=child_concurrencies,
+        browser_tmpdir=True,
     )
     sys.exit(runner.run_sync(_run_worker))
 
