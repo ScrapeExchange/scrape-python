@@ -489,6 +489,51 @@ class TestChannelVideoRefresh(unittest.IsolatedAsyncioTestCase):
             ['new-video'],
         )
 
+    async def test_below_min_subscribers_scraped_but_not_queued(
+        self,
+    ) -> None:
+        self.settings.channel_min_subscribers = 10
+        self.channel.subscriber_count = 9
+        await self.run_scrape()
+        meta: dict[str, str] = await self.queue.get_meta('i:UCexample')
+        self.assertEqual(self.modes, [False])
+        self.assertEqual(meta['state'], 'low_subs')
+        self.assertEqual(meta['subscriber_count'], '9')
+        self.assertEqual(
+            await self.redis.zrange('youtube:video:queue', 0, -1), [],
+        )
+
+    async def test_min_subscribers_setting_drives_low_subs(
+        self,
+    ) -> None:
+        self.settings.channel_min_subscribers = 5
+        self.channel.subscriber_count = 9
+        await self.run_scrape()
+        meta: dict[str, str] = await self.queue.get_meta('i:UCexample')
+        self.assertNotEqual(meta['state'], 'low_subs')
+        self.assertEqual(
+            await self.redis.zrange('youtube:video:queue', 0, -1),
+            ['new-video'],
+        )
+
+    async def test_at_min_subscribers_queues_videos(self) -> None:
+        self.settings.channel_min_subscribers = 10
+        self.channel.subscriber_count = 10
+        await self.run_scrape()
+        self.assertEqual(
+            await self.redis.zrange('youtube:video:queue', 0, -1),
+            ['new-video'],
+        )
+
+    async def test_unknown_subscribers_queue_videos(self) -> None:
+        self.settings.channel_min_subscribers = 10
+        self.channel.subscriber_count = None
+        await self.run_scrape()
+        self.assertEqual(
+            await self.redis.zrange('youtube:video:queue', 0, -1),
+            ['new-video'],
+        )
+
     async def test_filter_other_404_still_raises(self) -> None:
         def respond(request: httpx.Request) -> httpx.Response:
             return httpx.Response(404, json={'detail': 'Not Found'})
@@ -800,3 +845,34 @@ class TestKnownVideoIds(unittest.IsolatedAsyncioTestCase):
             await self.redis.zrange('youtube:video:queue', 0, -1),
             ['new'],
         )
+
+    async def test_queue_channel_videos_batches_one_enqueue_many(
+        self,
+    ) -> None:
+        channel: YouTubeChannel = YouTubeChannel(
+            'example', channel_id='UCexample',
+            with_download_client=False,
+        )
+        channel.video_ids = {'on-exchange', 'new-a', 'new-b', 'queued'}
+        await self.redis.zadd('youtube:video:queue', {'queued': 1})
+        summary: refresh.FullScrapeSummary = refresh.FullScrapeSummary(
+            'UCexample',
+        )
+        real = refresh.RedisVideoScrapeQueue.enqueue_many
+        with patch.object(
+            refresh.RedisVideoScrapeQueue, 'enqueue_many',
+            autospec=True, side_effect=real,
+        ) as spy:
+            await refresh.queue_channel_videos(
+                channel, redis=self.redis, http_client=self.http,
+                exchange_url='https://scrape.exchange',
+                video_fm=self.fm, summary=summary,
+                exchange_ids={'on-exchange'},
+            )
+        spy.assert_called_once()
+        self.assertEqual(
+            spy.call_args.args[1], ['new-a', 'new-b', 'queued'],
+        )
+        self.assertEqual(summary.video_ids_added, 2)
+        self.assertEqual(summary.video_ids_queue_known, 1)
+        self.assertEqual(summary.video_ids_existing, 1)

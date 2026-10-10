@@ -563,8 +563,9 @@ async def _resume_one_bulk_state(
                 },
             )
             return
-    results: 'BulkResults | None' = await fetch_bulk_results(
+    results: 'BulkResults | None' = await fetch_settled_bulk_results(
         state.job_id, exchange_url, client,
+        expected_total=len(state.batch_records),
     )
     await apply_bulk_results(
         state.batch_records, results, fm,
@@ -971,6 +972,74 @@ async def fetch_bulk_results(
     return results
 
 
+# Back-off between re-fetches of /results while the server's counts
+# catch up with its terminal status. scrape-api workers that predate
+# the counts-before-status ordering publish ``completed`` before
+# writing the counts, so the first fetch can report total=0 for a job
+# that fully succeeded. Total worst-case wait: 7.5s per batch.
+_RESULTS_SETTLE_DELAYS: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0)
+
+
+def _results_settled(
+    results: 'BulkResults | None', expected_total: int,
+) -> bool:
+    '''True when *results* can no longer improve by waiting: the
+    server has counted every submitted record and mirrored every
+    failure. A ``total`` above *expected_total* is also final (the
+    reconcile step rejects it).'''
+    if results is None:
+        return False
+    return (
+        results.total >= expected_total
+        and len(results.failures) >= results.failed
+    )
+
+
+async def fetch_settled_bulk_results(
+    job_id: str,
+    exchange_url: str,
+    client: ExchangeClient,
+    expected_total: int,
+    delays: tuple[float, ...] = _RESULTS_SETTLE_DELAYS,
+) -> 'BulkResults | None':
+    '''
+    :func:`fetch_bulk_results`, re-fetched with back-off until the
+    counts cover *expected_total* records and the failures list is
+    complete, or *delays* is exhausted. Returns the last fetch, which
+    :func:`apply_bulk_results` still validates; an unsettled result
+    leaves the batch for retry exactly as before.
+    '''
+    results: 'BulkResults | None' = await fetch_bulk_results(
+        job_id, exchange_url, client,
+    )
+    for attempt, delay in enumerate(delays, start=1):
+        if _results_settled(results, expected_total):
+            if attempt > 1:
+                logging.info(
+                    'Bulk results settled after re-fetch',
+                    extra={'job_id': job_id, 'attempts': attempt},
+                )
+            return results
+        logging.info(
+            'Bulk results not settled yet; re-fetching',
+            extra={
+                'job_id': job_id,
+                'attempt': attempt,
+                'delay_seconds': delay,
+                'expected_total': expected_total,
+                'total': results.total if results else None,
+                'failed': results.failed if results else None,
+                'failure_entries': (
+                    len(results.failures) if results else None
+                ),
+            },
+        )
+        _touch_watchdog_work()
+        await asyncio.sleep(delay)
+        results = await fetch_bulk_results(job_id, exchange_url, client)
+    return results
+
+
 def _match_failures(
     failures: list[dict],
     by_id: dict[str, str],
@@ -1364,8 +1433,9 @@ async def finalize_bulk_batch(
             success=0, failed=0, missing=0,
         )
 
-    results: 'BulkResults | None' = await fetch_bulk_results(
+    results: 'BulkResults | None' = await fetch_settled_bulk_results(
         job_id, exchange_url, client,
+        expected_total=len(batch_records),
     )
     success: int
     failed: int

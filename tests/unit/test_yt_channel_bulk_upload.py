@@ -79,6 +79,20 @@ class TestChannelUploadSettings(unittest.TestCase):
 
         self.assertEqual(settings.channel_upload_concurrency, 7)
 
+    def test_bulk_max_active_jobs_env_sets_max_active_bulk_jobs(
+        self,
+    ) -> None:
+        from tools.yt_channel_upload import ChannelUploadSettings
+
+        with patch.dict(
+            os.environ, {'BULK_MAX_ACTIVE_JOBS': '2'}, clear=True,
+        ):
+            settings = ChannelUploadSettings(
+                _cli_parse_args=False,
+            )
+
+        self.assertEqual(settings.max_active_bulk_jobs, 2)
+
 
 class TestApplyBulkResults(unittest.IsolatedAsyncioTestCase):
 

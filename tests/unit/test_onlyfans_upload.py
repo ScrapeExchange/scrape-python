@@ -1,5 +1,6 @@
 '''OnlyFans records participate in the generic uploader pipelines.'''
 
+import asyncio
 import json
 import tempfile
 import unittest
@@ -13,6 +14,7 @@ from scrape_exchange.bulk_upload import (
     apply_bulk_results,
 )
 from scrape_exchange.onlyfans.onlyfans_creator import extract_profile
+from tests.unit._bulk_upload_fakes import FakeBulkExchange
 from tests.unit.test_onlyfans_creator import public_profile
 from tools import scrape_upload as uploader
 
@@ -79,20 +81,17 @@ class TestOnlyFansUpload(unittest.IsolatedAsyncioTestCase):
     async def test_bulk_validates_and_routes_onlyfans_record(self) -> None:
         target: uploader.AssetUploadTarget = await self.target()
         await target.fm.write_file(self.filename, self.record)
-        with patch.object(uploader, 'upload_prepared_bulk_batch', AsyncMock(
-            return_value=BulkBatchOutcome(
-                status='completed', success=1, failed=0, missing=0,
-                success_ids={'example'}, job_id='test-job',
-            ),
-        )) as upload:
+        fake: FakeBulkExchange = FakeBulkExchange()
+        with fake.patched():
             count: int = await uploader.drain_bulk_target_once(
                 settings=self.settings, target=target, client=self.client,
             )
+            await asyncio.gather(*target.upload.in_flight_jobs)
         self.assertEqual(count, 1)
         payload: bytes
         records: list[tuple[str, str]]
         config: uploader.BulkUploadConfig
-        payload, records, config = upload.await_args.args
+        config, payload, records = fake.posts[0]
         self.assertEqual(json.loads(payload), self.record)
         self.assertEqual(records, [('example', self.filename)])
         self.assertEqual((config.platform, config.entity),

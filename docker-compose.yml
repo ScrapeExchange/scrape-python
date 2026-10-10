@@ -10,6 +10,12 @@
 x-scraper-common: &scraper-common
   image: ghcr.io/scrapeexchange/scrape-python:latest
   env_file: .env
+  environment:
+    # Cap glibc malloc arenas. Scrapers run many worker threads
+    # (thread-pool extract_info, to_thread I/O); each thread otherwise
+    # gets its own 64 MB arena that keeps freed memory, which held
+    # ~1.7 GB per yt-video worker. Override in .env if needed.
+    MALLOC_ARENA_MAX: ${MALLOC_ARENA_MAX:-2}
   restart: unless-stopped
   network_mode: host
   stop_grace_period: 60s
@@ -156,28 +162,44 @@ services:
     <<: *scraper-common
     command: ["tools/tt_creator_scrape.py"]
     container_name: tt-creator
+    # Camoufox browsers at roughly 250-300 MB each. The limit keeps an
+    # OOM inside this container instead of starving the host.
+    mem_limit: 8g
 
   tt-video:
     <<: *scraper-common
     command: ["tools/tt_video_scrape.py"]
     container_name: tt-video
+    # Camoufox browsers at roughly 250-300 MB each. The limit keeps an
+    # OOM inside this container instead of starving the host.
+    mem_limit: 8g
 
   ig-creator:
     <<: *scraper-common
     command: ["tools/ig_creator_scrape.py"]
     container_name: ig-creator
+    # One Camoufox browser per worker (IG_CREATOR_MAX_BROWSERS, default
+    # 12) at roughly 250-300 MB each. The limit keeps an OOM inside this
+    # container instead of starving every scraper on the host.
+    mem_limit: 8g
 
   tw-creator:
     <<: *scraper-common
     command: ["tools/tw_creator_scrape.py"]
     container_name: tw-creator
     init: true
+    # Camoufox browsers at roughly 250-300 MB each. The limit keeps an
+    # OOM inside this container instead of starving the host.
+    mem_limit: 8g
 
   of-creator:
     <<: *scraper-common
     command: ["tools/of_creator_scrape.py"]
     container_name: of-creator
     init: true
+    # Camoufox browsers at roughly 250-300 MB each. The limit keeps an
+    # OOM inside this container instead of starving the host.
+    mem_limit: 8g
 
   scrape-upload:
     <<: *scraper-common

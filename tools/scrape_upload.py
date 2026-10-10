@@ -15,8 +15,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import signal
+from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -28,7 +30,7 @@ from watchfiles import Change, awatch
 
 from scrape_exchange.bulk_upload import (
     BulkBatchOutcome,
-    reserve_bulk_upload_slot,
+    list_bulk_states,
     resume_pending_bulk_uploads,
 )
 from scrape_exchange.channel_scrape_queue import (
@@ -65,12 +67,18 @@ from scrape_exchange.onlyfans.onlyfans_creator import OnlyFansCreator
 from scrape_exchange.redis_client import redis_from_url
 from scrape_exchange.schema_validator import SchemaValidator, fetch_schema_dict
 from scrape_exchange.scraper_metrics import (
+    METRIC_BULK_JOBS_IN_FLIGHT,
     METRIC_FILES_PENDING_UPLOAD,
     METRIC_UPLOAD_BATCHES,
     METRIC_UPLOADS_FAILED,
     METRIC_UPLOADS_MISSING_RESULT,
 )
 from scrape_exchange.settings import ScraperSettings, normalize_log_level
+from scrape_exchange.streaming_listing import (
+    LISTING_CHUNK_SIZE,
+    StreamingListing,
+    count_matching_files,
+)
 from scrape_exchange.tiktok import (
     TikTokCreator,
     TikTokHashtag,
@@ -81,7 +89,8 @@ from scrape_exchange.upload import (
     BulkUploadConfig,
     emit_bulk_batch_metrics,
     ndjson_line,
-    upload_prepared_bulk_batch,
+    finalize_prepared_bulk_batch,
+    post_prepared_bulk_batch,
     validate_upload_record,
 )
 from scrape_exchange.video_scrape_queue import (
@@ -106,6 +115,15 @@ TIKTOK_HASHTAG_PREFIX: str = 'tiktok-hashtag-'
 INSTAGRAM_CREATOR_PREFIX: str = 'instagram-creator-'
 TWITCH_CREATOR_PREFIX: str = 'twitch-creator-'
 ONLYFANS_CREATOR_PREFIX: str = 'onlyfans-creator-'
+# Longest wait in the round-robin before re-polling every target while
+# bulk jobs are still running.
+ROUND_ROBIN_POLL_SECONDS: float = 60.0
+# Upper bound on the shutdown wait for in-flight bulk jobs; stays below
+# the container stop grace period so the drain finishes before SIGKILL.
+BULK_SHUTDOWN_DRAIN_SECONDS: float = 45.0
+SHUTDOWN_SIGNALS: tuple[signal.Signals, ...] = (
+    signal.SIGTERM, signal.SIGINT,
+)
 SCRAPE_UPLOAD_DEFAULT_LOG_FILE: str = (
     '/var/log/scrape/scrape_upload.log'
 )
@@ -134,6 +152,32 @@ class AssetTargetSpec:
     directory: str
 
 
+@dataclass
+class TargetUploadState:
+    '''Mutable bulk-upload state of one target: its streaming listing
+    and the jobs POSTed but not yet reconciled.
+
+    ``in_flight_jobs`` holds every background task the round-robin
+    waits on: the finalize task of each POSTed job (also keyed to its
+    job id in ``in_flight_job_ids``) and, at most one at a time, the
+    ``resume_task`` that reconciles orphaned jobs.'''
+    listing: StreamingListing | None = None
+    pending: deque[str] = field(default_factory=deque)
+    pass_ended: bool = False
+    in_flight_files: set[str] = field(default_factory=set)
+    in_flight_jobs: set[asyncio.Task] = field(default_factory=set)
+    in_flight_job_ids: dict[asyncio.Task, str] = field(
+        default_factory=dict,
+    )
+    resume_task: asyncio.Task | None = None
+    # One orphan resume per round-robin drain, so a resume that cannot
+    # reconcile anything does not loop.
+    resume_attempted: bool = False
+    # Set when a finalize released its files, so the next drain may
+    # need a fresh listing pass to see them again.
+    files_released: bool = False
+
+
 @dataclass(frozen=True)
 class AssetUploadTarget:
     descriptor: AssetDescriptor
@@ -141,6 +185,9 @@ class AssetUploadTarget:
     validator: SchemaValidator
     processor: AssetProcessor | None = None
     state: Any = None
+    upload: TargetUploadState = field(
+        default_factory=TargetUploadState, compare=False,
+    )
 
 
 def _youtube_video_record(data: dict[str, Any]) -> dict[str, Any]:
@@ -438,12 +485,23 @@ class ScrapeUploadSettings(ScraperSettings):
         description='Seconds to wait for bulk progress.',
     )
     max_active_bulk_jobs: int = Field(
-        default=10,
-        validation_alias=AliasChoices(
-            'MAX_ACTIVE_BULK_JOBS',
-            'max_active_bulk_jobs',
+        default=3,
+        ge=1,
+        validation_alias='BULK_MAX_ACTIVE_JOBS',
+        description=(
+            'Bulk jobs in flight per upload target: POSTed but not yet '
+            'reconciled. The uploader prepares and POSTs the next batch '
+            'while up to this many jobs run on the server.'
         ),
-        description='Maximum accepted bulk jobs in flight.',
+    )
+    pending_count_interval_seconds: float = Field(
+        default=600.0,
+        gt=0,
+        validation_alias='SCRAPE_UPLOAD_PENDING_COUNT_INTERVAL',
+        description=(
+            'Seconds between counts of files waiting to upload, which '
+            'set the files_pending_upload gauge.'
+        ),
     )
     background_drain_timeout_seconds: float = Field(
         default=300.0,
@@ -1139,6 +1197,15 @@ def content_id_from_filename(
     )
 
 
+def _is_target_upload_file(
+    name: str, descriptor: AssetDescriptor,
+) -> bool:
+    return (
+        name.endswith(COMPRESSED_JSON_SUFFIX)
+        and is_upload_file(name, descriptor)
+    )
+
+
 def iter_asset_files(
     fm: AssetFileManagement,
     descriptor: AssetDescriptor,
@@ -1146,7 +1213,7 @@ def iter_asset_files(
     return [
         name
         for name in fm.list_base(suffix=COMPRESSED_JSON_SUFFIX)
-        if is_upload_file(name, descriptor)
+        if _is_target_upload_file(name, descriptor)
     ]
 
 
@@ -1215,6 +1282,13 @@ async def prepare_asset_line(
         )
         await fm.mark_invalid(filename)
         return None
+    except FileNotFoundError:
+        # Listed, then moved to uploaded/ or removed before the read.
+        logging.debug(
+            'Asset file vanished before upload',
+            extra={'filename': filename, 'content_id': content_id},
+        )
+        return None
     except Exception as exc:
         logging.warning(
             'Failed to read asset file',
@@ -1270,54 +1344,6 @@ async def prepare_asset_line(
     return content_id, filename, ndjson_line(record), record
 
 
-async def upload_bulk_batch(
-    batch_buf: bytes,
-    batch_records: list[tuple[str, str]],
-    *,
-    settings: ScrapeUploadSettings,
-    target: AssetUploadTarget,
-    client: ExchangeClient,
-) -> None:
-    if not batch_records:
-        return
-    descriptor: AssetDescriptor = target.descriptor
-    fm: AssetFileManagement = target.fm
-    processor: AssetProcessor = (
-        target.processor if target.processor is not None
-        else processor_for(descriptor)
-    )
-    context: AssetProcessingContext = AssetProcessingContext(
-        settings=settings,
-        client=client,
-        fm=fm,
-        descriptor=descriptor,
-        state=target.state,
-    )
-    outcome: BulkBatchOutcome = await upload_prepared_bulk_batch(
-        batch_buf,
-        batch_records,
-        bulk_config(settings, descriptor),
-        client=client,
-        fm=fm,
-        **processor.bulk_kwargs(context),
-    )
-
-    async def _on_success(content_id: str) -> None:
-        await processor.on_success_id(content_id, context)
-
-    await emit_bulk_batch_metrics(
-        outcome,
-        platform=descriptor.platform,
-        scraper=SCRAPER_LABEL,
-        entity=descriptor.entity,
-        batches_counter=METRIC_UPLOAD_BATCHES,
-        uploaded_counter=METRIC_BACKGROUND_UPLOADS,
-        failed_counter=METRIC_UPLOADS_FAILED,
-        missing_result_counter=METRIC_UPLOADS_MISSING_RESULT,
-        on_success_id=_on_success,
-    )
-
-
 async def resume_bulk_target(
     *,
     settings: ScrapeUploadSettings,
@@ -1347,89 +1373,331 @@ async def resume_bulk_target(
     )
 
 
+def _processing(
+    settings: ScrapeUploadSettings,
+    target: AssetUploadTarget,
+    client: ExchangeClient,
+) -> tuple[AssetProcessor, AssetProcessingContext]:
+    processor: AssetProcessor = (
+        target.processor if target.processor is not None
+        else processor_for(target.descriptor)
+    )
+    context: AssetProcessingContext = AssetProcessingContext(
+        settings=settings,
+        client=client,
+        fm=target.fm,
+        descriptor=target.descriptor,
+        state=target.state,
+    )
+    return processor, context
+
+
+def _set_in_flight_gauge(target: AssetUploadTarget) -> None:
+    METRIC_BULK_JOBS_IN_FLIGHT.labels(
+        platform=target.descriptor.platform,
+        scraper=SCRAPER_LABEL,
+        entity=target.descriptor.entity,
+        worker_id=get_worker_id(),
+    ).set(len(target.upload.in_flight_job_ids))
+
+
+async def _emit_batch_outcome(
+    outcome: BulkBatchOutcome,
+    *,
+    target: AssetUploadTarget,
+    processor: AssetProcessor,
+    context: AssetProcessingContext,
+) -> None:
+    async def _on_success(content_id: str) -> None:
+        await processor.on_success_id(content_id, context)
+
+    await emit_bulk_batch_metrics(
+        outcome,
+        platform=target.descriptor.platform,
+        scraper=SCRAPER_LABEL,
+        entity=target.descriptor.entity,
+        batches_counter=METRIC_UPLOAD_BATCHES,
+        uploaded_counter=METRIC_BACKGROUND_UPLOADS,
+        failed_counter=METRIC_UPLOADS_FAILED,
+        missing_result_counter=METRIC_UPLOADS_MISSING_RESULT,
+        on_success_id=_on_success,
+    )
+
+
+async def _next_upload_names(
+    target: AssetUploadTarget, count: int,
+) -> list[str]:
+    '''Up to *count* upload-file names for *target* that are not in an
+    in-flight batch. Returns ``[]`` once at the end of each listing
+    pass; the next call starts a new pass.'''
+    upload: TargetUploadState = target.upload
+    if upload.listing is None:
+        upload.listing = StreamingListing(
+            target.fm.base_dir, chunk_size=LISTING_CHUNK_SIZE,
+        )
+    names: list[str] = []
+    while len(names) < count:
+        if not upload.pending:
+            if upload.pass_ended:
+                # Report the end of the pass on its own so the next
+                # listing pass starts only after these names are in
+                # flight or gone.
+                if not names:
+                    upload.pass_ended = False
+                break
+            chunk: list[str]
+            ended: bool
+            chunk, ended = await upload.listing.next_chunk()
+            upload.pending.extend(
+                name for name in chunk
+                if _is_target_upload_file(name, target.descriptor)
+            )
+            upload.pass_ended = ended
+            continue
+        name: str = upload.pending.popleft()
+        if name not in upload.in_flight_files:
+            names.append(name)
+    return names
+
+
+async def _finalize_in_background(
+    *,
+    settings: ScrapeUploadSettings,
+    target: AssetUploadTarget,
+    client: ExchangeClient,
+    job_id: str,
+    batch_id: str,
+    batch_records: list[tuple[str, str]],
+) -> None:
+    '''Wait for one POSTed job, apply its results and emit metrics.
+    Always frees its files, even on error or cancellation.'''
+    processor: AssetProcessor
+    context: AssetProcessingContext
+    processor, context = _processing(settings, target, client)
+    files: set[str] = {filename for _cid, filename in batch_records}
+    try:
+        outcome: BulkBatchOutcome = await finalize_prepared_bulk_batch(
+            job_id,
+            batch_id,
+            None,
+            batch_records,
+            bulk_config(settings, target.descriptor),
+            client=client,
+            fm=target.fm,
+            **processor.bulk_kwargs(context),
+        )
+        await _emit_batch_outcome(
+            outcome, target=target, processor=processor, context=context,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logging.error(
+            'Bulk finalize failed',
+            extra={
+                'job_id': job_id,
+                'batch_id': batch_id,
+                'platform': target.descriptor.platform,
+                'entity': target.descriptor.entity,
+                'records': len(batch_records),
+                'error': repr(exc),
+            },
+        )
+        METRIC_UPLOAD_BATCHES.labels(
+            platform=target.descriptor.platform,
+            scraper=SCRAPER_LABEL,
+            entity=target.descriptor.entity,
+            mode='bulk',
+            worker_id=get_worker_id(),
+            outcome='finalize_error',
+        ).inc()
+    finally:
+        target.upload.in_flight_files -= files
+        target.upload.files_released = True
+        task: asyncio.Task | None = asyncio.current_task()
+        if task is not None:
+            target.upload.in_flight_jobs.discard(task)
+            target.upload.in_flight_job_ids.pop(task, None)
+        _set_in_flight_gauge(target)
+
+
+async def _post_batch(
+    *,
+    settings: ScrapeUploadSettings,
+    target: AssetUploadTarget,
+    client: ExchangeClient,
+    batch_buf: bytearray,
+    batch_records: list[tuple[str, str]],
+) -> int:
+    '''POST one batch and hand its finalize to a background task.
+    Returns the number of records POSTed; 0 for an empty batch or a
+    failed POST, so the round-robin does not re-post the same files
+    right away (they come back on a later pass).'''
+    if not batch_records:
+        return 0
+    processor: AssetProcessor
+    context: AssetProcessingContext
+    processor, context = _processing(settings, target, client)
+    job_id: str
+    batch_id: str
+    err: BulkBatchOutcome | None
+    job_id, batch_id, err = await post_prepared_bulk_batch(
+        bytes(batch_buf),
+        batch_records,
+        bulk_config(settings, target.descriptor),
+        client=client,
+        fm=target.fm,
+    )
+    if err is not None:
+        await _emit_batch_outcome(
+            err, target=target, processor=processor, context=context,
+        )
+        return 0
+    target.upload.in_flight_files.update(
+        filename for _cid, filename in batch_records
+    )
+    task: asyncio.Task = asyncio.create_task(_finalize_in_background(
+        settings=settings,
+        target=target,
+        client=client,
+        job_id=job_id,
+        batch_id=batch_id,
+        batch_records=list(batch_records),
+    ))
+    target.upload.in_flight_jobs.add(task)
+    target.upload.in_flight_job_ids[task] = job_id
+    _set_in_flight_gauge(target)
+    return len(batch_records)
+
+
+def _orphaned_job_count(target: AssetUploadTarget) -> int:
+    '''Number of ``.bulk`` state files of *target* that no in-flight
+    finalize task owns: jobs whose finalize gave up (e.g. the progress
+    WebSocket failed) and that only a resume can reconcile.'''
+    owned: set[str] = set(target.upload.in_flight_job_ids.values())
+    return sum(
+        1 for state in list_bulk_states(target.fm)
+        if state.job_id not in owned
+    )
+
+
+async def _resume_in_background(
+    *,
+    settings: ScrapeUploadSettings,
+    target: AssetUploadTarget,
+    client: ExchangeClient,
+) -> None:
+    '''Reconcile *target*'s orphaned bulk jobs via status polling.'''
+    try:
+        await resume_bulk_target(
+            settings=settings, target=target, client=client,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logging.error(
+            'Resuming orphaned bulk jobs failed',
+            extra={
+                'platform': target.descriptor.platform,
+                'entity': target.descriptor.entity,
+                'error': repr(exc),
+            },
+        )
+    finally:
+        upload: TargetUploadState = target.upload
+        task: asyncio.Task | None = asyncio.current_task()
+        if task is not None:
+            upload.in_flight_jobs.discard(task)
+        upload.resume_task = None
+
+
+def _start_orphan_resume(
+    *,
+    settings: ScrapeUploadSettings,
+    target: AssetUploadTarget,
+    client: ExchangeClient,
+    orphans: int,
+) -> None:
+    '''Start the one background resume of *target*'s orphaned jobs.
+    Call only while the target has no in-flight finalize tasks: the
+    resume reconciles every state file of the target.'''
+    upload: TargetUploadState = target.upload
+    logging.warning(
+        'Orphaned bulk jobs reached the cap; resuming them',
+        extra={
+            'platform': target.descriptor.platform,
+            'entity': target.descriptor.entity,
+            'orphaned_jobs': orphans,
+        },
+    )
+    upload.resume_attempted = True
+    task: asyncio.Task = asyncio.create_task(_resume_in_background(
+        settings=settings, target=target, client=client,
+    ))
+    upload.resume_task = task
+    upload.in_flight_jobs.add(task)
+
+
 async def drain_bulk_target_once(
     *,
     settings: ScrapeUploadSettings,
     target: AssetUploadTarget,
     client: ExchangeClient,
 ) -> int:
-    descriptor: AssetDescriptor = target.descriptor
-    fm: AssetFileManagement = target.fm
-    processor: AssetProcessor = (
-        target.processor if target.processor is not None
-        else processor_for(descriptor)
-    )
-    context: AssetProcessingContext = AssetProcessingContext(
-        settings=settings,
-        client=client,
-        fm=fm,
-        descriptor=descriptor,
-        state=target.state,
-    )
-    files: list[str] = await asyncio.to_thread(
-        iter_asset_files, fm, descriptor,
-    )
-    METRIC_FILES_PENDING_UPLOAD.labels(
-        platform=descriptor.platform,
-        scraper=SCRAPER_LABEL,
-        entity=descriptor.entity,
-        worker_id=get_worker_id(),
-    ).set(len(files))
-    logging.info(
-        'Found asset files for bulk upload',
-        extra={
-            'base_dir': str(fm.base_dir),
-            'platform': descriptor.platform,
-            'entity': descriptor.entity,
-            'files_length': len(files),
-        },
-    )
+    '''Prepare and POST at most one batch for *target* without waiting
+    for the server to finish it. Returns the number of records POSTed;
+    0 when in-flight plus orphaned jobs already reach
+    ``max_active_bulk_jobs``, the POST failed or the listing pass ended
+    without eligible files. Orphaned jobs at the cap with nothing in
+    flight start one background resume.'''
+    upload: TargetUploadState = target.upload
+    if upload.resume_task is not None:
+        return 0
+    cap: int = max(settings.max_active_bulk_jobs, 1)
+    orphans: int = _orphaned_job_count(target)
+    if len(upload.in_flight_jobs) + orphans >= cap:
+        if (
+            not upload.in_flight_jobs
+            and orphans >= cap
+            and not upload.resume_attempted
+        ):
+            _start_orphan_resume(
+                settings=settings, target=target, client=client,
+                orphans=orphans,
+            )
+        return 0
+    processor: AssetProcessor
+    processor, _context = _processing(settings, target, client)
+    concurrency: int = max(settings.scrape_upload_concurrency, 1)
     batch_buf: bytearray = bytearray()
     batch_records: list[tuple[str, str]] = []
-    concurrency: int = max(settings.scrape_upload_concurrency, 1)
-
-    async def flush() -> int:
-        nonlocal batch_buf, batch_records
-        if not batch_records:
-            return 0
-        record_count: int = len(batch_records)
-        async with reserve_bulk_upload_slot(
-            fm,
-            client,
-            settings.exchange_url,
-            max_active_jobs=max(settings.max_active_bulk_jobs, 1),
-            poll_timeout_seconds=(
-                settings.bulk_progress_timeout_seconds
-            ),
-            **processor.bulk_kwargs(context),
-        ):
-            await upload_bulk_batch(
-                bytes(batch_buf),
-                batch_records,
-                settings=settings,
-                target=target,
-                client=client,
-            )
-        batch_buf = bytearray()
-        batch_records = []
-        return record_count
-
-    for start in range(0, len(files), concurrency):
-        chunk: list[str] = files[start:start + concurrency]
+    # A pass can end right after earlier turns consumed its names, while
+    # a finalize released files back to the directory (e.g. after it
+    # failed). Then try one fresh pass before reporting "nothing to
+    # do"; at most one per release, so files that never prepare cannot
+    # loop forever and an idle target is scanned once per call.
+    while True:
+        names: list[str] = await _next_upload_names(target, concurrency)
+        if not names:
+            if batch_records or not upload.files_released:
+                break
+            upload.files_released = False
+            continue
         prepared = await asyncio.gather(*(
             prepare_asset_line(
                 filename,
-                fm=fm,
-                descriptor=descriptor,
+                fm=target.fm,
+                descriptor=target.descriptor,
                 validator=target.validator,
                 settings=settings,
                 client=client,
                 processor=processor,
                 state=target.state,
             )
-            for filename in chunk
+            for filename in names
         ))
-        for entry in prepared:
+        index: int
+        for index, entry in enumerate(prepared):
             if entry is None:
                 continue
             content_id, filename, line, _record = entry
@@ -1444,20 +1712,114 @@ async def drain_bulk_target_once(
                     },
                 )
                 continue
-            if (
-                batch_records
-                and (
-                    len(batch_records) >= settings.bulk_batch_size
-                    or len(batch_buf) + len(line)
-                    > settings.bulk_max_batch_bytes
-                )
+            if batch_records and (
+                len(batch_records) >= settings.bulk_batch_size
+                or len(batch_buf) + len(line)
+                > settings.bulk_max_batch_bytes
             ):
-                return await flush()
+                # Batch full: this name and the rest of the chunk go
+                # back to the front of the queue for the next turn.
+                upload.pending.extendleft(reversed(names[index:]))
+                return await _post_batch(
+                    settings=settings, target=target, client=client,
+                    batch_buf=batch_buf, batch_records=batch_records,
+                )
             batch_buf.extend(line)
             batch_records.append((content_id, filename))
-            if len(batch_records) >= settings.bulk_batch_size:
-                return await flush()
-    return await flush()
+        if len(batch_records) >= settings.bulk_batch_size:
+            break
+    return await _post_batch(
+        settings=settings, target=target, client=client,
+        batch_buf=batch_buf, batch_records=batch_records,
+    )
+
+
+def in_flight_tasks(
+    targets: list[AssetUploadTarget],
+) -> set[asyncio.Task]:
+    '''Every background finalize task of *targets*.'''
+    return {
+        task for target in targets for task in target.upload.in_flight_jobs
+    }
+
+
+async def publish_pending_counts(
+    targets: list[AssetUploadTarget],
+) -> None:
+    '''Count each target's upload files (without keeping names), set
+    ``files_pending_upload`` and log the count.'''
+    target: AssetUploadTarget
+    for target in targets:
+        descriptor: AssetDescriptor = target.descriptor
+        count: int = await asyncio.to_thread(
+            count_matching_files,
+            target.fm.base_dir,
+            lambda name, d=descriptor: _is_target_upload_file(name, d),
+        )
+        METRIC_FILES_PENDING_UPLOAD.labels(
+            platform=descriptor.platform,
+            scraper=SCRAPER_LABEL,
+            entity=descriptor.entity,
+            worker_id=get_worker_id(),
+        ).set(count)
+        logging.info(
+            'Files pending upload',
+            extra={
+                'platform': descriptor.platform,
+                'entity': descriptor.entity,
+                'count': count,
+            },
+        )
+
+
+async def pending_count_loop(
+    targets: list[AssetUploadTarget], interval_seconds: float,
+) -> None:
+    '''Refresh ``files_pending_upload`` every *interval_seconds*.'''
+    while True:
+        try:
+            await publish_pending_counts(targets)
+        except Exception as exc:
+            logging.warning(
+                'Counting files pending upload failed',
+                extra={'error': repr(exc)},
+            )
+        await asyncio.sleep(interval_seconds)
+
+
+async def drain_in_flight(
+    targets: list[AssetUploadTarget], timeout_seconds: float,
+) -> None:
+    '''On shutdown: wait up to *timeout_seconds* for background
+    finalize tasks, cancel the rest (their ``.bulk`` state files make
+    the next start resume them) and close open listings.'''
+    pending: set[asyncio.Task] = in_flight_tasks(targets)
+    if pending:
+        _done, still_running = await asyncio.wait(
+            pending, timeout=timeout_seconds,
+        )
+        task: asyncio.Task
+        for task in still_running:
+            task.cancel()
+        if still_running:
+            await asyncio.gather(*still_running, return_exceptions=True)
+    target: AssetUploadTarget
+    for target in targets:
+        listing: StreamingListing | None = target.upload.listing
+        if listing is None:
+            continue
+        target.upload.listing = None
+        try:
+            listing.close()
+        except OSError as exc:
+            logging.warning(
+                'Closing directory listing failed',
+                extra={
+                    'platform': target.descriptor.platform,
+                    'entity': target.descriptor.entity,
+                    'error': repr(exc),
+                },
+            )
 
 
 async def drain_bulk_directory(
@@ -1473,17 +1835,11 @@ async def drain_bulk_directory(
         fm=fm,
         validator=validator,
     )
-    await resume_bulk_target(
+    await drain_targets_round_robin(
         settings=settings,
-        target=target,
+        targets=[target],
         client=client,
     )
-    while await drain_bulk_target_once(
-        settings=settings,
-        target=target,
-        client=client,
-    ):
-        pass
 
 
 async def enqueue_background_asset(
@@ -1665,6 +2021,9 @@ async def drain_targets_round_robin(
 ) -> None:
     if not targets:
         raise ValueError('at least one scrape upload target is required')
+    target: AssetUploadTarget
+    for target in targets:
+        target.upload.resume_attempted = False
     if settings.upload_mode == 'bulk' and resume_bulk:
         await asyncio.gather(*(
             resume_bulk_target(
@@ -1692,8 +2051,18 @@ async def drain_targets_round_robin(
                 client=client,
                 queued_files=queued_files,
             )
-        if progress_count == 0:
+        if progress_count:
+            continue
+        pending: set[asyncio.Task] = in_flight_tasks(targets)
+        if not pending:
             return
+        # Re-poll every target at least every ROUND_ROBIN_POLL_SECONDS
+        # so one hanging job does not stall the others.
+        await asyncio.wait(
+            pending,
+            timeout=ROUND_ROBIN_POLL_SECONDS,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
 
 
 async def watch_directory(
@@ -1860,6 +2229,38 @@ def configure_logging(settings: ScrapeUploadSettings) -> None:
     )
 
 
+def install_shutdown_handlers(
+    loop: asyncio.AbstractEventLoop, task: asyncio.Task,
+) -> list[signal.Signals]:
+    '''Cancel *task* on SIGTERM / SIGINT so its ``finally`` blocks
+    drain in-flight bulk jobs before exit (under ``docker stop`` the
+    process is PID 1, which ignores SIGTERM without a handler).
+    Returns the signals handled, for :func:`remove_shutdown_handlers`.
+    '''
+    installed: list[signal.Signals] = []
+    sig: signal.Signals
+    for sig in SHUTDOWN_SIGNALS:
+        try:
+            loop.add_signal_handler(sig, task.cancel)
+        except (NotImplementedError, RuntimeError, ValueError) as exc:
+            # No signal support here (e.g. not the main thread).
+            logging.warning(
+                'Cannot install shutdown signal handler',
+                extra={'signal': sig.name, 'error': repr(exc)},
+            )
+            continue
+        installed.append(sig)
+    return installed
+
+
+def remove_shutdown_handlers(
+    loop: asyncio.AbstractEventLoop, signals: list[signal.Signals],
+) -> None:
+    sig: signal.Signals
+    for sig in signals:
+        loop.remove_signal_handler(sig)
+
+
 async def run(settings: ScrapeUploadSettings) -> None:
     configure_logging(settings)
     start_metrics_server(settings.metrics_port)
@@ -1867,6 +2268,19 @@ async def run(settings: ScrapeUploadSettings) -> None:
         raise RuntimeError(
             'API_KEY_ID/API_KEY_SECRET must be configured'
         )
+    loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+    main_task: asyncio.Task | None = asyncio.current_task()
+    handled: list[signal.Signals] = (
+        install_shutdown_handlers(loop, main_task)
+        if main_task is not None else []
+    )
+    try:
+        await _run_with_client(settings)
+    finally:
+        remove_shutdown_handlers(loop, handled)
+
+
+async def _run_with_client(settings: ScrapeUploadSettings) -> None:
     client: ExchangeClient = await ExchangeClient.setup(
         settings.api_key_id,
         settings.api_key_secret,
@@ -1877,27 +2291,44 @@ async def run(settings: ScrapeUploadSettings) -> None:
             settings,
             client,
         )
-        await drain_targets_round_robin(
-            settings=settings,
-            targets=targets,
-            client=client,
-        )
-        if settings.upload_mode == 'background':
-            await client.drain_uploads(
-                timeout=settings.background_drain_timeout_seconds,
-            )
-        if settings.scrape_upload_watch:
-            drain_lock: asyncio.Lock = asyncio.Lock()
-            await asyncio.gather(*(
-                watch_target(
-                    settings=settings,
-                    target=target,
-                    targets=targets,
-                    client=client,
-                    drain_lock=drain_lock,
-                )
-                for target in targets
+        count_task: asyncio.Task | None = None
+        if settings.upload_mode == 'bulk':
+            count_task = asyncio.create_task(pending_count_loop(
+                targets, settings.pending_count_interval_seconds,
             ))
+        try:
+            await drain_targets_round_robin(
+                settings=settings,
+                targets=targets,
+                client=client,
+            )
+            if settings.upload_mode == 'background':
+                await client.drain_uploads(
+                    timeout=settings.background_drain_timeout_seconds,
+                )
+            if settings.scrape_upload_watch:
+                drain_lock: asyncio.Lock = asyncio.Lock()
+                await asyncio.gather(*(
+                    watch_target(
+                        settings=settings,
+                        target=target,
+                        targets=targets,
+                        client=client,
+                        drain_lock=drain_lock,
+                    )
+                    for target in targets
+                ))
+        finally:
+            if count_task is not None:
+                count_task.cancel()
+                await asyncio.gather(count_task, return_exceptions=True)
+            await drain_in_flight(
+                targets,
+                min(
+                    settings.background_drain_timeout_seconds,
+                    BULK_SHUTDOWN_DRAIN_SECONDS,
+                ),
+            )
     finally:
         await client.aclose()
 
@@ -1906,6 +2337,9 @@ def main() -> None:
     settings: ScrapeUploadSettings = ScrapeUploadSettings()
     try:
         asyncio.run(run(settings))
+    except asyncio.CancelledError:
+        # SIGTERM / SIGINT: run() already drained in-flight jobs.
+        logging.info('scrape_upload stopped by signal')
     except KeyboardInterrupt:
         raise
     except Exception:

@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from playwright.async_api import BrowserContext
 
+from scrape_exchange.browser_tmpdir import isolate_browser_tmpdir
 from scrape_exchange.creator_queue import RedisCreatorQueue
 from scrape_exchange.file_management import AssetFileManagement
 from scrape_exchange.logging import configure_logging
@@ -445,6 +446,11 @@ def main() -> None:
     )
     try:
         if creators is None:
+            # Daemon mode only: one-off batch runs may share a slot id
+            # with another run on the same host.
+            isolate_browser_tmpdir(
+                config_labels['scraper'], config_labels['worker_id'],
+            )
             asyncio.run(run_daemon(settings))
             return
         failed: int = asyncio.run(scrape_creators(creators, settings))

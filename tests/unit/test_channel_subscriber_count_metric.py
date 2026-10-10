@@ -174,7 +174,7 @@ class TestRssUpdateChannelRecordsMetric(
     async def asyncTearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    async def _run(self, page: dict) -> int:
+    async def _run(self, page: dict) -> int | None:
         settings: mock.MagicMock = mock.MagicMock()
         settings.channel_data_directory = self.tmp
         validator: mock.MagicMock = mock.MagicMock()
@@ -189,7 +189,7 @@ class TestRssUpdateChannelRecordsMetric(
             tabs_cls.return_value.browse_channel = (
                 mock.AsyncMock(return_value=page)
             )
-            subs: int
+            subs: int | None
             _, subs, _ = await self.module.update_channel(
                 channel_handle='inputhandle',
                 channel_id='UC_xyz',
@@ -209,10 +209,12 @@ class TestRssUpdateChannelRecordsMetric(
 
     async def test_missing(self) -> None:
         before: float = _sample('innertube', 'missing')
-        subs: int = await self._run({
+        subs: int | None = await self._run({
             'metadata': {'channelMetadataRenderer': {'title': 'T'}},
         })
-        self.assertEqual(subs, 0)
+        # Unknown, not zero: CHANNEL_MIN_SUBSCRIBERS must not treat a
+        # hidden count as a tiny channel.
+        self.assertIsNone(subs)
         self.assertEqual(_sample('innertube', 'missing'), before + 1)
 
 

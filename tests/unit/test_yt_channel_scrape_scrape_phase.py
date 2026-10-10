@@ -46,6 +46,7 @@ def _mock_settings() -> MagicMock:
     s.channel_not_found_terminal_threshold = 3
     s.channel_not_found_retry_seconds = 3600
     s.exchange_url = 'https://scrape.exchange'
+    s.channel_min_subscribers = 10
     return s
 
 

@@ -1,6 +1,8 @@
+import os
 import unittest
 from unittest.mock import patch
 
+from tools._tt_upload_common import TikTokUploadSettings
 from tools.tt_creator_upload import (
     CreatorUploadSettings,
     _load_creator_record,
@@ -46,6 +48,14 @@ class TestTikTokUploadSettings(unittest.TestCase):
         ):
             settings = CreatorUploadSettings(_cli_parse_args=[])
         self.assertEqual(settings.proxies, [])
+
+    def test_bulk_max_active_jobs_env_is_read(self) -> None:
+        with patch.dict(
+            os.environ, {'BULK_MAX_ACTIVE_JOBS': '2'}, clear=True,
+        ):
+            settings = TikTokUploadSettings(_cli_parse_args=[])
+
+        self.assertEqual(settings.max_active_bulk_jobs, 2)
 
 
 class TestTikTokUploadRecordLoaders(unittest.TestCase):

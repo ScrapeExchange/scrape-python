@@ -14,6 +14,7 @@ def _discovery_settings(**overrides) -> MagicMock:
     settings: MagicMock = MagicMock()
     settings.channel_discover_linked_channels = True
     settings.exchange_url = 'https://scrape.exchange'
+    settings.channel_min_subscribers = 10
     for key, value in overrides.items():
         setattr(settings, key, value)
     return settings

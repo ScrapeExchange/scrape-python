@@ -113,8 +113,20 @@ class VideoSettings(TikTokScraperSettings):
         ),
         description=(
             'Fleet-wide async worker upper bound. 0 means use proxy '
-            'count. In multi-process mode this budget is split across '
-            'child processes.'
+            'count, capped by TIKTOK_VIDEO_MAX_BROWSERS. In '
+            'multi-process mode this budget is split across child '
+            'processes.'
+        ),
+    )
+    video_max_browsers: int = Field(
+        default=12,
+        validation_alias=AliasChoices(
+            'TIKTOK_VIDEO_MAX_BROWSERS', 'video_max_browsers',
+        ),
+        description=(
+            'Cap on browser sessions (one per proxy) when '
+            'TIKTOK_VIDEO_CONCURRENCY is 0. Each Camoufox browser '
+            'uses roughly 250-300 MB of RAM. 0 = no cap.'
         ),
     )
     video_num_processes: int = Field(
@@ -640,9 +652,11 @@ def _resolve_video_concurrency(
     requested: int = int(settings.video_concurrency)
     if requested > 0:
         return requested
-    if proxy_count > 0:
-        return int(proxy_count)
-    return 1
+    auto: int = int(proxy_count) if proxy_count > 0 else 1
+    max_browsers: int = int(settings.video_max_browsers)
+    if max_browsers > 0:
+        return min(auto, max_browsers)
+    return auto
 
 
 def _effective_process_count(
@@ -702,6 +716,7 @@ def main() -> None:
         split_proxy_pool=True,
         concurrency_env_var='TIKTOK_VIDEO_CONCURRENCY',
         child_concurrencies=child_concurrencies,
+        browser_tmpdir=True,
     )
     sys.exit(runner.run_sync(_run_worker))
 

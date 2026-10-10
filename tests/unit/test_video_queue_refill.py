@@ -7,8 +7,11 @@ video backlog.
 :license    : GPLv3
 '''
 
+import asyncio
 import unittest
 from typing import Any
+
+from prometheus_client import REGISTRY
 
 import fakeredis.aioredis
 from mongomock_motor import AsyncMongoMockClient
@@ -79,6 +82,83 @@ class TestVideoQueueRefill(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entries[0].video_id, 'v000')
         self.assertEqual(entries[0].channel.channel_id, 'UCx')
         self.assertEqual(entries[0].source, 'channel')
+
+    async def test_hot_size_gauge_updated_after_every_batch(self) -> None:
+        refill: VideoQueueRefill = self._refill(low=2, high=5, batch=2)
+        seen: list[int] = []
+        real_record = refill._record_batch
+
+        def _capture(count: int, hot_now: int, **steps: float) -> None:
+            seen.append(int(REGISTRY.get_sample_value(
+                'video_queue_hot_size', {'platform': 'youtube'},
+            )))
+            real_record(count, hot_now, **steps)
+
+        refill._record_batch = _capture
+        await refill.refill_once()
+        self.assertEqual(seen, [2, 4, 5])
+
+    async def test_batch_steps_are_timed(self) -> None:
+        def _count(step: str) -> float:
+            return REGISTRY.get_sample_value(
+                'video_queue_refill_step_seconds_count',
+                {'platform': 'youtube', 'step': step},
+            ) or 0.0
+
+        steps: tuple[str, ...] = (
+            'mongo_read', 'redis_copy', 'mongo_mark_hot',
+        )
+        before: dict[str, float] = {step: _count(step) for step in steps}
+        with self.assertLogs(
+            'scrape_exchange.video_queue_refill', level='INFO',
+        ) as logs:
+            await self._refill(low=2, high=5, batch=3).refill_once()
+        for step in steps:
+            self.assertEqual(_count(step) - before[step], 2)
+        batch_logs: list = [
+            r for r in logs.records if r.getMessage() == 'Refill batch copied'
+        ]
+        self.assertEqual(len(batch_logs), 2)
+        self.assertEqual(batch_logs[-1].hot_size, 5)
+        self.assertGreaterEqual(batch_logs[-1].mongo_mark_hot_seconds, 0)
+
+    async def test_mark_hot_runs_chunks_concurrently(self) -> None:
+        refill: VideoQueueRefill = VideoQueueRefill(
+            self.redis, self.backlog, low_watermark=2, high_watermark=10,
+            batch_size=10, mark_hot_chunk_size=3, mark_hot_concurrency=2,
+        )
+        real_set_state = self.backlog.set_state
+        chunks: list[list[str]] = []
+        in_flight: int = 0
+        peak: int = 0
+
+        async def _spy(ids: list[str], **kwargs: str) -> int:
+            nonlocal in_flight, peak
+            chunks.append(list(ids))
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0)
+            try:
+                return await real_set_state(ids, **kwargs)
+            finally:
+                in_flight -= 1
+
+        self.backlog.set_state = _spy
+        self.assertEqual(await refill.refill_once(), 10)
+        self.assertEqual([len(c) for c in chunks], [3, 3, 3, 1])
+        self.assertEqual(peak, 2)
+        for i in range(10):
+            self.assertEqual(await self._state(f'v{i:03d}'), 'hot')
+
+    def test_rejects_bad_mark_hot_settings(self) -> None:
+        with self.assertRaises(ValueError):
+            VideoQueueRefill(
+                self.redis, self.backlog, mark_hot_chunk_size=0,
+            )
+        with self.assertRaises(ValueError):
+            VideoQueueRefill(
+                self.redis, self.backlog, mark_hot_concurrency=0,
+            )
 
     async def test_no_refill_at_or_above_low_watermark(self) -> None:
         refill: VideoQueueRefill = self._refill(low=2, high=5)

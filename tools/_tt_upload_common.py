@@ -80,9 +80,7 @@ class TikTokUploadSettings(TikTokScraperSettings):
     )
     max_active_bulk_jobs: int = Field(
         default=10,
-        validation_alias=AliasChoices(
-            'MAX_ACTIVE_BULK_JOBS', 'max_active_bulk_jobs',
-        ),
+        validation_alias='BULK_MAX_ACTIVE_JOBS',
         description='Maximum accepted bulk-upload jobs in flight.',
     )
     upload_log_level: str = Field(

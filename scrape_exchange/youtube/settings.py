@@ -14,6 +14,11 @@ from pydantic import AliasChoices, Field
 from ..settings import ScraperSettings
 
 
+# Channels below this many subscribers are not worth scraping videos
+# from; see YouTubeScraperSettings.channel_min_subscribers.
+DEFAULT_CHANNEL_MIN_SUBSCRIBERS: int = 10
+
+
 class YouTubeScraperSettings(ScraperSettings):
     channel_data_directory: str | None = Field(
         default=None,
@@ -96,6 +101,21 @@ class YouTubeScraperSettings(ScraperSettings):
             'YOUTUBE_VIDEO_DATA_DIR', 'video_data_directory'
         ),
         description='Directory to save the scraped video data',
+    )
+    channel_min_subscribers: int = Field(
+        default=DEFAULT_CHANNEL_MIN_SUBSCRIBERS,
+        ge=0,
+        validation_alias=AliasChoices(
+            'CHANNEL_MIN_SUBSCRIBERS', 'channel_min_subscribers',
+        ),
+        description=(
+            'Channels with fewer subscribers are scraped once and '
+            'uploaded, then marked low_subs and not re-scraped; their '
+            'videos are not added to the video scrape queue by the '
+            'channel or RSS scraper, and featured-channel links below '
+            'it are not queued. Unknown subscriber counts are not '
+            'affected. 0 disables the check.'
+        ),
     )
     bulk_batch_size: int = Field(
         default=1000,

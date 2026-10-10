@@ -369,6 +369,7 @@ def main() -> None:
         client_required=False, client_enabled=False, split_proxy_pool=True,
         concurrency_env_var='TWITCH_CREATOR_CONCURRENCY',
         child_concurrencies=child_concurrencies,
+        browser_tmpdir=True,
     )
     sys.exit(runner.run_sync(run_worker))
 

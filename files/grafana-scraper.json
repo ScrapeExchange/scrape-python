@@ -2519,6 +2519,70 @@
         "h": 4,
         "w": 8,
         "x": 16,
+        "y": 120
+      },
+      "id": 67,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (platform, entity) (bulk_jobs_in_flight{platform=~\"$platform\",job=~\"$job\",instance=~\"$instance\"})",
+          "legendFormat": "{{platform}} / {{entity}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Bulk jobs in flight",
+      "type": "stat",
+      "description": "Bulk jobs POSTed by scrape_upload and not yet reconciled, per target. Capped per target by BULK_MAX_ACTIVE_JOBS."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 8,
+        "x": 16,
         "y": 100
       },
       "id": 63,

@@ -72,6 +72,20 @@ class RefillSettings(BaseSettings):
         default=10_000, ge=1, le=100_000,
         description='Videos per MongoDB read and Redis pipeline.',
     )
+    mark_hot_chunk_size: int = Field(
+        default=1_000, ge=1, le=100_000,
+        validation_alias=AliasChoices(
+            'mark_hot_chunk_size', 'VIDEO_QUEUE_MARK_HOT_CHUNK_SIZE',
+        ),
+        description='Videos per MongoDB update when marking a batch hot.',
+    )
+    mark_hot_concurrency: int = Field(
+        default=8, ge=1, le=64,
+        validation_alias=AliasChoices(
+            'mark_hot_concurrency', 'VIDEO_QUEUE_MARK_HOT_CONCURRENCY',
+        ),
+        description='MongoDB mark-hot updates in flight at once.',
+    )
     interval_seconds: float = Field(
         default=30.0, gt=0,
         description='Seconds between hot-window checks.',
@@ -134,6 +148,8 @@ async def run(settings: RefillSettings) -> None:
         low_watermark=settings.low_watermark,
         high_watermark=settings.high_watermark,
         batch_size=settings.batch_size,
+        mark_hot_chunk_size=settings.mark_hot_chunk_size,
+        mark_hot_concurrency=settings.mark_hot_concurrency,
     )
     stop: asyncio.Event = asyncio.Event()
     loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()

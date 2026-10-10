@@ -108,6 +108,9 @@ async def post_prepared_bulk_batch(
     client: ExchangeClient,
     fm: AssetFileManagement,
 ) -> tuple[str, str, BulkBatchOutcome | None]:
+    '''POST one prepared batch (see :func:`post_bulk_batch`) using the
+    schema identity and URL in *config*. Returns ``(job_id, batch_id,
+    None)`` when accepted, else ``('', '', outcome)``.'''
     return await post_bulk_batch(
         batch_buf,
         batch_records,
@@ -134,6 +137,10 @@ async def finalize_prepared_bulk_batch(
     exchange_set: Any | None = None,
     id_from_filename: Callable[[str], str] | None = None,
 ) -> BulkBatchOutcome:
+    '''Wait for *job_id*, fetch and apply its results (see
+    :func:`finalize_bulk_batch`) using *config*'s URL and timeout.
+    If *err* is not None, return it unchanged without calling the
+    underlying finalize function.'''
     if err is not None:
         return err
     return await finalize_bulk_batch(

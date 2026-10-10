@@ -324,3 +324,58 @@ class TestFromDsn(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestEnqueueMany(_Base):
+
+    async def test_matches_single_enqueue_documents(self) -> None:
+        added: int = await self.queue.enqueue_many(
+            ['aaa', 'bbb'], source='channel', channel_id='UCx',
+            channel_handle='h',
+        )
+        self.assertEqual(added, 2)
+        await self.queue.enqueue(
+            'ccc', source='channel', channel_id='UCx', channel_handle='h',
+        )
+        many: dict[str, Any] = await self._doc('aaa')
+        single: dict[str, Any] = await self._doc('ccc')
+        for doc in (many, single):
+            doc.pop('_id')
+            doc.pop('enqueued_at')
+        self.assertEqual(many, single)
+
+    async def test_skips_known_ids_and_counts_only_new(self) -> None:
+        await self.backlog.add('aaa', source='rss', enqueued_at=1)
+        await self._hot('bbb')
+        added: int = await self.queue.enqueue_many(
+            ['aaa', 'bbb', 'ccc'], source='channel',
+        )
+        self.assertEqual(added, 1)
+        self.assertEqual((await self._doc('aaa'))['source'], 'rss')
+        self.assertEqual((await self._doc('bbb'))['state'], 'hot')
+        self.assertEqual((await self._doc('ccc'))['state'], 'queued')
+
+    async def test_inserts_in_chunks(self) -> None:
+        calls: list[int] = []
+        real_add_many = self.backlog.add_many
+
+        async def _spy(docs: list[dict[str, Any]]) -> int:
+            calls.append(len(docs))
+            return await real_add_many(docs)
+
+        self.backlog.add_many = _spy
+        ids: list[str] = [f'v{i:02d}' for i in range(7)]
+        added: int = await self.queue.enqueue_many(
+            ids, source='channel', chunk_size=3,
+        )
+        self.assertEqual(added, 7)
+        self.assertEqual(calls, [3, 3, 1])
+
+    async def test_empty_list_is_a_no_op(self) -> None:
+        self.assertEqual(
+            await self.queue.enqueue_many([], source='channel'), 0,
+        )
+
+    async def test_rejects_empty_video_id(self) -> None:
+        with self.assertRaises(ValueError):
+            await self.queue.enqueue_many(['aaa', ''], source='channel')
