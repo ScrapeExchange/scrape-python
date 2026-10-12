@@ -995,7 +995,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Fraction (5m) of scraped YouTube channel pages from which no subscriber count could be parsed. source=innertube is the pageHeaderRenderer metadata rows of the InnerTube browse response (channel + RSS scraper); source=about_page is subscriberCountText on the /about HTML page (channel scraper). A jump usually means YouTube changed the page layout.",
+      "description": "Fraction (5m) of scraped YouTube channel pages whose subscriber count TEXT was present but could not be parsed (outcome=unparseable). Pages that simply do not show a count are now outcome=absent and are excluded here. source=innertube is the pageHeaderRenderer metadata rows of the InnerTube browse response (channel + RSS scraper); source=about_page is subscriberCountText on the /about HTML page (channel scraper). A jump usually means YouTube changed the page layout.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1086,7 +1086,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (scraper, source) (rate(channel_subscriber_count_parse_total{outcome=\"missing\",job=~\"$job\",instance=~\"$instance\"}[5m])) / sum by (scraper, source) (rate(channel_subscriber_count_parse_total{job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "expr": "sum by (scraper, source) (rate(channel_subscriber_count_parse_total{outcome=\"unparseable\",job=~\"$job\",instance=~\"$instance\"}[5m])) / sum by (scraper, source) (rate(channel_subscriber_count_parse_total{job=~\"$job\",instance=~\"$instance\"}[5m]))",
           "legendFormat": "{{scraper}} {{source}}",
           "range": true,
           "refId": "A"
@@ -1100,7 +1100,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Rate (5m) of subscriber count parse attempts on scraped YouTube channel pages, split into found and missing.",
+      "description": "Rate (5m) of subscriber count parse attempts on scraped YouTube channel pages, split by outcome: found, absent (the page shows no count), and unparseable (count text present but not parseable). is_retry=true marks a forced missing-subscriber retry scrape.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1185,8 +1185,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (scraper, source, outcome) (rate(channel_subscriber_count_parse_total{job=~\"$job\",instance=~\"$instance\"}[5m]))",
-          "legendFormat": "{{scraper}} {{source}} {{outcome}}",
+          "expr": "sum by (scraper, source, outcome, is_retry) (rate(channel_subscriber_count_parse_total{job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{scraper}} {{source}} {{outcome}} {{is_retry}}",
           "range": true,
           "refId": "A"
         }
