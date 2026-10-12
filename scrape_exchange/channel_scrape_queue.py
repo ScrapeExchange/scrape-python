@@ -8,6 +8,7 @@ FileChannelScrapeQueue is planned for v2.
 
 import enum
 import json
+import logging
 import math
 import random
 import time
@@ -24,6 +25,8 @@ from pydantic_settings import (
 
 
 KEY_PREFIX: str = 'youtube:channel'
+
+_LOGGER: logging.Logger = logging.getLogger(__name__)
 
 # Channel meta field set (to a unix timestamp) once a scrape has paged
 # every video, short and live broadcast of the channel to the end.
@@ -47,7 +50,8 @@ class ChannelScrapeProgress:
 _COMPLETE_SCRAPE_LUA: str = '''
 -- Compare the snapshot before committing progress and scheduling together.
 -- KEYS: metadata, tier map, then every scheduled tier.
--- ARGV: id, expected count, new count, next full, tier, interval, now.
+-- ARGV: id, expected count, new count, next full, tier, interval, now,
+--   missing-subscriber base, missing-subscriber cap.
 -- A negative tier preserves the current tier and requests metadata only.
 local state = redis.call('HGET', KEYS[1], 'state')
 if state ~= 'scheduled' then return 0 end
@@ -55,9 +59,26 @@ if redis.call('HGET', KEYS[1], 'successful_scrapes') ~= ARGV[2] then
     return 0
 end
 local tier = tonumber(ARGV[5])
+local schedule_interval = tonumber(ARGV[6])
+local missing_after = -1
 if tier < 0 then
     tier = tonumber(redis.call('HGET', KEYS[2], ARGV[1])) or 0
     if tier < 0 or tier >= #KEYS - 2 then tier = 0 end
+    local attempts = tonumber(redis.call('HGET', KEYS[1],
+        'missing_subscriber_attempts')) or 0
+    local base = tonumber(ARGV[8])
+    local cap = tonumber(ARGV[9])
+    if attempts > 20 then attempts = 20 end
+    local delay = base * (2 ^ attempts)
+    if cap < 0 then
+        delay = -1
+    elseif base > 0 and cap >= 0 and delay > cap then
+        delay = cap
+    end
+    schedule_interval = delay
+    redis.call('HINCRBY', KEYS[1],
+        'missing_subscriber_attempts', 1)
+    missing_after = attempts + 1
     redis.call('HSET', KEYS[1],
         'last_subscriber_count_missing_at', ARGV[7],
         'force_rescrape_mode', 'metadata',
@@ -66,16 +87,20 @@ if tier < 0 then
 end
 local member = 'i:' .. ARGV[1]
 for k = 3, #KEYS do redis.call('ZREM', KEYS[k], member) end
-if tonumber(ARGV[6]) >= 0 then
+if schedule_interval >= 0 then
     redis.call('ZADD', KEYS[3 + tier],
-        tonumber(ARGV[7]) + tonumber(ARGV[6]), member)
+        tonumber(ARGV[7]) + schedule_interval, member)
 end
 redis.call('HSET', KEYS[2], ARGV[1], tostring(tier))
 redis.call('HSET', KEYS[1],
     'successful_scrapes', ARGV[3], 'next_full_scrape', ARGV[4],
     'last_attempt_at', ARGV[7])
 redis.call('HDEL', KEYS[1], 'unavailable_attempts')
-return 1
+if tier >= 0 then
+    redis.call('HDEL', KEYS[1], 'missing_subscriber_attempts')
+    return 1
+end
+return {1, schedule_interval, missing_after}
 '''
 
 
@@ -1071,14 +1096,31 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
                 self._k_meta(f'i:{channel_id}'), self._k_tiers(),
                 *[self._k_scheduled(tier.tier) for tier in self._tiers],
             ]
-            return bool(await self._redis.execute_command(
+            result: Any = await self._redis.execute_command(
                 'EVAL', _COMPLETE_SCRAPE_LUA, len(keys), *keys,
                 channel_id, str(progress.successful_scrapes),
                 str(progress.successful_scrapes + 1), str(next_full),
                 str(completed_tier),
                 str(completed_interval),
                 str(int(now)),
-            ))
+                str(self._settings
+                    .channel_missing_subscriber_retry_seconds),
+                str(self._tiers[-1].interval_seconds),
+            )
+            if isinstance(result, list):
+                ok: int = int(result[0])
+                delay: float = float(result[1])
+                attempts: int = int(result[2])
+                _LOGGER.info(
+                    'Scheduling missing-subscriber retry',
+                    extra={
+                        'channel_id': channel_id,
+                        'missing_subscriber_attempts': attempts,
+                        'retry_delay_seconds': delay,
+                    },
+                )
+                return bool(ok)
+            return bool(result)
         if sub_count is None:
             await self.retry_missing_subscriber_count(
                 channel_id=channel_id, now=now,
@@ -1139,6 +1181,7 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
         pipe.hdel(
             self._k_meta(member),
             'unavailable_attempts',
+            'missing_subscriber_attempts',
         )
         await pipe.execute()
 
@@ -1155,6 +1198,13 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
         has already been popped, so this transition must explicitly put it
         back in its current tier. Missing metadata does not require
         repeating a completed video enumeration.
+
+        The retry delay backs off exponentially:
+        ``min(base * 2 ** attempts, cap)``, where ``base`` is
+        ``channel_missing_subscriber_retry_seconds`` and ``cap`` is the
+        catch-all tier interval; ``missing_subscriber_attempts`` counts
+        consecutive misses and is incremented on every retry. A negative
+        catch-all interval drops the channel from the schedule.
         '''
         member: str = f'i:{channel_id}'
         current: ChannelState | None = await self.get_state(member)
@@ -1174,14 +1224,24 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
                 candidate = 0
             if 0 <= candidate < len(self._tiers):
                 tier = candidate
-        retry_at: float = (
-            now
-            + float(
-                self._settings
-                .channel_missing_subscriber_retry_seconds
-            )
-        )
         meta_key: str = self._k_meta(member)
+        attempts_raw: str | None = await self._redis.hget(
+            meta_key, 'missing_subscriber_attempts',
+        )
+        attempts: int = int(attempts_raw) if attempts_raw else 0
+        base: int = (
+            self._settings
+            .channel_missing_subscriber_retry_seconds
+        )
+        cap: int = self._tiers[-1].interval_seconds
+        if cap < 0:
+            delay: float = -1.0
+        else:
+            exponent: int = min(attempts, 20)
+            delay = min(
+                float(base) * (2.0 ** exponent), float(cap),
+            )
+        retry_at: float = now + delay
         pipe: aioredis.client.Pipeline = (
             self._redis.pipeline(transaction=True)
         )
@@ -1190,10 +1250,11 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
                 self._k_scheduled(candidate_tier), member,
             )
         pipe.hset(self._k_tiers(), channel_id, str(tier))
-        pipe.zadd(
-            self._k_scheduled(tier),
-            {member: retry_at},
-        )
+        if delay >= 0:
+            pipe.zadd(
+                self._k_scheduled(tier),
+                {member: retry_at},
+            )
         pipe.hset(
             meta_key,
             mapping={
@@ -1206,7 +1267,16 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
             },
         )
         pipe.hdel(meta_key, 'unavailable_attempts')
+        pipe.hincrby(meta_key, 'missing_subscriber_attempts', 1)
         await pipe.execute()
+        _LOGGER.info(
+            'Scheduling missing-subscriber retry',
+            extra={
+                'channel_id': channel_id,
+                'missing_subscriber_attempts': attempts + 1,
+                'retry_delay_seconds': delay,
+            },
+        )
 
     async def requeue_with_backoff(
         self,
