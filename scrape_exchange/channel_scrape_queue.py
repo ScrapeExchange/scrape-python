@@ -52,7 +52,9 @@ _COMPLETE_SCRAPE_LUA: str = '''
 -- KEYS: metadata, tier map, then every scheduled tier.
 -- ARGV: id, expected count, new count, next full, tier, interval, now,
 --   missing-subscriber base, missing-subscriber cap.
--- A negative tier preserves the current tier and requests metadata only.
+-- A negative tier preserves the current tier and requests metadata only;
+-- the interval argument is then ignored and the retry delay is computed
+-- from the base, the cap and the stored missing_subscriber_attempts.
 local state = redis.call('HGET', KEYS[1], 'state')
 if state ~= 'scheduled' then return 0 end
 if redis.call('HGET', KEYS[1], 'successful_scrapes') ~= ARGV[2] then
@@ -69,17 +71,16 @@ if tier < 0 then
         'missing_subscriber_attempts')) or 0
     local base = tonumber(ARGV[8])
     local cap = tonumber(ARGV[9])
-    if attempts > 20 then attempts = 20 end
-    local delay = base * (2 ^ attempts)
+    -- Clamp only the exponent so 2 ^ n stays finite.
+    local delay = base * (2 ^ math.min(attempts, 20))
     if cap < 0 then
         delay = -1
     elseif base > 0 and cap >= 0 and delay > cap then
         delay = cap
     end
     schedule_interval = delay
-    redis.call('HINCRBY', KEYS[1],
+    missing_after = redis.call('HINCRBY', KEYS[1],
         'missing_subscriber_attempts', 1)
-    missing_after = attempts + 1
     redis.call('HSET', KEYS[1],
         'last_subscriber_count_missing_at', ARGV[7],
         'force_rescrape_mode', 'metadata',
@@ -1083,10 +1084,12 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
                 self._tier_for_sub_count(sub_count)
                 if sub_count is not None else -1
             )
+            # On a miss the Lua script computes the backoff delay from
+            # the base, the cap and the stored attempt count, and ignores
+            # this interval.
             completed_interval: int = (
                 self._tiers[completed_tier].interval_seconds
-                if sub_count is not None else
-                self._settings.channel_missing_subscriber_retry_seconds
+                if sub_count is not None else -1
             )
             next_full: int = progress.next_full_scrape
             if full_scrape and progress.full_scrape_due:
@@ -1269,12 +1272,12 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
         )
         pipe.hdel(meta_key, 'unavailable_attempts')
         pipe.hincrby(meta_key, 'missing_subscriber_attempts', 1)
-        await pipe.execute()
+        results: list[Any] = await pipe.execute()
         _LOGGER.info(
             'Scheduling missing-subscriber retry',
             extra={
                 'channel_id': channel_id,
-                'missing_subscriber_attempts': attempts + 1,
+                'missing_subscriber_attempts': int(results[-1]),
                 'retry_delay_seconds': delay,
             },
         )

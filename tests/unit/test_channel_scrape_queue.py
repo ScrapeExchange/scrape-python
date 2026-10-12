@@ -2218,6 +2218,41 @@ class TestMissingSubscriberBackoffState(_MissingSubscriberTestBase):
             records[0].retry_delay_seconds, float(self.BASE * 2),
         )
 
+    async def test_logged_attempts_are_not_clamped(self) -> None:
+        # The exponent is clamped to keep 2 ** n finite; the logged
+        # attempt count must still be the stored counter.
+        queue: RedisChannelScrapeQueue = self._queue()
+        cap: int = 7 * 24 * 60 * 60
+        channel_id: str = 'UCmany'
+        await self._seed(channel_id)
+        await self.redis.hset(
+            self._meta_key(channel_id),
+            'missing_subscriber_attempts', '25',
+        )
+
+        with self.assertLogs(
+            'scrape_exchange.channel_scrape_queue', level='INFO',
+        ) as captured:
+            await queue.update_tier(
+                channel_id, sub_count=None, now=1000.0,
+                progress=ChannelScrapeProgress(
+                    successful_scrapes=0, next_full_scrape=1,
+                ),
+            )
+        records: list = self._retry_records(captured.records)
+        self.assertEqual(records[0].missing_subscriber_attempts, 26)
+        self.assertEqual(records[0].retry_delay_seconds, float(cap))
+
+        with self.assertLogs(
+            'scrape_exchange.channel_scrape_queue', level='INFO',
+        ) as captured:
+            await queue.retry_missing_subscriber_count(
+                channel_id=channel_id, now=2000.0,
+            )
+        records = self._retry_records(captured.records)
+        self.assertEqual(records[0].missing_subscriber_attempts, 27)
+        self.assertEqual(records[0].retry_delay_seconds, float(cap))
+
     @staticmethod
     def _retry_records(records: list) -> list:
         return [

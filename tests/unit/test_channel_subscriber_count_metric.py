@@ -259,6 +259,44 @@ class TestSubscriberCountParseOutcomes(unittest.TestCase):
             (None, 'unparseable'),
         )
 
+    def test_parser_reports_unparseable_for_unknown_suffix(
+        self,
+    ) -> None:
+        # convert_number_string raises KeyError for an unknown
+        # multiplier suffix.
+        self.assertEqual(
+            YouTubeChannel.parse_subscriber_count_with_outcome(
+                _header_with('5X subscribers'),
+            ),
+            (None, 'unparseable'),
+        )
+
+    def test_about_page_unknown_suffix_records_unparseable(
+        self,
+    ) -> None:
+        channel: YouTubeChannel = YouTubeChannel(
+            channel_handle='Test', with_download_client=False,
+        )
+        before: float = _sample('about_page', 'unparseable')
+        channel._parse_channel_about_data({
+            'subscriberCountText': '5X subscribers',
+            'videoCountText': '3 videos',
+        })
+        self.assertIsNone(channel.subscriber_count)
+        self.assertEqual(channel.video_count, 3)
+        self.assertEqual(
+            _sample('about_page', 'unparseable'), before + 1,
+        )
+
+    def test_about_page_empty_count_text_is_absent(self) -> None:
+        channel: YouTubeChannel = YouTubeChannel(
+            channel_handle='Test', with_download_client=False,
+        )
+        before: float = _sample('about_page', 'absent')
+        channel._parse_channel_about_data({'subscriberCountText': ''})
+        self.assertIsNone(channel.subscriber_count)
+        self.assertEqual(_sample('about_page', 'absent'), before + 1)
+
     def test_innertube_unparseable_records_outcome(self) -> None:
         channel: YouTubeChannel = YouTubeChannel(
             channel_handle='Test', with_download_client=False,

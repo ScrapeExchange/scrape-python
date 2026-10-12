@@ -1954,6 +1954,8 @@ async def update_channel(
         )
     description: str = metadata.get('description', '')
 
+    parsed_subscriber_count: int | None
+    subscriber_outcome: str
     parsed_subscriber_count, subscriber_outcome = (
         YouTubeChannel.parse_subscriber_count_with_outcome(channel_data)
     )
