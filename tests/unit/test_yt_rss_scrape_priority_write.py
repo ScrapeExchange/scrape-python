@@ -224,8 +224,8 @@ class TestUpdateChannelWritesPriority(
             self.module, 'YouTubeChannelTabs',
         ) as tabs_cls, mock.patch.object(
             self.module.YouTubeChannel,
-            'parse_subscriber_count',
-            return_value=42,
+            'parse_subscriber_count_with_outcome',
+            return_value=(42, 'found'),
         ), mock.patch.object(
             self.module.YouTubeChannel,
             'parse_view_count',
@@ -292,8 +292,8 @@ class TestUpdateChannelWritesPriority(
             self.module, 'YouTubeChannelTabs',
         ) as tabs_cls, mock.patch.object(
             self.module.YouTubeChannel,
-            'parse_subscriber_count',
-            return_value=42,
+            'parse_subscriber_count_with_outcome',
+            return_value=(42, 'found'),
         ), mock.patch.object(
             self.module.YouTubeChannel,
             'parse_view_count',

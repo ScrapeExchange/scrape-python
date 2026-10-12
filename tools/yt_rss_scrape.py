@@ -1951,11 +1951,11 @@ async def update_channel(
         )
     description: str = metadata.get('description', '')
 
-    parsed_subscriber_count: int | None = (
-        YouTubeChannel.parse_subscriber_count(channel_data)
+    parsed_subscriber_count, subscriber_outcome = (
+        YouTubeChannel.parse_subscriber_count_with_outcome(channel_data)
     )
     record_subscriber_count_parse(
-        'innertube', parsed_subscriber_count,
+        'innertube', subscriber_outcome, is_retry=False,
     )
     subscriber_count: int = parsed_subscriber_count or 0
     # YouTube no longer surfaces lifetime views on the channel

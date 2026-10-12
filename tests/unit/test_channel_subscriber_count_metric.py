@@ -40,6 +40,7 @@ def _sample(
             'scraper': scraper or _get_scraper(),
             'source': source,
             'outcome': outcome,
+            'is_retry': 'false',
             'worker_id': get_worker_id(),
         },
     )
@@ -98,14 +99,14 @@ def _load_yt_rss_scrape() -> ModuleType:
 class TestRecordSubscriberCountParse(unittest.TestCase):
     def test_found_and_missing(self) -> None:
         found_before: float = _sample('innertube', 'found')
-        missing_before: float = _sample('innertube', 'missing')
-        record_subscriber_count_parse('innertube', 0)
-        record_subscriber_count_parse('innertube', None)
+        missing_before: float = _sample('innertube', 'absent')
+        record_subscriber_count_parse('innertube', 'found')
+        record_subscriber_count_parse('innertube', 'absent')
         self.assertEqual(
             _sample('innertube', 'found'), found_before + 1,
         )
         self.assertEqual(
-            _sample('innertube', 'missing'), missing_before + 1,
+            _sample('innertube', 'absent'), missing_before + 1,
         )
 
 
@@ -125,11 +126,11 @@ class TestChannelParsersRecordMetric(unittest.TestCase):
         channel: YouTubeChannel = YouTubeChannel(
             channel_handle='Test', with_download_client=False,
         )
-        before: float = _sample('innertube', 'missing')
+        before: float = _sample('innertube', 'absent')
         channel.parse_channel_video_data({
             'metadata': {'channelMetadataRenderer': {'title': 'T'}},
         })
-        self.assertEqual(_sample('innertube', 'missing'), before + 1)
+        self.assertEqual(_sample('innertube', 'absent'), before + 1)
 
     def test_about_page_found(self) -> None:
         channel: YouTubeChannel = YouTubeChannel(
@@ -146,10 +147,10 @@ class TestChannelParsersRecordMetric(unittest.TestCase):
         channel: YouTubeChannel = YouTubeChannel(
             channel_handle='Test', with_download_client=False,
         )
-        before: float = _sample('about_page', 'missing')
+        before: float = _sample('about_page', 'absent')
         channel._parse_channel_about_data({})
         self.assertIsNone(channel.subscriber_count)
-        self.assertEqual(_sample('about_page', 'missing'), before + 1)
+        self.assertEqual(_sample('about_page', 'absent'), before + 1)
 
     def test_about_page_keeps_innertube_count(self) -> None:
         channel: YouTubeChannel = YouTubeChannel(
@@ -208,14 +209,14 @@ class TestRssUpdateChannelRecordsMetric(
         self.assertEqual(_sample('innertube', 'found'), before + 1)
 
     async def test_missing(self) -> None:
-        before: float = _sample('innertube', 'missing')
+        before: float = _sample('innertube', 'absent')
         subs: int | None = await self._run({
             'metadata': {'channelMetadataRenderer': {'title': 'T'}},
         })
         # Unknown, not zero: CHANNEL_MIN_SUBSCRIBERS must not treat a
         # hidden count as a tiny channel.
         self.assertIsNone(subs)
-        self.assertEqual(_sample('innertube', 'missing'), before + 1)
+        self.assertEqual(_sample('innertube', 'absent'), before + 1)
 
 
 if __name__ == '__main__':
