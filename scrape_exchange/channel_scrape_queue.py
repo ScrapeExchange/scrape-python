@@ -58,7 +58,8 @@ if state ~= 'scheduled' then return 0 end
 if redis.call('HGET', KEYS[1], 'successful_scrapes') ~= ARGV[2] then
     return 0
 end
-local tier = tonumber(ARGV[5])
+local completed_tier = tonumber(ARGV[5])
+local tier = completed_tier
 local schedule_interval = tonumber(ARGV[6])
 local missing_after = -1
 if tier < 0 then
@@ -96,7 +97,7 @@ redis.call('HSET', KEYS[1],
     'successful_scrapes', ARGV[3], 'next_full_scrape', ARGV[4],
     'last_attempt_at', ARGV[7])
 redis.call('HDEL', KEYS[1], 'unavailable_attempts')
-if tier >= 0 then
+if completed_tier >= 0 then
     redis.call('HDEL', KEYS[1], 'missing_subscriber_attempts')
     return 1
 end

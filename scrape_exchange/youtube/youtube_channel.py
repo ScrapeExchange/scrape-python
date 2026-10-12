@@ -1209,7 +1209,7 @@ class YouTubeChannel:
                 about_subscriber_count = convert_number_string(
                     about_subs_text,
                 )
-            except ValueError:
+            except (ValueError, IndexError):
                 about_outcome = 'unparseable'
                 _LOGGER.warning(
                     'unparseable subscriber count text: %r',
@@ -1245,11 +1245,12 @@ class YouTubeChannel:
                 country_text, to='ISO2', not_found=None
             )
 
-    def parse_channel_video_data(self, page_data: str) -> None:
+    def parse_channel_video_data(self, page_data: dict) -> None:
         '''
         Parses the info from the channel 'videos' page
 
-        :param page_data: the text of the 'videos' page for the channel
+        :param page_data: the parsed 'videos' page data for the
+            channel
         :returns: (none)
         '''
 
@@ -2082,7 +2083,7 @@ class YouTubeChannel:
                         try:
                             youtube_subs_count: int | None = \
                                 convert_number_string(content)
-                        except ValueError:
+                        except (ValueError, IndexError):
                             _LOGGER.warning(
                                 'unparseable subscriber count text: %r',
                                 content,
