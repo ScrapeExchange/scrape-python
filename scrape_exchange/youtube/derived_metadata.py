@@ -8,9 +8,10 @@ they are written locally and uploaded to scrape.exchange.
 from __future__ import annotations
 
 import logging
+import time
 
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from httpx2 import HTTPStatusError
 
@@ -45,7 +46,22 @@ CHANNEL_CATEGORY_COUNTS_PREFIX: str = 'youtube:channel_category_counts:'
 CATEGORY_COUNTS_TTL_SECONDS: int = 90 * 24 * 3600
 CHANNELS_WITH_CATEGORY_COUNTS: str = 'youtube:channels_with_category_counts'
 CHANNEL_COUNTRY_HASH: str = 'youtube:channel_country'
+# Negative cache for the country lookup: channels the API says are
+# not on scrape.exchange or have no country. Without it every video of
+# such a channel repeats the API round trip. Field value is the expiry
+# as a unix timestamp; HEXPIRE removes the field, the value guards
+# against a field that never got its TTL.
+CHANNEL_NO_COUNTRY_HASH: str = 'youtube:channel_no_country'
+NO_COUNTRY_TTL_SECONDS: int = 30 * 24 * 3600
 SCHEMA_VERSION: str = '0.0.2'
+
+
+class ApiCountry(NamedTuple):
+    '''Result of an API country lookup. ``known`` is ``True`` when the
+    API answered definitively (country found, channel without a
+    country, or no record), ``False`` after an error.'''
+    country: str | None
+    known: bool
 
 
 def normalize_category(value: str | None) -> str | None:
@@ -86,6 +102,36 @@ async def set_channel_country(
     if redis is None or not country:
         return
     await redis.hset(CHANNEL_COUNTRY_HASH, channel_id, country)
+    await redis.hdel(CHANNEL_NO_COUNTRY_HASH, channel_id)
+
+
+async def has_no_country(redis: Any | None, channel_id: str) -> bool:
+    '''``True`` while a non-expired no-country entry exists.'''
+    if redis is None:
+        return False
+    value: Any = await redis.hget(CHANNEL_NO_COUNTRY_HASH, channel_id)
+    if value is None:
+        return False
+    try:
+        expires_at: float = float(_decode(value))
+    except ValueError:
+        expires_at = 0.0
+    if expires_at > time.time():
+        return True
+    await redis.hdel(CHANNEL_NO_COUNTRY_HASH, channel_id)
+    return False
+
+
+async def mark_no_country(redis: Any | None, channel_id: str) -> None:
+    if redis is None:
+        return
+    expires_at: float = time.time() + NO_COUNTRY_TTL_SECONDS
+    await redis.hset(
+        CHANNEL_NO_COUNTRY_HASH, channel_id, f'{expires_at:.0f}',
+    )
+    await redis.hexpire(
+        CHANNEL_NO_COUNTRY_HASH, NO_COUNTRY_TTL_SECONDS, channel_id,
+    )
 
 
 async def increment_channel_category_count(
@@ -193,9 +239,10 @@ async def api_channel_country(
     *,
     username: str | None,
     channel_id: str,
-) -> str | None:
+) -> ApiCountry:
+    unknown: ApiCountry = ApiCountry(country=None, known=False)
     if client is None or not username:
-        return None
+        return unknown
     try:
         entry: GetDataResponseModel = await get_data_by_param(
             client,
@@ -205,25 +252,33 @@ async def api_channel_country(
             version=SCHEMA_VERSION,
             platform_content_id=channel_id,
         )
+    except HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            # No record for this channel on scrape.exchange.
+            return ApiCountry(country=None, known=True)
+        _log_api_country_failure(channel_id)
+        return unknown
+    except Exception:
+        _log_api_country_failure(channel_id)
+        return unknown
+    try:
         channel: YouTubeChannel = await fetch_youtube_channel(
             client, entry,
         )
-    except HTTPStatusError as exc:
-        if exc.response.status_code != 404:
-            LOGGER.warning(
-                'Failed API channel country lookup',
-                exc_info=True,
-                extra={'channel_id': channel_id},
-            )
-        return None
     except Exception:
-        LOGGER.warning(
-            'Failed API channel country lookup',
-            exc_info=True,
-            extra={'channel_id': channel_id},
-        )
-        return None
-    return channel.country
+        # The record exists but its data could not be fetched: that
+        # says nothing about the channel's country.
+        _log_api_country_failure(channel_id)
+        return unknown
+    return ApiCountry(country=channel.country or None, known=True)
+
+
+def _log_api_country_failure(channel_id: str) -> None:
+    LOGGER.warning(
+        'Failed API channel country lookup',
+        exc_info=True,
+        extra={'channel_id': channel_id},
+    )
 
 
 async def enrich_video_channel_country(
@@ -244,11 +299,16 @@ async def enrich_video_channel_country(
             channel_data_directory, video.channel_id,
         )
     if country is None:
-        country = await api_channel_country(
+        if await has_no_country(redis, video.channel_id):
+            return
+        result: ApiCountry = await api_channel_country(
             client,
             username=username,
             channel_id=video.channel_id,
         )
+        country = result.country
+        if result.known and not country:
+            await mark_no_country(redis, video.channel_id)
     if country:
         video.channel_country = country
         await set_channel_country(redis, video.channel_id, country)

@@ -6360,7 +6360,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Videos waiting in the Redis queue that the video scrapers pop from. tools/yt_video_queue_refill.py refills it from MongoDB below 10M, up to 20M.",
+      "description": "Videos waiting in the Redis queue that the video scrapers pop from. tools/yt_video_queue_refill.py refills it from MongoDB below 1M, up to 2M.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -6492,7 +6492,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "How long until the hot window drops below the 10M low watermark at the last hour's scrape rate.",
+      "description": "How long until the hot window drops below the 1M low watermark at the last hour's scrape rate.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -6544,7 +6544,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "clamp_min(max(video_queue_hot_size{platform=\"youtube\"}) - 10000000, 0) / sum(rate(video_queue_outcomes_total{outcome!=\"retried\"}[1h]))",
+          "expr": "clamp_min(max(video_queue_hot_size{platform=\"youtube\"}) - 1000000, 0) / sum(rate(video_queue_outcomes_total{outcome!=\"retried\"}[1h]))",
           "legendFormat": "Time until refill starts",
           "range": true,
           "refId": "A"
@@ -6628,7 +6628,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Redis hot-window size against the refill watermarks (VIDEO_QUEUE_LOW_WATERMARK / VIDEO_QUEUE_HIGH_WATERMARK, drawn at their 10M / 20M defaults).",
+      "description": "Redis hot-window size against the refill watermarks (VIDEO_QUEUE_LOW_WATERMARK / VIDEO_QUEUE_HIGH_WATERMARK, drawn at their 1M / 2M production settings).",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -6728,7 +6728,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "vector(10000000)",
+          "expr": "vector(1000000)",
           "legendFormat": "low watermark (refill starts)",
           "range": true,
           "refId": "B"
@@ -6739,7 +6739,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "vector(20000000)",
+          "expr": "vector(2000000)",
           "legendFormat": "high watermark (refill target)",
           "range": true,
           "refId": "C"
