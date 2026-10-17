@@ -32,6 +32,7 @@ METRIC_NAME: str = 'channel_subscriber_count_parse_total'
 
 def _sample(
     source: str, outcome: str, scraper: str | None = None,
+    is_retry: str = 'false',
 ) -> float:
     value: float | None = REGISTRY.get_sample_value(
         METRIC_NAME,
@@ -40,6 +41,7 @@ def _sample(
             'scraper': scraper or _get_scraper(),
             'source': source,
             'outcome': outcome,
+            'is_retry': is_retry,
             'worker_id': get_worker_id(),
         },
     )
@@ -98,14 +100,14 @@ def _load_yt_rss_scrape() -> ModuleType:
 class TestRecordSubscriberCountParse(unittest.TestCase):
     def test_found_and_missing(self) -> None:
         found_before: float = _sample('innertube', 'found')
-        missing_before: float = _sample('innertube', 'missing')
-        record_subscriber_count_parse('innertube', 0)
-        record_subscriber_count_parse('innertube', None)
+        missing_before: float = _sample('innertube', 'absent')
+        record_subscriber_count_parse('innertube', 'found')
+        record_subscriber_count_parse('innertube', 'absent')
         self.assertEqual(
             _sample('innertube', 'found'), found_before + 1,
         )
         self.assertEqual(
-            _sample('innertube', 'missing'), missing_before + 1,
+            _sample('innertube', 'absent'), missing_before + 1,
         )
 
 
@@ -125,11 +127,11 @@ class TestChannelParsersRecordMetric(unittest.TestCase):
         channel: YouTubeChannel = YouTubeChannel(
             channel_handle='Test', with_download_client=False,
         )
-        before: float = _sample('innertube', 'missing')
+        before: float = _sample('innertube', 'absent')
         channel.parse_channel_video_data({
             'metadata': {'channelMetadataRenderer': {'title': 'T'}},
         })
-        self.assertEqual(_sample('innertube', 'missing'), before + 1)
+        self.assertEqual(_sample('innertube', 'absent'), before + 1)
 
     def test_about_page_found(self) -> None:
         channel: YouTubeChannel = YouTubeChannel(
@@ -146,10 +148,10 @@ class TestChannelParsersRecordMetric(unittest.TestCase):
         channel: YouTubeChannel = YouTubeChannel(
             channel_handle='Test', with_download_client=False,
         )
-        before: float = _sample('about_page', 'missing')
+        before: float = _sample('about_page', 'absent')
         channel._parse_channel_about_data({})
         self.assertIsNone(channel.subscriber_count)
-        self.assertEqual(_sample('about_page', 'missing'), before + 1)
+        self.assertEqual(_sample('about_page', 'absent'), before + 1)
 
     def test_about_page_keeps_innertube_count(self) -> None:
         channel: YouTubeChannel = YouTubeChannel(
@@ -208,14 +210,143 @@ class TestRssUpdateChannelRecordsMetric(
         self.assertEqual(_sample('innertube', 'found'), before + 1)
 
     async def test_missing(self) -> None:
-        before: float = _sample('innertube', 'missing')
+        before: float = _sample('innertube', 'absent')
         subs: int | None = await self._run({
             'metadata': {'channelMetadataRenderer': {'title': 'T'}},
         })
         # Unknown, not zero: CHANNEL_MIN_SUBSCRIBERS must not treat a
         # hidden count as a tiny channel.
         self.assertIsNone(subs)
-        self.assertEqual(_sample('innertube', 'missing'), before + 1)
+        self.assertEqual(_sample('innertube', 'absent'), before + 1)
+
+
+class TestSubscriberCountParseOutcomes(unittest.TestCase):
+    '''``found`` / ``absent`` / ``unparseable`` from both page
+    sources, plus the ``is_retry`` label.'''
+
+    def test_parser_reports_absent_without_count_text(self) -> None:
+        self.assertEqual(
+            YouTubeChannel.parse_subscriber_count_with_outcome({}),
+            (None, 'absent'),
+        )
+
+    def test_parser_reports_found(self) -> None:
+        self.assertEqual(
+            YouTubeChannel.parse_subscriber_count_with_outcome(
+                _header_with('1.2K subscribers'),
+            ),
+            (1200, 'found'),
+        )
+
+    def test_parser_reports_unparseable(self) -> None:
+        # A row that ends in " subscribers" but carries no number:
+        # present text that convert_number_string cannot convert.
+        data: dict = _header_with(' subscribers')
+        self.assertEqual(
+            YouTubeChannel.parse_subscriber_count_with_outcome(data),
+            (None, 'unparseable'),
+        )
+        # The count-only wrapper keeps its contract.
+        self.assertIsNone(YouTubeChannel.parse_subscriber_count(data))
+
+    def test_parser_reports_unparseable_for_non_numeric_text(
+        self,
+    ) -> None:
+        self.assertEqual(
+            YouTubeChannel.parse_subscriber_count_with_outcome(
+                _header_with('No subscribers'),
+            ),
+            (None, 'unparseable'),
+        )
+
+    def test_parser_reports_unparseable_for_unknown_suffix(
+        self,
+    ) -> None:
+        # convert_number_string raises KeyError for an unknown
+        # multiplier suffix.
+        self.assertEqual(
+            YouTubeChannel.parse_subscriber_count_with_outcome(
+                _header_with('5X subscribers'),
+            ),
+            (None, 'unparseable'),
+        )
+
+    def test_about_page_unknown_suffix_records_unparseable(
+        self,
+    ) -> None:
+        channel: YouTubeChannel = YouTubeChannel(
+            channel_handle='Test', with_download_client=False,
+        )
+        before: float = _sample('about_page', 'unparseable')
+        channel._parse_channel_about_data({
+            'subscriberCountText': '5X subscribers',
+            'videoCountText': '3 videos',
+        })
+        self.assertIsNone(channel.subscriber_count)
+        self.assertEqual(channel.video_count, 3)
+        self.assertEqual(
+            _sample('about_page', 'unparseable'), before + 1,
+        )
+
+    def test_about_page_empty_count_text_is_absent(self) -> None:
+        channel: YouTubeChannel = YouTubeChannel(
+            channel_handle='Test', with_download_client=False,
+        )
+        before: float = _sample('about_page', 'absent')
+        channel._parse_channel_about_data({'subscriberCountText': ''})
+        self.assertIsNone(channel.subscriber_count)
+        self.assertEqual(_sample('about_page', 'absent'), before + 1)
+
+    def test_innertube_unparseable_records_outcome(self) -> None:
+        channel: YouTubeChannel = YouTubeChannel(
+            channel_handle='Test', with_download_client=False,
+        )
+        before: float = _sample('innertube', 'unparseable')
+        channel.parse_channel_video_data(_header_with(' subscribers'))
+        self.assertIsNone(channel.subscriber_count)
+        self.assertEqual(
+            _sample('innertube', 'unparseable'), before + 1,
+        )
+
+    def test_about_page_unparseable_records_outcome(self) -> None:
+        channel: YouTubeChannel = YouTubeChannel(
+            channel_handle='Test', with_download_client=False,
+        )
+        before: float = _sample('about_page', 'unparseable')
+        channel._parse_channel_about_data({
+            'subscriberCountText': {'simpleText': ' subscribers'},
+        })
+        self.assertIsNone(channel.subscriber_count)
+        self.assertEqual(
+            _sample('about_page', 'unparseable'), before + 1,
+        )
+
+    def test_is_retry_label_is_recorded(self) -> None:
+        channel: YouTubeChannel = YouTubeChannel(
+            channel_handle='Test', with_download_client=False,
+        )
+        channel.subscriber_count_retry = True
+        found_before: float = _sample(
+            'innertube', 'found', is_retry='true',
+        )
+        absent_before: float = _sample(
+            'innertube', 'absent', is_retry='true',
+        )
+        plain_before: float = _sample('innertube', 'found')
+        channel.parse_channel_video_data(_header_with('7 subscribers'))
+        channel.parse_channel_video_data({
+            'metadata': {'channelMetadataRenderer': {'title': 'T'}},
+        })
+        self.assertEqual(
+            _sample('innertube', 'found', is_retry='true'),
+            found_before + 1,
+        )
+        self.assertEqual(
+            _sample('innertube', 'absent', is_retry='true'),
+            absent_before + 1,
+        )
+        # A retry scrape must not be counted as a plain scrape.
+        self.assertEqual(_sample('innertube', 'found'), plain_before)
 
 
 if __name__ == '__main__':

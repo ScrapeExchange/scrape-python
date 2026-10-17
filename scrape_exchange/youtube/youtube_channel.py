@@ -110,24 +110,27 @@ METRIC_CHANNEL_HANDLE_RESOLVER_OUTCOMES: Counter = Counter(
 # page. ``source`` is ``"innertube"`` (pageHeaderRenderer metadata
 # rows of the InnerTube browse response) or ``"about_page"``
 # (``subscriberCountText`` of the /about HTML page). ``outcome`` is
-# ``"found"`` or ``"missing"``.
+# ``"found"``, ``"absent"`` or ``"unparseable"``. ``is_retry`` marks
+# a forced missing-subscriber retry scrape.
 METRIC_CHANNEL_SUBSCRIBER_COUNT_PARSE: Counter = Counter(
     'channel_subscriber_count_parse_total',
     'Attempts to parse the subscriber count from a scraped '
     'YouTube channel page, by page source and outcome.',
-    ['platform', 'scraper', 'source', 'outcome', 'worker_id'],
+    ['platform', 'scraper', 'source', 'outcome', 'is_retry',
+     'worker_id'],
 )
 
 
 def record_subscriber_count_parse(
-    source: str, subscriber_count: int | None,
+    source: str, outcome: str, is_retry: bool = False,
 ) -> None:
     '''
-    Record whether parsing the subscriber count from *source*
-    yielded a value.
+    Record the outcome of parsing the subscriber count from *source*.
 
     :param source: ``'innertube'`` or ``'about_page'``
-    :param subscriber_count: the parsed count, or ``None``
+    :param outcome: ``'found'``, ``'absent'`` or ``'unparseable'``
+    :param is_retry: whether this scrape is a forced missing-subscriber
+        retry
     :returns: (none)
     :raises: (none)
     '''
@@ -136,7 +139,8 @@ def record_subscriber_count_parse(
         platform='youtube',
         scraper=_get_scraper(),
         source=source,
-        outcome='missing' if subscriber_count is None else 'found',
+        outcome=outcome,
+        is_retry='true' if is_retry else 'false',
         worker_id=get_worker_id(),
     ).inc()
 
@@ -370,6 +374,7 @@ class YouTubeChannel:
 
         # The number of subscribers and views are not always available
         self.subscriber_count: int | None = None
+        self.subscriber_count_retry: bool = False
         self.video_count: int | None = None
         self.view_count: int | None = None
 
@@ -1193,15 +1198,34 @@ class YouTubeChannel:
             self._extract_simple_text(about_renderer.get('videoCountText'))
         )
 
-        about_subscriber_count: int | None = convert_number_string(
-            self._extract_simple_text(
-                about_renderer.get('subscriberCountText'),
-            ),
+        about_subs_text: str | None = self._extract_simple_text(
+            about_renderer.get('subscriberCountText'),
         )
+        about_subscriber_count: int | None = None
+        about_outcome: str
+        if not about_subs_text:
+            about_outcome = 'absent'
+        else:
+            try:
+                about_subscriber_count = convert_number_string(
+                    about_subs_text,
+                )
+            except (ValueError, IndexError, KeyError):
+                about_outcome = 'unparseable'
+                _LOGGER.warning(
+                    'Unparseable subscriber count text on about page',
+                    extra={
+                        'channel_handle': self.channel_handle,
+                        'subscriber_count_text': about_subs_text,
+                    },
+                )
+            else:
+                about_outcome = 'found'
         record_subscriber_count_parse(
-            'about_page', about_subscriber_count,
+            'about_page', about_outcome, self.subscriber_count_retry,
         )
-        if self.subscriber_count is None:
+        if about_subscriber_count is not None and \
+                self.subscriber_count is None:
             self.subscriber_count = about_subscriber_count
 
         self.external_urls = self.external_urls | \
@@ -1225,11 +1249,12 @@ class YouTubeChannel:
                 country_text, to='ISO2', not_found=None
             )
 
-    def parse_channel_video_data(self, page_data: str) -> None:
+    def parse_channel_video_data(self, page_data: dict) -> None:
         '''
         Parses the info from the channel 'videos' page
 
-        :param page_data: the text of the 'videos' page for the channel
+        :param page_data: the parsed 'videos' page data for the
+            channel
         :returns: (none)
         '''
 
@@ -1241,11 +1266,13 @@ class YouTubeChannel:
         self.banners: set[YouTubeThumbnail] = self.banners | \
             YouTubeChannel.parse_banners(page_data)
 
-        parsed_subscriber_count: int | None = (
-            YouTubeChannel.parse_subscriber_count(page_data)
-        )
+        parsed_subscriber_count: int | None
+        subscriber_outcome: str
+        parsed_subscriber_count, subscriber_outcome = \
+            YouTubeChannel.parse_subscriber_count_with_outcome(page_data)
         record_subscriber_count_parse(
-            'innertube', parsed_subscriber_count,
+            'innertube', subscriber_outcome,
+            self.subscriber_count_retry,
         )
         if parsed_subscriber_count is not None:
             self.subscriber_count = parsed_subscriber_count
@@ -2020,6 +2047,21 @@ class YouTubeChannel:
         :returns: the subscriber count
         '''
 
+        return YouTubeChannel.parse_subscriber_count_with_outcome(data)[0]
+
+    @staticmethod
+    def parse_subscriber_count_with_outcome(
+        data: dict,
+    ) -> tuple[int | None, str]:
+        '''
+        Parse the subscriber count from the scraped data, reporting
+        why parsing did or did not yield a value.
+
+        :param data: the scraped data
+        :returns: a tuple of the subscriber count (or ``None``) and
+            the outcome ``'found'``, ``'absent'`` or ``'unparseable'``
+        '''
+
         metadata_rows: list = data.get(
             'header', {}
         ).get(
@@ -2046,12 +2088,20 @@ class YouTubeChannel:
                     if content and content.rstrip().endswith((
                         ' subscriber', ' subscribers',
                     )):
-                        youtube_subs_count: int | None = \
-                            convert_number_string(content)
-                        return youtube_subs_count
+                        try:
+                            youtube_subs_count: int | None = \
+                                convert_number_string(content)
+                        except (ValueError, IndexError, KeyError):
+                            _LOGGER.warning(
+                                'Unparseable subscriber count text '
+                                'in InnerTube header',
+                                extra={'subscriber_count_text': content},
+                            )
+                            return (None, 'unparseable')
+                        return (youtube_subs_count, 'found')
 
         _LOGGER.debug('Failed to parse subscriber count')
-        return None
+        return (None, 'absent')
 
     @staticmethod
     def _parse_view_count_from_metadata_rows(

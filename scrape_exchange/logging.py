@@ -12,6 +12,7 @@ based on their settings.
 
 import logging
 import logging.handlers
+import re
 import sys
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -122,6 +123,80 @@ def _install_exc_wrappers() -> None:
 _install_exc_wrappers()
 
 
+_SECRET_KEY_PARTS: tuple[str, ...] = ('secret', 'password', 'token')
+_DSN_CREDENTIALS: re.Pattern[str] = re.compile(r'(://[^:/@\s]*:)[^@\s]*@')
+_REDACTED: str = '***'
+
+
+def _redact(value: Any) -> Any:
+    '''
+    Return a copy of a settings structure with secret values replaced:
+    keys containing ``secret``, ``password`` or ``token`` and the
+    password in DSNs such as ``redis://:pw@host``.
+    '''
+
+    if isinstance(value, dict):
+        out: dict = {}
+        for key, item in value.items():
+            secret: bool = any(
+                part in str(key).lower() for part in _SECRET_KEY_PARTS
+            )
+            if secret and item is not None:
+                out[key] = _REDACTED
+            else:
+                out[key] = _redact(item)
+        return out
+    if isinstance(value, (list, tuple)):
+        return [_redact(item) for item in value]
+    if isinstance(value, str):
+        return _DSN_CREDENTIALS.sub(rf'\g<1>{_REDACTED}@', value)
+    return value
+
+
+def _exc_field(value: Any) -> dict:
+    if isinstance(value, BaseException):
+        return {'type': type(value).__name__, 'message': str(value)}
+    if isinstance(value, dict):
+        return value
+    return {'type': None, 'message': str(value)}
+
+
+def _error_field(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, BaseException):
+        return repr(value)
+    try:
+        return orjson.dumps(value).decode('utf-8')
+    except TypeError:
+        return repr(value)
+
+
+def _settings_field(value: Any) -> dict:
+    if isinstance(value, str):
+        try:
+            value = orjson.loads(value)
+        except orjson.JSONDecodeError:
+            pass
+    if not isinstance(value, dict):
+        value = {'value': value}
+    # Values such as Path become strings, so the formatter never falls
+    # back to repr() of the whole dict.
+    return orjson.loads(orjson.dumps(_redact(value), default=str))
+
+
+# Fields that every tool logs into the shared daily scrape-* index.
+# Elasticsearch maps a field from the first record of the day that has
+# it, and rejects later records with another JSON type, so these are
+# normalised to one type each: ``exc`` an object, ``error`` a string,
+# ``settings`` an object with its secrets redacted.
+_FIELD_NORMALISERS: dict[str, Callable[[Any], Any]] = {
+    'exc': _exc_field,
+    'error': _error_field,
+    'settings': _settings_field,
+}
+
+
 class JsonFormatter(logging.Formatter):
     '''
     Format log records as single-line JSON documents.
@@ -154,6 +229,11 @@ class JsonFormatter(logging.Formatter):
         for key, value in record.__dict__.items():
             if key in reserved or key.startswith('_'):
                 continue
+            normaliser: Callable[[Any], Any] | None = (
+                _FIELD_NORMALISERS.get(key)
+            )
+            if normaliser is not None:
+                value = normaliser(value)
             if isinstance(value, BaseException):
                 payload[key] = {
                     'type': type(value).__name__,

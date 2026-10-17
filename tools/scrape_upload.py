@@ -20,6 +20,7 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from time import monotonic
 from typing import Any, Literal
 
 import brotli
@@ -170,9 +171,8 @@ class TargetUploadState:
         default_factory=dict,
     )
     resume_task: asyncio.Task | None = None
-    # One orphan resume per round-robin drain, so a resume that cannot
-    # reconcile anything does not loop.
-    resume_attempted: bool = False
+    # Cool down after recovery instead of disabling it for the drain.
+    resume_retry_at: float = 0.0
     # Set when a finalize released its files, so the next drain may
     # need a fresh listing pass to see them again.
     files_released: bool = False
@@ -1609,6 +1609,7 @@ async def _resume_in_background(
         if task is not None:
             upload.in_flight_jobs.discard(task)
         upload.resume_task = None
+        upload.resume_retry_at = monotonic() + ROUND_ROBIN_POLL_SECONDS
 
 
 def _start_orphan_resume(
@@ -1618,7 +1619,7 @@ def _start_orphan_resume(
     client: ExchangeClient,
     orphans: int,
 ) -> None:
-    '''Start the one background resume of *target*'s orphaned jobs.
+    '''Start one background resume of *target*'s orphaned jobs.
     Call only while the target has no in-flight finalize tasks: the
     resume reconciles every state file of the target.'''
     upload: TargetUploadState = target.upload
@@ -1630,7 +1631,6 @@ def _start_orphan_resume(
             'orphaned_jobs': orphans,
         },
     )
-    upload.resume_attempted = True
     task: asyncio.Task = asyncio.create_task(_resume_in_background(
         settings=settings, target=target, client=client,
     ))
@@ -1659,7 +1659,7 @@ async def drain_bulk_target_once(
         if (
             not upload.in_flight_jobs
             and orphans >= cap
-            and not upload.resume_attempted
+            and monotonic() >= upload.resume_retry_at
         ):
             _start_orphan_resume(
                 settings=settings, target=target, client=client,
@@ -2022,8 +2022,6 @@ async def drain_targets_round_robin(
     if not targets:
         raise ValueError('at least one scrape upload target is required')
     target: AssetUploadTarget
-    for target in targets:
-        target.upload.resume_attempted = False
     if settings.upload_mode == 'bulk' and resume_bulk:
         await asyncio.gather(*(
             resume_bulk_target(

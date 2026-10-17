@@ -995,7 +995,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Fraction (5m) of scraped YouTube channel pages from which no subscriber count could be parsed. source=innertube is the pageHeaderRenderer metadata rows of the InnerTube browse response (channel + RSS scraper); source=about_page is subscriberCountText on the /about HTML page (channel scraper). A jump usually means YouTube changed the page layout.",
+      "description": "Fraction (5m) of scraped YouTube channel pages whose subscriber count TEXT was present but could not be parsed (outcome=unparseable). Pages that simply do not show a count are now outcome=absent and are excluded here. source=innertube is the pageHeaderRenderer metadata rows of the InnerTube browse response (channel + RSS scraper); source=about_page is subscriberCountText on the /about HTML page (channel scraper). A jump usually means YouTube changed the page layout.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1086,7 +1086,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (scraper, source) (rate(channel_subscriber_count_parse_total{outcome=\"missing\",job=~\"$job\",instance=~\"$instance\"}[5m])) / sum by (scraper, source) (rate(channel_subscriber_count_parse_total{job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "expr": "sum by (scraper, source) (rate(channel_subscriber_count_parse_total{outcome=\"unparseable\",job=~\"$job\",instance=~\"$instance\"}[5m])) / sum by (scraper, source) (rate(channel_subscriber_count_parse_total{job=~\"$job\",instance=~\"$instance\"}[5m]))",
           "legendFormat": "{{scraper}} {{source}}",
           "range": true,
           "refId": "A"
@@ -1100,7 +1100,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Rate (5m) of subscriber count parse attempts on scraped YouTube channel pages, split into found and missing.",
+      "description": "Rate (5m) of subscriber count parse attempts on scraped YouTube channel pages, split by outcome: found, absent (the page shows no count), and unparseable (count text present but not parseable). is_retry=true marks a forced missing-subscriber retry scrape.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1185,8 +1185,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (scraper, source, outcome) (rate(channel_subscriber_count_parse_total{job=~\"$job\",instance=~\"$instance\"}[5m]))",
-          "legendFormat": "{{scraper}} {{source}} {{outcome}}",
+          "expr": "sum by (scraper, source, outcome, is_retry) (rate(channel_subscriber_count_parse_total{job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{scraper}} {{source}} {{outcome}} {{is_retry}}",
           "range": true,
           "refId": "A"
         }
@@ -6360,7 +6360,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Videos waiting in the Redis queue that the video scrapers pop from. tools/yt_video_queue_refill.py refills it from MongoDB below 10M, up to 20M.",
+      "description": "Videos waiting in the Redis queue that the video scrapers pop from. tools/yt_video_queue_refill.py refills it from MongoDB below 1M, up to 2M.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -6492,7 +6492,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "How long until the hot window drops below the 10M low watermark at the last hour's scrape rate.",
+      "description": "How long until the hot window drops below the 1M low watermark at the last hour's scrape rate.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -6544,7 +6544,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "clamp_min(max(video_queue_hot_size{platform=\"youtube\"}) - 10000000, 0) / sum(rate(video_queue_outcomes_total{outcome!=\"retried\"}[1h]))",
+          "expr": "clamp_min(max(video_queue_hot_size{platform=\"youtube\"}) - 1000000, 0) / sum(rate(video_queue_outcomes_total{outcome!=\"retried\"}[1h]))",
           "legendFormat": "Time until refill starts",
           "range": true,
           "refId": "A"
@@ -6628,7 +6628,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Redis hot-window size against the refill watermarks (VIDEO_QUEUE_LOW_WATERMARK / VIDEO_QUEUE_HIGH_WATERMARK, drawn at their 10M / 20M defaults).",
+      "description": "Redis hot-window size against the refill watermarks (VIDEO_QUEUE_LOW_WATERMARK / VIDEO_QUEUE_HIGH_WATERMARK, drawn at their 1M / 2M production settings).",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -6728,7 +6728,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "vector(10000000)",
+          "expr": "vector(1000000)",
           "legendFormat": "low watermark (refill starts)",
           "range": true,
           "refId": "B"
@@ -6739,7 +6739,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "vector(20000000)",
+          "expr": "vector(2000000)",
           "legendFormat": "high watermark (refill target)",
           "range": true,
           "refId": "C"

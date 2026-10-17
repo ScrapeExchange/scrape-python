@@ -10,6 +10,7 @@ import json
 import logging
 import unittest
 from io import StringIO
+from pathlib import Path
 from unittest.mock import patch
 
 from scrape_exchange import logging as se_logging
@@ -110,6 +111,100 @@ class JsonFormatterTests(unittest.TestCase):
             _make_record('line1\nline2')
         )
         self.assertEqual(formatted.count('\n'), 0)
+
+
+class FieldShapeTests(unittest.TestCase):
+    '''
+    Fields shared by all tools keep one JSON type, so Elasticsearch's
+    dynamic mapping of the daily scrape-* index never rejects a record.
+    '''
+
+    def test_string_exc_rendered_as_dict(self) -> None:
+        payload: dict = _format(_make_record(extra={'exc': 'boom'}))
+        self.assertEqual(payload['exc'], {'type': None, 'message': 'boom'})
+
+    def test_dict_exc_kept(self) -> None:
+        exc: dict[str, str] = {'type': 'ValueError', 'message': 'x'}
+        payload: dict = _format(_make_record(extra={'exc': exc}))
+        self.assertEqual(payload['exc'], exc)
+
+    def test_exception_error_rendered_as_string(self) -> None:
+        payload: dict = _format(
+            _make_record(extra={'error': ValueError('bad id')})
+        )
+        self.assertEqual(payload['error'], "ValueError('bad id')")
+
+    def test_string_error_kept(self) -> None:
+        payload: dict = _format(_make_record(extra={'error': 'bad'}))
+        self.assertEqual(payload['error'], 'bad')
+
+    def test_dict_error_rendered_as_json_string(self) -> None:
+        payload: dict = _format(
+            _make_record(extra={'error': {'code': 1}})
+        )
+        self.assertEqual(payload['error'], '{"code":1}')
+
+    def test_settings_json_string_rendered_as_dict(self) -> None:
+        payload: dict = _format(
+            _make_record(extra={'settings': '{\n  "worker_id": "1"\n}'})
+        )
+        self.assertEqual(payload['settings'], {'worker_id': '1'})
+
+    def test_settings_non_json_string_wrapped(self) -> None:
+        payload: dict = _format(
+            _make_record(extra={'settings': 'not json'})
+        )
+        self.assertEqual(payload['settings'], {'value': 'not json'})
+
+    def test_settings_secrets_redacted(self) -> None:
+        settings: dict = {
+            'api_key_id': 'ABC',
+            'api_key_secret': 's3cr3t',
+            'redis_password': 'pw',
+            'access_token': 'tok',
+            'redis_dsn': 'redis://:topsecret@192.168.1.11:6379/0',
+            'mongo_dsn': 'mongodb://root:pw@db:27017/?authSource=admin',
+            'exchange_url': 'https://scrape.exchange',
+            'nested': {'proxy_password': 'pw', 'worker_id': '1'},
+            'unset_secret': None,
+        }
+        payload: dict = _format(_make_record(extra={'settings': settings}))
+        self.assertEqual(payload['settings'], {
+            'api_key_id': 'ABC',
+            'api_key_secret': '***',
+            'redis_password': '***',
+            'access_token': '***',
+            'redis_dsn': 'redis://:***@192.168.1.11:6379/0',
+            'mongo_dsn': 'mongodb://root:***@db:27017/?authSource=admin',
+            'exchange_url': 'https://scrape.exchange',
+            'nested': {'proxy_password': '***', 'worker_id': '1'},
+            'unset_secret': None,
+        })
+        self.assertNotIn('s3cr3t', JsonFormatter().format(
+            _make_record(extra={'settings': settings})
+        ))
+
+    def test_settings_json_string_secrets_redacted(self) -> None:
+        payload: dict = _format(_make_record(extra={
+            'settings': '{"api_key_secret": "s3cr3t", '
+                        '"redis_dsn": "redis://:pw@h:6379/0"}',
+        }))
+        self.assertEqual(payload['settings'], {
+            'api_key_secret': '***', 'redis_dsn': 'redis://:***@h:6379/0',
+        })
+
+    def test_settings_with_unserialisable_values_stay_dict(self) -> None:
+        payload: dict = _format(_make_record(extra={
+            'settings': {'data_dir': Path('/data'), 'worker_id': '1'},
+        }))
+        self.assertEqual(
+            payload['settings'], {'data_dir': '/data', 'worker_id': '1'},
+        )
+
+    def test_caller_settings_not_mutated(self) -> None:
+        settings: dict[str, str] = {'api_key_secret': 's3cr3t'}
+        _format(_make_record(extra={'settings': settings}))
+        self.assertEqual(settings, {'api_key_secret': 's3cr3t'})
 
 
 class ConfigureLoggingTests(unittest.TestCase):

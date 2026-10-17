@@ -224,8 +224,8 @@ class TestUpdateChannelWritesPriority(
             self.module, 'YouTubeChannelTabs',
         ) as tabs_cls, mock.patch.object(
             self.module.YouTubeChannel,
-            'parse_subscriber_count',
-            return_value=42,
+            'parse_subscriber_count_with_outcome',
+            return_value=(42, 'found'),
         ), mock.patch.object(
             self.module.YouTubeChannel,
             'parse_view_count',
@@ -292,8 +292,8 @@ class TestUpdateChannelWritesPriority(
             self.module, 'YouTubeChannelTabs',
         ) as tabs_cls, mock.patch.object(
             self.module.YouTubeChannel,
-            'parse_subscriber_count',
-            return_value=42,
+            'parse_subscriber_count_with_outcome',
+            return_value=(42, 'found'),
         ), mock.patch.object(
             self.module.YouTubeChannel,
             'parse_view_count',
@@ -339,6 +339,165 @@ class TestUpdateChannelWritesPriority(
             brotli.decompress(path.read_bytes()),
         )
         self.assertNotIn('view_count', decoded)
+
+
+class TestUnknownSubscriberCountOmitsField(
+    unittest.IsolatedAsyncioTestCase,
+):
+    '''An unknown subscriber count is not a zero: the RSS record must
+    leave the field out so scrape.exchange keeps the last count the
+    channel scraper wrote, and unparseable header text must return
+    None instead of raising.'''
+
+    async def asyncSetUp(self) -> None:
+        self.tmp: str = tempfile.mkdtemp()
+        self.module: ModuleType = _load_yt_rss_scrape()
+
+    async def asyncTearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _settings(self) -> mock.MagicMock:
+        settings: mock.MagicMock = mock.MagicMock()
+        settings.channel_data_directory = self.tmp
+        return settings
+
+    async def _run(
+        self, browse_result: dict,
+    ) -> tuple[bool, int | None, dict]:
+        settings: mock.MagicMock = self._settings()
+        validator: mock.MagicMock = mock.MagicMock()
+        validator.validate.return_value = None
+        with mock.patch.object(
+            self.module, 'YouTubeChannelTabs',
+        ) as tabs_cls, mock.patch.object(
+            self.module,
+            'canonical_handle_from_browse',
+            return_value='canonhandle',
+        ):
+            tabs_cls.return_value.browse_channel = (
+                mock.AsyncMock(return_value=browse_result)
+            )
+            ok: bool
+            subs: int | None
+            ok, subs, _resolved = await self.module.update_channel(
+                channel_handle='inputhandle',
+                channel_id='UC_subs',
+                creator_map_backend=mock.AsyncMock(),
+                name_map_backend=mock.AsyncMock(),
+                validator=validator,
+                proxy=None,
+                settings=settings,
+            )
+        record_dict: dict = (
+            validator.validate.call_args[0][0]
+            if validator.validate.call_args else {}
+        )
+        return ok, subs, record_dict
+
+    async def test_record_omits_subscriber_count_when_unknown(
+        self,
+    ) -> None:
+        browse_result: dict = {
+            'metadata': {
+                'channelMetadataRenderer': {
+                    'title': 'NoSubs',
+                    'description': '',
+                },
+            },
+        }
+        with mock.patch.object(
+            self.module.YouTubeChannel,
+            'parse_subscriber_count_with_outcome',
+            return_value=(None, 'absent'),
+        ), mock.patch.object(
+            self.module.YouTubeChannel,
+            'parse_view_count',
+            return_value=None,
+        ), mock.patch.object(
+            self.module.YouTubeChannel,
+            'parse_video_count',
+            return_value=7,
+        ):
+            ok, subs, record_dict = await self._run(browse_result)
+
+        self.assertTrue(ok)
+        self.assertIsNone(subs)
+        self.assertNotIn('subscriber_count', record_dict)
+        self.assertNotIn('view_count', record_dict)
+        self.assertEqual(record_dict['video_count'], 7)
+        # The file on disk omits it too.
+        decoded: dict = orjson.loads(brotli.decompress((
+            Path(self.tmp) / 'channel-rss-UC_subs.json.br'
+        ).read_bytes()))
+        self.assertNotIn('subscriber_count', decoded)
+
+    async def test_known_subscriber_count_is_kept(self) -> None:
+        browse_result: dict = {
+            'metadata': {
+                'channelMetadataRenderer': {
+                    'title': 'HasSubs',
+                    'description': '',
+                },
+            },
+        }
+        with mock.patch.object(
+            self.module.YouTubeChannel,
+            'parse_subscriber_count_with_outcome',
+            return_value=(42, 'found'),
+        ), mock.patch.object(
+            self.module.YouTubeChannel,
+            'parse_video_count',
+            return_value=7,
+        ):
+            ok, subs, record_dict = await self._run(browse_result)
+
+        self.assertTrue(ok)
+        self.assertEqual(subs, 42)
+        self.assertEqual(record_dict['subscriber_count'], 42)
+
+    async def test_unparseable_header_text_returns_none(self) -> None:
+        # A metadata row that ends in " subscribers" but has no
+        # number: convert_number_string raises, and the RSS scraper
+        # must treat the count as unknown rather than propagate the
+        # error out of update_channel.
+        browse_result: dict = {
+            'header': {
+                'pageHeaderRenderer': {
+                    'content': {
+                        'pageHeaderViewModel': {
+                            'metadata': {
+                                'contentMetadataViewModel': {
+                                    'metadataRows': [
+                                        {
+                                            'metadataParts': [
+                                                {
+                                                    'text': {
+                                                        'content': (
+                                                            ' subscribers'
+                                                        ),
+                                                    },
+                                                },
+                                            ],
+                                        },
+                                    ],
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+            'metadata': {
+                'channelMetadataRenderer': {
+                    'title': 'Broken',
+                    'description': '',
+                },
+            },
+        }
+        ok, subs, record_dict = await self._run(browse_result)
+
+        self.assertTrue(ok)
+        self.assertIsNone(subs)
+        self.assertNotIn('subscriber_count', record_dict)
 
 
 if __name__ == '__main__':

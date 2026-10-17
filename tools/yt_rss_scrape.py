@@ -1417,7 +1417,10 @@ async def process_channel(
             channel_id, rss_url, channel_handle, 1,
         )
         return False
-    await creator_queue.update_tier(channel_id, sub_count or 0)
+    # An unknown subscriber count must not demote the channel to
+    # the catch-all tier: keep its current RSS tier.
+    if sub_count is not None:
+        await creator_queue.update_tier(channel_id, sub_count)
 
     # Bind had_feed once; used by both error and success paths.
     had_feed: bool = await creator_queue.has_had_feed(channel_id)
@@ -1951,13 +1954,15 @@ async def update_channel(
         )
     description: str = metadata.get('description', '')
 
-    parsed_subscriber_count: int | None = (
-        YouTubeChannel.parse_subscriber_count(channel_data)
+    parsed_subscriber_count: int | None
+    subscriber_outcome: str
+    parsed_subscriber_count, subscriber_outcome = (
+        YouTubeChannel.parse_subscriber_count_with_outcome(channel_data)
     )
     record_subscriber_count_parse(
-        'innertube', parsed_subscriber_count,
+        'innertube', subscriber_outcome, is_retry=False,
     )
-    subscriber_count: int = parsed_subscriber_count or 0
+    subscriber_count: int | None = parsed_subscriber_count
     # YouTube no longer surfaces lifetime views on the channel
     # header — they only appear on the About tab, which the
     # RSS scraper does not fetch. ``parse_view_count`` returns
@@ -1993,10 +1998,11 @@ async def update_channel(
         'channel_handle': resolved_handle,
         'url': channel_url,
         'title': title,
-        'subscriber_count': subscriber_count,
         'video_count': video_count,
         'description': description,
     }
+    if subscriber_count is not None:
+        record_dict['subscriber_count'] = subscriber_count
     if view_count is not None:
         record_dict['view_count'] = view_count
     err: str | None = validator.validate(record_dict)

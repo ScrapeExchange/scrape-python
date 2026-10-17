@@ -1339,6 +1339,117 @@ class TestOverlappingBulkUpload(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(target.upload.in_flight_jobs, set())
         self.assertEqual(target.upload.in_flight_job_ids, {})
 
+    async def test_later_orphans_recover_after_cooldown(self) -> None:
+        fake: FakeBulkExchange = FakeBulkExchange()
+        fake.write_state = True
+        fake.finalize_status = 'progress_failed'
+
+        async def resume(
+            fm: AssetFileManagement, *args: object, **kwargs: object,
+        ) -> None:
+            for state in list_bulk_states(fm):
+                await delete_bulk_state(fm, state.job_id)
+
+        with tempfile.TemporaryDirectory() as tmp, fake.patched():
+            fm: AssetFileManagement = AssetFileManagement(
+                tmp, prefix_rankings=_descriptor().prefix_rankings,
+            )
+            await self._write(fm, 'a', 'b', 'c', 'd')
+            target: scrape_upload.AssetUploadTarget = self._target(fm)
+            settings: scrape_upload.ScrapeUploadSettings = _settings(
+                bulk_batch_size=1, max_active_bulk_jobs=2,
+            )
+            with (
+                patch(
+                    'tools.scrape_upload.resume_pending_bulk_uploads',
+                    side_effect=resume,
+                ),
+                patch(
+                    'tools.scrape_upload.monotonic',
+                    return_value=100.0, create=True,
+                ) as clock,
+            ):
+                await asyncio.wait_for(
+                    scrape_upload.drain_targets_round_robin(
+                        settings=settings, targets=[target],
+                        client=object(), resume_bulk=False,
+                    ), 5,
+                )
+                self.assertEqual(len(list_bulk_states(fm)), 2)
+                # The same drain's target must recover later disconnects.
+                clock.return_value = 1000.0
+                await scrape_upload.drain_bulk_target_once(
+                    settings=settings, target=target, client=object(),
+                )
+                tasks: set[asyncio.Task] = set(
+                    target.upload.in_flight_jobs,
+                )
+                if tasks:
+                    await asyncio.gather(*tasks)
+                self.assertEqual(list_bulk_states(fm), [])
+                fake.finalize_status = 'completed'
+                await scrape_upload.drain_bulk_target_once(
+                    settings=settings, target=target, client=object(),
+                )
+                await asyncio.gather(*target.upload.in_flight_jobs)
+                self.assertTrue(fake.finalized)
+            await scrape_upload.drain_in_flight([target], 5)
+
+    async def test_failed_recovery_retries_after_cooldown(self) -> None:
+        fake: FakeBulkExchange = FakeBulkExchange()
+        fake.write_state = True
+        fake.finalize_status = 'progress_failed'
+        fail_recovery: bool = True
+
+        async def resume(
+            fm: AssetFileManagement, *args: object, **kwargs: object,
+        ) -> None:
+            if fail_recovery:
+                raise OSError('Recovery temporarily unavailable')
+            for state in list_bulk_states(fm):
+                await delete_bulk_state(fm, state.job_id)
+
+        with tempfile.TemporaryDirectory() as tmp, fake.patched():
+            fm: AssetFileManagement = AssetFileManagement(
+                tmp, prefix_rankings=_descriptor().prefix_rankings,
+            )
+            await self._write(fm, 'a')
+            target: scrape_upload.AssetUploadTarget = self._target(fm)
+            settings: scrape_upload.ScrapeUploadSettings = _settings(
+                bulk_batch_size=1, max_active_bulk_jobs=1,
+            )
+            with (
+                patch(
+                    'tools.scrape_upload.resume_pending_bulk_uploads',
+                    side_effect=resume,
+                ),
+                patch(
+                    'tools.scrape_upload.monotonic', return_value=100.0,
+                ) as clock,
+            ):
+                with self.assertLogs(level='ERROR'):
+                    await asyncio.wait_for(
+                        scrape_upload.drain_targets_round_robin(
+                            settings=settings, targets=[target],
+                            client=object(), resume_bulk=False,
+                        ), 5,
+                    )
+                self.assertEqual(len(list_bulk_states(fm)), 1)
+                fail_recovery = False
+                # A new drain must respect the previous attempt's cooldown.
+                await scrape_upload.drain_targets_round_robin(
+                    settings=settings, targets=[target], client=object(),
+                    resume_bulk=False,
+                )
+                self.assertEqual(len(list_bulk_states(fm)), 1)
+                clock.return_value = 1000.0
+                await scrape_upload.drain_bulk_target_once(
+                    settings=settings, target=target, client=object(),
+                )
+                await asyncio.gather(*target.upload.in_flight_jobs)
+                self.assertEqual(list_bulk_states(fm), [])
+            await scrape_upload.drain_in_flight([target], 5)
+
     async def test_idle_target_scans_once_per_call(self) -> None:
         calls: int = 0
         real = scrape_upload.StreamingListing.next_chunk

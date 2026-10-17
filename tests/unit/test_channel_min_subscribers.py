@@ -160,8 +160,10 @@ class TestRssSkipsSmallChannels(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_count_is_queued(self) -> None:
         queue: MagicMock = await self._process(None, 10)
         queue.enqueue.assert_awaited_once()
-        # Unknown keeps the previous tier routing input of 0.
-        self.creator_queue.update_tier.assert_awaited_once_with('UCX', 0)
+        # An unknown count is not evidence of a tiny channel, and it
+        # is not evidence for the catch-all tier either: the tier is
+        # left alone rather than demoted with a fabricated 0.
+        self.creator_queue.update_tier.assert_not_awaited()
 
     async def test_disabled_queues_tiny_channel(self) -> None:
         queue: MagicMock = await self._process(0, 0)

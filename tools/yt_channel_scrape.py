@@ -2164,6 +2164,8 @@ async def _scrape_one_queued(
     }
     if force_mode:
         extra['force_rescrape_mode'] = force_mode
+    if meta.get('force_source') == 'missing_subscriber_count':
+        extra['force_source'] = 'missing_subscriber_count'
     summary: FullScrapeSummary = FullScrapeSummary(channel_id)
     first_full_scrape: bool = (
         not metadata_only and progress.successful_scrapes == 0
@@ -3380,6 +3382,9 @@ async def _do_scrape_channel_to_disk_typed(
         po_token_url=PO_TOKEN_URL, debug=True,
         save_dir=settings.channel_data_directory,
         with_download_client=False,
+    )
+    channel.subscriber_count_retry = (
+        extra.get('force_source') == 'missing_subscriber_count'
     )
     try:
         scrape_proxy: str | None = (

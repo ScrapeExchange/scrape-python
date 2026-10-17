@@ -1791,6 +1791,69 @@ class TestParseChannelAboutDataCountry(unittest.TestCase):
         self.assertIsNone(ch.country)
 
 
+class TestAboutParseWithUnparseableSubscriberCount(unittest.TestCase):
+    '''An unparseable subscriberCountText must not abort the rest of
+    the /about parse — links, description and country still land.'''
+
+    def test_other_about_fields_still_parsed(self) -> None:
+        ch = YouTubeChannel('TestCh')
+        about_renderer = {
+            'subscriberCountText': {'simpleText': ' subscribers'},
+            'description': {'content': 'A channel description'},
+            'country': {'simpleText': 'Netherlands'},
+            'links': [
+                {
+                    'channelExternalLinkViewModel': {
+                        'title': {'content': 'Site'},
+                        'link': {'content': 'http://foo.bar/path'},
+                    }
+                }
+            ],
+        }
+        ch._parse_channel_about_data(about_renderer)
+        self.assertIsNone(ch.subscriber_count)
+        self.assertEqual(ch.description, 'A channel description')
+        self.assertEqual(ch.country, 'NL')
+        self.assertEqual(len(ch.external_urls), 1)
+        self.assertEqual(
+            next(iter(ch.external_urls)).url, 'https://foo.bar/path',
+        )
+
+    def test_innertube_unparseable_count_does_not_raise(self) -> None:
+        ch = YouTubeChannel('TestCh')
+        ch.parse_channel_video_data({
+            'header': {
+                'pageHeaderRenderer': {
+                    'content': {
+                        'pageHeaderViewModel': {
+                            'metadata': {
+                                'contentMetadataViewModel': {
+                                    'metadataRows': [
+                                        {
+                                            'metadataParts': [
+                                                {
+                                                    'text': {
+                                                        'content': (
+                                                            ' subscribers'
+                                                        ),
+                                                    },
+                                                },
+                                            ],
+                                        },
+                                    ],
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+            'metadata': {
+                'channelMetadataRenderer': {'title': 'TestCh'},
+            },
+        })
+        self.assertIsNone(ch.subscriber_count)
+
+
 class TestParseThumbnailsBannersHeaderFallback(unittest.TestCase):
     """Cover the header_renderer avatar fallback at line 739."""
 
