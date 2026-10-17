@@ -1053,11 +1053,7 @@ async def _run_worker(
     )
     logging.info(
         'Starting YouTube video scrape tool',
-        extra={
-            'settings': (
-                settings.model_dump_json(indent=2)
-            ),
-        },
+        extra={'settings': settings.model_dump()},
     )
 
     claim: ContentClaim
