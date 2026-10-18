@@ -12,6 +12,7 @@ mocked WebSocket) so the WebSocket-driven progress channel has
 matching coverage.
 '''
 
+import asyncio
 import tempfile
 import unittest
 from datetime import datetime, timedelta, UTC
@@ -24,6 +25,7 @@ import websockets.frames
 
 from scrape_exchange.bulk_upload import (
     BULK_STATE_DIR_NAME,
+    _poll_status_until_terminal,
     BulkResults,
     BulkUploadState,
     apply_bulk_results,
@@ -226,6 +228,14 @@ class _FakeWebSocket:
         return item
 
 
+def _status_resp(code: int, status: str = '') -> MagicMock:
+    resp: MagicMock = MagicMock()
+    resp.status_code = code
+    resp.text = ''
+    resp.json = MagicMock(return_value={'status': status})
+    return resp
+
+
 class TestStreamBulkJobProgress(unittest.IsolatedAsyncioTestCase):
 
     async def test_returns_true_on_completed_status(self) -> None:
@@ -290,20 +300,62 @@ class TestStreamBulkJobProgress(unittest.IsolatedAsyncioTestCase):
     async def test_returns_false_on_error_close(self) -> None:
         '''An auth/ownership/not-found close (code 4xxx) is a real
         failure; the helper returns False and the caller leaves
-        source files in base_dir for retry.'''
+        source files in base_dir for retry. No status poll.'''
+        close: websockets.frames.Close = websockets.frames.Close(
+            code=4404, reason='job not found',
+        )
         err: websockets.exceptions.ConnectionClosedError = (
-            websockets.exceptions.ConnectionClosedError(None, None)
+            websockets.exceptions.ConnectionClosedError(close, None)
         )
         ws = _FakeWebSocket([err])
+        client: MagicMock = _fake_client()
+        client.get = AsyncMock()
 
         with patch(
             'scrape_exchange.bulk_upload.websockets.connect',
             return_value=ws,
         ):
             ok: bool = await stream_bulk_job_progress(
-                'abcdef', 'http://test', _fake_client(), 30.0,
+                'abcdef', 'http://test', client, 30.0,
             )
         self.assertFalse(ok)
+        client.get.assert_not_called()
+
+    async def test_drop_without_close_frame_polls_status(self) -> None:
+        '''A connection that drops without a close frame (API or proxy
+        restart) leaves the job running server side: poll its status
+        instead of orphaning the batch.'''
+        err: websockets.exceptions.ConnectionClosedError = (
+            websockets.exceptions.ConnectionClosedError(None, None)
+        )
+        ws = _FakeWebSocket([err])
+        client: MagicMock = _fake_client()
+        client.get = AsyncMock(return_value=_status_resp(200, 'completed'))
+
+        with patch(
+            'scrape_exchange.bulk_upload.websockets.connect',
+            return_value=ws,
+        ):
+            ok: bool = await stream_bulk_job_progress(
+                'abcdef', 'http://test', client, 30.0,
+            )
+        self.assertTrue(ok)
+        client.get.assert_awaited_once()
+
+    async def test_connect_failure_polls_status(self) -> None:
+        '''A failed connect or handshake also falls back to polling.'''
+        client: MagicMock = _fake_client()
+        client.get = AsyncMock(return_value=_status_resp(200, 'completed'))
+
+        with patch(
+            'scrape_exchange.bulk_upload.websockets.connect',
+            side_effect=OSError('connection refused'),
+        ):
+            ok: bool = await stream_bulk_job_progress(
+                'abcdef', 'http://test', client, 30.0,
+            )
+        self.assertTrue(ok)
+        client.get.assert_awaited_once()
 
     async def test_service_restart_close_polls_status_until_terminal(
         self,
@@ -376,6 +428,77 @@ class TestStreamBulkJobProgress(unittest.IsolatedAsyncioTestCase):
                 'abcdef', 'http://test', _fake_client(), 30.0,
             )
         self.assertTrue(ok)
+
+
+class TestPollStatusUntilTerminal(unittest.IsolatedAsyncioTestCase):
+
+    def _deadline(self, seconds: float) -> float:
+        return asyncio.get_running_loop().time() + seconds
+
+    async def test_retries_transient_failures_until_terminal(
+        self,
+    ) -> None:
+        '''502, a transport error and 429 are retried; running status
+        keeps polling; completed ends the poll.'''
+        client: MagicMock = _fake_client()
+        client.get = AsyncMock(side_effect=[
+            _status_resp(502),
+            OSError('connection reset'),
+            _status_resp(429),
+            _status_resp(200, 'in_progress'),
+            _status_resp(200, 'completed'),
+        ])
+        with patch(
+            'scrape_exchange.bulk_upload.asyncio.sleep',
+            new_callable=AsyncMock,
+        ) as sleep:
+            ok: bool = await _poll_status_until_terminal(
+                'abcdef', 'http://test', client, self._deadline(300),
+            )
+        self.assertTrue(ok)
+        self.assertEqual(client.get.await_count, 5)
+        delays: list[float] = [
+            call.args[0] for call in sleep.await_args_list
+        ]
+        # Backoff doubles per consecutive failure, resets on success.
+        self.assertEqual(delays, [4.0, 8.0, 16.0, 2.0])
+
+    async def test_backoff_is_capped(self) -> None:
+        client: MagicMock = _fake_client()
+        client.get = AsyncMock(
+            side_effect=[_status_resp(503)] * 6
+            + [_status_resp(200, 'failed')],
+        )
+        with patch(
+            'scrape_exchange.bulk_upload.asyncio.sleep',
+            new_callable=AsyncMock,
+        ) as sleep:
+            ok: bool = await _poll_status_until_terminal(
+                'abcdef', 'http://test', client, self._deadline(300),
+            )
+        self.assertTrue(ok)
+        self.assertEqual(
+            max(call.args[0] for call in sleep.await_args_list), 30.0,
+        )
+
+    async def test_non_retryable_status_gives_up(self) -> None:
+        '''404 means the job is unknown: stop at once.'''
+        client: MagicMock = _fake_client()
+        client.get = AsyncMock(return_value=_status_resp(404))
+        ok: bool = await _poll_status_until_terminal(
+            'abcdef', 'http://test', client, self._deadline(300),
+        )
+        self.assertFalse(ok)
+        client.get.assert_awaited_once()
+
+    async def test_past_deadline_returns_false(self) -> None:
+        client: MagicMock = _fake_client()
+        client.get = AsyncMock()
+        ok: bool = await _poll_status_until_terminal(
+            'abcdef', 'http://test', client, self._deadline(-1),
+        )
+        self.assertFalse(ok)
+        client.get.assert_not_called()
 
 
 def _fake_state(job_id: str = 'abc123') -> BulkUploadState:

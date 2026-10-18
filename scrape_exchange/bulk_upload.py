@@ -66,6 +66,10 @@ _RESUME_POLL_TIMEOUT_SECONDS: float = 300.0
 # the watchdog; the overall job deadline still bounds the total wait.
 # Must be < WATCHDOG_WORK_TIMEOUT_SECONDS.
 _WS_RECV_TOUCH_INTERVAL: float = 30.0
+# Poll interval while the job is running, and the cap on the backoff
+# after a transient status-poll failure (transport error, 5xx, 429).
+_POLL_INTERVAL_SECONDS: float = 2.0
+_POLL_MAX_BACKOFF_SECONDS: float = 30.0
 _T = TypeVar('_T')
 
 
@@ -504,21 +508,24 @@ async def _handle_ws_close_error(
 ) -> bool:
     '''
     Decide what to do when the bulk-progress WebSocket closed
-    with an error frame. Logs at the right level, and on the
-    expected service-restart codes (1001/1012) falls back to
-    polling the status endpoint so the caller can still apply
-    per-record results instead of dropping the whole batch.
-    Returns ``True`` if a terminal status was eventually
-    observed, ``False`` otherwise.
+    with an error. Application close codes (4xxx: auth, ownership,
+    job not found) are final. Every other close — the service-
+    restart codes 1001/1012, server errors, or a connection that
+    dropped without a close frame (e.g. the API or its proxy
+    restarted) — leaves the server-side job running, so fall back
+    to polling the status endpoint. The caller can then apply
+    per-record results instead of orphaning the batch. Returns
+    ``True`` if a terminal status was eventually observed,
+    ``False`` otherwise.
     '''
     _log_ws_closed_with_error(job_id, exc)
     rcvd = exc.rcvd
     code: int | None = rcvd.code if rcvd else None
-    if code in (1001, 1012):
-        return await _poll_status_until_terminal(
-            job_id, exchange_url, client, deadline,
-        )
-    return False
+    if code is not None and code >= 4000:
+        return False
+    return await _poll_status_until_terminal(
+        job_id, exchange_url, client, deadline,
+    )
 
 
 async def _poll_status_until_terminal(
@@ -533,14 +540,16 @@ async def _poll_status_until_terminal(
     monotonic wall clock from
     ``asyncio.get_running_loop().time()`` — is reached.
 
-    Used as a fallback after a WebSocket service-restart close so
-    the scraper still observes the bulk job's outcome instead of
-    leaving every interrupted batch for retry. Returns ``True`` if
-    a terminal status was seen, ``False`` on timeout, transport
-    error, or non-200 response.
+    Used as a fallback after the progress WebSocket closed or
+    failed, so the uploader still observes the bulk job's outcome
+    instead of orphaning the interrupted batch. Transport errors
+    and 5xx/429 responses — expected while the API restarts — are
+    retried with backoff until *deadline*. Returns ``True`` if a
+    terminal status was seen, ``False`` on timeout or on any other
+    non-200 response (e.g. 404: the job is unknown).
     '''
     status_url: str = f'{exchange_url}{BULK_API_PATH}'
-    poll_interval: float = 2.0
+    failures: int = 0
     while True:
         _touch_watchdog_work()
         remaining: float = (
@@ -552,34 +561,51 @@ async def _poll_status_until_terminal(
                 extra={'job_id': job_id},
             )
             return False
+        poll_interval: float = _POLL_INTERVAL_SECONDS
+        resp: Response | None
         try:
-            resp: Response = await client.get(
+            resp = await client.get(
                 status_url, params={'job_id': job_id},
             )
         except Exception as exc:
+            failures += 1
             logging.warning(
-                'Bulk progress status fetch failed',
+                'Bulk progress status fetch failed, retrying',
                 exc=exc,
-                extra={'job_id': job_id},
+                extra={'job_id': job_id, 'failures': failures},
             )
-            return False
-        if resp.status_code != 200:
+            resp = None
+        if resp is not None and resp.status_code != 200:
+            retryable: bool = (
+                resp.status_code >= 500 or resp.status_code == 429
+            )
             logging.warning(
                 'Bulk progress status non-200',
                 extra={
                     'job_id': job_id,
                     'status_code': resp.status_code,
                     'response_text': resp.text,
+                    'retrying': retryable,
                 },
             )
-            return False
-        status: str = resp.json().get('status', '')
-        if status in TERMINAL_BULK_STATUSES:
-            logging.info(
-                'Bulk job reached terminal status (poll fallback)',
-                extra={'job_id': job_id, 'status': status},
+            if not retryable:
+                return False
+            failures += 1
+            resp = None
+        if resp is None:
+            poll_interval = min(
+                _POLL_INTERVAL_SECONDS * 2 ** failures,
+                _POLL_MAX_BACKOFF_SECONDS,
             )
-            return True
+        else:
+            failures = 0
+            status: str = resp.json().get('status', '')
+            if status in TERMINAL_BULK_STATUSES:
+                logging.info(
+                    'Bulk job reached terminal status (poll fallback)',
+                    extra={'job_id': job_id, 'status': status},
+                )
+                return True
         sleep_for: float = min(poll_interval, remaining)
         _touch_watchdog_work()
         await asyncio.sleep(sleep_for)
@@ -593,10 +619,10 @@ def _log_ws_closed_with_error(
     Log a WebSocket close at the right level for its close code.
 
     1012 (service_restart) and 1001 (going_away) are expected
-    during gunicorn worker rotation / API redeploys; the scraper
-    recovers by leaving files for retry on the next iteration, so
-    these get INFO. Anything else is a real anomaly (network
-    failure, server bug) and stays at WARNING.
+    during gunicorn worker rotation / API redeploys and get INFO.
+    Anything else is an anomaly (network failure, server bug,
+    rejected subscription) and stays at WARNING; the caller still
+    falls back to status polling unless the code is 4xxx.
     '''
     rcvd = exc.rcvd
     code: int | None = rcvd.code if rcvd else None
@@ -632,9 +658,10 @@ async def stream_bulk_job_progress(
 
     Returns ``True`` on terminal status (including a clean
     server-initiated close, which the server uses to signal "job
-    already complete"), and ``False`` on missing auth, an error
-    close code (4401/4403/4404), any other connection failure,
-    or timeout.
+    already complete"), and ``False`` on missing auth, an
+    application close code (4401/4403/4404) or timeout. Any other
+    close or connection failure falls back to polling the status
+    endpoint until the deadline.
 
     Auth is forwarded via the ``Authorization`` header copied off
     *client*.
@@ -742,12 +769,16 @@ async def stream_bulk_job_progress(
             job_id, exc, exchange_url, client, deadline,
         )
     except Exception as exc:
+        # Connect or handshake failure (e.g. the API is restarting).
+        # The job keeps running server side, so poll its status.
         logging.warning(
-            'Bulk progress WebSocket failed',
+            'Bulk progress WebSocket failed, polling status',
             exc=exc,
             extra={'job_id': job_id},
         )
-        return False
+        return await _poll_status_until_terminal(
+            job_id, exchange_url, client, deadline,
+        )
 
 
 async def fetch_bulk_results(
