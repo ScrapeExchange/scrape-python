@@ -20,7 +20,6 @@ import logging
 
 import httpx2 as httpx  # exchange client raises httpx2 exception classes
 
-from pathlib import Path
 
 from prometheus_client import Counter, Gauge
 

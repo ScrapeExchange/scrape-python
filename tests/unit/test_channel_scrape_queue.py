@@ -10,7 +10,6 @@ import fakeredis.aioredis
 
 from scrape_exchange.channel_scrape_queue import (
     ChannelScrapeProgress,
-    ChannelScrapeQueue,
     ChannelScrapeQueueSettings,
     ChannelState,
     RedisChannelScrapeQueue,
@@ -2029,7 +2028,7 @@ class TestMissingSubscriberBackoffState(_MissingSubscriberTestBase):
     async def test_count_resets_counter_in_lua_path(self) -> None:
         queue: RedisChannelScrapeQueue = self._queue()
         channel_id: str = 'UCreset1'
-        member: str = await self._seed(channel_id)
+        await self._seed(channel_id)
         progress: ChannelScrapeProgress = ChannelScrapeProgress(
             successful_scrapes=0, next_full_scrape=1,
         )

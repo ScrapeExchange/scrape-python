@@ -18,7 +18,6 @@ from scrape_exchange.creator_queue import (
     CHANNEL_FILENAME_PREFIX,
     FileCreatorQueue,
     TierConfig,
-    parse_priority_queues,
 )
 from scrape_exchange.file_management import (
     AssetFileManagement,

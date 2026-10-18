@@ -9,7 +9,6 @@ forking.
 '''
 
 import os
-import subprocess
 import time
 import unittest
 
@@ -895,7 +894,7 @@ class TestSuperviseChildren(unittest.TestCase):
         instance: int,
         process: _FakeProcess,
         spawn_time: float | None = None,
-    ) -> '_ChildSlot':
+    ) -> 'scraper_supervisor._ChildSlot':
         from scrape_exchange.scraper_supervisor import _ChildSlot
         return _ChildSlot(
             instance=instance,

@@ -20,7 +20,6 @@ import time
 import unittest
 
 from scrape_exchange.rate_limiter import (
-    _SharedFileBackend,
     _BucketConfig,
 )
 

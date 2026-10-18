@@ -1,7 +1,7 @@
 '''Unit tests for the pooled InnerTube pool.'''
 
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import scrape_exchange.youtube.youtube_channel_tabs as youtube_channel_tabs
 from scrape_exchange.youtube.youtube_channel_tabs import (

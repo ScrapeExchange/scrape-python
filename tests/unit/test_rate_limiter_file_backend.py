@@ -370,9 +370,9 @@ class TestRateLimiterSharedBackend(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(
             limiter_b._backend, _SharedFileBackend,
         )
-        tokens: float = await limiter_b._backend.try_acquire(
+        await limiter_b._backend.try_acquire(
             YouTubeCallType.BROWSE, 'http://a:3128',
-        ) and 0
+        )
         # Read state file directly — the authoritative value.
         files: list[str] = [
             f for f in os.listdir(self.state_dir)

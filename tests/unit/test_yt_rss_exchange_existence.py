@@ -91,7 +91,6 @@ class TestRssRedisFirstExistence(unittest.TestCase):
     def test_uploaded_and_tracked_videos_skip_the_get(self) -> None:
         async def scenario() -> None:
             import tempfile
-            from pathlib import Path
 
             from scrape_exchange.youtube.youtube_video import (
                 YouTubeVideo,

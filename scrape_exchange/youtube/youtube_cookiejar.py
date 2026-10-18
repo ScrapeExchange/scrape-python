@@ -38,7 +38,6 @@ from scrape_exchange.util import extract_proxy_ip, extract_proxy_port
 
 from .youtube_client import (
     AsyncYouTubeClient,
-    CONSENT_COOKIES,
     pooled_youtube_client_for_entry,
 )
 

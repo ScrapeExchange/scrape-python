@@ -18,10 +18,14 @@ call-site context (filename, content_id, etc.).
 
 import logging
 from logging import Logger
+from typing import TYPE_CHECKING
 
 from httpx import Response
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
+
+if TYPE_CHECKING:
+    from .exchange_client import ExchangeClient
 
 
 _LOGGER: Logger = logging.getLogger(__name__)

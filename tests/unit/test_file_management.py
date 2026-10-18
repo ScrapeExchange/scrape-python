@@ -961,7 +961,6 @@ class TestDeleteUploaded(unittest.IsolatedAsyncioTestCase):
             )  # must not raise
 
 
-import asyncio
 
 
 class TestMarkInvalid(unittest.TestCase):
