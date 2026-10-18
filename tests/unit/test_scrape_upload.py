@@ -1791,7 +1791,9 @@ class TestOrphanMaxAge(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(bulk_state_is_stale(
             state, now=now, max_age=timedelta(hours=3),
         ))
-        self.assertFalse(bulk_state_is_stale(state, now=now))
+        self.assertFalse(bulk_state_is_stale(
+            state, now=now, max_age=timedelta(hours=5),
+        ))
         state.created_at = ''
         self.assertFalse(bulk_state_is_stale(
             state, now=now, max_age=timedelta(seconds=1),

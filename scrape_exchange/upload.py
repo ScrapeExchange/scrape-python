@@ -3,14 +3,14 @@ Reusable upload-tool helpers.
 
 This module sits above :mod:`scrape_exchange.bulk_upload`: it keeps the
 HTTP bulk-upload protocol in ``bulk_upload.py`` and collects the small
-operator-tool patterns shared by YouTube channels, YouTube videos, and
-future TikTok uploaders.
+helpers ``tools/scrape_upload.py`` uses to validate, POST and reconcile
+batches.
 '''
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,7 +20,6 @@ from scrape_exchange.bulk_upload import (
     BulkBatchOutcome,
     finalize_bulk_batch,
     post_bulk_batch,
-    upload_bulk_batch,
 )
 from scrape_exchange.exchange_client import ExchangeClient
 from scrape_exchange.file_management import AssetFileManagement
@@ -37,19 +36,6 @@ class BulkUploadConfig:
     exchange_url: str
     progress_timeout_seconds: float
     filename_prefix: str
-
-
-def next_filename_chunk(
-    filenames: Iterator[str],
-    chunk_size: int,
-) -> list[str]:
-    chunk: list[str] = []
-    for _ in range(chunk_size):
-        try:
-            chunk.append(next(filenames))
-        except StopIteration:
-            break
-    return chunk
 
 
 def ndjson_line(record: dict) -> bytes:
@@ -151,33 +137,6 @@ async def finalize_prepared_bulk_batch(
         client=client,
         fm=fm,
         progress_timeout_seconds=config.progress_timeout_seconds,
-        exchange_set=exchange_set,
-        id_from_filename=id_from_filename,
-    )
-
-
-async def upload_prepared_bulk_batch(
-    batch_buf: bytes,
-    batch_records: list[tuple[str, str]],
-    config: BulkUploadConfig,
-    client: ExchangeClient,
-    fm: AssetFileManagement,
-    *,
-    exchange_set: Any | None = None,
-    id_from_filename: Callable[[str], str] | None = None,
-) -> BulkBatchOutcome:
-    return await upload_bulk_batch(
-        batch_buf,
-        batch_records,
-        schema_owner=config.schema_owner,
-        schema_version=config.schema_version,
-        platform=config.platform,
-        entity=config.entity,
-        exchange_url=config.exchange_url,
-        client=client,
-        fm=fm,
-        progress_timeout_seconds=config.progress_timeout_seconds,
-        filename_prefix=config.filename_prefix,
         exchange_set=exchange_set,
         id_from_filename=id_from_filename,
     )

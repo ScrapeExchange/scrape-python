@@ -12,7 +12,6 @@ mocked WebSocket) so the WebSocket-driven progress channel has
 matching coverage.
 '''
 
-import asyncio
 import tempfile
 import unittest
 from datetime import datetime, timedelta, UTC
@@ -31,12 +30,12 @@ from scrape_exchange.bulk_upload import (
     bulk_progress_ws_url,
     delete_bulk_state,
     list_bulk_states,
-    reserve_bulk_upload_slot,
     resume_pending_bulk_uploads,
     stream_bulk_job_progress,
-    wait_for_bulk_upload_slot,
     write_bulk_state,
 )
+
+_MAX_AGE: timedelta = timedelta(hours=3)
 
 
 class TestApplyBulkResults(unittest.IsolatedAsyncioTestCase):
@@ -196,83 +195,6 @@ class TestBulkProgressWsUrl(unittest.TestCase):
         self.assertEqual(
             url, 'ws://test.local/api/v1/bulk/progress/abcdef',
         )
-
-
-class TestWaitForBulkUploadSlot(unittest.IsolatedAsyncioTestCase):
-
-    async def test_returns_immediately_below_limit(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            fm = MagicMock()
-            fm.base_dir = Path(tmp)
-            with patch(
-                'scrape_exchange.bulk_upload.resume_pending_bulk_uploads',
-                new=AsyncMock(),
-            ) as resume_mock:
-                await wait_for_bulk_upload_slot(
-                    fm, MagicMock(), 'http://test',
-                    max_active_jobs=1,
-                )
-            resume_mock.assert_not_called()
-
-    async def test_waits_on_persisted_pending_jobs(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            fm = MagicMock()
-            fm.base_dir = Path(tmp)
-            await write_bulk_state(
-                fm,
-                BulkUploadState(
-                    job_id='job1',
-                    batch_id='batch1',
-                    schema_owner='boinko',
-                    schema_version='0.0.2',
-                    platform='youtube',
-                    entity='channel',
-                    upload_filename='channels-batch1.jsonl',
-                    batch_records=[('UCabc', 'channel-UCabc.json.br')],
-                ),
-            )
-
-            async def _resume(*_args, **_kwargs) -> None:
-                await delete_bulk_state(fm, 'job1')
-
-            with patch(
-                'scrape_exchange.bulk_upload.resume_pending_bulk_uploads',
-                new=AsyncMock(side_effect=_resume),
-            ) as resume_mock:
-                await wait_for_bulk_upload_slot(
-                    fm, MagicMock(), 'http://test',
-                    max_active_jobs=1,
-                    sleep_seconds=0,
-                )
-
-            resume_mock.assert_awaited_once()
-            self.assertEqual(list_bulk_states(fm), [])
-
-    async def test_reservation_counts_before_state_exists(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            fm = MagicMock()
-            fm.base_dir = Path(tmp)
-            resume_mock = AsyncMock()
-
-            with patch(
-                'scrape_exchange.bulk_upload.resume_pending_bulk_uploads',
-                new=resume_mock,
-            ):
-                async with reserve_bulk_upload_slot(
-                    fm, MagicMock(), 'http://test',
-                    max_active_jobs=1,
-                    sleep_seconds=0,
-                ):
-                    task = asyncio.create_task(wait_for_bulk_upload_slot(
-                        fm, MagicMock(), 'http://test',
-                        max_active_jobs=1,
-                        sleep_seconds=0,
-                    ))
-                    await asyncio.sleep(0)
-                    self.assertFalse(task.done())
-
-                await asyncio.wait_for(task, timeout=0.1)
-            resume_mock.assert_awaited()
 
 
 def _fake_client(
@@ -560,18 +482,19 @@ class TestResumePendingBulkUploads(
             client.get = AsyncMock()
             await resume_pending_bulk_uploads(
                 fm, client, 'http://test',
+                max_age=_MAX_AGE,
             )
             client.get.assert_not_called()
 
-    async def test_state_older_than_24_hours_is_deleted(
+    async def test_state_older_than_max_age_is_deleted(
         self,
     ) -> None:
-        '''Very old accepted jobs are abandoned instead of re-polled.'''
+        '''Accepted jobs older than max_age are abandoned, not re-polled.'''
         with tempfile.TemporaryDirectory() as base:
             fm = _fake_fm(Path(base))
             stale: BulkUploadState = _fake_state('stale')
             stale.created_at = (
-                datetime.now(UTC) - timedelta(hours=25)
+                datetime.now(UTC) - timedelta(hours=4)
             ).isoformat()
             await write_bulk_state(fm, stale)
             client = MagicMock()
@@ -579,6 +502,7 @@ class TestResumePendingBulkUploads(
 
             await resume_pending_bulk_uploads(
                 fm, client, 'http://test',
+                max_age=_MAX_AGE,
             )
 
             client.get.assert_not_called()
@@ -594,6 +518,7 @@ class TestResumePendingBulkUploads(
 
             await resume_pending_bulk_uploads(
                 fm, client, 'http://test',
+                max_age=_MAX_AGE,
             )
 
             client.get.assert_awaited_once()
@@ -622,6 +547,7 @@ class TestResumePendingBulkUploads(
 
             await resume_pending_bulk_uploads(
                 fm, client, 'http://test',
+                max_age=_MAX_AGE,
             )
 
             self.assertEqual(client.get.await_count, 2)
@@ -639,6 +565,7 @@ class TestResumePendingBulkUploads(
 
             await resume_pending_bulk_uploads(
                 fm, client, 'http://test',
+                max_age=_MAX_AGE,
             )
 
             self.assertEqual(len(list_bulk_states(fm)), 1)
@@ -653,6 +580,7 @@ class TestResumePendingBulkUploads(
 
             await resume_pending_bulk_uploads(
                 fm, client, 'http://test',
+                max_age=_MAX_AGE,
             )
 
             self.assertEqual(len(list_bulk_states(fm)), 1)
@@ -678,6 +606,7 @@ class TestResumePendingBulkUploads(
             ):
                 await resume_pending_bulk_uploads(
                     fm, client, 'http://test',
+                    max_age=_MAX_AGE,
                     poll_timeout_seconds=0.0,
                 )
 
