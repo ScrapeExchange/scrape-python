@@ -216,17 +216,20 @@ def _bulk_state_created_at(state: BulkUploadState) -> datetime | None:
     return created_at.astimezone(UTC)
 
 
-def _bulk_state_is_stale(
+def bulk_state_is_stale(
     state: BulkUploadState,
     *,
     now: datetime | None = None,
+    max_age: timedelta = _STALE_BULK_STATE_AGE,
 ) -> bool:
+    '''True when *state*'s job was submitted more than *max_age*
+    ago. A state without a parseable ``created_at`` is never stale.'''
     created_at: datetime | None = _bulk_state_created_at(state)
     if created_at is None:
         return False
     if now is None:
         now = datetime.now(UTC)
-    return now - created_at > _STALE_BULK_STATE_AGE
+    return now - created_at > max_age
 
 
 async def write_bulk_state(
@@ -321,10 +324,13 @@ async def resume_pending_bulk_uploads(
     poll_timeout_seconds: float = _RESUME_POLL_TIMEOUT_SECONDS,
     exchange_set: 'RedisExchangeChannelsSet | None' = None,
     id_from_filename: Callable[[str], str] | None = None,
+    max_age: timedelta = _STALE_BULK_STATE_AGE,
 ) -> None:
     '''
     Read ``<base_dir>/.bulk/`` on startup and reconcile every
-    persisted bulk job against the API:
+    persisted bulk job against the API. State files of jobs
+    submitted more than *max_age* ago are discarded without
+    asking the API; their source files stay in ``base_dir``.
 
     * The API returns 404 → the job was never queued (or has
       been cleaned up by retention). Delete the state file; the
@@ -354,15 +360,13 @@ async def resume_pending_bulk_uploads(
     )
     for state in states:
         _touch_watchdog_work()
-        if _bulk_state_is_stale(state):
+        if bulk_state_is_stale(state, max_age=max_age):
             _LOGGER.info(
                 'Discarding stale bulk-upload state file',
                 extra={
                     'job_id': state.job_id,
                     'created_at': state.created_at,
-                    'stale_after_hours': (
-                        _STALE_BULK_STATE_AGE.total_seconds() / 3600
-                    ),
+                    'stale_after_hours': max_age.total_seconds() / 3600,
                 },
             )
             await delete_bulk_state(fm, state.job_id)
