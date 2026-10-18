@@ -2703,8 +2703,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (platform, entity, mode, status) (rate(uploads_completed_total{platform=~\"$platform\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"}[5m]))",
-          "legendFormat": "{{platform}} / {{entity}} / {{mode}} / {{status}}",
+          "expr": "sum by (instance, platform, entity, mode, status) (rate(uploads_completed_total{platform=~\"$platform\",scraper=~\"$scraper\",job=~\"$job\",instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{instance}} / {{platform}} / {{entity}} / {{mode}} / {{status}}",
           "refId": "A"
         }
       ],
