@@ -19,6 +19,7 @@ import signal
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 from time import monotonic
 from typing import Any, Literal
@@ -31,6 +32,8 @@ from watchfiles import Change, awatch
 
 from scrape_exchange.bulk_upload import (
     BulkBatchOutcome,
+    bulk_state_is_stale,
+    delete_bulk_state,
     list_bulk_states,
     resume_pending_bulk_uploads,
 )
@@ -492,6 +495,17 @@ class ScrapeUploadSettings(ScraperSettings):
             'Bulk jobs in flight per upload target: POSTed but not yet '
             'reconciled. The uploader prepares and POSTs the next batch '
             'while up to this many jobs run on the server.'
+        ),
+    )
+    bulk_orphan_max_age_hours: float = Field(
+        default=3.0,
+        gt=0,
+        validation_alias='BULK_ORPHAN_MAX_AGE_HOURS',
+        description=(
+            'Hours after submission after which an orphaned bulk job '
+            '(one whose progress tracking was lost) is considered dead. '
+            'Its state file is discarded and its source files are '
+            'uploaded again in a later pass.'
         ),
     )
     pending_count_interval_seconds: float = Field(
@@ -1369,6 +1383,7 @@ async def resume_bulk_target(
         poll_timeout_seconds=(
             settings.bulk_progress_timeout_seconds
         ),
+        max_age=_orphan_max_age(settings),
         **processor.bulk_kwargs(context),
     )
 
@@ -1570,15 +1585,40 @@ async def _post_batch(
     return len(batch_records)
 
 
-def _orphaned_job_count(target: AssetUploadTarget) -> int:
+def _orphan_max_age(settings: ScrapeUploadSettings) -> timedelta:
+    return timedelta(hours=settings.bulk_orphan_max_age_hours)
+
+
+async def _orphaned_job_count(
+    settings: ScrapeUploadSettings, target: AssetUploadTarget,
+) -> int:
     '''Number of ``.bulk`` state files of *target* that no in-flight
     finalize task owns: jobs whose finalize gave up (e.g. the progress
-    WebSocket failed) and that only a resume can reconcile.'''
+    WebSocket failed) and that only a resume can reconcile. Orphans
+    submitted more than ``bulk_orphan_max_age_hours`` ago are dead:
+    their state files are deleted and not counted, so they stop
+    holding ``max_active_bulk_jobs`` slots.'''
     owned: set[str] = set(target.upload.in_flight_job_ids.values())
-    return sum(
-        1 for state in list_bulk_states(target.fm)
-        if state.job_id not in owned
-    )
+    max_age: timedelta = _orphan_max_age(settings)
+    count: int = 0
+    for state in list_bulk_states(target.fm):
+        if state.job_id in owned:
+            continue
+        if bulk_state_is_stale(state, max_age=max_age):
+            logging.warning(
+                'Discarding expired orphaned bulk job',
+                extra={
+                    'platform': target.descriptor.platform,
+                    'entity': target.descriptor.entity,
+                    'job_id': state.job_id,
+                    'created_at': state.created_at,
+                    'max_age_hours': settings.bulk_orphan_max_age_hours,
+                },
+            )
+            await delete_bulk_state(target.fm, state.job_id)
+            continue
+        count += 1
+    return count
 
 
 async def _resume_in_background(
@@ -1654,7 +1694,7 @@ async def drain_bulk_target_once(
     if upload.resume_task is not None:
         return 0
     cap: int = max(settings.max_active_bulk_jobs, 1)
-    orphans: int = _orphaned_job_count(target)
+    orphans: int = await _orphaned_job_count(settings, target)
     if len(upload.in_flight_jobs) + orphans >= cap:
         if (
             not upload.in_flight_jobs

@@ -40,7 +40,7 @@ class YouTubeScraperSettings(ScraperSettings):
             'channel-stat records (channel_id, '
             'channel_handle, url, title, '
             'subscriber_count, video_count, view_count, '
-            'description) for tools/yt_channel_upload.py '
+            'description) for tools/scrape_upload.py '
             'to pick up and POST to '
             'scrape.exchange. Defaults to "priority" '
             'which is resolved relative to '

@@ -1,8 +1,5 @@
 '''Unit tests for scrape_exchange.scraper_runner.'''
 
-import asyncio
-import signal
-import sys
 import unittest
 from unittest.mock import (
     AsyncMock,

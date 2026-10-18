@@ -15,7 +15,6 @@ from scrape_exchange.datatypes import Platform
 from scrape_exchange.scrape_api import (
     EdgeResponse,
     GetDataResponseModel,
-    PageInfoResponse,
     PostFilterRequestModel,
     QueryResponseModel,
     filter_data,

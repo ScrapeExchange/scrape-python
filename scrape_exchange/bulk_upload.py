@@ -21,11 +21,10 @@ record builder that turns a source file into ``(content_id, line)``.
 
 import asyncio
 import logging
-from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, UTC
 from pathlib import Path
-from typing import TYPE_CHECKING, AsyncIterator, Awaitable, Callable, TypeVar
+from typing import TYPE_CHECKING, Awaitable, Callable, TypeVar
 from uuid import uuid4
 
 import aiofiles.os
@@ -35,8 +34,6 @@ from httpx2 import Response, Timeout
 
 from .exchange_client import ExchangeClient
 from .file_management import AssetFileManagement, atomic_write_bytes
-from .scraper_metrics import METRIC_UPLOADS_SKIPPED
-from .worker_id import get_worker_id
 
 if TYPE_CHECKING:
     from .youtube.exchange_channels_set import (
@@ -45,36 +42,6 @@ if TYPE_CHECKING:
 
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
-
-
-def record_bulk_filter_skip(
-    *,
-    platform: str,
-    scraper: str,
-    entity: str,
-    reason: str,
-) -> None:
-    '''
-    Bump ``uploads_skipped_total`` for one record dropped by the
-    bulk-sweep filter (the per-file pipeline that runs before
-    each batch is built). Tagging by *reason* lets dashboards
-    attribute the gap between files-on-disk and files-uploaded
-    to a specific cause — e.g. ``superseded``, ``read_failed``,
-    ``no_handle``, ``missing_video_id``, ``schema_invalid``,
-    ``unrecognised_filename`` — so an operator can tell whether
-    the backlog is recoverable, permanent, or just stale.
-
-    Generic across scrapers: callers pass *platform*, *scraper*,
-    *entity* explicitly so the same counter covers video, channel,
-    and any future entity types.
-    '''
-    METRIC_UPLOADS_SKIPPED.labels(
-        platform=platform,
-        scraper=scraper,
-        entity=entity,
-        reason=reason,
-        worker_id=get_worker_id(),
-    ).inc()
 
 
 BULK_API_PATH: str = '/api/v1/bulk'
@@ -99,10 +66,10 @@ _RESUME_POLL_TIMEOUT_SECONDS: float = 300.0
 # the watchdog; the overall job deadline still bounds the total wait.
 # Must be < WATCHDOG_WORK_TIMEOUT_SECONDS.
 _WS_RECV_TOUCH_INTERVAL: float = 30.0
-_STALE_BULK_STATE_AGE: timedelta = timedelta(hours=24)
-_SLOT_WAIT_SLEEP_SECONDS: float = 5.0
-_SLOT_RESERVATIONS: dict[Path, int] = {}
-_SLOT_CONDITION: asyncio.Condition = asyncio.Condition()
+# Poll interval while the job is running, and the cap on the backoff
+# after a transient status-poll failure (transport error, 5xx, 429).
+_POLL_INTERVAL_SECONDS: float = 2.0
+_POLL_MAX_BACKOFF_SECONDS: float = 30.0
 _T = TypeVar('_T')
 
 
@@ -216,17 +183,20 @@ def _bulk_state_created_at(state: BulkUploadState) -> datetime | None:
     return created_at.astimezone(UTC)
 
 
-def _bulk_state_is_stale(
+def bulk_state_is_stale(
     state: BulkUploadState,
     *,
+    max_age: timedelta,
     now: datetime | None = None,
 ) -> bool:
+    '''True when *state*'s job was submitted more than *max_age*
+    ago. A state without a parseable ``created_at`` is never stale.'''
     created_at: datetime | None = _bulk_state_created_at(state)
     if created_at is None:
         return False
     if now is None:
         now = datetime.now(UTC)
-    return now - created_at > _STALE_BULK_STATE_AGE
+    return now - created_at > max_age
 
 
 async def write_bulk_state(
@@ -318,13 +288,17 @@ async def resume_pending_bulk_uploads(
     fm: AssetFileManagement,
     client: ExchangeClient,
     exchange_url: str,
+    *,
+    max_age: timedelta,
     poll_timeout_seconds: float = _RESUME_POLL_TIMEOUT_SECONDS,
     exchange_set: 'RedisExchangeChannelsSet | None' = None,
     id_from_filename: Callable[[str], str] | None = None,
 ) -> None:
     '''
     Read ``<base_dir>/.bulk/`` on startup and reconcile every
-    persisted bulk job against the API:
+    persisted bulk job against the API. State files of jobs
+    submitted more than *max_age* ago are discarded without
+    asking the API; their source files stay in ``base_dir``.
 
     * The API returns 404 → the job was never queued (or has
       been cleaned up by retention). Delete the state file; the
@@ -354,15 +328,13 @@ async def resume_pending_bulk_uploads(
     )
     for state in states:
         _touch_watchdog_work()
-        if _bulk_state_is_stale(state):
+        if bulk_state_is_stale(state, max_age=max_age):
             _LOGGER.info(
                 'Discarding stale bulk-upload state file',
                 extra={
                     'job_id': state.job_id,
                     'created_at': state.created_at,
-                    'stale_after_hours': (
-                        _STALE_BULK_STATE_AGE.total_seconds() / 3600
-                    ),
+                    'stale_after_hours': max_age.total_seconds() / 3600,
                 },
             )
             await delete_bulk_state(fm, state.job_id)
@@ -381,126 +353,6 @@ async def resume_pending_bulk_uploads(
                 exc=exc,
                 extra={'job_id': state.job_id},
             )
-
-
-async def wait_for_bulk_upload_slot(
-    fm: AssetFileManagement,
-    client: ExchangeClient,
-    exchange_url: str,
-    *,
-    max_active_jobs: int,
-    poll_timeout_seconds: float = _RESUME_POLL_TIMEOUT_SECONDS,
-    sleep_seconds: float = _SLOT_WAIT_SLEEP_SECONDS,
-    exchange_set: 'RedisExchangeChannelsSet | None' = None,
-    id_from_filename: Callable[[str], str] | None = None,
-) -> None:
-    '''
-    Block until this file manager has capacity to start another
-    accepted bulk job.
-
-    The durable ``.bulk`` state directory is the source of truth:
-    a job counts as active after ``POST /api/v1/bulk`` returns a
-    ``job_id`` and stops counting only after results are reconciled
-    and the state file is deleted. This keeps callers from starting
-    unbounded replacement jobs when a progress WebSocket fails while
-    the server-side job is still running.
-    '''
-    max_active: int = max(max_active_jobs, 1)
-    while True:
-        state_dir: Path = _bulk_state_dir(fm).resolve()
-        pending_count: int = (
-            len(list_bulk_states(fm))
-            + _SLOT_RESERVATIONS.get(state_dir, 0)
-        )
-        if pending_count < max_active:
-            return
-
-        _touch_watchdog_work()
-        _LOGGER.info(
-            'Waiting for bulk-upload slot',
-            extra={
-                'pending_jobs': pending_count,
-                'max_active_jobs': max_active,
-            },
-        )
-        await resume_pending_bulk_uploads(
-            fm, client, exchange_url,
-            poll_timeout_seconds=poll_timeout_seconds,
-            exchange_set=exchange_set,
-            id_from_filename=id_from_filename,
-        )
-        pending_count = (
-            len(list_bulk_states(fm))
-            + _SLOT_RESERVATIONS.get(state_dir, 0)
-        )
-        if pending_count < max_active:
-            return
-        _touch_watchdog_work()
-        await asyncio.sleep(sleep_seconds)
-
-
-@asynccontextmanager
-async def reserve_bulk_upload_slot(
-    fm: AssetFileManagement,
-    client: ExchangeClient,
-    exchange_url: str,
-    *,
-    max_active_jobs: int,
-    poll_timeout_seconds: float = _RESUME_POLL_TIMEOUT_SECONDS,
-    sleep_seconds: float = _SLOT_WAIT_SLEEP_SECONDS,
-    exchange_set: 'RedisExchangeChannelsSet | None' = None,
-    id_from_filename: Callable[[str], str] | None = None,
-) -> AsyncIterator[None]:
-    '''
-    Reserve one bulk-upload slot for a caller that is about to
-    POST a batch.
-
-    ``wait_for_bulk_upload_slot`` handles durable accepted jobs;
-    this context manager also accounts for local tasks that have
-    passed the gate but have not yet received and persisted a
-    ``job_id``. The reservation is held for the caller's whole
-    batch lifecycle, so progress failures hand capacity back only
-    if the durable state file continues to represent the still
-    pending server-side job.
-    '''
-    max_active: int = max(max_active_jobs, 1)
-    state_dir: Path = _bulk_state_dir(fm).resolve()
-    reserved: bool = False
-    try:
-        while True:
-            async with _SLOT_CONDITION:
-                pending_count: int = (
-                    len(list_bulk_states(fm))
-                    + _SLOT_RESERVATIONS.get(state_dir, 0)
-                )
-                if pending_count < max_active:
-                    _SLOT_RESERVATIONS[state_dir] = (
-                        _SLOT_RESERVATIONS.get(state_dir, 0) + 1
-                    )
-                    reserved = True
-                    break
-
-            await wait_for_bulk_upload_slot(
-                fm, client, exchange_url,
-                max_active_jobs=max_active,
-                poll_timeout_seconds=poll_timeout_seconds,
-                sleep_seconds=sleep_seconds,
-                exchange_set=exchange_set,
-                id_from_filename=id_from_filename,
-            )
-
-        yield
-    finally:
-        if reserved:
-            async with _SLOT_CONDITION:
-                remaining: int = _SLOT_RESERVATIONS.get(
-                    state_dir, 0,
-                ) - 1
-                if remaining > 0:
-                    _SLOT_RESERVATIONS[state_dir] = remaining
-                else:
-                    _SLOT_RESERVATIONS.pop(state_dir, None)
-                _SLOT_CONDITION.notify_all()
 
 
 async def _resume_one_bulk_state(
@@ -656,21 +508,24 @@ async def _handle_ws_close_error(
 ) -> bool:
     '''
     Decide what to do when the bulk-progress WebSocket closed
-    with an error frame. Logs at the right level, and on the
-    expected service-restart codes (1001/1012) falls back to
-    polling the status endpoint so the caller can still apply
-    per-record results instead of dropping the whole batch.
-    Returns ``True`` if a terminal status was eventually
-    observed, ``False`` otherwise.
+    with an error. Application close codes (4xxx: auth, ownership,
+    job not found) are final. Every other close — the service-
+    restart codes 1001/1012, server errors, or a connection that
+    dropped without a close frame (e.g. the API or its proxy
+    restarted) — leaves the server-side job running, so fall back
+    to polling the status endpoint. The caller can then apply
+    per-record results instead of orphaning the batch. Returns
+    ``True`` if a terminal status was eventually observed,
+    ``False`` otherwise.
     '''
     _log_ws_closed_with_error(job_id, exc)
     rcvd = exc.rcvd
     code: int | None = rcvd.code if rcvd else None
-    if code in (1001, 1012):
-        return await _poll_status_until_terminal(
-            job_id, exchange_url, client, deadline,
-        )
-    return False
+    if code is not None and code >= 4000:
+        return False
+    return await _poll_status_until_terminal(
+        job_id, exchange_url, client, deadline,
+    )
 
 
 async def _poll_status_until_terminal(
@@ -685,14 +540,16 @@ async def _poll_status_until_terminal(
     monotonic wall clock from
     ``asyncio.get_running_loop().time()`` — is reached.
 
-    Used as a fallback after a WebSocket service-restart close so
-    the scraper still observes the bulk job's outcome instead of
-    leaving every interrupted batch for retry. Returns ``True`` if
-    a terminal status was seen, ``False`` on timeout, transport
-    error, or non-200 response.
+    Used as a fallback after the progress WebSocket closed or
+    failed, so the uploader still observes the bulk job's outcome
+    instead of orphaning the interrupted batch. Transport errors
+    and 5xx/429 responses — expected while the API restarts — are
+    retried with backoff until *deadline*. Returns ``True`` if a
+    terminal status was seen, ``False`` on timeout or on any other
+    non-200 response (e.g. 404: the job is unknown).
     '''
     status_url: str = f'{exchange_url}{BULK_API_PATH}'
-    poll_interval: float = 2.0
+    failures: int = 0
     while True:
         _touch_watchdog_work()
         remaining: float = (
@@ -704,34 +561,51 @@ async def _poll_status_until_terminal(
                 extra={'job_id': job_id},
             )
             return False
+        poll_interval: float = _POLL_INTERVAL_SECONDS
+        resp: Response | None
         try:
-            resp: Response = await client.get(
+            resp = await client.get(
                 status_url, params={'job_id': job_id},
             )
         except Exception as exc:
+            failures += 1
             logging.warning(
-                'Bulk progress status fetch failed',
+                'Bulk progress status fetch failed, retrying',
                 exc=exc,
-                extra={'job_id': job_id},
+                extra={'job_id': job_id, 'failures': failures},
             )
-            return False
-        if resp.status_code != 200:
+            resp = None
+        if resp is not None and resp.status_code != 200:
+            retryable: bool = (
+                resp.status_code >= 500 or resp.status_code == 429
+            )
             logging.warning(
                 'Bulk progress status non-200',
                 extra={
                     'job_id': job_id,
                     'status_code': resp.status_code,
                     'response_text': resp.text,
+                    'retrying': retryable,
                 },
             )
-            return False
-        status: str = resp.json().get('status', '')
-        if status in TERMINAL_BULK_STATUSES:
-            logging.info(
-                'Bulk job reached terminal status (poll fallback)',
-                extra={'job_id': job_id, 'status': status},
+            if not retryable:
+                return False
+            failures += 1
+            resp = None
+        if resp is None:
+            poll_interval = min(
+                _POLL_INTERVAL_SECONDS * 2 ** failures,
+                _POLL_MAX_BACKOFF_SECONDS,
             )
-            return True
+        else:
+            failures = 0
+            status: str = resp.json().get('status', '')
+            if status in TERMINAL_BULK_STATUSES:
+                logging.info(
+                    'Bulk job reached terminal status (poll fallback)',
+                    extra={'job_id': job_id, 'status': status},
+                )
+                return True
         sleep_for: float = min(poll_interval, remaining)
         _touch_watchdog_work()
         await asyncio.sleep(sleep_for)
@@ -745,10 +619,10 @@ def _log_ws_closed_with_error(
     Log a WebSocket close at the right level for its close code.
 
     1012 (service_restart) and 1001 (going_away) are expected
-    during gunicorn worker rotation / API redeploys; the scraper
-    recovers by leaving files for retry on the next iteration, so
-    these get INFO. Anything else is a real anomaly (network
-    failure, server bug) and stays at WARNING.
+    during gunicorn worker rotation / API redeploys and get INFO.
+    Anything else is an anomaly (network failure, server bug,
+    rejected subscription) and stays at WARNING; the caller still
+    falls back to status polling unless the code is 4xxx.
     '''
     rcvd = exc.rcvd
     code: int | None = rcvd.code if rcvd else None
@@ -784,9 +658,10 @@ async def stream_bulk_job_progress(
 
     Returns ``True`` on terminal status (including a clean
     server-initiated close, which the server uses to signal "job
-    already complete"), and ``False`` on missing auth, an error
-    close code (4401/4403/4404), any other connection failure,
-    or timeout.
+    already complete"), and ``False`` on missing auth, an
+    application close code (4401/4403/4404) or timeout. Any other
+    close or connection failure falls back to polling the status
+    endpoint until the deadline.
 
     Auth is forwarded via the ``Authorization`` header copied off
     *client*.
@@ -894,12 +769,16 @@ async def stream_bulk_job_progress(
             job_id, exc, exchange_url, client, deadline,
         )
     except Exception as exc:
+        # Connect or handshake failure (e.g. the API is restarting).
+        # The job keeps running server side, so poll its status.
         logging.warning(
-            'Bulk progress WebSocket failed',
+            'Bulk progress WebSocket failed, polling status',
             exc=exc,
             extra={'job_id': job_id},
         )
-        return False
+        return await _poll_status_until_terminal(
+            job_id, exchange_url, client, deadline,
+        )
 
 
 async def fetch_bulk_results(
@@ -1456,60 +1335,3 @@ async def finalize_bulk_batch(
     )
 
 
-async def upload_bulk_batch(
-    batch_buf: bytes,
-    batch_records: list[tuple[str, str]],
-    *,
-    schema_owner: str,
-    schema_version: str,
-    platform: str,
-    entity: str,
-    exchange_url: str,
-    client: ExchangeClient,
-    fm: AssetFileManagement,
-    progress_timeout_seconds: float,
-    filename_prefix: str,
-    exchange_set: 'RedisExchangeChannelsSet | None' = None,
-    id_from_filename: Callable[[str], str] | None = None,
-) -> BulkBatchOutcome:
-    '''
-    Backwards-compatible wrapper: POST → progress → results →
-    mark_uploaded as one call.
-
-    New callers should invoke :func:`post_bulk_batch` and
-    :func:`finalize_bulk_batch` separately and drop their
-    ``batch_buf`` reference in between — that releases the batch
-    bytes during the progress wait. This wrapper exists only so
-    that the older one-call shape keeps working for tests and
-    legacy callers; it cannot release ``batch_buf`` on the
-    caller's behalf.
-    '''
-    job_id: str
-    batch_id: str
-    err: BulkBatchOutcome | None
-    job_id, batch_id, err = await post_bulk_batch(
-        batch_buf, batch_records,
-        schema_owner=schema_owner,
-        schema_version=schema_version,
-        platform=platform,
-        entity=entity,
-        exchange_url=exchange_url,
-        client=client,
-        fm=fm,
-        filename_prefix=filename_prefix,
-    )
-    # Release the wrapper's own reference — callers may still
-    # hold theirs, in which case they should switch to the
-    # two-phase API.
-    batch_buf = b''  # noqa: F841
-    if err is not None:
-        return err
-    return await finalize_bulk_batch(
-        job_id, batch_id, batch_records,
-        exchange_url=exchange_url,
-        client=client,
-        fm=fm,
-        progress_timeout_seconds=progress_timeout_seconds,
-        exchange_set=exchange_set,
-        id_from_filename=id_from_filename,
-    )

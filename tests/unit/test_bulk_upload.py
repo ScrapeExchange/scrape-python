@@ -13,7 +13,6 @@ matching coverage.
 '''
 
 import asyncio
-import os
 import tempfile
 import unittest
 from datetime import datetime, timedelta, UTC
@@ -21,77 +20,24 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import orjson
-import brotli
 import websockets.exceptions
 import websockets.frames
 
 from scrape_exchange.bulk_upload import (
     BULK_STATE_DIR_NAME,
+    _poll_status_until_terminal,
     BulkResults,
     BulkUploadState,
     apply_bulk_results,
     bulk_progress_ws_url,
     delete_bulk_state,
     list_bulk_states,
-    reserve_bulk_upload_slot,
     resume_pending_bulk_uploads,
     stream_bulk_job_progress,
-    wait_for_bulk_upload_slot,
     write_bulk_state,
 )
 
-
-class TestChannelUploadSettings(unittest.TestCase):
-
-    def test_channel_concurrency_does_not_set_upload_concurrency(
-        self,
-    ) -> None:
-        from tools.yt_channel_upload import ChannelUploadSettings
-
-        with patch.dict(
-            os.environ,
-            {
-                'CHANNEL_CONCURRENCY': '768',
-            },
-            clear=True,
-        ):
-            settings = ChannelUploadSettings(
-                _cli_parse_args=False,
-            )
-
-        self.assertEqual(settings.channel_upload_concurrency, 3)
-
-    def test_channel_upload_concurrency_env_sets_upload_concurrency(
-        self,
-    ) -> None:
-        from tools.yt_channel_upload import ChannelUploadSettings
-
-        with patch.dict(
-            os.environ,
-            {
-                'CHANNEL_UPLOAD_CONCURRENCY': '7',
-            },
-            clear=True,
-        ):
-            settings = ChannelUploadSettings(
-                _cli_parse_args=False,
-            )
-
-        self.assertEqual(settings.channel_upload_concurrency, 7)
-
-    def test_bulk_max_active_jobs_env_sets_max_active_bulk_jobs(
-        self,
-    ) -> None:
-        from tools.yt_channel_upload import ChannelUploadSettings
-
-        with patch.dict(
-            os.environ, {'BULK_MAX_ACTIVE_JOBS': '2'}, clear=True,
-        ):
-            settings = ChannelUploadSettings(
-                _cli_parse_args=False,
-            )
-
-        self.assertEqual(settings.max_active_bulk_jobs, 2)
+_MAX_AGE: timedelta = timedelta(hours=3)
 
 
 class TestApplyBulkResults(unittest.IsolatedAsyncioTestCase):
@@ -253,83 +199,6 @@ class TestBulkProgressWsUrl(unittest.TestCase):
         )
 
 
-class TestWaitForBulkUploadSlot(unittest.IsolatedAsyncioTestCase):
-
-    async def test_returns_immediately_below_limit(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            fm = MagicMock()
-            fm.base_dir = Path(tmp)
-            with patch(
-                'scrape_exchange.bulk_upload.resume_pending_bulk_uploads',
-                new=AsyncMock(),
-            ) as resume_mock:
-                await wait_for_bulk_upload_slot(
-                    fm, MagicMock(), 'http://test',
-                    max_active_jobs=1,
-                )
-            resume_mock.assert_not_called()
-
-    async def test_waits_on_persisted_pending_jobs(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            fm = MagicMock()
-            fm.base_dir = Path(tmp)
-            await write_bulk_state(
-                fm,
-                BulkUploadState(
-                    job_id='job1',
-                    batch_id='batch1',
-                    schema_owner='boinko',
-                    schema_version='0.0.2',
-                    platform='youtube',
-                    entity='channel',
-                    upload_filename='channels-batch1.jsonl',
-                    batch_records=[('UCabc', 'channel-UCabc.json.br')],
-                ),
-            )
-
-            async def _resume(*_args, **_kwargs) -> None:
-                await delete_bulk_state(fm, 'job1')
-
-            with patch(
-                'scrape_exchange.bulk_upload.resume_pending_bulk_uploads',
-                new=AsyncMock(side_effect=_resume),
-            ) as resume_mock:
-                await wait_for_bulk_upload_slot(
-                    fm, MagicMock(), 'http://test',
-                    max_active_jobs=1,
-                    sleep_seconds=0,
-                )
-
-            resume_mock.assert_awaited_once()
-            self.assertEqual(list_bulk_states(fm), [])
-
-    async def test_reservation_counts_before_state_exists(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            fm = MagicMock()
-            fm.base_dir = Path(tmp)
-            resume_mock = AsyncMock()
-
-            with patch(
-                'scrape_exchange.bulk_upload.resume_pending_bulk_uploads',
-                new=resume_mock,
-            ):
-                async with reserve_bulk_upload_slot(
-                    fm, MagicMock(), 'http://test',
-                    max_active_jobs=1,
-                    sleep_seconds=0,
-                ):
-                    task = asyncio.create_task(wait_for_bulk_upload_slot(
-                        fm, MagicMock(), 'http://test',
-                        max_active_jobs=1,
-                        sleep_seconds=0,
-                    ))
-                    await asyncio.sleep(0)
-                    self.assertFalse(task.done())
-
-                await asyncio.wait_for(task, timeout=0.1)
-            resume_mock.assert_awaited()
-
-
 def _fake_client(
     auth: str | None = 'Bearer test-token',
 ) -> MagicMock:
@@ -357,6 +226,14 @@ class _FakeWebSocket:
         if isinstance(item, Exception):
             raise item
         return item
+
+
+def _status_resp(code: int, status: str = '') -> MagicMock:
+    resp: MagicMock = MagicMock()
+    resp.status_code = code
+    resp.text = ''
+    resp.json = MagicMock(return_value={'status': status})
+    return resp
 
 
 class TestStreamBulkJobProgress(unittest.IsolatedAsyncioTestCase):
@@ -423,20 +300,62 @@ class TestStreamBulkJobProgress(unittest.IsolatedAsyncioTestCase):
     async def test_returns_false_on_error_close(self) -> None:
         '''An auth/ownership/not-found close (code 4xxx) is a real
         failure; the helper returns False and the caller leaves
-        source files in base_dir for retry.'''
+        source files in base_dir for retry. No status poll.'''
+        close: websockets.frames.Close = websockets.frames.Close(
+            code=4404, reason='job not found',
+        )
         err: websockets.exceptions.ConnectionClosedError = (
-            websockets.exceptions.ConnectionClosedError(None, None)
+            websockets.exceptions.ConnectionClosedError(close, None)
         )
         ws = _FakeWebSocket([err])
+        client: MagicMock = _fake_client()
+        client.get = AsyncMock()
 
         with patch(
             'scrape_exchange.bulk_upload.websockets.connect',
             return_value=ws,
         ):
             ok: bool = await stream_bulk_job_progress(
-                'abcdef', 'http://test', _fake_client(), 30.0,
+                'abcdef', 'http://test', client, 30.0,
             )
         self.assertFalse(ok)
+        client.get.assert_not_called()
+
+    async def test_drop_without_close_frame_polls_status(self) -> None:
+        '''A connection that drops without a close frame (API or proxy
+        restart) leaves the job running server side: poll its status
+        instead of orphaning the batch.'''
+        err: websockets.exceptions.ConnectionClosedError = (
+            websockets.exceptions.ConnectionClosedError(None, None)
+        )
+        ws = _FakeWebSocket([err])
+        client: MagicMock = _fake_client()
+        client.get = AsyncMock(return_value=_status_resp(200, 'completed'))
+
+        with patch(
+            'scrape_exchange.bulk_upload.websockets.connect',
+            return_value=ws,
+        ):
+            ok: bool = await stream_bulk_job_progress(
+                'abcdef', 'http://test', client, 30.0,
+            )
+        self.assertTrue(ok)
+        client.get.assert_awaited_once()
+
+    async def test_connect_failure_polls_status(self) -> None:
+        '''A failed connect or handshake also falls back to polling.'''
+        client: MagicMock = _fake_client()
+        client.get = AsyncMock(return_value=_status_resp(200, 'completed'))
+
+        with patch(
+            'scrape_exchange.bulk_upload.websockets.connect',
+            side_effect=OSError('connection refused'),
+        ):
+            ok: bool = await stream_bulk_job_progress(
+                'abcdef', 'http://test', client, 30.0,
+            )
+        self.assertTrue(ok)
+        client.get.assert_awaited_once()
 
     async def test_service_restart_close_polls_status_until_terminal(
         self,
@@ -511,272 +430,75 @@ class TestStreamBulkJobProgress(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ok)
 
 
-class TestCollectChannelRecordValidator(
-    unittest.IsolatedAsyncioTestCase,
-):
+class TestPollStatusUntilTerminal(unittest.IsolatedAsyncioTestCase):
 
-    async def test_unrecoverable_brotli_requeued_then_deleted(
+    def _deadline(self, seconds: float) -> float:
+        return asyncio.get_running_loop().time() + seconds
+
+    async def test_retries_transient_failures_until_terminal(
         self,
     ) -> None:
-        from tools.yt_channel_upload import _collect_channel_record
-
-        fm = AsyncMock()
-        fm.read_file.side_effect = brotli.error('corrupt')
-        scrape_queue = AsyncMock()
-        events: list[str] = []
-        scrape_queue.force_rescrape.side_effect = (
-            lambda *args, **kwargs: events.append('requeue')
-        )
-        fm.delete.side_effect = (
-            lambda *args, **kwargs: events.append('delete')
-        )
-
-        result = await _collect_channel_record(
-            'channel-UCabc.json.br', fm,
-            AsyncMock(), AsyncMock(), MagicMock(), scrape_queue,
-        )
-
-        self.assertIsNone(result)
-        scrape_queue.force_rescrape.assert_awaited_once_with(
-            'i:UCabc', mode='full',
-            source='channel_upload_corrupt_file',
-        )
-        fm.delete.assert_awaited_once_with(
-            'channel-UCabc.json.br', fail_ok=False,
-        )
-        self.assertEqual(events, ['requeue', 'delete'])
-
-    async def test_requeue_failure_preserves_corrupt_file(self) -> None:
-        from tools.yt_channel_upload import _collect_channel_record
-
-        fm = AsyncMock()
-        fm.read_file.side_effect = brotli.error('corrupt')
-        scrape_queue = AsyncMock()
-        scrape_queue.force_rescrape.side_effect = RuntimeError(
-            'redis unavailable',
-        )
-
-        with self.assertRaisesRegex(
-            RuntimeError, 'redis unavailable',
-        ):
-            await _collect_channel_record(
-                'channel-UCabc.json.br', fm,
-                AsyncMock(), AsyncMock(), MagicMock(), scrape_queue,
-            )
-
-        fm.delete.assert_not_awaited()
-
-    async def test_invalid_record_marked_invalid_and_skipped(
-        self,
-    ) -> None:
-        '''A record that fails the validator must not return a
-        line; the file must be moved to ``<filename>.invalid``.'''
-        from tools.yt_channel_upload import _collect_channel_record
-
-        channel = MagicMock()
-        channel.channel_id = 'UCabc'
-        channel.channel_handle = 'somehandle'
-        channel.to_dict = MagicMock(
-            return_value={'channel_id': 'UCabc'},
-        )
-
-        fm = AsyncMock()
-        fm.read_file = AsyncMock(return_value={
-            'channel_id': 'UCabc',
-        })
-        fm.mark_invalid = AsyncMock(
-            return_value='foo.json.br.invalid',
-        )
-
-        validator = MagicMock()
-        validator.validate = MagicMock(
-            return_value='/url: required field missing',
-        )
-
+        '''502, a transport error and 429 are retried; running status
+        keeps polling; completed ends the poll.'''
+        client: MagicMock = _fake_client()
+        client.get = AsyncMock(side_effect=[
+            _status_resp(502),
+            OSError('connection reset'),
+            _status_resp(429),
+            _status_resp(200, 'in_progress'),
+            _status_resp(200, 'completed'),
+        ])
         with patch(
-            'tools.yt_channel_upload.YouTubeChannel.from_dict',
-            return_value=channel,
-        ), patch(
-            'tools.yt_channel_upload.resolve_channel_upload_handle',
-            new=AsyncMock(return_value='somehandle'),
-        ):
-            result = await _collect_channel_record(
-                'foo.json.br', fm,
-                AsyncMock(), AsyncMock(), validator,
+            'scrape_exchange.bulk_upload.asyncio.sleep',
+            new_callable=AsyncMock,
+        ) as sleep:
+            ok: bool = await _poll_status_until_terminal(
+                'abcdef', 'http://test', client, self._deadline(300),
             )
+        self.assertTrue(ok)
+        self.assertEqual(client.get.await_count, 5)
+        delays: list[float] = [
+            call.args[0] for call in sleep.await_args_list
+        ]
+        # Backoff doubles per consecutive failure, resets on success.
+        self.assertEqual(delays, [4.0, 8.0, 16.0, 2.0])
 
-        self.assertIsNone(result)
-        validator.validate.assert_called_once()
-        fm.mark_invalid.assert_awaited_once_with('foo.json.br')
-
-
-class TestUnifiedBulkUploadLoopValidator(
-    unittest.IsolatedAsyncioTestCase,
-):
-
-    async def test_pending_scan_ignores_file_removed_after_listing(
-        self,
-    ) -> None:
-        from tools.yt_channel_upload import _pending_channel_paths
-
-        with tempfile.TemporaryDirectory() as tmp:
-            base_dir = Path(tmp)
-            existing = base_dir / 'channel-UCok.json.br'
-            removed = base_dir / 'channel-UCgone.json.br'
-            existing.write_bytes(b'{}')
-
-            fm = MagicMock()
-            fm.base_dir = base_dir
-            fm.list_base.return_value = [removed.name, existing.name]
-
-            paths = _pending_channel_paths(fm, set(), 100)
-
-        self.assertEqual(paths, [existing])
-
-    async def test_corrupt_file_requeued_and_deleted(self) -> None:
-        from tools.yt_channel_upload import _unified_bulk_upload_loop
-
-        with tempfile.TemporaryDirectory() as tmp:
-            base_dir = Path(tmp)
-            bad_file = base_dir / 'channel-UCbad.json.br'
-            bad_file.write_bytes(b'not brotli')
-
-            fm = MagicMock()
-            fm.base_dir = base_dir
-            fm.list_base = MagicMock(side_effect=[
-                [bad_file.name], [],
-            ])
-            fm.delete = AsyncMock()
-            scrape_queue = AsyncMock()
-
-            settings = MagicMock()
-            settings.bulk_batch_size = 100
-            settings.max_active_bulk_jobs = 1
-
-            class _StopLoop(Exception):
-                pass
-
-            async def _stop(*_args, **_kwargs) -> None:
-                raise _StopLoop()
-
-            with patch(
-                'tools.yt_channel_upload._wait_for_channel_changes',
-                new=_stop,
-            ):
-                with self.assertRaises(_StopLoop):
-                    await _unified_bulk_upload_loop(
-                        settings, MagicMock(), fm, MagicMock(),
-                        scrape_queue=scrape_queue,
-                    )
-
-            scrape_queue.force_rescrape.assert_awaited_once_with(
-                'i:UCbad', mode='full',
-                source='channel_upload_corrupt_file',
-            )
-            fm.delete.assert_awaited_once_with(
-                bad_file.name, fail_ok=False,
-            )
-
-    async def test_invalid_record_marked_invalid_and_skipped(
-        self,
-    ) -> None:
-        '''A brotli'd record that fails the validator must be moved
-        to ``<filename>.invalid`` before the loop waits for more
-        work.'''
-        import brotli
-        from tools.yt_channel_upload import _unified_bulk_upload_loop
-
-        with tempfile.TemporaryDirectory() as tmp:
-            base_dir = Path(tmp)
-            bad_file: Path = base_dir / 'channel-UCbad.json.br'
-            bad_file.write_bytes(
-                brotli.compress(orjson.dumps({'channel_id': 'UCbad'})),
-            )
-
-            fm = MagicMock()
-            fm.base_dir = base_dir
-            fm.list_base = MagicMock(return_value=[bad_file.name])
-            fm.mark_invalid = AsyncMock(
-                return_value=f'{bad_file.name}.invalid',
-            )
-
-            validator = MagicMock()
-            validator.validate = MagicMock(
-                return_value='/url: required field missing',
-            )
-
-            settings = MagicMock()
-            settings.bulk_batch_size = 100
-            settings.bulk_max_batch_bytes = 1_000_000
-            settings.max_active_bulk_jobs = 1
-
-            class _StopLoop(Exception):
-                pass
-
-            async def _stop(*_args, **_kwargs) -> None:
-                raise _StopLoop()
-
-            with patch(
-                'tools.yt_channel_upload._wait_for_channel_changes',
-                new=_stop,
-            ):
-                with self.assertRaises(_StopLoop):
-                    await _unified_bulk_upload_loop(
-                        settings, MagicMock(), fm, validator,
-                    )
-
-            validator.validate.assert_called_once()
-            fm.mark_invalid.assert_awaited_once_with(bad_file.name)
-
-
-class TestEnqueueUploadChannelValidator(
-    unittest.IsolatedAsyncioTestCase,
-):
-
-    async def test_invalid_record_not_enqueued_and_marked(
-        self,
-    ) -> None:
-        from tools.yt_channel_upload import enqueue_upload_channel
-
-        channel = MagicMock()
-        channel.channel_id = 'UCabc'
-        channel.channel_handle = 'somehandle'
-        channel.url = 'https://youtube.com/@somehandle'
-        channel.to_dict = MagicMock(
-            return_value={'channel_id': 'UCabc'},
+    async def test_backoff_is_capped(self) -> None:
+        client: MagicMock = _fake_client()
+        client.get = AsyncMock(
+            side_effect=[_status_resp(503)] * 6
+            + [_status_resp(200, 'failed')],
         )
-
-        client = MagicMock()
-        client.enqueue_upload = MagicMock(return_value=True)
-
-        fm = AsyncMock()
-        fm.mark_invalid = AsyncMock(
-            return_value='foo.json.br.invalid',
-        )
-
-        validator = MagicMock()
-        validator.validate = MagicMock(
-            return_value='/url: required field missing',
-        )
-
-        settings = MagicMock()
-        settings.exchange_url = 'http://test'
-        settings.schema_owner = 'boinko'
-        settings.schema_version = '0.0.2'
-
         with patch(
-            'tools.yt_channel_upload'
-            '.resolve_channel_upload_handle',
-            new=AsyncMock(return_value='somehandle'),
-        ):
-            ok: bool = await enqueue_upload_channel(
-                settings, client, fm, 'foo.json.br', channel,
-                AsyncMock(), AsyncMock(), validator,
+            'scrape_exchange.bulk_upload.asyncio.sleep',
+            new_callable=AsyncMock,
+        ) as sleep:
+            ok: bool = await _poll_status_until_terminal(
+                'abcdef', 'http://test', client, self._deadline(300),
             )
+        self.assertTrue(ok)
+        self.assertEqual(
+            max(call.args[0] for call in sleep.await_args_list), 30.0,
+        )
 
+    async def test_non_retryable_status_gives_up(self) -> None:
+        '''404 means the job is unknown: stop at once.'''
+        client: MagicMock = _fake_client()
+        client.get = AsyncMock(return_value=_status_resp(404))
+        ok: bool = await _poll_status_until_terminal(
+            'abcdef', 'http://test', client, self._deadline(300),
+        )
         self.assertFalse(ok)
-        client.enqueue_upload.assert_not_called()
-        fm.mark_invalid.assert_awaited_once_with('foo.json.br')
+        client.get.assert_awaited_once()
+
+    async def test_past_deadline_returns_false(self) -> None:
+        client: MagicMock = _fake_client()
+        client.get = AsyncMock()
+        ok: bool = await _poll_status_until_terminal(
+            'abcdef', 'http://test', client, self._deadline(-1),
+        )
+        self.assertFalse(ok)
+        client.get.assert_not_called()
 
 
 def _fake_state(job_id: str = 'abc123') -> BulkUploadState:
@@ -883,18 +605,19 @@ class TestResumePendingBulkUploads(
             client.get = AsyncMock()
             await resume_pending_bulk_uploads(
                 fm, client, 'http://test',
+                max_age=_MAX_AGE,
             )
             client.get.assert_not_called()
 
-    async def test_state_older_than_24_hours_is_deleted(
+    async def test_state_older_than_max_age_is_deleted(
         self,
     ) -> None:
-        '''Very old accepted jobs are abandoned instead of re-polled.'''
+        '''Accepted jobs older than max_age are abandoned, not re-polled.'''
         with tempfile.TemporaryDirectory() as base:
             fm = _fake_fm(Path(base))
             stale: BulkUploadState = _fake_state('stale')
             stale.created_at = (
-                datetime.now(UTC) - timedelta(hours=25)
+                datetime.now(UTC) - timedelta(hours=4)
             ).isoformat()
             await write_bulk_state(fm, stale)
             client = MagicMock()
@@ -902,6 +625,7 @@ class TestResumePendingBulkUploads(
 
             await resume_pending_bulk_uploads(
                 fm, client, 'http://test',
+                max_age=_MAX_AGE,
             )
 
             client.get.assert_not_called()
@@ -917,6 +641,7 @@ class TestResumePendingBulkUploads(
 
             await resume_pending_bulk_uploads(
                 fm, client, 'http://test',
+                max_age=_MAX_AGE,
             )
 
             client.get.assert_awaited_once()
@@ -945,6 +670,7 @@ class TestResumePendingBulkUploads(
 
             await resume_pending_bulk_uploads(
                 fm, client, 'http://test',
+                max_age=_MAX_AGE,
             )
 
             self.assertEqual(client.get.await_count, 2)
@@ -962,6 +688,7 @@ class TestResumePendingBulkUploads(
 
             await resume_pending_bulk_uploads(
                 fm, client, 'http://test',
+                max_age=_MAX_AGE,
             )
 
             self.assertEqual(len(list_bulk_states(fm)), 1)
@@ -976,6 +703,7 @@ class TestResumePendingBulkUploads(
 
             await resume_pending_bulk_uploads(
                 fm, client, 'http://test',
+                max_age=_MAX_AGE,
             )
 
             self.assertEqual(len(list_bulk_states(fm)), 1)
@@ -1001,6 +729,7 @@ class TestResumePendingBulkUploads(
             ):
                 await resume_pending_bulk_uploads(
                     fm, client, 'http://test',
+                    max_age=_MAX_AGE,
                     poll_timeout_seconds=0.0,
                 )
 

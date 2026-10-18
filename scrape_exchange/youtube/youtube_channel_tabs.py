@@ -10,11 +10,11 @@ the video IDs, playlist data, course data, post data, and product data.
 
 import asyncio
 import functools
+import random
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from logging import Logger
 from logging import getLogger
-import logging
 import time
 from typing import Any, Awaitable, Callable, Final
 

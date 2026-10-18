@@ -7,7 +7,10 @@ import unittest
 from scrape_exchange.creator_map import FileCreatorMap
 from scrape_exchange.youtube.youtube_video import YouTubeVideo
 
-from tools.yt_video_upload import resolve_video_upload_handle
+from tools.scrape_upload import (
+    YouTubeVideoProcessor,
+    YouTubeVideoProcessorState,
+)
 
 
 class TestHandlePropagation(unittest.IsolatedAsyncioTestCase):
@@ -32,8 +35,13 @@ class TestHandlePropagation(unittest.IsolatedAsyncioTestCase):
             # Fresh FileCreatorMap instance (another process) reading
             # the same file.
             reader: FileCreatorMap = FileCreatorMap(map_path)
-            handle: str | None = await resolve_video_upload_handle(
-                video, reader, proxy=None,
+            state: YouTubeVideoProcessorState = (
+                YouTubeVideoProcessorState(
+                    creator_map=reader, scrape_queue=None, uploaded=None,
+                )
+            )
+            handle: str | None = (
+                await YouTubeVideoProcessor()._resolve_handle(video, state)
             )
 
             self.assertEqual(handle, 'CanonicalHandle')

@@ -16,6 +16,7 @@ import unittest
 import brotli
 from prometheus_client import REGISTRY
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -23,6 +24,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from scrape_exchange.bulk_upload import (
     BulkBatchOutcome,
     BulkUploadState,
+    bulk_state_is_stale,
     delete_bulk_state,
     list_bulk_states,
     write_bulk_state,
@@ -78,6 +80,7 @@ def _settings(**overrides: object) -> SimpleNamespace:
         'bulk_batch_size': 1000,
         'bulk_max_batch_bytes': 1024 * 1024,
         'max_active_bulk_jobs': 2,
+        'bulk_orphan_max_age_hours': 3.0,
         'scrape_upload_concurrency': 2,
         'upload_mode': 'bulk',
         'background_drain_timeout_seconds': 1.0,
@@ -1658,6 +1661,143 @@ class TestShutdown(unittest.IsolatedAsyncioTestCase):
             'scrape_upload stopped by signal',
             [record.getMessage() for record in logs.records],
         )
+
+
+class TestOrphanMaxAge(unittest.IsolatedAsyncioTestCase):
+
+    async def _write_state(
+        self, fm: AssetFileManagement, job_id: str, age: timedelta,
+    ) -> None:
+        created_at: datetime = datetime.now(UTC) - age
+        await write_bulk_state(fm, BulkUploadState(
+            job_id=job_id, batch_id=f'batch-{job_id}',
+            schema_owner='owner', schema_version='1.0.0',
+            platform='example', entity='thing',
+            upload_filename=f'{job_id}.jsonl',
+            created_at=created_at.isoformat(),
+        ))
+
+    def _target(
+        self, fm: AssetFileManagement,
+    ) -> scrape_upload.AssetUploadTarget:
+        return scrape_upload.AssetUploadTarget(
+            descriptor=_descriptor(), fm=fm, validator=_validator(),
+        )
+
+    async def test_expired_orphans_discarded_and_not_counted(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fm: AssetFileManagement = AssetFileManagement(
+                tmp, prefix_rankings=_descriptor().prefix_rankings,
+            )
+            await self._write_state(fm, 'old1', timedelta(hours=4))
+            await self._write_state(fm, 'old2', timedelta(hours=26))
+            await self._write_state(fm, 'young', timedelta(hours=2))
+            target: scrape_upload.AssetUploadTarget = self._target(fm)
+            with self.assertLogs(level='WARNING') as logs:
+                orphans: int = await scrape_upload._orphaned_job_count(
+                    _settings(), target,
+                )
+            remaining: list[str] = [
+                state.job_id for state in list_bulk_states(fm)
+            ]
+        self.assertEqual(orphans, 1)
+        self.assertEqual(remaining, ['young'])
+        self.assertEqual(
+            sum('expired orphaned' in line for line in logs.output), 2,
+        )
+
+    async def test_max_age_follows_setting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fm: AssetFileManagement = AssetFileManagement(
+                tmp, prefix_rankings=_descriptor().prefix_rankings,
+            )
+            await self._write_state(fm, 'job', timedelta(hours=2))
+            target: scrape_upload.AssetUploadTarget = self._target(fm)
+            orphans: int = await scrape_upload._orphaned_job_count(
+                _settings(bulk_orphan_max_age_hours=1.0), target,
+            )
+            remaining: list[BulkUploadState] = list_bulk_states(fm)
+        self.assertEqual(orphans, 0)
+        self.assertEqual(remaining, [])
+
+    async def test_owned_job_never_discarded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fm: AssetFileManagement = AssetFileManagement(
+                tmp, prefix_rankings=_descriptor().prefix_rankings,
+            )
+            await self._write_state(fm, 'owned', timedelta(hours=5))
+            target: scrape_upload.AssetUploadTarget = self._target(fm)
+            task: asyncio.Task = asyncio.create_task(asyncio.sleep(0))
+            target.upload.in_flight_job_ids[task] = 'owned'
+            orphans: int = await scrape_upload._orphaned_job_count(
+                _settings(), target,
+            )
+            remaining: int = len(list_bulk_states(fm))
+            await task
+        self.assertEqual(orphans, 0)
+        self.assertEqual(remaining, 1)
+
+    async def test_expired_orphans_free_cap_for_new_batch(self) -> None:
+        fake: FakeBulkExchange = FakeBulkExchange(hold_finalize=True)
+        with tempfile.TemporaryDirectory() as tmp, fake.patched():
+            fm: AssetFileManagement = AssetFileManagement(
+                tmp, prefix_rankings=_descriptor().prefix_rankings,
+            )
+            await fm.write_file(
+                'asset-a.json.br',
+                {'id': 'a', 'url': 'https://scrape.exchange/a'},
+            )
+            await self._write_state(fm, 'old1', timedelta(hours=4))
+            await self._write_state(fm, 'old2', timedelta(hours=4))
+            target: scrape_upload.AssetUploadTarget = self._target(fm)
+            with self.assertLogs(level='WARNING'):
+                posted: int = await scrape_upload.drain_bulk_target_once(
+                    settings=_settings(max_active_bulk_jobs=2),
+                    target=target, client=object(),
+                )
+            self.assertEqual(posted, 1)
+            self.assertEqual(target.upload.resume_task, None)
+            fake.release.set()
+            await scrape_upload.drain_in_flight([target], 5)
+
+    async def test_resume_passes_orphan_max_age(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fm: AssetFileManagement = AssetFileManagement(
+                tmp, prefix_rankings=_descriptor().prefix_rankings,
+            )
+            target: scrape_upload.AssetUploadTarget = self._target(fm)
+            with patch(
+                'tools.scrape_upload.resume_pending_bulk_uploads',
+                new_callable=AsyncMock,
+            ) as resume:
+                await scrape_upload.resume_bulk_target(
+                    settings=_settings(bulk_orphan_max_age_hours=3.0),
+                    target=target, client=object(),
+                )
+        self.assertEqual(
+            resume.await_args.kwargs['max_age'], timedelta(hours=3),
+        )
+
+    def test_bulk_state_is_stale_honours_max_age(self) -> None:
+        now: datetime = datetime(2026, 10, 18, 12, 0, tzinfo=UTC)
+        state: BulkUploadState = BulkUploadState(
+            job_id='job', batch_id='batch', schema_owner='owner',
+            schema_version='1.0.0', platform='example', entity='thing',
+            upload_filename='job.jsonl',
+            created_at=(now - timedelta(hours=4)).isoformat(),
+        )
+        self.assertTrue(bulk_state_is_stale(
+            state, now=now, max_age=timedelta(hours=3),
+        ))
+        self.assertFalse(bulk_state_is_stale(
+            state, now=now, max_age=timedelta(hours=5),
+        ))
+        state.created_at = ''
+        self.assertFalse(bulk_state_is_stale(
+            state, now=now, max_age=timedelta(seconds=1),
+        ))
 
 
 if __name__ == '__main__':

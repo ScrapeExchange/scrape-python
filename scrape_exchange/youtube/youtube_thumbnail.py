@@ -7,7 +7,6 @@ Model a thumbnail of a Youtube video
 '''
 
 from enum import Enum
-from uuid import uuid4
 from uuid import UUID
 from typing import Self
 
@@ -16,7 +15,7 @@ MAX_SPOOLED_FILE: int = 1024 * 1024
 CHUNK_SIZE: int = 64 * 1024
 
 class YouTubeThumbnailSize(Enum):
-    # flake8: noqa=E221
+    # flake8: noqa: E221
     DEFAULT         = 'default'
     MEDIUM          = 'medium'
     HIGH            = 'high'

@@ -21,7 +21,7 @@ yt_channel_queue.py ──► Redis channel scrape queue
                      yt_channel_scrape.py ──► YOUTUBE_CHANNEL_DATA_DIR
                               │                       │
                               ▼                       ▼
-                     Redis identity maps     yt_channel_upload.py
+                     Redis identity maps     scrape_upload.py
                               │
                               ▼
 RSS feeds ──► yt_rss_scrape.py ──► Redis video scrape queue
@@ -31,9 +31,9 @@ RSS feeds ──► yt_rss_scrape.py ──► Redis video scrape queue
        in CHANNEL_DATA_DIR                │
                   │                       ▼
                   ▼               YOUTUBE_VIDEO_DATA_DIR
-        yt_channel_upload.py              │
+          scrape_upload.py                │
                                           ▼
-                                  yt_video_upload.py
+                                   scrape_upload.py
 ```
 
 The three scrapers are decoupled by Redis: each writes

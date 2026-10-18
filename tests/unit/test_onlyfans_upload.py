@@ -9,7 +9,6 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from scrape_exchange.bulk_upload import (
-    BulkBatchOutcome,
     BulkResults,
     apply_bulk_results,
 )

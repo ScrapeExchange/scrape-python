@@ -5,9 +5,8 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
-from scrape_exchange.bulk_upload import BulkBatchOutcome
 from scrape_exchange.file_management import AssetFileManagement
 from scrape_exchange.schema_validator import SchemaValidator
 from scrape_exchange.twitch.twitch_profile_extractor import extract_profile

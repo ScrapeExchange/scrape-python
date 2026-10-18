@@ -1761,7 +1761,7 @@ async def _write_channel(
     '''Persist the RSS-derived channel-stat record under
     ``settings.channel_data_directory`` as
     ``channel-rss-<channel_id>.json.br``. The
-    ``tools/yt_channel_upload.py`` picks these files up
+    ``tools/scrape_upload.py`` picks these files up
     alongside the standard ``channel-`` records and POSTs
     each to scrape.exchange.
 
