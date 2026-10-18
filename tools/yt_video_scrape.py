@@ -4,7 +4,7 @@
 YouTube Video Scrape Tool. Reads bare YouTube video-id request files from a
 specified directory, scrapes metadata, and saves enriched records back to disk.
 Uploading those records is handled by
-``tools/yt_video_upload.py``.
+``tools/scrape_upload.py``.
 
 :maintainer : Boinko <boinko@scrape.exchange>
 :copyright  : Copyright 2026

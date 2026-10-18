@@ -14,9 +14,9 @@ This document describes the end-to-end architecture of `scrape-python`, with emp
 
 ### Runtime orchestration
 - **`tools/yt_channel_scrape.py`**, **`tools/yt_rss_scrape.py`**,
-  **`tools/yt_video_scrape.py`**, **`tools/yt_channel_upload.py`**,
-  and **`tools/yt_video_upload.py`**: operational entrypoints for
-  the YouTube scrape and upload workers.
+  **`tools/yt_video_scrape.py`** and **`tools/scrape_upload.py`**:
+  operational entrypoints for the YouTube scrape workers and the
+  uploader for all platforms.
 - **`scrape_exchange.scraper_supervisor`**: lifecycle management for workers and coordinated shutdown.
 - **`scrape_exchange.scraper_runner`**: shared runtime scaffolding for
   worker tools: supervisor dispatch, logging, metrics, rate-limiter
@@ -79,7 +79,7 @@ scraper to its uploader.
    - The scraper writes compressed channel JSON files into
      `YOUTUBE_CHANNEL_DATA_DIR`.
 5. **Validation + upload**
-   - `yt_channel_upload.py` reads channel files, validates outbound
+   - `scrape_upload.py` reads channel files, validates outbound
      records against the channel schema, and uploads them through the
      exchange client/bulk-upload path.
 6. **Uploaded-file disposition + metrics**
@@ -102,7 +102,7 @@ scraper to its uploader.
    - The video scraper writes per-video JSON files into
      `YOUTUBE_VIDEO_DATA_DIR`.
 6. **Validation + upload**
-   - `yt_video_upload.py` reads video files, validates outbound video
+   - `scrape_upload.py` reads video files, validates outbound video
      records, and uploads them through the exchange client/bulk-upload
      path.
 7. **Uploaded-file disposition + metrics**

@@ -80,9 +80,9 @@ class TestSplit(unittest.IsolatedAsyncioTestCase):
         self.assertIs(result, err_outcome)
         finalize.assert_not_called()
 
-    def test_finalize_signature_for_yt_video_upload(self) -> None:
-        '''Regression: yt_video_upload.py line 900 calls with positional
-        args (job_id, batch_id, err, batch_records, config, ...).'''
+    def test_finalize_positional_signature(self) -> None:
+        '''Regression: callers pass positional args
+        (job_id, batch_id, err, batch_records, config, ...).'''
         sig: inspect.Signature = inspect.signature(
             finalize_prepared_bulk_batch
         )

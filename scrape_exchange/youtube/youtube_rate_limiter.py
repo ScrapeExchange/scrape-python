@@ -227,8 +227,8 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
         # ``https://www.youtube.com`` time out and pollute the logs).
         # The ``yt-dlp`` cookie file is still acquired lazily on
         # demand for any scraper path that does call YouTube
-        # (e.g. yt_video_upload's ``resolve_video_upload_handle``
-        # InnerTube fallback through one proxy).
+        # (e.g. scrape_upload's video handle resolution fallback
+        # through one proxy).
         self._auto_warm_cookies: bool = auto_warm_cookies
         # Per-proxy timeout circuit-breaker state. Keyed by the
         # same proxy URL passed to :meth:`acquire`. Tracks

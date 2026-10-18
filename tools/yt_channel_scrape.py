@@ -3,7 +3,7 @@
 '''
 YouTube Channel Scrape Tool. Reads YouTube channel names from a .lst file,
 scrapes channels that are not already present on disk, and writes channel
-records into the channel data directory for tools/yt_channel_upload.py.
+records into the channel data directory for tools/scrape_upload.py.
 
 :maintainer : Boinko <boinko@scrape.exchange>
 :copyright  : Copyright 2026

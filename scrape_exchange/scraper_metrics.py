@@ -118,7 +118,7 @@ METRIC_UPLOADED_ADDS: Counter = Counter(
 #     pass ``worker_id=get_worker_id()``. Each worker writes its own series;
 #     ``sum by (entity, state)`` gives the correct fleet total.
 #
-#   - Shared-state callers (e.g. yt_video_upload: directory listing,
+#   - Shared-state callers (e.g. scrape_upload: directory listing,
 #     yt_rss_scrape: Redis-backed tier sizes) pass ``worker_id=''``. All
 #     workers collapse to one series and ``livemostrecent`` returns the
 #     correct shared value without N× inflation.

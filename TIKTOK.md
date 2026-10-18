@@ -21,7 +21,7 @@ tt_discover_search.py ──► discovered usernames JSONL
                        tt_creator_scrape.py ──► TIKTOK_CREATOR_DATA_DIR
                                   │                       │
                                   ▼                       ▼
-                         Redis identity maps      tt_creator_upload.py
+                         Redis identity maps      scrape_upload.py
                                   │
                                   ▼
                          Redis video queue
@@ -30,7 +30,7 @@ tt_discover_search.py ──► discovered usernames JSONL
                        tt_video_scrape.py ──► TIKTOK_VIDEO_DATA_DIR
                                                           │
                                                           ▼
-                                                 tt_video_upload.py
+                                                 scrape_upload.py
 ```
 
 The creator and video scrapers are decoupled by Redis. The creator
@@ -245,15 +245,10 @@ Use `--max-categories`, `--search-term-count`, `--max-scrolls`, and
 
 ## 6. Uploaders
 
-`tt_creator_upload.py` and `tt_video_upload.py` drain the creator and
-video data directories, validate each Brotli JSON record against the
-TikTok schema, bulk upload to scrape.exchange, and move successful
-files to `uploaded/`.
-
-Uploaders share `tools/_tt_upload_common.py`. They require API
-credentials and the relevant data directory, but they deliberately
-clear the proxy catalog at startup. Upload-only containers therefore
-do not fail just because scraper proxy files are absent.
+`scrape_upload.py` drains the creator and video data directories,
+validates each Brotli JSON record against the TikTok schema, bulk
+uploads to scrape.exchange, and moves successful files to `uploaded/`.
+It uploads the files of every platform, not only TikTok.
 
 Creator uploads strip the embedded `videos` list before upload. The
 creator record still captures public profile metadata, while videos

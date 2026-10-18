@@ -238,11 +238,7 @@ services:
 
   yt-video:
     volumes: *data-volumes
-  yt-video-upload:
-    volumes: *data-volumes
   yt-channel:
-    volumes: *data-volumes
-  yt-channel-upload:
     volumes: *data-volumes
   yt-rss:
     volumes: *data-volumes
@@ -250,10 +246,10 @@ services:
     volumes: *tt-data-volumes
   tt-video:
     volumes: *tt-data-volumes
-  tt-creator-upload:
-    volumes: *tt-data-volumes
-  tt-video-upload:
-    volumes: *tt-data-volumes
+  # scrape-upload uploads every platform's files; also bind the TikTok
+  # data directories here if this host scrapes TikTok.
+  scrape-upload:
+    volumes: *data-volumes
 ```
 
 With Redis on the same host, set
@@ -470,18 +466,17 @@ The first time you run one of the tools, or after you pull new changes from the 
 ## YouTube Scrapers
 
 The YouTube tooling — three scrapers (`yt_channel_scrape.py`,
-`yt_rss_scrape.py`, `yt_video_scrape.py`), two uploaders
-(`yt_channel_upload.py`, `yt_video_upload.py`), and the operator CLI
+`yt_rss_scrape.py`, `yt_video_scrape.py`) and the operator CLI
 (`yt_channel_queue.py`) — is documented in [YOUTUBE.md](YOUTUBE.md),
 including the pipeline data flow, the observed rate limits and
 token-bucket configuration, and the scraping strategy for each tool.
 
 ## TikTok Scrapers
 
-There are four main TikTok daemon/upload tools:
-two scrapers (`tt_creator_scrape.py`, `tt_video_scrape.py`)
-and two uploaders (`tt_creator_upload.py`,
-`tt_video_upload.py`). The TikTok tools use the shared
+There are two main TikTok scrapers (`tt_creator_scrape.py`,
+`tt_video_scrape.py`); their output is uploaded by
+`scrape_upload.py`, like every other platform's. The TikTok
+tools use the shared
 Redis queues, proxy catalog, rate limiter, and
 Camoufox-backed session pool. They store browser session
 state under `TIKTOK_SESSION_STATE_DIR` so restarted
@@ -500,8 +495,8 @@ writes `tiktok-creator-*.json.br` files to
 URLs onto the TikTok video scrape queue. The video
 scraper consumes those URLs and writes
 `tiktok-video-*.json.br` files to `TIKTOK_VIDEO_DATA_DIR`.
-The uploaders validate records against the Scrape.Exchange
-TikTok JSON Schemas before uploading them.
+`scrape_upload.py` validates records against the
+Scrape.Exchange TikTok JSON Schemas before uploading them.
 
 The data flow between the TikTok tools is:
 
@@ -512,7 +507,7 @@ tools/scrape_queue.py -> Redis TikTok creator queue
                          tt_creator_scrape.py -> TIKTOK_CREATOR_DATA_DIR
                                   │                         │
                                   │                         ▼
-                                  │                tt_creator_upload.py
+                                  │                scrape_upload.py
                                   │                         │
                                   ▼                         ▼
                     Redis TikTok video queue         scrape.exchange
@@ -521,7 +516,7 @@ tools/scrape_queue.py -> Redis TikTok creator queue
                          tt_video_scrape.py -> TIKTOK_VIDEO_DATA_DIR
                                                             │
                                                             ▼
-                                                   tt_video_upload.py
+                                                   scrape_upload.py
                                                             │
                                                             ▼
                                                    scrape.exchange
@@ -535,13 +530,12 @@ These scripts are the main TikTok entry points:
 - **tt_creator_scrape.py**: Scrapes TikTok creator/profile
   metadata, compact video references, and playlist
   references, then writes creator JSON files.
-- **tt_creator_upload.py**: Watches
-  `TIKTOK_CREATOR_DATA_DIR`, validates creator records,
-  and uploads them to the Scrape.Exchange API.
 - **tt_video_scrape.py**: Consumes TikTok video URLs from
   the Redis video queue and writes per-video JSON files.
-- **tt_video_upload.py**: Watches `TIKTOK_VIDEO_DATA_DIR`,
-  validates video records, and uploads them to the API.
+- **scrape_upload.py**: Watches the TikTok creator and
+  video data directories (and those of the other
+  platforms), validates records, and uploads them to the
+  Scrape.Exchange API.
 
 `tt_discover_search.py` is an optional discovery helper
 that writes discovered TikTok usernames to JSONL from

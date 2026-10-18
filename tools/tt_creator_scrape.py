@@ -11,7 +11,7 @@ ms_token jar + refresh loop).
 
 Scrape-to-disk only: records are written as Brotli ``.json.br`` via
 ``AssetFileManagement``; uploading them to scrape.exchange is a
-separate tool (``tt_creator_upload.py``).
+separate tool (``scrape_upload.py``).
 
 Design: docs/superpowers/specs/
 2026-06-10-tiktok-creator-scrape-tool-design.md
