@@ -14,6 +14,7 @@ from scrape_exchange.handle_map import HandleMap
 from scrape_exchange.youtube.youtube_channel import YouTubeChannel
 from scrape_exchange.youtube.channel_errors import (  # noqa: F401
     ChannelNotFoundError,
+    ChannelRedirectedError,
     ChannelTerminatedError,
 )
 

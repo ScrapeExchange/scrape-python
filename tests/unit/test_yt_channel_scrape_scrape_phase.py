@@ -521,6 +521,55 @@ class TestScrapeOne(
         '._do_scrape_channel_to_disk_typed',
         new_callable=AsyncMock,
     )
+    async def test_redirect_marks_moved_and_queues_target(
+        self,
+        mock_scrape: AsyncMock,
+        mock_exists: AsyncMock,
+    ) -> None:
+        from scrape_exchange.youtube.channel_errors import (
+            ChannelRedirectedError,
+        )
+        target: str = 'UClgRkhTL3_hImCAmdLfDE4g'
+        mock_exists.return_value = False
+        mock_scrape.side_effect = ChannelRedirectedError(
+            'UCabc00000000000000000000', target,
+        )
+        queue = _mock_queue()
+        creator_map = AsyncMock()
+        creator_map.get.return_value = 'foo'
+        from tools.yt_channel_scrape import _scrape_one_queued
+
+        await _scrape_one_queued(
+            'UCabc00000000000000000000',
+            queue=queue,
+            settings=_mock_settings(),
+            fm=MagicMock(),
+            creator_map_backend=creator_map,
+            http_client=MagicMock(),
+        )
+
+        queue.enqueue_new.assert_awaited_once_with(
+            target, source='channel_redirect',
+        )
+        queue.mark.assert_awaited_once()
+        kwargs: dict = queue.mark.await_args.kwargs
+        self.assertEqual(
+            queue.mark.await_args.args[0], 'i:UCabc00000000000000000000',
+        )
+        self.assertEqual(kwargs['state'], ChannelState.MOVED)
+        self.assertEqual(kwargs['extra'], {'moved_to': target})
+        queue.update_tier.assert_not_called()
+
+    @patch(
+        'tools.yt_channel_scrape'
+        '._channel_exists_on_exchange',
+        new_callable=AsyncMock,
+    )
+    @patch(
+        'tools.yt_channel_scrape'
+        '._do_scrape_channel_to_disk_typed',
+        new_callable=AsyncMock,
+    )
     async def test_not_found_marks(
         self,
         mock_scrape: AsyncMock,

@@ -424,7 +424,7 @@ local states = {
     'inconsistent_identity', 'terminated',
     'unresolved', 'removed',
     'soft_unavailable', 'hard_unavailable',
-    'topic', 'no_videos', 'low_subs',
+    'topic', 'no_videos', 'low_subs', 'moved',
 }
 for _, s in ipairs(states) do
     redis.call(
@@ -469,7 +469,7 @@ local states = {
     'inconsistent_identity', 'terminated',
     'unresolved', 'removed',
     'soft_unavailable', 'hard_unavailable',
-    'topic', 'no_videos', 'low_subs',
+    'topic', 'no_videos', 'low_subs', 'moved',
 }
 for _, s in ipairs(states) do
     redis.call(
@@ -620,6 +620,8 @@ class ChannelState(str, enum.Enum):
     TOPIC = 'topic'
     NO_VIDEOS = 'no_videos'
     LOW_SUBS = 'low_subs'
+    # YouTube redirects the channel ID to another channel ID.
+    MOVED = 'moved'
 
     @classmethod
     def terminal_states(
@@ -637,6 +639,7 @@ class ChannelState(str, enum.Enum):
             cls.TOPIC,
             cls.NO_VIDEOS,
             cls.LOW_SUBS,
+            cls.MOVED,
         })
 
 

@@ -555,7 +555,7 @@ def _build_parser() -> ArgumentParser:
             "'removed', 'invalid_handle', "
             "'inconsistent_identity', 'soft_unavailable', "
             "'hard_unavailable', 'topic', 'no_videos', "
-            "'low_subs')."
+            "'low_subs', 'moved')."
         ),
     )
     c_export.add_argument(

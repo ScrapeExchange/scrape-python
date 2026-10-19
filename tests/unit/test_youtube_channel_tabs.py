@@ -1681,3 +1681,57 @@ class TestChannelAlerts(unittest.IsolatedAsyncioTestCase):
             channel_identity.ChannelTerminatedError,
             channel_errors.ChannelTerminatedError,
         )
+
+
+def _redirect_response(target: str) -> dict:
+    '''A browse response that only tells the client to navigate to
+    another channel: the channel moved to *target*.'''
+    return {
+        'onResponseReceivedActions': [{
+            'navigateAction': {'endpoint': {
+                'commandMetadata': {'webCommandMetadata': {
+                    'url': f'/channel/{target}',
+                    'webPageType': 'WEB_PAGE_TYPE_CHANNEL',
+                }},
+                'browseEndpoint': {'browseId': target},
+            }},
+        }],
+        'trackingParams': 'x',
+    }
+
+
+class TestChannelRedirect(unittest.IsolatedAsyncioTestCase):
+    '''A channel YouTube redirects to another channel ID is reported
+    with the new ID.'''
+
+    TARGET: str = 'UClgRkhTL3_hImCAmdLfDE4g'
+
+    async def test_redirect_raises_with_target(self) -> None:
+        from scrape_exchange.youtube.channel_errors import (
+            ChannelRedirectedError,
+        )
+        tabs = YouTubeChannelTabs(CHANNEL_ID)
+        tabs._browse = AsyncMock(
+            return_value=_redirect_response(self.TARGET),
+        )
+        with self.assertRaises(ChannelRedirectedError) as ctx:
+            await tabs.browse_channel()
+        self.assertEqual(ctx.exception.target_channel_id, self.TARGET)
+
+    async def test_redirect_to_itself_keeps_runtime_error(self) -> None:
+        tabs = YouTubeChannelTabs(CHANNEL_ID)
+        tabs._browse = AsyncMock(
+            return_value=_redirect_response(CHANNEL_ID),
+        )
+        with self.assertRaises(RuntimeError):
+            await tabs.browse_channel()
+
+    async def test_redirect_to_non_channel_keeps_runtime_error(
+        self,
+    ) -> None:
+        tabs = YouTubeChannelTabs(CHANNEL_ID)
+        tabs._browse = AsyncMock(
+            return_value=_redirect_response('FEwhat_to_watch'),
+        )
+        with self.assertRaises(RuntimeError):
+            await tabs.browse_channel()

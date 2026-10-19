@@ -2659,6 +2659,43 @@ class TestExpediteFullListing(_MissingSubscriberTestBase):
         self.assertEqual(result['moved'], 0)
         self.assertIsNone(await self._score('UCbusy', 1))
 
+
+class TestMovedState(_RedisQueueTestBase):
+    '''A channel that moved to another ID is terminal.'''
+
+    async def test_moved_is_terminal_and_unmark_clears_it(self) -> None:
+        self.assertIn(
+            ChannelState.MOVED, ChannelState.terminal_states(),
+        )
+        await self.queue.enqueue_new('UCold', source='test')
+        await self.queue.mark(
+            'i:UCold', state=ChannelState.MOVED,
+            extra={'moved_to': 'UCnew'},
+        )
+        self.assertEqual(
+            await self.queue.get_state('i:UCold'), ChannelState.MOVED,
+        )
+        record: str | None = await self.redis.hget(
+            'youtube:channel:moved', 'i:UCold',
+        )
+        assert record is not None
+        self.assertEqual(json.loads(record)['moved_to'], 'UCnew')
+        self.assertFalse(
+            await self.queue.enqueue_scheduled('UCold', source='test'),
+        )
+        await self.queue.unmark('i:UCold')
+        self.assertIsNone(
+            await self.redis.hget('youtube:channel:moved', 'i:UCold'),
+        )
+
+    async def test_marking_terminal_clears_moved(self) -> None:
+        await self.queue.enqueue_new('UCold', source='test')
+        await self.queue.mark('i:UCold', state=ChannelState.MOVED)
+        await self.queue.mark('i:UCold', state=ChannelState.REMOVED)
+        self.assertIsNone(
+            await self.redis.hget('youtube:channel:moved', 'i:UCold'),
+        )
+
 class TestListingCounts(_RedisQueueTestBase):
     '''Per-tier video listing status counters.'''
 

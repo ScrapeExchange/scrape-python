@@ -25,6 +25,17 @@ class ChannelTerminatedError(Exception):
     "channel terminated by YouTube" sentinel.'''
 
 
+class ChannelRedirectedError(Exception):
+    '''Raised when YouTube redirects a channel ID to another channel
+    ID: the channel moved, and :attr:`target_channel_id` is its new
+    ID.'''
+
+    def __init__(self, channel_id: str | None, target_channel_id: str,
+                 ) -> None:
+        super().__init__(f'{channel_id} moved to {target_channel_id}')
+        self.target_channel_id: str = target_channel_id
+
+
 # Phrases of the ERROR alert InnerTube returns instead of channel tabs.
 # The scraper's InnerTube clients request English.
 _TERMINATED_PHRASES: tuple[str, ...] = (
@@ -81,3 +92,31 @@ def raise_for_channel_alert(
             raise ChannelTerminatedError(f'{channel_id}: {text}')
         if any(phrase in lowered for phrase in _NOT_FOUND_PHRASES):
             raise ChannelNotFoundError(f'{channel_id}: {text}')
+
+
+def raise_for_channel_redirect(
+    channel_data: dict[str, Any], channel_id: str | None,
+) -> None:
+    '''Raise :class:`ChannelRedirectedError` when *channel_data* (an
+    InnerTube channel browse response without tabs) only tells the
+    client to navigate to a different channel ID.'''
+    actions: Any = channel_data.get('onResponseReceivedActions') or []
+    if not isinstance(actions, list):
+        return
+    action: Any
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        endpoint: Any = (
+            (action.get('navigateAction') or {}).get('endpoint') or {}
+        )
+        if not isinstance(endpoint, dict):
+            continue
+        target: Any = (endpoint.get('browseEndpoint') or {}).get('browseId')
+        if (
+            isinstance(target, str)
+            and target.startswith('UC')
+            and len(target) == 24
+            and target != channel_id
+        ):
+            raise ChannelRedirectedError(channel_id, target)

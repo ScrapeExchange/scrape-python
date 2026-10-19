@@ -44,6 +44,7 @@ from scrape_exchange.handle_map import NullHandleMap, RedisHandleMap
 from scrape_exchange.youtube.channel_identity import (
     ChannelIdentityStore,
     ChannelNotFoundError,
+    ChannelRedirectedError,
     ChannelTerminatedError,
     InconsistentIdentityError,
     is_valid_channel_handle,
@@ -2258,6 +2259,33 @@ async def _scrape_one_queued(
                 CHANNEL_FORCE_RESCRAPE_TOTAL.labels(
                     mode=force_mode,
                     outcome='not_found',
+                ).inc()
+            return
+        except ChannelRedirectedError as exc:
+            # YouTube redirects this ID to the channel's new ID: queue
+            # the new one (if unknown) and record where this one went.
+            target: str = exc.target_channel_id
+            try:
+                await queue.enqueue_new(target, source='channel_redirect')
+            except Exception:
+                logging.warning(
+                    'Could not queue the channel a redirect points to',
+                    exc_info=True,
+                    extra=extra | {'moved_to': target},
+                )
+            await queue.mark(
+                member,
+                state=ChannelState.MOVED,
+                last_error=str(exc),
+                extra={'moved_to': target},
+            )
+            CHANNEL_SCRAPE_OUTCOMES.labels(
+                outcome='moved',
+            ).inc()
+            if force_mode:
+                CHANNEL_FORCE_RESCRAPE_TOTAL.labels(
+                    mode=force_mode,
+                    outcome='moved',
                 ).inc()
             return
         except ChannelTerminatedError as exc:
