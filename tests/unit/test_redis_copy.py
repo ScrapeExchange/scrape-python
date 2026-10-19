@@ -44,10 +44,19 @@ class TestEndpoints(unittest.TestCase):
         with self.assertRaises(ValueError):
             check_distinct(a, b)
 
-    def test_same_server_other_db_is_allowed(self) -> None:
+    def test_same_server_other_db_is_refused(self) -> None:
+        # MIGRATE blocks the source server while it waits for the
+        # target, so a server cannot MIGRATE to itself.
+        with self.assertRaises(ValueError):
+            check_distinct(
+                endpoint_from_dsn('redis://localhost:6379/0'),
+                endpoint_from_dsn('redis://localhost:6379/1'),
+            )
+
+    def test_other_server_is_allowed(self) -> None:
         check_distinct(
             endpoint_from_dsn('redis://localhost:6379/0'),
-            endpoint_from_dsn('redis://localhost:6379/1'),
+            endpoint_from_dsn('redis://localhost:6380/0'),
         )
 
 
@@ -239,6 +248,19 @@ class TestVerify(unittest.TestCase):
         self.tgt.set('gone', 'v')
         report: VerifyReport = verify(self.src, self.tgt, sample_size=10)
         self.assertEqual(report.mismatches, [])
+
+
+class TestCliSettings(unittest.TestCase):
+
+    def test_refuses_same_database(self) -> None:
+        from tools.redis_copy_db import CopySettings, run
+
+        settings: CopySettings = CopySettings(
+            _cli_parse_args=[],
+            source_dsn='redis://localhost:6379/3',
+            target_dsn='redis://localhost:6379/3',
+        )
+        self.assertEqual(run(settings), 2)
 
 
 if __name__ == '__main__':

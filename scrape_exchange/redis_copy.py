@@ -44,11 +44,11 @@ def endpoint_from_dsn(dsn: str) -> Endpoint:
 
 
 def check_distinct(source: Endpoint, target: Endpoint) -> None:
-    '''Refuse to copy a database onto itself.'''
-    if (source.host, source.port, source.db) == (
-        target.host, target.port, target.db,
-    ):
-        raise ValueError('source and target are the same database')
+    '''Refuse a target on the source's own server: MIGRATE blocks the
+    source server while it waits for the target, so a server cannot
+    MIGRATE to itself (it times out with IOERR).'''
+    if (source.host, source.port) == (target.host, target.port):
+        raise ValueError('source and target are on the same server')
 
 
 def split_batches(
