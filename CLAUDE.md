@@ -1,5 +1,6 @@
 read settings, connectionstrings from LOCAL.md if the file exists.
 remember conversations about this code base and repo between sessions
+when creating a new branch, use feature/<feature-name> or bug/<bug-name>
 only use subagents if the user explicitly request them
 use uv for python package management
 use unittest for testing instead of pytest
