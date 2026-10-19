@@ -845,6 +845,11 @@ class RedisVideoScrapeQueue(VideoScrapeQueue):
         if self._backlog is not None:
             await self._backlog.delete(video_id)
 
+    async def flush(self) -> None:
+        '''Send buffered backlog deletes. Call before shutting down.'''
+        if self._backlog is not None:
+            await self._backlog.flush_deletes()
+
     async def mark(
         self, video_id: str, *,
         state: VideoState,

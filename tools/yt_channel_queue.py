@@ -479,7 +479,7 @@ def _build_parser() -> ArgumentParser:
             "'removed', 'invalid_handle', "
             "'inconsistent_identity', 'soft_unavailable', "
             "'hard_unavailable', 'topic', 'no_videos', "
-            "'low_subs')."
+            "'low_subs', 'moved')."
         ),
     )
     c_export.add_argument(
@@ -1627,6 +1627,7 @@ async def cmd_backfill_rss(
         )
         added += int(raw[0])
         already_known += int(raw[1])
+        await queue.recount_listing(*(f'i:{cid}' for cid in batch))
         batch = []
 
     cursor: int | str = 0
@@ -2590,6 +2591,7 @@ async def cmd_retier(
                 )
                 if moved_score is not None:
                     was_applied = True
+                    await queue.recount_listing(member)
             if not ns.apply or was_applied:
                 record_move('channel', old_tier, new_tier)
             write_status()

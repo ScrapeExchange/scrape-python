@@ -1586,3 +1586,171 @@ class TestScrapeContent(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def _alert_response(text: str, *, kind: str = 'ERROR', runs: bool = False,
+                    ) -> dict:
+    '''A browse response for a channel YouTube no longer shows: an
+    alert and no tabs.'''
+    text_obj: dict = (
+        {'runs': [{'text': part} for part in text.split(' ', 1)]}
+        if runs else {'simpleText': text}
+    )
+    return {
+        'alerts': [{'alertRenderer': {'type': kind, 'text': text_obj}}],
+        'contents': {},
+    }
+
+
+class TestChannelAlerts(unittest.IsolatedAsyncioTestCase):
+    '''A channel YouTube removed or never had is reported as such
+    instead of as a tab extraction failure.'''
+
+    REMOVED: str = (
+        'This channel was removed because it violated our Community '
+        'Guidelines.'
+    )
+
+    async def _browse(self, response: dict) -> None:
+        tabs = YouTubeChannelTabs(CHANNEL_ID)
+        tabs._browse = AsyncMock(return_value=response)
+        await tabs.browse_channel()
+
+    async def test_removed_channel_is_terminated(self) -> None:
+        from scrape_exchange.youtube.channel_errors import (
+            ChannelTerminatedError,
+        )
+        with self.assertRaises(ChannelTerminatedError):
+            await self._browse(_alert_response(self.REMOVED))
+
+    async def test_copyright_termination_is_terminated(self) -> None:
+        from scrape_exchange.youtube.channel_errors import (
+            ChannelTerminatedError,
+        )
+        with self.assertRaises(ChannelTerminatedError):
+            await self._browse(_alert_response(
+                'This account has been terminated because we received '
+                'multiple third-party claims of copyright infringement '
+                'regarding material the user posted.',
+            ))
+
+    async def test_missing_channel_is_not_found(self) -> None:
+        from scrape_exchange.youtube.channel_errors import (
+            ChannelNotFoundError,
+        )
+        with self.assertRaises(ChannelNotFoundError):
+            await self._browse(
+                _alert_response('This channel does not exist.'),
+            )
+
+    async def test_alert_text_in_runs(self) -> None:
+        from scrape_exchange.youtube.channel_errors import (
+            ChannelTerminatedError,
+        )
+        with self.assertRaises(ChannelTerminatedError):
+            await self._browse(_alert_response(self.REMOVED, runs=True))
+
+    async def test_get_page_tabs_reports_alert_too(self) -> None:
+        from scrape_exchange.youtube.channel_errors import (
+            ChannelTerminatedError,
+        )
+        tabs = YouTubeChannelTabs(CHANNEL_ID)
+        tabs._browse = AsyncMock(
+            return_value=_alert_response(self.REMOVED),
+        )
+        with self.assertRaises(ChannelTerminatedError):
+            await tabs.get_page_tabs()
+
+    async def test_non_error_alert_keeps_runtime_error(self) -> None:
+        with self.assertRaises(RuntimeError):
+            await self._browse(
+                _alert_response(self.REMOVED, kind='INFO'),
+            )
+
+    async def test_unknown_error_text_keeps_runtime_error(self) -> None:
+        with self.assertRaises(RuntimeError):
+            await self._browse(_alert_response('Something went wrong.'))
+
+    def test_identity_module_reexports_same_classes(self) -> None:
+        from scrape_exchange.youtube import channel_errors, channel_identity
+        self.assertIs(
+            channel_identity.ChannelNotFoundError,
+            channel_errors.ChannelNotFoundError,
+        )
+        self.assertIs(
+            channel_identity.ChannelTerminatedError,
+            channel_errors.ChannelTerminatedError,
+        )
+
+
+def _redirect_response(target: str) -> dict:
+    '''A browse response that only tells the client to navigate to
+    another channel: the channel moved to *target*.'''
+    return {
+        'onResponseReceivedActions': [{
+            'navigateAction': {'endpoint': {
+                'commandMetadata': {'webCommandMetadata': {
+                    'url': f'/channel/{target}',
+                    'webPageType': 'WEB_PAGE_TYPE_CHANNEL',
+                }},
+                'browseEndpoint': {'browseId': target},
+            }},
+        }],
+        'trackingParams': 'x',
+    }
+
+
+class TestChannelRedirect(unittest.IsolatedAsyncioTestCase):
+    '''A channel YouTube redirects to another channel ID is reported
+    with the new ID.'''
+
+    TARGET: str = 'UClgRkhTL3_hImCAmdLfDE4g'
+
+    async def test_redirect_raises_with_target(self) -> None:
+        from scrape_exchange.youtube.channel_errors import (
+            ChannelRedirectedError,
+        )
+        tabs = YouTubeChannelTabs(CHANNEL_ID)
+        tabs._browse = AsyncMock(
+            return_value=_redirect_response(self.TARGET),
+        )
+        with self.assertRaises(ChannelRedirectedError) as ctx:
+            await tabs.browse_channel()
+        self.assertEqual(ctx.exception.target_channel_id, self.TARGET)
+
+    async def test_redirect_to_itself_keeps_runtime_error(self) -> None:
+        tabs = YouTubeChannelTabs(CHANNEL_ID)
+        tabs._browse = AsyncMock(
+            return_value=_redirect_response(CHANNEL_ID),
+        )
+        with self.assertRaises(RuntimeError):
+            await tabs.browse_channel()
+
+    async def test_redirect_to_non_channel_keeps_runtime_error(
+        self,
+    ) -> None:
+        tabs = YouTubeChannelTabs(CHANNEL_ID)
+        tabs._browse = AsyncMock(
+            return_value=_redirect_response('FEwhat_to_watch'),
+        )
+        with self.assertRaises(RuntimeError):
+            await tabs.browse_channel()
+
+
+class TestRedirectToSystemPage(unittest.TestCase):
+    '''Redirects to YouTube system pages (Movies & TV store, Sports,
+    News, ...) are not moves to another creator channel.'''
+
+    def test_movies_store_is_a_system_page(self) -> None:
+        from scrape_exchange.youtube.channel_errors import (
+            ChannelRedirectedError,
+        )
+        exc = ChannelRedirectedError(CHANNEL_ID, 'UClgRkhTL3_hImCAmdLfDE4g')
+        self.assertTrue(exc.to_system_page)
+
+    def test_creator_channel_is_not_a_system_page(self) -> None:
+        from scrape_exchange.youtube.channel_errors import (
+            ChannelRedirectedError,
+        )
+        exc = ChannelRedirectedError(CHANNEL_ID, 'UCWpk9PSGHoJW1hZT4egxTNQ')
+        self.assertFalse(exc.to_system_page)

@@ -28,6 +28,10 @@ from innertube.locale import Locale
 from scrape_exchange._lazy_async_pool import _LazyAsyncPool
 from scrape_exchange.proxy_loader import _POOLED_HTTPX_LIMITS
 from scrape_exchange.youtube.youtube_types import YouTubeChannelPageType
+from scrape_exchange.youtube.channel_errors import (
+    raise_for_channel_alert,
+    raise_for_channel_redirect,
+)
 
 from .youtube_client import (
     ANDROID_CLIENT_VERSION,
@@ -225,6 +229,10 @@ class YouTubeChannelTabs:
         )
 
         if not self.tabs:
+            # A removed or unknown channel comes back as an ERROR alert
+            # without tabs; report it as such, not as a parse failure.
+            raise_for_channel_alert(channel_data, self.channel_id)
+            raise_for_channel_redirect(channel_data, self.channel_id)
             raise RuntimeError(
                 f'Failed to extract tabs for channel: {self.channel_id}'
             )
@@ -1075,6 +1083,10 @@ class YouTubeChannelTabs:
         )
 
         if not self.tabs:
+            # A removed or unknown channel comes back as an ERROR alert
+            # without tabs; report it as such, not as a parse failure.
+            raise_for_channel_alert(channel_data, self.channel_id)
+            raise_for_channel_redirect(channel_data, self.channel_id)
             raise RuntimeError(
                 f'Failed to extract tabs for channel: {self.channel_id}'
             )
@@ -1147,6 +1159,8 @@ class YouTubeChannelTabs:
         ).get('twoColumnBrowseResultsRenderer', {}).get('tabs')
 
         if not page_tabs:
+            raise_for_channel_alert(page_data, self.channel_id)
+            raise_for_channel_redirect(page_data, self.channel_id)
             raise RuntimeError(
                 f'Failed to extract tabs for channel: {self.channel_id}'
             )

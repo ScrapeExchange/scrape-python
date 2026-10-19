@@ -1155,6 +1155,10 @@ async def _run_worker(
             ),
         )
     finally:
+        try:
+            await video_queue.flush()
+        except Exception:
+            logging.exception('Flushing video backlog deletes failed')
         if publisher_task is not None:
             publisher_task.cancel()
             try:

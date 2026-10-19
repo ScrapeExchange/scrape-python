@@ -17,6 +17,7 @@ class TestPublishChannelQueueSizes(
         queue.count_by_tier = AsyncMock(
             return_value={0: 7, 1: 11},
         )
+        queue.count_listing = AsyncMock(return_value={})
         shutdown_event: asyncio.Event = asyncio.Event()
         metric: MagicMock = MagicMock()
         metric.labels.return_value.set.side_effect = (
@@ -42,6 +43,45 @@ class TestPublishChannelQueueSizes(
             metric.labels.return_value.set.call_args_list,
             [call(7), call(11)],
         )
+
+    async def test_publishes_listing_status_per_tier(self) -> None:
+        '''Every tier gets all four statuses; missing ones are 0.'''
+        queue: MagicMock = MagicMock()
+        queue.count_by_state = AsyncMock(return_value={})
+        queue.count_by_tier = AsyncMock(return_value={0: 3})
+        queue.count_listing = AsyncMock(return_value={
+            (0, 'complete'): 2, (0, 'partial'): 1, (1, 'partial'): 4,
+        })
+        shutdown_event: asyncio.Event = asyncio.Event()
+        shutdown_event.set()
+        published: dict[tuple[str, str], int] = {}
+
+        def _labels(*, tier: str, status: str) -> MagicMock:
+            child: MagicMock = MagicMock()
+            child.set.side_effect = (
+                lambda n: published.__setitem__((tier, status), n)
+            )
+            return child
+
+        metric: MagicMock = MagicMock()
+        metric.labels.side_effect = _labels
+        with patch.object(
+            yt_channel_scrape, 'CHANNEL_VIDEO_LISTING_STATUS', metric,
+        ):
+            shutdown_event.clear()
+            queue.count_by_state.side_effect = (
+                lambda: shutdown_event.set() or {}
+            )
+            await yt_channel_scrape._publish_channel_queue_sizes(
+                queue, interval=1.0, shutdown_event=shutdown_event,
+            )
+
+        self.assertEqual(published, {
+            ('1', 'complete'): 2, ('1', 'partial'): 1,
+            ('1', 'pre_tracking'): 0, ('1', 'never_scraped'): 0,
+            ('2', 'complete'): 0, ('2', 'partial'): 4,
+            ('2', 'pre_tracking'): 0, ('2', 'never_scraped'): 0,
+        })
 
 
 if __name__ == '__main__':

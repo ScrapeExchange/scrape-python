@@ -998,6 +998,10 @@ class TestRetryMissingSubscriberCount(_RedisQueueTestBase):
         await self.redis.hset(
             'youtube:channel:tiers', channel_id, '2',
         )
+        # A count from an earlier scrape: the channel keeps its tier.
+        await self.redis.hset(
+            f'youtube:channel:meta:{member}', 'subscriber_count', '50000',
+        )
         await self.redis.zadd(
             'youtube:channel:queue:scheduled:2',
             {member: 0.0},
@@ -1028,9 +1032,11 @@ class TestRetryMissingSubscriberCount(_RedisQueueTestBase):
             'missing_subscriber_count',
         )
 
-    async def test_unknown_tier_uses_highest_priority_tier(
+    async def test_never_counted_channel_uses_catch_all_tier(
         self,
     ) -> None:
+        # No stored count: the channel goes to the catch-all tier
+        # (index 4 of the default tiers), not tier 0.
         channel_id: str = 'UCa'
         member: str = f'i:{channel_id}'
 
@@ -1042,11 +1048,30 @@ class TestRetryMissingSubscriberCount(_RedisQueueTestBase):
         tier: str | None = await self.redis.hget(
             'youtube:channel:tiers', channel_id,
         )
-        self.assertEqual(tier, '0')
+        self.assertEqual(tier, '4')
         score: float | None = await self.redis.zscore(
-            'youtube:channel:queue:scheduled:0', member,
+            'youtube:channel:queue:scheduled:4', member,
         )
         self.assertEqual(score, 100.0 + 86400.0)
+
+    async def test_counted_channel_without_tier_uses_tier_0(
+        self,
+    ) -> None:
+        channel_id: str = 'UCb'
+        member: str = f'i:{channel_id}'
+        await self.redis.hset(
+            f'youtube:channel:meta:{member}', 'subscriber_count', '50000',
+        )
+
+        await self.queue.retry_missing_subscriber_count(
+            channel_id=channel_id,
+            now=100.0,
+        )
+
+        self.assertEqual(
+            await self.redis.hget('youtube:channel:tiers', channel_id),
+            '0',
+        )
 
 
 class TestRequeueWithBackoff(_RedisQueueTestBase):
@@ -1918,20 +1943,24 @@ class _MissingSubscriberTestBase(_RedisQueueTestBase):
 
     async def _seed(
         self, channel_id: str, tier: int = 1, *, schedule: bool = True,
+        subscriber_count: int | None = 5000,
     ) -> str:
-        '''A scheduled, never-scraped channel sitting in *tier*.'''
+        '''A scheduled channel sitting in *tier*. By default it has a
+        stored subscriber count from an earlier scrape, so a miss is
+        retried with backoff; ``subscriber_count=None`` seeds a channel
+        that never had one.'''
 
         member: str = f'i:{channel_id}'
         await self.redis.hset(
             'youtube:channel:tiers', channel_id, str(tier),
         )
-        await self.redis.hset(
-            self._meta_key(channel_id),
-            mapping={
-                'state': ChannelState.SCHEDULED.value,
-                'successful_scrapes': '0',
-            },
-        )
+        fields: dict[str, str] = {
+            'state': ChannelState.SCHEDULED.value,
+            'successful_scrapes': '0',
+        }
+        if subscriber_count is not None:
+            fields['subscriber_count'] = str(subscriber_count)
+        await self.redis.hset(self._meta_key(channel_id), mapping=fields)
         if schedule:
             await self.redis.zadd(self._scheduled_key(tier), {member: 0.0})
         return member
@@ -2258,3 +2287,306 @@ class TestMissingSubscriberBackoffState(_MissingSubscriberTestBase):
             record for record in records
             if record.getMessage() == 'Scheduling missing-subscriber retry'
         ]
+
+
+
+class TestUnpublishedSubscriberCount(_MissingSubscriberTestBase):
+    '''Channels that never had a subscriber count: one retry in the
+    catch-all tier, then the count is treated as not public.'''
+
+    DAY: int = 24 * 60 * 60
+    CATCH_ALL: int = 1
+    CATCH_ALL_INTERVAL: int = 7 * 24 * 60 * 60
+
+    def _progress(self, scrapes: int) -> ChannelScrapeProgress:
+        return ChannelScrapeProgress(
+            successful_scrapes=scrapes, next_full_scrape=1,
+        )
+
+    async def _field(self, channel_id: str, field: str) -> str | None:
+        return await self.redis.hget(self._meta_key(channel_id), field)
+
+    async def test_lua_path_retries_once_then_not_public(self) -> None:
+        queue: RedisChannelScrapeQueue = self._queue()
+        channel_id: str = 'UCtiny1'
+        await self._seed(channel_id, tier=0, subscriber_count=None)
+
+        await queue.update_tier(
+            channel_id, sub_count=None, now=1000.0,
+            progress=self._progress(0),
+        )
+        # First miss: one retry, in the catch-all tier, not tier 0.
+        self.assertIsNone(await self._score(channel_id, 0))
+        self.assertEqual(
+            await self._score(channel_id, self.CATCH_ALL),
+            1000.0 + self.DAY,
+        )
+        self.assertEqual(
+            await self.redis.hget('youtube:channel:tiers', channel_id),
+            str(self.CATCH_ALL),
+        )
+        self.assertEqual(await self._attempts(channel_id), '1')
+
+        with self.assertLogs(
+            'scrape_exchange.channel_scrape_queue', level='INFO',
+        ) as captured:
+            await queue.update_tier(
+                channel_id, sub_count=None, now=2000.0,
+                progress=self._progress(1),
+            )
+        # Second miss: not public, scheduled normally.
+        self.assertEqual(
+            await self._score(channel_id, self.CATCH_ALL),
+            2000.0 + self.CATCH_ALL_INTERVAL,
+        )
+        self.assertEqual(
+            await self._field(channel_id, 'subscriber_count_not_public'),
+            '2000',
+        )
+        self.assertIsNone(await self._attempts(channel_id))
+        self.assertIsNone(await self._field(channel_id, 'force_source'))
+        self.assertIsNone(
+            await self._field(channel_id, 'force_rescrape_mode'),
+        )
+        self.assertIn(
+            'Subscriber count not public',
+            [r.getMessage() for r in captured.records],
+        )
+
+    async def test_python_path_retries_once_then_not_public(self) -> None:
+        queue: RedisChannelScrapeQueue = self._queue()
+        channel_id: str = 'UCtiny2'
+        await self._seed(channel_id, tier=0, subscriber_count=None)
+
+        await queue.retry_missing_subscriber_count(
+            channel_id=channel_id, now=1000.0,
+        )
+        self.assertIsNone(await self._score(channel_id, 0))
+        self.assertEqual(
+            await self._score(channel_id, self.CATCH_ALL),
+            1000.0 + self.DAY,
+        )
+        self.assertEqual(await self._attempts(channel_id), '1')
+
+        await queue.retry_missing_subscriber_count(
+            channel_id=channel_id, now=2000.0,
+        )
+        self.assertEqual(
+            await self._score(channel_id, self.CATCH_ALL),
+            2000.0 + self.CATCH_ALL_INTERVAL,
+        )
+        self.assertEqual(
+            await self._field(channel_id, 'subscriber_count_not_public'),
+            '2000',
+        )
+        self.assertIsNone(await self._attempts(channel_id))
+        self.assertIsNone(await self._field(channel_id, 'force_source'))
+
+    async def test_stored_zero_counts_as_no_count(self) -> None:
+        queue: RedisChannelScrapeQueue = self._queue()
+        channel_id: str = 'UCzero'
+        await self._seed(channel_id, tier=0, subscriber_count=0)
+        await self.redis.hset(
+            self._meta_key(channel_id), 'missing_subscriber_attempts', '1',
+        )
+
+        await queue.update_tier(
+            channel_id, sub_count=None, now=1000.0,
+            progress=self._progress(0),
+        )
+        self.assertEqual(
+            await self._field(channel_id, 'subscriber_count_not_public'),
+            '1000',
+        )
+        self.assertIsNone(await self._score(channel_id, 0))
+
+    async def test_counted_channel_keeps_retrying_in_its_tier(self) -> None:
+        queue: RedisChannelScrapeQueue = self._queue()
+        channel_id: str = 'UCknown'
+        await self._seed(channel_id, tier=0, subscriber_count=2_000_000)
+        await self.redis.hset(
+            self._meta_key(channel_id), 'missing_subscriber_attempts', '3',
+        )
+
+        await queue.update_tier(
+            channel_id, sub_count=None, now=1000.0,
+            progress=self._progress(0),
+        )
+        self.assertEqual(
+            await self._score(channel_id, 0), 1000.0 + self.CATCH_ALL_INTERVAL,
+        )
+        self.assertEqual(await self._attempts(channel_id), '4')
+        self.assertIsNone(
+            await self._field(channel_id, 'subscriber_count_not_public'),
+        )
+
+    async def test_not_public_channel_is_not_retried_again(self) -> None:
+        queue: RedisChannelScrapeQueue = self._queue()
+        channel_id: str = 'UCyearly'
+        await self._seed(channel_id, tier=1, subscriber_count=None)
+        await self.redis.hset(
+            self._meta_key(channel_id),
+            'subscriber_count_not_public', '500',
+        )
+
+        await queue.update_tier(
+            channel_id, sub_count=None, now=1000.0,
+            progress=self._progress(0),
+        )
+        self.assertEqual(
+            await self._score(channel_id, self.CATCH_ALL),
+            1000.0 + self.CATCH_ALL_INTERVAL,
+        )
+        self.assertIsNone(await self._attempts(channel_id))
+
+        await queue.retry_missing_subscriber_count(
+            channel_id=channel_id, now=2000.0,
+        )
+        self.assertEqual(
+            await self._score(channel_id, self.CATCH_ALL),
+            2000.0 + self.CATCH_ALL_INTERVAL,
+        )
+        self.assertIsNone(await self._attempts(channel_id))
+
+    async def test_found_count_clears_not_public(self) -> None:
+        queue: RedisChannelScrapeQueue = self._queue()
+        channel_id: str = 'UCfound'
+        await self._seed(channel_id, tier=1, subscriber_count=None)
+        await self.redis.hset(
+            self._meta_key(channel_id),
+            'subscriber_count_not_public', '500',
+        )
+
+        await queue.update_tier(
+            channel_id, sub_count=2_000_000, now=1000.0,
+            progress=self._progress(0),
+        )
+        self.assertIsNone(
+            await self._field(channel_id, 'subscriber_count_not_public'),
+        )
+
+    async def test_found_count_clears_not_public_python_path(
+        self,
+    ) -> None:
+        queue: RedisChannelScrapeQueue = self._queue()
+        channel_id: str = 'UCfound2'
+        await self._seed(channel_id, tier=1, subscriber_count=None)
+        await self.redis.hset(
+            self._meta_key(channel_id),
+            'subscriber_count_not_public', '500',
+        )
+
+        await queue.update_tier(
+            channel_id, sub_count=2_000_000, now=1000.0,
+        )
+        self.assertIsNone(
+            await self._field(channel_id, 'subscriber_count_not_public'),
+        )
+
+
+class TestMovedState(_RedisQueueTestBase):
+    '''A channel that moved to another ID is terminal.'''
+
+    async def test_moved_is_terminal_and_unmark_clears_it(self) -> None:
+        self.assertIn(
+            ChannelState.MOVED, ChannelState.terminal_states(),
+        )
+        await self.queue.enqueue_new('UCold', source='test')
+        await self.queue.mark(
+            'i:UCold', state=ChannelState.MOVED,
+            extra={'moved_to': 'UCnew'},
+        )
+        self.assertEqual(
+            await self.queue.get_state('i:UCold'), ChannelState.MOVED,
+        )
+        record: str | None = await self.redis.hget(
+            'youtube:channel:moved', 'i:UCold',
+        )
+        assert record is not None
+        self.assertEqual(json.loads(record)['moved_to'], 'UCnew')
+        self.assertFalse(
+            await self.queue.enqueue_scheduled('UCold', source='test'),
+        )
+        await self.queue.unmark('i:UCold')
+        self.assertIsNone(
+            await self.redis.hget('youtube:channel:moved', 'i:UCold'),
+        )
+
+    async def test_marking_terminal_clears_moved(self) -> None:
+        await self.queue.enqueue_new('UCold', source='test')
+        await self.queue.mark('i:UCold', state=ChannelState.MOVED)
+        await self.queue.mark('i:UCold', state=ChannelState.REMOVED)
+        self.assertIsNone(
+            await self.redis.hget('youtube:channel:moved', 'i:UCold'),
+        )
+
+class TestListingCounts(_RedisQueueTestBase):
+    '''Per-tier video listing status counters.'''
+
+    async def _counts(self) -> dict[tuple[int, str], int]:
+        counts: dict[tuple[int, str], int] = (
+            await self.queue.count_listing()
+        )
+        return {key: n for key, n in counts.items() if n}
+
+    async def test_new_channel_progresses_to_complete(self) -> None:
+        self.assertEqual(
+            await self.queue.enqueue_new('UCa', source='test'),
+            'enqueued',
+        )
+        self.assertEqual(await self._counts(), {(0, 'never_scraped'): 1})
+        progress: ChannelScrapeProgress = (
+            await self.queue.get_scrape_progress('UCa', existing=False)
+        )
+        self.assertEqual(await self._counts(), {(0, 'never_scraped'): 1})
+        self.assertTrue(await self.queue.update_tier(
+            'UCa', sub_count=50, now=time.time(), progress=progress,
+        ))
+        self.assertEqual(await self._counts(), {(4, 'partial'): 1})
+        await self.queue.set_meta(
+            'i:UCa', video_ids_enumerated_at=str(int(time.time())),
+        )
+        self.assertEqual(await self._counts(), {(4, 'complete'): 1})
+
+    async def test_pre_tracking_channel_becomes_partial(self) -> None:
+        await self.redis.hset('youtube:channel:meta:i:UCold', mapping={
+            'state': 'scheduled', 'last_attempt_at': '1',
+        })
+        await self.redis.hset('youtube:channel:tiers', 'UCold', '2')
+        await self.queue.recount_listing('i:UCold')
+        self.assertEqual(await self._counts(), {(2, 'pre_tracking'): 1})
+        await self.queue.get_scrape_progress('UCold', existing=True)
+        self.assertEqual(await self._counts(), {(2, 'partial'): 1})
+
+    async def test_terminal_channels_are_not_counted(self) -> None:
+        await self.queue.enqueue_new('UCa', source='test')
+        await self.queue.mark('i:UCa', state=ChannelState.TOPIC)
+        self.assertEqual(await self._counts(), {})
+        self.assertIsNone(await self.redis.hget(
+            'youtube:channel:meta:i:UCa', 'listing_bucket',
+        ))
+        await self.queue.unmark('i:UCa')
+        self.assertEqual(await self._counts(), {(0, 'never_scraped'): 1})
+
+    async def test_force_rescrape_revives_count(self) -> None:
+        await self.queue.enqueue_new('UCa', source='test')
+        await self.queue.mark('i:UCa', state=ChannelState.REMOVED)
+        await self.queue.force_rescrape('i:UCa', mode='full')
+        self.assertEqual(await self._counts(), {(0, 'never_scraped'): 1})
+
+    async def test_handles_are_not_counted(self) -> None:
+        await self.queue.enqueue_unresolved('@someone', source='test')
+        await self.queue.recount_listing('h:someone')
+        self.assertEqual(await self._counts(), {})
+        await self.queue.promote_to_scheduled('someone', 'UCx')
+        self.assertEqual(await self._counts(), {(0, 'never_scraped'): 1})
+
+    async def test_recount_heals_unhooked_write(self) -> None:
+        await self.queue.enqueue_new('UCa', source='test')
+        await self.redis.hset(
+            'youtube:channel:meta:i:UCa', 'successful_scrapes', '3',
+        )
+        self.assertEqual(await self._counts(), {(0, 'never_scraped'): 1})
+        await self.queue.recount_listing('i:UCa')
+        await self.queue.recount_listing('i:UCa')
+        self.assertEqual(await self._counts(), {(0, 'partial'): 1})

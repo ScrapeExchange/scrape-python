@@ -46,6 +46,7 @@ RSS_SUPPRESSING_STATES: frozenset[ChannelState] = (
         ChannelState.TOPIC,
         ChannelState.NO_VIDEOS,
         ChannelState.LOW_SUBS,
+        ChannelState.MOVED,
     })
 )
 

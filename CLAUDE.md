@@ -1,5 +1,6 @@
 read settings, connectionstrings from LOCAL.md if the file exists.
 remember conversations about this code base and repo between sessions
+when creating a new branch, use feature/<feature-name> or bug/<bug-name>
 only use subagents if the user explicitly request them
 use uv for python package management
 use unittest for testing instead of pytest
@@ -32,7 +33,6 @@ The CreatorSettings, VideoSettings classes in the scraping tools are derived fro
 for linting, don't generate lines longer than 80 characters
 always specify typing when using variables
 assume that the scraping tools will be used by others with no knowledge of the code base, and keep the tools easy to use for them
-The number of proxies available in production is 18
 terminology: each supervisor with num_processes>1 launches a number of worker processes (aka workers), each worker process launching concurrency amount of asyncio tasks (aka tasks)
 The YouTube video model is scrape_exchange/youtube/youtube_video.py, which defines the structure of a YouTube video object and includes methods for scraping video details and saving them to files.
 The YouTube channel model is scrape_exchange/youtube/youtube_channel.py, which defines the structure of a YouTube channel object and includes methods for scraping channel details and saving them to files.

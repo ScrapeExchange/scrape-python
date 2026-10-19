@@ -281,6 +281,47 @@ class TestExtractChannels(unittest.TestCase):
             ],
         )
 
+    @staticmethod
+    def _channel_result(sub_text: str, count: dict) -> dict:
+        '''A channel search result as YouTube returns it today: the
+        handle in subscriberCountText, the count in videoCountText.'''
+        return {
+            'channelRenderer': {
+                'channelId': 'UC22BdTgxefuvUivrjesETjg',
+                'subscriberCountText': {'simpleText': sub_text},
+                'videoCountText': count,
+                'navigationEndpoint': {
+                    'browseEndpoint': {
+                        'browseId': 'UC22BdTgxefuvUivrjesETjg',
+                        'canonicalBaseUrl': '/@HistoryMatters',
+                    },
+                },
+            },
+        }
+
+    def test_count_read_from_video_count_text_in_market_language(
+        self,
+    ) -> None:
+        payload: dict = self._channel_result(
+            '@HistoryMatters',
+            {'simpleText': '41,8\xa0tys.\xa0subskrybentów'},
+        )
+        channels: list = extract_channels(payload, hl='pl')
+        self.assertEqual(channels[0].subscriber_count, 41_800)
+
+    def test_count_from_runs_text(self) -> None:
+        payload: dict = self._channel_result(
+            '@HistoryMatters',
+            {'runs': [{'text': '4.18'}, {'text': '万位订阅者'}]},
+        )
+        channels: list = extract_channels(payload, hl='zh-CN')
+        self.assertEqual(channels[0].subscriber_count, 41_800)
+
+    def test_no_count_shown_is_unknown(self) -> None:
+        payload: dict = self._channel_result('@HistoryMatters', {})
+        channels: list = extract_channels(payload, hl='th')
+        self.assertIsNone(channels[0].subscriber_count)
+
     def test_extracts_owner_browse_endpoint_from_video_result(self) -> None:
         payload = {
             'videoRenderer': {

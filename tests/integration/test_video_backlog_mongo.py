@@ -82,6 +82,7 @@ class TestVideoBacklogMongo(unittest.IsolatedAsyncioTestCase):
         entries: list = await self.queue.pop_entries(10)
         self.assertEqual(len(entries), 2)
         await self.queue.complete(entries[0].video_id)
+        await self.queue.flush()
         await self.queue.mark(
             entries[1].video_id, state=VideoState.FAILED, last_error='x',
         )

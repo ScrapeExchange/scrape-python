@@ -44,6 +44,7 @@ from scrape_exchange.handle_map import NullHandleMap, RedisHandleMap
 from scrape_exchange.youtube.channel_identity import (
     ChannelIdentityStore,
     ChannelNotFoundError,
+    ChannelRedirectedError,
     ChannelTerminatedError,
     InconsistentIdentityError,
     is_valid_channel_handle,
@@ -85,6 +86,7 @@ from scrape_exchange.creator_queue import (
     parse_priority_queues,
 )
 from scrape_exchange.channel_scrape_queue import (
+    LISTING_STATUSES,
     VIDEO_IDS_ENUMERATED_FIELD,
     ChannelScrapeProgress,
     ChannelScrapeQueueSettings,
@@ -463,6 +465,15 @@ CHANNEL_QUEUE_TIER_SIZE_NEW: Gauge = Gauge(
     'channel_queue_tier_size',
     'Number of channels in each scheduled tier.',
     ['tier'],
+    multiprocess_mode='mostrecent',
+)
+CHANNEL_VIDEO_LISTING_STATUS: Gauge = Gauge(
+    'channel_video_listing_status',
+    'Active (scheduled) channels per tier by how completely their '
+    'video IDs have been listed: complete (every tab paged to the '
+    'end), partial (scraped, not yet fully listed), pre_tracking '
+    '(last scraped before progress tracking) and never_scraped.',
+    ['tier', 'status'],
     multiprocess_mode='mostrecent',
 )
 CHANNEL_RESOLVE_OUTCOMES: Counter = Counter(
@@ -1262,9 +1273,9 @@ async def _publish_channel_queue_sizes(
     interval: float = 30.0,
     shutdown_event: asyncio.Event,
 ) -> None:
-    '''Publish gauges for channel_state_size and
-    channel_queue_tier_size. Run on a single
-    elected worker per host.'''
+    '''Publish gauges for channel_state_size,
+    channel_queue_tier_size and channel_video_listing_status.
+    Run on a single elected worker per host.'''
     while not shutdown_event.is_set():
         try:
             counts: dict[ChannelState, int] = (
@@ -1281,6 +1292,18 @@ async def _publish_channel_queue_sizes(
                 CHANNEL_QUEUE_TIER_SIZE_NEW.labels(
                     tier=str(tier + 1),
                 ).set(n)
+            listing: dict[tuple[int, str], int] = (
+                await queue.count_listing()
+            )
+            tiers: set[int] = set(tier_counts) | {
+                tier for tier, _ in listing
+            }
+            status: str
+            for tier in tiers:
+                for status in LISTING_STATUSES:
+                    CHANNEL_VIDEO_LISTING_STATUS.labels(
+                        tier=str(tier + 1), status=status,
+                    ).set(listing.get((tier, status), 0))
         except Exception:
             logging.warning(
                 'channel queue metrics publish '
@@ -2238,6 +2261,47 @@ async def _scrape_one_queued(
                     outcome='not_found',
                 ).inc()
             return
+        except ChannelRedirectedError as exc:
+            target: str = exc.target_channel_id
+            if exc.to_system_page:
+                # Folded into a YouTube system page (e.g. the Movies &
+                # TV store): no creator channel to follow.
+                await queue.mark(
+                    member,
+                    state=ChannelState.REMOVED,
+                    last_error=str(exc),
+                    note='redirects to a YouTube system page',
+                    extra={'redirected_to': target},
+                )
+                CHANNEL_SCRAPE_OUTCOMES.labels(
+                    outcome='redirected_system_page',
+                ).inc()
+                return
+            # YouTube redirects this ID to the channel's new ID: queue
+            # the new one (if unknown) and record where this one went.
+            try:
+                await queue.enqueue_new(target, source='channel_redirect')
+            except Exception:
+                logging.warning(
+                    'Could not queue the channel a redirect points to',
+                    exc_info=True,
+                    extra=extra | {'moved_to': target},
+                )
+            await queue.mark(
+                member,
+                state=ChannelState.MOVED,
+                last_error=str(exc),
+                extra={'moved_to': target},
+            )
+            CHANNEL_SCRAPE_OUTCOMES.labels(
+                outcome='moved',
+            ).inc()
+            if force_mode:
+                CHANNEL_FORCE_RESCRAPE_TOTAL.labels(
+                    mode=force_mode,
+                    outcome='moved',
+                ).inc()
+            return
         except ChannelTerminatedError as exc:
             await queue.mark(
                 member,
@@ -2334,10 +2398,25 @@ async def _scrape_one_queued(
             # make their newest videos 'known' before the first full
             # scrape has enumerated the back catalogue.
             await _add_channel_to_rss_queue(settings, fm, channel, extra)
+        count_outcome: str = 'scraped'
         if channel.subscriber_count is None:
+            # The queue decided between a retry and 'not public'; a
+            # retry leaves force_source set, 'not public' clears it.
+            after: dict[str, str] = await queue.get_meta(member)
+            not_public: bool = (
+                'subscriber_count_not_public' in after
+                and after.get('force_source') != 'missing_subscriber_count'
+            )
+            count_outcome = (
+                'subscriber_count_not_public' if not_public
+                else 'subscriber_count_missing'
+            )
             logging.info(
                 'Channel scrape completed without subscriber count; '
-                'scheduling a metadata refresh',
+                + (
+                    'count not public, scheduled normally' if not_public
+                    else 'scheduling a metadata refresh'
+                ),
                 extra=extra,
             )
         elif force_mode:
@@ -2349,8 +2428,7 @@ async def _scrape_one_queued(
             ).inc()
         CHANNEL_SCRAPE_OUTCOMES.labels(
             outcome=(
-                'subscriber_count_missing'
-                if channel.subscriber_count is None else 'scraped'
+                count_outcome
             ),
         ).inc()
         full_outcome = 'success'
