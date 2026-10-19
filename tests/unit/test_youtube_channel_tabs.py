@@ -1586,3 +1586,98 @@ class TestScrapeContent(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def _alert_response(text: str, *, kind: str = 'ERROR', runs: bool = False,
+                    ) -> dict:
+    '''A browse response for a channel YouTube no longer shows: an
+    alert and no tabs.'''
+    text_obj: dict = (
+        {'runs': [{'text': part} for part in text.split(' ', 1)]}
+        if runs else {'simpleText': text}
+    )
+    return {
+        'alerts': [{'alertRenderer': {'type': kind, 'text': text_obj}}],
+        'contents': {},
+    }
+
+
+class TestChannelAlerts(unittest.IsolatedAsyncioTestCase):
+    '''A channel YouTube removed or never had is reported as such
+    instead of as a tab extraction failure.'''
+
+    REMOVED: str = (
+        'This channel was removed because it violated our Community '
+        'Guidelines.'
+    )
+
+    async def _browse(self, response: dict) -> None:
+        tabs = YouTubeChannelTabs(CHANNEL_ID)
+        tabs._browse = AsyncMock(return_value=response)
+        await tabs.browse_channel()
+
+    async def test_removed_channel_is_terminated(self) -> None:
+        from scrape_exchange.youtube.channel_errors import (
+            ChannelTerminatedError,
+        )
+        with self.assertRaises(ChannelTerminatedError):
+            await self._browse(_alert_response(self.REMOVED))
+
+    async def test_copyright_termination_is_terminated(self) -> None:
+        from scrape_exchange.youtube.channel_errors import (
+            ChannelTerminatedError,
+        )
+        with self.assertRaises(ChannelTerminatedError):
+            await self._browse(_alert_response(
+                'This account has been terminated because we received '
+                'multiple third-party claims of copyright infringement '
+                'regarding material the user posted.',
+            ))
+
+    async def test_missing_channel_is_not_found(self) -> None:
+        from scrape_exchange.youtube.channel_errors import (
+            ChannelNotFoundError,
+        )
+        with self.assertRaises(ChannelNotFoundError):
+            await self._browse(
+                _alert_response('This channel does not exist.'),
+            )
+
+    async def test_alert_text_in_runs(self) -> None:
+        from scrape_exchange.youtube.channel_errors import (
+            ChannelTerminatedError,
+        )
+        with self.assertRaises(ChannelTerminatedError):
+            await self._browse(_alert_response(self.REMOVED, runs=True))
+
+    async def test_get_page_tabs_reports_alert_too(self) -> None:
+        from scrape_exchange.youtube.channel_errors import (
+            ChannelTerminatedError,
+        )
+        tabs = YouTubeChannelTabs(CHANNEL_ID)
+        tabs._browse = AsyncMock(
+            return_value=_alert_response(self.REMOVED),
+        )
+        with self.assertRaises(ChannelTerminatedError):
+            await tabs.get_page_tabs()
+
+    async def test_non_error_alert_keeps_runtime_error(self) -> None:
+        with self.assertRaises(RuntimeError):
+            await self._browse(
+                _alert_response(self.REMOVED, kind='INFO'),
+            )
+
+    async def test_unknown_error_text_keeps_runtime_error(self) -> None:
+        with self.assertRaises(RuntimeError):
+            await self._browse(_alert_response('Something went wrong.'))
+
+    def test_identity_module_reexports_same_classes(self) -> None:
+        from scrape_exchange.youtube import channel_errors, channel_identity
+        self.assertIs(
+            channel_identity.ChannelNotFoundError,
+            channel_errors.ChannelNotFoundError,
+        )
+        self.assertIs(
+            channel_identity.ChannelTerminatedError,
+            channel_errors.ChannelTerminatedError,
+        )

@@ -12,19 +12,15 @@ import re
 from scrape_exchange.creator_map import CreatorMap
 from scrape_exchange.handle_map import HandleMap
 from scrape_exchange.youtube.youtube_channel import YouTubeChannel
+from scrape_exchange.youtube.channel_errors import (  # noqa: F401
+    ChannelNotFoundError,
+    ChannelTerminatedError,
+)
 
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 
-class ChannelNotFoundError(LookupError):
-    '''Raised when a YouTube channel cannot be found
-    via InnerTube (HTTP 404 / empty response).'''
-
-
-class ChannelTerminatedError(Exception):
-    '''Raised when InnerTube returns the
-    "channel terminated by YouTube" sentinel.'''
 
 
 class InvalidHandleError(ValueError):

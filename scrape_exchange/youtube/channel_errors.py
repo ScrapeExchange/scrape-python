@@ -1,0 +1,83 @@
+'''
+Errors for YouTube channels that YouTube no longer shows, and the
+classification of the error alert InnerTube returns for them.
+
+Kept free of other scrape_exchange imports so both the InnerTube tab
+scraper and the channel identity store can use them without an import
+cycle; :mod:`scrape_exchange.youtube.channel_identity` re-exports the
+classes.
+
+:maintainer : Boinko <boinko@scrape.exchange>
+:copyright  : Copyright 2026
+:license    : GPLv3
+'''
+
+from typing import Any
+
+
+class ChannelNotFoundError(LookupError):
+    '''Raised when a YouTube channel cannot be found
+    via InnerTube (HTTP 404 / empty response).'''
+
+
+class ChannelTerminatedError(Exception):
+    '''Raised when InnerTube returns the
+    "channel terminated by YouTube" sentinel.'''
+
+
+# Phrases of the ERROR alert InnerTube returns instead of channel tabs.
+# The scraper's InnerTube clients request English.
+_TERMINATED_PHRASES: tuple[str, ...] = (
+    'removed because it violated',
+    'has been terminated',
+)
+_NOT_FOUND_PHRASES: tuple[str, ...] = (
+    'does not exist',
+    'is not available',
+)
+
+
+def _alert_text(alert: dict[str, Any]) -> str:
+    text: Any = alert.get('text') or {}
+    if not isinstance(text, dict):
+        return ''
+    simple: Any = text.get('simpleText')
+    if isinstance(simple, str):
+        return simple
+    return ''.join(
+        str(run.get('text', '')) for run in text.get('runs', []) or []
+        if isinstance(run, dict)
+    )
+
+
+def raise_for_channel_alert(
+    channel_data: dict[str, Any], channel_id: str | None,
+) -> None:
+    '''Raise the matching error when *channel_data* (an InnerTube
+    channel browse response) carries an ERROR alert saying the channel
+    was removed or does not exist; return otherwise.
+
+    :raises ChannelTerminatedError: the channel was removed or its
+        account terminated
+    :raises ChannelNotFoundError: the channel does not exist or is not
+        available
+    '''
+    alerts: Any = channel_data.get('alerts') or []
+    if not isinstance(alerts, list):
+        return
+    entry: Any
+    for entry in alerts:
+        if not isinstance(entry, dict):
+            continue
+        alert: Any = (
+            entry.get('alertRenderer')
+            or entry.get('alertWithButtonRenderer')
+        )
+        if not isinstance(alert, dict) or alert.get('type') != 'ERROR':
+            continue
+        text: str = _alert_text(alert)
+        lowered: str = text.lower()
+        if any(phrase in lowered for phrase in _TERMINATED_PHRASES):
+            raise ChannelTerminatedError(f'{channel_id}: {text}')
+        if any(phrase in lowered for phrase in _NOT_FOUND_PHRASES):
+            raise ChannelNotFoundError(f'{channel_id}: {text}')
