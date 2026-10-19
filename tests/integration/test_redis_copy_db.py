@@ -90,5 +90,32 @@ class TestRedisCopyDb(unittest.TestCase):
         self.assertEqual(self.tgt.dbsize(), 0)
 
 
+    def test_big_bloom_filter_is_copied_in_chunks(self) -> None:
+        # Large enough to exceed big_key_bytes, so it takes the
+        # BF.SCANDUMP / BF.LOADCHUNK path instead of MIGRATE.
+        self.src.execute_command(
+            'BF.RESERVE', 'bigbf', '0.001', '200000',
+        )
+        self.src.execute_command(
+            'BF.MADD', 'bigbf', *[f'id{i}' for i in range(1000)],
+        )
+        self.assertGreater(self.src.memory_usage('bigbf'), 50_000)
+        self.assertEqual(run(_settings()), 0)
+        self.assertEqual(
+            self.tgt.execute_command('BF.MEXISTS', 'bigbf', 'id7', 'nope'),
+            [1, 0],
+        )
+        self.assertEqual(
+            run(_settings(mode='verify', sample_size=10_000)), 0,
+        )
+
+    def test_resume_with_skip_existing(self) -> None:
+        self.assertEqual(run(_settings()), 0)
+        i: int
+        for i in range(0, 2000, 2):
+            self.tgt.delete(f'h:{i}')
+        self.assertEqual(run(_settings(skip_existing=True)), 0)
+        self.assertEqual(self.tgt.dbsize(), self.src.dbsize())
+
 if __name__ == '__main__':
     unittest.main()

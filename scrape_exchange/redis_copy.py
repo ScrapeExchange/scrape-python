@@ -130,9 +130,63 @@ def _migrate(
         stats.copied += len(keys)
 
 
+def _copy_bloom(
+    source: redis.Redis,
+    target_client: redis.Redis,
+    key: str,
+    stats: CopyStats,
+) -> None:
+    '''Copy a Bloom filter chunk by chunk with BF.SCANDUMP and
+    BF.LOADCHUNK. A big filter does not fit in one MIGRATE payload:
+    Redis rejects values above proto-max-bulk-len (512 MB by default)
+    and the source would build the whole payload in memory.'''
+    if target_client.exists(key):
+        stats.failed.append(key)
+        raise MigrateError(f'BUSYKEY {key} already exists in the target')
+    iterator: int = 0
+    while True:
+        try:
+            reply: list[Any] = source.execute_command(
+                'BF.SCANDUMP', key, iterator,
+            )
+        except redis.ResponseError:
+            if not source.exists(key):
+                stats.skipped += 1
+                return
+            raise
+        iterator = int(reply[0])
+        if iterator == 0:
+            break
+        target_client.execute_command(
+            'BF.LOADCHUNK', key, iterator, reply[1],
+        )
+    ttl_ms: int = int(source.pttl(key))
+    if ttl_ms > 0:
+        target_client.pexpire(key, ttl_ms)
+    stats.copied += 1
+
+
+def _drop_existing(
+    target_client: redis.Redis, keys: list[str], stats: CopyStats,
+) -> list[str]:
+    '''The *keys* not yet in the target; the others count as
+    skipped. Lets a copy that stopped partway be resumed.'''
+    pipe: Any = target_client.pipeline(transaction=False)
+    key: str
+    for key in keys:
+        pipe.exists(key)
+    present: list[int] = pipe.execute()
+    missing: list[str] = [
+        key for key, found in zip(keys, present) if not found
+    ]
+    stats.skipped += len(keys) - len(missing)
+    return missing
+
+
 def _copy_keys(
     source: redis.Redis,
     target: Endpoint,
+    target_client: redis.Redis,
     keys: list[str],
     stats: CopyStats,
     *,
@@ -140,9 +194,14 @@ def _copy_keys(
     timeout_ms: int,
     big_key_bytes: int,
     big_key_timeout_ms: int,
+    skip_existing: bool,
 ) -> None:
     '''Copy *keys*: small ones in MIGRATE batches, big ones one at a
-    time with the longer timeout.'''
+    time with the longer timeout, big Bloom filters in chunks.'''
+    if skip_existing:
+        keys = _drop_existing(target_client, keys, stats)
+        if not keys:
+            return
     # One round trip for the sizes of all keys: a call per key would
     # add a network round trip per key to the downtime.
     pipe: Any = source.pipeline(transaction=False)
@@ -157,7 +216,10 @@ def _copy_keys(
     for batch in batches:
         _migrate(source, target, batch, timeout_ms, stats)
     for key in big:
-        _migrate(source, target, [key], big_key_timeout_ms, stats)
+        if _decode(source.type(key)) == 'MBbloom--':
+            _copy_bloom(source, target_client, key, stats)
+        else:
+            _migrate(source, target, [key], big_key_timeout_ms, stats)
 
 
 def copy_all(
@@ -170,32 +232,45 @@ def copy_all(
     big_key_bytes: int,
     big_key_timeout_ms: int,
     allow_nonempty: bool = False,
+    skip_existing: bool = False,
     limit: int | None = None,
+    collect_keys: bool = False,
     progress: Callable[[CopyStats], None] | None = None,
 ) -> tuple[CopyStats, list[str]]:
     '''Copy every key of *source* (or the first *limit* keys) into
-    *target*. Keys that expire before they are copied are counted as
-    skipped.
+    *target*. Keys that expire before they are copied, and with
+    *skip_existing* keys already in the target, count as skipped.
 
-    :returns: the statistics and the keys sent to MIGRATE.
-    :raises ValueError: the target database is not empty and
-        *allow_nonempty* is false.
+    :returns: the statistics, and the keys handled when *collect_keys*
+        is true (an empty list otherwise: a full copy would hold
+        millions of key names in memory).
+    :raises ValueError: the target database is not empty and neither
+        *allow_nonempty* nor *skip_existing* is set.
     :raises MigrateError: a MIGRATE call failed.
     '''
-    if not allow_nonempty and target_client.dbsize():
+    if (
+        not (allow_nonempty or skip_existing)
+        and target_client.dbsize()
+    ):
         raise ValueError('target database is not empty')
     stats: CopyStats = CopyStats()
     sent: list[str] = []
     started: float = time.monotonic()
     pending: list[str] = []
+    handled: int = 0
 
     def _flush() -> None:
+        nonlocal handled
         _copy_keys(
-            source, target, pending, stats, batch_size=batch_size,
-            timeout_ms=timeout_ms, big_key_bytes=big_key_bytes,
+            source, target, target_client, pending, stats,
+            batch_size=batch_size, timeout_ms=timeout_ms,
+            big_key_bytes=big_key_bytes,
             big_key_timeout_ms=big_key_timeout_ms,
+            skip_existing=skip_existing,
         )
-        sent.extend(pending)
+        handled += len(pending)
+        if collect_keys:
+            sent.extend(pending)
         pending.clear()
         stats.seconds = time.monotonic() - started
         if progress is not None:
@@ -206,7 +281,7 @@ def copy_all(
         if isinstance(key, bytes):
             key = key.decode()
         pending.append(key)
-        if limit is not None and len(sent) + len(pending) >= limit:
+        if limit is not None and handled + len(pending) >= limit:
             break
         if len(pending) >= batch_size:
             _flush()
@@ -214,6 +289,16 @@ def copy_all(
         _flush()
     stats.seconds = time.monotonic() - started
     return stats, sent
+
+
+def dbsize_ok(
+    source_keys: int, target_keys: int, *, tolerance: float,
+) -> bool:
+    '''Whether the target holds as many keys as the source, allowing
+    *tolerance* (a fraction) fewer for keys that expired meanwhile.'''
+    return (
+        source_keys * (1.0 - tolerance) <= target_keys <= source_keys
+    )
 
 
 def sample_copy(
@@ -234,7 +319,7 @@ def sample_copy(
         source, target, target_client, batch_size=batch_size,
         timeout_ms=timeout_ms, big_key_bytes=big_key_bytes,
         big_key_timeout_ms=big_key_timeout_ms,
-        allow_nonempty=allow_nonempty, limit=size,
+        allow_nonempty=allow_nonempty, limit=size, collect_keys=True,
     )
     start: int
     for start in range(0, len(sent), batch_size):

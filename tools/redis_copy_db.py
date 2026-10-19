@@ -35,6 +35,7 @@ from scrape_exchange.redis_copy import (
     VerifyReport,
     check_distinct,
     copy_all,
+    dbsize_ok,
     endpoint_from_dsn,
     sample_copy,
     verify,
@@ -81,6 +82,20 @@ class CopySettings(BaseSettings):
         default=False,
         description='Allow copying into a database that has keys.',
     )
+    skip_existing: bool = Field(
+        default=False,
+        description=(
+            'Skip keys already in the target, to resume a copy that '
+            'stopped partway.'
+        ),
+    )
+    dbsize_tolerance: float = Field(
+        default=0.001, ge=0.0, lt=1.0,
+        description=(
+            'Verify: fraction of source keys the target may lack '
+            '(keys that expired after the copy).'
+        ),
+    )
 
 
 def _progress_printer(total: int) -> Callable[[CopyStats], None]:
@@ -101,9 +116,13 @@ def _progress_printer(total: int) -> Callable[[CopyStats], None]:
 
 def _verify(
     source: redis.Redis, target_client: redis.Redis, sample_size: int,
+    tolerance: float,
 ) -> int:
     report: VerifyReport = verify(
         source, target_client, sample_size=sample_size,
+    )
+    counts_ok: bool = dbsize_ok(
+        report.source_dbsize, report.target_dbsize, tolerance=tolerance,
     )
     print(
         f'source keys {report.source_dbsize} target keys '
@@ -113,7 +132,9 @@ def _verify(
     key: str
     for key in report.mismatches[:20]:
         print(f'  mismatch: {key}')
-    return 1 if report.mismatches else 0
+    if not counts_ok:
+        print('key counts differ by more than the tolerance')
+    return 1 if report.mismatches or not counts_ok else 0
 
 
 def run(settings: CopySettings) -> int:
@@ -128,7 +149,10 @@ def run(settings: CopySettings) -> int:
     source: redis.Redis = redis.Redis.from_url(source_url)
     target_client: redis.Redis = redis.Redis.from_url(target_url)
     if settings.mode == 'verify':
-        return _verify(source, target_client, settings.sample_size)
+        return _verify(
+            source, target_client, settings.sample_size,
+            settings.dbsize_tolerance,
+        )
     common: dict[str, int] = dict(
         batch_size=settings.batch_size, timeout_ms=settings.timeout_ms,
         big_key_bytes=settings.big_key_bytes,
@@ -150,6 +174,7 @@ def run(settings: CopySettings) -> int:
         stats, _ = copy_all(
             source, target, target_client,
             allow_nonempty=settings.allow_nonempty,
+            skip_existing=settings.skip_existing,
             progress=_progress_printer(int(source.dbsize())), **common,
         )
     except ValueError as exc:

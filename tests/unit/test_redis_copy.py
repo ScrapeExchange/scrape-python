@@ -7,7 +7,7 @@ Unit tests for scrape_exchange.redis_copy.
 '''
 
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import fakeredis
 import redis
@@ -146,7 +146,9 @@ class TestCopyAll(unittest.TestCase):
 
     def test_copies_in_batches(self) -> None:
         src: MagicMock = _source(['a', 'b', 'c'], [b'OK', b'OK'])
-        stats, sent = copy_all(src, EP, _target(), **KW)
+        stats, sent = copy_all(
+            src, EP, _target(), collect_keys=True, **KW,
+        )
         self.assertEqual((stats.copied, stats.skipped), (3, 0))
         self.assertEqual(sent, ['a', 'b', 'c'])
         first: tuple = src.execute_command.call_args_list[0].args
@@ -190,7 +192,9 @@ class TestCopyAll(unittest.TestCase):
 
     def test_limit_stops_early(self) -> None:
         src: MagicMock = _source(['a', 'b', 'c', 'd'], [b'OK'])
-        stats, sent = copy_all(src, EP, _target(), limit=2, **KW)
+        stats, sent = copy_all(
+            src, EP, _target(), limit=2, collect_keys=True, **KW,
+        )
         self.assertEqual(sent, ['a', 'b'])
 
 
@@ -261,6 +265,107 @@ class TestCliSettings(unittest.TestCase):
             target_dsn='redis://localhost:6379/3',
         )
         self.assertEqual(run(settings), 2)
+
+
+class TestCopyFixes(unittest.TestCase):
+
+    def test_big_bloom_filter_is_copied_in_chunks(self) -> None:
+        src: MagicMock = _source(['bf'], [], size=1000)
+        src.type.return_value = b'MBbloom--'
+        src.pttl.return_value = -1
+        dumps: dict = {0: [1, b'hdr'], 1: [2, b'bits'], 2: [0, b'']}
+        src.execute_command.side_effect = (
+            lambda cmd, key, it: dumps[it]
+        )
+        tgt: MagicMock = _target()
+        tgt.exists.return_value = 0
+        stats, _ = copy_all(src, EP, tgt, **KW)
+        self.assertEqual(stats.copied, 1)
+        loads: list = [
+            c.args for c in tgt.execute_command.call_args_list
+        ]
+        self.assertEqual(loads, [
+            ('BF.LOADCHUNK', 'bf', 1, b'hdr'),
+            ('BF.LOADCHUNK', 'bf', 2, b'bits'),
+        ])
+
+    def test_big_bloom_filter_already_in_target_stops(self) -> None:
+        src: MagicMock = _source(['bf'], [], size=1000)
+        src.type.return_value = b'MBbloom--'
+        tgt: MagicMock = _target()
+        tgt.exists.return_value = 1
+        with self.assertRaises(MigrateError):
+            copy_all(src, EP, tgt, **KW)
+
+    def test_skip_existing_leaves_target_keys_alone(self) -> None:
+        src: MagicMock = _source(['a', 'b'], [b'OK'])
+        tgt: MagicMock = _target(1)
+        tgt.pipeline.return_value.execute.return_value = [1, 0]
+        stats, _ = copy_all(
+            src, EP, tgt, allow_nonempty=True, skip_existing=True, **KW,
+        )
+        self.assertEqual((stats.copied, stats.skipped), (1, 1))
+        self.assertEqual(
+            src.execute_command.call_args.args[-2:], ('KEYS', 'b'),
+        )
+
+    def test_full_copy_does_not_keep_key_names(self) -> None:
+        src: MagicMock = _source(['a', 'b', 'c'], [b'OK', b'OK'])
+        stats, sent = copy_all(src, EP, _target(), **KW)
+        self.assertEqual(stats.copied, 3)
+        self.assertEqual(sent, [])
+
+
+class TestVerifyCounts(unittest.TestCase):
+
+    def test_counts_within_tolerance(self) -> None:
+        from scrape_exchange.redis_copy import dbsize_ok
+
+        self.assertTrue(dbsize_ok(100_000, 99_950, tolerance=0.001))
+
+    def test_too_few_target_keys(self) -> None:
+        from scrape_exchange.redis_copy import dbsize_ok
+
+        self.assertFalse(dbsize_ok(100_000, 99_000, tolerance=0.001))
+
+    def test_more_target_keys_than_source(self) -> None:
+        from scrape_exchange.redis_copy import dbsize_ok
+
+        self.assertFalse(dbsize_ok(100, 101, tolerance=0.001))
+
+
+class TestCliVerify(unittest.TestCase):
+
+    def _run_verify(self, target_keys: int) -> int:
+        from tools.redis_copy_db import CopySettings, run
+
+        src: fakeredis.FakeRedis = fakeredis.FakeRedis(
+            server=fakeredis.FakeServer(),
+        )
+        tgt: fakeredis.FakeRedis = fakeredis.FakeRedis(
+            server=fakeredis.FakeServer(),
+        )
+        i: int
+        for i in range(1000):
+            src.set(f'k{i}', 'v')
+        for i in range(target_keys):
+            tgt.set(f'k{i}', 'v')
+        settings: CopySettings = CopySettings(
+            _cli_parse_args=[], mode='verify', sample_size=1,
+            source_dsn='redis://localhost:6379/0',
+            target_dsn='redis://localhost:6380/1',
+        )
+        with patch(
+            'tools.redis_copy_db.redis.Redis.from_url',
+            side_effect=[src, tgt],
+        ):
+            return run(settings)
+
+    def test_verify_passes_on_equal_counts(self) -> None:
+        self.assertEqual(self._run_verify(1000), 0)
+
+    def test_verify_fails_when_target_misses_keys(self) -> None:
+        self.assertEqual(self._run_verify(900), 1)
 
 
 if __name__ == '__main__':
