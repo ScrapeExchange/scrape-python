@@ -97,9 +97,9 @@ class TestBacklog(_Base):
         )
         self.assertEqual(changed, 1)
         self.assertEqual(
-            await self.backlog.hot_page('', 10), ['hot', 'old'],
+            sorted([vid async for vid in self.backlog.iter_hot_ids()]),
+            ['hot', 'old'],
         )
-        self.assertEqual(await self.backlog.hot_page('hot', 10), ['old'])
 
     async def test_ensure_indexes(self) -> None:
         await self.backlog.ensure_indexes()
@@ -108,14 +108,85 @@ class TestBacklog(_Base):
             info['state_enqueued_at']['key'],
             [('state', 1), ('enqueued_at', 1)],
         )
-        self.assertEqual(info['state_id']['key'], [('state', 1), ('_id', 1)])
+        self.assertNotIn('state_id', info)
 
-    async def test_hot_page_creates_index_first(self) -> None:
+    async def test_iter_hot_ids_creates_index_first(self) -> None:
         await self.coll.insert_one(
             backlog_document('hot', state='hot', enqueued_at=1),
         )
-        self.assertEqual(await self.backlog.hot_page('', 10), ['hot'])
-        self.assertIn('state_id', await self.coll.index_information())
+        self.assertEqual(
+            [vid async for vid in self.backlog.iter_hot_ids()], ['hot'],
+        )
+        self.assertIn(
+            'state_enqueued_at', await self.coll.index_information(),
+        )
+
+    async def test_delete_is_buffered_until_batch_full(self) -> None:
+        backlog: MongoVideoBacklog = MongoVideoBacklog(
+            self.coll, delete_batch_size=2, delete_flush_seconds=3600,
+        )
+        await self.coll.insert_many([
+            backlog_document(vid, state='hot', enqueued_at=1)
+            for vid in ('a', 'b', 'c')
+        ])
+        await backlog.delete('a')
+        self.assertIsNotNone(await self._doc('a'))
+        await backlog.delete('b')
+        self.assertIsNone(await self._doc('a'))
+        self.assertIsNone(await self._doc('b'))
+        await backlog.delete('c')
+        self.assertIsNotNone(await self._doc('c'))
+        self.assertEqual(await backlog.flush_deletes(), 1)
+        self.assertIsNone(await self._doc('c'))
+        self.assertEqual(await backlog.flush_deletes(), 0)
+
+    async def test_delete_flushes_after_interval(self) -> None:
+        backlog: MongoVideoBacklog = MongoVideoBacklog(
+            self.coll, delete_batch_size=100, delete_flush_seconds=0,
+        )
+        await self.coll.insert_one(
+            backlog_document('a', state='hot', enqueued_at=1),
+        )
+        await backlog.delete('a')
+        self.assertIsNone(await self._doc('a'))
+
+    async def test_state_change_cancels_buffered_delete(self) -> None:
+        backlog: MongoVideoBacklog = MongoVideoBacklog(
+            self.coll, delete_batch_size=100, delete_flush_seconds=3600,
+        )
+        await self.coll.insert_many([
+            backlog_document(vid, state='hot', enqueued_at=1)
+            for vid in ('f', 'm', 'r')
+        ])
+        vid: str
+        for vid in ('f', 'm', 'r'):
+            await backlog.delete(vid)
+        await backlog.force('f', source='cli')
+        await backlog.mark('m', state='failed', record={'ts': 1})
+        await backlog.requeue('r')
+        self.assertEqual(await backlog.flush_deletes(), 0)
+        for vid in ('f', 'm', 'r'):
+            self.assertIsNotNone(await self._doc(vid))
+
+    async def test_failed_flush_keeps_ids(self) -> None:
+        backlog: MongoVideoBacklog = MongoVideoBacklog(
+            self.coll, delete_batch_size=100, delete_flush_seconds=3600,
+        )
+        await self.coll.insert_one(
+            backlog_document('a', state='hot', enqueued_at=1),
+        )
+        await backlog.delete('a')
+        original: Any = self.coll.delete_many
+
+        async def _boom(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError('mongo down')
+
+        self.coll.delete_many = _boom
+        with self.assertRaises(RuntimeError):
+            await backlog.flush_deletes()
+        self.coll.delete_many = original
+        self.assertEqual(await backlog.flush_deletes(), 1)
+        self.assertIsNone(await self._doc('a'))
 
     async def test_counts_derive_queued_and_cache(self) -> None:
         await self.backlog.add_many([
@@ -166,6 +237,7 @@ class TestQueueBacklogMode(_Base):
         self.assertEqual([e.video_id for e in entries], ['aaa'])
         self.assertEqual(entries[0].source, 'rss')
         await self.queue.complete('aaa')
+        await self.queue.flush()
         self.assertIsNone(await self._doc('aaa'))
         self.assertEqual(await self.redis.keys('*'), [])
 

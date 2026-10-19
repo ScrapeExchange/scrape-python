@@ -20,7 +20,8 @@ Document layout::
 ``queued`` documents wait in MongoDB; ``hot`` documents have been
 copied into the Redis hot window (queued or being scraped). A
 completed video's document is deleted; the uploaded-videos Bloom
-filter keeps it from being queued again.
+filter keeps it from being queued again. Deletes are buffered and
+sent in batches (see :meth:`MongoVideoBacklog.delete`).
 '''
 
 import asyncio
@@ -37,11 +38,17 @@ TERMINAL_STATES: tuple[str, ...] = ('unavailable', 'failed', 'removed')
 
 # count_by_state() runs every 30 s on several hosts; counting 100M+
 # documents exactly is expensive, so counts are cached.
-COUNTS_CACHE_SECONDS: float = 300.0
+COUNTS_CACHE_SECONDS: float = 1800.0
+
+# Completed videos are deleted in batches: one delete_many per
+# DELETE_BATCH_SIZE IDs, or per DELETE_FLUSH_SECONDS, whichever comes
+# first.
+DELETE_BATCH_SIZE: int = 500
+DELETE_FLUSH_SECONDS: float = 5.0
 
 DEFAULT_DATABASE: str = 'scraper'
 
-STATE_ID_INDEX: str = 'state_id'
+STATE_ENQUEUED_AT_INDEX: str = 'state_enqueued_at'
 
 # One backlog (and so one MongoDB client and connection pool) per DSN,
 # platform and event loop: callers such as the channel scraper build a
@@ -85,13 +92,26 @@ class MongoVideoBacklog:
 
     :param collection: a PyMongo ``AsyncCollection`` (or a compatible
         test double).
+    :param delete_batch_size: buffered deletes that trigger a flush
+    :param delete_flush_seconds: flush buffered deletes at least this
+        often while deletes keep arriving
     '''
 
-    def __init__(self, collection: Any) -> None:
+    def __init__(
+        self,
+        collection: Any,
+        *,
+        delete_batch_size: int = DELETE_BATCH_SIZE,
+        delete_flush_seconds: float = DELETE_FLUSH_SECONDS,
+    ) -> None:
         self._coll: Any = collection
         self._indexes_ready: bool = False
         self._counts: dict[str, int] | None = None
         self._counts_at: float = 0.0
+        self._delete_batch: int = delete_batch_size
+        self._delete_interval: float = delete_flush_seconds
+        self._pending_deletes: set[str] = set()
+        self._deletes_flushed_at: float = time.monotonic()
 
     @classmethod
     def from_dsn(
@@ -119,19 +139,18 @@ class MongoVideoBacklog:
         return backlog
 
     async def ensure_indexes(self) -> None:
-        '''Create the backlog's indexes once per process: the refill
-        reads the oldest queued documents (``state_enqueued_at``) and
-        the reconcile pages through hot IDs (``state_id``, which
-        answers that query from the index alone).'''
+        '''Create the backlog's index once per process: the refill
+        reads the oldest queued documents and the reconcile streams
+        the hot ones, both through ``state_enqueued_at``.
+
+        There is deliberately no ``(state, _id)`` index. Its keys are
+        spread randomly over the whole collection, so every insert,
+        state change and delete updated it at a random position.'''
         if self._indexes_ready:
             return
         await self._coll.create_index(
             [('state', ASCENDING), ('enqueued_at', ASCENDING)],
-            name='state_enqueued_at',
-        )
-        await self._coll.create_index(
-            [('state', ASCENDING), ('_id', ASCENDING)],
-            name=STATE_ID_INDEX,
+            name=STATE_ENQUEUED_AT_INDEX,
         )
         self._indexes_ready = True
 
@@ -260,6 +279,7 @@ class MongoVideoBacklog:
         :returns: the document as it was before, or None if new.
         '''
         await self.ensure_indexes()
+        self._pending_deletes.discard(video_id)
         update_set: dict[str, Any] = {'state': STATE_HOT}
         if channel_id:
             update_set['channel_id'] = channel_id
@@ -302,6 +322,7 @@ class MongoVideoBacklog:
         revive keeps it.'''
         if state not in TERMINAL_STATES:
             raise ValueError(f'not a terminal state: {state!r}')
+        self._pending_deletes.discard(video_id)
         update_set: dict[str, Any] = {'state': state, 'record': record}
         key: str
         for key in _CONTEXT_FIELDS:
@@ -322,6 +343,7 @@ class MongoVideoBacklog:
     ) -> None:
         '''Return *video_id* to the backlog as queued (operator
         revive of a terminal record).'''
+        self._pending_deletes.discard(video_id)
         await self._coll.update_one(
             {'_id': video_id},
             {
@@ -335,8 +357,42 @@ class MongoVideoBacklog:
         )
 
     async def delete(self, video_id: str) -> None:
-        '''Forget *video_id* (scraped successfully).'''
-        await self._coll.delete_one({'_id': video_id})
+        '''Forget *video_id* (scraped successfully).
+
+        The delete is buffered and sent with others in one
+        ``delete_many`` once the buffer holds ``delete_batch_size`` IDs
+        or ``delete_flush_seconds`` have passed since the last flush.
+        Call :meth:`flush_deletes` before shutting down. A buffered
+        delete lost in a crash leaves the document ``hot``; the refill
+        reconcile returns it to the backlog and it is scraped again.
+        '''
+        self._pending_deletes.add(video_id)
+        if (
+            len(self._pending_deletes) >= self._delete_batch
+            or time.monotonic() - self._deletes_flushed_at
+            >= self._delete_interval
+        ):
+            await self.flush_deletes()
+
+    async def flush_deletes(self) -> int:
+        '''Send the buffered deletes. On failure the IDs go back into
+        the buffer for the next flush and the error propagates.
+
+        :returns: number of documents deleted.
+        '''
+        self._deletes_flushed_at = time.monotonic()
+        if not self._pending_deletes:
+            return 0
+        ids: list[str] = list(self._pending_deletes)
+        self._pending_deletes = set()
+        try:
+            result: Any = await self._coll.delete_many(
+                {'_id': {'$in': ids}},
+            )
+        except Exception:
+            self._pending_deletes.update(ids)
+            raise
+        return int(result.deleted_count)
 
     # -- refill -------------------------------------------------------
 
@@ -364,18 +420,15 @@ class MongoVideoBacklog:
         )
         return int(result.modified_count)
 
-    async def hot_page(
-        self, after_id: str, limit: int,
-    ) -> list[str]:
-        '''IDs of hot documents after *after_id*, in ``_id`` order,
-        for reconciliation with Redis. The hint keeps MongoDB on the
-        ``state_id`` range scan; the ``_id`` index would satisfy the
-        sort too, but fetches every document to test its state.'''
+    async def iter_hot_ids(
+        self, *, batch_size: int = 10_000,
+    ) -> AsyncIterator[str]:
+        '''Stream the IDs of all hot documents, for reconciliation
+        with Redis. The hint keeps MongoDB on the ``state`` range of
+        ``state_enqueued_at``, which only reads the hot documents.'''
         await self.ensure_indexes()
-        docs: list[dict[str, Any]] = await self._coll.find(
-            {'state': STATE_HOT, '_id': {'$gt': after_id}},
-            {'_id': 1},
-        ).sort('_id', ASCENDING).hint(STATE_ID_INDEX).limit(
-            limit,
-        ).to_list(None)
-        return [doc['_id'] for doc in docs]
+        doc: dict[str, Any]
+        async for doc in self._coll.find(
+            {'state': STATE_HOT}, {'_id': 1},
+        ).hint(STATE_ENQUEUED_AT_INDEX).batch_size(batch_size):
+            yield doc['_id']

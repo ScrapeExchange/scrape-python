@@ -242,34 +242,44 @@ class VideoQueueRefill:
         '''Return hot documents whose Redis entry is gone to the
         backlog, so the refill copies them again.'''
         stats: ReconcileStats = ReconcileStats()
-        after: str = ''
-        while True:
-            ids: list[str] = await self._backlog.hot_page(after, page_size)
-            if not ids:
-                break
-            after = ids[-1]
-            pipe: aioredis.client.Pipeline = self._redis.pipeline(
-                transaction=False,
-            )
-            video_id: str
-            for video_id in ids:
-                pipe.hexists(
-                    f'{self._prefix}:qmeta:{qmeta_bucket(video_id)}',
-                    video_id,
-                )
-            present: list[bool] = await pipe.execute()
-            missing: list[str] = [
-                video_id for video_id, ok in zip(ids, present) if not ok
-            ]
-            stats.checked += len(ids)
-            if missing:
-                stats.requeued += await self._backlog.set_state(
-                    missing, from_state=STATE_HOT, to_state=STATE_QUEUED,
-                )
+        ids: list[str] = []
+        video_id: str
+        async for video_id in self._backlog.iter_hot_ids(
+            batch_size=page_size,
+        ):
+            ids.append(video_id)
+            if len(ids) >= page_size:
+                await self._reconcile_page(ids, stats)
+                ids = []
+        if ids:
+            await self._reconcile_page(ids, stats)
         METRIC_RECONCILED.labels(platform=self._platform).inc(
             stats.requeued,
         )
         return stats
+
+    async def _reconcile_page(
+        self, ids: list[str], stats: ReconcileStats,
+    ) -> None:
+        '''Requeue the *ids* whose Redis entry is gone.'''
+        pipe: aioredis.client.Pipeline = self._redis.pipeline(
+            transaction=False,
+        )
+        video_id: str
+        for video_id in ids:
+            pipe.hexists(
+                f'{self._prefix}:qmeta:{qmeta_bucket(video_id)}',
+                video_id,
+            )
+        present: list[bool] = await pipe.execute()
+        missing: list[str] = [
+            video_id for video_id, ok in zip(ids, present) if not ok
+        ]
+        stats.checked += len(ids)
+        if missing:
+            stats.requeued += await self._backlog.set_state(
+                missing, from_state=STATE_HOT, to_state=STATE_QUEUED,
+            )
 
     async def publish_backlog_sizes(self) -> None:
         '''Refresh the backlog-size gauges (cached counts).'''

@@ -626,6 +626,10 @@ async def _run_worker(ctx: ScraperRunContext) -> None:
             queue, settings, pool, ready, fm, concurrency,
         )
     finally:
+        try:
+            await queue.flush()
+        except Exception:
+            _LOGGER.exception('Flushing video backlog deletes failed')
         refresh_task.cancel()
         tasks: list[asyncio.Task] = [refresh_task]
         if publisher_task is not None:
