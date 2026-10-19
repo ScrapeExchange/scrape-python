@@ -1993,12 +1993,22 @@ class YouTubeChannel:
                 if not isinstance(text, dict):
                     continue
                 content: str = text.get('content', '')
-                if content and 'video' in content:
+                # The channel handle shares the row, and a handle such
+                # as '@nomorevideos3' contains 'video' too.
+                if (
+                    not content
+                    or content.lstrip().startswith('@')
+                    or 'video' not in content
+                ):
+                    continue
+                try:
                     count: int | None = (
                         convert_number_string(content)
                     )
-                    if count is not None:
-                        return count
+                except (ValueError, KeyError):
+                    continue
+                if count is not None:
+                    return count
         return None
 
     @staticmethod
@@ -2135,12 +2145,21 @@ class YouTubeChannel:
                 if not isinstance(text, dict):
                     continue
                 content: str = text.get('content', '')
-                if content and 'view' in content:
+                # Skip the channel handle: '@viewtube' contains 'view'.
+                if (
+                    not content
+                    or content.lstrip().startswith('@')
+                    or 'view' not in content
+                ):
+                    continue
+                try:
                     count: int | None = (
                         convert_number_string(content)
                     )
-                    if count is not None:
-                        return count
+                except (ValueError, KeyError):
+                    continue
+                if count is not None:
+                    return count
         return None
 
     @staticmethod

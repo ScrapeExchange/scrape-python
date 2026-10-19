@@ -1470,6 +1470,33 @@ class TestParseCountEdgeCases(unittest.TestCase):
         data = _make_metadata_rows('50 videos')
         self.assertIsNone(YouTubeChannel.parse_subscriber_count(data))
 
+    @staticmethod
+    def _parts(*texts: str) -> dict:
+        '''Header metadata with one row holding *texts* as parts.'''
+        data: dict = _make_metadata_rows('')
+        row: dict = (
+            data['header']['pageHeaderRenderer']['content']
+            ['pageHeaderViewModel']['metadata']
+            ['contentMetadataViewModel']['metadataRows'][0]
+        )
+        row['metadataParts'] = [
+            {'text': {'content': text}} for text in texts
+        ]
+        return data
+
+    def test_video_count_skips_handle_containing_video(self) -> None:
+        # '@nomorevideos3' contains 'video' but is the channel handle.
+        data: dict = self._parts('@nomorevideos3', '12 videos')
+        self.assertEqual(YouTubeChannel.parse_video_count(data), 12)
+
+    def test_video_count_handle_only_is_none(self) -> None:
+        data: dict = self._parts('@dwkvideo')
+        self.assertIsNone(YouTubeChannel.parse_video_count(data))
+
+    def test_view_count_skips_handle_containing_view(self) -> None:
+        data: dict = self._parts('@viewtube', '1,234 views')
+        self.assertEqual(YouTubeChannel.parse_view_count(data), 1234)
+
     def test_video_count_skips_non_dict_text(self) -> None:
         '''metadataParts with a non-dict text should be skipped.'''
         data = {
