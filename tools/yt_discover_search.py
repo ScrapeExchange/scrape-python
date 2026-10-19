@@ -55,6 +55,9 @@ from scrape_exchange.metrics_server import start_metrics_server
 from scrape_exchange.redis_client import redis_from_url
 from scrape_exchange.settings import ScraperSettings
 from scrape_exchange.util import extract_proxy_ip, extract_proxy_port
+from scrape_exchange.youtube.subscriber_counts import (
+    parse_subscriber_count,
+)
 from scrape_exchange.youtube.youtube_channel import YouTubeChannel
 from scrape_exchange.youtube.youtube_channel_tabs import (
     aclose_pooled_innertube,
@@ -140,11 +143,6 @@ UNLIMITED_KEYWORD_BATCH: int = 10
 _SEARCH_TYPE_VIDEO: int = 1
 _SEARCH_TYPE_CHANNEL: int = 2
 
-_SUBS_MULTIPLIERS: dict[str, int] = {
-    'K': 1_000,
-    'M': 1_000_000,
-    'B': 1_000_000_000,
-}
 
 # Prioritised markets (densest 10M-100M channel populations first),
 # as ``GL:hl`` pairs. Overridable via DISCOVER_MARKETS.
@@ -313,22 +311,13 @@ def _start_metrics(port: int) -> None:
     )
 
 
-def _parse_subscriber_text(text: str | None) -> int | None:
-    '''Parse a subscriber label such as ``12.3M subscribers`` into
-    an integer; ``None`` when it has no leading number.'''
-
-    if not text:
-        return None
-    token: str = text.strip().split(' ')[0].replace(',', '')
-    if not token:
-        return None
-    suffix: str = token[-1].upper()
-    try:
-        if suffix in _SUBS_MULTIPLIERS:
-            return int(float(token[:-1]) * _SUBS_MULTIPLIERS[suffix])
-        return int(token)
-    except ValueError:
-        return None
+def _parse_subscriber_text(
+    text: str | None, hl: str | None = 'en',
+) -> int | None:
+    '''Parse a subscriber label written in interface language *hl*,
+    such as ``12.3M subscribers`` or ``41,8 tys. subskrybentów``, into
+    an integer; ``None`` when it holds no count.'''
+    return parse_subscriber_count(text, hl)
 
 
 def _parse_markets(raw: str) -> list[tuple[str, str]]:
@@ -799,8 +788,34 @@ def _walk_json(value: Any) -> Iterable[tuple[Any, dict[str, Any] | None]]:
                 stack.append((child, parent))
 
 
-def extract_channels(payload: dict[str, Any]) -> list[DiscoveredChannel]:
-    '''Extract discovered channel identities from an InnerTube payload.'''
+def _renderer_text(value: Any) -> str:
+    '''The text of an InnerTube text object (simpleText or runs).'''
+    if not isinstance(value, dict):
+        return ''
+    simple: Any = value.get('simpleText')
+    if isinstance(simple, str):
+        return simple
+    return ''.join(
+        str(run.get('text', '')) for run in value.get('runs', []) or []
+        if isinstance(run, dict)
+    )
+
+
+def _channel_result_subscriber_text(renderer: dict[str, Any]) -> str:
+    '''The subscriber label of a channel search result. YouTube now
+    puts the channel handle in subscriberCountText and the count in
+    videoCountText.'''
+    sub_text: str = _renderer_text(renderer.get('subscriberCountText'))
+    if sub_text.strip().startswith('@'):
+        return _renderer_text(renderer.get('videoCountText'))
+    return sub_text
+
+
+def extract_channels(
+    payload: dict[str, Any], hl: str | None = 'en',
+) -> list[DiscoveredChannel]:
+    '''Extract discovered channel identities from an InnerTube payload
+    returned for interface language *hl*.'''
 
     candidates: list[DiscoveredChannel] = []
     for value, parent in _walk_json(payload):
@@ -820,8 +835,7 @@ def extract_channels(payload: dict[str, Any]) -> list[DiscoveredChannel]:
                     .get('canonicalBaseUrl')
                 )
                 subs = _parse_subscriber_text(
-                    (renderer.get('subscriberCountText') or {})
-                    .get('simpleText')
+                    _channel_result_subscriber_text(renderer), hl,
                 )
                 if cid or handle:
                     candidates.append(
@@ -1183,7 +1197,9 @@ async def discover_popular_for_market(
         ).inc()
         if payload is None:
             break
-        page_channels: list[DiscoveredChannel] = extract_channels(payload)
+        page_channels: list[DiscoveredChannel] = extract_channels(
+            payload, hl=hl,
+        )
         METRIC_CHANNELS_FOUND.labels(
             platform='youtube', facet=facet,
         ).inc(len(page_channels))
