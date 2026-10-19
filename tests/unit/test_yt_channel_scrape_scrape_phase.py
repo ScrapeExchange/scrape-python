@@ -193,6 +193,51 @@ class TestScrapeOne(
         '._do_scrape_channel_to_disk_typed',
         new_callable=AsyncMock,
     )
+    async def test_missing_count_marked_not_public_is_counted(
+        self,
+        mock_scrape: AsyncMock,
+        mock_exists: AsyncMock,
+    ) -> None:
+        mock_exists.return_value = True
+        mock_scrape.return_value = _mock_channel(subscriber_count=None)
+        queue = _mock_queue()
+        # After update_tier the queue has marked the count not public
+        # and cleared the retry flags.
+        queue.get_meta.side_effect = lambda member: (
+            {**_ENUMERATED, 'subscriber_count_not_public': '1'}
+            if queue.update_tier.await_count else dict(_ENUMERATED)
+        )
+        creator_map = AsyncMock()
+        creator_map.get.return_value = 'foo'
+        from tools import yt_channel_scrape
+
+        outcomes: MagicMock = MagicMock()
+        with patch.object(
+            yt_channel_scrape, 'CHANNEL_SCRAPE_OUTCOMES', outcomes,
+        ):
+            await yt_channel_scrape._scrape_one_queued(
+                'UCabc00000000000000000000',
+                queue=queue,
+                settings=_mock_settings(),
+                fm=MagicMock(),
+                creator_map_backend=creator_map,
+                http_client=MagicMock(),
+            )
+
+        outcomes.labels.assert_any_call(
+            outcome='subscriber_count_not_public',
+        )
+
+    @patch(
+        'tools.yt_channel_scrape'
+        '._channel_exists_on_exchange',
+        new_callable=AsyncMock,
+    )
+    @patch(
+        'tools.yt_channel_scrape'
+        '._do_scrape_channel_to_disk_typed',
+        new_callable=AsyncMock,
+    )
     async def test_missing_subscriber_count_completes_scrape(
         self,
         mock_scrape: AsyncMock,

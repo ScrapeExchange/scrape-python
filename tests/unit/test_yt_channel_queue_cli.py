@@ -3118,3 +3118,55 @@ class TestRecountListingCommand(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.queue.count_listing(), {
             (0, 'never_scraped'): 1,
         })
+
+
+class TestFixUnpublishedSubscribersCommand(
+    unittest.IsolatedAsyncioTestCase,
+):
+    '''fix-unpublished-subscribers: dry run by default, --apply moves.'''
+
+    async def asyncSetUp(self) -> None:
+        self.redis = fakeredis.aioredis.FakeRedis(
+            decode_responses=True,
+        )
+        self.queue: RedisChannelScrapeQueue = RedisChannelScrapeQueue(
+            self.redis, ChannelScrapeQueueSettings(),
+        )
+        await self.redis.zadd(
+            'youtube:channel:queue:scheduled:0', {'i:UCstuck': 0.0},
+        )
+        await self.redis.hset('youtube:channel:meta:i:UCstuck', mapping={
+            'state': 'scheduled',
+            'force_source': 'missing_subscriber_count',
+            'missing_subscriber_attempts': '2',
+        })
+
+    async def asyncTearDown(self) -> None:
+        await self.redis.aclose()
+
+    async def _run(self, *, apply: bool) -> str:
+        from tools.yt_channel_queue import cmd_fix_unpublished_subscribers
+
+        out: StringIO = StringIO()
+        with patch('sys.stdout', out):
+            rc: int = await cmd_fix_unpublished_subscribers(
+                argparse.Namespace(apply=apply, batch_size=100),
+                self.queue,
+            )
+        self.assertEqual(rc, 0)
+        return out.getvalue()
+
+    async def test_dry_run_reports_and_keeps_queue(self) -> None:
+        output: str = await self._run(apply=False)
+        self.assertIn('eligible 1', output)
+        self.assertIn('dry run', output)
+        self.assertIsNotNone(await self.redis.zscore(
+            'youtube:channel:queue:scheduled:0', 'i:UCstuck',
+        ))
+
+    async def test_apply_moves_to_catch_all(self) -> None:
+        output: str = await self._run(apply=True)
+        self.assertIn('moved 1', output)
+        self.assertIsNotNone(await self.redis.zscore(
+            'youtube:channel:queue:scheduled:4', 'i:UCstuck',
+        ))

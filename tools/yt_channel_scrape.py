@@ -2356,10 +2356,25 @@ async def _scrape_one_queued(
             # make their newest videos 'known' before the first full
             # scrape has enumerated the back catalogue.
             await _add_channel_to_rss_queue(settings, fm, channel, extra)
+        count_outcome: str = 'scraped'
         if channel.subscriber_count is None:
+            # The queue decided between a retry and 'not public'; a
+            # retry leaves force_source set, 'not public' clears it.
+            after: dict[str, str] = await queue.get_meta(member)
+            not_public: bool = (
+                'subscriber_count_not_public' in after
+                and after.get('force_source') != 'missing_subscriber_count'
+            )
+            count_outcome = (
+                'subscriber_count_not_public' if not_public
+                else 'subscriber_count_missing'
+            )
             logging.info(
                 'Channel scrape completed without subscriber count; '
-                'scheduling a metadata refresh',
+                + (
+                    'count not public, scheduled normally' if not_public
+                    else 'scheduling a metadata refresh'
+                ),
                 extra=extra,
             )
         elif force_mode:
@@ -2371,8 +2386,7 @@ async def _scrape_one_queued(
             ).inc()
         CHANNEL_SCRAPE_OUTCOMES.labels(
             outcome=(
-                'subscriber_count_missing'
-                if channel.subscriber_count is None else 'scraped'
+                count_outcome
             ),
         ).inc()
         full_outcome = 'success'

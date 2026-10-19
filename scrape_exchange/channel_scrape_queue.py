@@ -113,10 +113,14 @@ _COMPLETE_SCRAPE_LUA: str = '''
 -- Compare the snapshot before committing progress and scheduling together.
 -- KEYS: metadata, tier map, then every scheduled tier.
 -- ARGV: id, expected count, new count, next full, tier, interval, now,
---   missing-subscriber base, missing-subscriber cap.
--- A negative tier preserves the current tier and requests metadata only;
--- the interval argument is then ignored and the retry delay is computed
--- from the base, the cap and the stored missing_subscriber_attempts.
+--   missing-subscriber base, missing-subscriber cap (the catch-all
+--   tier's interval), retries for a channel that never had a count.
+-- A negative tier means the scrape found no subscriber count; the
+-- interval argument is then ignored. A channel with a stored count
+-- above 0 keeps its tier and is retried with a delay computed from the
+-- base, the cap and the stored missing_subscriber_attempts. A channel
+-- without one moves to the catch-all tier and, once it has used its
+-- retries, is scheduled normally with its count marked not public.
 local state = redis.call('HGET', KEYS[1], 'state')
 if state ~= 'scheduled' then return 0 end
 if redis.call('HGET', KEYS[1], 'successful_scrapes') ~= ARGV[2] then
@@ -126,28 +130,48 @@ local completed_tier = tonumber(ARGV[5])
 local tier = completed_tier
 local schedule_interval = tonumber(ARGV[6])
 local missing_after = -1
+local not_public = 0
 if tier < 0 then
-    tier = tonumber(redis.call('HGET', KEYS[2], ARGV[1])) or 0
-    if tier < 0 or tier >= #KEYS - 2 then tier = 0 end
+    local stored = tonumber(redis.call('HGET', KEYS[1],
+        'subscriber_count'))
+    local counted = stored ~= nil and stored > 0
     local attempts = tonumber(redis.call('HGET', KEYS[1],
         'missing_subscriber_attempts')) or 0
     local base = tonumber(ARGV[8])
     local cap = tonumber(ARGV[9])
-    -- Clamp only the exponent so 2 ^ n stays finite.
-    local delay = base * (2 ^ math.min(attempts, 20))
-    if cap < 0 then
-        delay = -1
-    elseif base > 0 and cap >= 0 and delay > cap then
-        delay = cap
+    if counted then
+        tier = tonumber(redis.call('HGET', KEYS[2], ARGV[1])) or 0
+        if tier < 0 or tier >= #KEYS - 2 then tier = 0 end
+    else
+        tier = #KEYS - 3
     end
-    schedule_interval = delay
-    missing_after = redis.call('HINCRBY', KEYS[1],
-        'missing_subscriber_attempts', 1)
-    redis.call('HSET', KEYS[1],
-        'last_subscriber_count_missing_at', ARGV[7],
-        'force_rescrape_mode', 'metadata',
-        'force_requested_at', ARGV[7],
-        'force_source', 'missing_subscriber_count')
+    local known_not_public = redis.call('HEXISTS', KEYS[1],
+        'subscriber_count_not_public') == 1
+    if not counted
+        and (known_not_public or attempts >= tonumber(ARGV[10])) then
+        not_public = 1
+        schedule_interval = cap
+        redis.call('HSET', KEYS[1],
+            'subscriber_count_not_public', ARGV[7])
+        redis.call('HDEL', KEYS[1], 'missing_subscriber_attempts',
+            'force_rescrape_mode', 'force_requested_at', 'force_source')
+    else
+        -- Clamp only the exponent so 2 ^ n stays finite.
+        local delay = base * (2 ^ math.min(attempts, 20))
+        if cap < 0 then
+            delay = -1
+        elseif base > 0 and cap >= 0 and delay > cap then
+            delay = cap
+        end
+        schedule_interval = delay
+        missing_after = redis.call('HINCRBY', KEYS[1],
+            'missing_subscriber_attempts', 1)
+        redis.call('HSET', KEYS[1],
+            'last_subscriber_count_missing_at', ARGV[7],
+            'force_rescrape_mode', 'metadata',
+            'force_requested_at', ARGV[7],
+            'force_source', 'missing_subscriber_count')
+    end
 end
 local member = 'i:' .. ARGV[1]
 for k = 3, #KEYS do redis.call('ZREM', KEYS[k], member) end
@@ -161,10 +185,35 @@ redis.call('HSET', KEYS[1],
     'last_attempt_at', ARGV[7])
 redis.call('HDEL', KEYS[1], 'unavailable_attempts')
 if completed_tier >= 0 then
-    redis.call('HDEL', KEYS[1], 'missing_subscriber_attempts')
+    redis.call('HDEL', KEYS[1], 'missing_subscriber_attempts',
+        'subscriber_count_not_public')
     return 1
 end
-return {1, schedule_interval, missing_after}
+return {1, schedule_interval, missing_after, not_public}
+'''
+
+
+_FIX_UNPUBLISHED_LUA: str = '''
+-- Move one channel that is stuck retrying a subscriber count YouTube
+-- does not publish into the catch-all tier, marked not public.
+-- KEYS[1] = source scheduled zset, KEYS[2] = catch-all scheduled zset,
+-- KEYS[3] = tier map, KEYS[4] = meta hash
+-- ARGV[1] = member, ARGV[2] = channel id, ARGV[3] = new score,
+-- ARGV[4] = catch-all tier, ARGV[5] = now
+-- A channel a worker has popped, or whose retry flag a scrape has
+-- cleared meanwhile, is left alone.
+if not redis.call('ZSCORE', KEYS[1], ARGV[1]) then return 0 end
+if redis.call('HGET', KEYS[4], 'force_source')
+        ~= 'missing_subscriber_count' then
+    return 0
+end
+redis.call('ZREM', KEYS[1], ARGV[1])
+redis.call('ZADD', KEYS[2], ARGV[3], ARGV[1])
+redis.call('HSET', KEYS[3], ARGV[2], ARGV[4])
+redis.call('HSET', KEYS[4], 'subscriber_count_not_public', ARGV[5])
+redis.call('HDEL', KEYS[4], 'missing_subscriber_attempts',
+    'force_rescrape_mode', 'force_requested_at', 'force_source')
+return 1
 '''
 
 
@@ -215,6 +264,20 @@ def awaiting_first_full_scrape(
     if successful_scrapes is None:
         return last_attempt_at is None
     return successful_scrapes == '0'
+
+
+def _positive_count(value: str | None) -> bool:
+    '''Whether a stored subscriber count is a number above 0. A
+    missing, empty or 0 count means the channel never had one.'''
+    try:
+        return value is not None and int(value) > 0
+    except ValueError:
+        return False
+
+
+def _as_str(value: Any) -> str | None:
+    '''Decode a Redis reply that may be bytes.'''
+    return value.decode() if isinstance(value, bytes) else value
 
 
 def parse_channel_priority_queues(
@@ -637,6 +700,16 @@ class ChannelScrapeQueueSettings(BaseSettings):
     )
     channel_unavailable_soft_retry_seconds: int = Field(
         default=3 * 86400,
+    )
+    channel_unpublished_subscriber_retries: int = Field(
+        default=1,
+        ge=0,
+        description=(
+            'Retries for a channel that never had a subscriber count '
+            '(none stored, or 0) when a scrape finds none. After '
+            'these the count is treated as not public and the channel '
+            'is scheduled normally in the catch-all tier.'
+        ),
     )
     channel_soft_reap_interval_seconds: int = Field(
         default=60,
@@ -1245,20 +1318,31 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
                 str(self._settings
                     .channel_missing_subscriber_retry_seconds),
                 str(self._tiers[-1].interval_seconds),
+                str(self._settings
+                    .channel_unpublished_subscriber_retries),
             )
             await self.recount_listing(f'i:{channel_id}')
             if isinstance(result, list):
                 ok: int = int(result[0])
                 delay: float = float(result[1])
                 attempts: int = int(result[2])
-                _LOGGER.info(
-                    'Scheduling missing-subscriber retry',
-                    extra={
-                        'channel_id': channel_id,
-                        'missing_subscriber_attempts': attempts,
-                        'retry_delay_seconds': delay,
-                    },
-                )
+                if int(result[3]):
+                    _LOGGER.info(
+                        'Subscriber count not public',
+                        extra={
+                            'channel_id': channel_id,
+                            'next_scrape_seconds': delay,
+                        },
+                    )
+                else:
+                    _LOGGER.info(
+                        'Scheduling missing-subscriber retry',
+                        extra={
+                            'channel_id': channel_id,
+                            'missing_subscriber_attempts': attempts,
+                            'retry_delay_seconds': delay,
+                        },
+                    )
                 return bool(ok)
             return bool(result)
         if sub_count is None:
@@ -1322,6 +1406,7 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
             self._k_meta(member),
             'unavailable_attempts',
             'missing_subscriber_attempts',
+            'subscriber_count_not_public',
         )
         await pipe.execute()
         await self.recount_listing(member)
@@ -1332,13 +1417,14 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
         channel_id: str,
         now: float,
     ) -> None:
-        '''Preserve the current tier and request a delayed metadata refresh.
+        '''Schedule a channel whose scrape found no subscriber count.
 
-        A missing subscriber count is unknown data, not evidence that the
-        channel belongs in the zero-subscriber catch-all tier. The channel
-        has already been popped, so this transition must explicitly put it
-        back in its current tier. Missing metadata does not require
-        repeating a completed video enumeration.
+        A missing count is unknown data, not evidence that the channel
+        belongs in the zero-subscriber catch-all tier. A channel with a
+        stored count above 0 keeps its current tier and gets a delayed
+        metadata refresh. The channel has already been popped, so this
+        transition must explicitly put it back. Missing metadata does
+        not require repeating a completed video enumeration.
 
         The retry delay backs off exponentially:
         ``min(base * 2 ** attempts, cap)``, where ``base`` is
@@ -1346,6 +1432,12 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
         catch-all tier interval; ``missing_subscriber_attempts`` counts
         consecutive misses and is incremented on every retry. A negative
         catch-all interval drops the channel from the schedule.
+
+        A channel that never had a count (none stored, or 0) moves to
+        the catch-all tier. Once it has used
+        ``channel_unpublished_subscriber_retries`` retries, YouTube is
+        taken not to publish its count: it is scheduled at the
+        catch-all interval and marked ``subscriber_count_not_public``.
         '''
         member: str = f'i:{channel_id}'
         current: ChannelState | None = await self.get_state(member)
@@ -1354,35 +1446,41 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
             and current in ChannelState.terminal_states()
         ):
             return
-        tier_str: str | None = await self._redis.hget(
-            self._k_tiers(), channel_id,
-        )
-        tier: int = 0
-        if tier_str is not None:
-            try:
-                candidate: int = int(tier_str)
-            except ValueError:
-                candidate = 0
-            if 0 <= candidate < len(self._tiers):
-                tier = candidate
         meta_key: str = self._k_meta(member)
-        attempts_raw: str | None = await self._redis.hget(
-            meta_key, 'missing_subscriber_attempts',
+        stored_raw: str | None
+        attempts_raw: str | None
+        not_public_raw: str | None
+        stored_raw, attempts_raw, not_public_raw = await self._redis.hmget(
+            meta_key, [
+                'subscriber_count', 'missing_subscriber_attempts',
+                'subscriber_count_not_public',
+            ],
         )
+        counted: bool = _positive_count(stored_raw)
         attempts: int = int(attempts_raw) if attempts_raw else 0
-        base: int = (
-            self._settings
-            .channel_missing_subscriber_retry_seconds
-        )
+        tier: int = len(self._tiers) - 1
+        if counted:
+            tier = await self._stored_tier(channel_id)
         cap: int = self._tiers[-1].interval_seconds
+        # A channel already known not to publish its count gets no
+        # retry: its retry counter was cleared when it was marked.
+        not_public: bool = not counted and (
+            not_public_raw is not None
+            or attempts
+            >= self._settings.channel_unpublished_subscriber_retries
+        )
+        delay: float
         if cap < 0:
-            delay: float = -1.0
+            delay = -1.0
+        elif not_public:
+            delay = float(cap)
         else:
-            exponent: int = min(attempts, 20)
-            delay = min(
-                float(base) * (2.0 ** exponent), float(cap),
+            base: int = (
+                self._settings
+                .channel_missing_subscriber_retry_seconds
             )
-        retry_at: float = now + delay
+            exponent: int = min(attempts, 20)
+            delay = min(float(base) * (2.0 ** exponent), float(cap))
         pipe: aioredis.client.Pipeline = (
             self._redis.pipeline(transaction=True)
         )
@@ -1394,23 +1492,47 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
         if delay >= 0:
             pipe.zadd(
                 self._k_scheduled(tier),
-                {member: retry_at},
+                {member: now + delay},
             )
-        pipe.hset(
-            meta_key,
-            mapping={
-                'state': ChannelState.SCHEDULED.value,
-                'last_attempt_at': str(int(now)),
-                'last_subscriber_count_missing_at': str(int(now)),
-                'force_rescrape_mode': 'metadata',
-                'force_requested_at': str(int(now)),
-                'force_source': 'missing_subscriber_count',
-            },
-        )
-        pipe.hdel(meta_key, 'unavailable_attempts')
-        pipe.hincrby(meta_key, 'missing_subscriber_attempts', 1)
+        if not_public:
+            pipe.hset(
+                meta_key,
+                mapping={
+                    'state': ChannelState.SCHEDULED.value,
+                    'last_attempt_at': str(int(now)),
+                    'subscriber_count_not_public': str(int(now)),
+                },
+            )
+            pipe.hdel(
+                meta_key, 'unavailable_attempts',
+                'missing_subscriber_attempts', 'force_rescrape_mode',
+                'force_requested_at', 'force_source',
+            )
+        else:
+            pipe.hset(
+                meta_key,
+                mapping={
+                    'state': ChannelState.SCHEDULED.value,
+                    'last_attempt_at': str(int(now)),
+                    'last_subscriber_count_missing_at': str(int(now)),
+                    'force_rescrape_mode': 'metadata',
+                    'force_requested_at': str(int(now)),
+                    'force_source': 'missing_subscriber_count',
+                },
+            )
+            pipe.hdel(meta_key, 'unavailable_attempts')
+            pipe.hincrby(meta_key, 'missing_subscriber_attempts', 1)
         results: list[Any] = await pipe.execute()
         await self.recount_listing(member)
+        if not_public:
+            _LOGGER.info(
+                'Subscriber count not public',
+                extra={
+                    'channel_id': channel_id,
+                    'next_scrape_seconds': delay,
+                },
+            )
+            return
         _LOGGER.info(
             'Scheduling missing-subscriber retry',
             extra={
@@ -1419,6 +1541,116 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
                 'retry_delay_seconds': delay,
             },
         )
+
+    async def _stored_tier(self, channel_id: str) -> int:
+        '''The channel's tier from the tier map; 0 when it is missing
+        or out of range.'''
+        tier_str: str | None = await self._redis.hget(
+            self._k_tiers(), channel_id,
+        )
+        if tier_str is None:
+            return 0
+        try:
+            candidate: int = int(tier_str)
+        except ValueError:
+            return 0
+        return candidate if 0 <= candidate < len(self._tiers) else 0
+
+    async def fix_unpublished_subscriber_retries(
+        self, *, apply: bool, now: float, batch_size: int = 1000,
+    ) -> dict[str, int]:
+        '''One-off cleanup: channels outside the catch-all tier that
+        are retrying a subscriber count, never had one (none stored, or
+        0) and have used their retries are moved to the catch-all tier
+        and marked ``subscriber_count_not_public``, as a new scrape now
+        does. Due times are spread over the catch-all interval so the
+        moved channels do not all come due at once.
+
+        :param apply: False only counts the eligible channels.
+        :returns: counts ``scanned``, ``eligible`` and ``moved``.
+        '''
+        catch_all: int = len(self._tiers) - 1
+        interval: int = self._tiers[-1].interval_seconds
+        retries: int = (
+            self._settings.channel_unpublished_subscriber_retries
+        )
+        result: dict[str, int] = {'scanned': 0, 'eligible': 0, 'moved': 0}
+        tier: int
+        for tier in range(catch_all):
+            source: str = self._k_scheduled(tier)
+            batch: list[str] = []
+            member: Any
+            async for member, _score in self._redis.zscan_iter(
+                source, count=batch_size,
+            ):
+                batch.append(_as_str(member))
+                if len(batch) >= batch_size:
+                    await self._fix_unpublished_batch(
+                        batch, source, catch_all, interval, retries,
+                        apply=apply, now=now, result=result,
+                    )
+                    batch = []
+            if batch:
+                await self._fix_unpublished_batch(
+                    batch, source, catch_all, interval, retries,
+                    apply=apply, now=now, result=result,
+                )
+        return result
+
+    async def _fix_unpublished_batch(
+        self,
+        members: list[str],
+        source: str,
+        catch_all: int,
+        interval: int,
+        retries: int,
+        *,
+        apply: bool,
+        now: float,
+        result: dict[str, int],
+    ) -> None:
+        pipe: aioredis.client.Pipeline = (
+            self._redis.pipeline(transaction=False)
+        )
+        member: str
+        for member in members:
+            pipe.hmget(
+                self._k_meta(member),
+                ['force_source', 'subscriber_count',
+                 'missing_subscriber_attempts'],
+            )
+        rows: list[list[Any]] = await pipe.execute()
+        result['scanned'] += len(members)
+        eligible: list[str] = [
+            member for member, (force, count, attempts)
+            in zip(members, rows)
+            if member.startswith('i:')
+            and _as_str(force) == 'missing_subscriber_count'
+            and not _positive_count(_as_str(count))
+            and int(_as_str(attempts) or 0) >= retries
+        ]
+        result['eligible'] += len(eligible)
+        if not apply or not eligible:
+            return
+        pipe = self._redis.pipeline(transaction=False)
+        for member in eligible:
+            score: float = (
+                now + self._rng.uniform(0.0, float(interval))
+                if interval > 0 else now
+            )
+            pipe.eval(
+                _FIX_UNPUBLISHED_LUA, 4,
+                source, self._k_scheduled(catch_all), self._k_tiers(),
+                self._k_meta(member),
+                member, member[2:], str(score), str(catch_all),
+                str(int(now)),
+            )
+        moved: list[int] = await pipe.execute()
+        done: list[str] = [
+            member for member, ok in zip(eligible, moved) if ok
+        ]
+        result['moved'] += len(done)
+        await self.recount_listing(*done)
 
     async def requeue_with_backoff(
         self,

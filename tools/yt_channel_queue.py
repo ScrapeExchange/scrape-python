@@ -487,6 +487,26 @@ def _build_parser() -> ArgumentParser:
         default=1000,
         help='Channels per Redis SCAN and pipeline. Default 1000.',
     )
+    c_fix_unpub: ArgumentParser = sub.add_parser(
+        'fix-unpublished-subscribers',
+        help=(
+            'Move channels stuck retrying a subscriber count YouTube '
+            'does not publish (no count stored, or 0, retries used) to '
+            'the catch-all tier, marked not public. Dry run by '
+            'default; pass --apply to move them.'
+        ),
+    )
+    c_fix_unpub.add_argument(
+        '--apply',
+        action='store_true',
+        default=False,
+    )
+    c_fix_unpub.add_argument(
+        '--batch-size',
+        type=int,
+        default=1000,
+        help='Channels per Redis ZSCAN and pipeline. Default 1000.',
+    )
     c_export: ArgumentParser = sub.add_parser(
         'export',
         help=(
@@ -1853,6 +1873,25 @@ async def cmd_recount_listing(
     return 0
 
 
+async def cmd_fix_unpublished_subscribers(
+    ns: Namespace,
+    queue: RedisChannelScrapeQueue,
+) -> int:
+    '''Report, or with --apply move, channels stuck retrying an
+    unpublished subscriber count.'''
+    result: dict[str, int] = (
+        await queue.fix_unpublished_subscriber_retries(
+            apply=ns.apply, now=time.time(), batch_size=ns.batch_size,
+        )
+    )
+    mode: str = 'applied' if ns.apply else 'dry run'
+    sys.stdout.write(
+        f'{mode}: scanned {result["scanned"]} eligible '
+        f'{result["eligible"]} moved {result["moved"]}\n',
+    )
+    return 0
+
+
 async def cmd_export(
     ns: Namespace,
     queue: RedisChannelScrapeQueue,
@@ -2728,6 +2767,7 @@ _HANDLERS['reconcile'] = cmd_reconcile
 _HANDLERS['retier'] = cmd_retier
 _HANDLERS['export'] = cmd_export
 _HANDLERS['recount-listing'] = cmd_recount_listing
+_HANDLERS['fix-unpublished-subscribers'] = cmd_fix_unpublished_subscribers
 _HANDLERS['export-rss'] = cmd_export_rss
 
 
