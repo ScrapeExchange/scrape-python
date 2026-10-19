@@ -1735,3 +1735,22 @@ class TestChannelRedirect(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaises(RuntimeError):
             await tabs.browse_channel()
+
+
+class TestRedirectToSystemPage(unittest.TestCase):
+    '''Redirects to YouTube system pages (Movies & TV store, Sports,
+    News, ...) are not moves to another creator channel.'''
+
+    def test_movies_store_is_a_system_page(self) -> None:
+        from scrape_exchange.youtube.channel_errors import (
+            ChannelRedirectedError,
+        )
+        exc = ChannelRedirectedError(CHANNEL_ID, 'UClgRkhTL3_hImCAmdLfDE4g')
+        self.assertTrue(exc.to_system_page)
+
+    def test_creator_channel_is_not_a_system_page(self) -> None:
+        from scrape_exchange.youtube.channel_errors import (
+            ChannelRedirectedError,
+        )
+        exc = ChannelRedirectedError(CHANNEL_ID, 'UCWpk9PSGHoJW1hZT4egxTNQ')
+        self.assertFalse(exc.to_system_page)

@@ -25,15 +25,37 @@ class ChannelTerminatedError(Exception):
     "channel terminated by YouTube" sentinel.'''
 
 
+# YouTube system pages that are not creator channels: a channel ID
+# that redirects to one of these was folded into it (for example a
+# film studio's channel into the Movies & TV store) rather than moved.
+# Verified 2026-10-19: these IDs return no channel metadata.
+YOUTUBE_SYSTEM_PAGE_CHANNEL_IDS: frozenset[str] = frozenset({
+    'UClgRkhTL3_hImCAmdLfDE4g',  # Movies & TV
+    'UCEgdi0XIXXZ-qJOFPf4JSKw',  # Sports
+    'UCOpNcN46UbXVtpKMrmU4Abg',  # Gaming
+    'UCYfdidRxbB8Qhf0Nx7ioOYw',  # News
+    'UC4R8DWoMoI7CAwX8_LjQHig',  # Live
+    'UCtFRv9O2AHqOZjjynzrv-xg',  # Learning
+    'UCrpQ4p1Ql_hG8rKXIKM1MOQ',  # Fashion & Beauty
+    'UCF0pVplsI8R5kcAqgtoRqoA',  # Popular on YouTube
+})
+
+
 class ChannelRedirectedError(Exception):
     '''Raised when YouTube redirects a channel ID to another channel
-    ID: the channel moved, and :attr:`target_channel_id` is its new
-    ID.'''
+    ID, :attr:`target_channel_id`. That is the channel's new ID unless
+    :attr:`to_system_page` is set.'''
 
     def __init__(self, channel_id: str | None, target_channel_id: str,
                  ) -> None:
-        super().__init__(f'{channel_id} moved to {target_channel_id}')
+        super().__init__(f'{channel_id} redirects to {target_channel_id}')
         self.target_channel_id: str = target_channel_id
+
+    @property
+    def to_system_page(self) -> bool:
+        '''Whether the target is a YouTube system page, not a creator
+        channel the old ID moved to.'''
+        return self.target_channel_id in YOUTUBE_SYSTEM_PAGE_CHANNEL_IDS
 
 
 # Phrases of the ERROR alert InnerTube returns instead of channel tabs.

@@ -2262,9 +2262,23 @@ async def _scrape_one_queued(
                 ).inc()
             return
         except ChannelRedirectedError as exc:
+            target: str = exc.target_channel_id
+            if exc.to_system_page:
+                # Folded into a YouTube system page (e.g. the Movies &
+                # TV store): no creator channel to follow.
+                await queue.mark(
+                    member,
+                    state=ChannelState.REMOVED,
+                    last_error=str(exc),
+                    note='redirects to a YouTube system page',
+                    extra={'redirected_to': target},
+                )
+                CHANNEL_SCRAPE_OUTCOMES.labels(
+                    outcome='redirected_system_page',
+                ).inc()
+                return
             # YouTube redirects this ID to the channel's new ID: queue
             # the new one (if unknown) and record where this one went.
-            target: str = exc.target_channel_id
             try:
                 await queue.enqueue_new(target, source='channel_redirect')
             except Exception:

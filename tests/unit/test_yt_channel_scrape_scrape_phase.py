@@ -521,6 +521,48 @@ class TestScrapeOne(
         '._do_scrape_channel_to_disk_typed',
         new_callable=AsyncMock,
     )
+    async def test_redirect_to_system_page_marks_removed(
+        self,
+        mock_scrape: AsyncMock,
+        mock_exists: AsyncMock,
+    ) -> None:
+        from scrape_exchange.youtube.channel_errors import (
+            ChannelRedirectedError,
+        )
+        store: str = 'UClgRkhTL3_hImCAmdLfDE4g'
+        mock_exists.return_value = False
+        mock_scrape.side_effect = ChannelRedirectedError(
+            'UCabc00000000000000000000', store,
+        )
+        queue = _mock_queue()
+        creator_map = AsyncMock()
+        creator_map.get.return_value = 'foo'
+        from tools.yt_channel_scrape import _scrape_one_queued
+
+        await _scrape_one_queued(
+            'UCabc00000000000000000000',
+            queue=queue,
+            settings=_mock_settings(),
+            fm=MagicMock(),
+            creator_map_backend=creator_map,
+            http_client=MagicMock(),
+        )
+
+        queue.enqueue_new.assert_not_awaited()
+        kwargs: dict = queue.mark.await_args.kwargs
+        self.assertEqual(kwargs['state'], ChannelState.REMOVED)
+        self.assertEqual(kwargs['extra'], {'redirected_to': store})
+
+    @patch(
+        'tools.yt_channel_scrape'
+        '._channel_exists_on_exchange',
+        new_callable=AsyncMock,
+    )
+    @patch(
+        'tools.yt_channel_scrape'
+        '._do_scrape_channel_to_disk_typed',
+        new_callable=AsyncMock,
+    )
     async def test_redirect_marks_moved_and_queues_target(
         self,
         mock_scrape: AsyncMock,
@@ -529,7 +571,7 @@ class TestScrapeOne(
         from scrape_exchange.youtube.channel_errors import (
             ChannelRedirectedError,
         )
-        target: str = 'UClgRkhTL3_hImCAmdLfDE4g'
+        target: str = 'UCWpk9PSGHoJW1hZT4egxTNQ'
         mock_exists.return_value = False
         mock_scrape.side_effect = ChannelRedirectedError(
             'UCabc00000000000000000000', target,
