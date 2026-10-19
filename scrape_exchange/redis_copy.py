@@ -11,9 +11,12 @@ with REPLACE (a key already in the target is an error).
 :license    : GPLv3
 '''
 
-from dataclasses import dataclass
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import Any
 
+import redis
 from redis.connection import parse_url
 
 
@@ -84,3 +87,161 @@ def migrate_args(
     elif target.password:
         args += ['AUTH', target.password]
     return args + ['KEYS', *keys]
+
+
+class MigrateError(Exception):
+    '''MIGRATE failed; the copy must stop.'''
+
+
+@dataclass
+class CopyStats:
+    '''Progress of a copy.'''
+
+    copied: int = 0
+    skipped: int = 0
+    failed: list[str] = field(default_factory=list)
+    seconds: float = 0.0
+
+
+@dataclass
+class SampleReport:
+    '''Result of :func:`sample_copy`.'''
+
+    keys: int
+    seconds: float
+    source_dbsize: int
+    estimated_seconds: float
+
+
+def _migrate(
+    source: redis.Redis, target: Endpoint, keys: list[str],
+    timeout_ms: int, stats: CopyStats,
+) -> None:
+    try:
+        reply: Any = source.execute_command(
+            *migrate_args(target, keys, timeout_ms),
+        )
+    except redis.ResponseError as exc:
+        stats.failed.extend(keys)
+        raise MigrateError(f'MIGRATE failed: {exc}') from exc
+    if reply in (b'NOKEY', 'NOKEY'):
+        stats.skipped += len(keys)
+    else:
+        stats.copied += len(keys)
+
+
+def _copy_keys(
+    source: redis.Redis,
+    target: Endpoint,
+    keys: list[str],
+    stats: CopyStats,
+    *,
+    batch_size: int,
+    timeout_ms: int,
+    big_key_bytes: int,
+    big_key_timeout_ms: int,
+) -> None:
+    '''Copy *keys*: small ones in MIGRATE batches, big ones one at a
+    time with the longer timeout.'''
+    # One round trip for the sizes of all keys: a call per key would
+    # add a network round trip per key to the downtime.
+    pipe: Any = source.pipeline(transaction=False)
+    key: str
+    for key in keys:
+        pipe.memory_usage(key)
+    sizes: dict[str, int] = {
+        key: int(size or 0) for key, size in zip(keys, pipe.execute())
+    }
+    batches, big = split_batches(keys, sizes, batch_size, big_key_bytes)
+    batch: list[str]
+    for batch in batches:
+        _migrate(source, target, batch, timeout_ms, stats)
+    for key in big:
+        _migrate(source, target, [key], big_key_timeout_ms, stats)
+
+
+def copy_all(
+    source: redis.Redis,
+    target: Endpoint,
+    target_client: redis.Redis,
+    *,
+    batch_size: int,
+    timeout_ms: int,
+    big_key_bytes: int,
+    big_key_timeout_ms: int,
+    allow_nonempty: bool = False,
+    limit: int | None = None,
+    progress: Callable[[CopyStats], None] | None = None,
+) -> tuple[CopyStats, list[str]]:
+    '''Copy every key of *source* (or the first *limit* keys) into
+    *target*. Keys that expire before they are copied are counted as
+    skipped.
+
+    :returns: the statistics and the keys sent to MIGRATE.
+    :raises ValueError: the target database is not empty and
+        *allow_nonempty* is false.
+    :raises MigrateError: a MIGRATE call failed.
+    '''
+    if not allow_nonempty and target_client.dbsize():
+        raise ValueError('target database is not empty')
+    stats: CopyStats = CopyStats()
+    sent: list[str] = []
+    started: float = time.monotonic()
+    pending: list[str] = []
+
+    def _flush() -> None:
+        _copy_keys(
+            source, target, pending, stats, batch_size=batch_size,
+            timeout_ms=timeout_ms, big_key_bytes=big_key_bytes,
+            big_key_timeout_ms=big_key_timeout_ms,
+        )
+        sent.extend(pending)
+        pending.clear()
+        stats.seconds = time.monotonic() - started
+        if progress is not None:
+            progress(stats)
+
+    key: Any
+    for key in source.scan_iter(count=batch_size):
+        if isinstance(key, bytes):
+            key = key.decode()
+        pending.append(key)
+        if limit is not None and len(sent) + len(pending) >= limit:
+            break
+        if len(pending) >= batch_size:
+            _flush()
+    if pending:
+        _flush()
+    stats.seconds = time.monotonic() - started
+    return stats, sent
+
+
+def sample_copy(
+    source: redis.Redis,
+    target: Endpoint,
+    target_client: redis.Redis,
+    *,
+    size: int,
+    batch_size: int,
+    timeout_ms: int,
+    big_key_bytes: int,
+    big_key_timeout_ms: int,
+    allow_nonempty: bool = False,
+) -> SampleReport:
+    '''Copy *size* keys, measure the speed, then delete exactly those
+    keys from the target.'''
+    stats, sent = copy_all(
+        source, target, target_client, batch_size=batch_size,
+        timeout_ms=timeout_ms, big_key_bytes=big_key_bytes,
+        big_key_timeout_ms=big_key_timeout_ms,
+        allow_nonempty=allow_nonempty, limit=size,
+    )
+    start: int
+    for start in range(0, len(sent), batch_size):
+        target_client.delete(*sent[start:start + batch_size])
+    total: int = int(source.dbsize())
+    rate: float = len(sent) / stats.seconds if stats.seconds else 0.0
+    return SampleReport(
+        keys=len(sent), seconds=stats.seconds, source_dbsize=total,
+        estimated_seconds=total / rate if rate else 0.0,
+    )
