@@ -9,18 +9,22 @@ Unit tests for scrape_exchange.redis_copy.
 import unittest
 from unittest.mock import MagicMock
 
+import fakeredis
 import redis
 
 from scrape_exchange.redis_copy import (
     CopyStats,
     Endpoint,
     MigrateError,
+    VerifyReport,
     check_distinct,
     copy_all,
     endpoint_from_dsn,
+    key_shape,
     migrate_args,
     sample_copy,
     split_batches,
+    verify,
 )
 
 
@@ -192,6 +196,49 @@ class TestSampleCopy(unittest.TestCase):
         self.assertEqual(report.keys, 2)
         self.assertEqual(report.source_dbsize, 300)
         self.assertGreaterEqual(report.estimated_seconds, 0.0)
+
+
+class TestVerify(unittest.TestCase):
+
+    def setUp(self) -> None:
+        self.src: fakeredis.FakeRedis = fakeredis.FakeRedis(
+            server=fakeredis.FakeServer(), decode_responses=True,
+        )
+        self.tgt: fakeredis.FakeRedis = fakeredis.FakeRedis(
+            server=fakeredis.FakeServer(), decode_responses=True,
+        )
+
+    def _both(self, fn: str, *args: object, **kwargs: object) -> None:
+        getattr(self.src, fn)(*args, **kwargs)
+        getattr(self.tgt, fn)(*args, **kwargs)
+
+    def test_identical_databases_match(self) -> None:
+        self._both('hset', 'h', mapping={'a': '1', 'b': '2'})
+        self._both('zadd', 'z', {'m': 1.0})
+        self._both('set', 's', 'v')
+        report: VerifyReport = verify(self.src, self.tgt, sample_size=10)
+        self.assertEqual(report.mismatches, [])
+        self.assertEqual(report.checked, 3)
+
+    def test_detects_missing_and_different_keys(self) -> None:
+        self._both('set', 's', 'v')
+        self.src.hset('h', mapping={'a': '1', 'b': '2'})
+        self.tgt.hset('h', mapping={'a': '1'})
+        self.src.set('only_src', 'x')
+        report: VerifyReport = verify(self.src, self.tgt, sample_size=10)
+        self.assertEqual(sorted(report.mismatches), ['h', 'only_src'])
+
+    def test_detects_lost_expiry(self) -> None:
+        self.src.set('t', 'v', ex=600)
+        self.tgt.set('t', 'v')
+        report: VerifyReport = verify(self.src, self.tgt, sample_size=10)
+        self.assertEqual(report.mismatches, ['t'])
+
+    def test_key_expired_in_source_is_not_a_mismatch(self) -> None:
+        self.assertIsNone(key_shape(self.src, 'gone'))
+        self.tgt.set('gone', 'v')
+        report: VerifyReport = verify(self.src, self.tgt, sample_size=10)
+        self.assertEqual(report.mismatches, [])
 
 
 if __name__ == '__main__':

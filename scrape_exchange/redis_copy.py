@@ -245,3 +245,69 @@ def sample_copy(
         keys=len(sent), seconds=stats.seconds, source_dbsize=total,
         estimated_seconds=total / rate if rate else 0.0,
     )
+
+
+@dataclass
+class VerifyReport:
+    '''Result of :func:`verify`.'''
+
+    source_dbsize: int
+    target_dbsize: int
+    checked: int
+    mismatches: list[str]
+
+
+_SIZE_COMMANDS: dict[str, str] = {
+    'hash': 'HLEN', 'zset': 'ZCARD', 'set': 'SCARD', 'list': 'LLEN',
+    'string': 'STRLEN', 'stream': 'XLEN',
+}
+
+
+def _decode(value: Any) -> Any:
+    return value.decode() if isinstance(value, bytes) else value
+
+
+def key_shape(
+    client: redis.Redis, key: str,
+) -> tuple[str, int, bool] | None:
+    '''``(type, size, has_ttl)`` of *key*, or None if it is missing.'''
+    kind: str = _decode(client.type(key))
+    if kind == 'none':
+        return None
+    size: int = 0
+    if kind in _SIZE_COMMANDS:
+        size = int(client.execute_command(_SIZE_COMMANDS[kind], key))
+    elif kind == 'MBbloom--':
+        info: list[Any] = client.execute_command('BF.INFO', key)
+        fields: dict[str, Any] = {
+            _decode(info[i]): info[i + 1] for i in range(0, len(info), 2)
+        }
+        size = int(fields.get('Number of items inserted', 0))
+    return kind, size, int(client.ttl(key)) > 0
+
+
+def verify(
+    source: redis.Redis, target_client: redis.Redis, *, sample_size: int,
+) -> VerifyReport:
+    '''Compare up to *sample_size* source keys with the target by type,
+    size and whether an expiry is set. A key that no longer exists in
+    the source (it expired after the copy) is skipped.'''
+    mismatches: list[str] = []
+    checked: int = 0
+    key: Any
+    for key in source.scan_iter(count=1000):
+        if checked >= sample_size:
+            break
+        key = _decode(key)
+        expected: tuple[str, int, bool] | None = key_shape(source, key)
+        if expected is None:
+            continue
+        checked += 1
+        if key_shape(target_client, key) != expected:
+            mismatches.append(key)
+    return VerifyReport(
+        source_dbsize=int(source.dbsize()),
+        target_dbsize=int(target_client.dbsize()),
+        checked=checked,
+        mismatches=mismatches,
+    )
