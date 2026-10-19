@@ -3057,3 +3057,64 @@ class TestExportChannelHandleEnrichment(
         )
         rows: list[dict] = await self._export_rows('scheduled')
         self.assertNotIn('channel_handle', rows[0])
+
+
+class TestRecountListingCommand(unittest.IsolatedAsyncioTestCase):
+    '''recount-listing initialises and repairs the listing counts.'''
+
+    async def asyncSetUp(self) -> None:
+        self.redis = fakeredis.aioredis.FakeRedis(
+            decode_responses=True,
+        )
+        self.queue: RedisChannelScrapeQueue = RedisChannelScrapeQueue(
+            self.redis, ChannelScrapeQueueSettings(),
+        )
+
+    async def asyncTearDown(self) -> None:
+        await self.redis.aclose()
+
+    async def _run(self, *, reset: bool) -> str:
+        from tools.yt_channel_queue import cmd_recount_listing
+
+        out: StringIO = StringIO()
+        with patch('sys.stdout', out), patch('sys.stderr', StringIO()):
+            rc: int = await cmd_recount_listing(
+                argparse.Namespace(reset=reset, batch_size=2),
+                self.queue,
+            )
+        self.assertEqual(rc, 0)
+        return out.getvalue()
+
+    async def test_counts_existing_channels(self) -> None:
+        meta: str = 'youtube:channel:meta:'
+        await self.redis.hset(f'{meta}i:UCa', mapping={
+            'state': 'scheduled', 'last_attempt_at': '1',
+        })
+        await self.redis.hset(f'{meta}i:UCb', mapping={
+            'state': 'scheduled', 'successful_scrapes': '2',
+            'video_ids_enumerated_at': '5',
+        })
+        await self.redis.hset('youtube:channel:tiers', 'UCb', '1')
+        await self.redis.hset(f'{meta}i:UCc', mapping={'state': 'topic'})
+        await self.redis.hset(f'{meta}h:x', mapping={
+            'state': 'pending_resolution',
+        })
+        output: str = await self._run(reset=False)
+        self.assertIn('scanned', output)
+        self.assertEqual(await self.queue.count_listing(), {
+            (0, 'pre_tracking'): 1, (1, 'complete'): 1,
+        })
+        await self._run(reset=False)
+        self.assertEqual(await self.queue.count_listing(), {
+            (0, 'pre_tracking'): 1, (1, 'complete'): 1,
+        })
+
+    async def test_reset_rebuilds_corrupted_counts(self) -> None:
+        await self.queue.enqueue_new('UCa', source='test')
+        await self.redis.hset(
+            'youtube:channel:listing_counts', '0:never_scraped', '99',
+        )
+        await self._run(reset=True)
+        self.assertEqual(await self.queue.count_listing(), {
+            (0, 'never_scraped'): 1,
+        })

@@ -42,6 +42,7 @@ from scrape_exchange.channel_queue_reconcile import (
     record_reconcile_error,
 )
 from scrape_exchange.channel_scrape_queue import (
+    LISTING_STATUSES,
     ChannelScrapeQueueSettings,
     ChannelState,
     RedisChannelScrapeQueue,
@@ -459,6 +460,32 @@ def _build_parser() -> ArgumentParser:
         type=int,
         default=None,
         help='Inspect at most N unique channels.',
+    )
+    c_recount: ArgumentParser = sub.add_parser(
+        'recount-listing',
+        help=(
+            'Recount the video listing status (complete, partial, '
+            'pre_tracking, never_scraped) of every channel into the '
+            'per-tier counters behind the channel_video_listing_status '
+            'metric. Safe while scrapers run; only needed once to '
+            'initialise the counters, or to correct them.'
+        ),
+    )
+    c_recount.add_argument(
+        '--reset',
+        action='store_true',
+        default=False,
+        help=(
+            'Delete the counters and count from scratch. Stop the '
+            'channel scrapers first: writes during a reset are '
+            'counted twice.'
+        ),
+    )
+    c_recount.add_argument(
+        '--batch-size',
+        type=int,
+        default=1000,
+        help='Channels per Redis SCAN and pipeline. Default 1000.',
     )
     c_export: ArgumentParser = sub.add_parser(
         'export',
@@ -1627,6 +1654,7 @@ async def cmd_backfill_rss(
         )
         added += int(raw[0])
         already_known += int(raw[1])
+        await queue.recount_listing(*(f'i:{cid}' for cid in batch))
         batch = []
 
     cursor: int | str = 0
@@ -1776,6 +1804,52 @@ async def cmd_reconcile(
         sys.stdout.write('\nrepaired:\n')
         for mode, count in sorted(report.repaired.items()):
             sys.stdout.write(f'  {mode:<48} {count:>12}\n')
+    return 0
+
+
+async def cmd_recount_listing(
+    ns: Namespace,
+    queue: RedisChannelScrapeQueue,
+) -> int:
+    '''Recount every channel's video listing status.'''
+    if ns.reset:
+        await queue.reset_listing_counts()
+    prefix: str = queue._k_meta('')
+    scanned: int = 0
+    cursor: int | str = 0
+    while True:
+        keys: list[str]
+        cursor, keys = await queue._redis.scan(
+            cursor, match=f'{prefix}i:*', count=ns.batch_size,
+        )
+        members: list[str] = [key[len(prefix):] for key in keys]
+        if members:
+            if ns.reset:
+                await queue.reset_listing_counts(*members)
+            await queue.recount_listing(*members)
+            scanned += len(members)
+            if scanned % 100_000 < len(members):
+                sys.stderr.write(f'scanned {scanned} channel keys\n')
+        if not cursor:
+            break
+    counts: dict[tuple[int, str], int] = await queue.count_listing()
+    # SCAN may return a key twice; recounting it again is a no-op.
+    sys.stdout.write(f'scanned {scanned} channel keys\n')
+    sys.stdout.write(
+        f'{"tier":<6}'
+        + ''.join(f'{status:>15}' for status in LISTING_STATUSES)
+        + '\n',
+    )
+    tier: int
+    for tier in sorted({tier for tier, _ in counts}):
+        sys.stdout.write(
+            f'{tier:<6}'
+            + ''.join(
+                f'{counts.get((tier, status), 0):>15}'
+                for status in LISTING_STATUSES
+            )
+            + '\n',
+        )
     return 0
 
 
@@ -2590,6 +2664,7 @@ async def cmd_retier(
                 )
                 if moved_score is not None:
                     was_applied = True
+                    await queue.recount_listing(member)
             if not ns.apply or was_applied:
                 record_move('channel', old_tier, new_tier)
             write_status()
@@ -2652,6 +2727,7 @@ _HANDLERS['backfill-rss'] = cmd_backfill_rss
 _HANDLERS['reconcile'] = cmd_reconcile
 _HANDLERS['retier'] = cmd_retier
 _HANDLERS['export'] = cmd_export
+_HANDLERS['recount-listing'] = cmd_recount_listing
 _HANDLERS['export-rss'] = cmd_export_rss
 
 

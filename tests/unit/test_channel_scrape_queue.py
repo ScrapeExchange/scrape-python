@@ -2258,3 +2258,84 @@ class TestMissingSubscriberBackoffState(_MissingSubscriberTestBase):
             record for record in records
             if record.getMessage() == 'Scheduling missing-subscriber retry'
         ]
+
+
+class TestListingCounts(_RedisQueueTestBase):
+    '''Per-tier video listing status counters.'''
+
+    async def _counts(self) -> dict[tuple[int, str], int]:
+        counts: dict[tuple[int, str], int] = (
+            await self.queue.count_listing()
+        )
+        return {key: n for key, n in counts.items() if n}
+
+    async def test_new_channel_progresses_to_complete(self) -> None:
+        self.assertEqual(
+            await self.queue.enqueue_new('UCa', source='test'),
+            'enqueued',
+        )
+        self.assertEqual(await self._counts(), {(0, 'never_scraped'): 1})
+        progress: ChannelScrapeProgress = (
+            await self.queue.get_scrape_progress('UCa', existing=False)
+        )
+        self.assertEqual(await self._counts(), {(0, 'never_scraped'): 1})
+        self.assertTrue(await self.queue.update_tier(
+            'UCa', sub_count=50, now=time.time(), progress=progress,
+        ))
+        self.assertEqual(await self._counts(), {(4, 'partial'): 1})
+        await self.queue.set_meta(
+            'i:UCa', video_ids_enumerated_at=str(int(time.time())),
+        )
+        self.assertEqual(await self._counts(), {(4, 'complete'): 1})
+
+    async def test_pre_tracking_channel_becomes_partial(self) -> None:
+        await self.redis.hset('youtube:channel:meta:i:UCold', mapping={
+            'state': 'scheduled', 'last_attempt_at': '1',
+        })
+        await self.redis.hset('youtube:channel:tiers', 'UCold', '2')
+        await self.queue.recount_listing('i:UCold')
+        self.assertEqual(await self._counts(), {(2, 'pre_tracking'): 1})
+        await self.queue.get_scrape_progress('UCold', existing=True)
+        self.assertEqual(await self._counts(), {(2, 'partial'): 1})
+
+    async def test_terminal_channels_are_not_counted(self) -> None:
+        await self.queue.enqueue_new('UCa', source='test')
+        await self.queue.mark('i:UCa', state=ChannelState.TOPIC)
+        self.assertEqual(await self._counts(), {})
+        self.assertIsNone(await self.redis.hget(
+            'youtube:channel:meta:i:UCa', 'listing_bucket',
+        ))
+        await self.queue.unmark('i:UCa')
+        self.assertEqual(await self._counts(), {(0, 'never_scraped'): 1})
+
+    async def test_force_rescrape_revives_count(self) -> None:
+        await self.queue.enqueue_new('UCa', source='test')
+        await self.queue.mark('i:UCa', state=ChannelState.REMOVED)
+        await self.queue.force_rescrape('i:UCa', mode='full')
+        self.assertEqual(await self._counts(), {(0, 'never_scraped'): 1})
+
+    async def test_handles_are_not_counted(self) -> None:
+        await self.queue.enqueue_unresolved('@someone', source='test')
+        await self.queue.recount_listing('h:someone')
+        self.assertEqual(await self._counts(), {})
+        await self.queue.promote_to_scheduled('someone', 'UCx')
+        self.assertEqual(await self._counts(), {(0, 'never_scraped'): 1})
+
+    async def test_recount_heals_unhooked_write(self) -> None:
+        await self.queue.enqueue_new('UCa', source='test')
+        await self.redis.hset(
+            'youtube:channel:meta:i:UCa', 'successful_scrapes', '3',
+        )
+        self.assertEqual(await self._counts(), {(0, 'never_scraped'): 1})
+        await self.queue.recount_listing('i:UCa')
+        await self.queue.recount_listing('i:UCa')
+        self.assertEqual(await self._counts(), {(0, 'partial'): 1})
+
+    async def test_reset_and_recount(self) -> None:
+        await self.queue.enqueue_new('UCa', source='test')
+        await self.queue.enqueue_new('UCb', source='test')
+        await self.queue.reset_listing_counts()
+        self.assertEqual(await self._counts(), {})
+        await self.queue.reset_listing_counts('i:UCa', 'i:UCb')
+        await self.queue.recount_listing('i:UCa', 'i:UCb')
+        self.assertEqual(await self._counts(), {(0, 'never_scraped'): 2})

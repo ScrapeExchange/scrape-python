@@ -34,6 +34,68 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 # already-known IDs; afterwards re-scrapes may stop early.
 VIDEO_IDS_ENUMERATED_FIELD: str = 'video_ids_enumerated_at'
 
+# Video listing status of an active (``scheduled``) channel, counted per
+# tier in the ``youtube:channel:listing_counts`` hash:
+#   complete      - a scrape paged every tab to the end
+#   partial       - scraped, but no scrape has listed every video yet
+#   pre_tracking  - last scraped before scrape progress was tracked
+#   never_scraped - no scrape has completed yet
+LISTING_STATUSES: tuple[str, ...] = (
+    'complete', 'partial', 'pre_tracking', 'never_scraped',
+)
+# Meta field holding the ``<tier>:<status>`` bucket the channel is
+# currently counted in, so each recount knows what to decrement.
+LISTING_BUCKET_FIELD: str = 'listing_bucket'
+# Meta fields that decide the listing status.
+_LISTING_FIELDS: frozenset[str] = frozenset({
+    'state', 'successful_scrapes', VIDEO_IDS_ENUMERATED_FIELD,
+    'last_attempt_at',
+})
+
+_RECOUNT_LISTING_LUA: str = '''
+-- Move one channel to its current listing bucket in the counts hash.
+-- KEYS[1] = meta hash, KEYS[2] = tier map, KEYS[3] = listing counts
+-- ARGV[1] = member, ARGV[2] = meta field holding the counted bucket
+-- The bucket is recomputed from the current meta every time, so the
+-- counts self-correct on the channel's next recount even if an
+-- earlier write was not followed by one.
+local bucket = ''
+if string.sub(ARGV[1], 1, 2) == 'i:' then
+    local f = redis.call('HMGET', KEYS[1], 'state',
+        'successful_scrapes', 'video_ids_enumerated_at',
+        'last_attempt_at')
+    if f[1] == 'scheduled' then
+        local tier = redis.call('HGET', KEYS[2], string.sub(ARGV[1], 3))
+        if not tier then tier = '0' end
+        local status
+        if f[3] and f[3] ~= '' then
+            status = 'complete'
+        elseif not f[2] then
+            if f[4] then
+                status = 'pre_tracking'
+            else
+                status = 'never_scraped'
+            end
+        elseif f[2] == '0' then
+            status = 'never_scraped'
+        else
+            status = 'partial'
+        end
+        bucket = tier .. ':' .. status
+    end
+end
+local old = redis.call('HGET', KEYS[1], ARGV[2]) or ''
+if old == bucket then return 0 end
+if old ~= '' then redis.call('HINCRBY', KEYS[3], old, -1) end
+if bucket ~= '' then
+    redis.call('HINCRBY', KEYS[3], bucket, 1)
+    redis.call('HSET', KEYS[1], ARGV[2], bucket)
+else
+    redis.call('HDEL', KEYS[1], ARGV[2])
+end
+return 1
+'''
+
 
 @dataclass(frozen=True)
 class ChannelScrapeProgress:
@@ -786,6 +848,9 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
             )
         )
         self._rng: random.Random = rng or random.Random()
+        self._recount_script: Any = redis.register_script(
+            _RECOUNT_LISTING_LUA,
+        )
 
     def _weighted_tier_order(self) -> list[int]:
         '''Return all tier indexes in a random order where each
@@ -826,6 +891,67 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
 
     def _k_tiers(self) -> str:
         return f'{KEY_PREFIX}:tiers'
+
+    def _k_listing_counts(self) -> str:
+        return f'{KEY_PREFIX}:listing_counts'
+
+    async def recount_listing(self, *members: str) -> None:
+        '''Bring the listing-status counts in step with *members*.
+
+        Call after every write that can change a channel's state,
+        tier, scrape progress or enumeration timestamp. Each member is
+        recounted atomically from its current meta, so the call need
+        not be part of the write it follows.
+        '''
+        if not members:
+            return
+        pipe: aioredis.client.Pipeline = (
+            self._redis.pipeline(transaction=False)
+        )
+        member: str
+        for member in members:
+            await self._recount_script(
+                keys=[
+                    self._k_meta(member), self._k_tiers(),
+                    self._k_listing_counts(),
+                ],
+                args=[member, LISTING_BUCKET_FIELD],
+                client=pipe,
+            )
+        await pipe.execute()
+
+    async def reset_listing_counts(self, *members: str) -> None:
+        '''Forget the counted bucket of *members*; with no members,
+        delete the counts hash itself. Used by a full recount from
+        scratch while no channel scraper is running.'''
+        if not members:
+            await self._redis.delete(self._k_listing_counts())
+            return
+        pipe: aioredis.client.Pipeline = (
+            self._redis.pipeline(transaction=False)
+        )
+        member: str
+        for member in members:
+            pipe.hdel(self._k_meta(member), LISTING_BUCKET_FIELD)
+        await pipe.execute()
+
+    async def count_listing(self) -> dict[tuple[int, str], int]:
+        '''Active channels per ``(tier, listing status)``.'''
+        raw: dict[str, str] = await self._redis.hgetall(
+            self._k_listing_counts(),
+        )
+        out: dict[tuple[int, str], int] = {}
+        key: str
+        value: str
+        for key, value in raw.items():
+            tier_str: str
+            status: str
+            tier_str, _, status = key.partition(':')
+            try:
+                out[(int(tier_str), status)] = int(value)
+            except ValueError:
+                continue
+        return out
 
     @staticmethod
     def _normalise_handle(handle: str) -> str:
@@ -910,6 +1036,8 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
                 for state in ChannelState.terminal_states()
             ],
         )
+        if enqueued:
+            await self.recount_listing(member)
         return bool(enqueued)
 
     async def enqueue_new(
@@ -950,7 +1078,12 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
                 for state in ChannelState.terminal_states()
             ],
         )
-        return result.decode() if isinstance(result, bytes) else result
+        outcome: str = (
+            result.decode() if isinstance(result, bytes) else result
+        )
+        if outcome == 'enqueued':
+            await self.recount_listing(member)
+        return outcome
 
     async def pop_unresolved(
         self, batch: int,
@@ -1016,6 +1149,7 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
             pipe.hsetnx(new_meta, field, value)
         pipe.delete(old_meta)
         await pipe.execute()
+        await self.recount_listing(new_member)
 
     async def pop_scheduled(
         self, batch: int, *, now: float,
@@ -1065,6 +1199,7 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
             pipe.hsetnx(key, 'next_full_scrape', '11' if existing else '1')
             pipe.hmget(key, ['successful_scrapes', 'next_full_scrape'])
             results: list[Any] = await pipe.execute()
+        await self.recount_listing(f'i:{channel_id}')
         return ChannelScrapeProgress(
             successful_scrapes=int(results[-1][0]),
             next_full_scrape=int(results[-1][1]),
@@ -1111,6 +1246,7 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
                     .channel_missing_subscriber_retry_seconds),
                 str(self._tiers[-1].interval_seconds),
             )
+            await self.recount_listing(f'i:{channel_id}')
             if isinstance(result, list):
                 ok: int = int(result[0])
                 delay: float = float(result[1])
@@ -1188,6 +1324,7 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
             'missing_subscriber_attempts',
         )
         await pipe.execute()
+        await self.recount_listing(member)
 
     async def retry_missing_subscriber_count(
         self,
@@ -1273,6 +1410,7 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
         pipe.hdel(meta_key, 'unavailable_attempts')
         pipe.hincrby(meta_key, 'missing_subscriber_attempts', 1)
         results: list[Any] = await pipe.execute()
+        await self.recount_listing(member)
         _LOGGER.info(
             'Scheduling missing-subscriber retry',
             extra={
@@ -1424,6 +1562,7 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
             },
         )
         await pipe.execute()
+        await self.recount_listing(member)
         return False
 
     async def mark(
@@ -1461,6 +1600,7 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
             json.dumps(record),
             str(tier_count),
         )
+        await self.recount_listing(member)
 
     async def unmark(
         self, member: str, *, score: float | None = None,
@@ -1502,6 +1642,7 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
             target_state.value,
             str(target_score),
         )
+        await self.recount_listing(member)
 
     async def force_rescrape(
         self,
@@ -1564,6 +1705,7 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
             str(len(scheduled_keys)),
             str(len(terminal_keys)),
         )
+        await self.recount_listing(member)
 
     async def clear_force_rescrape(
         self, member: str,
@@ -1622,6 +1764,7 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
                     'state',
                     ChannelState.SCHEDULED.value,
                 )
+                await self.recount_listing(member)
         return reaped
 
     async def get_state(
@@ -1660,6 +1803,8 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
                 self._k_meta(member),
                 mapping=fields,
             )
+            if _LISTING_FIELDS.intersection(fields):
+                await self.recount_listing(member)
 
     async def count_by_state(
         self,

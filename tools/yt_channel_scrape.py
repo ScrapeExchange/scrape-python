@@ -85,6 +85,7 @@ from scrape_exchange.creator_queue import (
     parse_priority_queues,
 )
 from scrape_exchange.channel_scrape_queue import (
+    LISTING_STATUSES,
     VIDEO_IDS_ENUMERATED_FIELD,
     ChannelScrapeProgress,
     ChannelScrapeQueueSettings,
@@ -463,6 +464,15 @@ CHANNEL_QUEUE_TIER_SIZE_NEW: Gauge = Gauge(
     'channel_queue_tier_size',
     'Number of channels in each scheduled tier.',
     ['tier'],
+    multiprocess_mode='mostrecent',
+)
+CHANNEL_VIDEO_LISTING_STATUS: Gauge = Gauge(
+    'channel_video_listing_status',
+    'Active (scheduled) channels per tier by how completely their '
+    'video IDs have been listed: complete (every tab paged to the '
+    'end), partial (scraped, not yet fully listed), pre_tracking '
+    '(last scraped before progress tracking) and never_scraped.',
+    ['tier', 'status'],
     multiprocess_mode='mostrecent',
 )
 CHANNEL_RESOLVE_OUTCOMES: Counter = Counter(
@@ -1262,9 +1272,9 @@ async def _publish_channel_queue_sizes(
     interval: float = 30.0,
     shutdown_event: asyncio.Event,
 ) -> None:
-    '''Publish gauges for channel_state_size and
-    channel_queue_tier_size. Run on a single
-    elected worker per host.'''
+    '''Publish gauges for channel_state_size,
+    channel_queue_tier_size and channel_video_listing_status.
+    Run on a single elected worker per host.'''
     while not shutdown_event.is_set():
         try:
             counts: dict[ChannelState, int] = (
@@ -1281,6 +1291,18 @@ async def _publish_channel_queue_sizes(
                 CHANNEL_QUEUE_TIER_SIZE_NEW.labels(
                     tier=str(tier + 1),
                 ).set(n)
+            listing: dict[tuple[int, str], int] = (
+                await queue.count_listing()
+            )
+            tiers: set[int] = set(tier_counts) | {
+                tier for tier, _ in listing
+            }
+            status: str
+            for tier in tiers:
+                for status in LISTING_STATUSES:
+                    CHANNEL_VIDEO_LISTING_STATUS.labels(
+                        tier=str(tier + 1), status=status,
+                    ).set(listing.get((tier, status), 0))
         except Exception:
             logging.warning(
                 'channel queue metrics publish '

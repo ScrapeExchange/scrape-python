@@ -4526,12 +4526,318 @@
       "type": "timeseries"
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Active (scheduled) channels by how completely their video IDs have been listed: complete = every tab paged to the end; partial = scraped but not yet fully listed; pre_tracking = last scraped before progress tracking; never_scraped = no scrape yet.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 25,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 170
+      },
+      "id": 130,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (status) (max by (tier, status) (channel_video_listing_status{job=~\"$job\",instance=~\"$instance\"}))",
+          "legendFormat": "{{status}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Channel video listing status (stacked)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Share of active channels in each tier whose video IDs have been listed completely.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 170
+      },
+      "id": 131,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (tier) (max by (tier, status) (channel_video_listing_status{status=\"complete\",job=~\"$job\",instance=~\"$instance\"}))\n/\nsum by (tier) (max by (tier, status) (channel_video_listing_status{job=~\"$job\",instance=~\"$instance\"}))",
+          "legendFormat": "tier {{tier}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Channel video listing: % complete per tier",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "One-time full listings of a channel's videos, shorts and live tabs: completed marks the channel complete; incomplete means paging stopped early and is retried on the next scrape.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 178
+      },
+      "id": 132,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (increase(channel_full_enumeration_total{job=~\"$job\",instance=~\"$instance\"}[1h]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Channel full listings (1h) by outcome",
+      "type": "timeseries"
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 170
+        "y": 186
       },
       "id": 89,
       "panels": [],
@@ -4605,7 +4911,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 171
+        "y": 187
       },
       "id": 90,
       "options": {
@@ -4706,7 +5012,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 171
+        "y": 187
       },
       "id": 91,
       "options": {
@@ -4748,7 +5054,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 179
+        "y": 195
       },
       "id": 28,
       "panels": [],
@@ -4822,7 +5128,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 180
+        "y": 196
       },
       "id": 29,
       "options": {
@@ -4923,7 +5229,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 180
+        "y": 196
       },
       "id": 30,
       "options": {
@@ -5024,7 +5330,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 188
+        "y": 204
       },
       "id": 31,
       "options": {
@@ -5125,7 +5431,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 188
+        "y": 204
       },
       "id": 32,
       "options": {
@@ -5165,7 +5471,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 196
+        "y": 212
       },
       "id": 103,
       "panels": [],
@@ -5235,7 +5541,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 197
+        "y": 213
       },
       "id": 104,
       "options": {
@@ -5344,7 +5650,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 197
+        "y": 213
       },
       "id": 105,
       "options": {
@@ -5448,7 +5754,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 205
+        "y": 221
       },
       "id": 106,
       "options": {
@@ -5563,7 +5869,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 205
+        "y": 221
       },
       "id": 107,
       "options": {
@@ -5605,7 +5911,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 213
+        "y": 229
       },
       "id": 108,
       "panels": [],
@@ -5675,7 +5981,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 214
+        "y": 230
       },
       "id": 109,
       "options": {
@@ -5774,7 +6080,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 214
+        "y": 230
       },
       "id": 110,
       "options": {
@@ -5873,7 +6179,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 222
+        "y": 238
       },
       "id": 111,
       "options": {
@@ -5983,7 +6289,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 222
+        "y": 238
       },
       "id": 112,
       "options": {
@@ -6094,7 +6400,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 230
+        "y": 246
       },
       "id": 113,
       "options": {
@@ -6195,7 +6501,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 230
+        "y": 246
       },
       "id": 114,
       "options": {
@@ -6295,7 +6601,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 230
+        "y": 246
       },
       "id": 115,
       "options": {
@@ -6348,7 +6654,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 238
+        "y": 254
       },
       "id": 118,
       "panels": [],
@@ -6384,7 +6690,7 @@
         "h": 5,
         "w": 6,
         "x": 0,
-        "y": 239
+        "y": 255
       },
       "id": 119,
       "options": {
@@ -6450,7 +6756,7 @@
         "h": 5,
         "w": 6,
         "x": 6,
-        "y": 239
+        "y": 255
       },
       "id": 120,
       "options": {
@@ -6516,7 +6822,7 @@
         "h": 5,
         "w": 6,
         "x": 12,
-        "y": 239
+        "y": 255
       },
       "id": 121,
       "options": {
@@ -6586,7 +6892,7 @@
         "h": 5,
         "w": 6,
         "x": 18,
-        "y": 239
+        "y": 255
       },
       "id": 122,
       "options": {
@@ -6690,7 +6996,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 244
+        "y": 260
       },
       "id": 123,
       "options": {
@@ -6815,7 +7121,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 244
+        "y": 260
       },
       "id": 124,
       "options": {
@@ -6918,7 +7224,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 252
+        "y": 268
       },
       "id": 125,
       "options": {
@@ -7032,7 +7338,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 252
+        "y": 268
       },
       "id": 126,
       "options": {
@@ -7135,7 +7441,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 260
+        "y": 276
       },
       "id": 127,
       "options": {
@@ -7263,7 +7569,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 260
+        "y": 276
       },
       "id": 128,
       "options": {
@@ -7308,6 +7614,110 @@
         }
       ],
       "title": "MongoDB connections and cache (scraper backlog)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Average seconds per refill batch for each step: MongoDB read, Redis copy and MongoDB mark-hot.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "log",
+              "log": 10
+            },
+            "showPoints": "never",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 284
+      },
+      "id": 129,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "max"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (step) (rate(video_queue_refill_step_seconds_sum[10m]))\n/\nsum by (step) (rate(video_queue_refill_step_seconds_count[10m]))",
+          "legendFormat": "{{step}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Refill batch step duration",
       "type": "timeseries"
     }
   ],
