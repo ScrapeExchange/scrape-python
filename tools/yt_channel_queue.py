@@ -507,6 +507,35 @@ def _build_parser() -> ArgumentParser:
         default=1000,
         help='Channels per Redis ZSCAN and pipeline. Default 1000.',
     )
+    c_expedite: ArgumentParser = sub.add_parser(
+        'expedite-full-listing',
+        help=(
+            'Make channels whose video list is still partial, with a '
+            'stored subscriber count above --min-subscribers, due '
+            'within --spread-days, so their one full listing happens '
+            'sooner. Only ever moves a scrape earlier. Dry run by '
+            'default; pass --apply to move them.'
+        ),
+    )
+    c_expedite.add_argument(
+        '--min-subscribers', type=int, default=1000,
+        help='Only channels with more subscribers. Default 1000.',
+    )
+    c_expedite.add_argument(
+        '--spread-days', type=float, default=7.0,
+        help='Spread the new due times over this many days. Default 7.',
+    )
+    c_expedite.add_argument(
+        '--include-pre-tracking', action='store_true', default=False,
+        help='Also channels last listed before progress tracking.',
+    )
+    c_expedite.add_argument(
+        '--apply', action='store_true', default=False,
+    )
+    c_expedite.add_argument(
+        '--batch-size', type=int, default=1000,
+        help='Channels per Redis ZSCAN and pipeline. Default 1000.',
+    )
     c_export: ArgumentParser = sub.add_parser(
         'export',
         help=(
@@ -1892,6 +1921,28 @@ async def cmd_fix_unpublished_subscribers(
     return 0
 
 
+async def cmd_expedite_full_listing(
+    ns: Namespace,
+    queue: RedisChannelScrapeQueue,
+) -> int:
+    '''Report, or with --apply move, partial-list channels to be
+    scraped within --spread-days.'''
+    result: dict[str, int] = await queue.expedite_full_listing(
+        min_subscribers=ns.min_subscribers,
+        spread_seconds=ns.spread_days * 86400.0,
+        apply=ns.apply,
+        now=time.time(),
+        include_pre_tracking=ns.include_pre_tracking,
+        batch_size=ns.batch_size,
+    )
+    mode: str = 'applied' if ns.apply else 'dry run'
+    sys.stdout.write(
+        f'{mode}: scanned {result["scanned"]} eligible '
+        f'{result["eligible"]} moved {result["moved"]}\n',
+    )
+    return 0
+
+
 async def cmd_export(
     ns: Namespace,
     queue: RedisChannelScrapeQueue,
@@ -2768,6 +2819,7 @@ _HANDLERS['retier'] = cmd_retier
 _HANDLERS['export'] = cmd_export
 _HANDLERS['recount-listing'] = cmd_recount_listing
 _HANDLERS['fix-unpublished-subscribers'] = cmd_fix_unpublished_subscribers
+_HANDLERS['expedite-full-listing'] = cmd_expedite_full_listing
 _HANDLERS['export-rss'] = cmd_export_rss
 
 

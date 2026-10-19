@@ -1652,6 +1652,101 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
         result['moved'] += len(done)
         await self.recount_listing(*done)
 
+    async def expedite_full_listing(
+        self,
+        *,
+        min_subscribers: int,
+        spread_seconds: float,
+        apply: bool,
+        now: float,
+        include_pre_tracking: bool = False,
+        batch_size: int = 1000,
+    ) -> dict[str, int]:
+        '''One-off: make channels whose video list is still partial
+        (and with *include_pre_tracking* those last listed before
+        progress tracking), with a stored subscriber count above
+        *min_subscribers*, due at a random time within
+        *spread_seconds* from *now*. A channel is only ever moved
+        earlier, and only while it is still queued.
+
+        :param apply: False only counts the eligible channels.
+        :returns: counts ``scanned``, ``eligible`` and ``moved``.
+        '''
+        statuses: set[str] = {'partial'}
+        if include_pre_tracking:
+            statuses.add('pre_tracking')
+        result: dict[str, int] = {'scanned': 0, 'eligible': 0, 'moved': 0}
+        tier: int
+        for tier in range(len(self._tiers)):
+            key: str = self._k_scheduled(tier)
+            batch: list[str] = []
+            member: Any
+            async for member, _score in self._redis.zscan_iter(
+                key, count=batch_size,
+            ):
+                batch.append(_as_str(member))
+                if len(batch) >= batch_size:
+                    await self._expedite_batch(
+                        batch, key, statuses, min_subscribers,
+                        spread_seconds, apply=apply, now=now,
+                        result=result,
+                    )
+                    batch = []
+            if batch:
+                await self._expedite_batch(
+                    batch, key, statuses, min_subscribers, spread_seconds,
+                    apply=apply, now=now, result=result,
+                )
+        return result
+
+    async def _expedite_batch(
+        self,
+        members: list[str],
+        key: str,
+        statuses: set[str],
+        min_subscribers: int,
+        spread_seconds: float,
+        *,
+        apply: bool,
+        now: float,
+        result: dict[str, int],
+    ) -> dict[str, int]:
+        pipe: aioredis.client.Pipeline = (
+            self._redis.pipeline(transaction=False)
+        )
+        member: str
+        for member in members:
+            pipe.hmget(
+                self._k_meta(member),
+                ['listing_bucket', 'subscriber_count'],
+            )
+        rows: list[list[Any]] = await pipe.execute()
+        result['scanned'] += len(members)
+        eligible: list[str] = []
+        for member, (bucket, count) in zip(members, rows):
+            status: str = (_as_str(bucket) or '').partition(':')[2]
+            try:
+                subs: int = int(_as_str(count) or 0)
+            except ValueError:
+                continue
+            if status in statuses and subs > min_subscribers:
+                eligible.append(member)
+        result['eligible'] += len(eligible)
+        if not apply or not eligible:
+            return result
+        pipe = self._redis.pipeline(transaction=False)
+        for member in eligible:
+            # XX: only while still queued (not popped by a worker);
+            # LT: only ever earlier than the current schedule.
+            pipe.zadd(
+                key,
+                {member: now + self._rng.uniform(0.0, spread_seconds)},
+                xx=True, lt=True, ch=True,
+            )
+        changed: list[int] = await pipe.execute()
+        result['moved'] += sum(int(n) for n in changed)
+        return result
+
     async def requeue_with_backoff(
         self,
         key: str,

@@ -2570,6 +2570,95 @@ class TestFixUnpublishedSubscriberRetries(_MissingSubscriberTestBase):
         self.assertEqual(result['moved'], 0)
         self.assertIsNone(await self._score('UCbusy', 1))
 
+
+class TestExpediteFullListing(_MissingSubscriberTestBase):
+    '''One-off: make partial-list channels above a subscriber count
+    due within a spread window, never later than already scheduled.'''
+
+    SPREAD: float = 7 * 24 * 60 * 60.0
+
+    async def _channel(
+        self, channel_id: str, *, bucket: str, subs: str | None,
+        score: float = 10_000_000.0, tier: int = 1,
+    ) -> None:
+        await self.redis.zadd(
+            self._scheduled_key(tier), {f'i:{channel_id}': score},
+        )
+        fields: dict[str, str] = {
+            'state': 'scheduled', 'listing_bucket': bucket,
+        }
+        if subs is not None:
+            fields['subscriber_count'] = subs
+        await self.redis.hset(self._meta_key(channel_id), mapping=fields)
+
+    async def _setup(self) -> RedisChannelScrapeQueue:
+        await self._channel('UCbig', bucket='1:partial', subs='5000')
+        await self._channel(
+            'UCbig0', bucket='0:partial', subs='2000000', tier=0,
+        )
+        await self._channel('UCsmall', bucket='1:partial', subs='1000')
+        await self._channel('UCnosubs', bucket='1:partial', subs=None)
+        await self._channel('UCdone', bucket='1:complete', subs='9000')
+        await self._channel('UCold', bucket='1:pre_tracking', subs='9000')
+        await self._channel(
+            'UCsoon', bucket='1:partial', subs='9000', score=1000.0,
+        )
+        return self._queue()
+
+    async def test_dry_run_counts_only(self) -> None:
+        queue: RedisChannelScrapeQueue = await self._setup()
+        result: dict[str, int] = await queue.expedite_full_listing(
+            min_subscribers=1000, spread_seconds=self.SPREAD,
+            apply=False, now=1000.0,
+        )
+        self.assertEqual(result['eligible'], 3)
+        self.assertEqual(result['moved'], 0)
+        self.assertEqual(await self._score('UCbig', 1), 10_000_000.0)
+
+    async def test_apply_moves_only_eligible_and_never_later(
+        self,
+    ) -> None:
+        queue: RedisChannelScrapeQueue = await self._setup()
+        result: dict[str, int] = await queue.expedite_full_listing(
+            min_subscribers=1000, spread_seconds=self.SPREAD,
+            apply=True, now=1000.0,
+        )
+        for channel_id, tier in (('UCbig', 1), ('UCbig0', 0)):
+            score: float | None = await self._score(channel_id, tier)
+            assert score is not None
+            self.assertGreaterEqual(score, 1000.0)
+            self.assertLessEqual(score, 1000.0 + self.SPREAD)
+        # Already due sooner than the window: left as it is.
+        self.assertEqual(await self._score('UCsoon', 1), 1000.0)
+        for channel_id in ('UCsmall', 'UCnosubs', 'UCdone', 'UCold'):
+            self.assertEqual(
+                await self._score(channel_id, 1), 10_000_000.0,
+            )
+        self.assertEqual(result['eligible'], 3)
+        self.assertEqual(result['moved'], 2)
+
+    async def test_include_pre_tracking(self) -> None:
+        queue: RedisChannelScrapeQueue = await self._setup()
+        result: dict[str, int] = await queue.expedite_full_listing(
+            min_subscribers=1000, spread_seconds=self.SPREAD,
+            apply=False, now=1000.0, include_pre_tracking=True,
+        )
+        self.assertEqual(result['eligible'], 4)
+
+    async def test_in_flight_channel_is_not_requeued(self) -> None:
+        queue: RedisChannelScrapeQueue = self._queue()
+        await self._channel('UCbusy', bucket='1:partial', subs='5000')
+        await self.redis.zadd(self._scheduled_key(1), {'i:UCother': 1.0})
+        members: list[str] = ['i:UCbusy']
+        await self.redis.zrem(self._scheduled_key(1), 'i:UCbusy')
+        result: dict[str, int] = await queue._expedite_batch(
+            members, self._scheduled_key(1), {'partial'}, 1000,
+            self.SPREAD, apply=True, now=1000.0,
+            result={'scanned': 0, 'eligible': 0, 'moved': 0},
+        )
+        self.assertEqual(result['moved'], 0)
+        self.assertIsNone(await self._score('UCbusy', 1))
+
 class TestListingCounts(_RedisQueueTestBase):
     '''Per-tier video listing status counters.'''
 

@@ -3170,3 +3170,59 @@ class TestFixUnpublishedSubscribersCommand(
         self.assertIsNotNone(await self.redis.zscore(
             'youtube:channel:queue:scheduled:4', 'i:UCstuck',
         ))
+
+
+class TestExpediteFullListingCommand(unittest.IsolatedAsyncioTestCase):
+    '''expedite-full-listing: dry run by default, --apply moves.'''
+
+    async def asyncSetUp(self) -> None:
+        self.redis = fakeredis.aioredis.FakeRedis(
+            decode_responses=True,
+        )
+        self.queue: RedisChannelScrapeQueue = RedisChannelScrapeQueue(
+            self.redis, ChannelScrapeQueueSettings(),
+        )
+        await self.redis.zadd(
+            'youtube:channel:queue:scheduled:4', {'i:UCbig': 1e12},
+        )
+        await self.redis.hset('youtube:channel:meta:i:UCbig', mapping={
+            'state': 'scheduled', 'listing_bucket': '4:partial',
+            'subscriber_count': '5000',
+        })
+
+    async def asyncTearDown(self) -> None:
+        await self.redis.aclose()
+
+    async def _run(self, *, apply: bool) -> str:
+        from tools.yt_channel_queue import cmd_expedite_full_listing
+
+        out: StringIO = StringIO()
+        with patch('sys.stdout', out):
+            rc: int = await cmd_expedite_full_listing(
+                argparse.Namespace(
+                    apply=apply, batch_size=100, min_subscribers=1000,
+                    spread_days=7.0, include_pre_tracking=False,
+                ),
+                self.queue,
+            )
+        self.assertEqual(rc, 0)
+        return out.getvalue()
+
+    async def test_dry_run(self) -> None:
+        output: str = await self._run(apply=False)
+        self.assertIn('eligible 1', output)
+        self.assertEqual(
+            await self.redis.zscore(
+                'youtube:channel:queue:scheduled:4', 'i:UCbig',
+            ),
+            1e12,
+        )
+
+    async def test_apply(self) -> None:
+        output: str = await self._run(apply=True)
+        self.assertIn('moved 1', output)
+        score: float | None = await self.redis.zscore(
+            'youtube:channel:queue:scheduled:4', 'i:UCbig',
+        )
+        assert score is not None
+        self.assertLess(score, 1e12)
