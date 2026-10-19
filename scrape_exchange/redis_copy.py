@@ -1,8 +1,7 @@
 '''
 Copy every key of one Redis database into another with MIGRATE.
 
-Used to move the scraper Redis into a database of another server; see
-docs/superpowers/specs/2026-10-19-scraper-redis-to-homedata-design.md.
+Used to move the scraper Redis into a database of another server.
 MIGRATE always runs with COPY (the source keeps its data) and never
 with REPLACE (a key already in the target is an error).
 
