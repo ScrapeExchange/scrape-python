@@ -14,6 +14,8 @@ from typing import Any
 import fakeredis.aioredis
 from mongomock_motor import AsyncMongoMockClient
 
+from tests.unit._mongomock_compat import HintlessCollection
+
 from scrape_exchange.video_backlog import (
     MongoVideoBacklog,
     backlog_document,
@@ -32,7 +34,8 @@ class _Base(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self) -> None:
         self.coll: Any = AsyncMongoMockClient()['scraper']['youtube_videos']
-        self.backlog: MongoVideoBacklog = MongoVideoBacklog(self.coll)
+        self.hintless: HintlessCollection = HintlessCollection(self.coll)
+        self.backlog: MongoVideoBacklog = MongoVideoBacklog(self.hintless)
         self.redis: fakeredis.aioredis.FakeRedis = (
             fakeredis.aioredis.FakeRedis(decode_responses=True)
         )
@@ -96,6 +99,7 @@ class TestBacklog(_Base):
             ['old', 'hot'], from_state='queued', to_state='hot',
         )
         self.assertEqual(changed, 1)
+        self.assertEqual(self.hintless.hints, ['_id_'])
         self.assertEqual(
             sorted([vid async for vid in self.backlog.iter_hot_ids()]),
             ['hot', 'old'],

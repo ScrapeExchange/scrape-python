@@ -49,6 +49,7 @@ DELETE_FLUSH_SECONDS: float = 5.0
 DEFAULT_DATABASE: str = 'scraper'
 
 STATE_ENQUEUED_AT_INDEX: str = 'state_enqueued_at'
+ID_INDEX: str = '_id_'
 
 # One backlog (and so one MongoDB client and connection pool) per DSN,
 # platform and event loop: callers such as the channel scraper build a
@@ -414,9 +415,14 @@ class MongoVideoBacklog:
         '''
         if not video_ids:
             return 0
+        # Without the hint the planner may pick state_enqueued_at: the
+        # refill marks the oldest queued documents, which sit at the
+        # start of that index, so the scan wins the planner's trial and
+        # then walks every queued document (hours on 600M+).
         result: Any = await self._coll.update_many(
             {'_id': {'$in': video_ids}, 'state': from_state},
             {'$set': {'state': to_state}},
+            hint=ID_INDEX,
         )
         return int(result.modified_count)
 
