@@ -221,6 +221,23 @@ impl Wal {
                 )));
             }
         }
+        let last_path: PathBuf = segment_path(dir, last);
+        let last_len: u64 = fs::metadata(&last_path)?.len();
+        if last_len <= HEADER_LEN as u64 {
+            let mut head: Vec<u8> = Vec::new();
+            File::open(&last_path)?.read_to_end(&mut head)?;
+            if Header::decode(&head).is_err() {
+                // A crash or failed write while the segment was being
+                // created: it holds no records, so recreate it.
+                tracing::warn!(
+                    segment = last,
+                    bytes = last_len,
+                    "recreating half-created change log segment"
+                );
+                let file: File = create_segment(dir, last)?;
+                return Ok(Wal::from_parts(dir, per_segment, file, last, 0));
+            }
+        }
         let (recs, torn) = read_segment(dir, last)?;
         let n: u64 = recs.len() as u64;
         let mut file: File = OpenOptions::new()
@@ -328,18 +345,25 @@ impl Wal {
     }
 }
 
+/// Create segment *first* atomically (temp file, header, fsync,
+/// rename), replacing any partial file a failed attempt left, and
+/// return it opened for appending.
 fn create_segment(dir: &Path, first: u64) -> io::Result<File> {
-    let mut f: File = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(segment_path(dir, first))?;
-    let h: Header = Header {
-        wal_cut: first,
-        ..Header::new(FileKind::Wal)
-    };
-    f.write_all(&h.encode())?;
-    f.sync_all()?;
+    let path: PathBuf = segment_path(dir, first);
+    let tmp: PathBuf = crate::fsutil::tmp_path(&path);
+    {
+        let mut f: File = File::create(&tmp)?;
+        let h: Header = Header {
+            wal_cut: first,
+            ..Header::new(FileKind::Wal)
+        };
+        f.write_all(&h.encode())?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, &path)?;
     fsync_dir(dir)?;
+    let mut f: File = OpenOptions::new().write(true).open(&path)?;
+    f.seek(SeekFrom::End(0))?;
     Ok(f)
 }
 
@@ -472,5 +496,37 @@ mod tests {
         );
         drop(w);
         assert_eq!(Wal::open(d.path()).unwrap().next_lsn(), 2);
+    }
+
+    #[test]
+    fn half_created_last_segment_recovers() {
+        for partial in [0usize, 50] {
+            let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+            {
+                let mut w: Wal = Wal::open_with(d.path(), 4).unwrap();
+                for r in sample(4) {
+                    w.append(&r).unwrap();
+                }
+            }
+            // A crash between creating segment 4 and writing its header.
+            std::fs::write(segment_path(d.path(), 4), vec![0u8; partial])
+                .unwrap();
+            let mut w: Wal = Wal::open_with(d.path(), 4).unwrap();
+            assert_eq!(w.next_lsn(), 4, "partial={partial}");
+            assert_eq!(w.append(&put(9)).unwrap(), 4);
+            w.sync().unwrap();
+            assert_eq!(replay(d.path(), 4).unwrap(), vec![(4, put(9))]);
+        }
+    }
+
+    #[test]
+    fn rotate_retries_after_failed_segment_creation() {
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let mut w: Wal = Wal::open_with(d.path(), 2).unwrap();
+        w.append(&put(1)).unwrap();
+        w.append(&put(2)).unwrap();
+        // An earlier rotation created the file but failed writing it.
+        std::fs::write(segment_path(d.path(), 2), b"x").unwrap();
+        assert_eq!(w.append(&put(3)).unwrap(), 2);
     }
 }

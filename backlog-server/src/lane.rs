@@ -183,14 +183,21 @@ impl Lane {
         Ok(pos)
     }
 
+    /// Create segment *first* atomically, replacing any partial file
+    /// a failed attempt left, and return it opened for appending.
     fn create_segment(&self, first: u64) -> io::Result<File> {
-        let mut f: File = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(segment_path(&self.dir, first))?;
-        f.write_all(&Header::new(FileKind::LaneSegment).encode())?;
+        let path: PathBuf = segment_path(&self.dir, first);
+        let tmp: PathBuf = crate::fsutil::tmp_path(&path);
+        {
+            let mut f: File = File::create(&tmp)?;
+            f.write_all(&Header::new(FileKind::LaneSegment).encode())?;
+            f.sync_all()?;
+        }
+        fs::rename(&tmp, &path)?;
         fsync_dir(&self.dir)?;
+        let mut f: File =
+            OpenOptions::new().read(true).write(true).open(&path)?;
+        f.seek(SeekFrom::End(0))?;
         Ok(f)
     }
 
