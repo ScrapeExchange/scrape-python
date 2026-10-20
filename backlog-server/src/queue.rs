@@ -10,13 +10,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::base::Base;
+use crate::base::{Base, list_generations, read_terminal, remove_generation};
+use crate::checkpoint::{self, Checkpoint, LaneCkpt};
 use crate::fileformat::FormatError;
+use crate::fsutil::remove_tmp_files;
 use crate::known::KnownSet;
 use crate::lane::{Lane, LaneId};
 use crate::leases::Leases;
 use crate::meta::{Meta, Reason, State};
-use crate::wal::{Record, Wal, WalError};
+use crate::wal::{Record, Wal, WalError, replay};
 
 #[derive(Debug, Clone, Copy)]
 pub struct QueueParams {
@@ -78,6 +80,7 @@ pub struct Queue {
     main: Lane,
     priority: Lane,
     leases: Leases,
+    replayed: usize,
 }
 
 fn queued(force: bool) -> Meta {
@@ -85,17 +88,95 @@ fn queued(force: bool) -> Meta {
 }
 
 impl Queue {
-    pub fn new_in_memory_for_tests(dir: &Path, params: QueueParams) -> Queue {
-        Queue {
+    /// Open (or create) the queue in *dir* and recover it: load the
+    /// checkpointed generation, cut lanes back to the checkpoint and
+    /// replay the change log.
+    pub fn open(dir: &Path, params: QueueParams) -> Result<Queue, QueueError> {
+        std::fs::create_dir_all(dir)?;
+        remove_tmp_files(dir)?;
+        let c: Checkpoint = checkpoint::read(dir)?.unwrap_or_default();
+        let base_dir: PathBuf = dir.join("base");
+        for g in list_generations(&base_dir)? {
+            if g != c.generation {
+                remove_generation(&base_dir, g)?;
+            }
+        }
+        let base: Arc<Base> = Arc::new(Base::open(&base_dir, c.generation)?);
+        let terminal: HashMap<u64, u32> =
+            read_terminal(&base_dir, c.generation)?;
+        let main: Lane = Lane::open(
+            &dir.join("lanes/main"),
+            Some(c.main.tail),
+            c.main.resume,
+        )?;
+        let priority: Lane = Lane::open(
+            &dir.join("lanes/priority"),
+            Some(c.priority.tail),
+            c.priority.resume,
+        )?;
+        let wal_dir: PathBuf = dir.join("wal");
+        let wal: Wal = Wal::open(&wal_dir)?;
+        let mut q: Queue = Queue {
             dir: dir.to_path_buf(),
             params,
-            known: KnownSet::new(Arc::new(Base::empty()), HashMap::new()),
-            wal: Wal::open(&dir.join("wal")).expect("wal"),
-            main: Lane::open(&dir.join("lanes/main"), None, 0).expect("lane"),
-            priority: Lane::open(&dir.join("lanes/priority"), None, 0)
-                .expect("lane"),
+            known: KnownSet::new(base, terminal),
+            wal,
+            main,
+            priority,
             leases: Leases::default(),
+            replayed: 0,
+        };
+        let records: Vec<(u64, Record)> = replay(&wal_dir, c.replay_from_lsn)?;
+        q.replayed = records.len();
+        for (lsn, r) in records {
+            let in_lane: bool = lsn < c.lanes_as_of_lsn;
+            match r {
+                Record::Put { id, meta, ts } => q.known.put(id, meta, ts),
+                Record::Append { lane, id } => {
+                    if !in_lane {
+                        q.lane_mut(lane).append(id)?;
+                    }
+                }
+                Record::PutAppend { id, meta, ts, lane } => {
+                    q.known.put(id, meta, ts);
+                    if !in_lane {
+                        q.lane_mut(lane).append(id)?;
+                    }
+                }
+            }
         }
+        Ok(q)
+    }
+
+    /// Records replayed by the last [`Queue::open`].
+    pub fn replayed(&self) -> usize {
+        self.replayed
+    }
+
+    /// Make everything durable and record where recovery starts, then
+    /// drop lane segments that are wholly consumed.
+    pub fn write_checkpoint(&mut self) -> Result<(), QueueError> {
+        self.sync()?;
+        let main_resume: u64 = self.resume_cursor(LaneId::Main);
+        let prio_resume: u64 = self.resume_cursor(LaneId::Priority);
+        let c: Checkpoint = Checkpoint {
+            generation: self.known.base().info().generation,
+            replay_from_lsn: self.known.base().info().wal_cut,
+            lanes_as_of_lsn: self.wal.next_lsn(),
+            main: LaneCkpt {
+                tail: self.main.tail(),
+                resume: main_resume,
+            },
+            priority: LaneCkpt {
+                tail: self.priority.tail(),
+                resume: prio_resume,
+            },
+            ..Checkpoint::default()
+        };
+        checkpoint::write(&self.dir, &c)?;
+        self.main.release_before(main_resume)?;
+        self.priority.release_before(prio_resume)?;
+        Ok(())
     }
 
     pub fn dir(&self) -> &Path {
@@ -301,6 +382,7 @@ impl Queue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::base::BaseWriter;
 
     const L: Duration = Duration::from_secs(60);
 
@@ -312,7 +394,7 @@ mod tests {
     }
 
     fn q(d: &tempfile::TempDir) -> Queue {
-        Queue::new_in_memory_for_tests(d.path(), params())
+        Queue::open(d.path(), params()).unwrap()
     }
 
     fn ids(items: &[PopItem]) -> Vec<(u64, bool)> {
@@ -459,13 +541,14 @@ mod tests {
     #[test]
     fn pop_bounded_scan_returns_partial() {
         let d: tempfile::TempDir = tempfile::tempdir().unwrap();
-        let mut q: Queue = Queue::new_in_memory_for_tests(
+        let mut q: Queue = Queue::open(
             d.path(),
             QueueParams {
                 pop_scan_limit: 1000,
                 ..params()
             },
-        );
+        )
+        .unwrap();
         let now: Instant = Instant::now();
         assert!(q.pop(10, L, now).unwrap().is_empty());
         for id in 0..5000 {
@@ -507,5 +590,114 @@ mod tests {
         assert_eq!(q.info().counts, [1, 0, 0, 0, 0]);
         assert_eq!(q.info().lane_main, 1);
         assert!(q.add(2, 0).unwrap());
+    }
+
+    fn drain(q: &mut Queue) -> Vec<u64> {
+        let got: Vec<PopItem> = q.pop(1000, L, Instant::now()).unwrap();
+        got.into_iter().map(|p| p.id).collect()
+    }
+
+    #[test]
+    fn reopen_without_checkpoint_replays_everything() {
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        {
+            let mut q: Queue = q(&d);
+            for id in [5, 6, 7] {
+                q.add(id, 0).unwrap();
+            }
+            q.mark(6, State::Failed, Reason::Premiere, 42).unwrap();
+            q.force(8, 0).unwrap();
+            q.sync().unwrap();
+        }
+        let mut q: Queue = q(&d);
+        assert_eq!(q.state(6), Some(State::Failed));
+        assert_eq!(q.meta(6).unwrap().reason(), Reason::Premiere);
+        assert_eq!(drain(&mut q), vec![8, 5, 7]);
+        assert_eq!(q.replayed(), 5);
+    }
+
+    #[test]
+    fn reopen_after_checkpoint_no_duplicate_lane_entries() {
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        {
+            let mut q: Queue = q(&d);
+            for id in 1..=3 {
+                q.add(id, 0).unwrap();
+            }
+            q.write_checkpoint().unwrap();
+            for id in 4..=5 {
+                q.add(id, 0).unwrap();
+            }
+            q.sync().unwrap();
+        }
+        let mut q: Queue = q(&d);
+        assert_eq!(q.info().lane_main, 5);
+        assert_eq!(drain(&mut q), vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn leased_ids_reissued_after_restart() {
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        {
+            let mut q: Queue = q(&d);
+            q.add(1, 0).unwrap();
+            q.add(2, 0).unwrap();
+            assert_eq!(drain(&mut q), vec![1, 2]);
+            q.complete(2, 0).unwrap();
+            q.write_checkpoint().unwrap();
+        }
+        let mut q: Queue = q(&d);
+        assert_eq!(drain(&mut q), vec![1]);
+    }
+
+    #[test]
+    fn checkpoint_releases_consumed_segments() {
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let mut q: Queue = q(&d);
+        q.add(1, 0).unwrap();
+        drain(&mut q);
+        q.complete(1, 0).unwrap();
+        q.write_checkpoint().unwrap();
+        let c: Checkpoint = checkpoint::read(d.path()).unwrap().unwrap();
+        assert_eq!((c.main.tail, c.main.resume), (1, 1));
+        assert_eq!(c.lanes_as_of_lsn, 2);
+    }
+
+    #[test]
+    fn tmp_and_orphan_generation_removed() {
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let bdir: PathBuf = d.path().join("base");
+        let mut w: BaseWriter = BaseWriter::create(&bdir, 9, 0).unwrap();
+        w.push(1, queued(false)).unwrap();
+        w.finish().unwrap();
+        std::fs::write(bdir.join("ids.00000010.tmp"), b"").unwrap();
+        let q: Queue = q(&d);
+        assert!(crate::base::list_generations(&bdir).unwrap().is_empty());
+        assert!(!bdir.join("ids.00000010.tmp").exists());
+        assert_eq!(q.state(1), None);
+    }
+
+    #[test]
+    fn counts_exact_after_replay() {
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let before: QueueInfo;
+        {
+            let mut q: Queue = q(&d);
+            for id in 0..100 {
+                q.add(id, 0).unwrap();
+            }
+            for id in 0..30 {
+                q.complete(id, 0).unwrap();
+            }
+            for id in 30..40 {
+                q.mark(id, State::Unavailable, Reason::Unavailable, 1)
+                    .unwrap();
+            }
+            q.write_checkpoint().unwrap();
+            before = q.info();
+        }
+        let q: Queue = q(&d);
+        assert_eq!(q.info().counts, before.counts);
+        assert_eq!(q.info().counts, [60, 30, 0, 10, 0]);
     }
 }

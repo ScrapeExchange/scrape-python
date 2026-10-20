@@ -1,4 +1,5 @@
 pub mod base;
+pub mod checkpoint;
 pub mod codec;
 pub mod fileformat;
 pub mod fsutil;
