@@ -298,6 +298,10 @@ pub fn run(args: &ImportArgs) -> Result<ImportReport> {
     }
     fs::create_dir_all(&qdir)?;
     let lock: File = crate::queue::lock_dir(&qdir)?;
+    // Queue::open refuses the directory while this marker exists.
+    let marker: PathBuf = qdir.join(crate::queue::IMPORTING);
+    fs::write(&marker, b"")?;
+    fsync_dir(&qdir)?;
     let tmp: PathBuf = qdir.join("import-tmp");
     fs::create_dir_all(&tmp)?;
     let run_len: usize = args.run_records.unwrap_or_else(|| {
@@ -459,6 +463,7 @@ pub fn run(args: &ImportArgs) -> Result<ImportReport> {
     };
     fs::remove_dir_all(&tmp)?;
     checkpoint::write(&qdir, &c)?;
+    fs::remove_file(&marker)?;
     fsync_dir(&qdir)?;
     drop(lock);
     let json: String = serde_json::to_string_pretty(&report)?;
@@ -642,5 +647,14 @@ mod tests {
         let t: tempfile::TempDir = tempfile::tempdir().unwrap();
         let _q: Queue = Queue::open(t.path(), params()).unwrap();
         assert!(Queue::open(t.path(), params()).is_err());
+    }
+
+    #[test]
+    fn interrupted_import_is_refused_not_wiped() {
+        let t: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let qdir: PathBuf = t.path().join("youtube_video");
+        std::fs::create_dir_all(&qdir).unwrap();
+        std::fs::write(qdir.join(crate::queue::IMPORTING), b"").unwrap();
+        assert!(Queue::open(&qdir, params()).is_err());
     }
 }

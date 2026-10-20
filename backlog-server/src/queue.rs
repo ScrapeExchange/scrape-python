@@ -77,6 +77,25 @@ pub enum QueueError {
     Io(#[from] io::Error),
 }
 
+/// Marker file present while `backlog-server import` builds a queue.
+pub const IMPORTING: &str = "IMPORTING";
+
+fn refuse(msg: String) -> QueueError {
+    QueueError::Io(io::Error::new(io::ErrorKind::InvalidData, msg))
+}
+
+/// Whether any change log segment holds at least one record.
+fn has_records(wal_dir: &Path) -> io::Result<bool> {
+    for first in crate::wal::segment_firsts(wal_dir)? {
+        let p: PathBuf = crate::wal::segment_path(wal_dir, first);
+        let len: u64 = std::fs::metadata(&p)?.len();
+        if len > crate::fileformat::HEADER_LEN as u64 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Take an exclusive, non-blocking lock on `<dir>/LOCK`; held until
 /// the returned file is dropped.
 pub fn lock_dir(dir: &Path) -> io::Result<std::fs::File> {
@@ -138,11 +157,36 @@ impl Queue {
     pub fn open(dir: &Path, params: QueueParams) -> Result<Queue, QueueError> {
         std::fs::create_dir_all(dir)?;
         let lock: std::fs::File = lock_dir(dir)?;
-        remove_tmp_files(dir)?;
-        let c: Checkpoint = checkpoint::read(dir)?.unwrap_or_default();
+        if dir.join(IMPORTING).exists() {
+            return Err(refuse(format!(
+                "{dir:?}: an import did not finish; empty the directory \
+                 and run the import again"
+            )));
+        }
         let base_dir: PathBuf = dir.join("base");
-        for g in list_generations(&base_dir)? {
+        let wal_dir: PathBuf = dir.join("wal");
+        let found: Option<Checkpoint> = checkpoint::read(dir)?;
+        let generations: Vec<u64> = list_generations(&base_dir)?;
+        // Without a checkpoint, a base generation is only legitimate as
+        // the leftover of a compaction, which needs logged records. A
+        // base with an empty log is an unfinished import or a restore
+        // missing its CHECKPOINT: refuse instead of deleting it.
+        if found.is_none() && !generations.is_empty() && !has_records(&wal_dir)?
+        {
+            return Err(refuse(format!(
+                "{dir:?} holds base generations {generations:?} but no \
+                 CHECKPOINT and no change log; refusing to discard them"
+            )));
+        }
+        remove_tmp_files(dir)?;
+        let c: Checkpoint = found.unwrap_or_default();
+        for g in generations {
             if g != c.generation {
+                tracing::warn!(
+                    queue_dir = %dir.display(),
+                    generation = g,
+                    "removing base generation the checkpoint does not name"
+                );
                 remove_generation(&base_dir, g)?;
             }
         }
@@ -159,7 +203,6 @@ impl Queue {
             Some(c.priority.tail),
             c.priority.resume,
         )?;
-        let wal_dir: PathBuf = dir.join("wal");
         let wal: Wal = Wal::open(&wal_dir)?;
         let mut q: Queue = Queue {
             _lock: lock,
@@ -539,6 +582,7 @@ impl Queue {
 mod tests {
     use super::*;
     use crate::base::BaseWriter;
+    use crate::checkpoint::{self, Checkpoint};
 
     const L: Duration = Duration::from_secs(60);
 
@@ -832,6 +876,7 @@ mod tests {
         w.push(1, queued(false)).unwrap();
         w.finish().unwrap();
         std::fs::write(bdir.join("ids.00000010.tmp"), b"").unwrap();
+        checkpoint::write(d.path(), &Checkpoint::default()).unwrap();
         let q: Queue = q(&d);
         assert!(crate::base::list_generations(&bdir).unwrap().is_empty());
         assert!(!bdir.join("ids.00000010.tmp").exists());
@@ -936,5 +981,42 @@ mod tests {
         let now: Instant = Instant::now();
         assert_eq!(q.pop(1, Duration::MAX, now).unwrap().len(), 1);
         assert!(q.touch(1, Duration::MAX, now));
+    }
+
+    fn write_gen(dir: &Path, g: u64) {
+        let mut w: BaseWriter =
+            BaseWriter::create(&dir.join("base"), g, 0).unwrap();
+        w.push(1, queued(false)).unwrap();
+        w.finish().unwrap();
+    }
+
+    #[test]
+    fn refuses_base_without_checkpoint() {
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        write_gen(d.path(), 1);
+        assert!(Queue::open(d.path(), params()).is_err());
+        assert!(d.path().join("base/ids.00000001").exists(), "kept");
+    }
+
+    #[test]
+    fn refuses_unfinished_import() {
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(IMPORTING), b"").unwrap();
+        assert!(Queue::open(d.path(), params()).is_err());
+    }
+
+    #[test]
+    fn crash_before_first_checkpoint_still_recovers() {
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        {
+            let mut q: Queue = q(&d);
+            q.add(5, 0).unwrap();
+            q.sync().unwrap();
+            // A compaction finished its files but not its checkpoint.
+            write_gen(d.path(), 1);
+        }
+        let mut q: Queue = q(&d);
+        assert_eq!(q.info().generation, 0);
+        assert_eq!(drain(&mut q), vec![5]);
     }
 }
