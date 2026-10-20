@@ -338,13 +338,16 @@ pub fn read_terminal(
         .collect())
 }
 
-/// Delete a generation's files; missing files are fine.
+/// Delete a generation's files, including temp files a failed write
+/// left; missing files are fine.
 pub fn remove_generation(dir: &Path, generation: u64) -> io::Result<()> {
-    for p in [
+    let finals: [PathBuf; 3] = [
         ids_path(dir, generation),
         state_path(dir, generation),
         terminal_path(dir, generation),
-    ] {
+    ];
+    let tmps: Vec<PathBuf> = finals.iter().map(|p| tmp_path(p)).collect();
+    for p in finals.into_iter().chain(tmps) {
         match fs::remove_file(&p) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
             _ => {}

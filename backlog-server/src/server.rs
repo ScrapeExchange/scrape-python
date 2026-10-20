@@ -375,16 +375,16 @@ fn finish(
             }
             Err(e) => {
                 error!(queue = %name, error = %e, "installing compaction");
-                q.abort_compaction();
+                q.abort_compaction(Instant::now());
             }
         },
         Ok((Err(e), _)) => {
             error!(queue = %name, error = %e, "compaction failed");
-            q.abort_compaction();
+            q.abort_compaction(Instant::now());
         }
         Err(e) => {
             error!(queue = %name, error = %e, "compaction panicked");
-            q.abort_compaction();
+            q.abort_compaction(Instant::now());
         }
     }
 }

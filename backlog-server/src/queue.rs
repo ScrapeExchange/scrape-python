@@ -111,7 +111,14 @@ pub struct Queue {
     /// (generation, wal_cut) of the compaction in flight.
     compacting: Option<(u64, u64)>,
     last_compaction: Instant,
+    /// Consecutive failed compactions, and when to try again.
+    compaction_failures: u32,
+    compaction_retry_at: Option<Instant>,
 }
+
+/// First wait after a failed compaction; doubles per failure.
+const COMPACTION_RETRY_BASE: Duration = Duration::from_secs(60);
+const COMPACTION_RETRY_MAX: Duration = Duration::from_secs(1800);
 
 /// `now + lease`, saturating instead of panicking on overflow.
 fn deadline(now: Instant, lease: Duration) -> Instant {
@@ -166,6 +173,8 @@ impl Queue {
             replayed: 0,
             compacting: None,
             last_compaction: Instant::now(),
+            compaction_failures: 0,
+            compaction_retry_at: None,
         };
         let records: Vec<(u64, Record)> = replay(&wal_dir, c.replay_from_lsn)?;
         q.replayed = records.len();
@@ -422,9 +431,16 @@ impl Queue {
 
     pub fn should_compact(&self, now: Instant) -> bool {
         let n: usize = self.known.delta_len();
+        if self.compaction_retry_at.is_some_and(|at| now < at) {
+            return false;
+        }
+        // After a failure the compaction was already due: retry as soon
+        // as the backoff has passed.
+        let retry: bool = self.compaction_failures > 0;
         self.compacting.is_none()
             && n > 0
-            && (n >= self.params.compaction_delta_entries
+            && (retry
+                || n >= self.params.compaction_delta_entries
                 || now.duration_since(self.last_compaction)
                     >= self.params.compaction_interval)
     }
@@ -465,6 +481,8 @@ impl Queue {
         self.known.install_base(base);
         self.compacting = None;
         self.last_compaction = Instant::now();
+        self.compaction_failures = 0;
+        self.compaction_retry_at = None;
         self.write_checkpoint()?;
         self.wal.truncate_before(wal_cut)?;
         if old != 0 {
@@ -473,11 +491,20 @@ impl Queue {
         Ok(())
     }
 
-    /// Give the frozen delta back after a failed compaction.
-    pub fn abort_compaction(&mut self) {
+    /// Give the frozen delta back after a failed compaction, remove
+    /// what it wrote, and wait before trying again (60 s, doubling per
+    /// consecutive failure, at most 30 min).
+    pub fn abort_compaction(&mut self, now: Instant) {
         if let Some((generation, _)) = self.compacting.take() {
             self.known.unfreeze();
             let _ = remove_generation(&self.dir.join("base"), generation);
+            self.compaction_failures =
+                self.compaction_failures.saturating_add(1);
+            let shift: u32 = (self.compaction_failures - 1).min(16);
+            let wait: Duration = COMPACTION_RETRY_BASE
+                .saturating_mul(1 << shift)
+                .min(COMPACTION_RETRY_MAX);
+            self.compaction_retry_at = Some(now + wait);
         }
     }
 

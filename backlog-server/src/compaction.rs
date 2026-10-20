@@ -56,6 +56,7 @@ pub fn run(job: &CompactionJob) -> io::Result<BaseInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::base::BaseWriter;
     use crate::base::tests::rng;
     use crate::meta::{ALL_STATES, Reason, State};
     use crate::queue::{Queue, QueueParams};
@@ -188,7 +189,7 @@ mod tests {
         let _job: CompactionJob = q.start_compaction().unwrap();
         assert!(q.start_compaction().is_none());
         q.complete(2, 0).unwrap();
-        q.abort_compaction();
+        q.abort_compaction(Instant::now());
         assert_eq!(q.info().delta_entries, 2);
         assert_eq!(q.state(1), Some(State::Queued));
         compact(&mut q);
@@ -211,5 +212,36 @@ mod tests {
         q.add(2, 0).unwrap();
         q.add(3, 0).unwrap();
         assert!(q.should_compact(now));
+    }
+
+    #[test]
+    fn failed_compaction_backs_off_and_cleans_up() {
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let mut q: Queue = Queue::open(d.path(), params()).unwrap();
+        q.add(1, 0).unwrap();
+        let job: CompactionJob = q.start_compaction().unwrap();
+        // A merge that died part-way leaves temp files behind.
+        drop(BaseWriter::create(&job.dir, job.generation, 0).unwrap());
+        let tmp = crate::fsutil::tmp_path(&crate::base::ids_path(
+            &job.dir,
+            job.generation,
+        ));
+        assert!(tmp.exists());
+        let t0: Instant = Instant::now();
+        q.abort_compaction(t0);
+        assert!(!tmp.exists(), "temp files removed on abort");
+        let past_interval: Instant = t0 + Duration::from_secs(3601);
+        assert!(!q.should_compact(t0 + Duration::from_secs(30)));
+        assert!(q.should_compact(t0 + Duration::from_secs(61)));
+        // A second failure doubles the wait.
+        let t1: Instant = t0 + Duration::from_secs(61);
+        q.start_compaction().unwrap();
+        q.abort_compaction(t1);
+        assert!(!q.should_compact(t1 + Duration::from_secs(100)));
+        assert!(q.should_compact(t1 + Duration::from_secs(121)));
+        // Success resets the backoff.
+        compact(&mut q);
+        q.add(2, 0).unwrap();
+        assert!(q.should_compact(past_interval + Duration::from_secs(3601)));
     }
 }
