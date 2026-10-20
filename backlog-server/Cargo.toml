@@ -26,3 +26,6 @@ path = "src/main.rs"
 
 [profile.release]
 debug = 1
+# A panicking queue owner must take the process down so the container
+# restart policy recovers it, instead of a live PING over a dead queue.
+panic = "abort"

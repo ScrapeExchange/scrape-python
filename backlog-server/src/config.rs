@@ -125,8 +125,12 @@ impl ServeConfig {
                 self.listen
             );
         }
-        if self.pop_scan_limit == 0 || self.lease_secs == 0 {
-            bail!("pop scan limit and lease must be positive");
+        if self.pop_scan_limit == 0 {
+            bail!("BACKLOG_POP_SCAN_LIMIT must be positive");
+        }
+        let max_lease: u64 = crate::commands::MAX_LEASE_SECS;
+        if !(1..=max_lease).contains(&self.lease_secs) {
+            bail!("BACKLOG_LEASE_SECS must be 1..={max_lease}");
         }
         parse_queues(&self.queues)
     }

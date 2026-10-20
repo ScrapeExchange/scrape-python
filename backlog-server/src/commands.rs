@@ -127,6 +127,20 @@ fn parse_u64(b: &[u8]) -> Option<u64> {
     text(b).parse::<u64>().ok()
 }
 
+/// Longest lease a client may ask for.
+pub const MAX_LEASE_SECS: u64 = 7 * 24 * 3600;
+
+/// A client-supplied lease in seconds, 1..=MAX_LEASE_SECS.
+fn parse_lease(b: &[u8]) -> Result<Duration, Value> {
+    match parse_u64(b) {
+        Some(s) if (1..=MAX_LEASE_SECS).contains(&s) => {
+            Ok(Duration::from_secs(s))
+        }
+        Some(_) => Err(err("ERR lease out of range")),
+        None => Err(err("ERR value is not an integer")),
+    }
+}
+
 fn check_password(c: &Ctx, user: Option<&[u8]>, pass: &[u8]) -> bool {
     if user.is_some_and(|u| u != b"default") {
         return false;
@@ -282,18 +296,16 @@ async fn backlog(op: &str, args: &[Vec<u8>], c: &Ctx) -> Value {
         },
         "POP" => {
             let (n, lease) = match rest {
-                [n] => (parse_u64(n), None),
-                [n, kw, s] if upper(kw) == "LEASE" => {
-                    (parse_u64(n), parse_u64(s).map(Duration::from_secs))
-                }
+                [n] => (n, None),
+                [n, kw, s] if upper(kw) == "LEASE" => match parse_lease(s) {
+                    Ok(l) => (n, Some(l)),
+                    Err(v) => return v,
+                },
                 _ => return wrong_args(),
             };
-            let Some(n) = n else {
+            let Some(n) = parse_u64(n) else {
                 return err("ERR value is not an integer");
             };
-            if rest.len() == 3 && lease.is_none() {
-                return err("ERR value is not an integer");
-            }
             Request::Pop {
                 n: n as usize,
                 lease,
@@ -302,9 +314,9 @@ async fn backlog(op: &str, args: &[Vec<u8>], c: &Ctx) -> Value {
         "TOUCH" => {
             let (id, lease) = match rest {
                 [id] => (id, None),
-                [id, s] => match parse_u64(s) {
-                    Some(s) => (id, Some(Duration::from_secs(s))),
-                    None => return err("ERR value is not an integer"),
+                [id, s] => match parse_lease(s) {
+                    Ok(l) => (id, Some(l)),
+                    Err(v) => return v,
                 },
                 _ => return wrong_args(),
             };
@@ -734,5 +746,27 @@ mod tests {
             run(&c, &mut conn, &["FLUSHALL"]).await,
             Value::Error("ERR unknown command".into())
         );
+    }
+    #[tokio::test]
+    async fn lease_out_of_range_rejected() {
+        let (c, fake) = ctx(None);
+        let mut conn: ConnState = ConnState::default();
+        for cmd in [
+            &[
+                "BACKLOG.TOUCH",
+                "youtube:video",
+                "AAAAAAAAAAE",
+                "18446744073709551615",
+            ][..],
+            &["BACKLOG.TOUCH", "youtube:video", "AAAAAAAAAAE", "0"],
+            &["BACKLOG.POP", "youtube:video", "5", "LEASE", "604801"],
+        ] {
+            assert_eq!(
+                run(&c, &mut conn, cmd).await,
+                Value::Error("ERR lease out of range".into()),
+                "{cmd:?}"
+            );
+        }
+        assert!(fake.seen.lock().unwrap().is_empty());
     }
 }

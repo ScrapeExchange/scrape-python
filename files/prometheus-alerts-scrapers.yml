@@ -485,3 +485,21 @@ groups:
           summary: >-
             Producers sent over 1000 malformed IDs to
             {{ $labels.queue }} in 1h
+
+      - alert: BacklogOpErrors
+        expr: |
+          sum by (queue, op) (
+            rate(backlog_ops_total{result="error"}[5m])
+          ) > 0
+        for: 5m
+        labels:
+          severity: critical
+          scraper: video
+        annotations:
+          summary: >-
+            backlog-server {{ $labels.op }} on {{ $labels.queue }} is
+            failing
+          description: >-
+            Commands return errors (disk full, I/O error or a poisoned
+            change log). Check free space on the data directory and the
+            server logs; restart once the cause is fixed.

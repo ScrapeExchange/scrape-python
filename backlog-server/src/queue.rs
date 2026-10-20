@@ -113,6 +113,13 @@ pub struct Queue {
     last_compaction: Instant,
 }
 
+/// `now + lease`, saturating instead of panicking on overflow.
+fn deadline(now: Instant, lease: Duration) -> Instant {
+    now.checked_add(lease)
+        .or_else(|| now.checked_add(Duration::from_secs(10 * 365 * 86_400)))
+        .unwrap_or(now)
+}
+
 fn queued(force: bool) -> Meta {
     Meta::new(State::Queued, force, Reason::None)
 }
@@ -304,7 +311,7 @@ impl Queue {
     ) -> Result<Vec<PopItem>, QueueError> {
         let mut out: Vec<PopItem> = Vec::new();
         let mut scanned: usize = 0;
-        let deadline: Instant = now + lease;
+        let deadline: Instant = deadline(now, lease);
         for lane in [LaneId::Priority, LaneId::Main] {
             while out.len() < n && scanned < self.params.pop_scan_limit {
                 let Some((pos, id)) = self.lane_mut(lane).next()? else {
@@ -330,7 +337,7 @@ impl Queue {
     }
 
     pub fn touch(&mut self, id: u64, lease: Duration, now: Instant) -> bool {
-        self.leases.touch(id, now + lease)
+        self.leases.touch(id, deadline(now, lease))
     }
 
     pub fn complete(&mut self, id: u64, ts: u32) -> Result<(), QueueError> {
@@ -892,5 +899,15 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         assert_eq!(drain(&mut q), vec![7]);
+    }
+
+    #[test]
+    fn huge_lease_does_not_panic() {
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let mut q: Queue = q(&d);
+        q.add(1, 0).unwrap();
+        let now: Instant = Instant::now();
+        assert_eq!(q.pop(1, Duration::MAX, now).unwrap().len(), 1);
+        assert!(q.touch(1, Duration::MAX, now));
     }
 }
