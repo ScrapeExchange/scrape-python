@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::{error, info, warn};
@@ -156,8 +156,12 @@ pub async fn start(cfg: ServeConfig) -> Result<Running> {
     let addr: SocketAddr = listener.local_addr()?;
     let metrics_addr: SocketAddr = mlistener.local_addr()?;
     info!(%addr, %metrics_addr, "listening");
-    let accept: JoinHandle<()> =
-        tokio::spawn(accept_loop(listener, ctx, stop_rx.clone()));
+    let accept: JoinHandle<()> = tokio::spawn(accept_loop(
+        listener,
+        ctx,
+        Arc::new(Semaphore::new(cfg.max_connections)),
+        stop_rx.clone(),
+    ));
     let mserve: JoinHandle<()> =
         tokio::spawn(metrics_loop(mlistener, all_metrics, stop_rx.clone()));
     let mut wait = stop_rx;
@@ -392,17 +396,30 @@ fn finish(
 async fn accept_loop(
     listener: TcpListener,
     ctx: Arc<Ctx>,
+    slots: Arc<Semaphore>,
     mut stop: watch::Receiver<bool>,
 ) {
     loop {
         tokio::select! {
             res = listener.accept() => match res {
-                Ok((stream, _)) => {
+                Ok((mut stream, _)) => {
+                    let Ok(slot) = slots.clone().try_acquire_owned() else {
+                        warn!("connection refused: limit reached");
+                        tokio::spawn(async move {
+                            let _ = stream
+                                .write_all(
+                                    b"-ERR max number of clients reached\r\n",
+                                )
+                                .await;
+                        });
+                        continue;
+                    };
                     let ctx: Arc<Ctx> = ctx.clone();
                     tokio::spawn(async move {
                         if let Err(e) = serve_conn(stream, ctx).await {
                             warn!(error = %e, "connection error");
                         }
+                        drop(slot);
                     });
                 }
                 Err(e) => warn!(error = %e, "accept failed"),
@@ -417,9 +434,16 @@ async fn serve_conn(mut stream: TcpStream, ctx: Arc<Ctx>) -> Result<()> {
     let mut buf: BytesMut = BytesMut::with_capacity(16 * 1024);
     let mut out: Vec<u8> = Vec::new();
     let mut conn: ConnState = ConnState::default();
+    let mut parser: resp::Parser = resp::Parser::default();
     loop {
         loop {
-            match resp::parse(&mut buf) {
+            // Small frames only until the client has authenticated.
+            let lim: &resp::Limits = if conn.authed || ctx.password.is_none() {
+                &resp::AUTHED
+            } else {
+                &resp::PRE_AUTH
+            };
+            match parser.parse(&mut buf, lim) {
                 Ok(Some(args)) => {
                     if args.is_empty() {
                         continue;
@@ -583,6 +607,22 @@ mod tests {
             b"*1\r\n$6\r\nqueued\r\n".to_vec()
         );
         drop(s);
+        r.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_rejects_over_connection_limit() {
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let mut c: ServeConfig = test_cfg(d.path());
+        c.max_connections = 1;
+        let r: Running = start(c).await.unwrap();
+        let mut first: TcpStream = TcpStream::connect(r.addr).await.unwrap();
+        assert_eq!(roundtrip(&mut first, b"PING\r\n").await, b"+PONG\r\n");
+        let mut second: TcpStream = TcpStream::connect(r.addr).await.unwrap();
+        let reply: Vec<u8> = roundtrip(&mut second, b"PING\r\n").await;
+        assert_eq!(reply, b"-ERR max number of clients reached\r\n");
+        drop(first);
+        drop(second);
         r.shutdown().await.unwrap();
     }
 }

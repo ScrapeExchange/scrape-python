@@ -61,6 +61,9 @@ pub struct ServeConfig {
     /// Most lane entries one POP may scan.
     #[arg(long, env = "BACKLOG_POP_SCAN_LIMIT", default_value_t = 100_000)]
     pub pop_scan_limit: usize,
+    /// Most concurrent client connections; extra ones are refused.
+    #[arg(long, env = "BACKLOG_MAX_CONNECTIONS", default_value_t = 1024)]
+    pub max_connections: usize,
     #[arg(long, env = "BACKLOG_LOG_LEVEL", default_value = "info")]
     pub log_level: String,
 }
@@ -124,6 +127,9 @@ impl ServeConfig {
                 "BACKLOG_PASSWORD is required when listening on {}",
                 self.listen
             );
+        }
+        if self.max_connections == 0 {
+            bail!("BACKLOG_MAX_CONNECTIONS must be positive");
         }
         if self.pop_scan_limit == 0 {
             bail!("BACKLOG_POP_SCAN_LIMIT must be positive");
