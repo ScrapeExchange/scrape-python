@@ -449,8 +449,10 @@ impl Queue {
     }
 
     /// Hard-link a consistent copy of the queue under *root*.
-    pub fn snapshot(&mut self, _root: &Path) -> Result<PathBuf, QueueError> {
-        Err(QueueError::Io(io::Error::other("snapshot not implemented")))
+    pub fn snapshot(&mut self, root: &Path) -> Result<PathBuf, QueueError> {
+        self.write_checkpoint()?;
+        let g: u64 = self.known.base().info().generation;
+        Ok(crate::snapshot::link_snapshot(&self.dir, g, root)?)
     }
 
     #[cfg(test)]
@@ -781,5 +783,50 @@ mod tests {
         let q: Queue = q(&d);
         assert_eq!(q.info().counts, before.counts);
         assert_eq!(q.info().counts, [60, 30, 0, 10, 0]);
+    }
+
+    fn copy_tree(src: &Path, dst: &Path) {
+        std::fs::create_dir_all(dst).unwrap();
+        for e in std::fs::read_dir(src).unwrap().flatten() {
+            let to: PathBuf = dst.join(e.file_name());
+            if e.file_type().unwrap().is_dir() {
+                copy_tree(&e.path(), &to);
+            } else {
+                std::fs::copy(e.path(), &to).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_restores_exact_state() {
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let root: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let qdir: PathBuf = d.path().join("youtube_video");
+        let mut q: Queue = Queue::open(&qdir, params()).unwrap();
+        for id in 1..=5 {
+            q.add(id, 0).unwrap();
+        }
+        drain(&mut q);
+        q.complete(1, 0).unwrap();
+        q.mark(2, State::Failed, Reason::Transient, 9).unwrap();
+        let snap: PathBuf = q.snapshot(root.path()).unwrap();
+        assert!(snap.starts_with(root.path().join("youtube_video")));
+        for id in 6..=8 {
+            q.add(id, 0).unwrap();
+        }
+        q.sync().unwrap();
+        let restored: tempfile::TempDir = tempfile::tempdir().unwrap();
+        copy_tree(&snap, restored.path());
+        let mut r: Queue = Queue::open(restored.path(), params()).unwrap();
+        assert_eq!(r.state(1), Some(State::Scraped));
+        assert_eq!(r.meta(2).unwrap().reason(), Reason::Transient);
+        // Leased-but-unfinished 3, 4, 5 come back; later adds may too.
+        let got: Vec<u64> = drain(&mut r);
+        assert_eq!(&got[..3], &[3, 4, 5]);
+        let mut sorted: Vec<u64> = got.clone();
+        sorted.dedup();
+        assert_eq!(sorted.len(), got.len(), "no duplicates: {got:?}");
+        let again: PathBuf = q.snapshot(root.path()).unwrap();
+        assert_ne!(again, snap);
     }
 }

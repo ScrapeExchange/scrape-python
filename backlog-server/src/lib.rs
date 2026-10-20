@@ -14,4 +14,5 @@ pub mod metrics;
 pub mod queue;
 pub mod resp;
 pub mod server;
+pub mod snapshot;
 pub mod wal;
