@@ -448,6 +448,11 @@ impl Queue {
         self.compacting.is_some()
     }
 
+    /// Hard-link a consistent copy of the queue under *root*.
+    pub fn snapshot(&mut self, _root: &Path) -> Result<PathBuf, QueueError> {
+        Err(QueueError::Io(io::Error::other("snapshot not implemented")))
+    }
+
     #[cfg(test)]
     pub fn wal_mut(&mut self) -> &mut Wal {
         &mut self.wal

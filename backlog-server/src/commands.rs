@@ -83,9 +83,20 @@ pub struct Ctx {
     pub password: Option<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ConnState {
     pub authed: bool,
+    /// Negotiated protocol: 2 until a successful `HELLO 3`.
+    pub proto: u8,
+}
+
+impl Default for ConnState {
+    fn default() -> ConnState {
+        ConnState {
+            authed: false,
+            proto: 2,
+        }
+    }
 }
 
 fn ok() -> Value {
@@ -141,11 +152,12 @@ fn auth(c: &Ctx, conn: &mut ConnState, args: &[Vec<u8>]) -> Value {
 }
 
 fn hello(c: &Ctx, conn: &mut ConnState, args: &[Vec<u8>]) -> Value {
-    if let Some(v) = args.get(1)
-        && text(v) != "2"
-    {
-        return err("NOPROTO unsupported protocol version");
-    }
+    let proto: u8 = match args.get(1).map(|v| text(v)) {
+        None => conn.proto,
+        Some("2") => 2,
+        Some("3") => 3,
+        Some(_) => return err("NOPROTO unsupported protocol version"),
+    };
     let mut i: usize = 2;
     while i < args.len() {
         match upper(&args[i]).as_str() {
@@ -160,18 +172,16 @@ fn hello(c: &Ctx, conn: &mut ConnState, args: &[Vec<u8>]) -> Value {
             _ => return err("ERR syntax error"),
         }
     }
-    Value::Array(Some(vec![
-        bulk("server"),
-        bulk("backlog-server"),
-        bulk("version"),
-        bulk(env!("CARGO_PKG_VERSION")),
-        bulk("proto"),
-        Value::Int(2),
-        bulk("mode"),
-        bulk("standalone"),
-        bulk("role"),
-        bulk("master"),
-    ]))
+    conn.proto = proto;
+    Value::Map(vec![
+        (bulk("server"), bulk("backlog-server")),
+        (bulk("version"), bulk(env!("CARGO_PKG_VERSION"))),
+        (bulk("proto"), Value::Int(i64::from(proto))),
+        (bulk("id"), Value::Int(0)),
+        (bulk("mode"), bulk("standalone")),
+        (bulk("role"), bulk("master")),
+        (bulk("modules"), Value::Array(Some(Vec::new()))),
+    ])
 }
 
 /// Execute one command.
@@ -531,6 +541,11 @@ mod tests {
         assert!(!conn.authed);
         let v: Value = run(&c, &mut conn, &["AUTH", "default", "pw"]).await;
         assert_eq!(v, Value::Simple("OK".into()));
+        let mut conn3: ConnState = ConnState::default();
+        let v: Value =
+            run(&c, &mut conn3, &["HELLO", "3", "AUTH", "default", "pw"]).await;
+        assert!(matches!(v, Value::Map(_)));
+        assert!(conn3.authed);
     }
 
     #[tokio::test]
@@ -553,12 +568,18 @@ mod tests {
             run(&c, &mut conn, &["SELECT", "3"]).await,
             Value::Error(_)
         ));
-        assert!(matches!(run(&c, &mut conn, &["HELLO", "3"]).await,
+        assert!(matches!(run(&c, &mut conn, &["HELLO", "4"]).await,
                          Value::Error(e) if e.starts_with("NOPROTO")));
         assert!(matches!(
             run(&c, &mut conn, &["HELLO", "2"]).await,
-            Value::Array(_)
+            Value::Map(_)
         ));
+        assert_eq!(conn.proto, 2);
+        let Value::Map(m) = run(&c, &mut conn, &["HELLO", "3"]).await else {
+            panic!("not a map");
+        };
+        assert!(m.contains(&(bulk("proto"), Value::Int(3))));
+        assert_eq!(conn.proto, 3);
     }
 
     #[tokio::test]

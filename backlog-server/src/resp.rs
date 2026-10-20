@@ -13,6 +13,8 @@ pub enum Value {
     Int(i64),
     Bulk(Option<Vec<u8>>),
     Array(Option<Vec<Value>>),
+    /// A RESP3 map; sent as a flat array to RESP2 clients.
+    Map(Vec<(Value, Value)>),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -107,7 +109,20 @@ fn parse_inline(
     Ok(Some(out))
 }
 
+/// Encode for a RESP2 client.
 pub fn encode(v: &Value, out: &mut Vec<u8>) {
+    encode_proto(v, out, 2);
+}
+
+fn push_len(out: &mut Vec<u8>, prefix: u8, n: usize) {
+    out.push(prefix);
+    out.extend_from_slice(n.to_string().as_bytes());
+    out.extend_from_slice(b"\r\n");
+}
+
+/// Encode for a client speaking protocol *proto* (2 or 3). The only
+/// differences used here are nulls and maps.
+pub fn encode_proto(v: &Value, out: &mut Vec<u8>, proto: u8) {
     match v {
         Value::Simple(s) => {
             out.push(b'+');
@@ -121,20 +136,31 @@ pub fn encode(v: &Value, out: &mut Vec<u8>) {
             out.push(b':');
             out.extend_from_slice(i.to_string().as_bytes());
         }
+        Value::Bulk(None) | Value::Array(None) if proto >= 3 => {
+            out.push(b'_');
+        }
         Value::Bulk(None) => out.extend_from_slice(b"$-1"),
+        Value::Array(None) => out.extend_from_slice(b"*-1"),
         Value::Bulk(Some(b)) => {
-            out.push(b'$');
-            out.extend_from_slice(b.len().to_string().as_bytes());
-            out.extend_from_slice(b"\r\n");
+            push_len(out, b'$', b.len());
             out.extend_from_slice(b);
         }
-        Value::Array(None) => out.extend_from_slice(b"*-1"),
         Value::Array(Some(items)) => {
-            out.push(b'*');
-            out.extend_from_slice(items.len().to_string().as_bytes());
-            out.extend_from_slice(b"\r\n");
+            push_len(out, b'*', items.len());
             for item in items {
-                encode(item, out);
+                encode_proto(item, out, proto);
+            }
+            return;
+        }
+        Value::Map(pairs) => {
+            if proto >= 3 {
+                push_len(out, b'%', pairs.len());
+            } else {
+                push_len(out, b'*', pairs.len() * 2);
+            }
+            for (k, val) in pairs {
+                encode_proto(k, out, proto);
+                encode_proto(val, out, proto);
             }
             return;
         }
@@ -178,6 +204,20 @@ mod tests {
         assert!(parse(&mut b).is_err());
         let mut b: BytesMut = BytesMut::from(&b"*1\r\n+x\r\n"[..]);
         assert!(parse(&mut b).is_err());
+    }
+
+    #[test]
+    fn encode_resp3_nulls_and_maps() {
+        let v: Value = Value::Array(Some(vec![
+            Value::Bulk(None),
+            Value::Map(vec![(Value::Simple("proto".into()), Value::Int(3))]),
+        ]));
+        let mut out: Vec<u8> = Vec::new();
+        encode_proto(&v, &mut out, 3);
+        assert_eq!(out, b"*2\r\n_\r\n%1\r\n+proto\r\n:3\r\n");
+        let mut out2: Vec<u8> = Vec::new();
+        encode_proto(&v, &mut out2, 2);
+        assert_eq!(out2, b"*2\r\n$-1\r\n*2\r\n+proto\r\n:3\r\n");
     }
 
     #[test]
