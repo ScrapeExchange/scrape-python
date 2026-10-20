@@ -1,8 +1,8 @@
 //! One named queue: known set, lanes, leases and change log.
 //!
-//! Every mutation is written to the change log first, then to the
-//! lane file, then applied in memory, so a failed write leaves memory
-//! unchanged.
+//! A mutation that touches a lane is written to the lane file first,
+//! then to the change log, then applied in memory, so a failed write
+//! leaves memory unchanged and never strands a queued ID.
 
 use std::collections::HashMap;
 use std::io;
@@ -243,6 +243,11 @@ impl Queue {
     }
 
     /// Log and apply a meta change plus a lane append, atomically.
+    ///
+    /// The lane entry is written first: if the log write then fails,
+    /// the entry is a harmless stale one (POP skips IDs that are not
+    /// queued). The other order could leave a logged `queued` ID that
+    /// no lane holds, which POP would never return.
     fn put_append(
         &mut self,
         id: u64,
@@ -250,8 +255,8 @@ impl Queue {
         ts: u32,
         lane: LaneId,
     ) -> Result<(), QueueError> {
-        self.wal.append(&Record::PutAppend { id, meta, ts, lane })?;
         self.lane_mut(lane).append(id)?;
+        self.wal.append(&Record::PutAppend { id, meta, ts, lane })?;
         self.known.put(id, meta, ts);
         Ok(())
     }
@@ -387,8 +392,9 @@ impl Queue {
                 lane: LaneId::Priority,
                 id: *id,
             };
-            self.wal.append(&r)?;
+            // Lane first, as in put_append.
             self.priority.append(*id)?;
+            self.wal.append(&r)?;
             self.leases.remove(*id);
         }
         Ok(expired.len())
@@ -482,6 +488,11 @@ impl Queue {
     /// Check the base generation's payload checksums.
     pub fn verify_base(&self) -> Result<(), QueueError> {
         Ok(self.known.base().verify()?)
+    }
+
+    #[cfg(test)]
+    pub fn main_mut(&mut self) -> &mut Lane {
+        &mut self.main
     }
 
     #[cfg(test)]
@@ -701,8 +712,11 @@ mod tests {
         assert!(q.add(2, 0).is_err());
         assert_eq!(q.state(2), None);
         assert_eq!(q.info().counts, [1, 0, 0, 0, 0]);
-        assert_eq!(q.info().lane_main, 1);
+        // The lane entry written before the failed log write is stale
+        // and harmless: 2 is still unknown and pops exactly once.
+        assert_eq!(q.info().lane_main, 2);
         assert!(q.add(2, 0).unwrap());
+        assert_eq!(drain(&mut q), vec![1, 2]);
     }
 
     fn drain(q: &mut Queue) -> Vec<u64> {
@@ -857,5 +871,26 @@ mod tests {
         assert_eq!(sorted.len(), got.len(), "no duplicates: {got:?}");
         let again: PathBuf = q.snapshot(root.path()).unwrap();
         assert_ne!(again, snap);
+    }
+
+    #[test]
+    fn lane_failure_never_strands_a_queued_id() {
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        {
+            let mut q: Queue = q(&d);
+            q.main_mut().fail_next_write();
+            assert!(q.add(7, 0).is_err());
+            assert_eq!(q.state(7), None);
+            q.write_checkpoint().unwrap();
+        }
+        let mut q: Queue = q(&d);
+        // Either unknown (so a producer can add it again) or poppable;
+        // never queued-but-unreachable.
+        match q.state(7) {
+            None => assert!(q.add(7, 0).unwrap()),
+            Some(State::Queued) => {}
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(drain(&mut q), vec![7]);
     }
 }

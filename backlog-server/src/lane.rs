@@ -55,6 +55,8 @@ pub struct Lane {
     writer: Option<File>,
     buf: Vec<u64>,
     buf_start: u64,
+    #[cfg(test)]
+    fail_next: bool,
 }
 
 impl Lane {
@@ -123,6 +125,8 @@ impl Lane {
             writer,
             buf: Vec::new(),
             buf_start: head,
+            #[cfg(test)]
+            fail_next: false,
         })
     }
 
@@ -155,8 +159,25 @@ impl Lane {
             self.writer = Some(self.create_segment(self.tail)?);
             self.segments.push(self.tail);
         }
+        let last: u64 = *self.segments.last().expect("segment exists");
+        let good: u64 = HEADER_LEN as u64 + (self.tail - last) * 8;
+        #[cfg(test)]
+        let fail: bool = std::mem::take(&mut self.fail_next);
+        #[cfg(not(test))]
+        let fail: bool = false;
         let w: &mut File = self.writer.as_mut().expect("writer exists");
-        w.write_all(&id.to_le_bytes())?;
+        let res: io::Result<()> = if fail {
+            w.write_all(&id.to_le_bytes()[..3])
+                .and(Err(io::Error::other("injected lane write failure")))
+        } else {
+            w.write_all(&id.to_le_bytes())
+        };
+        if let Err(e) = res {
+            // Cut a short write back so later entries stay aligned.
+            w.set_len(good)?;
+            w.seek(SeekFrom::Start(good))?;
+            return Err(e);
+        }
         let pos: u64 = self.tail;
         self.tail += 1;
         Ok(pos)
@@ -231,6 +252,11 @@ impl Lane {
             fsync_dir(&self.dir)?;
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn fail_next_write(&mut self) {
+        self.fail_next = true;
     }
 }
 
