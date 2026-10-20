@@ -1,6 +1,7 @@
 pub mod base;
 pub mod checkpoint;
 pub mod codec;
+pub mod commands;
 pub mod compaction;
 pub mod fileformat;
 pub mod fsutil;
@@ -9,4 +10,5 @@ pub mod lane;
 pub mod leases;
 pub mod meta;
 pub mod queue;
+pub mod resp;
 pub mod wal;
