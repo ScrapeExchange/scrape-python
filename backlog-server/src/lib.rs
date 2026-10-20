@@ -1,6 +1,7 @@
 pub mod base;
 pub mod checkpoint;
 pub mod codec;
+pub mod compaction;
 pub mod fileformat;
 pub mod fsutil;
 pub mod known;

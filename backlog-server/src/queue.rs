@@ -10,8 +10,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::base::{Base, list_generations, read_terminal, remove_generation};
+use crate::base::{
+    Base, BaseInfo, list_generations, read_terminal, remove_generation,
+};
 use crate::checkpoint::{self, Checkpoint, LaneCkpt};
+use crate::compaction::CompactionJob;
 use crate::fileformat::FormatError;
 use crate::fsutil::remove_tmp_files;
 use crate::known::KnownSet;
@@ -24,6 +27,8 @@ use crate::wal::{Record, Wal, WalError, replay};
 pub struct QueueParams {
     pub lease_default: Duration,
     pub pop_scan_limit: usize,
+    pub compaction_interval: Duration,
+    pub compaction_delta_entries: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +86,9 @@ pub struct Queue {
     priority: Lane,
     leases: Leases,
     replayed: usize,
+    /// (generation, wal_cut) of the compaction in flight.
+    compacting: Option<(u64, u64)>,
+    last_compaction: Instant,
 }
 
 fn queued(force: bool) -> Meta {
@@ -125,6 +133,8 @@ impl Queue {
             priority,
             leases: Leases::default(),
             replayed: 0,
+            compacting: None,
+            last_compaction: Instant::now(),
         };
         let records: Vec<(u64, Record)> = replay(&wal_dir, c.replay_from_lsn)?;
         q.replayed = records.len();
@@ -373,6 +383,71 @@ impl Queue {
         Ok(())
     }
 
+    pub fn should_compact(&self, now: Instant) -> bool {
+        let n: usize = self.known.delta_len();
+        self.compacting.is_none()
+            && n > 0
+            && (n >= self.params.compaction_delta_entries
+                || now.duration_since(self.last_compaction)
+                    >= self.params.compaction_interval)
+    }
+
+    /// Freeze the delta and describe the next generation to build.
+    /// None if a compaction is running or there is nothing to merge.
+    pub fn start_compaction(&mut self) -> Option<CompactionJob> {
+        if self.compacting.is_some() || self.known.delta_len() == 0 {
+            return None;
+        }
+        let wal_cut: u64 = self.wal.next_lsn();
+        let generation: u64 = self.known.base().info().generation + 1;
+        let frozen: Arc<HashMap<u64, Meta>> = self.known.freeze();
+        self.compacting = Some((generation, wal_cut));
+        Some(CompactionJob {
+            dir: self.dir.join("base"),
+            base: self.known.base().clone(),
+            frozen,
+            terminal: self.known.terminal_ts().clone(),
+            generation,
+            wal_cut,
+        })
+    }
+
+    /// Install a generation built by [`crate::compaction::run`],
+    /// checkpoint it and drop what it superseded.
+    pub fn finish_compaction(
+        &mut self,
+        info: BaseInfo,
+    ) -> Result<(), QueueError> {
+        let Some((generation, wal_cut)) = self.compacting else {
+            return Ok(());
+        };
+        let base_dir: PathBuf = self.dir.join("base");
+        let old: u64 = self.known.base().info().generation;
+        let base: Arc<Base> = Arc::new(Base::open(&base_dir, info.generation)?);
+        debug_assert_eq!(info.generation, generation);
+        self.known.install_base(base);
+        self.compacting = None;
+        self.last_compaction = Instant::now();
+        self.write_checkpoint()?;
+        self.wal.truncate_before(wal_cut)?;
+        if old != 0 {
+            remove_generation(&base_dir, old)?;
+        }
+        Ok(())
+    }
+
+    /// Give the frozen delta back after a failed compaction.
+    pub fn abort_compaction(&mut self) {
+        if let Some((generation, _)) = self.compacting.take() {
+            self.known.unfreeze();
+            let _ = remove_generation(&self.dir.join("base"), generation);
+        }
+    }
+
+    pub fn is_compacting(&self) -> bool {
+        self.compacting.is_some()
+    }
+
     #[cfg(test)]
     pub fn wal_mut(&mut self) -> &mut Wal {
         &mut self.wal
@@ -390,6 +465,8 @@ mod tests {
         QueueParams {
             lease_default: L,
             pop_scan_limit: 100_000,
+            compaction_interval: Duration::from_secs(3600),
+            compaction_delta_entries: 10_000_000,
         }
     }
 
