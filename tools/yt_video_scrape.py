@@ -75,9 +75,10 @@ from scrape_exchange.youtube.youtube_video_innertube import (
 )
 from scrape_exchange.youtube.settings import YouTubeScraperSettings
 from scrape_exchange.youtube.uploaded_video_ids import UploadedVideoIds
+from scrape_exchange.video_queue_factory import make_video_scrape_queue
 from scrape_exchange.video_scrape_queue import (
-    RedisVideoScrapeQueue,
     VideoQueueChannelContext,
+    VideoScrapeQueue,
     VideoScrapeQueueEntry,
     VideoScrapeQueueSettings,
     VideoState,
@@ -386,7 +387,7 @@ def _max_rate_limit_wait(settings: 'VideoSettings') -> float | None:
 async def _scrape_one_queued(
     video_id: str,
     *,
-    queue: RedisVideoScrapeQueue,
+    queue: VideoScrapeQueue,
     settings: 'VideoSettings',
     proxies: list[str],
     uploaded: UploadedVideoIds,
@@ -603,7 +604,7 @@ async def _scrape_one_queued(
 
 
 async def _queue_driven_loop(
-    queue: RedisVideoScrapeQueue,
+    queue: VideoScrapeQueue,
     settings: 'VideoSettings',
     proxies: list[str],
     concurrency: int,
@@ -720,7 +721,7 @@ async def _queue_driven_loop(
 
 
 async def _publish_video_queue_sizes(
-    queue: RedisVideoScrapeQueue,
+    queue: VideoScrapeQueue,
     *,
     interval: float = 30.0,
 ) -> None:
@@ -1073,7 +1074,7 @@ async def _run_worker(
     # scrape queue (see ADR + Phase 4 plan). Subsequent tasks wire
     # the queue into the main loop; the queue is constructed here
     # so settings and lifetime are owned by _run_worker.
-    video_queue: RedisVideoScrapeQueue | None = None
+    video_queue: VideoScrapeQueue | None = None
     if settings.redis_dsn:
         video_queue_redis: aioredis.Redis = redis_from_url(
             settings.redis_dsn,
@@ -1096,8 +1097,11 @@ async def _run_worker(
                 ),
             )
         )
-        video_queue = RedisVideoScrapeQueue(
-            video_queue_redis, video_queue_settings,
+        video_queue = make_video_scrape_queue(
+            platform='youtube',
+            redis=video_queue_redis,
+            settings=video_queue_settings,
+            component='youtube-video-queue',
         )
 
     if video_queue is None:

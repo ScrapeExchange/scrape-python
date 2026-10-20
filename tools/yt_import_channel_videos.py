@@ -7,7 +7,7 @@ The channel file is a brotli-compressed JSON document produced by
 ``YouTubeChannel.to_dict(with_video_ids=True)``). Every entry in
 the channel's ``video_ids`` field is added to the back of
 ``youtube:video:queue`` via
-:meth:`RedisVideoScrapeQueue.enqueue`.
+:meth:`VideoScrapeQueue.enqueue`.
 
 The underlying ``enqueue`` is idempotent (ZADD NX): video_ids
 already queued or in any terminal state are skipped without
@@ -31,9 +31,10 @@ from pydantic_settings import (
 
 from scrape_exchange.brotli import brotli_read
 from scrape_exchange.redis_client import redis_from_url
+from scrape_exchange.video_queue_factory import make_video_scrape_queue
 from scrape_exchange.video_scrape_queue import (
-    RedisVideoScrapeQueue,
     VideoQueueChannelContext,
+    VideoScrapeQueue,
     VideoScrapeQueueSettings,
 )
 
@@ -109,7 +110,7 @@ def _read_channel_file(
 
 async def _enqueue_all(
     video_ids: list[str],
-    queue: RedisVideoScrapeQueue,
+    queue: VideoScrapeQueue,
     channel_context: VideoQueueChannelContext,
 ) -> tuple[int, int, int]:
     '''Enqueue each video id and return counters.
@@ -189,10 +190,11 @@ async def main_async() -> int:
         component='yt-import-channel-videos',
         decode_responses=True,
     )
-    queue: RedisVideoScrapeQueue = (
-        RedisVideoScrapeQueue(
-            redis, VideoScrapeQueueSettings(),
-        )
+    queue: VideoScrapeQueue = make_video_scrape_queue(
+        platform='youtube',
+        redis=redis,
+        settings=VideoScrapeQueueSettings(),
+        component='yt-import-channel-videos',
     )
     try:
         enqueued, skipped, errors = (

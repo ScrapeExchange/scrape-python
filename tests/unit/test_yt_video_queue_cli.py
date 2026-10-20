@@ -645,3 +645,29 @@ class TestFilterAlreadyScraped(
             remote_check=True,
         )
         self.assertEqual(res.survivors, ['aaa'])
+
+
+class TestBacklogServerUnsupported(
+    unittest.IsolatedAsyncioTestCase,
+):
+
+    async def test_unsupported_command_exits_2(self) -> None:
+        from scrape_exchange.backlog_server_queue import (
+            BacklogServerUnsupported,
+        )
+        queue = AsyncMock()
+        queue.search_meta.side_effect = BacklogServerUnsupported('x')
+        err = StringIO()
+        with patch(
+            'tools.yt_video_queue.make_video_scrape_queue',
+            return_value=queue,
+        ), patch(
+            'tools.yt_video_queue.redis_from_url',
+            return_value=AsyncMock(),
+        ), patch('sys.stderr', err):
+            rc: int = await main_async(['search', 'abc'])
+        self.assertEqual(rc, 2)
+        self.assertIn(
+            'search is not supported when BACKLOG_SERVER_DSN is set',
+            err.getvalue(),
+        )

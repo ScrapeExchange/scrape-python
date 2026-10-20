@@ -858,9 +858,9 @@ class TestKnownVideoIds(unittest.IsolatedAsyncioTestCase):
         summary: refresh.FullScrapeSummary = refresh.FullScrapeSummary(
             'UCexample',
         )
-        real = refresh.RedisVideoScrapeQueue.enqueue_many
+        real = RedisVideoScrapeQueue.enqueue_many
         with patch.object(
-            refresh.RedisVideoScrapeQueue, 'enqueue_many',
+            RedisVideoScrapeQueue, 'enqueue_many',
             autospec=True, side_effect=real,
         ) as spy:
             await refresh.queue_channel_videos(
