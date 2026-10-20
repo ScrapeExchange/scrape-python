@@ -77,7 +77,29 @@ pub enum QueueError {
     Io(#[from] io::Error),
 }
 
+/// Take an exclusive, non-blocking lock on `<dir>/LOCK`; held until
+/// the returned file is dropped.
+pub fn lock_dir(dir: &Path) -> io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let f: std::fs::File = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("LOCK"))?;
+    // SAFETY: flock on a valid open descriptor has no other effects.
+    let rc: i32 =
+        unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!("queue directory {dir:?} is in use by another process"),
+        ));
+    }
+    Ok(f)
+}
+
 pub struct Queue {
+    _lock: std::fs::File,
     dir: PathBuf,
     params: QueueParams,
     known: KnownSet,
@@ -101,6 +123,7 @@ impl Queue {
     /// replay the change log.
     pub fn open(dir: &Path, params: QueueParams) -> Result<Queue, QueueError> {
         std::fs::create_dir_all(dir)?;
+        let lock: std::fs::File = lock_dir(dir)?;
         remove_tmp_files(dir)?;
         let c: Checkpoint = checkpoint::read(dir)?.unwrap_or_default();
         let base_dir: PathBuf = dir.join("base");
@@ -125,6 +148,7 @@ impl Queue {
         let wal_dir: PathBuf = dir.join("wal");
         let wal: Wal = Wal::open(&wal_dir)?;
         let mut q: Queue = Queue {
+            _lock: lock,
             dir: dir.to_path_buf(),
             params,
             known: KnownSet::new(base, terminal),
@@ -453,6 +477,11 @@ impl Queue {
         self.write_checkpoint()?;
         let g: u64 = self.known.base().info().generation;
         Ok(crate::snapshot::link_snapshot(&self.dir, g, root)?)
+    }
+
+    /// Check the base generation's payload checksums.
+    pub fn verify_base(&self) -> Result<(), QueueError> {
+        Ok(self.known.base().verify()?)
     }
 
     #[cfg(test)]

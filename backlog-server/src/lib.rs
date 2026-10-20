@@ -6,6 +6,7 @@ pub mod compaction;
 pub mod config;
 pub mod fileformat;
 pub mod fsutil;
+pub mod import;
 pub mod known;
 pub mod lane;
 pub mod leases;
