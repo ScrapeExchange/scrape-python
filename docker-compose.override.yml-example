@@ -6,6 +6,10 @@
 # silently creating directories at the host paths and bind-mounting
 # those directories into the container.
 
+# The backlog-server service takes its data directory from
+# BACKLOG_DATA_DIR_HOST in .env (for example a directory on an SSD,
+# owned by uid/gid 1002) and needs no override here.
+
 x-scraper-volumes: &scraper-volumes
   - type: bind
     source: /path/to/proxies

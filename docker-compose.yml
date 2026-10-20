@@ -27,6 +27,31 @@ services:
     network_mode: host
     init: true
 
+  # Backlog server for the YouTube video queue. Runs on one host only:
+  # enable it there with `--profile backlog` (or COMPOSE_PROFILES).
+  # Set BACKLOG_DATA_DIR_HOST, BACKLOG_PASSWORD, BACKLOG_LISTEN and
+  # BACKLOG_METRICS_LISTEN in .env; see
+  # docs/operator/2026-10-20-backlog-server-cutover.md.
+  backlog-server:
+    image: ghcr.io/scrapeexchange/backlog-server:latest
+    build: ./backlog-server
+    profiles: ["backlog"]
+    container_name: backlog-server
+    env_file: .env
+    environment:
+      BACKLOG_DATA_DIR: /data
+    user: "1002:1002"
+    network_mode: host
+    restart: unless-stopped
+    stop_grace_period: 60s
+    mem_limit: 20g
+    volumes:
+      - type: bind
+        source: ${BACKLOG_DATA_DIR_HOST:-/path/to/backlog}
+        target: /data
+        bind:
+          create_host_path: false
+
 # Uncomment the redis section to run a Redis server on your host
 #  redis:
 #    container_name: "redis"
