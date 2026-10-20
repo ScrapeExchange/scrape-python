@@ -4,5 +4,7 @@ pub mod fileformat;
 pub mod fsutil;
 pub mod known;
 pub mod lane;
+pub mod leases;
 pub mod meta;
+pub mod queue;
 pub mod wal;

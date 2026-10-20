@@ -42,22 +42,41 @@ impl LaneId {
 /// A physical change: set an ID's meta, or append it to a lane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Record {
-    Put { id: u64, meta: Meta, ts: u32 },
-    Append { lane: LaneId, id: u64 },
+    Put {
+        id: u64,
+        meta: Meta,
+        ts: u32,
+    },
+    Append {
+        lane: LaneId,
+        id: u64,
+    },
+    /// A Put and an Append in one atomic record.
+    PutAppend {
+        id: u64,
+        meta: Meta,
+        ts: u32,
+        lane: LaneId,
+    },
 }
 
 const TAG_PUT: u8 = 1;
 const TAG_APPEND: u8 = 2;
+const TAG_PUT_APPEND: u8 = 3;
 
 impl Record {
     pub fn encode(&self) -> [u8; RECORD_LEN] {
         let mut b: [u8; RECORD_LEN] = [0; RECORD_LEN];
-        let (tag, small, ts, id) = match *self {
-            Record::Put { id, meta, ts } => (TAG_PUT, meta.0, ts, id),
-            Record::Append { lane, id } => (TAG_APPEND, lane as u8, 0, id),
+        let (tag, small, lane, ts, id) = match *self {
+            Record::Put { id, meta, ts } => (TAG_PUT, meta.0, 0, ts, id),
+            Record::Append { lane, id } => (TAG_APPEND, lane as u8, 0, 0, id),
+            Record::PutAppend { id, meta, ts, lane } => {
+                (TAG_PUT_APPEND, meta.0, lane as u8, ts, id)
+            }
         };
         b[0] = tag;
         b[1] = small;
+        b[2] = lane;
         b[4..8].copy_from_slice(&ts.to_le_bytes());
         b[8..16].copy_from_slice(&id.to_le_bytes());
         let crc: u32 = crc32fast::hash(&b[..16]);
@@ -80,6 +99,12 @@ impl Record {
             TAG_APPEND => Some(Record::Append {
                 lane: LaneId::from_u8(b[1])?,
                 id,
+            }),
+            TAG_PUT_APPEND => Some(Record::PutAppend {
+                id,
+                meta: Meta(b[1]),
+                ts: u32_at(b, 4),
+                lane: LaneId::from_u8(b[2])?,
             }),
             _ => None,
         }
@@ -334,8 +359,15 @@ mod tests {
     fn sample(n: u64) -> Vec<Record> {
         (0..n)
             .map(|i| {
-                if i % 2 == 0 {
+                if i % 3 == 0 {
                     put(i)
+                } else if i % 3 == 1 {
+                    Record::PutAppend {
+                        id: i,
+                        meta: Meta::new(State::Failed, true, Reason::Other),
+                        ts: 9,
+                        lane: LaneId::Main,
+                    }
                 } else {
                     Record::Append {
                         lane: LaneId::Priority,
