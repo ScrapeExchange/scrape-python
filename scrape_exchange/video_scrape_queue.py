@@ -373,6 +373,18 @@ class VideoScrapeQueueSettings(BaseSettings):
             'when unset the queue lives entirely in Redis.'
         ),
     )
+    backlog_server_dsn: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            'BACKLOG_SERVER_DSN', 'backlog_server_dsn',
+        ),
+        description=(
+            'Redis-protocol URL of backlog-server, e.g. '
+            'redis://:<password>@<host>:6390/0. When set, the YouTube '
+            'video queue lives in backlog-server instead of Redis and '
+            'MongoDB.'
+        ),
+    )
 
 
 class VideoScrapeQueue(ABC):

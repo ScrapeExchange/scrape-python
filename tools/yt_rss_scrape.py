@@ -123,8 +123,9 @@ from scrape_exchange.channel_scrape_queue import (
     KEY_PREFIX as CHANNEL_QUEUE_KEY_PREFIX,
     awaiting_first_full_scrape,
 )
+from scrape_exchange.video_queue_factory import make_video_scrape_queue
 from scrape_exchange.video_scrape_queue import (
-    RedisVideoScrapeQueue,
+    VideoScrapeQueue,
     VideoScrapeQueueSettings,
 )
 from scrape_exchange.youtube.uploaded_video_ids import UploadedVideoIds
@@ -1123,7 +1124,7 @@ async def _fetch_rss_safe(
 async def _queue_video_for_scrape(
     video: YouTubeVideo,
     channel_handle: str,
-    video_queue: RedisVideoScrapeQueue,
+    video_queue: VideoScrapeQueue,
 ) -> str | None:
     '''
     Enqueue a video id onto the Redis-backed video scrape queue so
@@ -1262,7 +1263,7 @@ async def process_channel(
     name_map_backend: NameMap,
     channel_validator: SchemaValidator,
     tier: int,
-    video_queue: RedisVideoScrapeQueue,
+    video_queue: VideoScrapeQueue,
     uploaded_videos: UploadedVideoIds,
 ) -> bool | None:
     '''
@@ -2531,7 +2532,7 @@ async def _stream_processor(
     name_map_backend: NameMap,
     channel_validator: SchemaValidator,
     settings: RssSettings,
-    video_queue: RedisVideoScrapeQueue,
+    video_queue: VideoScrapeQueue,
     uploaded_videos: UploadedVideoIds,
 ) -> None:
     '''Single-channel streaming processor.
@@ -2652,7 +2653,7 @@ async def worker_loop(
     creator_map_backend: CreatorMap,
     name_map_backend: NameMap,
     channel_validator: SchemaValidator,
-    video_queue: RedisVideoScrapeQueue,
+    video_queue: VideoScrapeQueue,
     uploaded_videos: UploadedVideoIds,
 ) -> None:
     '''
@@ -2915,11 +2916,11 @@ async def _run_worker(
         component='youtube-rss-video-queue',
         decode_responses=True,
     )
-    video_queue: RedisVideoScrapeQueue = (
-        RedisVideoScrapeQueue(
-            video_queue_redis,
-            VideoScrapeQueueSettings(),
-        )
+    video_queue: VideoScrapeQueue = make_video_scrape_queue(
+        platform='youtube',
+        redis=video_queue_redis,
+        settings=VideoScrapeQueueSettings(),
+        component='youtube-rss-video-queue',
     )
     # One shared wrapper over the worker's pool: the per-channel
     # Redis existence pre-check must not open its own connection.

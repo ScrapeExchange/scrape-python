@@ -27,10 +27,12 @@ from pydantic_settings import (
 )
 
 from scrape_exchange.exchange_client import ExchangeClient
+from scrape_exchange.backlog_server_queue import BacklogServerUnsupported
 from scrape_exchange.redis_client import redis_from_url
 from scrape_exchange.scrape_api import get_data_by_param
+from scrape_exchange.video_queue_factory import make_video_scrape_queue
 from scrape_exchange.video_scrape_queue import (
-    RedisVideoScrapeQueue,
+    VideoScrapeQueue,
     VideoScrapeQueueSettings,
     VideoState,
 )
@@ -46,7 +48,7 @@ _ENQUEUE_POLICY_BATCH_SIZE: int = 1_000
 
 
 _Handler = Callable[
-    [argparse.Namespace, RedisVideoScrapeQueue],
+    [argparse.Namespace, VideoScrapeQueue],
     Awaitable[int],
 ]
 
@@ -190,7 +192,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 async def cmd_count(
     ns: argparse.Namespace,
-    queue: RedisVideoScrapeQueue,
+    queue: VideoScrapeQueue,
 ) -> int:
     counts: dict[VideoState, int] = (
         await queue.count_by_state()
@@ -214,7 +216,7 @@ async def cmd_count(
 
 async def cmd_stats(
     ns: argparse.Namespace,
-    queue: RedisVideoScrapeQueue,
+    queue: VideoScrapeQueue,
 ) -> int:
     counts: dict[VideoState, int] = (
         await queue.count_by_state()
@@ -232,7 +234,7 @@ async def cmd_stats(
 
 async def cmd_show(
     ns: argparse.Namespace,
-    queue: RedisVideoScrapeQueue,
+    queue: VideoScrapeQueue,
 ) -> int:
     meta: dict[str, str] = (
         await queue.get_meta(ns.video_id)
@@ -439,7 +441,7 @@ async def _source_uploaded(
 
 
 async def _source_terminal(
-    video_ids: list[str], queue: RedisVideoScrapeQueue,
+    video_ids: list[str], queue: VideoScrapeQueue,
 ) -> tuple[list[str], int, int]:
     '''Source 2: terminal queue state (queued -> duplicate).'''
     pending: list[str] = []
@@ -519,7 +521,7 @@ async def _filter_already_scraped(
     video_ids: list[str],
     *,
     uploaded: UploadedVideoIds | None,
-    queue: RedisVideoScrapeQueue,
+    queue: VideoScrapeQueue,
     exchange_client: ExchangeClient | None,
     schema_version: str,
     remote_check: bool,
@@ -562,7 +564,7 @@ async def _run_enqueue_policy(
     video_ids: list[str],
     *,
     ns: argparse.Namespace,
-    queue: RedisVideoScrapeQueue,
+    queue: VideoScrapeQueue,
     settings: 'YtVideoQueueSettings',
 ) -> EnqueueReport:
     '''Shared add/import logic: --force re-scrapes regardless;
@@ -666,7 +668,7 @@ def _write_enqueue_status(
 
 async def cmd_add(
     ns: argparse.Namespace,
-    queue: RedisVideoScrapeQueue,
+    queue: VideoScrapeQueue,
 ) -> int:
     video_ids: list[str] = list(ns.video_ids)
     if getattr(ns, 'file', None):
@@ -690,7 +692,7 @@ async def cmd_add(
 
 async def cmd_remove(
     ns: argparse.Namespace,
-    queue: RedisVideoScrapeQueue,
+    queue: VideoScrapeQueue,
 ) -> int:
     for vid in ns.video_ids:
         await queue.mark(
@@ -702,7 +704,7 @@ async def cmd_remove(
 
 async def cmd_rescrape(
     ns: argparse.Namespace,
-    queue: RedisVideoScrapeQueue,
+    queue: VideoScrapeQueue,
 ) -> int:
     for vid in ns.video_ids:
         state: VideoState | None = (
@@ -720,7 +722,7 @@ async def cmd_rescrape(
 
 async def cmd_mark(
     ns: argparse.Namespace,
-    queue: RedisVideoScrapeQueue,
+    queue: VideoScrapeQueue,
 ) -> int:
     try:
         target: VideoState = VideoState(ns.state)
@@ -737,7 +739,7 @@ async def cmd_mark(
 
 async def cmd_unmark(
     ns: argparse.Namespace,
-    queue: RedisVideoScrapeQueue,
+    queue: VideoScrapeQueue,
 ) -> int:
     await queue.unmark(ns.video_id)
     return 0
@@ -745,7 +747,7 @@ async def cmd_unmark(
 
 async def cmd_ingest_sentinels(
     ns: argparse.Namespace,
-    queue: RedisVideoScrapeQueue,
+    queue: VideoScrapeQueue,
 ) -> int:
     # Legacy filename pattern:
     # video-(min|dlp|yt)-<video_id>.json.br.<suffix>
@@ -784,7 +786,7 @@ async def cmd_ingest_sentinels(
 
 async def cmd_search(
     ns: argparse.Namespace,
-    queue: RedisVideoScrapeQueue,
+    queue: VideoScrapeQueue,
 ) -> int:
     fields: tuple[str, ...] = (
         (ns.by,) if ns.by
@@ -800,7 +802,7 @@ async def cmd_search(
 
 async def cmd_import(
     ns: argparse.Namespace,
-    queue: RedisVideoScrapeQueue,
+    queue: VideoScrapeQueue,
 ) -> int:
     video_ids: list[str] = await asyncio.to_thread(
         _read_import_video_ids, Path(ns.file),
@@ -849,15 +851,22 @@ async def main_async(argv: list[str]) -> int:
         decode_responses=True,
         max_connections=1,
     )
-    queue: RedisVideoScrapeQueue = (
-        RedisVideoScrapeQueue(
-            redis, VideoScrapeQueueSettings(),
-        )
+    queue: VideoScrapeQueue = make_video_scrape_queue(
+        platform='youtube',
+        redis=redis,
+        settings=VideoScrapeQueueSettings(),
+        component='yt-video-queue-cli',
     )
     try:
         return await _HANDLERS[ns.command](
             ns, queue,
         )
+    except BacklogServerUnsupported:
+        sys.stderr.write(
+            f'{ns.command} is not supported when '
+            f'BACKLOG_SERVER_DSN is set\n',
+        )
+        return 2
     finally:
         await redis.aclose()
 

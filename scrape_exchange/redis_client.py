@@ -349,6 +349,11 @@ def redis_from_url(
         ),
     )
     kwargs.setdefault('client_name', redis_client_name(component))
+    # redis-py 8 defaults socket_timeout to 5 s (7.x: no timeout).
+    # Reading a large reply, such as HGETALL of the 8.5M-entry creator
+    # map, takes longer than that, so keep 7.x behaviour unless the
+    # caller or the DSN (?socket_timeout=) sets a timeout.
+    kwargs.setdefault('socket_timeout', None)
     pool_cls: Any = _retrying_pool_class(aioredis)
     pool: Any = pool_cls.from_url(
         redis_dsn, **kwargs,

@@ -97,8 +97,10 @@ from scrape_exchange.upload import (
     post_prepared_bulk_batch,
     validate_upload_record,
 )
+from scrape_exchange.video_queue_factory import make_video_scrape_queue
 from scrape_exchange.video_scrape_queue import (
     RedisVideoScrapeQueue,
+    VideoScrapeQueue,
     VideoScrapeQueueSettings,
 )
 from scrape_exchange.worker_id import get_worker_id
@@ -744,7 +746,7 @@ class YouTubeChannelProcessor(AssetProcessor):
 @dataclass(frozen=True)
 class YouTubeVideoProcessorState:
     creator_map: CreatorMap
-    scrape_queue: RedisVideoScrapeQueue | None
+    scrape_queue: VideoScrapeQueue | None
     uploaded: UploadedVideoIds | None
 
 
@@ -769,9 +771,11 @@ class YouTubeVideoProcessor(AssetProcessor):
             redis_client: aioredis.Redis = creator_map.redis_client
             return YouTubeVideoProcessorState(
                 creator_map=creator_map,
-                scrape_queue=RedisVideoScrapeQueue(
-                    redis_client,
-                    VideoScrapeQueueSettings(),
+                scrape_queue=make_video_scrape_queue(
+                    platform='youtube',
+                    redis=redis_client,
+                    settings=VideoScrapeQueueSettings(),
+                    component='scrape-upload-youtube-video-queue',
                 ),
                 uploaded=UploadedVideoIds(settings.redis_dsn),
             )

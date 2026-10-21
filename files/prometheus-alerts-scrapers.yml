@@ -427,3 +427,79 @@ groups:
             InnerTube search p95 is {{ $value | humanize }}s (rate
             limiter wait excluded) for 30m. Slow responses can be
             YouTube throttling before outright 429s, or slow proxies.
+
+  # --- BACKLOG SERVER ------------------------------------------------
+  # backlog-server holds the YouTube video queue. Its metrics carry a
+  # `queue` label; the scrape job must be named `backlog_server`.
+
+  - name: backlog_server
+    interval: 30s
+    rules:
+
+      - alert: BacklogServerDown
+        expr: up{job="backlog_server"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          scraper: video
+        annotations:
+          summary: "backlog-server is not answering /metrics"
+          description: >-
+            Video producers and scrapers cannot reach their queue.
+            Check the backlog-server container on its host.
+
+      - alert: BacklogCompactionStale
+        expr: |
+          (time() - backlog_compaction_last_success_timestamp > 10800)
+          and on (queue) backlog_delta_entries > 0
+        for: 15m
+        labels:
+          severity: warning
+          scraper: video
+        annotations:
+          summary: "backlog-server has not compacted {{ $labels.queue }} for 3h"
+          description: >-
+            The in-memory delta and change log keep growing until a
+            compaction succeeds. Look for "compaction failed" in the
+            server logs and check free disk space.
+
+      - alert: BacklogLeasesExpiring
+        expr: rate(backlog_leases_expired_total[15m]) > 1
+        for: 30m
+        labels:
+          severity: warning
+          scraper: video
+        annotations:
+          summary: "Leases on {{ $labels.queue }} keep expiring"
+          description: >-
+            Popped video IDs are not completed or marked before their
+            lease ends, so they are re-queued. Scrapers may be crashing
+            or BACKLOG_LEASE_SECS is shorter than a worst-case scrape.
+
+      - alert: BacklogInvalidIds
+        expr: increase(backlog_invalid_ids_total[1h]) > 1000
+        labels:
+          severity: warning
+          scraper: video
+        annotations:
+          summary: >-
+            Producers sent over 1000 malformed IDs to
+            {{ $labels.queue }} in 1h
+
+      - alert: BacklogOpErrors
+        expr: |
+          sum by (queue, op) (
+            rate(backlog_ops_total{result="error"}[5m])
+          ) > 0
+        for: 5m
+        labels:
+          severity: critical
+          scraper: video
+        annotations:
+          summary: >-
+            backlog-server {{ $labels.op }} on {{ $labels.queue }} is
+            failing
+          description: >-
+            Commands return errors (disk full, I/O error or a poisoned
+            change log). Check free space on the data directory and the
+            server logs; restart once the cause is fixed.

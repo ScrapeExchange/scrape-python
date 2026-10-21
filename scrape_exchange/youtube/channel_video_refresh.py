@@ -10,8 +10,9 @@ import redis.asyncio as aioredis
 from prometheus_client import Counter, Histogram
 
 from scrape_exchange.file_management import AssetFileManagement
+from scrape_exchange.video_queue_factory import make_video_scrape_queue
 from scrape_exchange.video_scrape_queue import (
-    RedisVideoScrapeQueue,
+    VideoScrapeQueue,
     VideoScrapeQueueSettings,
     VideoState,
 )
@@ -242,8 +243,11 @@ class KnownVideoIds:
         self._uploaded: UploadedVideoIds = UploadedVideoIds(
             '', redis_client=redis,
         )
-        self._queue: RedisVideoScrapeQueue = RedisVideoScrapeQueue(
-            redis, VideoScrapeQueueSettings(),
+        self._queue: VideoScrapeQueue = make_video_scrape_queue(
+            platform='youtube',
+            redis=redis,
+            settings=VideoScrapeQueueSettings(),
+            component='youtube-channel-video-queue',
         )
         self.exchange_ids: set[str] = set()
 
@@ -312,8 +316,11 @@ async def queue_channel_videos(
         query.
     '''
     uploaded: UploadedVideoIds = UploadedVideoIds('', redis_client=redis)
-    queue: RedisVideoScrapeQueue = RedisVideoScrapeQueue(
-        redis, VideoScrapeQueueSettings(),
+    queue: VideoScrapeQueue = make_video_scrape_queue(
+        platform='youtube',
+        redis=redis,
+        settings=VideoScrapeQueueSettings(),
+        component='youtube-channel-video-queue',
     )
     if not channel.channel_id:
         raise ValueError(
