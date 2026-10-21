@@ -110,6 +110,34 @@ class TestRedisFromUrl(unittest.TestCase):
         )
 
 
+class TestRedisFromUrlSocketTimeout(unittest.TestCase):
+    '''redis-py 8 defaults socket_timeout to 5 s; large replies such as
+    HGETALL of the creator map take longer to read, so the shared
+    client keeps redis-py 7's "no timeout" unless one is asked for.'''
+
+    @staticmethod
+    def _timeout(url: str, **kwargs: object) -> object:
+        client = redis_from_url(url, component='test', **kwargs)
+        return client.connection_pool.connection_kwargs.get(
+            'socket_timeout', 'missing',
+        )
+
+    def test_no_socket_timeout_by_default(self) -> None:
+        self.assertIsNone(self._timeout('redis://localhost:6379/0'))
+
+    def test_explicit_socket_timeout_wins(self) -> None:
+        self.assertEqual(
+            self._timeout('redis://localhost:6379/0', socket_timeout=3.0),
+            3.0,
+        )
+
+    def test_dsn_socket_timeout_is_honoured(self) -> None:
+        self.assertEqual(
+            self._timeout('redis://localhost:6379/0?socket_timeout=7'),
+            7.0,
+        )
+
+
 class TestRedisBusyRetry(unittest.IsolatedAsyncioTestCase):
 
     async def test_command_recovers_after_dataset_loading(self) -> None:
