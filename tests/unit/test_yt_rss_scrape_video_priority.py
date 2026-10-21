@@ -76,12 +76,28 @@ class TestQueueVideoForScrape(
         video.from_innertube.assert_not_awaited()
         video.to_file.assert_not_awaited()
 
-    async def test_returns_none_when_enqueue_raises(
+    async def test_raises_when_enqueue_fails(
         self,
     ) -> None:
         video = self._video('vid_b')
         queue: mock.AsyncMock = self._queue()
-        queue.enqueue.side_effect = RuntimeError('redis down')
+        queue.enqueue.side_effect = RuntimeError('queue down')
+        with self.assertRaises(RuntimeError):
+            await self.module._queue_video_for_scrape(
+                video,
+                channel_handle='hh',
+                video_queue=queue,
+            )
+        queue.enqueue.assert_awaited_once()
+        video.from_innertube.assert_not_awaited()
+        video.to_file.assert_not_awaited()
+
+    async def test_returns_none_for_malformed_id(
+        self,
+    ) -> None:
+        video = self._video('bad')
+        queue: mock.AsyncMock = self._queue()
+        queue.enqueue.side_effect = ValueError('invalid video_id: bad')
         result: str | None = (
             await self.module._queue_video_for_scrape(
                 video,
@@ -90,9 +106,6 @@ class TestQueueVideoForScrape(
             )
         )
         self.assertIsNone(result)
-        queue.enqueue.assert_awaited_once()
-        video.from_innertube.assert_not_awaited()
-        video.to_file.assert_not_awaited()
 
 
 if __name__ == '__main__':

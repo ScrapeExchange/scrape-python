@@ -1127,14 +1127,16 @@ async def _queue_video_for_scrape(
     video_queue: VideoScrapeQueue,
 ) -> str | None:
     '''
-    Enqueue a video id onto the Redis-backed video scrape queue so
-    the video scraper picks it up. Returns the video id on success,
-    ``None`` on failure.
+    Enqueue a video id onto the video scrape queue so the video
+    scraper picks it up. Returns the video id on success and ``None``
+    when the queue rejects the id as malformed, which a retry cannot
+    fix. Any other failure (queue unreachable, server error) raises,
+    so :func:`process_channel` fails the channel and it is retried.
 
     :param channel_handle: Display name of the channel, used only
         for logging.
-    :param video_queue: Redis-backed scrape queue the video scraper
-        consumes from.
+    :param video_queue: Scrape queue the video scraper consumes from.
+    :raises Exception: when the queue cannot store the video id.
     '''
 
     video_id: str = str(video.video_id)
@@ -1168,9 +1170,9 @@ async def _queue_video_for_scrape(
             channel_url=video_channel_url,
             channel_is_verified=video_channel_is_verified,
         )
-    except Exception as exc:
+    except ValueError as exc:
         logging.warning(
-            'Failed to enqueue video for scrape, '
+            'Video queue rejected a malformed video id, '
             'skipping video',
             exc=exc, extra=extra,
         )
@@ -1690,37 +1692,38 @@ async def process_channel(
 
     videos_queued: int = 0
     videos_failed: int = 0
+    videos_invalid: int = 0
     for video, result in zip(
         new_videos, queue_results,
     ):
         if isinstance(result, Exception):
             logging.warning(
-                'Failed to process video',
-                exc=result, extra=extra
+                'Failed to queue video for scrape',
+                exc=result,
+                extra=extra | {'video_id': str(video.video_id)},
             )
             videos_failed += 1
         elif result is None:
-            videos_failed += 1
+            videos_invalid += 1
         else:
             videos_queued += 1
 
-    missed: int = (
-        len(new_videos) - videos_queued - videos_failed
-    )
     logging.info(
         MSG_PROCESSED_VIDEOS, extra={
             'channel_handle': channel_handle,
             'videos_queued': videos_queued,
             'videos_existing': videos_existing,
             'videos_failed': videos_failed,
+            'videos_invalid': videos_invalid,
             'video_count': len(videos),
         },
     )
-    if missed > 0:
+    if videos_failed > 0:
+        # Fail the channel so the worker retries it soon; videos
+        # queued meanwhile dedupe on the retry.
         raise RuntimeError(
-            f'{missed} out of {len(videos)} videos '
-            f'for channel {channel_handle!r} could not '
-            f'be processed'
+            f'{videos_failed} of {len(new_videos)} new videos '
+            f'for channel {channel_handle!r} could not be queued'
         )
 
     videos = []
