@@ -8729,6 +8729,7 @@
         "options": [],
         "query": "prometheus",
         "refresh": 1,
+        "regex": "/^prometheus/i",
         "type": "datasource"
       },
       {
