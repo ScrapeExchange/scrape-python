@@ -60,6 +60,17 @@ class TestPrivacySettings(unittest.TestCase):
             frozenset({'example.org', 'foo.example'}),
         )
 
+    def test_allowed_domains_strip_scheme_and_path(self) -> None:
+        with mock.patch.dict(os.environ, {
+            'YOUTUBE_PRIVACY_ALLOWED_DOMAINS':
+                'https://mysite.example/, http://WWW.Band.example/tour',
+        }):
+            settings: YouTubeScraperSettings = _settings()
+        self.assertEqual(
+            settings.extra_allowed_domains,
+            frozenset({'mysite.example', 'band.example'}),
+        )
+
 
 class TestMarkerSuffixes(unittest.TestCase):
 

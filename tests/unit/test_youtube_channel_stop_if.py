@@ -142,6 +142,17 @@ class TestStopIfAbout(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await outer
 
+    async def test_discarded_enumeration_error_is_ignored(self) -> None:
+        channel: YouTubeChannel = _channel()
+
+        async def failing() -> int:
+            raise ConnectionError('proxy dropped')
+
+        content_task: asyncio.Task[int] = asyncio.create_task(failing())
+        await asyncio.sleep(0)
+        await channel._stop_content_task(content_task)
+        self.assertTrue(channel.scrape_stopped_early)
+
     async def test_stop_if_passed_to_content(self) -> None:
         channel: YouTubeChannel = _channel()
         received: list[object] = []

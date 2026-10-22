@@ -1854,10 +1854,16 @@ class YouTubeChannel:
             if current is not None and current.cancelling():
                 # This task was cancelled too: do not swallow that.
                 raise
-        except (ValueError, RuntimeError):
+        except Exception as exc:
             # The enumeration failed before it was cancelled; its
             # result is not needed.
-            pass
+            _LOGGER.debug(
+                'Discarded video enumeration failed',
+                extra={
+                    'channel_handle': self.channel_handle,
+                    'exc': str(exc),
+                },
+            )
 
     def _set_video_count_from_loaded_video_ids(self) -> None:
         if self.video_count not in (None, 0):

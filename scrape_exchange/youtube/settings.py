@@ -9,6 +9,8 @@ scrape_exchange YouTube tools.
 
 import os
 
+from urllib.parse import urlsplit
+
 from pydantic import AliasChoices, Field
 
 from ..settings import ScraperSettings
@@ -169,12 +171,22 @@ class YouTubeScraperSettings(ScraperSettings):
     @property
     def extra_allowed_domains(self) -> frozenset[str]:
         '''Return :attr:`privacy_allowed_domains` as a set of
-        lowercased domains without a leading ``www.``.'''
+        lowercased domains. A scheme, path and leading ``www.`` are
+        dropped, so ``https://www.mysite.example/`` becomes
+        ``mysite.example``.'''
         domains: set[str] = set()
         item: str
         for item in self.privacy_allowed_domains.split(','):
-            domain: str = item.strip().lower().rstrip('.')
-            domain = domain.removeprefix('www.')
+            candidate: str = item.strip()
+            if not candidate:
+                continue
+            if '://' not in candidate:
+                candidate = f'https://{candidate}'
+            try:
+                host: str = urlsplit(candidate).hostname or ''
+            except ValueError:
+                continue
+            domain: str = host.lower().rstrip('.').removeprefix('www.')
             if domain:
                 domains.add(domain)
         return frozenset(domains)

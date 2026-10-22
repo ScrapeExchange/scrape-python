@@ -164,5 +164,75 @@ class TestMaskMetrics(unittest.TestCase):
         self.assertEqual(after - before, 2)
 
 
+
+class TestReviewFalsePositives(unittest.TestCase):
+    '''Ordinary description text that must stay unmasked.'''
+
+    def _assert_kept(self, *texts: str) -> None:
+        text: str
+        for text in texts:
+            with self.subTest(text=text):
+                self.assertEqual(mask_text(text, A), text)
+
+    def test_missing_space_after_full_stop(self) -> None:
+        self._assert_kept(
+            'Thanks for watching.Me and my friends.',
+            'Enjoy.In this video. Great.No way. Wow.It works.',
+            'Built with ASP.NET, Vb.net and Socket.io',
+            'Danke.Es war gut. Merci.De rien.',
+        )
+
+    def test_address_lookalikes(self) -> None:
+        self._assert_kept(
+            'Spring 2026 collection',
+            'Engineering 101 and Mastering 3',
+            'Up to 100 via PayPal.',
+            'Step 2 via Zapier',
+            'Send 5 via email',
+            '3 place cards',
+            'Top 10 Best Street food',
+            'Top 10 Best Road Trips',
+            '10 Best Lane changes',
+        )
+
+    def test_number_lists(self) -> None:
+        self._assert_kept(
+            'Open Mon-Fri 10.00-18.00',
+            'Specs: 1.5 2.0 3.5 4.0',
+            'scores 3-2 1-0 2-2 4-1',
+            'Resolution 1920 1080',
+            'build 20261022',
+            'order 12345678',
+        )
+
+    def test_real_contacts_still_masked(self) -> None:
+        masked: str = mask_text(
+            'call +31 6 12345678 or 020 123 4567, shop at '
+            'mijnwinkel.nl or myblog.example/about, visit '
+            'Kerkstraat 12 or 221B Baker Street', A,
+        )
+        self.assertEqual(
+            masked,
+            'call <phone hidden> or <phone hidden>, shop at '
+            '<url withheld> or <url withheld>, visit '
+            '<address hidden> or <address hidden>',
+        )
+
+
+class TestReviewRobustness(unittest.TestCase):
+
+    def test_private_use_characters_do_not_crash(self) -> None:
+        text: str = 'a \ue000X\ue001 b \ue000\ue100\ue001'
+        self.assertEqual(mask_text(text, A), 'a X b ')
+
+    def test_nested_redirect_is_unwrapped(self) -> None:
+        nested: str = (
+            'https://www.youtube.com/redirect?q=https%3A%2F%2F'
+            'www.youtube.com%2Fredirect%3Fq%3Dhttps%253A%252F%252F'
+            'evil.example'
+        )
+        self.assertEqual(mask_text(nested, A), '<url withheld>')
+
+
 if __name__ == '__main__':
     unittest.main()
