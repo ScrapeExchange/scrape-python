@@ -47,6 +47,9 @@ def _mock_settings() -> MagicMock:
     s.channel_not_found_retry_seconds = 3600
     s.exchange_url = 'https://scrape.exchange'
     s.channel_min_subscribers = 10
+    s.channel_privacy_subscribers = 4000
+    s.channel_views_per_subscriber = 100
+    s.extra_allowed_domains = frozenset()
     return s
 
 
@@ -56,9 +59,11 @@ def _mock_channel(
     video_count: int | None = 1,
     title: str | None = 'Channel',
     channel_handle: str | None = 'channel',
+    view_count: int | None = None,
 ) -> MagicMock:
     channel = MagicMock()
     channel.subscriber_count = subscriber_count
+    channel.view_count = view_count
     channel.video_count = video_count
     channel.video_ids = {'video-id'}
     channel.video_ids_complete = True
@@ -82,13 +87,16 @@ class TestChannelEndState(unittest.TestCase):
             ChannelState.TOPIC,
         )
 
-    def test_unknown_counts_do_not_mark_terminal(self) -> None:
+    def test_unknown_counts_mark_low_subs(self) -> None:
         from tools.yt_channel_scrape import _channel_end_state
 
-        self.assertIsNone(_channel_end_state(_mock_channel(
-            subscriber_count=None,
-            video_count=None,
-        )))
+        self.assertEqual(
+            _channel_end_state(_mock_channel(
+                subscriber_count=None,
+                video_count=None,
+            )),
+            ChannelState.LOW_SUBS,
+        )
 
 
 class TestScrapeOne(
@@ -199,7 +207,9 @@ class TestScrapeOne(
         mock_exists: AsyncMock,
     ) -> None:
         mock_exists.return_value = True
-        mock_scrape.return_value = _mock_channel(subscriber_count=None)
+        mock_scrape.return_value = _mock_channel(
+            subscriber_count=None, view_count=10**9,
+        )
         queue = _mock_queue()
         # After update_tier the queue has marked the count not public
         # and cleared the retry flags.
@@ -245,7 +255,7 @@ class TestScrapeOne(
     ) -> None:
         mock_exists.return_value = True
         mock_scrape.return_value = _mock_channel(
-            subscriber_count=None,
+            subscriber_count=None, view_count=10**9,
         )
         queue = _mock_queue()
         creator_map = AsyncMock()
@@ -266,7 +276,10 @@ class TestScrapeOne(
         queue.update_tier.assert_awaited_once()
         self.assertIsNone(queue.update_tier.await_args.kwargs['sub_count'])
         queue.retry_missing_subscriber_count.assert_not_awaited()
-        queue.set_meta.assert_not_awaited()
+        queue.set_meta.assert_awaited_once_with(
+            'i:UCabc00000000000000000000',
+            view_count=str(10**9),
+        )
         queue.clear_force_rescrape.assert_not_awaited()
 
     @patch(
@@ -662,6 +675,7 @@ class TestScrapeOne(
         mock_exists.return_value = False
         channel = MagicMock()
         channel.subscriber_count = None
+        channel.view_count = 10**9
         channel.video_count = None
         channel.channel_id = 'UCabc00000000000000000000'
         channel.channel_handle = 'empty'
@@ -711,6 +725,7 @@ class TestScrapeOne(
         mock_exists.return_value = False
         channel = MagicMock()
         channel.subscriber_count = None
+        channel.view_count = 10**9
         channel.video_count = 37
         channel.channel_id = 'UCabc00000000000000000000'
         channel.channel_handle = 'active'
@@ -760,6 +775,7 @@ class TestScrapeOne(
         mock_exists.return_value = False
         channel = MagicMock()
         channel.subscriber_count = None
+        channel.view_count = 10**9
         channel.video_count = 0
         channel.channel_id = 'UCabc00000000000000000000'
         channel.channel_handle = 'empty'
@@ -1108,6 +1124,8 @@ class TestTypedScrape(
 
     async def test_success_metric_uses_channel_status(self) -> None:
         channel: MagicMock = MagicMock()
+        channel.subscriber_count = 1_000_000
+        channel.view_count = None
         channel.channel_id = 'UCabc00000000000000000000'
         channel.channel_handle = 'channel'
         channel.about_page_succeeded = True
@@ -1164,6 +1182,11 @@ class TestTypedScrape(
         )
 
     @patch(
+        'tools.yt_channel_scrape._apply_privacy_limits',
+        new_callable=AsyncMock,
+        return_value=False,
+    )
+    @patch(
         'tools.yt_channel_scrape._persist_scraped_channel',
         new_callable=AsyncMock,
     )
@@ -1180,6 +1203,7 @@ class TestTypedScrape(
         mock_try: AsyncMock,
         mock_no_content: MagicMock,
         mock_persist: AsyncMock,
+        _mock_privacy: AsyncMock,
     ) -> None:
         mock_try.return_value = None
         settings = _mock_settings()
@@ -1655,6 +1679,9 @@ class TestScrapeOneHandleOptional(
         channel_id: str = 'UCabc00000000000000000000'
         channel: MagicMock = MagicMock()
         channel.subscriber_count = 10
+        channel.view_count = None
+        channel.description = None
+        channel.external_urls = set()
         channel.video_count = 1
         channel.channel_id = channel_id
         channel.channel_handle = None

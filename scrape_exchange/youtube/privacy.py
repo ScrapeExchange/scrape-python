@@ -481,7 +481,8 @@ def mask_channel_record(record: dict, allowed: frozenset[str]) -> None:
         record['description'] = mask_text(record['description'], allowed)
 
 
-def _parse_count(value: Any) -> int | None:
+def parse_count(value: Any) -> int | None:
+    '''Parse a count stored in Redis; None when absent or invalid.'''
     if isinstance(value, bytes):
         value = value.decode('utf-8', errors='replace')
     try:
@@ -507,4 +508,4 @@ async def lookup_channel_counts(
         key,
     ):
         return None
-    return _parse_count(values[0]), _parse_count(values[1])
+    return parse_count(values[0]), parse_count(values[1])

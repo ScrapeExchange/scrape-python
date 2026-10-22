@@ -169,6 +169,9 @@ class TestChannelVideoRefresh(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         self.channel.subscriber_count = None
+        # A view count keeps the channel above CHANNEL_MIN_SUBSCRIBERS,
+        # so the missing subscriber count is retried.
+        self.channel.view_count = 10**9
         self.status = 503
         # A filter-query failure is all-or-nothing: the scrape fails
         # and the refresh stays due, no partial accounting.
@@ -200,6 +203,7 @@ class TestChannelVideoRefresh(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         self.channel.subscriber_count = None
+        self.channel.view_count = 10**9
         self.existing = True
         await self.queue.set_meta(
             'i:UCexample', successful_scrapes='10',
@@ -525,9 +529,25 @@ class TestChannelVideoRefresh(unittest.IsolatedAsyncioTestCase):
             ['new-video'],
         )
 
-    async def test_unknown_subscribers_queue_videos(self) -> None:
+    async def test_unknown_counts_do_not_queue_videos(self) -> None:
         self.settings.channel_min_subscribers = 10
         self.channel.subscriber_count = None
+        self.channel.view_count = None
+        await self.run_scrape()
+        self.assertEqual(
+            await self.redis.zrange('youtube:video:queue', 0, -1), [],
+        )
+        self.assertEqual(
+            await self.queue.get_state('i:UCexample'),
+            ChannelState.LOW_SUBS,
+        )
+
+    async def test_unknown_subscribers_with_views_queue_videos(
+        self,
+    ) -> None:
+        self.settings.channel_min_subscribers = 10
+        self.channel.subscriber_count = None
+        self.channel.view_count = 10**9
         await self.run_scrape()
         self.assertEqual(
             await self.redis.zrange('youtube:video:queue', 0, -1),
