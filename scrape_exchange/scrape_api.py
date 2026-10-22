@@ -251,16 +251,15 @@ async def get_data_by_content(
 
 async def filter_data(
     client: ExchangeClient,
-    filters: PostFilterRequestModel | None = None,
+    filters: PostFilterRequestModel,
 ) -> QueryResponseModel[GetDataResponseModel]:
     '''``POST /api/v1/filter`` -> paginated matches.
 
-    Pass an empty :class:`PostFilterRequestModel` to walk every
-    record. To iterate transparently across pages use
-    :func:`iter_filter_data`.
+    *filters* must set ``platform`` and ``entity``; the API answers
+    422 otherwise. The only exception is a search by
+    ``platform_creator_id`` alone. To iterate transparently across
+    pages use :func:`iter_filter_data`.
     '''
-    if filters is None:
-        filters = PostFilterRequestModel()
     response = await client.post(
         f'{client.exchange_url.rstrip("/")}{_API_PREFIX}/filter',
         json=filters.model_dump(
@@ -280,7 +279,7 @@ async def filter_data(
 
 async def iter_filter_data(
     client: ExchangeClient,
-    filters: PostFilterRequestModel | None = None,
+    filters: PostFilterRequestModel,
 ) -> AsyncIterator[GetDataResponseModel]:
     '''Yield every ``GetDataResponseModel`` matching *filters*.
 
@@ -288,10 +287,7 @@ async def iter_filter_data(
     False. The page size from *filters* (default 100) governs the
     request batching.
     '''
-    base: PostFilterRequestModel = (
-        filters.model_copy(deep=True) if filters
-        else PostFilterRequestModel()
-    )
+    base: PostFilterRequestModel = filters.model_copy(deep=True)
     while True:
         page: QueryResponseModel[GetDataResponseModel] = (
             await filter_data(client, base)

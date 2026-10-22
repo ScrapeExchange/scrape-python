@@ -177,6 +177,18 @@ class TestEndpointWrappers(
         self.assertEqual(len(page.edges), 1)
 
 
+    async def test_filter_data_requires_filters(self) -> None:
+        # The API rejects filters without platform + entity, so an
+        # implicit empty filter is not offered.
+        client: MagicMock = MagicMock()
+        client.post = AsyncMock()
+        with self.assertRaises(TypeError):
+            await filter_data(client)
+        with self.assertRaises(TypeError):
+            iter_filter_data(client)
+        client.post.assert_not_awaited()
+
+
 class TestIterFilterData(
     unittest.IsolatedAsyncioTestCase,
 ):
@@ -211,7 +223,9 @@ class TestIterFilterData(
         client.post = AsyncMock(side_effect=responses)
         seen: list = []
         async for entry in iter_filter_data(
-            client, PostFilterRequestModel(),
+            client, PostFilterRequestModel(
+                platform=Platform.YOUTUBE, entity='video',
+            ),
         ):
             seen.append(entry)
         self.assertEqual(len(seen), 3)
