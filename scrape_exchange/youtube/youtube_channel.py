@@ -76,6 +76,10 @@ from ..file_management import VIDEO_FILE_PREFIX
 
 _LOGGER: Logger = getLogger(__name__)
 
+# Called with the channel once its first page is parsed; True stops the
+# scrape before the video tabs are enumerated.
+StopIfFn = Callable[['YouTubeChannel'], bool]
+
 # Limits the amount of videos imported for a channel
 # per run
 MAX_CHANNEL_VIDEOS_PER_RUN: int = 40
@@ -377,6 +381,9 @@ class YouTubeChannel:
         self.subscriber_count_retry: bool = False
         self.video_count: int | None = None
         self.view_count: int | None = None
+        # Set when a scrape stopped early because ``stop_if`` said the
+        # channel is too small to enumerate its videos.
+        self.scrape_stopped_early: bool = False
 
         self.channel_links: set[YouTubeChannelLink] = set()
 
@@ -863,6 +870,7 @@ class YouTubeChannel:
         require_complete_video_ids: bool = False,
         known_video_ids: KnownVideoIdsFn | None = None,
         oldest_first_limit: int = 0,
+        stop_if: 'StopIfFn | None' = None,
     ) -> None:
         '''
         Scrapes the channel page for information. This does not include data
@@ -890,6 +898,10 @@ class YouTubeChannel:
         :param oldest_first_limit: when > 0, page the videos, shorts and
         live tabs in 'Oldest' order and keep at most this many IDs per
         tab (a new channel's first scrape).
+        :param stop_if: when set, called once the about page (or the
+        first InnerTube page) has been parsed; when it returns True the
+        video enumeration is cancelled or skipped and
+        :attr:`scrape_stopped_early` is set.
         :returns: dict of the scraped data
         :raises: ValueError if no data could be scraped or parsed
         '''
@@ -933,6 +945,7 @@ class YouTubeChannel:
                     ),
                     known_video_ids=known_video_ids,
                     oldest_first_limit=oldest_first_limit,
+                    stop_if=stop_if,
                 ),
             )
 
@@ -945,6 +958,11 @@ class YouTubeChannel:
         # already known.
         if not self.channel_id and self.channel_handle:
             await self._resolve_channel_id_via_innertube()
+
+        if stop_if is not None and stop_if(self):
+            await self._stop_content_task(content_task)
+            self._reconcile_description_external_links()
+            return
 
         if not with_video_ids:
             return  # caller wanted metadata only
@@ -959,6 +977,7 @@ class YouTubeChannel:
                     ),
                     known_video_ids=known_video_ids,
                     oldest_first_limit=oldest_first_limit,
+                    stop_if=stop_if,
                 )
         except (ValueError, RuntimeError) as exc:
             if require_complete_video_ids:
@@ -1741,6 +1760,7 @@ class YouTubeChannel:
         self, save_dir: str, max_videos_per_channel: int = 0,
         known_video_ids: KnownVideoIdsFn | None = None,
         oldest_first_limit: int = 0,
+        stop_if: 'StopIfFn | None' = None,
     ) -> int:
         '''
         Scrapes video_id's and videos from the YouTube InnerTube API.
@@ -1754,6 +1774,8 @@ class YouTubeChannel:
         scraped.
         :param known_video_ids: see :meth:`scrape`.
         :param oldest_first_limit: see :meth:`scrape`.
+        :param stop_if: see :meth:`scrape`; checked after the first
+        InnerTube page is parsed, before the tabs are enumerated.
         :returns: number of videos scraped
         :raises: RuntimeError, ValueError
         '''
@@ -1783,6 +1805,10 @@ class YouTubeChannel:
 
         self.parse_channel_video_data(page_data)
 
+        if stop_if is not None and stop_if(self):
+            self.scrape_stopped_early = True
+            return 0
+
         try:
             self.video_ids, self.podcast_ids, self.playlists, self.courses, \
                 self.posts, self.products = \
@@ -1811,6 +1837,24 @@ class YouTubeChannel:
         )
 
         return videos_imported
+
+    async def _stop_content_task(
+        self, content_task: 'asyncio.Task[int] | None',
+    ) -> None:
+        '''Cancel a running video enumeration and mark the scrape as
+        stopped early.'''
+        self.scrape_stopped_early = True
+        if content_task is None:
+            return
+        content_task.cancel()
+        try:
+            await content_task
+        except asyncio.CancelledError:
+            pass
+        except (ValueError, RuntimeError):
+            # The enumeration failed before it was cancelled; its
+            # result is not needed.
+            pass
 
     def _set_video_count_from_loaded_video_ids(self) -> None:
         if self.video_count not in (None, 0):
