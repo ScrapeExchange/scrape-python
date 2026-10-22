@@ -19,11 +19,18 @@ written to disk for upload, the scrapers classify its channel by size:
 import re
 
 from enum import Enum
+from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, urlsplit
 
 from prometheus_client import Counter
 
+from ..channel_scrape_queue import KEY_PREFIX as CHANNEL_KEY_PREFIX
 from .settings import YouTubeScraperSettings
+from .youtube_external_link import YouTubeExternalLink
+
+if TYPE_CHECKING:
+    from .youtube_channel import YouTubeChannel
+    from .youtube_video import YouTubeVideo
 
 
 EMAIL_HIDDEN: str = '<email hidden>'
@@ -433,3 +440,71 @@ def mask_text(text: str | None, allowed: frozenset[str]) -> str | None:
     return _KEEP_TOKEN.sub(
         lambda match: kept[ord(match.group(1)) - 0xE100], masked,
     )
+
+
+# --- Records ------------------------------------------------------------
+
+def _mask_link_url(url: str, allowed: frozenset[str]) -> str:
+    if url.lower().startswith('mailto:'):
+        PRIVACY_MASKED_ITEMS.labels(kind='email').inc()
+        return EMAIL_HIDDEN
+    if is_allowed_url(url, allowed):
+        return url
+    PRIVACY_MASKED_ITEMS.labels(kind='url').inc()
+    return URL_WITHHELD
+
+
+def mask_channel(
+    channel: 'YouTubeChannel', allowed: frozenset[str],
+) -> None:
+    '''Mask the description and the external links of *channel* in
+    place. A link keeps its name and priority.'''
+    channel.description = mask_text(channel.description, allowed)
+    channel.external_urls = {
+        YouTubeExternalLink(
+            name=link.name,
+            url=_mask_link_url(link.url, allowed),
+            priority=link.priority,
+        )
+        for link in channel.external_urls or set()
+    }
+
+
+def mask_video(video: 'YouTubeVideo', allowed: frozenset[str]) -> None:
+    '''Mask the description of *video* in place.'''
+    video.description = mask_text(video.description, allowed)
+
+
+def mask_channel_record(record: dict, allowed: frozenset[str]) -> None:
+    '''Mask the description of an RSS lite channel record in place.'''
+    if record.get('description'):
+        record['description'] = mask_text(record['description'], allowed)
+
+
+def _parse_count(value: Any) -> int | None:
+    if isinstance(value, bytes):
+        value = value.decode('utf-8', errors='replace')
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+async def lookup_channel_counts(
+    redis: Any, channel_id: str | None,
+) -> tuple[int | None, int | None] | None:
+    '''Return ``(subscriber_count, view_count)`` from the channel scrape
+    queue's meta hash of *channel_id*, or ``None`` when the channel is
+    not in the queue. A count that is missing or unparseable is
+    ``None``.'''
+    if not channel_id:
+        return None
+    key: str = f'{CHANNEL_KEY_PREFIX}:meta:i:{channel_id}'
+    values: list[Any] = await redis.hmget(
+        key, ['subscriber_count', 'view_count'],
+    )
+    if all(value is None for value in values) and not await redis.exists(
+        key,
+    ):
+        return None
+    return _parse_count(values[0]), _parse_count(values[1])
