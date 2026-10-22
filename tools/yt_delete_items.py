@@ -71,9 +71,11 @@ _DELETE_TIMEOUT: Timeout = Timeout(
 
 class DeleteItemsSettings(ScraperSettings):
     '''
-    Filter and safety settings for the bulk-delete tool. All
-    filter fields are optional; the server further scopes the
-    query to records uploaded by the authenticated account.
+    Filter and safety settings for the bulk-delete tool.
+    ``platform`` and ``entity`` are required (checked by
+    :func:`delete_items`); the other filter fields are optional. The
+    server further scopes the query to records uploaded by the
+    authenticated account.
     '''
 
     schema_owner: str | None = Field(
@@ -217,12 +219,18 @@ async def delete_items(
     code (0 on success, non-zero on a request-level failure).
     '''
     
-    body: dict[str, str] = _build_filter_body(settings)
-    if not body and not settings.confirm:
-        logging.info(
-            'No filter fields set; preview will match every '
-            'record this account uploaded',
+    if not settings.platform or not settings.entity:
+        # The API answers 422 PLATFORM_ENTITY_REQUIRED otherwise.
+        logging.error(
+            '--platform and --entity are required for bulk delete',
+            extra={
+                'platform': settings.platform,
+                'entity': settings.entity,
+            },
         )
+        return 1
+
+    body: dict[str, str] = _build_filter_body(settings)
 
     url: str = f'{settings.exchange_url}{FILTER_API_PATH}'
     params: dict[str, str] = {
