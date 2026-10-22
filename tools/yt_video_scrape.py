@@ -28,6 +28,8 @@ from yt_dlp.YoutubeDL import YoutubeDL
 
 from scrape_exchange.file_management import (
     AssetFileManagement,
+    LOW_SUBS_SUFFIX,
+    UNKNOWN_CHANNEL_SUFFIX,
     VIDEO_MIN_FILE_PREFIX as VIDEO_MIN_PREFIX,
     VIDEO_YTDLP_FILE_PREFIX as VIDEO_YTDLP_PREFIX,
 )
@@ -65,6 +67,13 @@ from scrape_exchange.youtube.youtube_channel import YouTubeChannel
 from scrape_exchange.youtube.derived_metadata import (
     enrich_video_channel_country,
     increment_channel_category_count,
+)
+from scrape_exchange.youtube.privacy import (
+    ChannelSize,
+    allowed_domains,
+    classify_for_settings,
+    lookup_channel_counts,
+    mask_video,
 )
 from scrape_exchange.youtube.youtube_video import YouTubeVideo
 from scrape_exchange.youtube.youtube_video import (
@@ -306,7 +315,43 @@ async def _scrape_to_disk(
     await video.to_file(
         settings.video_data_directory,
         output_prefix,
+        marker_suffix=await _apply_video_privacy_limits(
+            video, settings=settings, redis=redis,
+        ),
     )
+
+
+async def _apply_video_privacy_limits(
+    video: YouTubeVideo,
+    *,
+    settings: 'VideoSettings',
+    redis: aioredis.Redis | None,
+) -> str:
+    '''Decide how *video* is saved, from its channel's counts in the
+    channel scrape queue (never from yt-dlp-only fields, so InnerTube
+    and yt-dlp scrapes are treated alike). Returns the marker suffix to
+    save it with: ``.unknown_channel`` when the channel is not in the
+    queue, ``.low_subs`` when it is tiny, ``''`` otherwise. Masks the
+    description of a small channel's video in place.'''
+    counts: tuple[int | None, int | None] | None = (
+        await lookup_channel_counts(redis, video.channel_id)
+        if redis is not None else None
+    )
+    if counts is None:
+        VIDEO_PRIVACY_OUTCOMES.labels(outcome='unknown_channel').inc()
+        return UNKNOWN_CHANNEL_SUFFIX
+    size: ChannelSize = classify_for_settings(
+        counts[0], counts[1], settings,
+    )
+    if size is ChannelSize.TINY:
+        VIDEO_PRIVACY_OUTCOMES.labels(outcome='low_subs').inc()
+        return LOW_SUBS_SUFFIX
+    if size is ChannelSize.SMALL:
+        mask_video(video, allowed_domains(settings))
+        VIDEO_PRIVACY_OUTCOMES.labels(outcome='masked').inc()
+    else:
+        VIDEO_PRIVACY_OUTCOMES.labels(outcome='unmasked').inc()
+    return ''
 
 
 def _apply_queue_channel_context(
@@ -785,6 +830,12 @@ VIDEO_STATE_SIZE: Gauge = Gauge(
 VIDEO_QUEUE_OUTCOMES: Counter = Counter(
     'video_queue_outcomes_total',
     'Outcomes per scrape attempt.',
+    ['outcome'],
+)
+VIDEO_PRIVACY_OUTCOMES: Counter = Counter(
+    'youtube_video_privacy_outcomes_total',
+    'Privacy limits applied to scraped videos: unknown_channel and '
+    'low_subs (kept on disk, not uploaded), masked or unmasked.',
     ['outcome'],
 )
 VIDEO_PROXY_SWITCHES: Counter = Counter(

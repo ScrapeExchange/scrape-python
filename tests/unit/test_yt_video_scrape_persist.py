@@ -170,6 +170,9 @@ class TestScrapeToDisk(unittest.IsolatedAsyncioTestCase):
         settings.log_level = 'INFO'
         settings.video_use_yt_dlp = False
         redis: MagicMock = MagicMock()
+        # The privacy check looks the channel up in the channel queue.
+        redis.hmget = AsyncMock(return_value=[None, None])
+        redis.exists = AsyncMock(return_value=0)
 
         with patch(
             'tools.yt_video_scrape.YouTubeVideo.scrape',
