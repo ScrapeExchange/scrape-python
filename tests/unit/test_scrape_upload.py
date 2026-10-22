@@ -19,6 +19,7 @@ from prometheus_client import REGISTRY
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from scrape_exchange.bulk_upload import (
@@ -440,6 +441,88 @@ class TestPrepareAssetLine(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record['channel_handle'], 'ExampleHandle')
         self.assertEqual(creator_puts, [('UCabc', 'ExampleHandle')])
         self.assertEqual(name_puts, [('Example Channel', 'UCabc')])
+
+    def _channel_context(
+        self,
+    ) -> tuple[
+        scrape_upload.AssetProcessingContext,
+        list[tuple[str, str]],
+        list[tuple[str, str]],
+    ]:
+        creator_puts: list[tuple[str, str]] = []
+        name_puts: list[tuple[str, str]] = []
+
+        class FakeCreatorMap:
+            async def put(self, channel_id: str, handle: str) -> None:
+                creator_puts.append((channel_id, handle))
+
+        class FakeNameMap:
+            async def put(
+                self, *, asset_title: str, asset_id: str,
+            ) -> None:
+                name_puts.append((asset_title, asset_id))
+
+        context = scrape_upload.AssetProcessingContext(
+            settings=_settings(),
+            client=object(),
+            fm=object(),
+            descriptor=scrape_upload.descriptor_for('youtube', 'channel'),
+            state=scrape_upload.YouTubeChannelProcessorState(
+                creator_map=FakeCreatorMap(),
+                name_map=FakeNameMap(),
+                scrape_queue=None,
+                exchange_set=None,
+            ),
+        )
+        return context, creator_puts, name_puts
+
+    async def test_rss_channel_record_is_uploaded_as_partial(
+        self,
+    ) -> None:
+        '''yt-rss writes only the stats it read; the server merges an
+        upload field by field, so filling the other fields with empty
+        defaults would wipe the stored banners, thumbnails, links and
+        joined_date.'''
+        context, creator_puts, name_puts = self._channel_context()
+        rss: dict[str, Any] = {
+            'channel_id': 'UCabc',
+            'channel_handle': 'ExampleHandle',
+            'url': 'https://www.youtube.com/channel/UCabc',
+            'title': 'Example Channel',
+            'video_count': 12,
+            'description': 'About the channel',
+            'subscriber_count': 3400,
+            'view_count': 98765,
+        }
+
+        record = await scrape_upload.YouTubeChannelProcessor().prepare_record(
+            dict(rss),
+            filename='channel-rss-UCabc.json.br',
+            content_id='UCabc',
+            context=context,
+        )
+
+        self.assertEqual(record, rss)
+        self.assertEqual(creator_puts, [('UCabc', 'ExampleHandle')])
+        self.assertEqual(name_puts, [('Example Channel', 'UCabc')])
+
+    async def test_full_channel_record_is_still_complete(
+        self,
+    ) -> None:
+        context, _, _ = self._channel_context()
+        record = await scrape_upload.YouTubeChannelProcessor().prepare_record(
+            {
+                'channel_id': 'UCabc',
+                'channel_handle': 'ExampleHandle',
+                'title': 'Example Channel',
+                'url': 'https://www.youtube.com/channel/UCabc',
+            },
+            filename='channel-UCabc.json.br',
+            content_id='UCabc',
+            context=context,
+        )
+        self.assertIn('banners', record)
+        self.assertIn('channel_thumbnails', record)
 
     async def test_youtube_video_processor_records_successful_ids(
         self,

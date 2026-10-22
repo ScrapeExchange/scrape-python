@@ -37,6 +37,9 @@ VIDEO_FILE_PREFIX: str = 'video-'
 VIDEO_MIN_FILE_PREFIX: str = 'video-min-'
 VIDEO_YTDLP_FILE_PREFIX: str = 'video-dlp-'
 CHANNEL_FILE_PREFIX: str = 'channel-'
+# Partial channel records the RSS scraper writes: only the stats it
+# reads, uploaded as-is so they do not overwrite the other fields.
+CHANNEL_RSS_FILE_PREFIX: str = 'channel-rss-'
 VIDEO_ID_FILE_PREFIX: str = '<video-id>'
 VIDEO_ID_RE: re.Pattern[str] = re.compile(r'^[A-Za-z0-9_-]{11}$')
 
