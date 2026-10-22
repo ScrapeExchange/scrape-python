@@ -1,7 +1,7 @@
 '''
 CHANNEL_MIN_SUBSCRIBERS: channels below the minimum are still scraped,
 but their videos are not added to the video scrape queue by the RSS
-scraper. Unknown subscriber counts never block queuing.
+scraper. Unknown subscriber counts count as below the minimum.
 '''
 
 import importlib.util
@@ -157,12 +157,13 @@ class TestRssSkipsSmallChannels(unittest.IsolatedAsyncioTestCase):
         queue: MagicMock = await self._process(10, 10)
         queue.enqueue.assert_awaited_once()
 
-    async def test_unknown_count_is_queued(self) -> None:
+    async def test_unknown_count_is_not_queued(self) -> None:
         queue: MagicMock = await self._process(None, 10)
-        queue.enqueue.assert_awaited_once()
-        # An unknown count is not evidence of a tiny channel, and it
-        # is not evidence for the catch-all tier either: the tier is
-        # left alone rather than demoted with a fabricated 0.
+        # Privacy: a channel of unknown size counts as below the
+        # minimum, so its videos are not queued.
+        queue.enqueue.assert_not_awaited()
+        # An unknown count is not evidence for the catch-all tier: the
+        # tier is left alone rather than demoted with a fabricated 0.
         self.creator_queue.update_tier.assert_not_awaited()
 
     async def test_disabled_queues_tiny_channel(self) -> None:
