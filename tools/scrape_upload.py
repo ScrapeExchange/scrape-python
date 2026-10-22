@@ -56,6 +56,7 @@ from scrape_exchange.exchange_client import (
 )
 from scrape_exchange.file_management import (
     CHANNEL_FILE_PREFIX,
+    CHANNEL_RSS_FILE_PREFIX,
     COMPRESSED_JSON_SUFFIX,
     VIDEO_MIN_FILE_PREFIX,
     VIDEO_YTDLP_FILE_PREFIX,
@@ -705,6 +706,13 @@ class YouTubeChannelProcessor(AssetProcessor):
                     asset_title=channel.title,
                     asset_id=channel.channel_id,
                 )
+        if os.path.basename(filename).startswith(CHANNEL_RSS_FILE_PREFIX):
+            # An RSS record carries only the stats the RSS scraper read.
+            # The server merges uploads field by field, so send it as-is:
+            # round-tripping it through YouTubeChannel would add every
+            # other field as an empty default and wipe the stored banners,
+            # thumbnails, links and joined_date.
+            return data
         channel.channel_handle = handle
         return channel.to_dict(with_video_ids=False)
 

@@ -43,6 +43,7 @@ from pydantic import (
 
 from scrape_exchange.exchange_client import ExchangeClient
 from scrape_exchange.file_management import (
+    CHANNEL_RSS_FILE_PREFIX,
     AssetFileManagement,
 )
 from scrape_exchange.schema_validator import (
@@ -1807,7 +1808,7 @@ async def _write_channel(
         return
     target: Path = (
         Path(base_dir)
-        / f'channel-rss-{channel_id}.json.br'
+        / f'{CHANNEL_RSS_FILE_PREFIX}{channel_id}.json.br'
     )
     await brotli_write_async(target, record_dict)
 
