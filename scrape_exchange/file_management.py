@@ -125,6 +125,12 @@ DEFAULT_PREFIX_RANKINGS: dict[str, list[str]] = {
 
 FAILED_SUFFIX: str = '.failed'
 
+# Records kept on disk but never uploaded, to protect the privacy of
+# tiny YouTube channels (below CHANNEL_MIN_SUBSCRIBERS) and of videos
+# whose channel is not known to the channel scrape queue.
+LOW_SUBS_SUFFIX: str = '.low_subs'
+UNKNOWN_CHANNEL_SUFFIX: str = '.unknown_channel'
+
 COMPRESSED_JSON_SUFFIX: str = '.json.br'
 
 # Suffixes that mark a file as a status indicator (failure, not-found,
@@ -134,7 +140,7 @@ COMPRESSED_JSON_SUFFIX: str = '.json.br'
 # any other file.
 MARKER_SUFFIXES: tuple[str, ...] = (
     FAILED_SUFFIX, '.not_found', '.unresolved', '.unavailable',
-    '.invalid',
+    '.invalid', LOW_SUBS_SUFFIX, UNKNOWN_CHANNEL_SUFFIX,
 )
 
 

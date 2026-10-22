@@ -17,6 +17,12 @@ from ..settings import ScraperSettings
 # Channels below this many subscribers are not worth scraping videos
 # from; see YouTubeScraperSettings.channel_min_subscribers.
 DEFAULT_CHANNEL_MIN_SUBSCRIBERS: int = 10
+# Below this many subscribers a channel is treated as an individual:
+# personal data in its descriptions is masked. Above it YouTube
+# channels can be monetized.
+DEFAULT_CHANNEL_PRIVACY_SUBSCRIBERS: int = 4000
+# Views per subscriber assumed when a channel has no subscriber count.
+DEFAULT_CHANNEL_VIEWS_PER_SUBSCRIBER: int = 100
 
 
 class YouTubeScraperSettings(ScraperSettings):
@@ -109,14 +115,69 @@ class YouTubeScraperSettings(ScraperSettings):
             'CHANNEL_MIN_SUBSCRIBERS', 'channel_min_subscribers',
         ),
         description=(
-            'Channels with fewer subscribers are scraped once and '
-            'uploaded, then marked low_subs and not re-scraped; their '
-            'videos are not added to the video scrape queue by the '
-            'channel or RSS scraper, and featured-channel links below '
-            'it are not queued. Unknown subscriber counts are not '
-            'affected. 0 disables the check.'
+            'Channels with fewer subscribers are scraped once, saved '
+            'with the .low_subs suffix (never uploaded) and marked '
+            'low_subs; their videos are saved as .low_subs instead of '
+            'being uploaded. A channel without a subscriber count is '
+            'compared on views (this value times '
+            'YOUTUBE_CHANNEL_VIEWS_PER_SUBSCRIBER); without either '
+            'count it counts as below the minimum. Featured-channel '
+            'links with a known count below it are not queued. 0 '
+            'disables the check.'
         ),
     )
+    channel_privacy_subscribers: int = Field(
+        default=DEFAULT_CHANNEL_PRIVACY_SUBSCRIBERS,
+        ge=0,
+        validation_alias=AliasChoices(
+            'YOUTUBE_CHANNEL_PRIVACY_SUBSCRIBERS',
+            'channel_privacy_subscribers',
+        ),
+        description=(
+            'Channels with fewer subscribers get email addresses, '
+            'phone numbers, street addresses and links to personal '
+            'websites masked in their channel and video '
+            'descriptions. 0 disables masking.'
+        ),
+    )
+    channel_views_per_subscriber: int = Field(
+        default=DEFAULT_CHANNEL_VIEWS_PER_SUBSCRIBER,
+        ge=1,
+        validation_alias=AliasChoices(
+            'YOUTUBE_CHANNEL_VIEWS_PER_SUBSCRIBER',
+            'channel_views_per_subscriber',
+        ),
+        description=(
+            'When a channel has no subscriber count, its total view '
+            'count is compared to the subscriber thresholds times '
+            'this factor.'
+        ),
+    )
+    privacy_allowed_domains: str = Field(
+        default='',
+        validation_alias=AliasChoices(
+            'YOUTUBE_PRIVACY_ALLOWED_DOMAINS',
+            'privacy_allowed_domains',
+        ),
+        description=(
+            'Comma-separated domains whose links are never masked, '
+            'in addition to the built-in list of social networks '
+            'and well-known sites.'
+        ),
+    )
+
+    @property
+    def extra_allowed_domains(self) -> frozenset[str]:
+        '''Return :attr:`privacy_allowed_domains` as a set of
+        lowercased domains without a leading ``www.``.'''
+        domains: set[str] = set()
+        item: str
+        for item in self.privacy_allowed_domains.split(','):
+            domain: str = item.strip().lower().rstrip('.')
+            domain = domain.removeprefix('www.')
+            if domain:
+                domains.add(domain)
+        return frozenset(domains)
     bulk_batch_size: int = Field(
         default=1000,
         validation_alias=AliasChoices(
