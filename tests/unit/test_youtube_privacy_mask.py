@@ -83,6 +83,16 @@ class TestMaskAddress(unittest.TestCase):
         )
         self.assertEqual(mask_text(text, A), text)
 
+    def test_title_case_phrases_kept(self) -> None:
+        text: str
+        for text in ('5 Tips To Find Your Way',
+                     '10 Steps To The Right Place',
+                     'Win 3 Tickets To Madison Square',
+                     '2 Hours Of Night Drive',
+                     '1 Night At The Supreme Court'):
+            with self.subTest(text=text):
+                self.assertEqual(mask_text(text, A), text)
+
 
 class TestMaskUrl(unittest.TestCase):
 

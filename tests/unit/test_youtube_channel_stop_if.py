@@ -114,6 +114,34 @@ class TestStopIfAbout(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(channel.scrape_stopped_early)
         self.assertEqual(cancelled, [True])
 
+    async def test_outer_cancellation_is_not_swallowed(self) -> None:
+        channel: YouTubeChannel = _channel()
+        child_cancelled: asyncio.Event = asyncio.Event()
+        release: asyncio.Event = asyncio.Event()
+
+        async def slow_to_cancel() -> int:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                child_cancelled.set()
+                await release.wait()
+                raise
+            return 0
+
+        content_task: asyncio.Task[int] = asyncio.create_task(
+            slow_to_cancel(),
+        )
+        await asyncio.sleep(0)
+        outer: asyncio.Task[None] = asyncio.create_task(
+            channel._stop_content_task(content_task),
+        )
+        await child_cancelled.wait()
+        outer.cancel()
+        await asyncio.sleep(0)
+        release.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await outer
+
     async def test_stop_if_passed_to_content(self) -> None:
         channel: YouTubeChannel = _channel()
         received: list[object] = []

@@ -1850,7 +1850,10 @@ class YouTubeChannel:
         try:
             await content_task
         except asyncio.CancelledError:
-            pass
+            current: asyncio.Task | None = asyncio.current_task()
+            if current is not None and current.cancelling():
+                # This task was cancelled too: do not swallow that.
+                raise
         except (ValueError, RuntimeError):
             # The enumeration failed before it was cancelled; its
             # result is not needed.

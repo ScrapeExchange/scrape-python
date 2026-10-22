@@ -336,8 +336,10 @@ _ADDRESS_PATTERNS: tuple[re.Pattern[str], ...] = (
     # "221B Baker Street", "1600 Pennsylvania Avenue"
     re.compile(
         rf'\b{_HOUSE_NUMBER}\s+(?:{_NAME}\s+){{1,4}}'
+        # Only unambiguous street types: "Way", "Place", "Court",
+        # "Square" and "Drive" are common in title-case video phrases.
         r'(?:Street|St\.|Road|Rd\.|Avenue|Ave\.|Lane|Ln\.|Boulevard|'
-        r'Blvd\.|Drive|Dr\.|Court|Place|Square|Way|Terrace)(?!\w)'
+        r'Blvd\.)(?!\w)'
     ),
     # "12 rue de la Paix", "7 avenida del Mar"
     re.compile(
