@@ -458,6 +458,56 @@ Redis-only queue into MongoDB (steps `terminal`,
 `backlog`, `hot`, in that order, with producers and
 scrapers stopped).
 
+### backlog-server (the current YouTube queue)
+
+With `BACKLOG_SERVER_DSN` set, the YouTube video queue
+is `backlog-server` (`backlog-server/` in this repo, a
+single Rust process holding every known ID on local
+disk and speaking RESP with its own `BACKLOG.*`
+commands) instead of MongoDB plus the Redis hot window.
+Queue selection is in
+`scrape_exchange/video_queue_factory.py`; the client is
+`scrape_exchange/backlog_server_queue.py`. Every command
+is idempotent, which is what lets the client — built by
+`redis_client.backlog_redis_from_url` — reconnect and
+retry a command that hit a connection error rather than
+handing the failure to the scraper. That is deliberate
+and specific to the backlog server: on the shared Redis
+client retries stay at connection establishment, so a
+Lua mutation whose response was lost is never replayed.
+
+The client bounds each connect attempt (5 s) and each
+reply (30 s), PINGs a connection that has been idle for
+more than 30 s before giving it to a command, and
+retries connection errors with jittered exponential
+backoff (60 s of sleeps worst case, plus up to 30 s of
+connect timeouts when the host does not answer). The
+PING's reconnect runs under that same retry policy, so
+with `BACKLOG_REDIS_COMMAND_RETRIES=0` a failed PING is
+raised to the caller. The shared client's pool-level
+connect retry (1 s to 256 s) is off for this client:
+stacked on the command retry it turned one connect into
+15+ minutes of retrying. A backlog-server restart is
+therefore a pause, not a failed scrape. Tunables, all
+optional, are `BACKLOG_REDIS_CONNECT_TIMEOUT_SECONDS`,
+`BACKLOG_REDIS_SOCKET_TIMEOUT_SECONDS`,
+`BACKLOG_REDIS_HEALTH_CHECK_INTERVAL_SECONDS`,
+`BACKLOG_REDIS_COMMAND_RETRIES`,
+`BACKLOG_REDIS_RETRY_BASE_SECONDS` and
+`BACKLOG_REDIS_RETRY_CAP_SECONDS`; query parameters on
+`BACKLOG_SERVER_DSN` win over them.
+
+The video scraper's producer parks and retries on top of
+that (`VIDEO_QUEUE_ERROR_BACKOFF_SECONDS`, default 5 s,
+doubling to `VIDEO_QUEUE_ERROR_BACKOFF_MAX_SECONDS`,
+default 60 s) rather than exiting the worker when the
+backoff budget is spent. A consumer whose `complete`,
+`mark` or lease touch fails the same way leaves the
+video to its lease: it returns to the queue when the
+lease expires and is scraped again.
+`queue_connection_errors_total` counts both, labelled
+`operation="pop"` and `operation="update"`.
+
 ### Two backends, two cost profiles
 
 - **InnerTube only (default).** Async I/O all the way

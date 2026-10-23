@@ -23,7 +23,10 @@ import redis
 from scrape_exchange.backlog_server_queue import (
     BacklogServerVideoScrapeQueue,
 )
-from scrape_exchange.redis_client import redis_from_url
+from scrape_exchange.redis_client import (
+    backlog_redis_from_url,
+    redis_from_url,
+)
 from scrape_exchange.video_scrape_queue import (
     VideoScrapeQueueEntry,
     VideoScrapeQueueSettings,
@@ -240,6 +243,68 @@ class TestBacklogServer(unittest.IsolatedAsyncioTestCase):
         s.start()
         q2: BacklogServerVideoScrapeQueue = self.queue(s)
         self.assertEqual(await q2.pop(100), ids)
+
+    def backlog_client(self, s: Server, **dsn_query: str) -> Any:
+        '''One backlog client, built the way the scrapers build it.'''
+        query: str = '&'.join(
+            f'{key}={value}' for key, value in dsn_query.items()
+        )
+        dsn: str = f'{s.dsn}?{query}' if query else s.dsn
+        client: Any = backlog_redis_from_url(
+            dsn, component='restart-test', decode_responses=True,
+        )
+        self.clients.append(client)
+        return client
+
+    async def test_client_survives_a_server_restart(self) -> None:
+        '''One client and one queue across a server restart: the command
+        after the restart must run on a reconnected socket instead of
+        raising at the scraper.'''
+        s: Server = self.server()
+        client: Any = self.backlog_client(s)
+        q: BacklogServerVideoScrapeQueue = (
+            BacklogServerVideoScrapeQueue(client, VideoScrapeQueueSettings())
+        )
+        ids: list[str] = video_ids(3, seed=5)
+        self.assertEqual(await q.enqueue_many(ids, source='t'), 3)
+        s.stop(signal.SIGKILL)
+        await asyncio.sleep(0.2)
+        s.start()
+
+        # Same client, same pool, dead socket: reconnect and retry.
+        self.assertEqual(await q.pop(10), ids)
+        self.assertTrue(await client.ping())
+        # A write through the reconnected socket lands too.
+        await q.complete(ids[0])
+        self.assertIsNone(await q.get_state(ids[0]))
+        counts: dict[VideoState, int] = await q.count_by_state()
+        self.assertEqual(counts[VideoState.QUEUED], 2)
+
+    async def test_health_check_reconnects_an_idle_connection(
+        self,
+    ) -> None:
+        '''A socket the server closed while the client was idle must be
+        replaced on the next command instead of failing it.
+
+        The health-check PING catches the dead socket, but the
+        reconnect after it runs under the command retry policy, so this
+        passes because of the two together, not the health check on
+        its own (with BACKLOG_REDIS_COMMAND_RETRIES=0 it fails).'''
+        s: Server = self.server()
+        client: Any = self.backlog_client(s, health_check_interval='1')
+        q: BacklogServerVideoScrapeQueue = (
+            BacklogServerVideoScrapeQueue(client, VideoScrapeQueueSettings())
+        )
+        ids: list[str] = video_ids(2, seed=6)
+        self.assertEqual(await q.enqueue_many(ids, source='t'), 2)
+        s.stop(signal.SIGKILL)
+        # Idle longer than health_check_interval with the peer gone.
+        await asyncio.sleep(1.2)
+        s.start()
+        self.assertEqual(await q.get_states(ids), {
+            ids[0]: VideoState.QUEUED, ids[1]: VideoState.QUEUED,
+        })
+        self.assertEqual(await q.pop(10), ids)
 
 
 if __name__ == '__main__':
