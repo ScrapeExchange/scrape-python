@@ -458,3 +458,21 @@ METRIC_RSS_CIRCUIT_WAIT_SECONDS: Histogram = Histogram(
     ['platform'],
     buckets=(0, 1, 5, 15, 60, 300, 900, 3600, 7200),
 )
+
+# ---------------------------------------------------------------------------
+# queue_connection_errors_total
+#   Incremented each time a worker's interaction with its queue backend
+#   (backlog-server for the YouTube video queue, Redis for the others)
+#   failed with a connection error after the client's own retries were
+#   exhausted. ``operation="pop"``: the producer parked and retried.
+#   ``operation="update"``: a consumer's complete/mark/touch failed and
+#   the video was left to its lease, to be scraped again when it
+#   expires. A sustained rate here means the queue host or the network
+#   to it is unhappy, not that a scrape failed.
+# ---------------------------------------------------------------------------
+METRIC_QUEUE_CONNECTION_ERRORS: Counter = Counter(
+    'queue_connection_errors_total',
+    'Queue interactions that failed with a connection error after '
+    'the client exhausted its own retries, by operation.',
+    ['platform', 'scraper', 'operation'],
+)

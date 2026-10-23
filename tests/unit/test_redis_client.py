@@ -7,8 +7,15 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from scrape_exchange.redis_client import (
+    DEFAULT_BACKLOG_COMMAND_RETRIES,
+    DEFAULT_BACKLOG_CONNECT_TIMEOUT_SECONDS,
+    DEFAULT_BACKLOG_HEALTH_CHECK_INTERVAL_SECONDS,
+    DEFAULT_BACKLOG_SOCKET_TIMEOUT_SECONDS,
     DEFAULT_MAX_CONNECTIONS,
+    BacklogRedisSettings,
     RedisConnectRetrySettings,
+    backlog_command_retry,
+    backlog_redis_from_url,
     call_with_redis_busy_retry,
     call_with_redis_connect_retry,
     is_redis_busy_script_error,
@@ -693,3 +700,176 @@ class TestWatchdogPacedBackoff(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(_default_touch_work(), watchdog.touch_work)
         finally:
             Watchdog.reset()
+
+
+class TestBacklogRedisFromUrl(unittest.TestCase):
+    '''The backlog-server client is built for a server that restarts:
+    bounded connect and read timeouts, a health check on idle
+    connections, and a command retry that reconnects.'''
+
+    @staticmethod
+    def _kwargs(url: str = 'redis://localhost:6390/0', **extra: object):
+        client = backlog_redis_from_url(
+            url, component='backlog-test', **extra,
+        )
+        return client.connection_pool.connection_kwargs
+
+    def test_defaults_bound_connect_and_read(self) -> None:
+        kwargs = self._kwargs()
+        self.assertEqual(
+            kwargs['socket_connect_timeout'],
+            DEFAULT_BACKLOG_CONNECT_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            kwargs['socket_timeout'],
+            DEFAULT_BACKLOG_SOCKET_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            kwargs['health_check_interval'],
+            DEFAULT_BACKLOG_HEALTH_CHECK_INTERVAL_SECONDS,
+        )
+
+    def test_command_retry_covers_connection_and_timeout(self) -> None:
+        from redis.exceptions import ConnectionError as RedisConnectionError
+        from redis.exceptions import TimeoutError as RedisTimeoutError
+
+        retry = self._kwargs()['retry']
+        self.assertEqual(
+            retry.get_retries(), DEFAULT_BACKLOG_COMMAND_RETRIES,
+        )
+        supported = set(retry._supported_errors)
+        self.assertIn(RedisConnectionError, supported)
+        self.assertIn(RedisTimeoutError, supported)
+        # The shared Redis client must keep its connect-only rule.
+        self.assertIsNone(
+            redis_from_url(
+                'redis://localhost:6379/0', component='shared',
+            ).connection_pool.connection_kwargs.get('retry'),
+        )
+
+    def test_slow_reply_is_bounded_on_the_backlog_client_only(
+        self,
+    ) -> None:
+        '''socket_timeout=None is deliberate on the shared client (the
+        creator map's HGETALL outlives any timeout) and must not leak
+        to the backlog client.'''
+        self.assertIsNone(
+            redis_from_url(
+                'redis://localhost:6379/0', component='shared',
+            ).connection_pool.connection_kwargs['socket_timeout'],
+        )
+        self.assertIsNotNone(self._kwargs()['socket_timeout'])
+
+    def test_dsn_query_string_wins(self) -> None:
+        kwargs = self._kwargs(
+            'redis://localhost:6390/0?socket_timeout=7'
+            '&health_check_interval=5',
+        )
+        self.assertEqual(kwargs['socket_timeout'], 7.0)
+        self.assertEqual(kwargs['health_check_interval'], 5)
+
+    def test_environment_overrides(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                'BACKLOG_REDIS_COMMAND_RETRIES': '2',
+                'BACKLOG_REDIS_CONNECT_TIMEOUT_SECONDS': '1.5',
+                'BACKLOG_REDIS_SOCKET_TIMEOUT_SECONDS': '9',
+                'BACKLOG_REDIS_HEALTH_CHECK_INTERVAL_SECONDS': '0',
+                'BACKLOG_REDIS_RETRY_CAP_SECONDS': '4',
+            },
+            clear=True,
+        ):
+            kwargs = self._kwargs()
+        self.assertEqual(kwargs['retry'].get_retries(), 2)
+        self.assertEqual(kwargs['socket_connect_timeout'], 1.5)
+        self.assertEqual(kwargs['socket_timeout'], 9.0)
+        self.assertEqual(kwargs['health_check_interval'], 0)
+        self.assertEqual(
+            kwargs['retry']._backoff._cap, 4.0,
+        )
+
+    def test_backoff_worst_case_stays_inside_watchdog_window(
+        self,
+    ) -> None:
+        '''A command retry sleeps without pulsing the watchdog, so the
+        whole retry budget has to fit well inside the 180s work-signal
+        timeout.'''
+        retry = backlog_command_retry()
+        backoff = retry._backoff
+        # Un-jittered upper bound of every sleep the retry can make.
+        worst: float = 0.0
+        for attempt in range(1, retry.get_retries() + 1):
+            worst += min(
+                backoff._cap, backoff._base * 2 ** attempt,
+            )
+        self.assertEqual(worst, 60.0)
+        self.assertLess(worst, 120.0)
+        self.assertGreater(backoff.compute(1), 0.0)
+
+    def test_backlog_pool_has_no_stacked_connect_retry(self) -> None:
+        '''The command retry already reconnects; the shared pool's
+        connect retry on top of it multiplied the attempts.'''
+        import redis.asyncio as aioredis
+
+        shared_pool: Any = redis_from_url(
+            'redis://localhost:6379/0', component='shared',
+        ).connection_pool
+        backlog_pool: Any = backlog_redis_from_url(
+            'redis://localhost:6390/0', component='backlog-test',
+        ).connection_pool
+        self.assertEqual(
+            type(shared_pool).__name__, 'ConnectRetryPool',
+        )
+        self.assertIs(
+            type(backlog_pool), aioredis.BlockingConnectionPool,
+        )
+
+    def test_rejects_invalid_tuning(self) -> None:
+        from pydantic import ValidationError
+
+        with self.assertRaises(ValidationError):
+            BacklogRedisSettings(connect_timeout_seconds=0)
+        with self.assertRaises(ValidationError):
+            BacklogRedisSettings(command_retries=-1)
+        with self.assertRaises(ValidationError):
+            BacklogRedisSettings(retry_base_seconds=0)
+
+
+class TestBacklogConnectAttemptsAreBounded(
+    unittest.IsolatedAsyncioTestCase,
+):
+
+    async def test_unreachable_server_fails_after_one_retry_budget(
+        self,
+    ) -> None:
+        '''With the server refusing connections, a command must fail
+        after command_retries + 1 connect attempts, not that many per
+        step of the pool's 1s-to-256s connect retry (60 attempts and
+        15+ minutes before the fix).'''
+        import redis.asyncio.connection as connection_module
+        from redis.exceptions import ConnectionError as RedisConnectionError
+
+        attempts: list[int] = []
+
+        async def refuse(self: Any) -> None:
+            attempts.append(1)
+            raise ConnectionRefusedError('refused')
+
+        client: Any = backlog_redis_from_url(
+            'redis://localhost:6390/0', component='backlog-test',
+        )
+        with (
+            patch.object(connection_module.Connection, '_connect', refuse),
+            patch('redis.asyncio.retry.sleep', new_callable=AsyncMock),
+            patch(
+                'scrape_exchange.redis_client._paced_sleep',
+                new_callable=AsyncMock,
+            ) as paced,
+            self.assertRaises(RedisConnectionError),
+        ):
+            await client.execute_command('BACKLOG.INFO', 'q')
+        self.assertEqual(
+            len(attempts), DEFAULT_BACKLOG_COMMAND_RETRIES + 1,
+        )
+        paced.assert_not_awaited()

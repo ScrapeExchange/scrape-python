@@ -45,7 +45,11 @@ from scrape_exchange.creator_map import (
 )
 from scrape_exchange.exchange_client import ExchangeClient
 from scrape_exchange.proxy_loader import proxy_file_label
-from scrape_exchange.redis_client import redis_from_url
+from scrape_exchange.redis_client import (
+    is_redis_connection_error,
+    paced_sleep,
+    redis_from_url,
+)
 from scrape_exchange.util import (
     extract_proxy_ip,
     extract_proxy_port,
@@ -99,6 +103,7 @@ import redis.asyncio as aioredis
 # avoid duplicate-registration errors when multiple tool modules are
 # imported in the same process (e.g. test runners).
 from scrape_exchange.scraper_metrics import (
+    METRIC_QUEUE_CONNECTION_ERRORS,
     METRIC_UPLOADS_SKIPPED as METRIC_VIDEOS_ALREADY_UPLOADED,
     METRIC_SCRAPES_COMPLETED,
     METRIC_SCRAPE_FAILURES,
@@ -648,6 +653,74 @@ async def _scrape_one_queued(
     VIDEO_QUEUE_OUTCOMES.labels(outcome='failed').inc()
 
 
+async def _pop_entries_resilient(
+    queue: VideoScrapeQueue,
+    settings: 'VideoSettings',
+) -> list[VideoScrapeQueueEntry]:
+    '''Pop a batch, parking the producer while the queue is unreachable.
+
+    Connection failures (connect refused or timed out, a socket dropped
+    by a server restart, a response lost on the wire) are transient:
+    the queue holds every ID either way, so nothing is lost by waiting.
+    The producer therefore retries with capped exponential backoff
+    instead of dying and taking every consumer of this worker with it.
+
+    The sleep is watchdog-paced, so a worker parked in backoff is
+    alive by intent rather than looking like a wedge.
+
+    Other errors (protocol mismatch, a reply the client cannot parse, a
+    bug here) are not connection failures: they propagate and fail the
+    worker, which is what a supervisor restart is for.
+
+    :param queue: the video scrape queue to pop from
+    :param settings: the backoff bounds come from here
+    :returns: the popped entries, possibly empty when the queue is
+        drained
+    '''
+
+    failures: int = 0
+    while True:
+        try:
+            entries: list[VideoScrapeQueueEntry] = (
+                await queue.pop_entries(settings.video_queue_batch)
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if not is_redis_connection_error(exc):
+                raise
+            failures += 1
+            # The exponent is capped: the delay hit the ceiling long
+            # before, and float * 2**1024 overflows on a days-long
+            # outage.
+            delay: float = min(
+                settings.video_queue_error_backoff_max_seconds,
+                settings.video_queue_error_backoff_seconds
+                * (2 ** min(failures - 1, 16)),
+            )
+            METRIC_QUEUE_CONNECTION_ERRORS.labels(
+                platform='youtube',
+                scraper='video_scraper',
+                operation='pop',
+            ).inc()
+            logging.warning(
+                'Video queue unreachable; parking the producer',
+                exc_info=exc,
+                extra={
+                    'consecutive_failures': failures,
+                    'retry_seconds': delay,
+                },
+            )
+            await paced_sleep(delay)
+            continue
+        if failures:
+            logging.info(
+                'Video queue reachable again',
+                extra={'failed_attempts': failures},
+            )
+        return entries
+
+
 async def _queue_driven_loop(
     queue: VideoScrapeQueue,
     settings: 'VideoSettings',
@@ -668,6 +741,10 @@ async def _queue_driven_loop(
     independently. The bounded in-process queue provides natural
     backpressure: when consumers are saturated the producer
     blocks on ``put`` and stops pulling from Redis.
+
+    The producer pops through :func:`_pop_entries_resilient`, so a
+    queue backend that is unreachable parks the producer in backoff
+    rather than killing the worker.
 
     The streaming shape was chosen over a batched
     ``asyncio.gather`` because gather waits for the slowest item
@@ -699,9 +776,7 @@ async def _queue_driven_loop(
 
     async def producer() -> None:
         while True:
-            entries = await queue.pop_entries(
-                settings.video_queue_batch,
-            )
+            entries = await _pop_entries_resilient(queue, settings)
             if not entries:
                 # Empty queue is "alive but idle", not a hang: keep the
                 # watchdog work signal fresh while we poll.
@@ -733,7 +808,27 @@ async def _queue_driven_loop(
                     exchange_client=exchange_client,
                     exchange_username=exchange_username,
                 )
-            except Exception:
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if is_redis_connection_error(exc):
+                    # complete/mark/TOUCH failed after the client's own
+                    # retries. The ID stays leased and returns to the
+                    # queue when the lease expires, so it is scraped
+                    # again rather than lost; this is an outage of the
+                    # queue host, not a bug in the scrape.
+                    METRIC_QUEUE_CONNECTION_ERRORS.labels(
+                        platform='youtube',
+                        scraper='video_scraper',
+                        operation='update',
+                    ).inc()
+                    logging.warning(
+                        'Video queue unreachable; leaving the video '
+                        'to its lease',
+                        exc_info=exc,
+                        extra={'video_id': entry.video_id},
+                    )
+                    continue
                 # Defensive: per-video classification +
                 # queue-state transitions live inside
                 # :func:`_scrape_one_queued`; this catch is
@@ -963,6 +1058,37 @@ class VideoSettings(YouTubeScraperSettings):
         description=(
             'Seconds the worker sleeps between empty-queue polls '
             'before retrying pop().'
+        ),
+    )
+    video_queue_error_backoff_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        validation_alias=AliasChoices(
+            'VIDEO_QUEUE_ERROR_BACKOFF_SECONDS',
+            'video_queue_error_backoff_seconds',
+        ),
+        description=(
+            'First delay (seconds) before the producer retries a pop '
+            'that failed with a connection error after the client '
+            'exhausted its own retries. Doubles per consecutive '
+            'failure up to VIDEO_QUEUE_ERROR_BACKOFF_MAX_SECONDS; the '
+            'worker keeps retrying rather than exiting, since the '
+            'queue holds every ID either way.'
+        ),
+    )
+    video_queue_error_backoff_max_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        validation_alias=AliasChoices(
+            'VIDEO_QUEUE_ERROR_BACKOFF_MAX_SECONDS',
+            'video_queue_error_backoff_max_seconds',
+        ),
+        description=(
+            'Ceiling (seconds) on the producer connection-error '
+            'backoff. Must stay well under the 180s watchdog '
+            'work-signal timeout; the sleep is paced and pulses the '
+            'work signal, so the cap is about detection lag, not '
+            'liveness.'
         ),
     )
     video_transient_max_attempts: int = Field(

@@ -6,13 +6,15 @@ The YouTube video queue lives in backlog-server when
 '''
 
 import asyncio
+import weakref
+from typing import Any
 
 import redis.asyncio as aioredis
 
 from scrape_exchange.backlog_server_queue import (
     BacklogServerVideoScrapeQueue,
 )
-from scrape_exchange.redis_client import redis_from_url
+from scrape_exchange.redis_client import backlog_redis_from_url
 from scrape_exchange.video_scrape_queue import (
     RedisVideoScrapeQueue,
     VideoScrapeQueue,
@@ -21,23 +23,35 @@ from scrape_exchange.video_scrape_queue import (
 
 # One backlog-server client (and so one connection pool) per DSN and
 # event loop: callers such as the channel scraper build a queue per
-# scrape, and a pool per queue would churn connections.
-_SHARED: dict[tuple[str, int], aioredis.Redis] = {}
+# scrape, and a pool per queue would churn connections. Keyed by the
+# loop object itself (weakly) rather than by ``id(loop)``: ids are
+# reused once a loop is collected, and a client built on a dead loop
+# can never establish a connection.
+_BY_LOOP: weakref.WeakKeyDictionary[Any, dict[str, aioredis.Redis]] = (
+    weakref.WeakKeyDictionary()
+)
+# Callers outside any running loop (sync setup code, tests) share one
+# client per DSN.
+_NO_LOOP: dict[str, aioredis.Redis] = {}
 
 
 def _backlog_client(dsn: str, component: str) -> aioredis.Redis:
-    loop_id: int
+    '''Return the shared backlog-server client for *dsn*.'''
+    loop: Any
     try:
-        loop_id = id(asyncio.get_running_loop())
+        loop = asyncio.get_running_loop()
     except RuntimeError:
-        loop_id = 0
-    key: tuple[str, int] = (dsn, loop_id)
-    client: aioredis.Redis | None = _SHARED.get(key)
+        loop = None
+    clients: dict[str, aioredis.Redis] = (
+        _NO_LOOP if loop is None else _BY_LOOP.setdefault(loop, {})
+    )
+    client: aioredis.Redis | None = clients.get(dsn)
     if client is None:
-        client = redis_from_url(
+        created: aioredis.Redis = backlog_redis_from_url(
             dsn, component=component, decode_responses=True,
         )
-        _SHARED[key] = client
+        clients[dsn] = created
+        return created
     return client
 
 

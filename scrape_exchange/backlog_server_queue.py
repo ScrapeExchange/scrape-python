@@ -98,6 +98,15 @@ class BacklogServerVideoScrapeQueue(VideoScrapeQueue):
         self._forced: set[str] = set()
 
     async def _cmd(self, command: str, *args: Any) -> Any:
+        # The client retries connection failures on the command itself
+        # (see backlog_redis_from_url): every BACKLOG.* command is
+        # idempotent, so a replayed command leaves the server in the
+        # same state as a single delivery. The reply can differ (a
+        # replayed ADD answers 0, FORCE 'forced_pending', REQUEUE
+        # False), so counts derived from replies are a lower bound
+        # across a reconnect. That is the one place this client differs
+        # from the Redis queue, whose Lua mutations may only be sent
+        # once.
         return await self._redis.execute_command(
             f'BACKLOG.{command}', self._queue, *args,
         )
