@@ -207,6 +207,11 @@ class TestUpdateChannelWritesPriority(
         fields.'''
         settings: mock.MagicMock = mock.MagicMock()
         settings.channel_data_directory = self.tmp
+        # Record-shape tests: privacy limits are covered in
+        # test_yt_rss_scrape_privacy.
+        settings.channel_min_subscribers = 0
+        settings.channel_privacy_subscribers = 0
+        settings.channel_views_per_subscriber = 100
         creator_map: mock.AsyncMock = mock.AsyncMock()
         name_map: mock.AsyncMock = mock.AsyncMock()
         validator: mock.MagicMock = mock.MagicMock()
@@ -275,6 +280,11 @@ class TestUpdateChannelWritesPriority(
         last-known value on the server).'''
         settings: mock.MagicMock = mock.MagicMock()
         settings.channel_data_directory = self.tmp
+        # Record-shape tests: privacy limits are covered in
+        # test_yt_rss_scrape_privacy.
+        settings.channel_min_subscribers = 0
+        settings.channel_privacy_subscribers = 0
+        settings.channel_views_per_subscriber = 100
         creator_map: mock.AsyncMock = mock.AsyncMock()
         name_map: mock.AsyncMock = mock.AsyncMock()
         validator: mock.MagicMock = mock.MagicMock()
@@ -359,6 +369,11 @@ class TestUnknownSubscriberCountOmitsField(
     def _settings(self) -> mock.MagicMock:
         settings: mock.MagicMock = mock.MagicMock()
         settings.channel_data_directory = self.tmp
+        # Record-shape tests: privacy limits are covered in
+        # test_yt_rss_scrape_privacy.
+        settings.channel_min_subscribers = 0
+        settings.channel_privacy_subscribers = 0
+        settings.channel_views_per_subscriber = 100
         return settings
 
     async def _run(

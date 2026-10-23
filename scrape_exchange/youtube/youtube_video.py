@@ -848,11 +848,14 @@ class YouTubeVideo:
         return self
 
     async def to_file(self, save_dir: str, filename_prefix: str = '',
-                      overwrite: bool = True, compressed: bool = True) -> str:
+                      overwrite: bool = True, compressed: bool = True,
+                      marker_suffix: str = '') -> str:
         '''
         Saves the video metadata to a JSON file in the specified directory.
 
         :param save_dir: Directory to save the JSON file in
+        :param marker_suffix: appended after ``.json[.br]``, e.g.
+            ``.low_subs``, to keep the file on disk without uploading it
         :returns: (none)
         :raises: (none)
         '''
@@ -862,7 +865,7 @@ class YouTubeVideo:
 
         filename: str = YouTubeVideo.get_filepath(
             self.video_id, save_dir, filename_prefix, compressed
-        )
+        ) + marker_suffix
 
         if not overwrite and os.path.exists(filename):
             raise FileExistsError(f'File {filename} already exists')

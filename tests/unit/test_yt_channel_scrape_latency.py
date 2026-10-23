@@ -52,6 +52,10 @@ class TestDoScrapeChannelToDiskLatency(
 
         settings: MagicMock = MagicMock()
         settings.channel_data_directory = '/tmp/scrape-test'
+        # Privacy limits are covered in their own tests.
+        settings.channel_min_subscribers = 0
+        settings.channel_privacy_subscribers = 0
+        settings.channel_views_per_subscriber = 100
         fm: MagicMock = MagicMock()
 
         with patch.object(
@@ -124,6 +128,10 @@ class TestDoScrapeChannelToDiskLatency(
 
         settings: MagicMock = MagicMock()
         settings.channel_data_directory = '/tmp/scrape-test'
+        # Privacy limits are covered in their own tests.
+        settings.channel_min_subscribers = 0
+        settings.channel_privacy_subscribers = 0
+        settings.channel_views_per_subscriber = 100
         settings.video_data_directory = '/tmp/videos'
         redis: MagicMock = MagicMock()
 

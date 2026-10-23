@@ -1987,6 +1987,7 @@ class TestScrapeValidation(unittest.IsolatedAsyncioTestCase):
                 max_videos_per_channel=unittest.mock.ANY,
                 known_video_ids=None,
                 oldest_first_limit=0,
+                stop_if=None,
             )
 
     async def test_content_description_reconciles_when_about_fails(

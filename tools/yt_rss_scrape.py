@@ -44,6 +44,7 @@ from pydantic import (
 from scrape_exchange.exchange_client import ExchangeClient
 from scrape_exchange.file_management import (
     CHANNEL_RSS_FILE_PREFIX,
+    LOW_SUBS_SUFFIX,
     AssetFileManagement,
 )
 from scrape_exchange.schema_validator import (
@@ -132,7 +133,13 @@ from scrape_exchange.video_scrape_queue import (
 from scrape_exchange.youtube.uploaded_video_ids import UploadedVideoIds
 from scrape_exchange.youtube.channel_video_refresh import (
     VIDEOS_SKIPPED_MIN_SUBSCRIBERS,
-    below_min_subscribers,
+)
+from scrape_exchange.youtube.privacy import (
+    ChannelSize,
+    allowed_domains,
+    classify_channel_size,
+    classify_for_settings,
+    mask_channel_record,
 )
 
 
@@ -1652,9 +1659,7 @@ async def process_channel(
         )
         return True
 
-    if below_min_subscribers(
-        sub_count, settings.channel_min_subscribers,
-    ):
+    if _rss_channel_is_tiny(sub_count, settings):
         VIDEOS_SKIPPED_MIN_SUBSCRIBERS.labels(
             scraper='rss_scraper',
         ).inc(len(new_videos))
@@ -1757,8 +1762,44 @@ async def _ensure_priority_directory(
             pass
 
 
+def _rss_channel_is_tiny(
+    subscriber_count: int | None, settings: RssSettings,
+) -> bool:
+    '''True when this poll's subscriber count puts the channel below
+    ``CHANNEL_MIN_SUBSCRIBERS``; an unknown count counts as below it.
+    The RSS scraper rarely sees a view count, so only the subscriber
+    count is used here.'''
+    return classify_channel_size(
+        subscriber_count, None,
+        min_subscribers=settings.channel_min_subscribers,
+        privacy_subscribers=0,
+        views_per_subscriber=1,
+    ) is ChannelSize.TINY
+
+
+def _apply_rss_privacy_limits(
+    record_dict: dict, settings: RssSettings,
+) -> str:
+    '''Apply the privacy limits to an RSS lite channel record. Returns
+    the marker suffix to write it with: ``.low_subs`` for a tiny
+    channel (kept on disk, never uploaded), ``''`` otherwise. A small
+    channel's description is masked in place. The decision is per
+    poll; end states are left to the channel scraper.'''
+    size: ChannelSize = classify_for_settings(
+        record_dict.get('subscriber_count'),
+        record_dict.get('view_count'),
+        settings,
+    )
+    if size is ChannelSize.TINY:
+        return LOW_SUBS_SUFFIX
+    if size is ChannelSize.SMALL:
+        mask_channel_record(record_dict, allowed_domains(settings))
+    return ''
+
+
 async def _write_channel(
     record_dict: dict, settings: RssSettings,
+    marker_suffix: str = '',
 ) -> None:
     '''Persist the RSS-derived channel-stat record under
     ``settings.channel_data_directory`` as
@@ -1808,7 +1849,7 @@ async def _write_channel(
         return
     target: Path = (
         Path(base_dir)
-        / f'{CHANNEL_RSS_FILE_PREFIX}{channel_id}.json.br'
+        / f'{CHANNEL_RSS_FILE_PREFIX}{channel_id}.json.br{marker_suffix}'
     )
     await brotli_write_async(target, record_dict)
 
@@ -2007,6 +2048,7 @@ async def update_channel(
         record_dict['subscriber_count'] = subscriber_count
     if view_count is not None:
         record_dict['view_count'] = view_count
+    marker_suffix: str = _apply_rss_privacy_limits(record_dict, settings)
     err: str | None = validator.validate(record_dict)
     if err is not None:
         logging.warning(
@@ -2020,7 +2062,7 @@ async def update_channel(
         )
         return False, parsed_subscriber_count, resolved_handle
 
-    await _write_channel(record_dict, settings)
+    await _write_channel(record_dict, settings, marker_suffix)
     METRIC_CHANNEL_PRIORITY_WRITES.labels(
         platform='youtube',
         scraper='rss_scraper',

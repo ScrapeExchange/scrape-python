@@ -60,6 +60,7 @@ from scrape_exchange.channel_list_parsing import (
 from scrape_exchange.file_management import (
     AssetFileManagement,
     CHANNEL_FILE_PREFIX,
+    LOW_SUBS_SUFFIX,
     atomic_write_bytes,
 )
 from scrape_exchange.scraper_runner import (
@@ -103,7 +104,17 @@ from scrape_exchange.youtube.channel_video_refresh import (
 )
 from scrape_exchange.youtube.settings import (
     DEFAULT_CHANNEL_MIN_SUBSCRIBERS,
+    DEFAULT_CHANNEL_PRIVACY_SUBSCRIBERS,
+    DEFAULT_CHANNEL_VIEWS_PER_SUBSCRIBER,
     YouTubeScraperSettings,
+)
+from scrape_exchange.youtube.privacy import (
+    ChannelSize,
+    allowed_domains,
+    classify_channel_size,
+    classify_for_settings,
+    mask_channel,
+    parse_count,
 )
 from scrape_exchange.youtube.derived_metadata import (
     enrich_channel_category,
@@ -141,6 +152,19 @@ class ChannelNoContentError(RuntimeError):
 
     def __init__(self, message: str, channel: YouTubeChannel) -> None:
         super().__init__(message)
+        self.channel: YouTubeChannel = channel
+
+
+class ChannelTooSmallError(Exception):
+    '''Raised after a channel below ``CHANNEL_MIN_SUBSCRIBERS`` (or of
+    unknown size) was written to disk as ``.low_subs``. The channel is
+    never uploaded and goes to the LOW_SUBS end state.'''
+
+    def __init__(self, channel: YouTubeChannel) -> None:
+        super().__init__(
+            f'channel {channel.channel_id!r} is below the minimum '
+            'subscriber count',
+        )
         self.channel: YouTubeChannel = channel
 
 
@@ -484,6 +508,12 @@ CHANNEL_RESOLVE_OUTCOMES: Counter = Counter(
 CHANNEL_SCRAPE_OUTCOMES: Counter = Counter(
     'channel_queue_scrape_outcomes_total',
     'Scrape-phase outcomes per attempt.',
+    ['outcome'],
+)
+CHANNEL_PRIVACY_OUTCOMES: Counter = Counter(
+    'youtube_channel_privacy_outcomes_total',
+    'Privacy limits applied to scraped channels: low_subs (kept on '
+    'disk, not uploaded), masked or unmasked.',
     ['outcome'],
 )
 CHANNEL_SOFT_REAP: Counter = Counter(
@@ -2215,6 +2245,7 @@ async def _scrape_one_queued(
                     metadata_only=metadata_only,
                     known_video_ids=known_video_ids,
                     oldest_first_limit=oldest_first_limit,
+                    stored_counts=_stored_counts(meta),
                 )
             )
         except TopicChannelError as exc:
@@ -2223,9 +2254,21 @@ async def _scrape_one_queued(
                 last_error=str(exc),
             )
             return
+        except ChannelTooSmallError as exc:
+            full_outcome = 'terminal'
+            count_fields = _count_meta(exc.channel)
+            if count_fields:
+                await queue.set_meta(member, **count_fields)
+            await _mark_channel_end_state(
+                queue, member, channel_id, exc.channel,
+                ChannelState.LOW_SUBS,
+                force_mode=force_mode,
+                last_error=str(exc),
+            )
+            return
         except ChannelNoContentError as exc:
             end_state: ChannelState | None = _channel_end_state(
-                exc.channel, settings.channel_min_subscribers,
+                exc.channel, settings, _stored_counts(meta),
             )
             if end_state is not None:
                 full_outcome = 'terminal'
@@ -2349,13 +2392,11 @@ async def _scrape_one_queued(
                 exc_info=True,
                 extra=extra,
             )
-        if channel.subscriber_count is not None:
-            await queue.set_meta(
-                member,
-                subscriber_count=str(channel.subscriber_count),
-            )
+        count_fields: dict[str, str] = _count_meta(channel)
+        if count_fields:
+            await queue.set_meta(member, **count_fields)
         end_state: ChannelState | None = _channel_end_state(
-            channel, settings.channel_min_subscribers,
+            channel, settings, _stored_counts(meta),
         )
         if end_state is not None:
             full_outcome = 'terminal'
@@ -2521,12 +2562,113 @@ def _is_topic_channel_scrape(channel: YouTubeChannel) -> bool:
     )
 
 
-def _channel_has_low_subscribers(
-    channel: YouTubeChannel, min_subscribers: int,
-) -> bool:
-    return below_min_subscribers(
-        channel.subscriber_count, min_subscribers,
+# (subscriber_count, view_count) last stored in the channel queue meta.
+StoredCounts = tuple[int | None, int | None]
+NO_STORED_COUNTS: StoredCounts = (None, None)
+
+
+def _stored_counts(meta: dict[str, str]) -> StoredCounts:
+    return (
+        parse_count(meta.get('subscriber_count')),
+        parse_count(meta.get('view_count')),
     )
+
+
+def _channel_size(
+    channel: YouTubeChannel,
+    settings: YouTubeScraperSettings | None = None,
+    stored_counts: StoredCounts = NO_STORED_COUNTS,
+) -> ChannelSize:
+    '''Size class of *channel*. A count the scrape did not find falls
+    back to the one stored in the channel queue, so a single parse
+    miss does not make a known channel tiny.'''
+    subscriber_count: int | None = (
+        channel.subscriber_count
+        if channel.subscriber_count is not None
+        else stored_counts[0]
+    )
+    view_count: int | None = (
+        channel.view_count
+        if channel.view_count is not None
+        else stored_counts[1]
+    )
+    if settings is not None:
+        return classify_for_settings(
+            subscriber_count, view_count, settings,
+        )
+    return classify_channel_size(
+        subscriber_count, view_count,
+        min_subscribers=MIN_CHANNEL_SUBSCRIBERS,
+        privacy_subscribers=DEFAULT_CHANNEL_PRIVACY_SUBSCRIBERS,
+        views_per_subscriber=DEFAULT_CHANNEL_VIEWS_PER_SUBSCRIBER,
+    )
+
+
+def _channel_has_low_subscribers(
+    channel: YouTubeChannel,
+    settings: YouTubeScraperSettings | None = None,
+    stored_counts: StoredCounts = NO_STORED_COUNTS,
+) -> bool:
+    return (
+        _channel_size(channel, settings, stored_counts)
+        is ChannelSize.TINY
+    )
+
+
+def _tiny_stop_if(
+    settings: YouTubeScraperSettings,
+) -> Callable[[YouTubeChannel], bool]:
+    '''Stop a scrape once a known subscriber count makes the channel
+    tiny. An unknown count never stops it: the view count may still
+    arrive later in the scrape.'''
+
+    def stop_if(channel: YouTubeChannel) -> bool:
+        return (
+            channel.subscriber_count is not None
+            and _channel_has_low_subscribers(channel, settings)
+        )
+
+    return stop_if
+
+
+async def _apply_privacy_limits(
+    fm: AssetFileManagement,
+    filename: str,
+    channel: YouTubeChannel,
+    settings: YouTubeScraperSettings,
+    stored_counts: StoredCounts = NO_STORED_COUNTS,
+) -> bool:
+    '''Apply the privacy limits before *channel* is written for upload.
+
+    A tiny channel is written as ``<filename>.low_subs`` (kept on disk,
+    never uploaded) and True is returned: the caller must not write the
+    normal file. A small channel has its description and links masked
+    in place. Returns False otherwise.'''
+    size: ChannelSize = _channel_size(channel, settings, stored_counts)
+    if size is ChannelSize.TINY:
+        await fm.write_file(
+            f'{filename}{LOW_SUBS_SUFFIX}',
+            channel.to_dict(with_video_ids=True),
+        )
+        CHANNEL_PRIVACY_OUTCOMES.labels(outcome='low_subs').inc()
+        return True
+    if size is ChannelSize.SMALL:
+        mask_channel(channel, allowed_domains(settings))
+        CHANNEL_PRIVACY_OUTCOMES.labels(outcome='masked').inc()
+    else:
+        CHANNEL_PRIVACY_OUTCOMES.labels(outcome='unmasked').inc()
+    return False
+
+
+def _count_meta(channel: YouTubeChannel) -> dict[str, str]:
+    '''The known subscriber and view counts of *channel* as channel
+    queue meta fields.'''
+    fields: dict[str, str] = {}
+    if channel.subscriber_count is not None:
+        fields['subscriber_count'] = str(channel.subscriber_count)
+    if channel.view_count is not None:
+        fields['view_count'] = str(channel.view_count)
+    return fields
 
 
 def _channel_has_no_videos(channel: YouTubeChannel) -> bool:
@@ -2535,11 +2677,12 @@ def _channel_has_no_videos(channel: YouTubeChannel) -> bool:
 
 def _channel_end_state(
     channel: YouTubeChannel,
-    min_subscribers: int = MIN_CHANNEL_SUBSCRIBERS,
+    settings: YouTubeScraperSettings | None = None,
+    stored_counts: StoredCounts = NO_STORED_COUNTS,
 ) -> ChannelState | None:
     if _is_topic_channel_scrape(channel):
         return ChannelState.TOPIC
-    if _channel_has_low_subscribers(channel, min_subscribers):
+    if _channel_has_low_subscribers(channel, settings, stored_counts):
         return ChannelState.LOW_SUBS
     if _channel_has_no_videos(channel):
         return ChannelState.NO_VIDEOS
@@ -2846,6 +2989,7 @@ async def _try_scrape_channel_typed(
     metadata_only: bool = False,
     known_video_ids: KnownVideoIds | None = None,
     oldest_first_limit: int = 0,
+    stop_if: Callable[[YouTubeChannel], bool] | None = None,
 ) -> str | None:
     '''Run ``channel.scrape()`` and surface failures as typed
     exceptions for the queue-driven path.  Returns the proxy used
@@ -2875,6 +3019,7 @@ async def _try_scrape_channel_typed(
             require_complete_video_ids=not metadata_only,
             known_video_ids=known_video_ids,
             oldest_first_limit=oldest_first_limit,
+            stop_if=stop_if,
         )
     except ValueError as exc:
         logging.debug(
@@ -3352,6 +3497,9 @@ async def _do_scrape_channel_to_disk(
         if scrape_proxy else 'none'
     )
 
+    if await _apply_privacy_limits(fm, filename, channel, settings):
+        return False, False, None
+
     if _channel_has_no_content(
         channel, scrape_proxy_ip,
         scrape_proxy_network, scrape_proxy, log_handle,
@@ -3420,6 +3568,7 @@ async def _do_scrape_channel_to_disk_typed(
     metadata_only: bool = False,
     known_video_ids: KnownVideoIds | None = None,
     oldest_first_limit: int = 0,
+    stored_counts: StoredCounts = NO_STORED_COUNTS,
 ) -> YouTubeChannel:
     '''Typed-exception variant of
     :func:`_do_scrape_channel_to_disk` for the
@@ -3471,6 +3620,7 @@ async def _do_scrape_channel_to_disk_typed(
                 metadata_only=metadata_only,
                 known_video_ids=known_video_ids,
                 oldest_first_limit=oldest_first_limit,
+                stop_if=_tiny_stop_if(settings),
             )
         )
     except ChannelNotFoundError:
@@ -3502,6 +3652,11 @@ async def _do_scrape_channel_to_disk_typed(
         extract_proxy_port(scrape_proxy)
         if scrape_proxy else 'none'
     )
+
+    if await _apply_privacy_limits(
+        fm, filename, channel, settings, stored_counts,
+    ):
+        raise ChannelTooSmallError(channel)
 
     if not metadata_only and _channel_has_no_content(
         channel, scrape_proxy_ip,

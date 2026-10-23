@@ -178,6 +178,10 @@ class TestRssUpdateChannelRecordsMetric(
 
     async def _run(self, page: dict) -> int | None:
         settings: mock.MagicMock = mock.MagicMock()
+        # Privacy limits are covered in their own tests.
+        settings.channel_min_subscribers = 0
+        settings.channel_privacy_subscribers = 0
+        settings.channel_views_per_subscriber = 100
         settings.channel_data_directory = self.tmp
         validator: mock.MagicMock = mock.MagicMock()
         validator.validate.return_value = None

@@ -8,7 +8,7 @@ tests when needed.
 '''
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 
 # Environment variables that pydantic-settings would otherwise
@@ -100,6 +100,52 @@ class TestBuildFilterBody(unittest.TestCase):
             ),
         )
         self.assertEqual(body, {})
+
+
+class TestDeleteItemsRequiresPlatformEntity(
+    unittest.IsolatedAsyncioTestCase,
+):
+    '''The API rejects DELETE filters without platform + entity
+    (422 PLATFORM_ENTITY_REQUIRED); the tool fails fast instead.'''
+
+    def setUp(self) -> None:
+        self._env_patch = patch.dict(
+            'os.environ', _ISOLATED_ENV, clear=True,
+        )
+        self._env_patch.start()
+
+    def tearDown(self) -> None:
+        self._env_patch.stop()
+
+    async def _run(self, **fields: str) -> tuple[int, AsyncMock]:
+        from tools.yt_delete_items import (
+            DeleteItemsSettings,
+            delete_items,
+        )
+
+        settings: DeleteItemsSettings = DeleteItemsSettings(
+            _cli_parse_args=False, _env_file=None, **fields,
+        )
+        client: MagicMock = MagicMock()
+        client.request = AsyncMock()
+        with self.assertLogs(level='ERROR'):
+            code: int = await delete_items(settings, client)
+        return code, client.request
+
+    async def test_creator_only_is_rejected_locally(self) -> None:
+        code, request = await self._run(platform_creator_id='somehandle')
+        self.assertEqual(code, 1)
+        request.assert_not_awaited()
+
+    async def test_platform_without_entity_is_rejected(self) -> None:
+        code, request = await self._run(platform='youtube')
+        self.assertEqual(code, 1)
+        request.assert_not_awaited()
+
+    async def test_no_filters_is_rejected(self) -> None:
+        code, request = await self._run()
+        self.assertEqual(code, 1)
+        request.assert_not_awaited()
 
 
 if __name__ == '__main__':
