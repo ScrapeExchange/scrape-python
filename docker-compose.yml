@@ -16,6 +16,25 @@ x-scraper-common: &scraper-common
     # gets its own 64 MB arena that keeps freed memory, which held
     # ~1.7 GB per yt-video worker. Override in .env if needed.
     MALLOC_ARENA_MAX: ${MALLOC_ARENA_MAX:-2}
+    # Keep proxy environment OUT of the scrapers. Egress is decided
+    # only by the scrapers' own per-request proxy selection
+    # (PROXY_FILES + proxy= on each client). The clients that still
+    # honour the environment (the bare httpx clients used for
+    # exchange existence checks and discovery, plus curl_cffi for
+    # proxyless YouTube fetches) would otherwise send LAN and
+    # scrape.exchange calls through a VPN squid, and NO_PROXY cannot
+    # be spelled portably: httpx 0.23.3 silently ignores CIDR
+    # entries and a leading-dot suffix does not match the apex.
+    # Explicitly empty values stop docker from injecting the
+    # daemon/CLI proxy configuration into these containers; both
+    # cases are set because urllib reads both and libcurl reads the
+    # lowercase form for http_proxy.
+    HTTP_PROXY: ""
+    HTTPS_PROXY: ""
+    NO_PROXY: ""
+    http_proxy: ""
+    https_proxy: ""
+    no_proxy: ""
   restart: unless-stopped
   network_mode: host
   stop_grace_period: 60s
