@@ -11,6 +11,7 @@ records into the channel data directory for tools/scrape_upload.py.
 '''
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -87,6 +88,7 @@ from scrape_exchange.creator_queue import (
     parse_priority_queues,
 )
 from scrape_exchange.channel_scrape_queue import (
+    LISTING_RESUME_FIELD,
     LISTING_STATUSES,
     VIDEO_IDS_ENUMERATED_FIELD,
     ChannelScrapeProgress,
@@ -100,7 +102,9 @@ from scrape_exchange.youtube.channel_video_refresh import (
     FullScrapeSummary,
     KnownVideoIds,
     below_min_subscribers,
+    fetch_exchange_video_ids,
     queue_channel_videos,
+    queue_video_ids,
 )
 from scrape_exchange.youtube.settings import (
     DEFAULT_CHANNEL_MIN_SUBSCRIBERS,
@@ -120,7 +124,10 @@ from scrape_exchange.youtube.derived_metadata import (
     enrich_channel_category,
     set_channel_country,
 )
-from scrape_exchange.youtube.youtube_channel import YouTubeChannel
+from scrape_exchange.youtube.youtube_channel import (
+    ListingCheckpointFn,
+    YouTubeChannel,
+)
 from scrape_exchange.youtube.youtube_rate_limiter import YouTubeRateLimiter
 from scrape_exchange.youtube.youtube_video import DENO_PATH, PO_TOKEN_URL
 
@@ -2236,6 +2243,20 @@ async def _scrape_one_queued(
             settings, creator_map_backend, http_client, channel_id,
             extra,
         )
+    # A full enumeration may take hours for a channel with millions
+    # of videos: resume it from where an earlier scrape stopped.
+    listing_resume: dict[str, str] | None = None
+    on_listing_checkpoint: ListingCheckpointFn | None = None
+    if needs_full_enumeration:
+        listing_resume = _parse_listing_resume(meta, extra)
+        on_listing_checkpoint = _listing_checkpoint_fn(
+            queue, member, listing_resume,
+            settings=settings,
+            stored_counts=_stored_counts(meta),
+            redis=creator_map_backend.redis_client,
+            http_client=http_client,
+            extra=extra,
+        )
     full_outcome: str = 'failure'
     try:
         try:
@@ -2246,6 +2267,8 @@ async def _scrape_one_queued(
                     known_video_ids=known_video_ids,
                     oldest_first_limit=oldest_first_limit,
                     stored_counts=_stored_counts(meta),
+                    listing_resume=listing_resume,
+                    on_listing_checkpoint=on_listing_checkpoint,
                 )
             )
         except TopicChannelError as exc:
@@ -2990,6 +3013,8 @@ async def _try_scrape_channel_typed(
     known_video_ids: KnownVideoIds | None = None,
     oldest_first_limit: int = 0,
     stop_if: Callable[[YouTubeChannel], bool] | None = None,
+    listing_resume: dict[str, str] | None = None,
+    on_listing_checkpoint: ListingCheckpointFn | None = None,
 ) -> str | None:
     '''Run ``channel.scrape()`` and surface failures as typed
     exceptions for the queue-driven path.  Returns the proxy used
@@ -3020,6 +3045,8 @@ async def _try_scrape_channel_typed(
             known_video_ids=known_video_ids,
             oldest_first_limit=oldest_first_limit,
             stop_if=stop_if,
+            listing_resume=listing_resume,
+            on_listing_checkpoint=on_listing_checkpoint,
         )
     except ValueError as exc:
         logging.debug(
@@ -3211,18 +3238,32 @@ async def _record_full_enumeration(
     capped first scrape that reached the end of every tab.'''
     if metadata_only or meta.get(VIDEO_IDS_ENUMERATED_FIELD):
         return
-    if not channel.video_ids_complete:
+    if not channel.video_listing_complete:
         if needs_full_enumeration:
+            if channel.listing_state:
+                await queue.set_meta(
+                    member,
+                    **{LISTING_RESUME_FIELD: json.dumps(
+                        channel.listing_state,
+                    )},
+                )
             CHANNEL_FULL_ENUMERATION.labels(outcome='incomplete').inc()
             logging.warning(
-                'Full enumeration stopped early; retrying on the next '
+                'Full enumeration stopped early; resuming on the next '
                 'scrape',
-                extra=extra,
+                extra=extra | {
+                    'tabs_pending': ','.join(sorted(
+                        tab for tab, token in channel.listing_state.items()
+                        if token
+                    )),
+                },
             )
         return
     await queue.set_meta(
         member, **{VIDEO_IDS_ENUMERATED_FIELD: str(int(time.time()))},
     )
+    # Checkpoints of this scrape may have saved a resume point too.
+    await queue.delete_meta(member, LISTING_RESUME_FIELD)
     if needs_full_enumeration:
         CHANNEL_FULL_ENUMERATION.labels(outcome='completed').inc()
         logging.info(
@@ -3231,6 +3272,90 @@ async def _record_full_enumeration(
                 'video_ids_found': str(len(channel.video_ids)),
             },
         )
+
+
+def _parse_listing_resume(
+    meta: dict[str, str], extra: dict[str, str],
+) -> dict[str, str]:
+    '''The saved resume point of the channel's full listing; empty
+    when there is none or it cannot be read.'''
+    raw: str | None = meta.get(LISTING_RESUME_FIELD)
+    if not raw:
+        return {}
+    try:
+        data: object = json.loads(raw)
+    except ValueError:
+        data = None
+    if not isinstance(data, dict) or not all(
+        isinstance(tab, str) and isinstance(token, str)
+        for tab, token in data.items()
+    ):
+        logging.warning(
+            'Ignoring unreadable channel listing resume point',
+            extra=extra,
+        )
+        return {}
+    return data
+
+
+def _listing_checkpoint_fn(
+    queue: RedisChannelScrapeQueue,
+    member: str,
+    listing_resume: dict[str, str],
+    *,
+    settings: ChannelSettings,
+    stored_counts: StoredCounts,
+    redis: aioredis.Redis | None,
+    http_client: httpx.AsyncClient,
+    extra: dict[str, str],
+) -> ListingCheckpointFn | None:
+    '''Build the checkpoint callback of a resumable full listing.
+
+    Each checkpoint first queues the video IDs found since the
+    previous one, then saves the tab's continuation token, so a
+    scrape that dies resumes after IDs already delivered. A channel
+    that is tiny, or not yet known not to be, gets no checkpoints:
+    its videos must never be queued (see :func:`_apply_privacy_limits`).
+    '''
+    if redis is None:
+        return None
+    state: dict[str, str] = dict(listing_resume)
+    exchange_ids: set[str] | None = None
+    video_fm: AssetFileManagement = AssetFileManagement(
+        settings.video_data_directory,
+    )
+
+    async def checkpoint(
+        channel: YouTubeChannel, tab: str, token: str,
+        video_ids: set[str],
+    ) -> None:
+        nonlocal exchange_ids
+        if _channel_has_low_subscribers(channel, settings, stored_counts):
+            return
+        if exchange_ids is None:
+            exchange_ids = await fetch_exchange_video_ids(
+                http_client, settings.exchange_url, channel.channel_id,
+            )
+        summary: FullScrapeSummary = FullScrapeSummary(channel.channel_id)
+        await queue_video_ids(
+            video_ids, channel.channel_id, channel.channel_handle,
+            redis=redis, http_client=http_client,
+            exchange_url=settings.exchange_url, video_fm=video_fm,
+            summary=summary, exchange_ids=exchange_ids,
+        )
+        state[tab] = token
+        await queue.set_meta(
+            member, **{LISTING_RESUME_FIELD: json.dumps(state)},
+        )
+        logging.debug(
+            'Saved channel listing checkpoint',
+            extra=extra | {
+                'tab': tab,
+                'video_ids_added': str(summary.video_ids_added),
+            },
+        )
+
+    return checkpoint
 
 
 def _allow_incremental_enumeration(
@@ -3569,6 +3694,8 @@ async def _do_scrape_channel_to_disk_typed(
     known_video_ids: KnownVideoIds | None = None,
     oldest_first_limit: int = 0,
     stored_counts: StoredCounts = NO_STORED_COUNTS,
+    listing_resume: dict[str, str] | None = None,
+    on_listing_checkpoint: ListingCheckpointFn | None = None,
 ) -> YouTubeChannel:
     '''Typed-exception variant of
     :func:`_do_scrape_channel_to_disk` for the
@@ -3590,6 +3717,9 @@ async def _do_scrape_channel_to_disk_typed(
     :param oldest_first_limit: when > 0, tabs are paged oldest-first
         and capped at this many IDs each (a new channel's first
         full scrape).
+    :param listing_resume: makes a full listing resumable; see
+        :meth:`YouTubeChannel.scrape`.
+    :param on_listing_checkpoint: see :meth:`YouTubeChannel.scrape`.
 
     Raises:
         ChannelNotFoundError: channel returned 404.
@@ -3621,6 +3751,8 @@ async def _do_scrape_channel_to_disk_typed(
                 known_video_ids=known_video_ids,
                 oldest_first_limit=oldest_first_limit,
                 stop_if=_tiny_stop_if(settings),
+                listing_resume=listing_resume,
+                on_listing_checkpoint=on_listing_checkpoint,
             )
         )
     except ChannelNotFoundError:

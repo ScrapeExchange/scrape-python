@@ -1,12 +1,14 @@
 '''Scrape-phase tests for the new queue path.'''
 
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from scrape_exchange.channel_scrape_queue import (
+    LISTING_RESUME_FIELD,
     VIDEO_IDS_ENUMERATED_FIELD,
     ChannelScrapeProgress,
     ChannelState,
@@ -67,6 +69,8 @@ def _mock_channel(
     channel.video_count = video_count
     channel.video_ids = {'video-id'}
     channel.video_ids_complete = True
+    channel.video_listing_complete = True
+    channel.listing_state = {}
     channel.channel_id = 'UCabc00000000000000000000'
     channel.channel_handle = channel_handle
     channel.title = title
@@ -1814,6 +1818,7 @@ class TestFullEnumeration(ScrapePhaseTestCase):
     async def _run(
         self, *, meta: dict[str, str], progress: ChannelScrapeProgress,
         exists: bool, complete: bool = True,
+        listing_state: dict[str, str] | None = None,
     ) -> tuple[AsyncMock, AsyncMock]:
         queue: AsyncMock = _mock_queue()
         queue.get_meta.return_value = meta
@@ -1821,6 +1826,8 @@ class TestFullEnumeration(ScrapePhaseTestCase):
         queue.update_tier.return_value = True
         channel: MagicMock = _mock_channel()
         channel.video_ids_complete = complete
+        channel.video_listing_complete = complete
+        channel.listing_state = listing_state or {}
         creator_map: AsyncMock = AsyncMock()
         creator_map.get.return_value = 'foo'
         with patch(
@@ -1912,3 +1919,138 @@ class TestFullEnumeration(ScrapePhaseTestCase):
             complete=False,
         )
         self.assertFalse(self._enumerated_marked(queue))
+
+    def _saved_resume(self, queue: AsyncMock) -> list[dict[str, str]]:
+        return [
+            json.loads(call.kwargs[LISTING_RESUME_FIELD])
+            for call in queue.set_meta.await_args_list
+            if LISTING_RESUME_FIELD in call.kwargs
+        ]
+
+    async def test_full_enumeration_resumes_saved_listing(self) -> None:
+        _, mock_scrape = await self._run(
+            meta={LISTING_RESUME_FIELD: json.dumps({'videos': 'tok'})},
+            progress=ChannelScrapeProgress(3, 11), exists=True,
+        )
+        kwargs: dict = mock_scrape.await_args.kwargs
+        self.assertEqual(kwargs['listing_resume'], {'videos': 'tok'})
+        self.assertIsNotNone(kwargs['on_listing_checkpoint'])
+
+    async def test_other_scrapes_are_not_resumable(self) -> None:
+        for meta, progress in (
+            ({}, ChannelScrapeProgress(0, 1)),
+            (dict(_ENUMERATED), ChannelScrapeProgress(3, 11)),
+        ):
+            _, mock_scrape = await self._run(
+                meta=meta, progress=progress, exists=False,
+            )
+            kwargs: dict = mock_scrape.await_args.kwargs
+            self.assertIsNone(kwargs['listing_resume'])
+            self.assertIsNone(kwargs['on_listing_checkpoint'])
+
+    async def test_incomplete_listing_saves_resume_point(self) -> None:
+        state: dict[str, str] = {'videos': 'tok', 'shorts': ''}
+        queue, _ = await self._run(
+            meta={}, progress=ChannelScrapeProgress(3, 11), exists=True,
+            complete=False, listing_state=state,
+        )
+        self.assertEqual(self._saved_resume(queue), [state])
+        self.assertFalse(self._enumerated_marked(queue))
+        queue.delete_meta.assert_not_awaited()
+
+    async def test_completed_listing_clears_resume_point(self) -> None:
+        queue, _ = await self._run(
+            meta={LISTING_RESUME_FIELD: json.dumps({'videos': ''})},
+            progress=ChannelScrapeProgress(3, 11), exists=True,
+        )
+        self.assertTrue(self._enumerated_marked(queue))
+        queue.delete_meta.assert_awaited_once_with(
+            'i:UCabc00000000000000000000', LISTING_RESUME_FIELD,
+        )
+
+
+class TestParseListingResume(unittest.TestCase):
+    def test_reads_saved_state(self) -> None:
+        from tools.yt_channel_scrape import _parse_listing_resume
+        state: dict[str, str] = {'videos': 'tok', 'live': ''}
+        self.assertEqual(
+            _parse_listing_resume(
+                {LISTING_RESUME_FIELD: json.dumps(state)}, {},
+            ),
+            state,
+        )
+
+    def test_missing_or_bad_state_is_empty(self) -> None:
+        from tools.yt_channel_scrape import _parse_listing_resume
+        raw: str | None
+        for raw in (None, '', 'not json', '[1]', '{"videos": 1}'):
+            meta: dict[str, str] = (
+                {} if raw is None else {LISTING_RESUME_FIELD: raw}
+            )
+            with self.assertNoLogs(level='ERROR'):
+                self.assertEqual(_parse_listing_resume(meta, {}), {})
+
+
+class TestListingCheckpoint(unittest.IsolatedAsyncioTestCase):
+    def _checkpoint(self, queue: AsyncMock, stored: dict[str, str]):
+        from tools.yt_channel_scrape import _listing_checkpoint_fn
+        settings: MagicMock = _mock_settings()
+        settings.video_data_directory = '/tmp'
+        return _listing_checkpoint_fn(
+            queue, 'i:UCabc00000000000000000000', stored,
+            settings=settings, stored_counts=(None, None),
+            redis=MagicMock(), http_client=MagicMock(), extra={},
+        )
+
+    async def test_queues_ids_then_saves_token(self) -> None:
+        queue: AsyncMock = _mock_queue()
+        channel: MagicMock = _mock_channel(subscriber_count=50_000)
+        checkpoint = self._checkpoint(queue, {'shorts': ''})
+        calls: list[str] = []
+        queue.set_meta.side_effect = lambda *a, **k: calls.append('meta')
+        with patch(
+            'tools.yt_channel_scrape.fetch_exchange_video_ids',
+            new_callable=AsyncMock, return_value={'v1'},
+        ) as fetch, patch(
+            'tools.yt_channel_scrape.queue_video_ids',
+            new_callable=AsyncMock,
+            side_effect=lambda *a, **k: calls.append('queue'),
+        ) as queue_ids:
+            await checkpoint(channel, 'videos', 't100', {'v1', 'v2'})
+            await checkpoint(channel, 'videos', 't200', {'v3'})
+        fetch.assert_awaited_once()
+        self.assertEqual(calls, ['queue', 'meta', 'queue', 'meta'])
+        self.assertEqual(queue_ids.await_args_list[0].args[0], {'v1', 'v2'})
+        self.assertEqual(
+            queue_ids.await_args.kwargs['exchange_ids'], {'v1'},
+        )
+        self.assertEqual(
+            json.loads(
+                queue.set_meta.await_args.kwargs[LISTING_RESUME_FIELD],
+            ),
+            {'shorts': '', 'videos': 't200'},
+        )
+
+    async def test_tiny_channel_gets_no_checkpoint(self) -> None:
+        queue: AsyncMock = _mock_queue()
+        checkpoint = self._checkpoint(queue, {})
+        channel: MagicMock
+        for channel in (
+            _mock_channel(subscriber_count=5),
+            _mock_channel(subscriber_count=None),
+        ):
+            with patch(
+                'tools.yt_channel_scrape.queue_video_ids',
+                new_callable=AsyncMock,
+            ) as queue_ids:
+                await checkpoint(channel, 'videos', 't100', {'v1'})
+            queue_ids.assert_not_awaited()
+        queue.set_meta.assert_not_awaited()
+
+    async def test_no_redis_no_checkpoint(self) -> None:
+        from tools.yt_channel_scrape import _listing_checkpoint_fn
+        self.assertIsNone(_listing_checkpoint_fn(
+            _mock_queue(), 'i:UCabc00000000000000000000', {},
+            settings=_mock_settings(), stored_counts=(None, None),
+            redis=None, http_client=MagicMock(), extra={},
+        ))

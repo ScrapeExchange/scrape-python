@@ -1988,6 +1988,8 @@ class TestScrapeValidation(unittest.IsolatedAsyncioTestCase):
                 known_video_ids=None,
                 oldest_first_limit=0,
                 stop_if=None,
+                listing_resume=None,
+                on_listing_checkpoint=None,
             )
 
     async def test_content_description_reconciles_when_about_fails(
@@ -2343,6 +2345,8 @@ class TestCanonicalHandleAttribute(unittest.IsolatedAsyncioTestCase):
                 'http://proxy-one:8080',
                 known_video_ids=None,
                 oldest_first_limit=0,
+                listing_resume=None,
+                on_listing_checkpoint=None,
             )
 
     async def test_video_count_falls_back_to_parsed_video_ids(

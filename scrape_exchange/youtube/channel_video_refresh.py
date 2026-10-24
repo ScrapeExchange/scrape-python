@@ -315,6 +315,32 @@ async def queue_channel_videos(
         already fetched (see :class:`KnownVideoIds`); skips the filter
         query.
     '''
+    if not channel.channel_id:
+        raise ValueError(
+            'queue_channel_videos requires a channel with a channel_id',
+        )
+    await queue_video_ids(
+        channel.video_ids, channel.channel_id, channel.channel_handle,
+        redis=redis, http_client=http_client, exchange_url=exchange_url,
+        video_fm=video_fm, summary=summary, exchange_ids=exchange_ids,
+    )
+
+
+async def queue_video_ids(
+    video_ids: set[str],
+    channel_id: str,
+    channel_handle: str | None,
+    *,
+    redis: aioredis.Redis,
+    http_client: httpx.AsyncClient,
+    exchange_url: str,
+    video_fm: AssetFileManagement,
+    summary: FullScrapeSummary,
+    exchange_ids: set[str] | None = None,
+) -> None:
+    '''Queue those of *video_ids*, all of channel *channel_id*, that
+    are not uploaded, scraped locally or on the exchange; see
+    :func:`queue_channel_videos`.'''
     uploaded: UploadedVideoIds = UploadedVideoIds('', redis_client=redis)
     queue: VideoScrapeQueue = make_video_scrape_queue(
         platform='youtube',
@@ -322,11 +348,7 @@ async def queue_channel_videos(
         settings=VideoScrapeQueueSettings(),
         component='youtube-channel-video-queue',
     )
-    if not channel.channel_id:
-        raise ValueError(
-            'queue_channel_videos requires a channel with a channel_id',
-        )
-    ids: list[str] = sorted(channel.video_ids)
+    ids: list[str] = sorted(video_ids)
     summary.video_ids_found = len(ids)
 
     # Local filtering: the uploaded set and scrape output files
@@ -351,7 +373,7 @@ async def queue_channel_videos(
 
     if exchange_ids is None:
         exchange_ids = await fetch_exchange_video_ids(
-            http_client, exchange_url, channel.channel_id,
+            http_client, exchange_url, channel_id,
         )
 
     to_queue: list[str] = []
@@ -364,8 +386,8 @@ async def queue_channel_videos(
     # full enumerations of large channels queue tens of thousands.
     added: int = await queue.enqueue_many(
         to_queue, source='channel',
-        channel_id=channel.channel_id,
-        channel_handle=channel.channel_handle,
+        channel_id=channel_id,
+        channel_handle=channel_handle,
     )
     summary.video_ids_added += added
     summary.video_ids_queue_known += len(to_queue) - added

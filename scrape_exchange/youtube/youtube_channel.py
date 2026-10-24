@@ -11,7 +11,7 @@ import os
 import re
 import time
 
-from typing import Callable, Self
+from typing import Awaitable, Callable, Self
 from logging import Logger
 from logging import getLogger
 from datetime import UTC, datetime
@@ -64,6 +64,9 @@ from .youtube_product import YouTubeProduct
 
 from .youtube_external_link import YouTubeExternalLink
 from .youtube_channel_tabs import KnownVideoIdsFn
+from .youtube_channel_tabs import (
+    ListingCheckpointFn as TabListingCheckpointFn,
+)
 from .youtube_channel_tabs import YouTubeChannelTabs
 from .youtube_channel_tabs import borrow_pooled_innertube_for_entry
 from .youtube_channel_tabs import refresh_pooled_web_innertube_for_entry
@@ -79,6 +82,13 @@ _LOGGER: Logger = getLogger(__name__)
 # Called with the channel once its first page is parsed; True stops the
 # scrape before the video tabs are enumerated.
 StopIfFn = Callable[['YouTubeChannel'], bool]
+
+# Called during a resumable full listing (see :meth:`YouTubeChannel.scrape`)
+# with the channel, the tab, the continuation token of the tab's next
+# page and the video IDs found since the previous checkpoint.
+ListingCheckpointFn = Callable[
+    ['YouTubeChannel', str, str, set[str]], Awaitable[None]
+]
 
 # Limits the amount of videos imported for a channel
 # per run
@@ -391,6 +401,13 @@ class YouTubeChannel:
         # False when tab paging stopped early at already-known IDs, so
         # video_ids holds only the channel's newest videos.
         self.video_ids_complete: bool = True
+        # Per listed tab after a resumable full listing: LISTING_TAB_DONE
+        # or the continuation token the next scrape resumes from.
+        self.listing_state: dict[str, str] = {}
+        # True when every video, short and live broadcast has been
+        # listed, by this scrape alone or by a resumable full listing
+        # over several scrapes.
+        self.video_listing_complete: bool = True
         self.podcast_ids: set[str] = set()
         self.merch: set[YouTubeProduct] = set()
         self.courses: set[YouTubeCourse] = set()
@@ -871,6 +888,8 @@ class YouTubeChannel:
         known_video_ids: KnownVideoIdsFn | None = None,
         oldest_first_limit: int = 0,
         stop_if: 'StopIfFn | None' = None,
+        listing_resume: dict[str, str] | None = None,
+        on_listing_checkpoint: ListingCheckpointFn | None = None,
     ) -> None:
         '''
         Scrapes the channel page for information. This does not include data
@@ -902,6 +921,13 @@ class YouTubeChannel:
         first InnerTube page) has been parsed; when it returns True the
         video enumeration is cancelled or skipped and
         :attr:`scrape_stopped_early` is set.
+        :param listing_resume: when not None, a full listing (neither
+        ``known_video_ids`` nor ``oldest_first_limit``) is resumable: it
+        continues from this saved :attr:`listing_state` and a page that
+        fails after its retries ends the listing for this scrape instead
+        of failing it; see :attr:`video_listing_complete`.
+        :param on_listing_checkpoint: called every few pages of a
+        resumable full listing.
         :returns: dict of the scraped data
         :raises: ValueError if no data could be scraped or parsed
         '''
@@ -946,6 +972,8 @@ class YouTubeChannel:
                     known_video_ids=known_video_ids,
                     oldest_first_limit=oldest_first_limit,
                     stop_if=stop_if,
+                    listing_resume=listing_resume,
+                    on_listing_checkpoint=on_listing_checkpoint,
                 ),
             )
 
@@ -978,6 +1006,8 @@ class YouTubeChannel:
                     known_video_ids=known_video_ids,
                     oldest_first_limit=oldest_first_limit,
                     stop_if=stop_if,
+                    listing_resume=listing_resume,
+                    on_listing_checkpoint=on_listing_checkpoint,
                 )
         except (ValueError, RuntimeError) as exc:
             if require_complete_video_ids:
@@ -1761,6 +1791,8 @@ class YouTubeChannel:
         known_video_ids: KnownVideoIdsFn | None = None,
         oldest_first_limit: int = 0,
         stop_if: 'StopIfFn | None' = None,
+        listing_resume: dict[str, str] | None = None,
+        on_listing_checkpoint: ListingCheckpointFn | None = None,
     ) -> int:
         '''
         Scrapes video_id's and videos from the YouTube InnerTube API.
@@ -1776,6 +1808,8 @@ class YouTubeChannel:
         :param oldest_first_limit: see :meth:`scrape`.
         :param stop_if: see :meth:`scrape`; checked after the first
         InnerTube page is parsed, before the tabs are enumerated.
+        :param listing_resume: see :meth:`scrape`.
+        :param on_listing_checkpoint: see :meth:`scrape`.
         :returns: number of videos scraped
         :raises: RuntimeError, ValueError
         '''
@@ -1790,9 +1824,17 @@ class YouTubeChannel:
             )
 
         proxy: str | None = getattr(self.browse_client, 'proxy', None)
+        tab_checkpoint: TabListingCheckpointFn | None = None
+        if on_listing_checkpoint is not None:
+            async def tab_checkpoint(
+                tab: str, token: str, video_ids: set[str],
+            ) -> None:
+                await on_listing_checkpoint(self, tab, token, video_ids)
         tabs = YouTubeChannelTabs(
             self.channel_id, proxy, known_video_ids=known_video_ids,
             oldest_first_limit=oldest_first_limit,
+            listing_resume=listing_resume,
+            on_listing_checkpoint=tab_checkpoint,
         )
         page_data: dict[str, any] = await tabs.browse_channel()
 
@@ -1818,6 +1860,10 @@ class YouTubeChannel:
                 f'Failed to scrape channel content: {exc}'
             ) from exc
         self.video_ids_complete = tabs.enumeration_complete
+        self.listing_state = dict(tabs.listing_state)
+        self.video_listing_complete = (
+            tabs.enumeration_complete or tabs.listing_complete
+        )
         if self.video_ids_complete:
             # A partial enumeration would undercount the videos.
             self._set_video_count_from_loaded_video_ids()

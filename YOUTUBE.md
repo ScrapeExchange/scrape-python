@@ -245,6 +245,23 @@ channel's capped first scrape. If a pass stops early it is
 retried on the next scrape. Prometheus counts the passes in
 `channel_full_enumeration_total{outcome="completed"|"incomplete"}`.
 
+The exhaustive pass of a channel with millions of videos takes
+hours, so it is resumable. While it is unfinished, the
+`listing_resume` field of the meta hash holds a JSON object that
+maps each tab to the continuation token it resumes from (`''` once
+the tab is listed). Every 100 pages the scraper queues the video
+IDs found since the previous checkpoint and then saves the tab's
+token, so a crash or restart loses at most 100 pages. A page that
+still fails after its retries ends the pass for this scrape: the
+IDs found so far are kept, written and queued, and the next scrape
+of the channel, at its normal tier interval, continues from that
+page. Tabs already listed are skipped. If YouTube rejects a saved
+token, the tab restarts from its first page. The field is deleted
+when every tab is listed. Prometheus counts resumed tabs in
+`channel_listing_resumes_total{outcome="resumed"|"expired"|"skipped"}`
+and failed pages in
+`channel_tab_early_stops_total{reason="error"}`.
+
 Forced full scrapes also discover missing videos without
 shifting an upcoming periodic refresh. Forced metadata
 scrapes leave a due full scrape pending for the next
