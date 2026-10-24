@@ -95,14 +95,33 @@ CHANNEL_TAB_ITEMS: Counter = Counter(
 CHANNEL_TAB_EARLY_STOPS: Counter = Counter(
     'channel_tab_early_stops_total',
     'Channel tabs whose paging stopped before the last page: '
-    'reason=known (Latest order, a page held only known IDs) or '
-    'reason=limit (Oldest order, first-scrape ID cap reached).',
+    'reason=known (Latest order, a page held only known IDs), '
+    'reason=limit (Oldest order, first-scrape ID cap reached) or '
+    'reason=error (a full listing page failed; the listing resumes '
+    'from that page on the next scrape).',
     ['platform', 'scraper', 'entity', 'tab', 'reason', 'worker_id'],
+)
+CHANNEL_LISTING_RESUMES: Counter = Counter(
+    'channel_listing_resumes_total',
+    'Full channel listing tabs started from a saved resume point: '
+    'outcome=resumed (the saved continuation token worked), '
+    'expired (YouTube rejected it; the tab restarted from its first '
+    'page) or skipped (the tab was listed by an earlier scrape).',
+    ['platform', 'scraper', 'entity', 'tab', 'outcome', 'worker_id'],
 )
 
 # Returns the subset of the given video IDs that are already known
 # (on the exchange, uploaded, queued or scraped locally).
 KnownVideoIdsFn = Callable[[list[str]], Awaitable[set[str]]]
+
+# Called every LISTING_CHECKPOINT_PAGES continuation pages of a
+# resumable full listing with the tab, the continuation token of its
+# next page and the video IDs found since the previous checkpoint.
+ListingCheckpointFn = Callable[[str, str, set[str]], Awaitable[None]]
+
+LISTING_CHECKPOINT_PAGES: Final[int] = 100
+# Listing state of a tab whose full listing reached its last page.
+LISTING_TAB_DONE: Final[str] = ''
 
 # Tabs whose items can be ordered newest-first via the 'Latest' chip.
 LATEST_ORDERED_TABS: Final[frozenset[str]] = frozenset(
@@ -121,6 +140,19 @@ _KNOWN_TAB_LABELS: Final[set[str]] = {
     'store',
     'videos',
 }
+
+
+def _token_rejected(exc: BaseException) -> bool:
+    '''True when a browse failed because InnerTube rejected the
+    request (HTTP 400), as it does for an expired continuation
+    token, rather than for a transient reason.'''
+
+    error: BaseException | None = exc
+    while error is not None:
+        if isinstance(error, InnerTubeRequestError):
+            return error.error.code == 400
+        error = error.__cause__
+    return False
 
 
 def _tab_metric_label(title: str) -> str:
@@ -147,6 +179,8 @@ class YouTubeChannelTabs:
         self, channel_id: str, proxy: str | None = None,
         known_video_ids: KnownVideoIdsFn | None = None,
         oldest_first_limit: int = 0,
+        listing_resume: dict[str, str] | None = None,
+        on_listing_checkpoint: ListingCheckpointFn | None = None,
     ) -> None:
         '''
         :param known_video_ids: when set, the videos, shorts and live
@@ -156,6 +190,15 @@ class YouTubeChannelTabs:
             live tabs are paged in 'Oldest' order and each yields at
             most this many video IDs. Takes precedence over
             ``known_video_ids``.
+        :param listing_resume: when not None, a full listing (neither
+            ``known_video_ids`` nor ``oldest_first_limit``) of the
+            videos, shorts and live tabs is resumable: a tab with a
+            saved continuation token continues from it, a tab saved as
+            :data:`LISTING_TAB_DONE` is skipped, and a page that fails
+            after its retries stops the tab instead of raising. See
+            :attr:`listing_state`.
+        :param on_listing_checkpoint: called during a resumable full
+            listing every :data:`LISTING_CHECKPOINT_PAGES` pages.
         '''
         self.channel_id: str = channel_id
         self.proxy: str | None = (
@@ -174,6 +217,30 @@ class YouTubeChannelTabs:
         # False when at least one tab stopped paging early, so the
         # scraped video IDs are not the channel's full inventory.
         self.enumeration_complete: bool = True
+        self.resumable_listing: bool = (
+            listing_resume is not None
+            and known_video_ids is None
+            and self.oldest_first_limit == 0
+        )
+        self.listing_resume: dict[str, str] = dict(listing_resume or {})
+        self.on_listing_checkpoint: ListingCheckpointFn | None = (
+            on_listing_checkpoint
+        )
+        # Per listed tab after a resumable full listing:
+        # LISTING_TAB_DONE when the tab reached its last page (in this
+        # or an earlier scrape), else the continuation token to resume
+        # from.
+        self.listing_state: dict[str, str] = {}
+
+    @property
+    def listing_complete(self) -> bool:
+        '''True when a resumable full listing has reached the last page
+        of every listed tab, possibly over several scrapes.'''
+
+        return self.resumable_listing and all(
+            state == LISTING_TAB_DONE
+            for state in self.listing_state.values()
+        )
 
     @property
     def client(self) -> InnerTube:
@@ -302,6 +369,8 @@ class YouTubeChannelTabs:
             title: str = tab_renderer.get('title', '').lower()
             if title == 'home':
                 continue
+            if self._listed_before(title):
+                continue
 
             tab_tasks.append(asyncio.create_task(
                 self._scrape_tab(tab_renderer, title),
@@ -327,6 +396,24 @@ class YouTubeChannelTabs:
             products.update(tab_products)
 
         return video_ids, podcast_ids, playlists, courses, posts, products
+
+    def _listed_before(self, title: str) -> bool:
+        '''True when an earlier scrape of this resumable full listing
+        reached the last page of tab *title*, so it is not paged again;
+        its video IDs come from the channel's previous record.'''
+
+        if not (
+            self.resumable_listing
+            and title in LATEST_ORDERED_TABS
+            and self.listing_resume.get(title) == LISTING_TAB_DONE
+        ):
+            return False
+        self.listing_state[title] = LISTING_TAB_DONE
+        self.enumeration_complete = False
+        CHANNEL_LISTING_RESUMES.labels(
+            **_tab_metric_base(title), outcome='skipped',
+        ).inc()
+        return True
 
     async def _scrape_tab(
         self, tab_renderer: dict[str, any], title: str,
@@ -478,59 +565,16 @@ class YouTubeChannelTabs:
             ):
                 continuation_token = ''
 
+            listing: bool = (
+                self.resumable_listing and title in LATEST_ORDERED_TABS
+            )
             # Subsequent pages for one tab keep their tab-local order.
-            while continuation_token:
-                active_page_type = 'continuation'
-                continued_data: dict = await self._browse(
-                    continuation_token=continuation_token
-                )
-                active_page_type = None
-
-                CHANNEL_TAB_PAGES.labels(
-                    **metric_base,
-                    page_type='continuation',
-                    outcome='success',
-                ).inc()
-
-                actions: list = continued_data.get(
-                    'onResponseReceivedActions'
-                )
-                if not actions:
-                    break
-
-                continuation_items: list = actions[0].get(
-                    'appendContinuationItemsAction', {}
-                ).get('continuationItems')
-
-                if not continuation_items:
-                    break
-
-                continuation_token = self.get_continuation_token(
-                    continuation_items[-1]
-                )
-                if 'continuationItemRenderer' in continuation_items[-1]:
-                    continuation_items = continuation_items[:-1]
-
-                _LOGGER.debug(
-                    'Parsed videos or shorts',
-                    extra=extra | {
-                        'continuation_items_length': len(
-                            continuation_items
-                        )
-                    }
-                )
-                page_ids = []
-                for item in continuation_items:
-                    video_id: str | None = self._extract_video_id(
-                        item, title,
-                    )
-                    if video_id:
-                        page_ids.append(video_id)
-                if await self._stop_after_page(
-                    page_ids, video_ids, continuation_token,
-                    latest_order, id_limit, metric_base, title,
-                ):
-                    break
+            await self._page_continuations(
+                title, continuation_token, video_ids, latest_order,
+                id_limit, metric_base, listing,
+            )
+            if listing and title not in self.listing_state:
+                self.listing_state[title] = LISTING_TAB_DONE
 
             CHANNEL_TAB_ITEMS.labels(
                 **metric_base,
@@ -551,6 +595,163 @@ class YouTubeChannelTabs:
                 **metric_base,
                 outcome=outcome,
             ).observe(time.monotonic() - started_at)
+
+    async def _page_continuations(
+        self, title: str, continuation_token: str, video_ids: set[str],
+        latest_order: bool, id_limit: int, metric_base: dict[str, str],
+        listing: bool,
+    ) -> None:
+        '''Page tab *title* from *continuation_token* to its end,
+        adding the video IDs to *video_ids*.
+
+        In a resumable full listing (*listing*) the tab continues from
+        its saved token when it has one, checkpoints every
+        :data:`LISTING_CHECKPOINT_PAGES` pages, and stops at a page
+        that fails after its retries, keeping that page's token in
+        :attr:`listing_state`. Otherwise a failed page raises.
+        '''
+
+        extra: dict[str, str] = {'channel_id': self.channel_id, 'tab': title}
+        first_token: str = continuation_token
+        resume_token: str = (
+            self.listing_resume.get(title) or '' if listing else ''
+        )
+        resuming: bool = bool(continuation_token and resume_token)
+        if resuming:
+            continuation_token = resume_token
+        pending: set[str] = set(video_ids)
+        pages: int = 0
+        while continuation_token:
+            try:
+                continued_data: dict = await self._browse(
+                    continuation_token=continuation_token
+                )
+            except Exception as exc:
+                CHANNEL_TAB_PAGES.labels(
+                    **metric_base,
+                    page_type='continuation',
+                    outcome='failure',
+                ).inc()
+                if resuming and _token_rejected(exc):
+                    resuming = False
+                    continuation_token = self._restart_listing(
+                        title, first_token, metric_base,
+                    )
+                    continue
+                if not listing:
+                    raise
+                self.listing_state[title] = continuation_token
+                self._record_early_stop(metric_base, title, 'error')
+                _LOGGER.warning(
+                    'Full channel listing page failed; the next scrape '
+                    'resumes from it',
+                    exc=exc,
+                    extra=extra | {'video_ids_found': len(video_ids)},
+                )
+                return
+
+            CHANNEL_TAB_PAGES.labels(
+                **metric_base,
+                page_type='continuation',
+                outcome='success',
+            ).inc()
+            continuation_items: list = self._continuation_items(
+                continued_data,
+            )
+            if not continuation_items:
+                if resuming:
+                    resuming = False
+                    continuation_token = self._restart_listing(
+                        title, first_token, metric_base,
+                    )
+                    continue
+                break
+            if resuming:
+                # The IDs before the resume point are not paged again.
+                resuming = False
+                self.enumeration_complete = False
+                CHANNEL_LISTING_RESUMES.labels(
+                    **metric_base, outcome='resumed',
+                ).inc()
+
+            continuation_token = self.get_continuation_token(
+                continuation_items[-1]
+            )
+            if 'continuationItemRenderer' in continuation_items[-1]:
+                continuation_items = continuation_items[:-1]
+
+            _LOGGER.debug(
+                'Parsed videos or shorts',
+                extra=extra | {
+                    'continuation_items_length': len(continuation_items)
+                }
+            )
+            page_ids: list[str] = []
+            for item in continuation_items:
+                video_id: str | None = self._extract_video_id(item, title)
+                if video_id:
+                    page_ids.append(video_id)
+            pending.update(page_ids)
+            if await self._stop_after_page(
+                page_ids, video_ids, continuation_token,
+                latest_order, id_limit, metric_base, title,
+            ):
+                break
+            pages += 1
+            if (
+                listing and continuation_token
+                and pages % LISTING_CHECKPOINT_PAGES == 0
+            ):
+                await self._listing_checkpoint(
+                    title, continuation_token, pending,
+                )
+                pending = set()
+
+    @staticmethod
+    def _continuation_items(data: dict[str, any]) -> list:
+        '''The items of a continuation response; empty at the end.'''
+
+        actions: list = data.get('onResponseReceivedActions')
+        if not actions:
+            return []
+        return actions[0].get(
+            'appendContinuationItemsAction', {}
+        ).get('continuationItems') or []
+
+    def _restart_listing(
+        self, title: str, first_token: str, metric_base: dict[str, str],
+    ) -> str:
+        '''Drop the saved resume point of tab *title* that YouTube no
+        longer accepts; returns the token to restart paging from.'''
+
+        CHANNEL_LISTING_RESUMES.labels(
+            **metric_base, outcome='expired',
+        ).inc()
+        _LOGGER.info(
+            'Saved channel listing resume point expired; restarting '
+            'the tab from its first page',
+            extra={'channel_id': self.channel_id, 'tab': title},
+        )
+        return first_token
+
+    async def _listing_checkpoint(
+        self, title: str, continuation_token: str, video_ids: set[str],
+    ) -> None:
+        '''Hand a listing checkpoint to the caller. A failing callback
+        is logged and the listing carries on.'''
+
+        if self.on_listing_checkpoint is None:
+            return
+        try:
+            await self.on_listing_checkpoint(
+                title, continuation_token, video_ids,
+            )
+        except Exception as exc:
+            _LOGGER.warning(
+                'Channel listing checkpoint failed',
+                exc=exc,
+                extra={'channel_id': self.channel_id, 'tab': title},
+            )
 
     async def _sorted_contents(
         self, page_tab: dict[str, any], contents: list,
@@ -896,6 +1097,7 @@ class YouTubeChannelTabs:
             'proxy_network': proxy_network,
             'proxy_file': proxy_file,
         }
+        last_exc: Exception | None = None
         for attempt in range(1, max_retries + 1):
             self.client_request_count += 1
 
@@ -940,6 +1142,7 @@ class YouTubeChannelTabs:
                 return result
             except InnerTubeRequestError as exc:
                 Watchdog.get().touch_work()
+                last_exc = exc
                 duration = time.monotonic() - start
                 status_class: str = (
                     '4xx' if exc.error.code == 429 else 'error'
@@ -992,6 +1195,7 @@ class YouTubeChannelTabs:
                     penalty = min(penalty * 2, _PENALTY_MAX)
             except Exception as exc:
                 Watchdog.get().touch_work()
+                last_exc = exc
                 if isinstance(
                     exc, (httpx.TransportError, asyncio.TimeoutError),
                 ) and not isinstance(exc, httpx.ReadTimeout):
@@ -1037,7 +1241,7 @@ class YouTubeChannelTabs:
 
         raise RuntimeError(
             f'Failed to fetch tabbed data after {max_retries} attempts'
-        )
+        ) from last_exc
 
     async def _browse_once(
         self, client: InnerTube, params: str, continuation_token: str,

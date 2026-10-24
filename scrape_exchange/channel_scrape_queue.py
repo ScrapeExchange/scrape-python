@@ -33,6 +33,11 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 # Until it is set, every re-scrape pages all tabs without stopping at
 # already-known IDs; afterwards re-scrapes may stop early.
 VIDEO_IDS_ENUMERATED_FIELD: str = 'video_ids_enumerated_at'
+# Channel meta field holding, while a full listing of the channel's
+# videos is unfinished, a JSON object mapping each listed tab to the
+# continuation token its listing resumes from ('' once the tab is
+# listed). Deleted when the listing completes.
+LISTING_RESUME_FIELD: str = 'listing_resume'
 
 # Video listing status of an active (``scheduled``) channel, counted per
 # tier in the ``youtube:channel:listing_counts`` hash:
@@ -867,6 +872,11 @@ class ChannelScrapeQueue(ABC):
     @abstractmethod
     async def set_meta(
         self, member: str, **fields: str,
+    ) -> None: ...
+
+    @abstractmethod
+    async def delete_meta(
+        self, member: str, *fields: str,
     ) -> None: ...
 
     @abstractmethod
@@ -1922,6 +1932,14 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
                 self._k_meta(member),
                 mapping=fields,
             )
+            if _LISTING_FIELDS.intersection(fields):
+                await self.recount_listing(member)
+
+    async def delete_meta(
+        self, member: str, *fields: str,
+    ) -> None:
+        if fields:
+            await self._redis.hdel(self._k_meta(member), *fields)
             if _LISTING_FIELDS.intersection(fields):
                 await self.recount_listing(member)
 

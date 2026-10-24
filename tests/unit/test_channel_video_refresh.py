@@ -295,6 +295,7 @@ class TestChannelVideoRefresh(unittest.IsolatedAsyncioTestCase):
     async def test_incomplete_full_pass_is_retried(self) -> None:
         self.existing = True
         self.channel.video_ids_complete = False
+        self.channel.video_listing_complete = False
         await self.redis.hset('youtube:channel:meta:i:UCexample', mapping={
             'successful_scrapes': '3', 'next_full_scrape': '11',
         })

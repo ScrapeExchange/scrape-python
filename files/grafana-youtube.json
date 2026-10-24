@@ -312,7 +312,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(max by (state) (scrape_queue_size{scraper=\"rss_scraper\",entity=\"rss_feed\",job=~\"$job\",instance=~\"$instance\"})) / clamp_min(sum(increase(scrapes_completed_total{scraper=\"rss_scraper\",job=~\"$job\",instance=~\"$instance\"}[1h])), 1) / 168",
+          "expr": "sum(max by (state) (scrape_queue_size{scraper=\"rss_scraper\",entity=\"rss_feed\",job=~\"$job\",instance=~\"$instance\"})) / clamp_min(sum(increase(scrapes_completed_total{scraper=\"rss_scraper\",job=~\"$job\",instance=~\"$instance\"}[1h])), 1) / 24",
           "legendFormat": "RSS",
           "range": true,
           "refId": "A"
@@ -323,7 +323,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(max by (tier) (channel_queue_tier_size{job=~\"$job\",instance=~\"$instance\"})) / clamp_min(sum(increase(scrapes_completed_total{scraper=\"channel_scraper\",job=~\"$job\",instance=~\"$instance\"}[1h])), 1) / 168",
+          "expr": "sum(max by (tier) (channel_queue_tier_size{job=~\"$job\",instance=~\"$instance\"})) / clamp_min(sum(increase(scrapes_completed_total{scraper=\"channel_scraper\",job=~\"$job\",instance=~\"$instance\"}[1h])), 1) / 24",
           "legendFormat": "Channel",
           "range": true,
           "refId": "B"
@@ -334,13 +334,13 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max(video_state_size{state=\"queued\",job=~\"$job\",instance=~\"$instance\"}) / clamp_min(sum(increase(scrapes_completed_total{scraper=\"video_scraper\",job=~\"$job\",instance=~\"$instance\"}[1h])), 1) / 168",
+          "expr": "max(video_state_size{state=\"queued\",job=~\"$job\",instance=~\"$instance\"}) / clamp_min(sum(increase(scrapes_completed_total{scraper=\"video_scraper\",job=~\"$job\",instance=~\"$instance\"}[1h])), 1) / 24",
           "legendFormat": "Video",
           "range": true,
           "refId": "C"
         }
       ],
-      "title": "Days to process the queue at last day's rate",
+      "title": "Days to process the queue at last hour's rate",
       "type": "stat"
     },
     {
