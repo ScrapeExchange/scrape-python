@@ -1076,6 +1076,12 @@ class YouTubeChannel:
                     raise RuntimeError(
                         f'Incomplete channel video enumeration: {exc}',
                     ) from exc
+        if (
+            with_about_page and not self.about_page_succeeded
+            and self.partial_error is None and self.fetched_fields
+        ):
+            # Fields only /about provides were not fetched.
+            self.partial_error = 'About page scrape failed'
         self._reconcile_description_external_links()
 
     def _keep_partial_result(self, exc: Exception) -> bool:

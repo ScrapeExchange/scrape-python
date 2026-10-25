@@ -128,6 +128,27 @@ class TestPartialScrape(PartialScrapeTestCase):
         self.assertFalse(channel.video_ids_complete)
         self.assertFalse(channel.video_listing_complete)
 
+    async def test_about_failure_makes_scrape_partial(self) -> None:
+        channel: YouTubeChannel = _channel()
+        await self._scrape(channel, _tabs_mock(), _about_fails)
+        self.assertIsNotNone(channel.partial_error)
+        self.assertEqual(
+            channel.fetched_fields, INNERTUBE_FIELDS | TAB_RECORD_FIELDS,
+        )
+        self.assertTrue(channel.video_ids_complete)
+
+    async def test_no_about_page_requested_is_not_partial(self) -> None:
+        channel: YouTubeChannel = _channel()
+        with patch(
+            'scrape_exchange.youtube.youtube_channel.YouTubeChannelTabs',
+            return_value=_tabs_mock(),
+        ):
+            await channel.scrape(
+                save_dir=self.tmp.name, with_about_page=False,
+                require_complete_video_ids=True,
+            )
+        self.assertIsNone(channel.partial_error)
+
     async def test_browse_and_about_failure_raises(self) -> None:
         channel: YouTubeChannel = _channel()
         tabs: MagicMock = _tabs_mock()
