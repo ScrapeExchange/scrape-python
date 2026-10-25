@@ -227,6 +227,24 @@ return 1
 '''
 
 
+_REQUEUE_INTERRUPTED_LUA: str = '''
+-- Put back a channel whose scrape was interrupted after it was popped.
+-- KEYS: metadata, tier map, then every scheduled tier.
+-- ARGV: id, score.
+-- Does nothing (returns 0) when the state changed meanwhile (e.g. a
+-- terminal mark) or the channel is already in a scheduled tier.
+if redis.call('HGET', KEYS[1], 'state') ~= 'scheduled' then return 0 end
+local member = 'i:' .. ARGV[1]
+for k = 3, #KEYS do
+    if redis.call('ZSCORE', KEYS[k], member) then return 0 end
+end
+local tier = tonumber(redis.call('HGET', KEYS[2], ARGV[1])) or 0
+if tier < 0 or tier >= #KEYS - 2 then tier = 0 end
+redis.call('ZADD', KEYS[3 + tier], tonumber(ARGV[2]), member)
+return 1
+'''
+
+
 _FIX_UNPUBLISHED_LUA: str = '''
 -- Move one channel that is stuck retrying a subscriber count YouTube
 -- does not publish into the catch-all tier, marked not public.
@@ -876,6 +894,11 @@ class ChannelScrapeQueue(ABC):
         now: float,
         progress: ChannelScrapeProgress | None = None,
     ) -> bool | None: ...
+
+    @abstractmethod
+    async def requeue_interrupted(
+        self, channel_id: str, *, now: float,
+    ) -> bool: ...
 
     @abstractmethod
     async def mark_not_found_confirmed(
@@ -1719,6 +1742,29 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
             return False
         await self.recount_listing(member)
         return True
+
+    async def requeue_interrupted(
+        self, channel_id: str, *, now: float,
+    ) -> bool:
+        '''Put a popped channel whose scrape was interrupted (its
+        worker was cancelled) back into its stored tier, due *now*.
+
+        Popping takes the channel out of every scheduled tier, and only
+        the end of its scrape puts it back; without this an interrupted
+        scrape leaves it scheduled in its metadata but in no tier.
+
+        :returns: False, changing nothing, when the channel's state
+            changed meanwhile or it is already in a scheduled tier.
+        '''
+        keys: list[str] = [
+            self._k_meta(f'i:{channel_id}'), self._k_tiers(),
+            *[self._k_scheduled(tier.tier) for tier in self._tiers],
+        ]
+        result: int = int(await self._redis.execute_command(
+            'EVAL', _REQUEUE_INTERRUPTED_LUA, len(keys), *keys,
+            channel_id, str(now),
+        ))
+        return result == 1
 
     async def mark_not_found_confirmed(
         self,

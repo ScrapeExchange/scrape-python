@@ -1070,6 +1070,51 @@ class TestScrapeWorkers(
             1,
         )
 
+    @patch(
+        'tools.yt_channel_scrape._scrape_one_queued',
+        new_callable=AsyncMock,
+    )
+    async def test_cancelled_scrape_requeues_channel(
+        self,
+        mock_scrape: AsyncMock,
+    ) -> None:
+        started: asyncio.Event = asyncio.Event()
+
+        async def scrape_one(channel_id: str, **kwargs) -> None:
+            started.set()
+            await asyncio.Event().wait()
+
+        mock_scrape.side_effect = scrape_one
+        settings = _mock_settings()
+        settings.channel_queue_idle_poll_seconds = 0.01
+        queue = _mock_queue()
+        queue.pop_scheduled.return_value = ['UC1']
+        from tools.yt_channel_scrape import (
+            _scrape_scheduled_worker,
+        )
+        task: asyncio.Task[None] = asyncio.create_task(
+            _scrape_scheduled_worker(
+                worker_index=0,
+                queue=queue,
+                settings=settings,
+                fm=MagicMock(),
+                creator_map_backend=AsyncMock(),
+                http_client=MagicMock(),
+                shutdown_event=asyncio.Event(),
+                active_started_at={},
+                record_completed=MagicMock(),
+            )
+        )
+        await started.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        queue.requeue_interrupted.assert_awaited_once()
+        self.assertEqual(
+            queue.requeue_interrupted.await_args.args, ('UC1',),
+        )
+        queue.mark_soft_unavailable.assert_not_awaited()
+
     async def test_long_running_workers_report_progress(self) -> None:
         active_started_at: dict[str, float] = {
             '0:UCslow': 1.0,

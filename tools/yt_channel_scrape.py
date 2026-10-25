@@ -1623,6 +1623,11 @@ async def _scrape_scheduled_worker(
                 name_map=name_map,
             )
         except asyncio.CancelledError:
+            # Shutdown: the popped channel is in no scheduled tier until
+            # its scrape ends, so put it back before the worker exits.
+            await asyncio.shield(
+                _requeue_interrupted(queue, channel_id),
+            )
             raise
         except Exception as exc:
             logging.exception(
@@ -1640,6 +1645,28 @@ async def _scrape_scheduled_worker(
             active_started_at.pop(active_key, None)
             record_completed()
             Watchdog.get().touch_work()
+
+
+async def _requeue_interrupted(
+    queue: RedisChannelScrapeQueue, channel_id: str,
+) -> None:
+    '''Put a channel whose scrape was cancelled back in the queue;
+    never raises, so the cancellation carries on.'''
+    try:
+        requeued: bool = await queue.requeue_interrupted(
+            channel_id, now=time.time(),
+        )
+    except Exception:
+        logging.warning(
+            'Could not requeue interrupted channel scrape',
+            exc_info=True,
+            extra={'channel_id': channel_id},
+        )
+        return
+    logging.info(
+        'Requeued interrupted channel scrape',
+        extra={'channel_id': channel_id, 'requeued': str(requeued)},
+    )
 
 
 async def _resolve_one_queued(
