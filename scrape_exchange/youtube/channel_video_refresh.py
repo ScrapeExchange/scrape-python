@@ -10,6 +10,12 @@ import redis.asyncio as aioredis
 from prometheus_client import Counter, Histogram
 
 from scrape_exchange.file_management import AssetFileManagement
+from scrape_exchange.scrape_api import (
+    EdgeResponse,
+    GetDataResponseModel,
+    QueryResponseModel,
+    decode_data_payload,
+)
 from scrape_exchange.video_queue_factory import make_video_scrape_queue
 from scrape_exchange.video_scrape_queue import (
     VideoScrapeQueue,
@@ -214,6 +220,65 @@ async def fetch_exchange_video_ids(
         f'Video filter query failed after {DELIVER_ATTEMPTS} '
         f'attempts for {channel_id}',
     )
+
+
+class ExchangeRecordError(RuntimeError):
+    '''The exchange's channel record could not be read.'''
+
+
+async def fetch_exchange_channel_video_ids(
+    http_client: httpx.AsyncClient,
+    exchange_url: str,
+    channel_id: str,
+) -> set[str]:
+    '''Return the ``video_ids`` the exchange's records for
+    *channel_id* hold, via ``GET /api/v1/data/content`` and a download
+    of each record's ``data_url``.
+
+    The channel record's IDs include videos that have no video record
+    on the exchange yet, so :func:`fetch_exchange_video_ids` cannot
+    stand in for it. The exchange's "Data not found" 404 means no
+    record and returns an empty set.
+
+    :raises ExchangeRecordError: any other failure, so the caller does
+        not write a record that could lose stored IDs
+    '''
+    url: str = (
+        f'{exchange_url.rstrip("/")}/api/v1/data/content/youtube/channel/'
+        f'{channel_id}'
+    )
+    video_ids: set[str] = set()
+    try:
+        response: httpx.Response = await http_client.get(url)
+        if _is_no_data_response(response):
+            return video_ids
+        response.raise_for_status()
+        records: QueryResponseModel[GetDataResponseModel] = (
+            QueryResponseModel[GetDataResponseModel].model_validate(
+                response.json(),
+            )
+        )
+        edge: EdgeResponse[GetDataResponseModel]
+        for edge in records.edges:
+            data_url: str = edge.node.data_url
+            if not data_url.startswith(('http://', 'https://')):
+                data_url = (
+                    f'{exchange_url.rstrip("/")}/{data_url.lstrip("/")}'
+                )
+            payload_response: httpx.Response = await http_client.get(
+                data_url,
+            )
+            payload_response.raise_for_status()
+            payload: dict[str, Any] = decode_data_payload(
+                payload_response.content, data_url,
+            )
+            video_ids.update(payload.get('video_ids') or [])
+    except (httpx.HTTPError, ValueError) as exc:
+        raise ExchangeRecordError(
+            f'Could not read the exchange record of channel '
+            f'{channel_id}: {exc}',
+        ) from exc
+    return video_ids
 
 
 class KnownVideoIds:

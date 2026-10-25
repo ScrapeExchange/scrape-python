@@ -360,7 +360,15 @@ async def fetch_dict_url(
         )
     response = await client.get(url)
     response.raise_for_status()
-    raw: bytes = response.content
+    return decode_data_payload(response.content, url)
+
+
+def decode_data_payload(raw: bytes, url: str) -> dict[str, Any]:
+    '''Decode a data payload downloaded from *url*; see
+    :func:`fetch_dict_url` for the decoding precedence.
+
+    :raises ValueError: the payload is not a JSON object
+    '''
     try:
         decompressed: bytes = brotli.decompress(raw)
     except brotli.error:

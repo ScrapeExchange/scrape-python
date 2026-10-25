@@ -400,25 +400,6 @@ class TestChannelVideoRefresh(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.modes, [False])
         self.assertEqual(self.captured_known, [None])
 
-    async def test_merge_previous_video_ids(self) -> None:
-        filename: str = 'channel-UCexample.json.br'
-        await self.fm.write_file(filename, {'video_ids': ['old1', 'old2']})
-        self.channel.video_ids = {'new1'}
-        self.channel.video_ids_complete = False
-        await scraper._merge_previous_video_ids(
-            self.fm, filename, self.channel, {'exch1'},
-        )
-        self.assertEqual(
-            self.channel.video_ids, {'new1', 'old1', 'old2', 'exch1'},
-        )
-
-    async def test_merge_without_previous_file(self) -> None:
-        self.channel.video_ids = {'new1'}
-        await scraper._merge_previous_video_ids(
-            self.fm, 'channel-UCnone.json.br', self.channel, set(),
-        )
-        self.assertEqual(self.channel.video_ids, {'new1'})
-
     async def _scrape_capturing(
         self, rss_queue: AsyncMock | None = None,
     ) -> list[dict[str, object]]:

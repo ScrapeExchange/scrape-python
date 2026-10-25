@@ -99,9 +99,12 @@ from scrape_exchange.channel_scrape_queue import (
     parse_channel_priority_weights,
 )
 from scrape_exchange.youtube.channel_video_refresh import (
+    ExchangeRecordError,
+    FilterQueryError,
     FullScrapeSummary,
     KnownVideoIds,
     below_min_subscribers,
+    fetch_exchange_channel_video_ids,
     fetch_exchange_video_ids,
     queue_channel_videos,
     queue_video_ids,
@@ -2269,6 +2272,7 @@ async def _scrape_one_queued(
                     stored_counts=_stored_counts(meta),
                     listing_resume=listing_resume,
                     on_listing_checkpoint=on_listing_checkpoint,
+                    http_client=http_client,
                 )
             )
         except TopicChannelError as exc:
@@ -3077,6 +3081,14 @@ async def _try_scrape_channel(
         proxy: str | None = await _try_scrape_channel_typed(
             channel, settings, extra,
         )
+        if channel.partial_error:
+            # This path writes complete records only; the queue path
+            # writes partial ones.
+            _record_scrape_failure(
+                channel, 'Incomplete channel scrape',
+                RuntimeError(channel.partial_error), extra,
+            )
+            return False, None
         return True, proxy
     except asyncio.CancelledError:
         raise
@@ -3412,19 +3424,29 @@ async def _load_known_video_ids(
     return known
 
 
-async def _merge_previous_video_ids(
+async def _union_previous_video_ids(
     fm: AssetFileManagement,
     filename: str,
     channel: YouTubeChannel,
-    exchange_ids: set[str],
+    *,
+    http_client: httpx.AsyncClient,
+    exchange_url: str,
+    exchange_ids: set[str] | None,
 ) -> None:
-    '''Restore the full video_ids list after an early-stopped scrape.
+    '''Restore the full video_ids list after an incomplete
+    enumeration, so the written record never drops a stored ID.
 
-    Adds the video_ids of the channel's previous file (current copy,
-    else the uploaded copy) and the exchange's IDs for the channel to
-    the newly scraped ones, so the written record stays complete.
+    Adds to the newly scraped IDs the video_ids of the channel's
+    previous record (current local copy, else the uploaded copy, else
+    the exchange's channel records) and the exchange's video IDs for
+    the channel (*exchange_ids* when already fetched).
+
+    :raises ExchangeRecordError: the exchange's channel records could
+        not be read
+    :raises FilterQueryError: the exchange's video IDs could not be
+        read
     '''
-    previous: set[str] = set()
+    previous: set[str] | None = None
     reader: Callable[[str], Awaitable[dict]]
     for reader in (fm.read_file, fm.read_uploaded):
         try:
@@ -3433,7 +3455,42 @@ async def _merge_previous_video_ids(
             continue
         previous = set(data.get('video_ids') or [])
         break
+    if previous is None:
+        previous = await fetch_exchange_channel_video_ids(
+            http_client, exchange_url, channel.channel_id,
+        )
+    if exchange_ids is None:
+        exchange_ids = await fetch_exchange_video_ids(
+            http_client, exchange_url, channel.channel_id,
+        )
     channel.video_ids |= previous | exchange_ids
+
+
+async def _union_previous_video_ids_with(
+    fm: AssetFileManagement,
+    filename: str,
+    channel: YouTubeChannel,
+    *,
+    http_client: httpx.AsyncClient | None,
+    exchange_url: str,
+    exchange_ids: set[str] | None,
+) -> None:
+    ''':func:`_union_previous_video_ids` with *http_client*, or with
+    a short-lived client when it is None.'''
+    if http_client is not None:
+        await _union_previous_video_ids(
+            fm, filename, channel, http_client=http_client,
+            exchange_url=exchange_url, exchange_ids=exchange_ids,
+        )
+        return
+    client: httpx.AsyncClient
+    async with httpx.AsyncClient(
+        timeout=10.0, follow_redirects=True,
+    ) as client:
+        await _union_previous_video_ids(
+            fm, filename, channel, http_client=client,
+            exchange_url=exchange_url, exchange_ids=exchange_ids,
+        )
 
 
 async def _persist_scraped_channel(
@@ -3696,6 +3753,7 @@ async def _do_scrape_channel_to_disk_typed(
     stored_counts: StoredCounts = NO_STORED_COUNTS,
     listing_resume: dict[str, str] | None = None,
     on_listing_checkpoint: ListingCheckpointFn | None = None,
+    http_client: httpx.AsyncClient | None = None,
 ) -> YouTubeChannel:
     '''Typed-exception variant of
     :func:`_do_scrape_channel_to_disk` for the
@@ -3720,6 +3778,9 @@ async def _do_scrape_channel_to_disk_typed(
     :param listing_resume: makes a full listing resumable; see
         :meth:`YouTubeChannel.scrape`.
     :param on_listing_checkpoint: see :meth:`YouTubeChannel.scrape`.
+    :param http_client: client for the exchange lookups that keep an
+        incomplete enumeration's video_ids whole; a short-lived one is
+        used when None.
 
     Raises:
         ChannelNotFoundError: channel returned 404.
@@ -3815,11 +3876,22 @@ async def _do_scrape_channel_to_disk_typed(
         )
 
     if not channel.video_ids_complete:
-        await _merge_previous_video_ids(
-            fm, filename, channel,
-            known_video_ids.exchange_ids
-            if known_video_ids is not None else set(),
-        )
+        try:
+            await _union_previous_video_ids_with(
+                fm, filename, channel,
+                http_client=http_client,
+                exchange_url=settings.exchange_url,
+                exchange_ids=(
+                    known_video_ids.exchange_ids
+                    if known_video_ids is not None else None
+                ),
+            )
+        except (ExchangeRecordError, FilterQueryError) as exc:
+            # Writing now could drop video IDs the exchange holds.
+            raise RuntimeError(
+                f'channel {channel.channel_id!r}: cannot read its '
+                f'earlier video IDs: {exc}',
+            ) from exc
 
     if not await _persist_scraped_channel(
         fm, filename, channel, channel_handle,
