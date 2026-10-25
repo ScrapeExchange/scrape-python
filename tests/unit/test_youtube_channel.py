@@ -2845,5 +2845,44 @@ class TestResolveChannelIdViaInnerTube(unittest.IsolatedAsyncioTestCase):
             body={'url': 'https://www.youtube.com/@MrBeast'},
         )
 
+
+class TestStoreProducts(unittest.IsolatedAsyncioTestCase):
+    '''The store tab's products are the channel's ``merch``.'''
+
+    async def test_store_products_land_in_merch(self) -> None:
+        import tempfile
+
+        product: YouTubeProduct = YouTubeProduct(
+            title='Channel shirt', price='$25.00',
+        )
+        with tempfile.TemporaryDirectory() as save_dir:
+            channel: YouTubeChannel = YouTubeChannel(
+                channel_handle='handle', channel_id='UC1234567890abcdefghij',
+            )
+            channel.browse_client = MagicMock()
+
+            with patch(
+                'scrape_exchange.youtube.youtube_channel'
+                '.YouTubeChannelTabs',
+            ) as tabs_cls:
+                tabs_cls.return_value.browse_channel = AsyncMock(
+                    return_value={'metadata': {}},
+                )
+                tabs_cls.return_value.scrape_loaded_tabs = AsyncMock(
+                    return_value=(
+                        set(), set(), set(), set(), set(), {product},
+                    ),
+                )
+                with patch.object(
+                    channel, 'parse_channel_video_data',
+                ):
+                    await channel.scrape_channel_content(
+                        save_dir=save_dir,
+                    )
+
+            self.assertEqual(channel.merch, {product})
+            self.assertEqual(channel.to_dict()['merch'], [product.to_dict()])
+
+
 if __name__ == '__main__':
     unittest.main()

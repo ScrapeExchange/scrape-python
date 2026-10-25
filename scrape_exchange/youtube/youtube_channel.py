@@ -413,7 +413,6 @@ class YouTubeChannel:
         self.courses: set[YouTubeCourse] = set()
         self.playlists: set[YouTubePlaylist] = set()
         self.posts: set[YouTubePost] = set()
-        self.products: set[YouTubeProduct] = set()
 
         self.videos: set[YouTubeVideo] = set()
 
@@ -1853,7 +1852,7 @@ class YouTubeChannel:
 
         try:
             self.video_ids, self.podcast_ids, self.playlists, self.courses, \
-                self.posts, self.products = \
+                self.posts, self.merch = \
                 await tabs.scrape_loaded_tabs()
         except Exception as exc:
             raise RuntimeError(

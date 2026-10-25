@@ -3117,7 +3117,7 @@ def _channel_has_no_content(
     videos, playlists, courses, podcasts, or products to upload.
     '''
     if (channel.video_ids or channel.playlists or channel.courses
-            or channel.podcast_ids or channel.products):
+            or channel.podcast_ids or channel.merch):
         return False
 
     if channel.description:
@@ -3151,7 +3151,7 @@ def _channel_has_no_content(
             'playlists_length': len(channel.playlists),
             'courses_length': len(channel.courses),
             'podcast_ids_length': len(channel.podcast_ids),
-            'products_length': len(channel.products),
+            'products_length': len(channel.merch),
         },
     )
     return True
