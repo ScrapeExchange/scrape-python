@@ -11,7 +11,11 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from scrape_exchange.schema_validator import SchemaValidator
-from scrape_exchange.youtube.channel_errors import ChannelTerminatedError
+from scrape_exchange.youtube.channel_errors import (
+    ChannelNotFoundError,
+    ChannelRedirectedError,
+    ChannelTerminatedError,
+)
 from scrape_exchange.youtube.youtube_channel import (
     ABOUT_FIELDS,
     INNERTUBE_FIELDS,
@@ -170,14 +174,19 @@ class TestPartialScrape(PartialScrapeTestCase):
             await self._scrape(channel, tabs, _about_ok)
 
     async def test_channel_error_in_tabs_is_not_partial(self) -> None:
-        channel: YouTubeChannel = _channel()
-        tabs: MagicMock = _tabs_mock()
-        tabs.scrape_loaded_tabs = AsyncMock(
-            side_effect=ChannelTerminatedError('gone'),
-        )
-        with self.assertRaises(RuntimeError):
-            await self._scrape(channel, tabs, _about_ok)
-        self.assertIsNone(channel.partial_error)
+        error: Exception
+        for error in (
+            ChannelTerminatedError('gone'),
+            ChannelRedirectedError(CHANNEL_ID, 'UCother0000000000000000'),
+            ChannelNotFoundError('missing'),
+        ):
+            with self.subTest(error=type(error).__name__):
+                channel: YouTubeChannel = _channel()
+                tabs: MagicMock = _tabs_mock()
+                tabs.scrape_loaded_tabs = AsyncMock(side_effect=error)
+                with self.assertRaises(RuntimeError):
+                    await self._scrape(channel, tabs, _about_ok)
+                self.assertIsNone(channel.partial_error)
 
 
 class TestOnlyFetched(unittest.TestCase):

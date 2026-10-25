@@ -63,6 +63,7 @@ from .youtube_types import YouTubeChannelLink
 from .youtube_product import YouTubeProduct
 
 from .youtube_external_link import YouTubeExternalLink
+from .channel_errors import ChannelNotFoundError
 from .channel_errors import ChannelRedirectedError
 from .channel_errors import ChannelTerminatedError
 from .youtube_channel_tabs import KnownVideoIdsFn
@@ -1103,7 +1104,10 @@ class YouTubeChannel:
         '''
         if not self.fetched_fields or isinstance(
             exc.__cause__,
-            (ChannelTerminatedError, ChannelRedirectedError),
+            (
+                ChannelNotFoundError, ChannelTerminatedError,
+                ChannelRedirectedError,
+            ),
         ):
             return False
         self.partial_error = f'Incomplete channel content: {exc}'
