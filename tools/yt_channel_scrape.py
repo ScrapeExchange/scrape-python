@@ -3546,10 +3546,9 @@ async def _union_previous_video_ids(
     previous local record (current copy, else the uploaded copy) and
     the exchange's video IDs for the channel (*exchange_ids* when
     already fetched). Uploads never carry video_ids, so the exchange's
-    channel records cannot supply them.
-
-    :raises FilterQueryError: the exchange's video IDs could not be
-        read
+    channel records cannot supply them, and the union only keeps the
+    local record whole: when the exchange's video IDs cannot be read,
+    the local record's IDs are kept and the scrape carries on.
     '''
     previous: set[str] = set()
     reader: Callable[[str], Awaitable[dict]]
@@ -3561,9 +3560,18 @@ async def _union_previous_video_ids(
         previous = set(data.get('video_ids') or [])
         break
     if exchange_ids is None:
-        exchange_ids = await fetch_exchange_video_ids(
-            http_client, exchange_url, channel.channel_id,
-        )
+        try:
+            exchange_ids = await fetch_exchange_video_ids(
+                http_client, exchange_url, channel.channel_id,
+            )
+        except FilterQueryError as exc:
+            logging.warning(
+                'Could not read the exchange video IDs of the channel; '
+                'keeping the local record\'s IDs only',
+                exc=exc,
+                extra={'channel_id': channel.channel_id},
+            )
+            exchange_ids = set()
     channel.video_ids |= previous | exchange_ids
 
 
@@ -3972,22 +3980,15 @@ async def _do_scrape_channel_to_disk_typed(
         )
 
     if not channel.video_ids_complete:
-        try:
-            await _union_previous_video_ids_with(
-                fm, filename, channel,
-                http_client=http_client,
-                exchange_url=settings.exchange_url,
-                exchange_ids=(
-                    known_video_ids.exchange_ids
-                    if known_video_ids is not None else None
-                ),
-            )
-        except FilterQueryError as exc:
-            # Writing now could drop video IDs the exchange holds.
-            raise RuntimeError(
-                f'channel {channel.channel_id!r}: cannot read its '
-                f'earlier video IDs: {exc}',
-            ) from exc
+        await _union_previous_video_ids_with(
+            fm, filename, channel,
+            http_client=http_client,
+            exchange_url=settings.exchange_url,
+            exchange_ids=(
+                known_video_ids.exchange_ids
+                if known_video_ids is not None else None
+            ),
+        )
 
     # A partial scrape is written even without content: its metadata
     # is what the exchange should get.

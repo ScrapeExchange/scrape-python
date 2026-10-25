@@ -108,13 +108,15 @@ class TestWritePartialRecord(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data['title'], 'Fresh title')
         self.assertEqual(data['video_ids'], [])
 
-    async def test_lookup_failure_writes_nothing(self) -> None:
+    async def test_filter_failure_still_writes_record(self) -> None:
+        await self.fm.write_file(FILENAME, {
+            'channel_id': CHANNEL_ID, 'video_ids': ['old1'],
+        })
         self.video_ids.side_effect = FilterQueryError('down')
-        with self.assertRaises(RuntimeError) as ctx:
+        with self.assertRaises(ChannelPartialScrapeError):
             await self._scrape()
-        self.assertNotIsInstance(ctx.exception, ChannelPartialScrapeError)
-        with self.assertRaises(Exception):
-            await self.fm.read_file(FILENAME)
+        data: dict = await self.fm.read_file(FILENAME)
+        self.assertEqual(data['video_ids'], ['old1'])
 
     async def test_privacy_limits_still_apply(self) -> None:
         self.privacy.return_value = True

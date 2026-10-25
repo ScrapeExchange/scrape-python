@@ -70,10 +70,12 @@ class TestUnionPreviousVideoIds(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.channel.video_ids, {'new1', 'given1'})
         self.video_ids.assert_not_awaited()
 
-    async def test_filter_error_propagates(self) -> None:
+    async def test_filter_error_keeps_local_union(self) -> None:
+        # An exchange outage must not fail the channel's scrape.
+        await self.fm.write_file(FILENAME, {'video_ids': ['old1']})
         self.video_ids.side_effect = FilterQueryError('down')
-        with self.assertRaises(FilterQueryError):
-            await self._union()
+        await self._union()
+        self.assertEqual(self.channel.video_ids, {'new1', 'old1'})
 
 
 class TestLegacyPathRejectsPartial(unittest.IsolatedAsyncioTestCase):
