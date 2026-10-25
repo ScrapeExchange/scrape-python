@@ -32,6 +32,7 @@ from scrape_exchange.bulk_upload import (
 )
 from scrape_exchange.file_management import AssetFileManagement
 from scrape_exchange.schema_validator import SchemaValidator
+from scrape_exchange.youtube.youtube_channel import YouTubeChannel
 from tests.unit._bulk_upload_fakes import FakeBulkExchange
 from tools import scrape_upload
 
@@ -510,19 +511,48 @@ class TestPrepareAssetLine(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         context, _, _ = self._channel_context()
+        channel: YouTubeChannel = YouTubeChannel(
+            'ExampleHandle', channel_id='UCabc',
+            with_download_client=False,
+        )
+        channel.title = 'Example Channel'
+        full: dict = channel.to_dict(with_video_ids=True)
         record = await scrape_upload.YouTubeChannelProcessor().prepare_record(
-            {
-                'channel_id': 'UCabc',
-                'channel_handle': 'ExampleHandle',
-                'title': 'Example Channel',
-                'url': 'https://www.youtube.com/channel/UCabc',
-            },
+            dict(full),
             filename='channel-UCabc.json.br',
             content_id='UCabc',
             context=context,
         )
-        self.assertIn('banners', record)
-        self.assertIn('channel_thumbnails', record)
+        self.assertEqual(set(record), set(full) - {'video_ids'})
+
+    async def test_partial_channel_record_keeps_omitted_keys_out(
+        self,
+    ) -> None:
+        # A partial scrape leaves out what it did not fetch; adding
+        # those keys back as empty values would wipe the stored ones.
+        context, _, _ = self._channel_context()
+        partial: dict = {
+            'channel_id': 'UCabc',
+            'channel_handle': 'ExampleHandle',
+            'url': 'https://www.youtube.com/channel/UCabc',
+            'title': 'Example Channel',
+            'posts': [],
+            'video_ids': ['v1'],
+        }
+        record = await scrape_upload.YouTubeChannelProcessor().prepare_record(
+            dict(partial),
+            filename='channel-UCabc.json.br',
+            content_id='UCabc',
+            context=context,
+        )
+        self.assertEqual(
+            set(record),
+            {'channel_id', 'channel_handle', 'url', 'title', 'posts'},
+        )
+        self.assertEqual(
+            set(scrape_upload._youtube_channel_record(dict(partial))),
+            {'channel_id', 'channel_handle', 'url', 'title', 'posts'},
+        )
 
     async def test_youtube_video_processor_records_successful_ids(
         self,

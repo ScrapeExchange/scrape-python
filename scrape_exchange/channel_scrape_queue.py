@@ -188,13 +188,60 @@ redis.call('HSET', KEYS[2], ARGV[1], tostring(tier))
 redis.call('HSET', KEYS[1],
     'successful_scrapes', ARGV[3], 'next_full_scrape', ARGV[4],
     'last_attempt_at', ARGV[7])
-redis.call('HDEL', KEYS[1], 'unavailable_attempts')
+redis.call('HDEL', KEYS[1], 'unavailable_attempts', 'partial_attempts')
 if completed_tier >= 0 then
     redis.call('HDEL', KEYS[1], 'missing_subscriber_attempts',
         'subscriber_count_not_public')
     return 1
 end
 return {1, schedule_interval, missing_after, not_public}
+'''
+
+
+_MARK_PARTIAL_LUA: str = '''
+-- Reschedule a channel whose scrape was written but partial.
+-- KEYS: metadata, tier map, then every scheduled tier.
+-- ARGV: id, expected successful_scrapes ('' to skip the check),
+--   max retries, retry score, now, last error.
+-- Returns -1 when the state changed during the scrape (a terminal
+-- mark, or another scrape committed): the queue is left alone.
+-- Returns 0 when the retries are used up, else 1.
+if redis.call('HGET', KEYS[1], 'state') ~= 'scheduled' then
+    return -1
+end
+if ARGV[2] ~= ''
+        and redis.call('HGET', KEYS[1], 'successful_scrapes') ~= ARGV[2]
+then
+    return -1
+end
+local attempts = redis.call('HINCRBY', KEYS[1], 'partial_attempts', 1)
+if attempts > tonumber(ARGV[3]) then return 0 end
+local tier = tonumber(redis.call('HGET', KEYS[2], ARGV[1])) or 0
+if tier < 0 or tier >= #KEYS - 2 then tier = 0 end
+local member = 'i:' .. ARGV[1]
+for k = 3, #KEYS do redis.call('ZREM', KEYS[k], member) end
+redis.call('ZADD', KEYS[3 + tier], tonumber(ARGV[4]), member)
+redis.call('HSET', KEYS[1],
+    'last_attempt_at', ARGV[5], 'last_partial_error', ARGV[6])
+return 1
+'''
+
+
+_REQUEUE_INTERRUPTED_LUA: str = '''
+-- Put back a channel whose scrape was interrupted after it was popped.
+-- KEYS: metadata, tier map, then every scheduled tier.
+-- ARGV: id, score.
+-- Does nothing (returns 0) when the state changed meanwhile (e.g. a
+-- terminal mark) or the channel is already in a scheduled tier.
+if redis.call('HGET', KEYS[1], 'state') ~= 'scheduled' then return 0 end
+local member = 'i:' .. ARGV[1]
+for k = 3, #KEYS do
+    if redis.call('ZSCORE', KEYS[k], member) then return 0 end
+end
+local tier = tonumber(redis.call('HGET', KEYS[2], ARGV[1])) or 0
+if tier < 0 or tier >= #KEYS - 2 then tier = 0 end
+redis.call('ZADD', KEYS[3 + tier], tonumber(ARGV[2]), member)
+return 1
 '''
 
 
@@ -704,6 +751,23 @@ class ChannelScrapeQueueSettings(BaseSettings):
     channel_unavailable_soft_retry_seconds: int = Field(
         default=3 * 86400,
     )
+    channel_partial_retry_seconds: int = Field(
+        default=6 * 3600,
+        gt=0,
+        description=(
+            'Delay before retrying a channel whose scrape was written '
+            'but partial (part of its content could not be fetched).'
+        ),
+    )
+    channel_partial_max_retries: int = Field(
+        default=3,
+        ge=0,
+        description=(
+            'Consecutive partial scrapes retried after '
+            'channel_partial_retry_seconds; the next one counts as a '
+            'successful scrape and is scheduled by its tier.'
+        ),
+    )
     channel_unpublished_subscriber_retries: int = Field(
         default=1,
         ge=0,
@@ -820,6 +884,21 @@ class ChannelScrapeQueue(ABC):
         *,
         last_error: str | None,
     ) -> None: ...
+
+    @abstractmethod
+    async def mark_partial(
+        self,
+        channel_id: str,
+        *,
+        last_error: str | None,
+        now: float,
+        progress: ChannelScrapeProgress | None = None,
+    ) -> bool | None: ...
+
+    @abstractmethod
+    async def requeue_interrupted(
+        self, channel_id: str, *, now: float,
+    ) -> bool: ...
 
     @abstractmethod
     async def mark_not_found_confirmed(
@@ -1398,6 +1477,7 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
         pipe.hdel(
             self._k_meta(member),
             'unavailable_attempts',
+            'partial_attempts',
             'missing_subscriber_attempts',
             'subscriber_count_not_public',
         )
@@ -1615,6 +1695,76 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
                 ),
             },
         )
+
+    async def mark_partial(
+        self,
+        channel_id: str,
+        *,
+        last_error: str | None,
+        now: float,
+        progress: ChannelScrapeProgress | None = None,
+    ) -> bool | None:
+        '''Retry a channel whose scrape was written but partial.
+
+        Reschedules the popped channel in its stored tier after
+        ``channel_partial_retry_seconds`` and counts the consecutive
+        partial scrape in ``partial_attempts``. Unlike
+        :meth:`mark_soft_unavailable` it never moves the channel toward
+        ``hard_unavailable``: its data was delivered.
+
+        Like :meth:`update_tier` it leaves the queue alone when the
+        channel's state changed during the scrape: a terminal mark
+        (e.g. an operator removal) or, with *progress*, another scrape
+        that committed meanwhile.
+
+        :returns: True when rescheduled; False once
+            ``channel_partial_max_retries`` retries are used up, so the
+            caller handles the scrape as a success (:meth:`update_tier`
+            clears ``partial_attempts``); None when superseded.
+        '''
+        member: str = f'i:{channel_id}'
+        keys: list[str] = [
+            self._k_meta(member), self._k_tiers(),
+            *[self._k_scheduled(tier.tier) for tier in self._tiers],
+        ]
+        result: int = int(await self._redis.execute_command(
+            'EVAL', _MARK_PARTIAL_LUA, len(keys), *keys,
+            channel_id,
+            str(progress.successful_scrapes) if progress else '',
+            str(self._settings.channel_partial_max_retries),
+            str(now + self._settings.channel_partial_retry_seconds),
+            str(int(now)),
+            last_error or '',
+        ))
+        if result < 0:
+            return None
+        if result == 0:
+            return False
+        await self.recount_listing(member)
+        return True
+
+    async def requeue_interrupted(
+        self, channel_id: str, *, now: float,
+    ) -> bool:
+        '''Put a popped channel whose scrape was interrupted (its
+        worker was cancelled) back into its stored tier, due *now*.
+
+        Popping takes the channel out of every scheduled tier, and only
+        the end of its scrape puts it back; without this an interrupted
+        scrape leaves it scheduled in its metadata but in no tier.
+
+        :returns: False, changing nothing, when the channel's state
+            changed meanwhile or it is already in a scheduled tier.
+        '''
+        keys: list[str] = [
+            self._k_meta(f'i:{channel_id}'), self._k_tiers(),
+            *[self._k_scheduled(tier.tier) for tier in self._tiers],
+        ]
+        result: int = int(await self._redis.execute_command(
+            'EVAL', _REQUEUE_INTERRUPTED_LUA, len(keys), *keys,
+            channel_id, str(now),
+        ))
+        return result == 1
 
     async def mark_not_found_confirmed(
         self,

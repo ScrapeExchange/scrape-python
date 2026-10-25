@@ -109,7 +109,10 @@ from scrape_exchange.youtube.exchange_channels_set import (
     RedisExchangeChannelsSet,
 )
 from scrape_exchange.youtube.uploaded_video_ids import UploadedVideoIds
-from scrape_exchange.youtube.youtube_channel import YouTubeChannel, fallback_handle
+from scrape_exchange.youtube.youtube_channel import (
+    YouTubeChannel,
+    fallback_handle,
+)
 from scrape_exchange.youtube.youtube_video import YouTubeVideo
 
 UploadMode = Literal['bulk', 'background']
@@ -201,8 +204,10 @@ def _youtube_video_record(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def _youtube_channel_record(data: dict[str, Any]) -> dict[str, Any]:
+    # A partial scrape leaves out what it did not fetch: upload only
+    # the keys the file holds, see YouTubeChannel.from_dict.
     return YouTubeChannel.from_dict(data).to_dict(
-        with_video_ids=False,
+        with_video_ids=False, only_fetched=True,
     )
 
 
@@ -714,7 +719,7 @@ class YouTubeChannelProcessor(AssetProcessor):
             # thumbnails, links and joined_date.
             return data
         channel.channel_handle = handle
-        return channel.to_dict(with_video_ids=False)
+        return channel.to_dict(with_video_ids=False, only_fetched=True)
 
     async def handle_brotli_error(
         self,

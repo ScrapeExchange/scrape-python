@@ -63,6 +63,9 @@ from .youtube_types import YouTubeChannelLink
 from .youtube_product import YouTubeProduct
 
 from .youtube_external_link import YouTubeExternalLink
+from .channel_errors import ChannelNotFoundError
+from .channel_errors import ChannelRedirectedError
+from .channel_errors import ChannelTerminatedError
 from .youtube_channel_tabs import KnownVideoIdsFn
 from .youtube_channel_tabs import (
     ListingCheckpointFn as TabListingCheckpointFn,
@@ -93,6 +96,40 @@ ListingCheckpointFn = Callable[
 # Limits the amount of videos imported for a channel
 # per run
 MAX_CHANNEL_VIDEOS_PER_RUN: int = 40
+
+# Record keys a successful /about scrape fills (scrape_about_page and
+# the parsers it calls).
+ABOUT_FIELDS: frozenset[str] = frozenset({
+    'title', 'description', 'rss_url', 'available_country_codes',
+    'keywords', 'is_family_safe', 'joined_date', 'view_count',
+    'video_count', 'subscriber_count', 'external_urls', 'country',
+    'channel_thumbnails', 'banners', 'channel_links', 'verified',
+})
+# Record keys a successful InnerTube browse fills
+# (parse_channel_video_data).
+INNERTUBE_FIELDS: frozenset[str] = frozenset({
+    'title', 'description', 'keywords', 'is_family_safe',
+    'channel_thumbnails', 'banners', 'subscriber_count', 'video_count',
+})
+# The record key each content tab fills. A tab the channel lacks
+# leaves its key fetched (and empty); a tab that failed does not.
+TAB_FIELDS: dict[str, str] = {
+    'playlists': 'playlists',
+    'courses': 'courses',
+    'posts': 'posts',
+    'store': 'merch',
+    'videos': 'video_ids',
+    'shorts': 'video_ids',
+    'live': 'video_ids',
+}
+TAB_RECORD_FIELDS: frozenset[str] = frozenset(TAB_FIELDS.values())
+# Always written: the keys the channel schema requires.
+IDENTITY_FIELDS: frozenset[str] = frozenset(
+    {'channel_id', 'channel_handle', 'url'},
+)
+_COUNT_FIELDS: frozenset[str] = frozenset(
+    {'subscriber_count', 'video_count', 'view_count'},
+)
 
 HTTP_PREFIX: str = 'http://'
 HTTPS_PREFIX: str = 'https://'
@@ -408,12 +445,20 @@ class YouTubeChannel:
         # listed, by this scrape alone or by a resumable full listing
         # over several scrapes.
         self.video_listing_complete: bool = True
+        # Record keys filled by this scrape; see to_dict(only_fetched).
+        self.fetched_fields: set[str] = set()
+        # Set when part of the content fetch failed but the scrape
+        # still collected useful data.
+        self.partial_error: str | None = None
+        # True when the partial part is channel content (a tab or the
+        # InnerTube browse failed); False when only /about failed, so
+        # the content collected is complete.
+        self.content_partial: bool = False
         self.podcast_ids: set[str] = set()
         self.merch: set[YouTubeProduct] = set()
         self.courses: set[YouTubeCourse] = set()
         self.playlists: set[YouTubePlaylist] = set()
         self.posts: set[YouTubePost] = set()
-        self.products: set[YouTubeProduct] = set()
 
         self.videos: set[YouTubeVideo] = set()
 
@@ -466,7 +511,25 @@ class YouTubeChannel:
         )
         return equal
 
-    def to_dict(self, with_video_ids: bool = False) -> dict[str, any]:
+    def to_dict(
+        self, with_video_ids: bool = False, only_fetched: bool = False,
+    ) -> dict[str, any]:
+        '''
+        :param with_video_ids: include ``video_ids``
+        :param only_fetched: emit only the identity keys and the keys in
+        :attr:`fetched_fields`, so a partial scrape's record leaves out
+        what it did not fetch instead of writing it as empty
+        '''
+        data: dict[str, any] = self._to_dict(with_video_ids)
+        if not only_fetched:
+            return data
+        keep: set[str] = (
+            IDENTITY_FIELDS | self.fetched_fields
+            | ({'video_ids'} if with_video_ids else set())
+        )
+        return {key: value for key, value in data.items() if key in keep}
+
+    def _to_dict(self, with_video_ids: bool = False) -> dict[str, any]:
         data: dict[str, any] = {
             'channel_id': self.channel_id,
             'channel_handle': (
@@ -526,6 +589,11 @@ class YouTubeChannel:
         yt-dlp per record adds latency and resource cost without
         benefit. Callers that intend to scrape after reconstruction
         can opt in via ``with_download_client=True``.
+
+        :attr:`fetched_fields` is set to the keys *data* holds, so
+        ``to_dict(only_fetched=True)`` writes back what *data* held: a
+        partial record's left-out keys stay out instead of returning as
+        empty values that would wipe the stored ones.
         '''
         channel = YouTubeChannel(
             channel_handle=data.get('channel_handle'),
@@ -583,6 +651,7 @@ class YouTubeChannel:
             YouTubeProduct.from_dict(m) for m in data.get('merch', [])
         }
         channel.video_ids = set(data.get('video_ids', []))
+        channel.fetched_fields = set(data)
         return channel
 
     def _extract_initial_data(self, html_content: str) -> dict:
@@ -946,6 +1015,7 @@ class YouTubeChannel:
             try:
                 await self.scrape_about_page(proxies=proxies)
                 self.about_page_succeeded = True
+                self.fetched_fields |= ABOUT_FIELDS
             except Exception as exc:
                 # /about is best-effort: InnerTube populates most
                 # channel metadata, so HTML failures keep going.
@@ -1011,11 +1081,48 @@ class YouTubeChannel:
                 )
         except (ValueError, RuntimeError) as exc:
             if require_complete_video_ids:
-                # A bad continuation is not evidence of a missing channel.
-                raise RuntimeError(
-                    f'Incomplete channel video enumeration: {exc}',
-                ) from exc
+                if not self._keep_partial_result(exc):
+                    # A bad continuation is not evidence of a missing
+                    # channel.
+                    raise RuntimeError(
+                        f'Incomplete channel video enumeration: {exc}',
+                    ) from exc
+        if (
+            with_about_page and not self.about_page_succeeded
+            and self.partial_error is None and self.fetched_fields
+        ):
+            # Fields only /about provides were not fetched.
+            self.partial_error = 'About page scrape failed'
         self._reconcile_description_external_links()
+
+    def _keep_partial_result(self, exc: Exception) -> bool:
+        '''Turn a failed content fetch into a partial result when the
+        scrape already collected useful data; True when it did.
+
+        A channel alert or redirect wrapped in *exc* is never a partial
+        result.
+        '''
+        if not self.fetched_fields or isinstance(
+            exc.__cause__,
+            (
+                ChannelNotFoundError, ChannelTerminatedError,
+                ChannelRedirectedError,
+            ),
+        ):
+            return False
+        self.partial_error = f'Incomplete channel content: {exc}'
+        self.content_partial = True
+        self.video_ids_complete = False
+        self.video_listing_complete = False
+        _LOGGER.warning(
+            'Channel content fetch failed; keeping the partial result',
+            extra={
+                'channel_handle': self.channel_handle,
+                'channel_id': self.channel_id,
+                'exc': str(exc),
+            },
+        )
+        return True
 
     async def scrape_about_page(self, proxies: list[str] | str | None = None
                                 ) -> None:
@@ -1846,6 +1953,7 @@ class YouTubeChannel:
             self.channel_handle = canonical
 
         self.parse_channel_video_data(page_data)
+        self.fetched_fields |= INNERTUBE_FIELDS
 
         if stop_if is not None and stop_if(self):
             self.scrape_stopped_early = True
@@ -1853,12 +1961,13 @@ class YouTubeChannel:
 
         try:
             self.video_ids, self.podcast_ids, self.playlists, self.courses, \
-                self.posts, self.products = \
+                self.posts, self.merch = \
                 await tabs.scrape_loaded_tabs()
         except Exception as exc:
             raise RuntimeError(
                 f'Failed to scrape channel content: {exc}'
             ) from exc
+        self._record_tab_fields(tabs.failed_tabs)
         self.video_ids_complete = tabs.enumeration_complete
         self.listing_state = dict(tabs.listing_state)
         self.video_listing_complete = (
@@ -1883,6 +1992,25 @@ class YouTubeChannel:
         )
 
         return videos_imported
+
+    def _record_tab_fields(self, failed_tabs: set[str]) -> None:
+        '''Mark the record keys of the content tabs fetched, except
+        those of *failed_tabs*; a failed tab makes the scrape partial.
+
+        ``video_ids`` stays fetched when a video tab failed: it holds
+        the IDs collected before the failure, which callers union with
+        the channel's earlier IDs.
+        '''
+        failed_fields: set[str] = {
+            TAB_FIELDS[title] for title in failed_tabs
+            if title in TAB_FIELDS
+        } - {'video_ids'}
+        self.fetched_fields |= TAB_RECORD_FIELDS - failed_fields
+        if failed_tabs:
+            self.content_partial = True
+            self.partial_error = (
+                f'Failed channel tabs: {", ".join(sorted(failed_tabs))}'
+            )
 
     async def _stop_content_task(
         self, content_task: 'asyncio.Task[int] | None',

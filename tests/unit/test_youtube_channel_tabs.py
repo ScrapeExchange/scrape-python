@@ -1116,7 +1116,7 @@ class TestScrapeContent(unittest.IsolatedAsyncioTestCase):
                          'success')
         duration.labels.return_value.observe.assert_called_once()
 
-    async def test_scrape_tab_records_failed_continuation_page(
+    async def test_scrape_tab_stops_at_failed_continuation_page(
         self,
     ) -> None:
         tabs = YouTubeChannelTabs(CHANNEL_ID)
@@ -1162,9 +1162,11 @@ class TestScrapeContent(unittest.IsolatedAsyncioTestCase):
             'scrape_exchange.youtube.youtube_channel_tabs'
             '.CHANNEL_TAB_DURATION',
         ) as duration:
-            with self.assertRaises(RuntimeError):
-                await tabs._scrape_tab(tab_renderer, 'videos')
+            video_ids, *_ = await tabs._scrape_tab(tab_renderer, 'videos')
 
+        self.assertEqual(video_ids, set())
+        self.assertEqual(tabs.failed_tabs, {'videos'})
+        self.assertFalse(tabs.enumeration_complete)
         page_calls: list[dict] = [
             call.kwargs for call in pages.labels.call_args_list
         ]

@@ -71,6 +71,7 @@ def _mock_channel(
     channel.video_ids_complete = True
     channel.video_listing_complete = True
     channel.listing_state = {}
+    channel.partial_error = None
     channel.channel_id = 'UCabc00000000000000000000'
     channel.channel_handle = channel_handle
     channel.title = title
@@ -1069,6 +1070,51 @@ class TestScrapeWorkers(
             1,
         )
 
+    @patch(
+        'tools.yt_channel_scrape._scrape_one_queued',
+        new_callable=AsyncMock,
+    )
+    async def test_cancelled_scrape_requeues_channel(
+        self,
+        mock_scrape: AsyncMock,
+    ) -> None:
+        started: asyncio.Event = asyncio.Event()
+
+        async def scrape_one(channel_id: str, **kwargs) -> None:
+            started.set()
+            await asyncio.Event().wait()
+
+        mock_scrape.side_effect = scrape_one
+        settings = _mock_settings()
+        settings.channel_queue_idle_poll_seconds = 0.01
+        queue = _mock_queue()
+        queue.pop_scheduled.return_value = ['UC1']
+        from tools.yt_channel_scrape import (
+            _scrape_scheduled_worker,
+        )
+        task: asyncio.Task[None] = asyncio.create_task(
+            _scrape_scheduled_worker(
+                worker_index=0,
+                queue=queue,
+                settings=settings,
+                fm=MagicMock(),
+                creator_map_backend=AsyncMock(),
+                http_client=MagicMock(),
+                shutdown_event=asyncio.Event(),
+                active_started_at={},
+                record_completed=MagicMock(),
+            )
+        )
+        await started.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        queue.requeue_interrupted.assert_awaited_once()
+        self.assertEqual(
+            queue.requeue_interrupted.await_args.args, ('UC1',),
+        )
+        queue.mark_soft_unavailable.assert_not_awaited()
+
     async def test_long_running_workers_report_progress(self) -> None:
         active_started_at: dict[str, float] = {
             '0:UCslow': 1.0,
@@ -1133,6 +1179,7 @@ class TestTypedScrape(
         channel.channel_id = 'UCabc00000000000000000000'
         channel.channel_handle = 'channel'
         channel.about_page_succeeded = True
+        channel.partial_error = None
         settings: MagicMock = _mock_settings()
         settings.channel_data_directory = '/tmp'
         from tools.yt_channel_scrape import (
@@ -1178,6 +1225,7 @@ class TestTypedScrape(
                     'channel_status': 'existing',
                 },
                 metadata_only=True,
+                exchange_video_ids=MagicMock(),
             )
 
         self.assertEqual(
@@ -1224,6 +1272,7 @@ class TestTypedScrape(
                 'channel-UCabc00000000000000000000.json.br',
                 {'channel_id': 'UCabc00000000000000000000'},
                 metadata_only=False,
+                exchange_video_ids=MagicMock(),
             )
         mock_no_content.assert_called_once()
         mock_persist.assert_not_awaited()
@@ -1993,13 +2042,21 @@ class TestParseListingResume(unittest.TestCase):
 
 class TestListingCheckpoint(unittest.IsolatedAsyncioTestCase):
     def _checkpoint(self, queue: AsyncMock, stored: dict[str, str]):
-        from tools.yt_channel_scrape import _listing_checkpoint_fn
+        from tools.yt_channel_scrape import (
+            ExchangeVideoIds,
+            _listing_checkpoint_fn,
+        )
         settings: MagicMock = _mock_settings()
         settings.video_data_directory = '/tmp'
         return _listing_checkpoint_fn(
             queue, 'i:UCabc00000000000000000000', stored,
             settings=settings, stored_counts=(None, None),
-            redis=MagicMock(), http_client=MagicMock(), extra={},
+            redis=MagicMock(), http_client=MagicMock(),
+            exchange_video_ids=ExchangeVideoIds(
+                MagicMock(), settings.exchange_url,
+                'UCabc00000000000000000000',
+            ),
+            extra={},
         )
 
     async def test_queues_ids_then_saves_token(self) -> None:
@@ -2052,5 +2109,6 @@ class TestListingCheckpoint(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(_listing_checkpoint_fn(
             _mock_queue(), 'i:UCabc00000000000000000000', {},
             settings=_mock_settings(), stored_counts=(None, None),
-            redis=None, http_client=MagicMock(), extra={},
+            redis=None, http_client=MagicMock(),
+            exchange_video_ids=MagicMock(), extra={},
         ))

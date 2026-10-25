@@ -99,6 +99,7 @@ from scrape_exchange.channel_scrape_queue import (
     parse_channel_priority_weights,
 )
 from scrape_exchange.youtube.channel_video_refresh import (
+    FilterQueryError,
     FullScrapeSummary,
     KnownVideoIds,
     below_min_subscribers,
@@ -159,6 +160,16 @@ class ChannelNoContentError(RuntimeError):
 
     def __init__(self, message: str, channel: YouTubeChannel) -> None:
         super().__init__(message)
+        self.channel: YouTubeChannel = channel
+
+
+class ChannelPartialScrapeError(Exception):
+    '''Raised after a partial scrape was written to disk: part of the
+    content fetch failed, so the channel is retried soon instead of
+    being counted as scraped.'''
+
+    def __init__(self, channel: YouTubeChannel) -> None:
+        super().__init__(channel.partial_error or 'partial channel scrape')
         self.channel: YouTubeChannel = channel
 
 
@@ -402,6 +413,31 @@ class ChannelSettings(YouTubeScraperSettings):
     )
     channel_unavailable_soft_retry_seconds: int = Field(
         default=3 * 86400,
+    )
+    channel_partial_retry_seconds: int = Field(
+        default=6 * 3600,
+        gt=0,
+        validation_alias=AliasChoices(
+            'CHANNEL_PARTIAL_RETRY_SECONDS',
+            'channel_partial_retry_seconds',
+        ),
+        description=(
+            'Seconds before retrying a channel whose scrape was '
+            'uploaded but partial (part of its content could not be '
+            'fetched).'
+        ),
+    )
+    channel_partial_max_retries: int = Field(
+        default=3,
+        ge=0,
+        validation_alias=AliasChoices(
+            'CHANNEL_PARTIAL_MAX_RETRIES',
+            'channel_partial_max_retries',
+        ),
+        description=(
+            'Consecutive partial scrapes of a channel that are retried '
+            'early; the next one counts as a normal scrape.'
+        ),
     )
     channel_soft_reap_interval_seconds: int = Field(
         default=60,
@@ -739,6 +775,12 @@ async def _run_worker(
                 channel_unavailable_soft_retry_seconds=(
                     settings
                     .channel_unavailable_soft_retry_seconds
+                ),
+                channel_partial_retry_seconds=(
+                    settings.channel_partial_retry_seconds
+                ),
+                channel_partial_max_retries=(
+                    settings.channel_partial_max_retries
                 ),
                 channel_soft_reap_interval_seconds=(
                     settings
@@ -1581,6 +1623,11 @@ async def _scrape_scheduled_worker(
                 name_map=name_map,
             )
         except asyncio.CancelledError:
+            # Shutdown: the popped channel is in no scheduled tier until
+            # its scrape ends, so put it back before the worker exits.
+            await asyncio.shield(
+                _requeue_interrupted(queue, channel_id),
+            )
             raise
         except Exception as exc:
             logging.exception(
@@ -1598,6 +1645,28 @@ async def _scrape_scheduled_worker(
             active_started_at.pop(active_key, None)
             record_completed()
             Watchdog.get().touch_work()
+
+
+async def _requeue_interrupted(
+    queue: RedisChannelScrapeQueue, channel_id: str,
+) -> None:
+    '''Put a channel whose scrape was cancelled back in the queue;
+    never raises, so the cancellation carries on.'''
+    try:
+        requeued: bool = await queue.requeue_interrupted(
+            channel_id, now=time.time(),
+        )
+    except Exception:
+        logging.warning(
+            'Could not requeue interrupted channel scrape',
+            exc_info=True,
+            extra={'channel_id': channel_id},
+        )
+        return
+    logging.info(
+        'Requeued interrupted channel scrape',
+        extra={'channel_id': channel_id, 'requeued': str(requeued)},
+    )
 
 
 async def _resolve_one_queued(
@@ -2243,6 +2312,13 @@ async def _scrape_one_queued(
             settings, creator_map_backend, http_client, channel_id,
             extra,
         )
+    exchange_video_ids: ExchangeVideoIds = ExchangeVideoIds(
+        http_client, settings.exchange_url, channel_id,
+        known=(
+            known_video_ids.exchange_ids
+            if known_video_ids is not None else None
+        ),
+    )
     # A full enumeration may take hours for a channel with millions
     # of videos: resume it from where an earlier scrape stopped.
     listing_resume: dict[str, str] | None = None
@@ -2255,9 +2331,11 @@ async def _scrape_one_queued(
             stored_counts=_stored_counts(meta),
             redis=creator_map_backend.redis_client,
             http_client=http_client,
+            exchange_video_ids=exchange_video_ids,
             extra=extra,
         )
     full_outcome: str = 'failure'
+    partial: bool = False
     try:
         try:
             channel: YouTubeChannel = (
@@ -2269,6 +2347,7 @@ async def _scrape_one_queued(
                     stored_counts=_stored_counts(meta),
                     listing_resume=listing_resume,
                     on_listing_checkpoint=on_listing_checkpoint,
+                    exchange_video_ids=exchange_video_ids,
                 )
             )
         except TopicChannelError as exc:
@@ -2383,6 +2462,10 @@ async def _scrape_one_queued(
                     outcome='terminated',
                 ).inc()
             return
+        except ChannelPartialScrapeError as exc:
+            # Written to disk; deliver what it found, then retry soon.
+            channel = exc.channel
+            partial = True
         except (RuntimeError, OSError) as exc:
             await queue.mark_soft_unavailable(
                 channel_id, last_error=str(exc),
@@ -2436,11 +2519,19 @@ async def _scrape_one_queued(
                 exchange_url=settings.exchange_url,
                 video_fm=AssetFileManagement(settings.video_data_directory),
                 summary=summary,
-                exchange_ids=(
-                    known_video_ids.exchange_ids
-                    if known_video_ids is not None else None
-                ),
+                exchange_ids=exchange_video_ids.fetched,
             )
+        if partial:
+            handled: str | None = await _retry_partial_scrape(
+                queue, member, meta, channel,
+                progress=progress,
+                needs_full_enumeration=needs_full_enumeration,
+                force_mode=force_mode,
+                extra=extra,
+            )
+            if handled is not None:
+                full_outcome = handled
+                return
         committed: bool | None = await queue.update_tier(
             channel_id,
             sub_count=channel.subscriber_count,
@@ -3077,6 +3168,14 @@ async def _try_scrape_channel(
         proxy: str | None = await _try_scrape_channel_typed(
             channel, settings, extra,
         )
+        if channel.content_partial:
+            # This path writes complete content only; the queue path
+            # writes partial records. /about stays best-effort here.
+            _record_scrape_failure(
+                channel, 'Incomplete channel scrape',
+                RuntimeError(channel.partial_error), extra,
+            )
+            return False, None
         return True, proxy
     except asyncio.CancelledError:
         raise
@@ -3117,7 +3216,7 @@ def _channel_has_no_content(
     videos, playlists, courses, podcasts, or products to upload.
     '''
     if (channel.video_ids or channel.playlists or channel.courses
-            or channel.podcast_ids or channel.products):
+            or channel.podcast_ids or channel.merch):
         return False
 
     if channel.description:
@@ -3151,7 +3250,7 @@ def _channel_has_no_content(
             'playlists_length': len(channel.playlists),
             'courses_length': len(channel.courses),
             'podcast_ids_length': len(channel.podcast_ids),
-            'products_length': len(channel.products),
+            'products_length': len(channel.merch),
         },
     )
     return True
@@ -3207,6 +3306,57 @@ async def _add_channel_to_rss_queue(
         'Added channel to the RSS queue after its first full scrape',
         extra=extra | {'rss_added': str(added)},
     )
+
+
+async def _retry_partial_scrape(
+    queue: RedisChannelScrapeQueue,
+    member: str,
+    meta: dict[str, str],
+    channel: YouTubeChannel,
+    *,
+    progress: ChannelScrapeProgress,
+    needs_full_enumeration: bool,
+    force_mode: str | None,
+    extra: dict[str, str],
+) -> str | None:
+    '''Schedule an early retry of a channel whose partial scrape was
+    written: keep a resumable listing's resume point, but neither
+    count the scrape as successful (no tier update, no enumeration
+    mark) nor clear a forced re-scrape.
+
+    :returns: the scrape's outcome, ``'partial'`` or ``'superseded'``
+        (the channel's state changed during the scrape and is kept);
+        None when the channel's partial retries are used up, so the
+        caller handles the scrape as a successful one.
+    '''
+    retried: bool | None = await queue.mark_partial(
+        channel.channel_id,
+        last_error=channel.partial_error,
+        now=time.time(),
+        progress=progress,
+    )
+    if retried is None:
+        return 'superseded'
+    if not retried:
+        logging.info(
+            'Partial channel scrape retries used up; counting this '
+            'scrape as a successful one',
+            extra=extra | {'partial_error': channel.partial_error or ''},
+        )
+        return None
+    await _record_full_enumeration(
+        queue, member, meta, channel,
+        metadata_only=False,
+        needs_full_enumeration=needs_full_enumeration,
+        extra=extra,
+    )
+    CHANNEL_SCRAPE_OUTCOMES.labels(outcome='partial').inc()
+    if force_mode:
+        CHANNEL_FORCE_RESCRAPE_TOTAL.labels(
+            mode=force_mode,
+            outcome='partial',
+        ).inc()
+    return 'partial'
 
 
 def _needs_full_enumeration(
@@ -3307,6 +3457,7 @@ def _listing_checkpoint_fn(
     stored_counts: StoredCounts,
     redis: aioredis.Redis | None,
     http_client: httpx.AsyncClient,
+    exchange_video_ids: ExchangeVideoIds,
     extra: dict[str, str],
 ) -> ListingCheckpointFn | None:
     '''Build the checkpoint callback of a resumable full listing.
@@ -3320,7 +3471,6 @@ def _listing_checkpoint_fn(
     if redis is None:
         return None
     state: dict[str, str] = dict(listing_resume)
-    exchange_ids: set[str] | None = None
     video_fm: AssetFileManagement = AssetFileManagement(
         settings.video_data_directory,
     )
@@ -3329,13 +3479,9 @@ def _listing_checkpoint_fn(
         channel: YouTubeChannel, tab: str, token: str,
         video_ids: set[str],
     ) -> None:
-        nonlocal exchange_ids
         if _channel_has_low_subscribers(channel, settings, stored_counts):
             return
-        if exchange_ids is None:
-            exchange_ids = await fetch_exchange_video_ids(
-                http_client, settings.exchange_url, channel.channel_id,
-            )
+        exchange_ids: set[str] = await exchange_video_ids.get()
         summary: FullScrapeSummary = FullScrapeSummary(channel.channel_id)
         await queue_video_ids(
             video_ids, channel.channel_id, channel.channel_handle,
@@ -3412,17 +3558,59 @@ async def _load_known_video_ids(
     return known
 
 
-async def _merge_previous_video_ids(
+class ExchangeVideoIds:
+    '''The exchange's video IDs of one channel, fetched at most once
+    per scrape and shared by the listing checkpoints, the video_ids
+    union and the video delivery.'''
+
+    def __init__(
+        self,
+        http_client: httpx.AsyncClient,
+        exchange_url: str,
+        channel_id: str,
+        known: set[str] | None = None,
+    ) -> None:
+        ''':param known: the IDs when already fetched, e.g. by
+            :class:`KnownVideoIds`'''
+        self._http_client: httpx.AsyncClient = http_client
+        self._exchange_url: str = exchange_url
+        self._channel_id: str = channel_id
+        self._ids: set[str] | None = known
+
+    @property
+    def fetched(self) -> set[str] | None:
+        '''The IDs when fetched, else None.'''
+        return self._ids
+
+    async def get(self) -> set[str]:
+        '''The IDs, fetched on first use.
+
+        :raises FilterQueryError: the lookup failed; a later call
+            tries again
+        '''
+        if self._ids is None:
+            self._ids = await fetch_exchange_video_ids(
+                self._http_client, self._exchange_url, self._channel_id,
+            )
+        return self._ids
+
+
+async def _union_previous_video_ids(
     fm: AssetFileManagement,
     filename: str,
     channel: YouTubeChannel,
-    exchange_ids: set[str],
+    exchange_video_ids: ExchangeVideoIds,
 ) -> None:
-    '''Restore the full video_ids list after an early-stopped scrape.
+    '''Restore the full video_ids list after an incomplete
+    enumeration, so the written record never drops a stored ID.
 
-    Adds the video_ids of the channel's previous file (current copy,
-    else the uploaded copy) and the exchange's IDs for the channel to
-    the newly scraped ones, so the written record stays complete.
+    Adds to the newly scraped IDs the video_ids of the channel's
+    previous local record (current copy, else the uploaded copy) and
+    the exchange's video IDs for the channel. Uploads never carry
+    video_ids, so the exchange's channel records cannot supply them,
+    and the union only keeps the local record whole: when the
+    exchange's video IDs cannot be read, the local record's IDs are
+    kept and the scrape carries on.
     '''
     previous: set[str] = set()
     reader: Callable[[str], Awaitable[dict]]
@@ -3433,20 +3621,37 @@ async def _merge_previous_video_ids(
             continue
         previous = set(data.get('video_ids') or [])
         break
+    exchange_ids: set[str]
+    try:
+        exchange_ids = await exchange_video_ids.get()
+    except FilterQueryError as exc:
+        logging.warning(
+            'Could not read the exchange video IDs of the channel; '
+            'keeping the local record\'s IDs only',
+            exc=exc,
+            extra={'channel_id': channel.channel_id},
+        )
+        exchange_ids = set()
     channel.video_ids |= previous | exchange_ids
 
 
 async def _persist_scraped_channel(
     fm: AssetFileManagement, filename: str,
     channel: YouTubeChannel, channel_handle: str,
+    only_fetched: bool = False,
 ) -> bool:
     '''
     Write the freshly-scraped channel to disk. Returns True on success,
     False on a write failure (caller should propagate as "failed").
+
+    :param only_fetched: write only the keys the scrape fetched (a
+        partial scrape), see :meth:`YouTubeChannel.to_dict`
     '''
     try:
         await fm.write_file(
-            filename, channel.to_dict(with_video_ids=True),
+            filename, channel.to_dict(
+                with_video_ids=True, only_fetched=only_fetched,
+            ),
         )
     except Exception as exc:
         logging.error(
@@ -3696,6 +3901,7 @@ async def _do_scrape_channel_to_disk_typed(
     stored_counts: StoredCounts = NO_STORED_COUNTS,
     listing_resume: dict[str, str] | None = None,
     on_listing_checkpoint: ListingCheckpointFn | None = None,
+    exchange_video_ids: ExchangeVideoIds,
 ) -> YouTubeChannel:
     '''Typed-exception variant of
     :func:`_do_scrape_channel_to_disk` for the
@@ -3720,6 +3926,8 @@ async def _do_scrape_channel_to_disk_typed(
     :param listing_resume: makes a full listing resumable; see
         :meth:`YouTubeChannel.scrape`.
     :param on_listing_checkpoint: see :meth:`YouTubeChannel.scrape`.
+    :param exchange_video_ids: the exchange's video IDs of the
+        channel, which keep an incomplete enumeration's video_ids whole.
 
     Raises:
         ChannelNotFoundError: channel returned 404.
@@ -3790,17 +3998,6 @@ async def _do_scrape_channel_to_disk_typed(
     ):
         raise ChannelTooSmallError(channel)
 
-    if not metadata_only and _channel_has_no_content(
-        channel, scrape_proxy_ip,
-        scrape_proxy_network, scrape_proxy,
-        channel_handle,
-    ):
-        raise ChannelNoContentError(
-            f'channel {channel_handle!r} scraped but '
-            f'has no content',
-            channel,
-        )
-
     if _persisted_channel_id_or_fail(
         channel.channel_id or extra.get('channel_id'), extra=extra,
     ) is None:
@@ -3815,14 +4012,29 @@ async def _do_scrape_channel_to_disk_typed(
         )
 
     if not channel.video_ids_complete:
-        await _merge_previous_video_ids(
-            fm, filename, channel,
-            known_video_ids.exchange_ids
-            if known_video_ids is not None else set(),
+        await _union_previous_video_ids(
+            fm, filename, channel, exchange_video_ids,
+        )
+
+    # A scrape whose content fetch failed is written even without
+    # content: its metadata is what the exchange should get. When only
+    # /about failed, the content is complete and the check applies.
+    partial: bool = bool(channel.partial_error)
+    if not metadata_only and not channel.content_partial and (
+        _channel_has_no_content(
+            channel, scrape_proxy_ip,
+            scrape_proxy_network, scrape_proxy,
+            channel_handle,
+        )
+    ):
+        raise ChannelNoContentError(
+            f'channel {channel_handle!r} scraped but '
+            f'has no content',
+            channel,
         )
 
     if not await _persist_scraped_channel(
-        fm, filename, channel, channel_handle,
+        fm, filename, channel, channel_handle, only_fetched=partial,
     ):
         raise RuntimeError(
             f'failed to persist scraped channel '
@@ -3851,11 +4063,11 @@ async def _do_scrape_channel_to_disk_typed(
         scraper='channel_scraper',
         entity='channel',
         api=success_api,
-        outcome='success',
+        outcome='partial' if partial else 'success',
         worker_id=get_worker_id(),
     ).observe(time.monotonic() - scrape_start)
     logging.info(
-        'Downloaded channel',
+        'Downloaded partial channel' if partial else 'Downloaded channel',
         extra={
             'channel_handle': channel_handle,
             'proxy_ip': scrape_proxy_ip,
@@ -3863,6 +4075,8 @@ async def _do_scrape_channel_to_disk_typed(
             'proxy_network': scrape_proxy_network,
         },
     )
+    if partial:
+        raise ChannelPartialScrapeError(channel)
     return channel
 
 
