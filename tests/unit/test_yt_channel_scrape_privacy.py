@@ -138,6 +138,7 @@ class TestTypedScrapeToDisk(unittest.IsolatedAsyncioTestCase):
                     await _do_scrape_channel_to_disk_typed(
                         settings, fm, 'handle', FILENAME,
                         {'channel_id': CHANNEL_ID},
+                        exchange_video_ids=MagicMock(),
                     )
             self.assertTrue(
                 (Path(tmp) / f'{FILENAME}.low_subs').exists())

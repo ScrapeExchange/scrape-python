@@ -84,7 +84,10 @@ class TestWritePartialRecord(unittest.IsolatedAsyncioTestCase):
     async def _scrape(self) -> None:
         await scraper._do_scrape_channel_to_disk_typed(
             _settings(self.directory.name), self.fm, 'channel', FILENAME,
-            {'channel_id': CHANNEL_ID}, http_client=AsyncMock(),
+            {'channel_id': CHANNEL_ID},
+            exchange_video_ids=scraper.ExchangeVideoIds(
+                AsyncMock(), 'https://scrape.exchange', CHANNEL_ID,
+            ),
         )
 
     async def test_partial_record_written_and_raised(self) -> None:
@@ -232,6 +235,21 @@ class TestScrapeOnePartial(unittest.IsolatedAsyncioTestCase):
             'CHANNEL_FORCE_RESCRAPE_TOTAL'
         ].labels.assert_called_with(mode='full', outcome='partial')
 
+
+    async def test_exchange_ids_fetched_once_are_reused(self) -> None:
+        async def scrape(*_args, **kwargs) -> None:
+            # The union fetched the exchange's video IDs.
+            kwargs['exchange_video_ids']._ids = {'x1'}
+            raise ChannelPartialScrapeError(self.channel)
+
+        self.mocks['_do_scrape_channel_to_disk_typed'].side_effect = scrape
+        await self._run()
+        self.assertEqual(
+            self.mocks['queue_channel_videos'].await_args.kwargs[
+                'exchange_ids'
+            ],
+            {'x1'},
+        )
 
     async def test_superseded_partial_leaves_queue_alone(self) -> None:
         self.queue.mark_partial.return_value = None

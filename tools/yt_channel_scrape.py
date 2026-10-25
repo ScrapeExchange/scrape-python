@@ -2285,6 +2285,13 @@ async def _scrape_one_queued(
             settings, creator_map_backend, http_client, channel_id,
             extra,
         )
+    exchange_video_ids: ExchangeVideoIds = ExchangeVideoIds(
+        http_client, settings.exchange_url, channel_id,
+        known=(
+            known_video_ids.exchange_ids
+            if known_video_ids is not None else None
+        ),
+    )
     # A full enumeration may take hours for a channel with millions
     # of videos: resume it from where an earlier scrape stopped.
     listing_resume: dict[str, str] | None = None
@@ -2297,6 +2304,7 @@ async def _scrape_one_queued(
             stored_counts=_stored_counts(meta),
             redis=creator_map_backend.redis_client,
             http_client=http_client,
+            exchange_video_ids=exchange_video_ids,
             extra=extra,
         )
     full_outcome: str = 'failure'
@@ -2312,7 +2320,7 @@ async def _scrape_one_queued(
                     stored_counts=_stored_counts(meta),
                     listing_resume=listing_resume,
                     on_listing_checkpoint=on_listing_checkpoint,
-                    http_client=http_client,
+                    exchange_video_ids=exchange_video_ids,
                 )
             )
         except TopicChannelError as exc:
@@ -2484,10 +2492,7 @@ async def _scrape_one_queued(
                 exchange_url=settings.exchange_url,
                 video_fm=AssetFileManagement(settings.video_data_directory),
                 summary=summary,
-                exchange_ids=(
-                    known_video_ids.exchange_ids
-                    if known_video_ids is not None else None
-                ),
+                exchange_ids=exchange_video_ids.fetched,
             )
         if partial:
             handled: str | None = await _retry_partial_scrape(
@@ -3425,6 +3430,7 @@ def _listing_checkpoint_fn(
     stored_counts: StoredCounts,
     redis: aioredis.Redis | None,
     http_client: httpx.AsyncClient,
+    exchange_video_ids: ExchangeVideoIds,
     extra: dict[str, str],
 ) -> ListingCheckpointFn | None:
     '''Build the checkpoint callback of a resumable full listing.
@@ -3438,7 +3444,6 @@ def _listing_checkpoint_fn(
     if redis is None:
         return None
     state: dict[str, str] = dict(listing_resume)
-    exchange_ids: set[str] | None = None
     video_fm: AssetFileManagement = AssetFileManagement(
         settings.video_data_directory,
     )
@@ -3447,13 +3452,9 @@ def _listing_checkpoint_fn(
         channel: YouTubeChannel, tab: str, token: str,
         video_ids: set[str],
     ) -> None:
-        nonlocal exchange_ids
         if _channel_has_low_subscribers(channel, settings, stored_counts):
             return
-        if exchange_ids is None:
-            exchange_ids = await fetch_exchange_video_ids(
-                http_client, settings.exchange_url, channel.channel_id,
-            )
+        exchange_ids: set[str] = await exchange_video_ids.get()
         summary: FullScrapeSummary = FullScrapeSummary(channel.channel_id)
         await queue_video_ids(
             video_ids, channel.channel_id, channel.channel_handle,
@@ -3530,25 +3531,59 @@ async def _load_known_video_ids(
     return known
 
 
+class ExchangeVideoIds:
+    '''The exchange's video IDs of one channel, fetched at most once
+    per scrape and shared by the listing checkpoints, the video_ids
+    union and the video delivery.'''
+
+    def __init__(
+        self,
+        http_client: httpx.AsyncClient,
+        exchange_url: str,
+        channel_id: str,
+        known: set[str] | None = None,
+    ) -> None:
+        ''':param known: the IDs when already fetched, e.g. by
+            :class:`KnownVideoIds`'''
+        self._http_client: httpx.AsyncClient = http_client
+        self._exchange_url: str = exchange_url
+        self._channel_id: str = channel_id
+        self._ids: set[str] | None = known
+
+    @property
+    def fetched(self) -> set[str] | None:
+        '''The IDs when fetched, else None.'''
+        return self._ids
+
+    async def get(self) -> set[str]:
+        '''The IDs, fetched on first use.
+
+        :raises FilterQueryError: the lookup failed; a later call
+            tries again
+        '''
+        if self._ids is None:
+            self._ids = await fetch_exchange_video_ids(
+                self._http_client, self._exchange_url, self._channel_id,
+            )
+        return self._ids
+
+
 async def _union_previous_video_ids(
     fm: AssetFileManagement,
     filename: str,
     channel: YouTubeChannel,
-    *,
-    http_client: httpx.AsyncClient,
-    exchange_url: str,
-    exchange_ids: set[str] | None,
+    exchange_video_ids: ExchangeVideoIds,
 ) -> None:
     '''Restore the full video_ids list after an incomplete
     enumeration, so the written record never drops a stored ID.
 
     Adds to the newly scraped IDs the video_ids of the channel's
     previous local record (current copy, else the uploaded copy) and
-    the exchange's video IDs for the channel (*exchange_ids* when
-    already fetched). Uploads never carry video_ids, so the exchange's
-    channel records cannot supply them, and the union only keeps the
-    local record whole: when the exchange's video IDs cannot be read,
-    the local record's IDs are kept and the scrape carries on.
+    the exchange's video IDs for the channel. Uploads never carry
+    video_ids, so the exchange's channel records cannot supply them,
+    and the union only keeps the local record whole: when the
+    exchange's video IDs cannot be read, the local record's IDs are
+    kept and the scrape carries on.
     '''
     previous: set[str] = set()
     reader: Callable[[str], Awaitable[dict]]
@@ -3559,47 +3594,18 @@ async def _union_previous_video_ids(
             continue
         previous = set(data.get('video_ids') or [])
         break
-    if exchange_ids is None:
-        try:
-            exchange_ids = await fetch_exchange_video_ids(
-                http_client, exchange_url, channel.channel_id,
-            )
-        except FilterQueryError as exc:
-            logging.warning(
-                'Could not read the exchange video IDs of the channel; '
-                'keeping the local record\'s IDs only',
-                exc=exc,
-                extra={'channel_id': channel.channel_id},
-            )
-            exchange_ids = set()
+    exchange_ids: set[str]
+    try:
+        exchange_ids = await exchange_video_ids.get()
+    except FilterQueryError as exc:
+        logging.warning(
+            'Could not read the exchange video IDs of the channel; '
+            'keeping the local record\'s IDs only',
+            exc=exc,
+            extra={'channel_id': channel.channel_id},
+        )
+        exchange_ids = set()
     channel.video_ids |= previous | exchange_ids
-
-
-async def _union_previous_video_ids_with(
-    fm: AssetFileManagement,
-    filename: str,
-    channel: YouTubeChannel,
-    *,
-    http_client: httpx.AsyncClient | None,
-    exchange_url: str,
-    exchange_ids: set[str] | None,
-) -> None:
-    ''':func:`_union_previous_video_ids` with *http_client*, or with
-    a short-lived client when it is None.'''
-    if http_client is not None:
-        await _union_previous_video_ids(
-            fm, filename, channel, http_client=http_client,
-            exchange_url=exchange_url, exchange_ids=exchange_ids,
-        )
-        return
-    client: httpx.AsyncClient
-    async with httpx.AsyncClient(
-        timeout=10.0, follow_redirects=True,
-    ) as client:
-        await _union_previous_video_ids(
-            fm, filename, channel, http_client=client,
-            exchange_url=exchange_url, exchange_ids=exchange_ids,
-        )
 
 
 async def _persist_scraped_channel(
@@ -3868,7 +3874,7 @@ async def _do_scrape_channel_to_disk_typed(
     stored_counts: StoredCounts = NO_STORED_COUNTS,
     listing_resume: dict[str, str] | None = None,
     on_listing_checkpoint: ListingCheckpointFn | None = None,
-    http_client: httpx.AsyncClient | None = None,
+    exchange_video_ids: ExchangeVideoIds,
 ) -> YouTubeChannel:
     '''Typed-exception variant of
     :func:`_do_scrape_channel_to_disk` for the
@@ -3893,9 +3899,8 @@ async def _do_scrape_channel_to_disk_typed(
     :param listing_resume: makes a full listing resumable; see
         :meth:`YouTubeChannel.scrape`.
     :param on_listing_checkpoint: see :meth:`YouTubeChannel.scrape`.
-    :param http_client: client for the exchange lookups that keep an
-        incomplete enumeration's video_ids whole; a short-lived one is
-        used when None.
+    :param exchange_video_ids: the exchange's video IDs of the
+        channel, which keep an incomplete enumeration's video_ids whole.
 
     Raises:
         ChannelNotFoundError: channel returned 404.
@@ -3980,14 +3985,8 @@ async def _do_scrape_channel_to_disk_typed(
         )
 
     if not channel.video_ids_complete:
-        await _union_previous_video_ids_with(
-            fm, filename, channel,
-            http_client=http_client,
-            exchange_url=settings.exchange_url,
-            exchange_ids=(
-                known_video_ids.exchange_ids
-                if known_video_ids is not None else None
-            ),
+        await _union_previous_video_ids(
+            fm, filename, channel, exchange_video_ids,
         )
 
     # A scrape whose content fetch failed is written even without

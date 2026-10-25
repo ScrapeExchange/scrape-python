@@ -44,8 +44,9 @@ class TestUnionPreviousVideoIds(unittest.IsolatedAsyncioTestCase):
     async def _union(self, exchange_ids: set[str] | None = None) -> None:
         await scraper._union_previous_video_ids(
             self.fm, FILENAME, self.channel,
-            http_client=AsyncMock(), exchange_url=EXCHANGE_URL,
-            exchange_ids=exchange_ids,
+            scraper.ExchangeVideoIds(
+                AsyncMock(), EXCHANGE_URL, CHANNEL_ID, known=exchange_ids,
+            ),
         )
 
     async def test_prefers_local_file(self) -> None:
@@ -76,6 +77,42 @@ class TestUnionPreviousVideoIds(unittest.IsolatedAsyncioTestCase):
         self.video_ids.side_effect = FilterQueryError('down')
         await self._union()
         self.assertEqual(self.channel.video_ids, {'new1', 'old1'})
+
+
+class TestExchangeVideoIds(unittest.IsolatedAsyncioTestCase):
+
+    async def test_fetches_once(self) -> None:
+        fetch: AsyncMock = AsyncMock(return_value={'v1'})
+        ids: scraper.ExchangeVideoIds = scraper.ExchangeVideoIds(
+            AsyncMock(), EXCHANGE_URL, CHANNEL_ID,
+        )
+        self.assertIsNone(ids.fetched)
+        with patch.object(scraper, 'fetch_exchange_video_ids', fetch):
+            self.assertEqual(await ids.get(), {'v1'})
+            self.assertEqual(await ids.get(), {'v1'})
+        fetch.assert_awaited_once()
+        self.assertEqual(ids.fetched, {'v1'})
+
+    async def test_known_ids_are_not_fetched(self) -> None:
+        fetch: AsyncMock = AsyncMock()
+        ids: scraper.ExchangeVideoIds = scraper.ExchangeVideoIds(
+            AsyncMock(), EXCHANGE_URL, CHANNEL_ID, known={'k1'},
+        )
+        with patch.object(scraper, 'fetch_exchange_video_ids', fetch):
+            self.assertEqual(await ids.get(), {'k1'})
+        fetch.assert_not_awaited()
+
+    async def test_failure_is_retried(self) -> None:
+        fetch: AsyncMock = AsyncMock(
+            side_effect=[FilterQueryError('down'), {'v1'}],
+        )
+        ids: scraper.ExchangeVideoIds = scraper.ExchangeVideoIds(
+            AsyncMock(), EXCHANGE_URL, CHANNEL_ID,
+        )
+        with patch.object(scraper, 'fetch_exchange_video_ids', fetch):
+            with self.assertRaises(FilterQueryError):
+                await ids.get()
+            self.assertEqual(await ids.get(), {'v1'})
 
 
 class TestLegacyPathRejectsPartial(unittest.IsolatedAsyncioTestCase):

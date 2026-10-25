@@ -1180,6 +1180,7 @@ class TestTypedScrape(
                     'channel_status': 'existing',
                 },
                 metadata_only=True,
+                exchange_video_ids=MagicMock(),
             )
 
         self.assertEqual(
@@ -1226,6 +1227,7 @@ class TestTypedScrape(
                 'channel-UCabc00000000000000000000.json.br',
                 {'channel_id': 'UCabc00000000000000000000'},
                 metadata_only=False,
+                exchange_video_ids=MagicMock(),
             )
         mock_no_content.assert_called_once()
         mock_persist.assert_not_awaited()
@@ -1995,13 +1997,21 @@ class TestParseListingResume(unittest.TestCase):
 
 class TestListingCheckpoint(unittest.IsolatedAsyncioTestCase):
     def _checkpoint(self, queue: AsyncMock, stored: dict[str, str]):
-        from tools.yt_channel_scrape import _listing_checkpoint_fn
+        from tools.yt_channel_scrape import (
+            ExchangeVideoIds,
+            _listing_checkpoint_fn,
+        )
         settings: MagicMock = _mock_settings()
         settings.video_data_directory = '/tmp'
         return _listing_checkpoint_fn(
             queue, 'i:UCabc00000000000000000000', stored,
             settings=settings, stored_counts=(None, None),
-            redis=MagicMock(), http_client=MagicMock(), extra={},
+            redis=MagicMock(), http_client=MagicMock(),
+            exchange_video_ids=ExchangeVideoIds(
+                MagicMock(), settings.exchange_url,
+                'UCabc00000000000000000000',
+            ),
+            extra={},
         )
 
     async def test_queues_ids_then_saves_token(self) -> None:
@@ -2054,5 +2064,6 @@ class TestListingCheckpoint(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(_listing_checkpoint_fn(
             _mock_queue(), 'i:UCabc00000000000000000000', {},
             settings=_mock_settings(), stored_counts=(None, None),
-            redis=None, http_client=MagicMock(), extra={},
+            redis=None, http_client=MagicMock(),
+            exchange_video_ids=MagicMock(), extra={},
         ))
