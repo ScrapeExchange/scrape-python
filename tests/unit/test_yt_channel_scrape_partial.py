@@ -152,6 +152,7 @@ class TestScrapeOnePartial(unittest.IsolatedAsyncioTestCase):
         )
         self.queue.get_meta.return_value = {}
         self.queue.update_tier.return_value = True
+        self.queue.mark_partial.return_value = True
         self.channel: MagicMock = MagicMock()
         self.channel.channel_id = CHANNEL_ID
         self.channel.channel_handle = 'channel'
@@ -193,9 +194,13 @@ class TestScrapeOnePartial(unittest.IsolatedAsyncioTestCase):
         await self._run()
         self.mocks['queue_channel_videos'].assert_awaited_once()
         self.mocks['_enqueue_discovered_channel_links'].assert_awaited()
-        self.queue.mark_soft_unavailable.assert_awaited_once_with(
-            CHANNEL_ID, last_error='Failed channel tabs: videos',
+        self.queue.mark_partial.assert_awaited_once()
+        call = self.queue.mark_partial.await_args
+        self.assertEqual(call.args, (CHANNEL_ID,))
+        self.assertEqual(
+            call.kwargs['last_error'], 'Failed channel tabs: videos',
         )
+        self.queue.mark_soft_unavailable.assert_not_awaited()
         self.queue.update_tier.assert_not_awaited()
         self.queue.clear_force_rescrape.assert_not_awaited()
         self.mocks['_add_channel_to_rss_queue'].assert_not_awaited()
@@ -227,6 +232,23 @@ class TestScrapeOnePartial(unittest.IsolatedAsyncioTestCase):
         self.mocks[
             'CHANNEL_FORCE_RESCRAPE_TOTAL'
         ].labels.assert_called_with(mode='full', outcome='partial')
+
+
+    async def test_used_up_retries_count_as_success(self) -> None:
+        self.queue.mark_partial.return_value = False
+        await self._run()
+        self.queue.update_tier.assert_awaited_once()
+        self.queue.mark_soft_unavailable.assert_not_awaited()
+        fields: set[str] = set()
+        for call in self.queue.set_meta.await_args_list:
+            fields |= set(call.kwargs)
+        # The listing is still incomplete: never marked enumerated.
+        self.assertNotIn(VIDEO_IDS_ENUMERATED_FIELD, fields)
+        self.assertNotIn(
+            'partial',
+            [c.kwargs.get('outcome') for c in
+             self.mocks['CHANNEL_SCRAPE_OUTCOMES'].labels.call_args_list],
+        )
 
 
 if __name__ == '__main__':

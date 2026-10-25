@@ -188,7 +188,7 @@ redis.call('HSET', KEYS[2], ARGV[1], tostring(tier))
 redis.call('HSET', KEYS[1],
     'successful_scrapes', ARGV[3], 'next_full_scrape', ARGV[4],
     'last_attempt_at', ARGV[7])
-redis.call('HDEL', KEYS[1], 'unavailable_attempts')
+redis.call('HDEL', KEYS[1], 'unavailable_attempts', 'partial_attempts')
 if completed_tier >= 0 then
     redis.call('HDEL', KEYS[1], 'missing_subscriber_attempts',
         'subscriber_count_not_public')
@@ -704,6 +704,23 @@ class ChannelScrapeQueueSettings(BaseSettings):
     channel_unavailable_soft_retry_seconds: int = Field(
         default=3 * 86400,
     )
+    channel_partial_retry_seconds: int = Field(
+        default=6 * 3600,
+        gt=0,
+        description=(
+            'Delay before retrying a channel whose scrape was written '
+            'but partial (part of its content could not be fetched).'
+        ),
+    )
+    channel_partial_max_retries: int = Field(
+        default=3,
+        ge=0,
+        description=(
+            'Consecutive partial scrapes retried after '
+            'channel_partial_retry_seconds; the next one counts as a '
+            'successful scrape and is scheduled by its tier.'
+        ),
+    )
     channel_unpublished_subscriber_retries: int = Field(
         default=1,
         ge=0,
@@ -820,6 +837,15 @@ class ChannelScrapeQueue(ABC):
         *,
         last_error: str | None,
     ) -> None: ...
+
+    @abstractmethod
+    async def mark_partial(
+        self,
+        channel_id: str,
+        *,
+        last_error: str | None,
+        now: float,
+    ) -> bool: ...
 
     @abstractmethod
     async def mark_not_found_confirmed(
@@ -1398,6 +1424,7 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
         pipe.hdel(
             self._k_meta(member),
             'unavailable_attempts',
+            'partial_attempts',
             'missing_subscriber_attempts',
             'subscriber_count_not_public',
         )
@@ -1615,6 +1642,55 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
                 ),
             },
         )
+
+    async def mark_partial(
+        self,
+        channel_id: str,
+        *,
+        last_error: str | None,
+        now: float,
+    ) -> bool:
+        '''Retry a channel whose scrape was written but partial.
+
+        Reschedules the popped channel in its stored tier after
+        ``channel_partial_retry_seconds`` and counts the consecutive
+        partial scrape in ``partial_attempts``. Unlike
+        :meth:`mark_soft_unavailable` it never moves the channel toward
+        ``hard_unavailable``: its data was delivered.
+
+        :returns: False once ``channel_partial_max_retries`` retries
+            are used up; the caller then handles the scrape as a
+            success (:meth:`update_tier` clears ``partial_attempts``).
+        '''
+        member: str = f'i:{channel_id}'
+        meta_key: str = self._k_meta(member)
+        attempts: int = await self._redis.hincrby(
+            meta_key, 'partial_attempts', 1,
+        )
+        if attempts > self._settings.channel_partial_max_retries:
+            return False
+        tier: int = await self._stored_tier(channel_id)
+        pipe: aioredis.client.Pipeline = (
+            self._redis.pipeline(transaction=True)
+        )
+        candidate_tier: int
+        for candidate_tier in range(len(self._tiers)):
+            pipe.zrem(self._k_scheduled(candidate_tier), member)
+        pipe.zadd(
+            self._k_scheduled(tier),
+            {member: now + self._settings.channel_partial_retry_seconds},
+        )
+        pipe.hset(
+            meta_key,
+            mapping={
+                'state': ChannelState.SCHEDULED.value,
+                'last_attempt_at': str(int(now)),
+                'last_partial_error': last_error or '',
+            },
+        )
+        await pipe.execute()
+        await self.recount_listing(member)
+        return True
 
     async def mark_not_found_confirmed(
         self,

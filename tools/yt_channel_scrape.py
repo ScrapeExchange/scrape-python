@@ -416,6 +416,31 @@ class ChannelSettings(YouTubeScraperSettings):
     channel_unavailable_soft_retry_seconds: int = Field(
         default=3 * 86400,
     )
+    channel_partial_retry_seconds: int = Field(
+        default=6 * 3600,
+        gt=0,
+        validation_alias=AliasChoices(
+            'CHANNEL_PARTIAL_RETRY_SECONDS',
+            'channel_partial_retry_seconds',
+        ),
+        description=(
+            'Seconds before retrying a channel whose scrape was '
+            'uploaded but partial (part of its content could not be '
+            'fetched).'
+        ),
+    )
+    channel_partial_max_retries: int = Field(
+        default=3,
+        ge=0,
+        validation_alias=AliasChoices(
+            'CHANNEL_PARTIAL_MAX_RETRIES',
+            'channel_partial_max_retries',
+        ),
+        description=(
+            'Consecutive partial scrapes of a channel that are retried '
+            'early; the next one counts as a normal scrape.'
+        ),
+    )
     channel_soft_reap_interval_seconds: int = Field(
         default=60,
     )
@@ -752,6 +777,12 @@ async def _run_worker(
                 channel_unavailable_soft_retry_seconds=(
                     settings
                     .channel_unavailable_soft_retry_seconds
+                ),
+                channel_partial_retry_seconds=(
+                    settings.channel_partial_retry_seconds
+                ),
+                channel_partial_max_retries=(
+                    settings.channel_partial_max_retries
                 ),
                 channel_soft_reap_interval_seconds=(
                     settings
@@ -2460,14 +2491,13 @@ async def _scrape_one_queued(
                     if known_video_ids is not None else None
                 ),
             )
-        if partial:
+        if partial and await _retry_partial_scrape(
+            queue, member, meta, channel,
+            needs_full_enumeration=needs_full_enumeration,
+            force_mode=force_mode,
+            extra=extra,
+        ):
             full_outcome = 'partial'
-            await _finish_partial_scrape(
-                queue, member, meta, channel,
-                needs_full_enumeration=needs_full_enumeration,
-                force_mode=force_mode,
-                extra=extra,
-            )
             return
         committed: bool | None = await queue.update_tier(
             channel_id,
@@ -3245,7 +3275,7 @@ async def _add_channel_to_rss_queue(
     )
 
 
-async def _finish_partial_scrape(
+async def _retry_partial_scrape(
     queue: RedisChannelScrapeQueue,
     member: str,
     meta: dict[str, str],
@@ -3254,19 +3284,32 @@ async def _finish_partial_scrape(
     needs_full_enumeration: bool,
     force_mode: str | None,
     extra: dict[str, str],
-) -> None:
-    '''Schedule a quick retry of a channel whose partial scrape was
+) -> bool:
+    '''Schedule an early retry of a channel whose partial scrape was
     written: keep a resumable listing's resume point, but neither
     count the scrape as successful (no tier update, no enumeration
-    mark) nor clear a forced re-scrape.'''
+    mark) nor clear a forced re-scrape.
+
+    :returns: False when the channel's partial retries are used up;
+        the caller then handles the scrape as a successful one.
+    '''
+    retried: bool = await queue.mark_partial(
+        channel.channel_id,
+        last_error=channel.partial_error,
+        now=time.time(),
+    )
+    if not retried:
+        logging.info(
+            'Partial channel scrape retries used up; counting this '
+            'scrape as a successful one',
+            extra=extra | {'partial_error': channel.partial_error or ''},
+        )
+        return False
     await _record_full_enumeration(
         queue, member, meta, channel,
         metadata_only=False,
         needs_full_enumeration=needs_full_enumeration,
         extra=extra,
-    )
-    await queue.mark_soft_unavailable(
-        channel.channel_id, last_error=channel.partial_error,
     )
     CHANNEL_SCRAPE_OUTCOMES.labels(outcome='partial').inc()
     if force_mode:
@@ -3274,6 +3317,7 @@ async def _finish_partial_scrape(
             mode=force_mode,
             outcome='partial',
         ).inc()
+    return True
 
 
 def _needs_full_enumeration(
