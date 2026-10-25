@@ -15,10 +15,7 @@ from scrape_exchange.channel_scrape_queue import (
     ChannelScrapeProgress,
 )
 from scrape_exchange.file_management import AssetFileManagement
-from scrape_exchange.youtube.channel_video_refresh import (
-    ExchangeRecordError,
-    FilterQueryError,
-)
+from scrape_exchange.youtube.channel_video_refresh import FilterQueryError
 from scrape_exchange.youtube.youtube_channel import (
     ABOUT_FIELDS,
     YouTubeChannel,
@@ -69,7 +66,6 @@ class TestWritePartialRecord(unittest.IsolatedAsyncioTestCase):
             self.directory.name,
         )
         self.channel: YouTubeChannel = _partial_channel()
-        self.record_ids: AsyncMock = AsyncMock(return_value=set())
         self.video_ids: AsyncMock = AsyncMock(return_value=set())
         self.privacy: AsyncMock = AsyncMock(return_value=False)
         for target, value in (
@@ -78,7 +74,6 @@ class TestWritePartialRecord(unittest.IsolatedAsyncioTestCase):
             ('_reject_topic_channel_if_needed',
              AsyncMock(return_value=False)),
             ('_apply_privacy_limits', self.privacy),
-            ('fetch_exchange_channel_video_ids', self.record_ids),
             ('fetch_exchange_video_ids', self.video_ids),
         ):
             patcher = patch.object(scraper, target, value)
@@ -114,29 +109,18 @@ class TestWritePartialRecord(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data['video_ids'], [])
 
     async def test_lookup_failure_writes_nothing(self) -> None:
-        for error in (
-            ExchangeRecordError('down'), FilterQueryError('down'),
-        ):
-            with self.subTest(error=type(error).__name__):
-                self.record_ids.side_effect = None
-                self.video_ids.side_effect = None
-                if isinstance(error, ExchangeRecordError):
-                    self.record_ids.side_effect = error
-                else:
-                    self.video_ids.side_effect = error
-                with self.assertRaises(RuntimeError) as ctx:
-                    await self._scrape()
-                self.assertNotIsInstance(
-                    ctx.exception, ChannelPartialScrapeError,
-                )
-                with self.assertRaises(Exception):
-                    await self.fm.read_file(FILENAME)
+        self.video_ids.side_effect = FilterQueryError('down')
+        with self.assertRaises(RuntimeError) as ctx:
+            await self._scrape()
+        self.assertNotIsInstance(ctx.exception, ChannelPartialScrapeError)
+        with self.assertRaises(Exception):
+            await self.fm.read_file(FILENAME)
 
     async def test_privacy_limits_still_apply(self) -> None:
         self.privacy.return_value = True
         with self.assertRaises(scraper.ChannelTooSmallError):
             await self._scrape()
-        self.record_ids.assert_not_awaited()
+        self.video_ids.assert_not_awaited()
 
 
 class TestScrapeOnePartial(unittest.IsolatedAsyncioTestCase):

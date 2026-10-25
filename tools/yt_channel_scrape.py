@@ -99,12 +99,10 @@ from scrape_exchange.channel_scrape_queue import (
     parse_channel_priority_weights,
 )
 from scrape_exchange.youtube.channel_video_refresh import (
-    ExchangeRecordError,
     FilterQueryError,
     FullScrapeSummary,
     KnownVideoIds,
     below_min_subscribers,
-    fetch_exchange_channel_video_ids,
     fetch_exchange_video_ids,
     queue_channel_videos,
     queue_video_ids,
@@ -3536,16 +3534,15 @@ async def _union_previous_video_ids(
     enumeration, so the written record never drops a stored ID.
 
     Adds to the newly scraped IDs the video_ids of the channel's
-    previous record (current local copy, else the uploaded copy, else
-    the exchange's channel records) and the exchange's video IDs for
-    the channel (*exchange_ids* when already fetched).
+    previous local record (current copy, else the uploaded copy) and
+    the exchange's video IDs for the channel (*exchange_ids* when
+    already fetched). Uploads never carry video_ids, so the exchange's
+    channel records cannot supply them.
 
-    :raises ExchangeRecordError: the exchange's channel records could
-        not be read
     :raises FilterQueryError: the exchange's video IDs could not be
         read
     '''
-    previous: set[str] | None = None
+    previous: set[str] = set()
     reader: Callable[[str], Awaitable[dict]]
     for reader in (fm.read_file, fm.read_uploaded):
         try:
@@ -3554,10 +3551,6 @@ async def _union_previous_video_ids(
             continue
         previous = set(data.get('video_ids') or [])
         break
-    if previous is None:
-        previous = await fetch_exchange_channel_video_ids(
-            http_client, exchange_url, channel.channel_id,
-        )
     if exchange_ids is None:
         exchange_ids = await fetch_exchange_video_ids(
             http_client, exchange_url, channel.channel_id,
@@ -3980,7 +3973,7 @@ async def _do_scrape_channel_to_disk_typed(
                     if known_video_ids is not None else None
                 ),
             )
-        except (ExchangeRecordError, FilterQueryError) as exc:
+        except FilterQueryError as exc:
             # Writing now could drop video IDs the exchange holds.
             raise RuntimeError(
                 f'channel {channel.channel_id!r}: cannot read its '
