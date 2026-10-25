@@ -218,6 +218,21 @@ class TestScrapeOnePartial(unittest.IsolatedAsyncioTestCase):
         ].labels.assert_called_with(mode='full', outcome='partial')
 
 
+    async def test_superseded_partial_leaves_queue_alone(self) -> None:
+        self.queue.mark_partial.return_value = None
+        await self._run()
+        self.assertEqual(
+            self.queue.mark_partial.await_args.kwargs['progress'],
+            ChannelScrapeProgress(1, 11),
+        )
+        self.queue.update_tier.assert_not_awaited()
+        self.queue.mark_soft_unavailable.assert_not_awaited()
+        self.assertNotIn(
+            'partial',
+            [c.kwargs.get('outcome') for c in
+             self.mocks['CHANNEL_SCRAPE_OUTCOMES'].labels.call_args_list],
+        )
+
     async def test_used_up_retries_count_as_success(self) -> None:
         self.queue.mark_partial.return_value = False
         await self._run()

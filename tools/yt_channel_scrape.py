@@ -2489,14 +2489,17 @@ async def _scrape_one_queued(
                     if known_video_ids is not None else None
                 ),
             )
-        if partial and await _retry_partial_scrape(
-            queue, member, meta, channel,
-            needs_full_enumeration=needs_full_enumeration,
-            force_mode=force_mode,
-            extra=extra,
-        ):
-            full_outcome = 'partial'
-            return
+        if partial:
+            handled: str | None = await _retry_partial_scrape(
+                queue, member, meta, channel,
+                progress=progress,
+                needs_full_enumeration=needs_full_enumeration,
+                force_mode=force_mode,
+                extra=extra,
+            )
+            if handled is not None:
+                full_outcome = handled
+                return
         committed: bool | None = await queue.update_tier(
             channel_id,
             sub_count=channel.subscriber_count,
@@ -3279,30 +3282,36 @@ async def _retry_partial_scrape(
     meta: dict[str, str],
     channel: YouTubeChannel,
     *,
+    progress: ChannelScrapeProgress,
     needs_full_enumeration: bool,
     force_mode: str | None,
     extra: dict[str, str],
-) -> bool:
+) -> str | None:
     '''Schedule an early retry of a channel whose partial scrape was
     written: keep a resumable listing's resume point, but neither
     count the scrape as successful (no tier update, no enumeration
     mark) nor clear a forced re-scrape.
 
-    :returns: False when the channel's partial retries are used up;
-        the caller then handles the scrape as a successful one.
+    :returns: the scrape's outcome, ``'partial'`` or ``'superseded'``
+        (the channel's state changed during the scrape and is kept);
+        None when the channel's partial retries are used up, so the
+        caller handles the scrape as a successful one.
     '''
-    retried: bool = await queue.mark_partial(
+    retried: bool | None = await queue.mark_partial(
         channel.channel_id,
         last_error=channel.partial_error,
         now=time.time(),
+        progress=progress,
     )
+    if retried is None:
+        return 'superseded'
     if not retried:
         logging.info(
             'Partial channel scrape retries used up; counting this '
             'scrape as a successful one',
             extra=extra | {'partial_error': channel.partial_error or ''},
         )
-        return False
+        return None
     await _record_full_enumeration(
         queue, member, meta, channel,
         metadata_only=False,
@@ -3315,7 +3324,7 @@ async def _retry_partial_scrape(
             mode=force_mode,
             outcome='partial',
         ).inc()
-    return True
+    return 'partial'
 
 
 def _needs_full_enumeration(

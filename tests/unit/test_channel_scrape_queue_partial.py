@@ -81,6 +81,38 @@ class TestMarkPartial(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(results, [True, True, True, False])
 
+    async def test_terminal_state_set_during_scrape_is_kept(
+        self,
+    ) -> None:
+        await self.queue.mark(MEMBER, state=ChannelState.REMOVED)
+        retried: bool | None = await self.queue.mark_partial(
+            CHANNEL_ID, last_error='boom', now=1000.0,
+        )
+        self.assertIsNone(retried)
+        self.assertEqual(
+            await self.queue.get_state(MEMBER), ChannelState.REMOVED,
+        )
+        tier: int
+        for tier in range(len(self.queue._tiers)):
+            self.assertIsNone(await self.redis.zscore(
+                f'youtube:channel:queue:scheduled:{tier}', MEMBER,
+            ))
+        self.assertIsNone(await self.redis.hget(META, 'partial_attempts'))
+
+    async def test_superseded_scrape_is_ignored(self) -> None:
+        stored: ChannelScrapeProgress = (
+            await self.queue.get_scrape_progress(CHANNEL_ID, existing=True)
+        )
+        stale: ChannelScrapeProgress = ChannelScrapeProgress(
+            stored.successful_scrapes - 1, stored.next_full_scrape,
+        )
+        self.assertIsNone(await self.queue.mark_partial(
+            CHANNEL_ID, last_error='boom', now=1000.0, progress=stale,
+        ))
+        self.assertTrue(await self.queue.mark_partial(
+            CHANNEL_ID, last_error='boom', now=1000.0, progress=stored,
+        ))
+
     async def test_success_clears_partial_attempts(self) -> None:
         await self.queue.mark_partial(
             CHANNEL_ID, last_error='boom', now=1000.0,

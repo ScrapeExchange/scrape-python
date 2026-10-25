@@ -198,6 +198,35 @@ return {1, schedule_interval, missing_after, not_public}
 '''
 
 
+_MARK_PARTIAL_LUA: str = '''
+-- Reschedule a channel whose scrape was written but partial.
+-- KEYS: metadata, tier map, then every scheduled tier.
+-- ARGV: id, expected successful_scrapes ('' to skip the check),
+--   max retries, retry score, now, last error.
+-- Returns -1 when the state changed during the scrape (a terminal
+-- mark, or another scrape committed): the queue is left alone.
+-- Returns 0 when the retries are used up, else 1.
+if redis.call('HGET', KEYS[1], 'state') ~= 'scheduled' then
+    return -1
+end
+if ARGV[2] ~= ''
+        and redis.call('HGET', KEYS[1], 'successful_scrapes') ~= ARGV[2]
+then
+    return -1
+end
+local attempts = redis.call('HINCRBY', KEYS[1], 'partial_attempts', 1)
+if attempts > tonumber(ARGV[3]) then return 0 end
+local tier = tonumber(redis.call('HGET', KEYS[2], ARGV[1])) or 0
+if tier < 0 or tier >= #KEYS - 2 then tier = 0 end
+local member = 'i:' .. ARGV[1]
+for k = 3, #KEYS do redis.call('ZREM', KEYS[k], member) end
+redis.call('ZADD', KEYS[3 + tier], tonumber(ARGV[4]), member)
+redis.call('HSET', KEYS[1],
+    'last_attempt_at', ARGV[5], 'last_partial_error', ARGV[6])
+return 1
+'''
+
+
 _FIX_UNPUBLISHED_LUA: str = '''
 -- Move one channel that is stuck retrying a subscriber count YouTube
 -- does not publish into the catch-all tier, marked not public.
@@ -845,7 +874,8 @@ class ChannelScrapeQueue(ABC):
         *,
         last_error: str | None,
         now: float,
-    ) -> bool: ...
+        progress: ChannelScrapeProgress | None = None,
+    ) -> bool | None: ...
 
     @abstractmethod
     async def mark_not_found_confirmed(
@@ -1649,7 +1679,8 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
         *,
         last_error: str | None,
         now: float,
-    ) -> bool:
+        progress: ChannelScrapeProgress | None = None,
+    ) -> bool | None:
         '''Retry a channel whose scrape was written but partial.
 
         Reschedules the popped channel in its stored tier after
@@ -1658,37 +1689,34 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
         :meth:`mark_soft_unavailable` it never moves the channel toward
         ``hard_unavailable``: its data was delivered.
 
-        :returns: False once ``channel_partial_max_retries`` retries
-            are used up; the caller then handles the scrape as a
-            success (:meth:`update_tier` clears ``partial_attempts``).
+        Like :meth:`update_tier` it leaves the queue alone when the
+        channel's state changed during the scrape: a terminal mark
+        (e.g. an operator removal) or, with *progress*, another scrape
+        that committed meanwhile.
+
+        :returns: True when rescheduled; False once
+            ``channel_partial_max_retries`` retries are used up, so the
+            caller handles the scrape as a success (:meth:`update_tier`
+            clears ``partial_attempts``); None when superseded.
         '''
         member: str = f'i:{channel_id}'
-        meta_key: str = self._k_meta(member)
-        attempts: int = await self._redis.hincrby(
-            meta_key, 'partial_attempts', 1,
-        )
-        if attempts > self._settings.channel_partial_max_retries:
+        keys: list[str] = [
+            self._k_meta(member), self._k_tiers(),
+            *[self._k_scheduled(tier.tier) for tier in self._tiers],
+        ]
+        result: int = int(await self._redis.execute_command(
+            'EVAL', _MARK_PARTIAL_LUA, len(keys), *keys,
+            channel_id,
+            str(progress.successful_scrapes) if progress else '',
+            str(self._settings.channel_partial_max_retries),
+            str(now + self._settings.channel_partial_retry_seconds),
+            str(int(now)),
+            last_error or '',
+        ))
+        if result < 0:
+            return None
+        if result == 0:
             return False
-        tier: int = await self._stored_tier(channel_id)
-        pipe: aioredis.client.Pipeline = (
-            self._redis.pipeline(transaction=True)
-        )
-        candidate_tier: int
-        for candidate_tier in range(len(self._tiers)):
-            pipe.zrem(self._k_scheduled(candidate_tier), member)
-        pipe.zadd(
-            self._k_scheduled(tier),
-            {member: now + self._settings.channel_partial_retry_seconds},
-        )
-        pipe.hset(
-            meta_key,
-            mapping={
-                'state': ChannelState.SCHEDULED.value,
-                'last_attempt_at': str(int(now)),
-                'last_partial_error': last_error or '',
-            },
-        )
-        await pipe.execute()
         await self.recount_listing(member)
         return True
 
