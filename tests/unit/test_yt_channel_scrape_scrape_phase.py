@@ -71,6 +71,7 @@ def _mock_channel(
     channel.video_ids_complete = True
     channel.video_listing_complete = True
     channel.listing_state = {}
+    channel.partial_error = None
     channel.channel_id = 'UCabc00000000000000000000'
     channel.channel_handle = channel_handle
     channel.title = title
@@ -1133,6 +1134,7 @@ class TestTypedScrape(
         channel.channel_id = 'UCabc00000000000000000000'
         channel.channel_handle = 'channel'
         channel.about_page_succeeded = True
+        channel.partial_error = None
         settings: MagicMock = _mock_settings()
         settings.channel_data_directory = '/tmp'
         from tools.yt_channel_scrape import (
