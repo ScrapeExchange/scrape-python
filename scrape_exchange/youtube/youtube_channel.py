@@ -103,7 +103,7 @@ ABOUT_FIELDS: frozenset[str] = frozenset({
     'title', 'description', 'rss_url', 'available_country_codes',
     'keywords', 'is_family_safe', 'joined_date', 'view_count',
     'video_count', 'subscriber_count', 'external_urls', 'country',
-    'channel_thumbnails', 'banners', 'channel_links',
+    'channel_thumbnails', 'banners', 'channel_links', 'verified',
 })
 # Record keys a successful InnerTube browse fills
 # (parse_channel_video_data).

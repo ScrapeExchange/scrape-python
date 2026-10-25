@@ -191,6 +191,12 @@ class TestPartialScrape(PartialScrapeTestCase):
 
 class TestOnlyFetched(unittest.TestCase):
 
+    def test_about_fields_include_verified(self) -> None:
+        # Set by _extract_initial_data, which only /about calls;
+        # category is never scraped, so no field set holds it.
+        self.assertIn('verified', ABOUT_FIELDS)
+        self.assertNotIn('category', ABOUT_FIELDS | INNERTUBE_FIELDS)
+
     def test_only_fetched_omits_unfetched_keys(self) -> None:
         channel: YouTubeChannel = _channel()
         channel.title = 'Title'
