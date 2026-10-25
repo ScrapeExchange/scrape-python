@@ -3990,13 +3990,16 @@ async def _do_scrape_channel_to_disk_typed(
             ),
         )
 
-    # A partial scrape is written even without content: its metadata
-    # is what the exchange should get.
+    # A scrape whose content fetch failed is written even without
+    # content: its metadata is what the exchange should get. When only
+    # /about failed, the content is complete and the check applies.
     partial: bool = bool(channel.partial_error)
-    if not metadata_only and not partial and _channel_has_no_content(
-        channel, scrape_proxy_ip,
-        scrape_proxy_network, scrape_proxy,
-        channel_handle,
+    if not metadata_only and not channel.content_partial and (
+        _channel_has_no_content(
+            channel, scrape_proxy_ip,
+            scrape_proxy_network, scrape_proxy,
+            channel_handle,
+        )
     ):
         raise ChannelNoContentError(
             f'channel {channel_handle!r} scraped but '

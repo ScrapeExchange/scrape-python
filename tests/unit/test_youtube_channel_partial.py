@@ -104,6 +104,7 @@ class TestPartialScrape(PartialScrapeTestCase):
             channel, _tabs_mock(failed={'playlists'}), _about_ok,
         )
         self.assertIsNotNone(channel.partial_error)
+        self.assertTrue(channel.content_partial)
         self.assertNotIn('playlists', channel.fetched_fields)
         self.assertIn('merch', channel.fetched_fields)
         self.assertIn('video_ids', channel.fetched_fields)
@@ -124,6 +125,7 @@ class TestPartialScrape(PartialScrapeTestCase):
         tabs.browse_channel = AsyncMock(side_effect=RuntimeError('boom'))
         await self._scrape(channel, tabs, _about_ok)
         self.assertIsNotNone(channel.partial_error)
+        self.assertTrue(channel.content_partial)
         self.assertEqual(channel.fetched_fields, ABOUT_FIELDS)
         self.assertFalse(channel.video_ids_complete)
         self.assertFalse(channel.video_listing_complete)
@@ -132,6 +134,7 @@ class TestPartialScrape(PartialScrapeTestCase):
         channel: YouTubeChannel = _channel()
         await self._scrape(channel, _tabs_mock(), _about_fails)
         self.assertIsNotNone(channel.partial_error)
+        self.assertFalse(channel.content_partial)
         self.assertEqual(
             channel.fetched_fields, INNERTUBE_FIELDS | TAB_RECORD_FIELDS,
         )

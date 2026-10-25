@@ -449,6 +449,10 @@ class YouTubeChannel:
         # Set when part of the content fetch failed but the scrape
         # still collected useful data.
         self.partial_error: str | None = None
+        # True when the partial part is channel content (a tab or the
+        # InnerTube browse failed); False when only /about failed, so
+        # the content collected is complete.
+        self.content_partial: bool = False
         self.podcast_ids: set[str] = set()
         self.merch: set[YouTubeProduct] = set()
         self.courses: set[YouTubeCourse] = set()
@@ -1097,6 +1101,7 @@ class YouTubeChannel:
         ):
             return False
         self.partial_error = f'Incomplete channel content: {exc}'
+        self.content_partial = True
         self.video_ids_complete = False
         self.video_listing_complete = False
         _LOGGER.warning(
@@ -1992,6 +1997,7 @@ class YouTubeChannel:
         } - {'video_ids'}
         self.fetched_fields |= TAB_RECORD_FIELDS - failed_fields
         if failed_tabs:
+            self.content_partial = True
             self.partial_error = (
                 f'Failed channel tabs: {", ".join(sorted(failed_tabs))}'
             )

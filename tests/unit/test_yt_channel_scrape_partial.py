@@ -50,6 +50,7 @@ def _partial_channel() -> YouTubeChannel:
     channel.subscriber_count = 1_000_000
     channel.fetched_fields = set(ABOUT_FIELDS)
     channel.partial_error = 'Incomplete channel content: boom'
+    channel.content_partial = True
     channel.video_ids_complete = False
     channel.video_listing_complete = False
     return channel
@@ -117,6 +118,18 @@ class TestWritePartialRecord(unittest.IsolatedAsyncioTestCase):
             await self._scrape()
         data: dict = await self.fm.read_file(FILENAME)
         self.assertEqual(data['video_ids'], ['old1'])
+
+    async def test_about_only_partial_without_content_is_no_content(
+        self,
+    ) -> None:
+        # Only /about failed: the content is complete and empty.
+        self.channel.partial_error = 'About page scrape failed'
+        self.channel.content_partial = False
+        self.channel.video_ids_complete = True
+        with self.assertRaises(scraper.ChannelNoContentError):
+            await self._scrape()
+        with self.assertRaises(Exception):
+            await self.fm.read_file(FILENAME)
 
     async def test_privacy_limits_still_apply(self) -> None:
         self.privacy.return_value = True
