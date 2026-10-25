@@ -243,7 +243,9 @@ class YouTubeChannelTabs:
         '''True when a resumable full listing has reached the last page
         of every listed tab, possibly over several scrapes.'''
 
-        return self.resumable_listing and all(
+        return self.resumable_listing and not (
+            self.failed_tabs & LATEST_ORDERED_TABS
+        ) and all(
             state == LISTING_TAB_DONE
             for state in self.listing_state.values()
         )
@@ -917,6 +919,14 @@ class YouTubeChannelTabs:
         missing from the result and the scrape is therefore partial.'''
 
         self.failed_tabs.add(title)
+        saved_token: str | None = self.listing_resume.get(title)
+        if (
+            self.resumable_listing and title in LATEST_ORDERED_TABS
+            and title not in self.listing_state and saved_token
+        ):
+            # The tab failed before paging: keep the resume point an
+            # earlier scrape saved instead of restarting the tab.
+            self.listing_state[title] = saved_token
         self._record_early_stop(metric_base, title, 'error')
 
     def _record_early_stop(

@@ -187,6 +187,36 @@ class TestFailedContinuation(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(tabs.enumeration_complete)
 
 
+SHORTS_TAB: dict[str, Any] = {
+    'title': 'Shorts',
+    'endpoint': {'browseEndpoint': {'params': 'shorts_p'}},
+}
+
+
+class TestFailedListingTab(unittest.IsolatedAsyncioTestCase):
+    async def test_tab_failed_before_paging_keeps_listing_open(
+        self,
+    ) -> None:
+        tabs: YouTubeChannelTabs = _tabs({
+            'videos_p': RuntimeError('boom'),
+            'shorts_p': _page(['s1'], title='Shorts', params='shorts_p'),
+        }, listing_resume={})
+        _loaded_tabs(tabs, [VIDEOS_TAB, SHORTS_TAB])
+        await tabs.scrape_loaded_tabs()
+        self.assertEqual(tabs.failed_tabs, {'videos'})
+        self.assertEqual(tabs.listing_state, {'shorts': LISTING_TAB_DONE})
+        self.assertFalse(tabs.listing_complete)
+
+    async def test_failed_tab_keeps_its_saved_resume_point(self) -> None:
+        tabs: YouTubeChannelTabs = _tabs({
+            'videos_p': RuntimeError('boom'),
+        }, listing_resume={'videos': 'saved-token'})
+        _loaded_tabs(tabs, [VIDEOS_TAB])
+        await tabs.scrape_loaded_tabs()
+        self.assertEqual(tabs.listing_state, {'videos': 'saved-token'})
+        self.assertFalse(tabs.listing_complete)
+
+
 class TestFailedTab(unittest.IsolatedAsyncioTestCase):
     async def test_failed_initial_page_fails_only_that_tab(self) -> None:
         tabs: YouTubeChannelTabs = _tabs({
