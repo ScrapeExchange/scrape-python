@@ -840,13 +840,43 @@ async def _write_redis_counts(
         await redis.srem(CHANNELS_WITH_CATEGORY_COUNTS, channel_id)
 
 
+def apply_channel_updates(
+    channel: YouTubeChannel,
+    *,
+    category: FieldUpdatePlan,
+    country: FieldUpdatePlan,
+) -> None:
+    '''Set the planned category and country on *channel* and mark them
+    as fields of its record, see :func:`channel_record`.'''
+    if category.should_update:
+        channel.category = category.value
+        channel.fetched_fields.add('category')
+    if country.should_update:
+        channel.country = country.value
+        channel.fetched_fields.add('country')
+
+
+def channel_record(
+    channel: YouTubeChannel, *, with_video_ids: bool = False,
+) -> dict:
+    '''The record of a channel read from a file or the exchange, with
+    only the keys that record held plus the updated ones.
+
+    A partial scrape's record leaves out what it did not fetch; writing
+    those keys back as empty values would wipe the stored ones.
+    '''
+    return channel.to_dict(
+        with_video_ids=with_video_ids, only_fetched=True,
+    )
+
+
 async def _write_local_channel(
     evidence: ChannelEvidence,
     validator: SchemaValidator,
 ) -> None:
     if not evidence.filename:
         return
-    data: dict = evidence.channel.to_dict()
+    data: dict = channel_record(evidence.channel, with_video_ids=True)
     error: str | None = validator.validate(data)
     if error:
         raise ValueError(f'channel validation failed: {error}')
@@ -1058,14 +1088,11 @@ async def run(settings: BackfillSettings) -> RunSummary:
                     local_channel or api_channel
                 )
                 if evidence:
-                    if plan.category_update.should_update:
-                        evidence.channel.category = (
-                            plan.category_update.value
-                        )
-                    if plan.channel_country_update.should_update:
-                        evidence.channel.country = (
-                            plan.channel_country_update.value
-                        )
+                    apply_channel_updates(
+                        evidence.channel,
+                        category=plan.category_update,
+                        country=plan.channel_country_update,
+                    )
                     if settings.apply_local and evidence.source == 'local':
                         try:
                             await _write_local_channel(
@@ -1079,7 +1106,7 @@ async def run(settings: BackfillSettings) -> RunSummary:
                             )
                     if settings.apply_remote and client is not None:
                         try:
-                            data = evidence.channel.to_dict()
+                            data = channel_record(evidence.channel)
                             error = channel_validator.validate(data)
                             if error:
                                 raise ValueError(error)

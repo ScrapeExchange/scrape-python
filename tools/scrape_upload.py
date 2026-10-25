@@ -110,7 +110,6 @@ from scrape_exchange.youtube.exchange_channels_set import (
 )
 from scrape_exchange.youtube.uploaded_video_ids import UploadedVideoIds
 from scrape_exchange.youtube.youtube_channel import (
-    IDENTITY_FIELDS as CHANNEL_IDENTITY_FIELDS,
     YouTubeChannel,
     fallback_handle,
 )
@@ -204,26 +203,11 @@ def _youtube_video_record(data: dict[str, Any]) -> dict[str, Any]:
     return YouTubeVideo.from_dict(data).to_dict()
 
 
-def _fields_in_file(
-    record: dict[str, Any], data: dict[str, Any],
-) -> dict[str, Any]:
-    '''The keys of the normalised channel *record* that its file
-    *data* holds, plus the identity keys.
-
-    A partial scrape leaves out what it did not fetch. The server
-    merges uploads field by field, so adding those keys back as empty
-    defaults would wipe the stored values.
-    '''
-    return {
-        key: value for key, value in record.items()
-        if key in data or key in CHANNEL_IDENTITY_FIELDS
-    }
-
-
 def _youtube_channel_record(data: dict[str, Any]) -> dict[str, Any]:
-    return _fields_in_file(
-        YouTubeChannel.from_dict(data).to_dict(with_video_ids=False),
-        data,
+    # A partial scrape leaves out what it did not fetch: upload only
+    # the keys the file holds, see YouTubeChannel.from_dict.
+    return YouTubeChannel.from_dict(data).to_dict(
+        with_video_ids=False, only_fetched=True,
     )
 
 
@@ -735,7 +719,7 @@ class YouTubeChannelProcessor(AssetProcessor):
             # thumbnails, links and joined_date.
             return data
         channel.channel_handle = handle
-        return _fields_in_file(channel.to_dict(with_video_ids=False), data)
+        return channel.to_dict(with_video_ids=False, only_fetched=True)
 
     async def handle_brotli_error(
         self,

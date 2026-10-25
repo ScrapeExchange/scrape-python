@@ -229,5 +229,32 @@ class TestOnlyFetched(unittest.TestCase):
         ))
 
 
+
+class TestRoundTripKeepsKeys(unittest.TestCase):
+
+    def test_partial_file_round_trips_to_its_own_keys(self) -> None:
+        data: dict = {
+            'channel_id': CHANNEL_ID, 'channel_handle': 'handle',
+            'url': f'https://www.youtube.com/channel/{CHANNEL_ID}',
+            'title': 'Title', 'posts': [], 'video_ids': ['v1'],
+        }
+        channel: YouTubeChannel = YouTubeChannel.from_dict(data)
+        self.assertEqual(
+            set(channel.to_dict(only_fetched=True, with_video_ids=True)),
+            set(data),
+        )
+        self.assertEqual(
+            set(channel.to_dict(only_fetched=True)), set(data) - {'video_ids'},
+        )
+
+    def test_full_file_round_trips_to_every_key(self) -> None:
+        full: dict = _channel().to_dict(with_video_ids=True)
+        channel: YouTubeChannel = YouTubeChannel.from_dict(full)
+        self.assertEqual(
+            set(channel.to_dict(only_fetched=True, with_video_ids=True)),
+            set(full),
+        )
+
+
 if __name__ == '__main__':
     unittest.main()

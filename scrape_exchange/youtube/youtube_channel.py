@@ -588,6 +588,11 @@ class YouTubeChannel:
         yt-dlp per record adds latency and resource cost without
         benefit. Callers that intend to scrape after reconstruction
         can opt in via ``with_download_client=True``.
+
+        :attr:`fetched_fields` is set to the keys *data* holds, so
+        ``to_dict(only_fetched=True)`` writes back what *data* held: a
+        partial record's left-out keys stay out instead of returning as
+        empty values that would wipe the stored ones.
         '''
         channel = YouTubeChannel(
             channel_handle=data.get('channel_handle'),
@@ -645,6 +650,7 @@ class YouTubeChannel:
             YouTubeProduct.from_dict(m) for m in data.get('merch', [])
         }
         channel.video_ids = set(data.get('video_ids', []))
+        channel.fetched_fields = set(data)
         return channel
 
     def _extract_initial_data(self, html_content: str) -> dict:

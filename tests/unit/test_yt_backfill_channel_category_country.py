@@ -1,3 +1,4 @@
+import json
 import unittest
 
 from pathlib import Path
@@ -8,11 +9,17 @@ from scrape_exchange.brotli import brotli_write_async
 from scrape_exchange.file_management import AssetFileManagement
 from scrape_exchange.youtube.youtube_channel import YouTubeChannel
 from scrape_exchange.youtube.youtube_video import YouTubeVideo
+from scrape_exchange.brotli import brotli_read_async
+from scrape_exchange.schema_validator import SchemaValidator
 from tools.yt_backfill_channel_category_country import (
     BackfillSettings,
     CATEGORY_THRESHOLD,
     ChannelEvidence,
+    FieldUpdatePlan,
     VideoEvidence,
+    _write_local_channel,
+    apply_channel_updates,
+    channel_record,
     build_channel_plan,
     configure_backfill_logging,
     count_video_categories,
@@ -277,6 +284,50 @@ class TestBackfillLogging(unittest.TestCase):
                 {'category': 'Education', 'video_count': 1},
                 {'category': 'Gaming', 'video_count': 1},
             ],
+        )
+
+
+class TestPartialChannelFile(unittest.IsolatedAsyncioTestCase):
+    '''A partial channel file leaves out what its scrape did not
+    fetch; rewriting or uploading it must not add those keys back as
+    empty values.'''
+
+    async def test_update_keeps_the_file_keys(self) -> None:
+        data: dict = {
+            'channel_id': 'UC123', 'channel_handle': 'handle',
+            'url': 'https://www.youtube.com/channel/UC123',
+            'title': 'Title', 'video_ids': ['aaaaaaaaaaa'],
+        }
+        schema_path: Path = (
+            Path(__file__).parent.parent
+            / 'collateral' / 'boinko-youtube-channel-schema.json'
+        )
+        validator: SchemaValidator = SchemaValidator(
+            json.loads(schema_path.read_text()),
+        )
+        with TemporaryDirectory() as channel_dir:
+            fm: AssetFileManagement = AssetFileManagement(channel_dir)
+            filename: str = 'channel-UC123.json.br'
+            await fm.write_file(filename, data)
+            evidence: ChannelEvidence = ChannelEvidence(
+                channel=YouTubeChannel.from_dict(await fm.read_file(filename)),
+                source='local', filename=filename, file_manager=fm,
+            )
+            apply_channel_updates(
+                evidence.channel,
+                category=FieldUpdatePlan(True, 'Music'),
+                country=FieldUpdatePlan(False),
+            )
+            await _write_local_channel(evidence, validator)
+            written: dict = await brotli_read_async(
+                Path(channel_dir) / filename,
+            )
+        self.assertEqual(set(written), set(data) | {'category'})
+        self.assertEqual(written['category'], 'Music')
+        self.assertEqual(written['video_ids'], ['aaaaaaaaaaa'])
+        self.assertEqual(
+            set(channel_record(evidence.channel)),
+            set(data) - {'video_ids'} | {'category'},
         )
 
 
