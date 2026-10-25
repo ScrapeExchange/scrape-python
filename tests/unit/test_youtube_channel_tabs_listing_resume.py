@@ -145,13 +145,17 @@ class TestResumableListingFailure(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(tabs.enumeration_complete)
         self.assertFalse(tabs.listing_complete)
 
-    async def test_failed_page_raises_when_not_resumable(self) -> None:
+    async def test_failed_page_stops_when_not_resumable(self) -> None:
+        '''Without a resumable listing a failed page still keeps the
+        IDs collected before it, and saves no token.'''
         tabs: YouTubeChannelTabs = _tabs({
             'videos_p': _first_page('v1', 't1'),
             't1': RuntimeError('boom'),
         })
-        with self.assertRaises(RuntimeError):
-            await tabs._scrape_tab(TAB_RENDERER, 'videos')
+        video_ids, *_ = await tabs._scrape_tab(TAB_RENDERER, 'videos')
+        self.assertEqual(video_ids, {'v1'})
+        self.assertEqual(tabs.listing_state, {})
+        self.assertFalse(tabs.enumeration_complete)
 
     async def test_known_id_listing_is_not_resumable(self) -> None:
         tabs: YouTubeChannelTabs = YouTubeChannelTabs(

@@ -29,6 +29,9 @@ from scrape_exchange._lazy_async_pool import _LazyAsyncPool
 from scrape_exchange.proxy_loader import _POOLED_HTTPX_LIMITS
 from scrape_exchange.youtube.youtube_types import YouTubeChannelPageType
 from scrape_exchange.youtube.channel_errors import (
+    ChannelNotFoundError,
+    ChannelRedirectedError,
+    ChannelTerminatedError,
     raise_for_channel_alert,
     raise_for_channel_redirect,
 )
@@ -231,6 +234,9 @@ class YouTubeChannelTabs:
         # or an earlier scrape), else the continuation token to resume
         # from.
         self.listing_state: dict[str, str] = {}
+        # Lowercase titles of the tabs whose scrape failed in this
+        # scrape; their content is missing from the result.
+        self.failed_tabs: set[str] = set()
 
     @property
     def listing_complete(self) -> bool:
@@ -346,13 +352,13 @@ class YouTubeChannelTabs:
         set[YouTubePost], set[YouTubeProduct]
     ]:
         extra: dict[str, str] = {'channel_id': self.channel_id}
-        tab_tasks: list[asyncio.Task[
+        tab_tasks: list[tuple[str, asyncio.Task[
             tuple[
                 set[str], set[str], set[YouTubePlaylist],
                 set[YouTubeCourse], set[YouTubePost],
                 set[YouTubeProduct],
             ]
-        ]] = []
+        ]]] = []
         for tab in tabs:
             tab_renderer: dict[str, any] = tab.get('tabRenderer')
 
@@ -372,9 +378,9 @@ class YouTubeChannelTabs:
             if self._listed_before(title):
                 continue
 
-            tab_tasks.append(asyncio.create_task(
+            tab_tasks.append((title, asyncio.create_task(
                 self._scrape_tab(tab_renderer, title),
-            ))
+            )))
 
         video_ids: set[str] = set()
         podcast_ids: set[str] = set()
@@ -382,12 +388,35 @@ class YouTubeChannelTabs:
         courses: set[YouTubeCourse] = set()
         posts: set[YouTubePost] = set()
         products: set[YouTubeProduct] = set()
-        results = await asyncio.gather(*tab_tasks)
-        for (
-            tab_video_ids, tab_podcast_ids,
-            tab_playlists, tab_courses, tab_posts,
-            tab_products,
-        ) in results:
+        results: list = await asyncio.gather(
+            *(task for _title, task in tab_tasks),
+            return_exceptions=True,
+        )
+        title: str
+        result: Any
+        for (title, _task), result in zip(tab_tasks, results):
+            if isinstance(result, (
+                asyncio.CancelledError, ChannelNotFoundError,
+                ChannelTerminatedError, ChannelRedirectedError,
+            )):
+                raise result
+            if isinstance(result, BaseException):
+                # The tab reported rather than returned a result: keep
+                # the other tabs' content and record the failure.
+                self.failed_tabs.add(title)
+                self.enumeration_complete = False
+                _LOGGER.warning(
+                    'Channel tab raised; the other tabs keep their '
+                    'content',
+                    exc=result,
+                    extra=extra | {'tab': title},
+                )
+                continue
+            (
+                tab_video_ids, tab_podcast_ids,
+                tab_playlists, tab_courses, tab_posts,
+                tab_products,
+            ) = result
             video_ids.update(tab_video_ids)
             podcast_ids.update(tab_podcast_ids)
             playlists.update(tab_playlists)
@@ -580,8 +609,15 @@ class YouTubeChannelTabs:
                 **metric_base,
                 item_type='video_id',
             ).inc(len(video_ids))
+            if title in self.failed_tabs:
+                # Paging stopped at a failed page: the tab did not
+                # finish, whatever IDs it collected.
+                outcome = 'failure'
             return video_ids, set(), set(), set(), set(), set()
-        except Exception:
+        except (
+            asyncio.CancelledError, ChannelNotFoundError,
+            ChannelTerminatedError, ChannelRedirectedError,
+        ):
             outcome = 'failure'
             if active_page_type is not None:
                 CHANNEL_TAB_PAGES.labels(
@@ -590,6 +626,23 @@ class YouTubeChannelTabs:
                     outcome='failure',
                 ).inc()
             raise
+        except Exception as exc:
+            # This tab failed; the content the other tabs collected is
+            # still worth keeping, so the scrape carries on without it.
+            outcome = 'failure'
+            if active_page_type is not None:
+                CHANNEL_TAB_PAGES.labels(
+                    **metric_base,
+                    page_type=active_page_type,
+                    outcome='failure',
+                ).inc()
+            self._mark_tab_failed(metric_base, title)
+            _LOGGER.warning(
+                'Channel tab failed; the other tabs keep their content',
+                exc=exc,
+                extra=extra | {'tab': title},
+            )
+            return video_ids, set(), set(), set(), set(), set()
         finally:
             CHANNEL_TAB_DURATION.labels(
                 **metric_base,
@@ -605,10 +658,12 @@ class YouTubeChannelTabs:
         adding the video IDs to *video_ids*.
 
         In a resumable full listing (*listing*) the tab continues from
-        its saved token when it has one, checkpoints every
-        :data:`LISTING_CHECKPOINT_PAGES` pages, and stops at a page
-        that fails after its retries, keeping that page's token in
-        :attr:`listing_state`. Otherwise a failed page raises.
+        its saved token when it has one and checkpoints every
+        :data:`LISTING_CHECKPOINT_PAGES` pages. In every mode a page
+        that fails after its retries stops the tab instead of raising:
+        the IDs collected before it are kept, the tab joins
+        :attr:`failed_tabs`, and only a resumable listing saves that
+        page's token in :attr:`listing_state`.
         '''
 
         extra: dict[str, str] = {'channel_id': self.channel_id, 'tab': title}
@@ -638,13 +693,15 @@ class YouTubeChannelTabs:
                         title, first_token, metric_base,
                     )
                     continue
-                if not listing:
-                    raise
-                self.listing_state[title] = continuation_token
-                self._record_early_stop(metric_base, title, 'error')
+                # Every mode stops the tab here: the IDs collected
+                # before the failed page are kept, and the scrape
+                # continues with the other tabs.
+                if listing:
+                    self.listing_state[title] = continuation_token
+                self._mark_tab_failed(metric_base, title)
                 _LOGGER.warning(
-                    'Full channel listing page failed; the next scrape '
-                    'resumes from it',
+                    'Channel tab page failed; keeping the IDs collected '
+                    'before it',
                     exc=exc,
                     extra=extra | {'video_ids_found': len(video_ids)},
                 )
@@ -852,6 +909,15 @@ class YouTubeChannelTabs:
             return False
         known: set[str] = await self.known_video_ids(page_ids)
         return set(page_ids) <= known
+
+    def _mark_tab_failed(
+        self, metric_base: dict[str, str], title: str,
+    ) -> None:
+        '''Record that the scrape of tab *title* failed: its content is
+        missing from the result and the scrape is therefore partial.'''
+
+        self.failed_tabs.add(title)
+        self._record_early_stop(metric_base, title, 'error')
 
     def _record_early_stop(
         self, metric_base: dict[str, str], title: str, reason: str,
