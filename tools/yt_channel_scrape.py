@@ -3136,9 +3136,9 @@ async def _try_scrape_channel(
         proxy: str | None = await _try_scrape_channel_typed(
             channel, settings, extra,
         )
-        if channel.partial_error:
-            # This path writes complete records only; the queue path
-            # writes partial ones.
+        if channel.content_partial:
+            # This path writes complete content only; the queue path
+            # writes partial records. /about stays best-effort here.
             _record_scrape_failure(
                 channel, 'Incomplete channel scrape',
                 RuntimeError(channel.partial_error), extra,

@@ -87,6 +87,7 @@ class TestLegacyPathRejectsPartial(unittest.IsolatedAsyncioTestCase):
 
         async def scrape(chan: YouTubeChannel, *_args) -> str:
             chan.partial_error = 'Failed channel tabs: playlists'
+            chan.content_partial = True
             return 'proxy'
 
         with patch.object(
@@ -97,6 +98,25 @@ class TestLegacyPathRejectsPartial(unittest.IsolatedAsyncioTestCase):
             )
         self.assertFalse(ok)
         self.assertIsNone(proxy)
+
+    async def test_about_only_partial_is_a_success(self) -> None:
+        # /about is best-effort on this path, as it always was.
+        channel: YouTubeChannel = YouTubeChannel(
+            'example', channel_id=CHANNEL_ID, with_download_client=False,
+        )
+
+        async def scrape(chan: YouTubeChannel, *_args) -> str:
+            chan.partial_error = 'About page scrape failed'
+            return 'proxy'
+
+        with patch.object(
+            scraper, '_try_scrape_channel_typed', side_effect=scrape,
+        ):
+            ok, proxy = await scraper._try_scrape_channel(
+                channel, AsyncMock(), AsyncMock(), CHANNEL_ID, {},
+            )
+        self.assertTrue(ok)
+        self.assertEqual(proxy, 'proxy')
 
 
 if __name__ == '__main__':
