@@ -1468,9 +1468,23 @@ class TestImportRevivesTerminal(
         )
         self.assertIn('revived from terminal: 1', report)
 
-    async def test_does_not_revive_topic_with_whitespace_handle(
+    def _topic_queue(self) -> RedisChannelScrapeQueue:
+        '''A six-tier queue, so the topic tier is index 4.'''
+
+        return RedisChannelScrapeQueue(
+            self.redis,
+            ChannelScrapeQueueSettings(
+                _env_file=None,
+                channel_priority_queues=(
+                    '7:1000000,30:100000,90:10000,180:1000,365:100,365:0'
+                ),
+            ),
+        )
+
+    async def test_import_revives_whitespace_topic_into_topic_tier(
         self,
     ) -> None:
+        self.queue = self._topic_queue()
         cid: str = 'UCXuqSBlHAE6Xw-yeJA0Tunw'
         member: str = f'i:{cid}'
         await self.queue.mark(
@@ -1483,20 +1497,45 @@ class TestImportRevivesTerminal(
             {'channel_id': cid, 'channel_handle': None},
         ])
 
-        self.assertTrue(
+        self.assertFalse(
             await self.redis.hexists(
                 'youtube:channel:topic', member,
             ),
         )
         self.assertEqual(
             await self.queue.get_state(member),
-            ChannelState.TOPIC,
+            ChannelState.SCHEDULED,
         )
-        self.assertNotIn('revived from terminal', report)
+        self.assertIn('revived from terminal: 1', report)
+        # The topic tier, never the highest-priority tier the
+        # default-tier fallback used to pick.
+        self.assertIsNotNone(
+            await self.redis.zscore(
+                self.queue._k_scheduled(4), member,
+            ),
+        )
+        self.assertIsNone(
+            await self.redis.zscore(
+                self.queue._k_scheduled(0), member,
+            ),
+        )
+        self.assertEqual(
+            await self.redis.hget(
+                self.queue._k_tiers(), cid,
+            ),
+            '4',
+        )
+        self.assertEqual(
+            await self.redis.hget(
+                self.queue._k_meta(member), 'topic',
+            ),
+            '1',
+        )
 
     async def test_revives_topic_without_whitespace_handle(
         self,
     ) -> None:
+        self.queue = self._topic_queue()
         cid: str = 'UCabc0000000000000000000'
         member: str = f'i:{cid}'
         await self.queue.mark(
@@ -3057,3 +3096,181 @@ class TestExportChannelHandleEnrichment(
         )
         rows: list[dict] = await self._export_rows('scheduled')
         self.assertNotIn('channel_handle', rows[0])
+
+
+TOPIC_QUEUES: str = '7:1000000,30:100000,90:10000,180:1000,365:100,365:0'
+
+
+class TestRequeueTopic(unittest.IsolatedAsyncioTestCase):
+    '''requeue-topic moves the parked topic channels into the topic
+    tier; retier keeps them there.'''
+
+    async def asyncSetUp(self) -> None:
+        self.redis = fakeredis.aioredis.FakeRedis(
+            decode_responses=True,
+        )
+        self.queue: RedisChannelScrapeQueue = (
+            RedisChannelScrapeQueue(
+                self.redis,
+                ChannelScrapeQueueSettings(
+                    _env_file=None,
+                    channel_priority_queues=TOPIC_QUEUES,
+                ),
+            )
+        )
+
+    async def asyncTearDown(self) -> None:
+        await self.redis.aclose()
+
+    async def _seed_topic(
+        self, cid: str, *, subscriber_count: int | None = None,
+    ) -> str:
+        member: str = f'i:{cid}'
+        await self.queue.mark(
+            member,
+            state=ChannelState.TOPIC,
+            extra={'channel_handle': f'{cid.lower()} - topic'},
+        )
+        if subscriber_count is not None:
+            await self.queue.set_meta(
+                member, subscriber_count=str(subscriber_count),
+            )
+        return member
+
+    def _ns(
+        self, *, apply: bool = False, limit: int | None = None,
+    ) -> argparse.Namespace:
+        return argparse.Namespace(
+            apply=apply, limit=limit, batch_size=1000,
+        )
+
+    async def _run(self, ns: argparse.Namespace) -> str:
+        from tools.yt_channel_queue import cmd_requeue_topic
+        out = StringIO()
+        with patch('sys.stdout', out):
+            rc: int = await cmd_requeue_topic(ns, self.queue)
+        self.assertEqual(rc, 0)
+        return out.getvalue()
+
+    async def test_requeue_topic_dry_run(self) -> None:
+        members: list[str] = [
+            await self._seed_topic('UCtopic00000000000000001'),
+            await self._seed_topic('UCtopic00000000000000002'),
+            await self._seed_topic('UCtopic00000000000000003'),
+        ]
+        # One parked low_subs channel whose stored record is a topic
+        # channel: the dry run must count it.
+        await self.queue.mark(
+            'i:UCtopic00000000000000004',
+            state=ChannelState.LOW_SUBS,
+            extra={'channel_handle': 'bulldog - topic'},
+        )
+
+        report: str = await self._run(self._ns())
+
+        self.assertIn('inspected=3', report)
+        self.assertIn('moved=0', report)
+        self.assertIn('dry_run=true', report)
+        self.assertIn('tier=4', report)
+        self.assertIn('low_subs_topic=1', report)
+        for member in members:
+            self.assertEqual(
+                await self.queue.get_state(member),
+                ChannelState.TOPIC,
+            )
+            self.assertIsNone(
+                await self.redis.zscore(
+                    self.queue._k_scheduled(4), member,
+                ),
+            )
+
+    async def test_requeue_topic_apply_limit(self) -> None:
+        members: list[str] = [
+            await self._seed_topic('UCtopic00000000000000005'),
+            await self._seed_topic('UCtopic00000000000000006'),
+            await self._seed_topic('UCtopic00000000000000007'),
+        ]
+
+        report: str = await self._run(self._ns(apply=True, limit=2))
+
+        self.assertIn('inspected=2', report)
+        self.assertIn('moved=2', report)
+        self.assertIn('dry_run=false', report)
+        moved: list[str] = [
+            member for member in members
+            if await self.redis.zscore(
+                self.queue._k_scheduled(4), member,
+            ) is not None
+        ]
+        self.assertEqual(len(moved), 2)
+        for member in moved:
+            cid: str = member[2:]
+            self.assertEqual(
+                await self.redis.hget(self.queue._k_tiers(), cid),
+                '4',
+            )
+            self.assertEqual(
+                await self.redis.hget(
+                    self.queue._k_meta(member), 'topic',
+                ),
+                '1',
+            )
+            self.assertFalse(
+                await self.redis.hexists(
+                    'youtube:channel:topic', member,
+                ),
+            )
+        self.assertEqual(
+            len(await self.redis.hkeys('youtube:channel:topic')), 1,
+        )
+
+    async def test_retier_keeps_topic_in_topic_tier(self) -> None:
+        from tools.yt_channel_queue import cmd_retier
+        cid: str = 'UCtopic00000000000000008'
+        member: str = f'i:{cid}'
+        await self.redis.hset(
+            self.queue._k_meta(member),
+            mapping={
+                'state': ChannelState.SCHEDULED.value,
+                'topic': '1',
+                'subscriber_count': '5',
+                'channel_handle': 'artist - topic',
+            },
+        )
+        await self.redis.zadd(
+            self.queue._k_scheduled(4), {member: 1.0},
+        )
+        await self.redis.hset(self.queue._k_tiers(), cid, '4')
+        settings = SimpleNamespace(
+            channel_data_directory=tempfile.mkdtemp(),
+            rss_priority_queues='1:1000000,24:0',
+            exchange_url='https://scrape.exchange',
+            api_key_id=None,
+            api_key_secret=None,
+        )
+        self.addCleanup(shutil.rmtree, settings.channel_data_directory)
+        ns = argparse.Namespace(
+            queue='channel', apply=True, batch_size=1000, limit=None,
+        )
+        with (
+            patch(
+                'tools.yt_channel_queue.YtChannelQueueSettings',
+                return_value=settings,
+            ),
+            patch('sys.stdout', StringIO()),
+            patch('sys.stderr', StringIO()),
+        ):
+            rc: int = await cmd_retier(ns, self.queue)
+        self.assertEqual(rc, 0)
+        # Five subscribers would otherwise be the zero-subscriber
+        # catch-all (tier 5); a topic channel stays in tier 4.
+        self.assertIsNotNone(
+            await self.redis.zscore(
+                self.queue._k_scheduled(4), member,
+            ),
+        )
+        self.assertIsNone(
+            await self.redis.zscore(
+                self.queue._k_scheduled(5), member,
+            ),
+        )

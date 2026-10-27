@@ -59,6 +59,7 @@ from scrape_exchange.youtube.channel_identity import (
     ChannelIdentityStore,
     is_valid_channel_handle,
 )
+from scrape_exchange.youtube.privacy import is_topic_channel_title
 
 from scrape_exchange.youtube.youtube_channel import (
     YouTubeChannel,
@@ -459,6 +460,31 @@ def _build_parser() -> ArgumentParser:
         type=int,
         default=None,
         help='Inspect at most N unique channels.',
+    )
+    c_requeue_topic: ArgumentParser = sub.add_parser(
+        'requeue-topic',
+        help=(
+            'Requeue the topic channels parked in the topic state into '
+            'the topic tier and flag them topic=1. Dry-run by default; '
+            'pass --apply to move them.'
+        ),
+    )
+    c_requeue_topic.add_argument(
+        '--apply',
+        action='store_true',
+        default=False,
+    )
+    c_requeue_topic.add_argument(
+        '--limit',
+        type=int,
+        default=None,
+        help='Inspect at most N parked topic channels.',
+    )
+    c_requeue_topic.add_argument(
+        '--batch-size',
+        type=int,
+        default=1000,
+        help='Redis SCAN batch size. Default 1000.',
     )
     c_export: ArgumentParser = sub.add_parser(
         'export',
@@ -1215,6 +1241,19 @@ def _parse_import_line(
     return (cid, handle)
 
 
+def _meta_subscriber_count(meta: dict[str, str]) -> int | None:
+    '''The subscriber count stored in channel meta; None when absent.'''
+
+    raw: str | None = meta.get('subscriber_count')
+    if not raw:
+        return None
+    try:
+        count: int = int(raw)
+    except ValueError:
+        return None
+    return count if count >= 0 else None
+
+
 async def _revive_if_terminal(
     queue: RedisChannelScrapeQueue,
     member: str,
@@ -1234,34 +1273,26 @@ async def _revive_if_terminal(
     member prefix. We pass an explicit normal-position
     score so revived channels do not jump to the front.
 
-    Topic members whose recorded channel handle contains
-    whitespace remain terminal. Such handles are fallback
-    display names, not valid YouTube handles.
+    A topic member is revived into the topic tier and flagged
+    ``topic=1``, so the video scraper exempts it from the privacy
+    limits. Its recorded handle may be a display name with
+    whitespace; that no longer keeps it parked.
 
     Returns ``(terminal_found, revived_from)``. The second
-    value is ``None`` when there was no terminal state or
-    when a whitespace-handle topic was intentionally retained.
+    value is ``None`` when there was no terminal state.
     '''
     state: ChannelState | None = await queue.get_state(member)
     if state is None or state not in ChannelState.terminal_states():
         return (False, None)
     if state == ChannelState.TOPIC:
-        raw_record: str | None = await queue._redis.hget(
-            queue._k_state(ChannelState.TOPIC), member,
+        meta: dict[str, str] = await queue.get_meta(member)
+        await queue.set_meta(member, topic='1')
+        await queue.unmark(
+            member,
+            score=time.time(),
+            tier=queue.topic_tier(_meta_subscriber_count(meta)),
         )
-        stored_handle: str = ''
-        if raw_record:
-            try:
-                record: object = json.loads(raw_record)
-            except ValueError:
-                record = None
-            if isinstance(record, dict):
-                raw_handle: object = record.get('channel_handle')
-                if isinstance(raw_handle, str):
-                    stored_handle = raw_handle
-        handle: str = stored_handle or channel_handle
-        if any(char.isspace() for char in handle):
-            return (True, None)
+        return (True, state)
     await queue.unmark(member, score=time.time())
     return (True, state)
 
@@ -1777,6 +1808,99 @@ async def cmd_reconcile(
         sys.stdout.write('\nrepaired:\n')
         for mode, count in sorted(report.repaired.items()):
             sys.stdout.write(f'  {mode:<48} {count:>12}\n')
+    return 0
+
+
+def _record_is_topic_channel(raw: str | None) -> bool:
+    '''True when a parked state hash's record describes a topic
+    channel, by its stored handle or title.'''
+
+    if not raw:
+        return False
+    try:
+        record: object = json.loads(raw)
+    except ValueError:
+        return False
+    if not isinstance(record, dict):
+        return False
+    for field in ('channel_handle', 'title'):
+        value: object = record.get(field)
+        if isinstance(value, str) and is_topic_channel_title(value):
+            return True
+    return False
+
+
+async def _count_low_subs_topic(
+    queue: RedisChannelScrapeQueue,
+    batch_size: int,
+    limit: int | None,
+) -> int:
+    '''Count parked ``low_subs`` members whose stored record is a topic
+    channel. These are the parked channels requeue-topic does not see,
+    worth reviewing before they are requeued by hand.'''
+
+    key: str = queue._k_state(ChannelState.LOW_SUBS)
+    found: int = 0
+    inspected: int = 0
+    async for _member, raw_value in queue._redis.hscan_iter(
+        key, count=batch_size,
+    ):
+        if limit is not None and inspected >= limit:
+            break
+        inspected += 1
+        if _record_is_topic_channel(raw_value):
+            found += 1
+    return found
+
+
+async def cmd_requeue_topic(
+    ns: Namespace,
+    queue: RedisChannelScrapeQueue,
+) -> int:
+    '''Requeue every channel parked in the ``topic`` state.
+
+    Each member is flagged ``topic=1`` so the video scraper exempts its
+    videos from the privacy limits, then requeued into the topic tier
+    with a normal-position score. A member whose stored subscriber
+    count qualifies for a higher-priority tier lands there instead.
+
+    Dry-run by default, like ``retier``: pass ``--apply`` to move the
+    members. The dry run also reports how many parked ``low_subs``
+    members are topic channels, which this command does not touch.
+    '''
+
+    batch_size: int = max(ns.batch_size, 1)
+    topic_key: str = queue._k_state(ChannelState.TOPIC)
+    now: float = time.time()
+    inspected: int = 0
+    moved: int = 0
+    async for member, _raw in queue._redis.hscan_iter(
+        topic_key, count=batch_size,
+    ):
+        if not member.startswith('i:'):
+            continue
+        if ns.limit is not None and inspected >= ns.limit:
+            break
+        inspected += 1
+        meta: dict[str, str] = await queue.get_meta(member)
+        tier: int = queue.topic_tier(_meta_subscriber_count(meta))
+        if not ns.apply:
+            continue
+        await queue.set_meta(member, topic='1')
+        await queue.unmark(member, score=now, tier=tier)
+        await queue.recount_listing(member)
+        moved += 1
+    report: str = (
+        f'requeue-topic: inspected={inspected} moved={moved} '
+        f'dry_run={str(not ns.apply).lower()} '
+        f'tier={queue.topic_tier()}'
+    )
+    if not ns.apply:
+        low_subs_topic: int = await _count_low_subs_topic(
+            queue, batch_size, ns.limit,
+        )
+        report += f' low_subs_topic={low_subs_topic}'
+    sys.stdout.write(f'{report}\n')
     return 0
 
 
@@ -2570,8 +2694,13 @@ async def cmd_retier(
             if subscriber_count is None:
                 write_status()
                 continue
-            new_tier: int = queue._tier_for_sub_count(
-                subscriber_count,
+            channel_meta: dict[str, str] = await queue.get_meta(
+                member,
+            )
+            new_tier: int = (
+                queue.topic_tier(subscriber_count)
+                if channel_meta.get('topic') == '1'
+                else queue._tier_for_sub_count(subscriber_count)
             )
             if new_tier == old_tier:
                 write_status()
@@ -2653,6 +2782,7 @@ _HANDLERS['ingest-sentinels'] = cmd_ingest_sentinels
 _HANDLERS['backfill-rss'] = cmd_backfill_rss
 _HANDLERS['reconcile'] = cmd_reconcile
 _HANDLERS['retier'] = cmd_retier
+_HANDLERS['requeue-topic'] = cmd_requeue_topic
 _HANDLERS['export'] = cmd_export
 _HANDLERS['export-rss'] = cmd_export_rss
 
