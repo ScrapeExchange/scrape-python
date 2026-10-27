@@ -1834,59 +1834,73 @@ def _record_is_topic_channel(raw: str | None) -> bool:
     return False
 
 
-async def _count_low_subs_topic(
+async def _parked_entries(
     queue: RedisChannelScrapeQueue,
+    state: ChannelState,
     batch_size: int,
-    limit: int | None,
-) -> int:
-    '''Count parked ``low_subs`` members whose stored record is a topic
-    channel. These are the parked channels requeue-topic does not see,
-    worth reviewing before they are requeued by hand.'''
+) -> list[tuple[str, str | None]]:
+    '''The ``(member, record)`` pairs parked in *state*, collected
+    before any is moved: moving members while HSCAN walks the hash
+    could skip or repeat some of them.'''
 
-    key: str = queue._k_state(ChannelState.LOW_SUBS)
-    found: int = 0
-    inspected: int = 0
-    async for _member, raw_value in queue._redis.hscan_iter(
-        key, count=batch_size,
+    entries: list[tuple[str, str | None]] = []
+    async for member, raw in queue._redis.hscan_iter(
+        queue._k_state(state), count=batch_size,
     ):
-        if limit is not None and inspected >= limit:
-            break
-        inspected += 1
-        if _record_is_topic_channel(raw_value):
-            found += 1
-    return found
+        entries.append((member, raw))
+    return entries
+
+
+async def _requeue_topic_member(
+    queue: RedisChannelScrapeQueue,
+    member: str,
+    *,
+    flag: bool,
+    now: float,
+) -> None:
+    '''Move a parked channel-ID *member* into its topic tier, flagging
+    it ``topic=1`` first when *flag*.'''
+
+    meta: dict[str, str] = await queue.get_meta(member)
+    if flag:
+        await queue.set_meta(member, topic='1')
+    await queue.unmark(
+        member, score=now,
+        tier=queue.topic_tier(_meta_subscriber_count(meta)),
+    )
 
 
 async def cmd_requeue_topic(
     ns: Namespace,
     queue: RedisChannelScrapeQueue,
 ) -> int:
-    '''Requeue every channel parked in the ``topic`` state.
+    '''Requeue the topic channels parked in the ``topic`` and
+    ``low_subs`` states.
 
-    Each member is flagged ``topic=1`` so the video scraper exempts its
-    videos from the privacy limits, then requeued into the topic tier
-    with a normal-position score. A member whose stored subscriber
-    count qualifies for a higher-priority tier lands there instead.
+    Every channel-ID member of the ``topic`` state is requeued into the
+    topic tier with a normal-position score; a member whose stored
+    subscriber count qualifies for a higher-priority tier lands there
+    instead. Those whose stored record is a topic channel are flagged
+    ``topic=1`` first, so the video scraper exempts their videos from
+    the privacy limits. ``low_subs`` members whose stored record is a
+    topic channel are flagged and requeued the same way; the other
+    ``low_subs`` members stay parked.
 
     Dry-run by default, like ``retier``: pass ``--apply`` to move the
-    members. The dry run also reports how many parked ``low_subs``
-    members are topic channels, which this command does not touch.
+    members. ``--limit`` caps the channel-ID members inspected across
+    both states.
     '''
 
     batch_size: int = max(ns.batch_size, 1)
-    topic_key: str = queue._k_state(ChannelState.TOPIC)
     now: float = time.time()
     inspected: int = 0
     moved: int = 0
     flagged: int = 0
     handles: int = 0
-    # Collected first: moving members while HSCAN walks the hash
-    # could skip or repeat some of them.
-    entries: list[tuple[str, str | None]] = []
-    async for member, raw in queue._redis.hscan_iter(
-        topic_key, count=batch_size,
-    ):
-        entries.append((member, raw))
+    low_subs_topic: int = 0
+    entries: list[tuple[str, str | None]] = await _parked_entries(
+        queue, ChannelState.TOPIC, batch_size,
+    )
     for member, raw in entries:
         if member.startswith('h:'):
             # A handle parked before resolution: back to resolution,
@@ -1906,25 +1920,34 @@ async def cmd_requeue_topic(
         is_topic: bool = _record_is_topic_channel(raw)
         if is_topic:
             flagged += 1
-        meta: dict[str, str] = await queue.get_meta(member)
-        tier: int = queue.topic_tier(_meta_subscriber_count(meta))
-        if not ns.apply:
+        if ns.apply:
+            await _requeue_topic_member(
+                queue, member, flag=is_topic, now=now,
+            )
+            moved += 1
+    # Topic channels the old scrapers parked as too small: the privacy
+    # rules no longer apply to them.
+    for member, raw in await _parked_entries(
+        queue, ChannelState.LOW_SUBS, batch_size,
+    ):
+        if not member.startswith('i:') or not _record_is_topic_channel(
+            raw,
+        ):
             continue
-        if is_topic:
-            await queue.set_meta(member, topic='1')
-        await queue.unmark(member, score=now, tier=tier)
-        moved += 1
+        if ns.limit is not None and inspected >= ns.limit:
+            break
+        inspected += 1
+        low_subs_topic += 1
+        if ns.apply:
+            await _requeue_topic_member(queue, member, flag=True, now=now)
+            moved += 1
     report: str = (
         f'requeue-topic: inspected={inspected} moved={moved} '
         f'flagged={flagged} handles={handles} '
+        f'low_subs_topic={low_subs_topic} '
         f'dry_run={str(not ns.apply).lower()} '
         f'tier={queue.topic_tier()}'
     )
-    if not ns.apply:
-        low_subs_topic: int = await _count_low_subs_topic(
-            queue, batch_size, ns.limit,
-        )
-        report += f' low_subs_topic={low_subs_topic}'
     sys.stdout.write(f'{report}\n')
     return 0
 

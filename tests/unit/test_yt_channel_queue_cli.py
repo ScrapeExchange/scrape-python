@@ -3180,7 +3180,8 @@ class TestRequeueTopic(unittest.IsolatedAsyncioTestCase):
 
         report: str = await self._run(self._ns())
 
-        self.assertIn('inspected=3', report)
+        # Three topic members plus the low_subs topic channel.
+        self.assertIn('inspected=4', report)
         self.assertIn('moved=0', report)
         self.assertIn('dry_run=true', report)
         self.assertIn('tier=4', report)
@@ -3294,6 +3295,42 @@ class TestRequeueTopic(unittest.IsolatedAsyncioTestCase):
             await self.redis.hget(
                 self.queue._k_tiers(), 'queen - topic',
             ),
+        )
+
+    async def test_requeue_topic_recovers_low_subs_topic(self) -> None:
+        topic: str = 'i:UCtopic00000000000000012'
+        await self.queue.mark(
+            topic,
+            state=ChannelState.LOW_SUBS,
+            extra={'channel_handle': '', 'channel_title': 'Money - Topic'},
+        )
+        await self.queue.set_meta(topic, subscriber_count='11')
+        personal: str = 'i:UCtopic00000000000000013'
+        await self.queue.mark(
+            personal,
+            state=ChannelState.LOW_SUBS,
+            extra={'channel_handle': 'me', 'channel_title': 'Me'},
+        )
+
+        dry: str = await self._run(self._ns())
+        self.assertIn('low_subs_topic=1', dry)
+        self.assertEqual(
+            await self.queue.get_state(topic), ChannelState.LOW_SUBS,
+        )
+
+        report: str = await self._run(self._ns(apply=True))
+
+        self.assertIn('low_subs_topic=1', report)
+        self.assertIn('moved=1', report)
+        self.assertIsNotNone(
+            await self.redis.zscore(self.queue._k_scheduled(4), topic),
+        )
+        self.assertEqual(
+            await self.redis.hget(self.queue._k_meta(topic), 'topic'),
+            '1',
+        )
+        self.assertEqual(
+            await self.queue.get_state(personal), ChannelState.LOW_SUBS,
         )
 
     async def test_retier_keeps_topic_in_topic_tier(self) -> None:

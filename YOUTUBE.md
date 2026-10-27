@@ -752,7 +752,10 @@ the topic tier and flags `topic=1` on those whose stored record
 has a ` - Topic` title or display-name handle; members parked by
 the old `-topic` handle rule are requeued without the flag, so
 they keep the privacy rules. Handle members (`h:`) go back to
-resolution. It is a dry run unless `--apply` is given:
+resolution. Topic channels the old scrapers parked in `low_subs`
+(their stored record has a ` - Topic` title) are flagged and
+requeued the same way; other `low_subs` members stay parked. It is
+a dry run unless `--apply` is given:
 
 ```bash
 PYTHONPATH=. uv run tools/yt_channel_queue.py requeue-topic
@@ -762,11 +765,11 @@ PYTHONPATH=. uv run tools/yt_channel_queue.py requeue-topic --apply
 
 The report line is
 `requeue-topic: inspected=N moved=M flagged=F handles=H
-dry_run=<bool> tier=T`, where `flagged` counts the channel-ID
-members flagged `topic=1` and `handles` the `h:` members, and a
-dry run also reports `low_subs_topic=K`: parked `low_subs`
-members whose stored record is a topic channel. Those are not
-touched by this command.
+low_subs_topic=K dry_run=<bool> tier=T`, where `inspected` counts
+the channel-ID members of both states (`--limit` caps it),
+`flagged` the `topic`-state members flagged `topic=1`, `handles`
+the `h:` members and `low_subs_topic` the topic channels found in
+`low_subs`. `tier` is the 0-based topic tier index.
 
 Rollout, once the new scrapers are deployed on every host:
 
