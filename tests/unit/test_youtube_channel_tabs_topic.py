@@ -131,6 +131,134 @@ def _uploads_continuation(
     }
 
 
+def _album_lockup(album_id: str) -> dict[str, Any]:
+    return {
+        'lockupViewModel': {
+            'contentId': album_id,
+            'contentType': 'LOCKUP_CONTENT_TYPE_ALBUM',
+            'metadata': {
+                'lockupMetadataViewModel': {
+                    'title': {'content': f'Album {album_id}'},
+                },
+            },
+            'contentImage': {
+                'collectionThumbnailViewModel': {
+                    'primaryThumbnail': {
+                        'thumbnailViewModel': {
+                            'overlays': [{
+                                'thumbnailOverlayBadgeViewModel': {
+                                    'thumbnailBadges': [{
+                                        'thumbnailBadgeViewModel': {
+                                            'text': '27 songs',
+                                        },
+                                    }],
+                                },
+                            }],
+                        },
+                    },
+                },
+            },
+        },
+    }
+
+
+def _grid_album(album_id: str) -> dict[str, Any]:
+    return {
+        'gridPlaylistRenderer': {
+            'playlistId': album_id,
+            'title': {'runs': [{'text': f'Album {album_id}'}]},
+            'videoCountShortText': {'simpleText': '11'},
+        },
+    }
+
+
+def _panel_token(token: str) -> dict[str, Any]:
+    return {
+        'continuationItemRenderer': {
+            'continuationEndpoint': {
+                'continuationCommand': {'token': token},
+            },
+        },
+    }
+
+
+def _shelf(
+    album_ids: list[str], panel_token: str = '',
+) -> dict[str, Any]:
+    shelf: dict[str, Any] = {
+        'content': {
+            'horizontalListRenderer': {
+                'items': [
+                    _album_lockup(album_id) for album_id in album_ids
+                ],
+            },
+        },
+    }
+    if panel_token:
+        shelf['endpoint'] = {
+            'showEngagementPanelEndpoint': {
+                'engagementPanel': {
+                    'engagementPanelSectionListRenderer': {
+                        'content': {
+                            'sectionListRenderer': {
+                                'contents': [{
+                                    'itemSectionRenderer': {
+                                        'contents': [{
+                                            'continuationItemRenderer': {
+                                                'continuationEndpoint': {
+                                                    'continuationCommand': {
+                                                        'token': panel_token,
+                                                    },
+                                                },
+                                            },
+                                        }],
+                                    },
+                                }],
+                            },
+                        },
+                    },
+                },
+            },
+        }
+    return {'shelfRenderer': shelf}
+
+
+def _home_tab(*shelves: dict[str, Any]) -> dict[str, Any]:
+    return {
+        'tabRenderer': {
+            'title': 'Home',
+            'content': {
+                'sectionListRenderer': {
+                    'contents': [{
+                        'itemSectionRenderer': {
+                            'contents': list(shelves),
+                        },
+                    }],
+                },
+            },
+        },
+    }
+
+
+def _panel_page(
+    albums: list[str], token: str = '', wrapped: bool = False,
+) -> dict[str, Any]:
+    items: list[dict[str, Any]] = [
+        _grid_album(album_id) for album_id in albums
+    ]
+    if token:
+        items.append(_panel_token(token))
+    if wrapped:
+        items = [{'gridRenderer': {'items': items}}]
+    return {
+        'onResponseReceivedEndpoints': [{
+            'appendContinuationItemsAction': {
+                'continuationItems': items,
+            },
+        }],
+    }
+
+
 class _Browser:
     '''Records every _browse call and answers from the fixture.'''
 
@@ -316,6 +444,105 @@ class TestUploadsListing(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn('uploads', tabs.failed_tabs)
         self.assertEqual(video_ids, {'vid1'})
+
+
+class TestHomeShelves(unittest.IsolatedAsyncioTestCase):
+
+    async def test_home_shelf_albums_collected(self) -> None:
+        home: dict[str, Any] = _home_tab(_shelf(['a1', 'a2']))
+        page: dict[str, Any] = _channel_page('Queen - Topic', [home])
+        browser: _Browser = _Browser(page)
+        tabs: YouTubeChannelTabs = _tabs(page, browser)
+
+        playlists = await tabs._scrape_home_playlists(home['tabRenderer'])
+
+        self.assertEqual(
+            {playlist.playlist_id for playlist in playlists},
+            {'a1', 'a2'},
+        )
+        # The Home tab is already loaded: no extra browse.
+        tabs._browse.assert_not_awaited()
+        self.assertEqual(tabs.failed_tabs, set())
+
+    async def test_album_panel_paged(self) -> None:
+        home: dict[str, Any] = _home_tab(
+            _shelf([f'a{i}' for i in range(1, 13)], panel_token='p1'),
+        )
+        page: dict[str, Any] = _channel_page('Queen - Topic', [home])
+        browser: _Browser = _Browser(page)
+        tabs: YouTubeChannelTabs = _tabs(page, browser)
+
+        async def panel(
+            params: str = '', continuation_token: str = '',
+            max_retries: int = 4, browse_id: str | None = None,
+        ) -> dict[str, Any]:
+            if continuation_token == 'p1':
+                return _panel_page(
+                    ['a13', 'a14', 'a15'], token='p2', wrapped=True)
+            return _panel_page(['a16'])
+
+        tabs._browse = AsyncMock(side_effect=panel)
+        playlists = await tabs._scrape_home_playlists(home['tabRenderer'])
+
+        self.assertEqual(
+            {playlist.playlist_id for playlist in playlists},
+            {f'a{i}' for i in range(1, 17)},
+        )
+        self.assertEqual(tabs._browse.await_count, 2)
+        self.assertEqual(tabs.failed_tabs, set())
+
+    async def test_album_panel_failure_keeps_shelf(self) -> None:
+        home: dict[str, Any] = _home_tab(
+            _shelf(['a1', 'a2'], panel_token='p1'),
+        )
+        page: dict[str, Any] = _channel_page('Queen - Topic', [home])
+        browser: _Browser = _Browser(page)
+        tabs: YouTubeChannelTabs = _tabs(page, browser)
+        tabs._browse = AsyncMock(side_effect=RuntimeError('panel failed'))
+
+        playlists = await tabs._scrape_home_playlists(home['tabRenderer'])
+
+        self.assertEqual(
+            {playlist.playlist_id for playlist in playlists},
+            {'a1', 'a2'},
+        )
+        self.assertIn('home', tabs.failed_tabs)
+
+    async def test_album_panel_repeated_token_stops(self) -> None:
+        home: dict[str, Any] = _home_tab(
+            _shelf([], panel_token='p1'),
+        )
+        page: dict[str, Any] = _channel_page('Queen - Topic', [home])
+        browser: _Browser = _Browser(page)
+        tabs: YouTubeChannelTabs = _tabs(page, browser)
+        tabs._browse = AsyncMock(
+            return_value=_panel_page(['a1'], token='p1'))
+
+        playlists = await tabs._scrape_home_playlists(home['tabRenderer'])
+
+        self.assertEqual(
+            {playlist.playlist_id for playlist in playlists}, {'a1'})
+        self.assertEqual(tabs._browse.await_count, 1)
+
+    async def test_non_topic_home_not_scraped(self) -> None:
+        home: dict[str, Any] = _home_tab(_shelf(['a1']))
+        page: dict[str, Any] = _channel_page(
+            'Queen', [home, _videos_tab('vid1')])
+
+        def uploads(
+            browse_id: str | None, token: str,
+        ) -> dict[str, Any]:
+            return _uploads_page([])
+
+        browser: _Browser = _Browser(page, uploads)
+        tabs: YouTubeChannelTabs = _tabs(page, browser)
+        await tabs.browse_channel()
+        _video_ids, _podcasts, playlists, *_ = (
+            await tabs.scrape_loaded_tabs()
+        )
+
+        self.assertEqual(playlists, set())
+        self.assertNotIn('home', tabs.failed_tabs)
 
 
 if __name__ == '__main__':

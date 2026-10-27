@@ -144,6 +144,9 @@ SORTABLE_TABS: Final[frozenset[str]] = frozenset(
 # The synthetic tab holding a topic channel's tracks: it has no Videos
 # tab, so its uploads playlist is listed in its place.
 UPLOADS_TAB: Final[str] = 'uploads'
+# The Home tab, which is the only one a topic channel has. It is not
+# paged as a listing; its 'Albums & Singles' shelf holds the playlists.
+HOME_TAB: Final[str] = 'home'
 # An uploads playlist is browsed as 'VL' + 'UU' + the channel ID
 # without its 'UC' prefix.
 UPLOADS_BROWSE_PREFIX: Final[str] = 'VLUU'
@@ -428,6 +431,17 @@ class YouTubeChannelTabs:
         if self.is_topic and not self._listed_before(UPLOADS_TAB):
             uploads_task = asyncio.create_task(self._scrape_uploads())
 
+        # A topic channel's albums live on the Home tab's 'Albums &
+        # Singles' shelf, which the tab loop skips.
+        home_task: asyncio.Task[set[YouTubePlaylist]] | None = None
+        home_tab: dict[str, any] | None = (
+            self._home_tab_renderer() if self.is_topic else None
+        )
+        if home_tab is not None:
+            home_task = asyncio.create_task(
+                self._scrape_home_playlists(home_tab),
+            )
+
         video_ids: set[str] = set()
         podcast_ids: set[str] = set()
         playlists: set[YouTubePlaylist] = set()
@@ -472,6 +486,8 @@ class YouTubeChannelTabs:
 
         if uploads_task is not None:
             video_ids.update(await uploads_task)
+        if home_task is not None:
+            playlists.update(await home_task)
 
         return video_ids, podcast_ids, playlists, courses, posts, products
 
@@ -698,6 +714,203 @@ class YouTubeChannelTabs:
                 **metric_base,
                 outcome=outcome,
             ).observe(time.monotonic() - started_at)
+
+    def _home_tab_renderer(self) -> dict[str, any] | None:
+        '''The Home tab's tabRenderer, already loaded by
+        :meth:`browse_channel`; None when the channel has none.'''
+
+        for tab in self.tabs:
+            tab_renderer: dict[str, any] = tab.get('tabRenderer', {})
+            if tab_renderer.get('title', '').lower() == HOME_TAB:
+                return tab_renderer
+        return None
+
+    async def _scrape_home_playlists(
+        self, home_tab: dict,
+    ) -> set[YouTubePlaylist]:
+        '''Collect the playlists of a topic channel's Home tab.
+
+        Every lockup :meth:`YouTubePlaylist.from_innertube` accepts (an
+        album is a playlist) is collected from the shelves already
+        loaded, so no browse is needed for the first page. A shelf whose
+        engagement panel holds a continuation token is then paged to the
+        end: those pages list ``gridPlaylistRenderer`` items, parsed by
+        :meth:`YouTubePlaylist.from_grid_playlist`.
+
+        A page that fails keeps the playlists collected before it and
+        marks the Home tab failed; a token that repeats the last one
+        stops paging.
+
+        :param home_tab: the Home tab's tabRenderer dict
+        :returns: the playlists found, shelf and panel pages combined
+        '''
+
+        metric_base: dict[str, str] = _tab_metric_base(HOME_TAB)
+        extra: dict[str, str] = {
+            'channel_id': self.channel_id, 'tab': HOME_TAB,
+        }
+        started_at: float = time.monotonic()
+        outcome: str = 'success'
+        playlists: set[YouTubePlaylist] = set()
+        try:
+            for shelf in self._home_shelves(home_tab):
+                for item in shelf.get(
+                    'content', {},
+                ).get(
+                    'horizontalListRenderer', {},
+                ).get('items', []):
+                    playlist: YouTubePlaylist | None = (
+                        YouTubePlaylist.from_innertube(
+                            item, self.channel_id,
+                        )
+                    )
+                    if playlist:
+                        playlists.add(playlist)
+                panel_token: str = self._panel_token(shelf)
+                if panel_token:
+                    playlists.update(
+                        await self._page_album_panel(
+                            panel_token, metric_base,
+                        )
+                    )
+        except Exception as exc:
+            outcome = 'failure'
+            self._mark_tab_failed(metric_base, HOME_TAB)
+            _LOGGER.warning(
+                'Home tab playlists failed; keeping what was collected',
+                exc=exc,
+                extra=extra,
+            )
+        finally:
+            CHANNEL_TAB_DURATION.labels(
+                **metric_base, outcome=outcome,
+            ).observe(time.monotonic() - started_at)
+
+        CHANNEL_TAB_ITEMS.labels(
+            **metric_base, item_type='playlist',
+        ).inc(len(playlists))
+        return playlists
+
+    async def _page_album_panel(
+        self, panel_token: str, metric_base: dict[str, str],
+    ) -> set[YouTubePlaylist]:
+        '''Page one shelf's album panel from *panel_token* to the
+        end, returning the albums it lists.'''
+
+        found: set[YouTubePlaylist] = set()
+        seen_tokens: set[str] = set()
+        token: str = panel_token
+        while token and token not in seen_tokens:
+            seen_tokens.add(token)
+            try:
+                panel_data: dict = await self._browse(
+                    continuation_token=token,
+                )
+            except Exception as exc:
+                CHANNEL_TAB_PAGES.labels(
+                    **metric_base,
+                    page_type='continuation',
+                    outcome='failure',
+                ).inc()
+                self._mark_tab_failed(metric_base, HOME_TAB)
+                _LOGGER.warning(
+                    'Album panel page failed; keeping the albums '
+                    'collected before it',
+                    exc=exc,
+                    extra={
+                        'channel_id': self.channel_id,
+                        'albums_found': len(found),
+                    },
+                )
+                return found
+            CHANNEL_TAB_PAGES.labels(
+                **metric_base,
+                page_type='continuation',
+                outcome='success',
+            ).inc()
+            items: list = self._panel_items(panel_data)
+            if not items:
+                return found
+            token = (
+                self.get_continuation_token(items[-1])
+                if _is_trailing_continuation(items[-1]) else ''
+            )
+            if _is_trailing_continuation(items[-1]):
+                items = items[:-1]
+            for item in items:
+                playlist: YouTubePlaylist | None = (
+                    YouTubePlaylist.from_grid_playlist(
+                        item, self.channel_id,
+                    )
+                )
+                if playlist:
+                    found.add(playlist)
+        return found
+
+    @staticmethod
+    def _home_shelves(home_tab: dict) -> list:
+        '''The shelfRenderer dicts of a Home tab.'''
+
+        shelves: list = []
+        for section in home_tab.get(
+            'content', {},
+        ).get(
+            'sectionListRenderer', {},
+        ).get('contents', []):
+            for content in section.get(
+                'itemSectionRenderer', {},
+            ).get('contents', []):
+                shelf: dict | None = content.get('shelfRenderer')
+                if shelf:
+                    shelves.append(shelf)
+        return shelves
+
+    @staticmethod
+    def _panel_items(panel_data: dict) -> list:
+        '''The items of an album-panel page, unwrapping the grid the
+        first page is wrapped in.'''
+
+        endpoints: list = (
+            panel_data.get('onResponseReceivedEndpoints') or []
+        )
+        if not endpoints:
+            return []
+        items: list = endpoints[0].get(
+            'appendContinuationItemsAction', {}
+        ).get('continuationItems') or []
+        if items and 'gridRenderer' in items[0]:
+            return items[0]['gridRenderer'].get('items', []) or []
+        return items
+
+    @staticmethod
+    def _panel_token(shelf: dict) -> str:
+        '''The continuation token of a shelf's engagement panel.'''
+
+        return shelf.get(
+            'endpoint', {},
+        ).get(
+            'showEngagementPanelEndpoint', {},
+        ).get(
+            'engagementPanel', {},
+        ).get(
+            'engagementPanelSectionListRenderer', {},
+        ).get(
+            'content', {},
+        ).get(
+            'sectionListRenderer', {},
+        ).get(
+            'contents', [{}],
+        )[0].get(
+            'itemSectionRenderer', {},
+        ).get(
+            'contents', [{}],
+        )[0].get(
+            'continuationItemRenderer', {},
+        ).get(
+            'continuationEndpoint', {},
+        ).get(
+            'continuationCommand', {},
+        ).get('token', '')
 
     async def _scrape_uploads(self) -> set[str]:
         '''List a topic channel's tracks from its uploads playlist.
