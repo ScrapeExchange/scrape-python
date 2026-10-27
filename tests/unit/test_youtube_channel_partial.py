@@ -271,5 +271,31 @@ class TestRoundTripKeepsKeys(unittest.TestCase):
         )
 
 
+class TestTopicTabFields(unittest.TestCase):
+    '''The synthetic uploads and home tabs map to record keys like any
+    other tab, so a failed one omits only its own field.'''
+
+    def test_no_failure_fetches_every_tab_field(self) -> None:
+        channel: YouTubeChannel = _channel()
+        channel._record_tab_fields(set())
+        self.assertIn('playlists', channel.fetched_fields)
+        self.assertIn('video_ids', channel.fetched_fields)
+
+    def test_failed_home_omits_playlists(self) -> None:
+        channel: YouTubeChannel = _channel()
+        channel._record_tab_fields({'home'})
+        self.assertNotIn('playlists', channel.fetched_fields)
+        self.assertIn('video_ids', channel.fetched_fields)
+        self.assertTrue(channel.content_partial)
+
+    def test_failed_uploads_keeps_video_ids(self) -> None:
+        channel: YouTubeChannel = _channel()
+        channel._record_tab_fields({'uploads'})
+        self.assertIn('video_ids', channel.fetched_fields)
+        self.assertIn('playlists', channel.fetched_fields)
+        self.assertIn('merch', channel.fetched_fields)
+        self.assertTrue(channel.content_partial)
+
+
 if __name__ == '__main__':
     unittest.main()

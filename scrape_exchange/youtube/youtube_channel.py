@@ -121,6 +121,10 @@ TAB_FIELDS: dict[str, str] = {
     'videos': 'video_ids',
     'shorts': 'video_ids',
     'live': 'video_ids',
+    # A topic channel's synthetic tabs: its tracks come from the
+    # uploads playlist, its albums from the Home shelf.
+    'uploads': 'video_ids',
+    'home': 'playlists',
 }
 TAB_RECORD_FIELDS: frozenset[str] = frozenset(TAB_FIELDS.values())
 # Always written: the keys the channel schema requires.
