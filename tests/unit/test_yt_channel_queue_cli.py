@@ -3248,10 +3248,17 @@ class TestRequeueTopic(unittest.IsolatedAsyncioTestCase):
         )
         handle: str = 'h:queen - topic'
         await self.queue.mark(handle, state=ChannelState.TOPIC)
+        # Most parked records carry the title as 'channel_title'.
+        titled: str = 'i:UCtopic00000000000000011'
+        await self.queue.mark(
+            titled,
+            state=ChannelState.TOPIC,
+            extra={'channel_handle': '', 'channel_title': 'Skatman - Topic'},
+        )
 
         dry: str = await self._run(self._ns())
-        self.assertIn('inspected=2', dry)
-        self.assertIn('flagged=1', dry)
+        self.assertIn('inspected=3', dry)
+        self.assertIn('flagged=2', dry)
         self.assertIn('handles=1', dry)
         self.assertEqual(
             await self.queue.get_state(handle), ChannelState.TOPIC,
@@ -3259,9 +3266,13 @@ class TestRequeueTopic(unittest.IsolatedAsyncioTestCase):
 
         report: str = await self._run(self._ns(apply=True))
 
-        self.assertIn('moved=2', report)
+        self.assertIn('moved=3', report)
         self.assertIn('handles=1', report)
-        for member in (topic, dashed):
+        self.assertEqual(
+            await self.redis.hget(self.queue._k_meta(titled), 'topic'),
+            '1',
+        )
+        for member in (topic, dashed, titled):
             self.assertIsNotNone(
                 await self.redis.zscore(
                     self.queue._k_scheduled(4), member,

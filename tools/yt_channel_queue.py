@@ -1827,7 +1827,7 @@ def _record_is_topic_channel(raw: str | None) -> bool:
         return False
     if not isinstance(record, dict):
         return False
-    for field in ('channel_handle', 'title'):
+    for field in ('channel_handle', 'channel_title', 'title'):
         value: object = record.get(field)
         if isinstance(value, str) and is_topic_channel_title(value):
             return True
