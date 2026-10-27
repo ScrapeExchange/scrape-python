@@ -143,6 +143,24 @@ class TestVideoPrivacy(unittest.IsolatedAsyncioTestCase):
         await self._scrape(_video())
         self.assertEqual((await self._saved()).description, DESCRIPTION)
 
+    async def test_topic_channel_video_saved_unmasked(self) -> None:
+        from tools.yt_video_scrape import VIDEO_PRIVACY_OUTCOMES
+        before: float = VIDEO_PRIVACY_OUTCOMES.labels(
+            outcome='topic',
+        )._value.get()
+        await self._meta(subscriber_count='0', topic='1')
+        await self._scrape(_video())
+        self.assertTrue(os.path.exists(self._path()))
+        self.assertFalse(os.path.exists(self._path('.low_subs')))
+        self.assertFalse(os.path.exists(self._path('.unknown_channel')))
+        self.assertEqual((await self._saved()).description, DESCRIPTION)
+        self.assertEqual(
+            VIDEO_PRIVACY_OUTCOMES.labels(
+                outcome='topic',
+            )._value.get() - before,
+            1,
+        )
+
     async def test_yt_dlp_path_also_gated(self) -> None:
         await self._scrape(_video(), use_yt_dlp=True)
         self.assertTrue(os.path.exists(
