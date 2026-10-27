@@ -126,8 +126,17 @@ LISTING_CHECKPOINT_PAGES: Final[int] = 100
 # Listing state of a tab whose full listing reached its last page.
 LISTING_TAB_DONE: Final[str] = ''
 
-# Tabs whose items can be ordered newest-first via the 'Latest' chip.
-LATEST_ORDERED_TABS: Final[frozenset[str]] = frozenset(
+# Tabs whose items are paginated as a video listing: they are paged to
+# the end, their continuation token is resumable and they carry the
+# channel's video IDs. 'uploads' is the synthetic tab of a topic
+# channel, built from its uploads playlist instead of a channel tab.
+LISTING_TABS: Final[frozenset[str]] = frozenset(
+    {'videos', 'shorts', 'live', 'uploads'},
+)
+
+# Listing tabs whose items can be ordered via the 'Latest' / 'Oldest'
+# sort chips, which the uploads playlist does not have.
+SORTABLE_TABS: Final[frozenset[str]] = frozenset(
     {'videos', 'shorts', 'live'},
 )
 LATEST_CHIP_TEXT: Final[str] = 'latest'
@@ -135,12 +144,14 @@ OLDEST_CHIP_TEXT: Final[str] = 'oldest'
 
 _KNOWN_TAB_LABELS: Final[set[str]] = {
     'courses',
+    'home',
     'live',
     'playlists',
     'podcasts',
     'posts',
     'shorts',
     'store',
+    'uploads',
     'videos',
 }
 
@@ -244,7 +255,7 @@ class YouTubeChannelTabs:
         of every listed tab, possibly over several scrapes.'''
 
         return self.resumable_listing and not (
-            self.failed_tabs & LATEST_ORDERED_TABS
+            self.failed_tabs & LISTING_TABS
         ) and all(
             state == LISTING_TAB_DONE
             for state in self.listing_state.values()
@@ -435,7 +446,7 @@ class YouTubeChannelTabs:
 
         if not (
             self.resumable_listing
-            and title in LATEST_ORDERED_TABS
+            and title in LISTING_TABS
             and self.listing_resume.get(title) == LISTING_TAB_DONE
         ):
             return False
@@ -559,14 +570,14 @@ class YouTubeChannelTabs:
 
             latest_order: bool = False
             id_limit: int = 0
-            if title in LATEST_ORDERED_TABS and self.oldest_first_limit:
+            if title in SORTABLE_TABS and self.oldest_first_limit:
                 id_limit = self.oldest_first_limit
                 active_page_type = 'sort'
                 contents, _ = await self._sorted_contents(
                     page_tab, contents, metric_base, OLDEST_CHIP_TEXT,
                 )
                 active_page_type = None
-            elif self.known_video_ids and title in LATEST_ORDERED_TABS:
+            elif self.known_video_ids and title in SORTABLE_TABS:
                 active_page_type = 'sort'
                 contents, latest_order = await self._sorted_contents(
                     page_tab, contents, metric_base, LATEST_CHIP_TEXT,
@@ -597,7 +608,7 @@ class YouTubeChannelTabs:
                 continuation_token = ''
 
             listing: bool = (
-                self.resumable_listing and title in LATEST_ORDERED_TABS
+                self.resumable_listing and title in LISTING_TABS
             )
             # Subsequent pages for one tab keep their tab-local order.
             await self._page_continuations(
@@ -921,7 +932,7 @@ class YouTubeChannelTabs:
         self.failed_tabs.add(title)
         saved_token: str | None = self.listing_resume.get(title)
         if (
-            self.resumable_listing and title in LATEST_ORDERED_TABS
+            self.resumable_listing and title in LISTING_TABS
             and title not in self.listing_state and saved_token
         ):
             # The tab failed before paging: keep the resume point an

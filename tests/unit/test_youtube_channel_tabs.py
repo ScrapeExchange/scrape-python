@@ -11,7 +11,12 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from scrape_exchange.watchdog import Watchdog
-from scrape_exchange.youtube.youtube_channel_tabs import YouTubeChannelTabs
+from scrape_exchange.youtube.youtube_channel_tabs import (
+    LISTING_TABS,
+    SORTABLE_TABS,
+    YouTubeChannelTabs,
+    _tab_metric_label,
+)
 from scrape_exchange.youtube.youtube_types import YouTubeChannelPageType
 
 
@@ -42,6 +47,21 @@ class TestYouTubeChannelTabsInit(unittest.TestCase):
         self.assertEqual(tabs.channel_id, CHANNEL_ID)
         self.assertIsNotNone(tabs.client)
         self.assertEqual(tabs.tabs, [])
+
+
+class TestTabSets(unittest.TestCase):
+    '''The tab-title sets that drive paging, resume and sort chips.'''
+
+    def test_listing_and_sortable_tabs(self) -> None:
+        self.assertIn('uploads', LISTING_TABS)
+        self.assertNotIn('uploads', SORTABLE_TABS)
+        self.assertEqual(
+            SORTABLE_TABS, frozenset({'videos', 'shorts', 'live'}))
+        self.assertTrue(SORTABLE_TABS < LISTING_TABS)
+
+    def test_metric_labels_for_new_tabs(self) -> None:
+        self.assertEqual(_tab_metric_label('uploads'), 'uploads')
+        self.assertEqual(_tab_metric_label('home'), 'home')
 
 
 class TestExtractVideoId(unittest.TestCase):
