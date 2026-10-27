@@ -465,6 +465,41 @@ class YouTubeChannelTabs:
         courses: set[YouTubeCourse] = set()
         posts: set[YouTubePost] = set()
         products: set[YouTubeProduct] = set()
+        side_tasks: list[asyncio.Task] = [
+            task for task in (uploads_task, home_task) if task is not None
+        ]
+        try:
+            await self._collect_tab_results(
+                tab_tasks, video_ids, podcast_ids, playlists, courses,
+                posts, products,
+            )
+            if uploads_task is not None:
+                video_ids.update(await uploads_task)
+            if home_task is not None:
+                playlists.update(await home_task)
+        finally:
+            # A tab that ended the scrape (channel gone, cancelled)
+            # must not leave the uploads and Home tasks browsing.
+            for task in side_tasks:
+                task.cancel()
+            await asyncio.gather(*side_tasks, return_exceptions=True)
+
+        return video_ids, podcast_ids, playlists, courses, posts, products
+
+    async def _collect_tab_results(
+        self,
+        tab_tasks: list[tuple[str, asyncio.Task]],
+        video_ids: set[str],
+        podcast_ids: set[str],
+        playlists: set[YouTubePlaylist],
+        courses: set[YouTubeCourse],
+        posts: set[YouTubePost],
+        products: set[YouTubeProduct],
+    ) -> None:
+        '''Await the tab tasks and add their content to the sets. A
+        tab reporting the channel gone (or a cancellation) is raised.'''
+
+        extra: dict[str, str] = {'channel_id': self.channel_id}
         results: list = await asyncio.gather(
             *(task for _title, task in tab_tasks),
             return_exceptions=True,
@@ -500,13 +535,6 @@ class YouTubeChannelTabs:
             courses.update(tab_courses)
             posts.update(tab_posts)
             products.update(tab_products)
-
-        if uploads_task is not None:
-            video_ids.update(await uploads_task)
-        if home_task is not None:
-            playlists.update(await home_task)
-
-        return video_ids, podcast_ids, playlists, courses, posts, products
 
     def _listed_before(self, title: str) -> bool:
         '''True when an earlier scrape of this resumable full listing
@@ -1075,7 +1103,21 @@ class YouTubeChannelTabs:
             continuation_token = resume_token
         pending: set[str] = set(video_ids)
         pages: int = 0
+        seen_tokens: set[str] = set()
         while continuation_token:
+            if continuation_token in seen_tokens:
+                # The same page again would page forever: stop the tab
+                # like a failed page, so it is not recorded complete.
+                if listing:
+                    self.listing_state[title] = continuation_token
+                self._mark_tab_failed(metric_base, title)
+                _LOGGER.warning(
+                    'Channel tab repeated a continuation token; '
+                    'keeping the IDs collected before it',
+                    extra=extra | {'video_ids_found': len(video_ids)},
+                )
+                return
+            seen_tokens.add(continuation_token)
             try:
                 continued_data: dict = await self._browse(
                     continuation_token=continuation_token

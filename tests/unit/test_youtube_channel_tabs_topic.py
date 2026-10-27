@@ -4,11 +4,13 @@ tab: a topic channel's tracks come from its uploads playlist, paged with
 the same resume and checkpoint machinery as the video tabs.
 '''
 
+import asyncio
 import logging
 import unittest
 from typing import Any, Callable
 from unittest.mock import AsyncMock
 
+from scrape_exchange.youtube.channel_errors import ChannelNotFoundError
 from scrape_exchange.youtube.youtube_channel_tabs import (
     LISTING_TAB_DONE,
     YouTubeChannelTabs,
@@ -360,6 +362,74 @@ class TestUploadsListing(unittest.IsolatedAsyncioTestCase):
         self.assertIn(UPLOADS_BROWSE_ID, browser.attrs('browse_id'))
         self.assertIn('t1', browser.attrs('continuation_token'))
         self.assertEqual(tabs.failed_tabs, set())
+
+    async def test_uploads_repeated_token_stops(self) -> None:
+        # A page whose next token is the one just used would page the
+        # same page forever; the tab stops and counts as failed, so the
+        # listing is not recorded as complete.
+        def uploads(
+            browse_id: str | None, token: str,
+        ) -> dict[str, Any]:
+            if token == 't1':
+                return _uploads_continuation(['v2'], token='t1')
+            return _uploads_page(['v1'], token='t1')
+
+        page: dict[str, Any] = _channel_page(
+            'Queen - Topic', [HOME_TAB],
+        )
+        browser: _Browser = _Browser(page, uploads)
+        tabs: YouTubeChannelTabs = _tabs(page, browser)
+
+        async def yielding(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            # Yield like a real request, so the timeout can fire if
+            # paging never ends.
+            await asyncio.sleep(0)
+            return browser.route(*args, **kwargs)
+
+        tabs._browse = AsyncMock(side_effect=yielding)
+        await tabs.browse_channel()
+        video_ids, *_ = await asyncio.wait_for(
+            tabs.scrape_loaded_tabs(), timeout=5,
+        )
+
+        self.assertEqual(video_ids, {'v1', 'v2'})
+        self.assertEqual(browser.attrs('continuation_token').count('t1'), 1)
+        self.assertIn('uploads', tabs.failed_tabs)
+
+    async def test_side_tasks_cancelled_when_a_tab_ends_the_scrape(
+        self,
+    ) -> None:
+        # A tab reporting the channel gone ends the scrape; the uploads
+        # and Home tasks must not keep browsing for nobody.
+        page: dict[str, Any] = _channel_page(
+            'Queen - Topic', [HOME_TAB, _videos_tab('vid1')],
+        )
+        tabs: YouTubeChannelTabs = _tabs(page, _Browser(page))
+        await tabs.browse_channel()
+        started: asyncio.Event = asyncio.Event()
+        cancelled: list[str] = []
+
+        async def side(name: str) -> set:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.append(name)
+                raise
+            return set()
+
+        async def gone(*_args: Any) -> None:
+            await started.wait()
+            raise ChannelNotFoundError(CHANNEL_ID)
+
+        tabs._scrape_uploads = lambda: side('uploads')
+        tabs._home_tab_renderer = lambda: HOME_TAB['tabRenderer']
+        tabs._scrape_home_playlists = lambda _home: side('home')
+        tabs._scrape_tab = gone
+
+        with self.assertRaises(ChannelNotFoundError):
+            await tabs.scrape_loaded_tabs()
+        self.assertEqual(sorted(cancelled), ['home', 'uploads'])
 
     async def test_uploads_resumable_checkpoint_and_done(self) -> None:
         def uploads(
