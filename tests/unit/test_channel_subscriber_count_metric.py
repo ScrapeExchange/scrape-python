@@ -196,7 +196,7 @@ class TestRssUpdateChannelRecordsMetric(
                 mock.AsyncMock(return_value=page)
             )
             subs: int | None
-            _, subs, _ = await self.module.update_channel(
+            _, subs, _, _is_topic = await self.module.update_channel(
                 channel_handle='inputhandle',
                 channel_id='UC_xyz',
                 creator_map_backend=mock.AsyncMock(),

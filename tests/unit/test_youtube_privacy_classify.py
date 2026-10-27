@@ -16,6 +16,7 @@ from scrape_exchange.youtube.privacy import (
     classify_channel_size,
     classify_for_settings,
     is_allowed_url,
+    is_topic_channel_title,
     unwrap_youtube_redirect,
 )
 from scrape_exchange.youtube.settings import YouTubeScraperSettings
@@ -172,6 +173,16 @@ class TestAllowlist(unittest.TestCase):
         self.assertTrue(HARDCODED_ALLOWED_DOMAINS <= domains)
         self.assertTrue(
             is_allowed_url('https://www.myband.example/tour', domains))
+
+
+class TestTopicTitle(unittest.TestCase):
+
+    def test_is_topic_channel_title(self) -> None:
+        self.assertTrue(is_topic_channel_title('Queen - Topic'))
+        self.assertTrue(is_topic_channel_title('  bulldog - TOPIC '))
+        self.assertFalse(is_topic_channel_title('Topic Talks'))
+        self.assertFalse(is_topic_channel_title(''))
+        self.assertFalse(is_topic_channel_title(None))
 
 
 if __name__ == '__main__':

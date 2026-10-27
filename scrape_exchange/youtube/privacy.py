@@ -18,6 +18,7 @@ written to disk for upload, the scrapers classify its channel by size:
 
 import re
 
+from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 from urllib.parse import SplitResult, parse_qs, urlsplit
@@ -38,6 +39,9 @@ PHONE_HIDDEN: str = '<phone hidden>'
 ADDRESS_HIDDEN: str = '<address hidden>'
 URL_WITHHELD: str = '<url withheld>'
 
+# YouTube titles its auto-generated artist channels '<artist> - Topic'.
+TOPIC_TITLE_SUFFIX: str = ' - topic'
+
 PRIVACY_MASKED_ITEMS: Counter = Counter(
     'youtube_privacy_masked_items_total',
     'Personal data items masked in YouTube descriptions',
@@ -49,6 +53,20 @@ class ChannelSize(str, Enum):
     TINY = 'tiny'
     SMALL = 'small'
     LARGE = 'large'
+
+
+@dataclass(frozen=True)
+class ChannelPrivacyRecord:
+    '''The privacy-relevant fields of a channel's scrape-queue meta.
+
+    ``topic`` is set when the channel scraper recognised the channel as
+    a YouTube topic channel; its records and videos are exempt from the
+    privacy limits.
+    '''
+
+    subscriber_count: int | None
+    view_count: int | None
+    topic: bool
 
 
 def classify_channel_size(
@@ -96,6 +114,16 @@ def classify_for_settings(
         privacy_subscribers=settings.channel_privacy_subscribers,
         views_per_subscriber=settings.channel_views_per_subscriber,
     )
+
+
+def is_topic_channel_title(title: str | None) -> bool:
+    '''True when *title* is the title of a YouTube topic channel, i.e.
+    it ends with :data:`TOPIC_TITLE_SUFFIX` once stripped and
+    case-folded (``'Queen - Topic'``). A missing title is not a topic
+    title.'''
+    if not isinstance(title, str):
+        return False
+    return title.strip().casefold().endswith(TOPIC_TITLE_SUFFIX)
 
 
 # Domains behind each key of scrape_exchange.datatypes.SocialNetworks.
@@ -558,14 +586,41 @@ async def lookup_channel_counts(
     queue's meta hash of *channel_id*, or ``None`` when the channel is
     not in the queue. A count that is missing or unparseable is
     ``None``.'''
+    record: ChannelPrivacyRecord | None = await lookup_channel_privacy(
+        redis, channel_id,
+    )
+    if record is None:
+        return None
+    return record.subscriber_count, record.view_count
+
+
+def _as_bool(value: Any) -> bool:
+    '''Parse a Redis meta flag (``'1'``, ``b'1'``, ``'true'``).'''
+    if isinstance(value, bytes):
+        value = value.decode('utf-8', errors='replace')
+    if value is None:
+        return False
+    return str(value).strip().casefold() in ('1', 'true', 'yes')
+
+
+async def lookup_channel_privacy(
+    redis: Any, channel_id: str | None,
+) -> ChannelPrivacyRecord | None:
+    '''Return the privacy-relevant meta of the channel scrape queue's
+    hash for *channel_id*, or ``None`` when the channel is not in the
+    queue. One ``HMGET`` serves both the counts and the topic flag.'''
     if not channel_id:
         return None
     key: str = f'{CHANNEL_KEY_PREFIX}:meta:i:{channel_id}'
     values: list[Any] = await redis.hmget(
-        key, ['subscriber_count', 'view_count'],
+        key, ['subscriber_count', 'view_count', 'topic'],
     )
     if all(value is None for value in values) and not await redis.exists(
         key,
     ):
         return None
-    return parse_count(values[0]), parse_count(values[1])
+    return ChannelPrivacyRecord(
+        subscriber_count=parse_count(values[0]),
+        view_count=parse_count(values[1]),
+        topic=_as_bool(values[2]),
+    )

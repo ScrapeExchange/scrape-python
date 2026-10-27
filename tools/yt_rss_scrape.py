@@ -139,6 +139,7 @@ from scrape_exchange.youtube.privacy import (
     allowed_domains,
     classify_channel_size,
     classify_for_settings,
+    is_topic_channel_title,
     mask_channel_record,
 )
 
@@ -1392,7 +1393,7 @@ async def process_channel(
         platform='youtube',
     ).observe(wait_seconds)
 
-    update_result: tuple[bool, int | None, str | None]
+    update_result: tuple[bool, int | None, str | None, bool]
     rss_result: list[YouTubeVideo] | None | Exception
     update_result, rss_result = await asyncio.gather(
         _timed(
@@ -1417,6 +1418,9 @@ async def process_channel(
     # None when InnerTube did not expose a subscriber count.
     sub_count: int | None = update_result[1]
     resolved_handle: str | None = update_result[2]
+    # True when the lite record's title marks the channel as a topic
+    # channel, which exempts it from the privacy limits.
+    is_topic: bool = update_result[3]
 
     if not update_ok:
         # Leave the tier unchanged — don't overwrite a
@@ -1659,7 +1663,7 @@ async def process_channel(
         )
         return True
 
-    if _rss_channel_is_tiny(sub_count, settings):
+    if _rss_channel_is_tiny(sub_count, settings, topic=is_topic):
         VIDEOS_SKIPPED_MIN_SUBSCRIBERS.labels(
             scraper='rss_scraper',
         ).inc(len(new_videos))
@@ -1764,11 +1768,15 @@ async def _ensure_priority_directory(
 
 def _rss_channel_is_tiny(
     subscriber_count: int | None, settings: RssSettings,
+    topic: bool = False,
 ) -> bool:
     '''True when this poll's subscriber count puts the channel below
     ``CHANNEL_MIN_SUBSCRIBERS``; an unknown count counts as below it.
     The RSS scraper rarely sees a view count, so only the subscriber
-    count is used here.'''
+    count is used here. A topic channel (*topic*) is never tiny: topic
+    channels are exempt from the privacy limits.'''
+    if topic:
+        return False
     return classify_channel_size(
         subscriber_count, None,
         min_subscribers=settings.channel_min_subscribers,
@@ -1784,7 +1792,12 @@ def _apply_rss_privacy_limits(
     the marker suffix to write it with: ``.low_subs`` for a tiny
     channel (kept on disk, never uploaded), ``''`` otherwise. A small
     channel's description is masked in place. The decision is per
-    poll; end states are left to the channel scraper.'''
+    poll; end states are left to the channel scraper.
+
+    A record whose title is a topic channel's title is exempt: it is
+    written unmasked with no marker suffix.'''
+    if is_topic_channel_title(record_dict.get('title')):
+        return ''
     size: ChannelSize = classify_for_settings(
         record_dict.get('subscriber_count'),
         record_dict.get('view_count'),
@@ -1884,7 +1897,7 @@ async def update_channel(
     proxy: str | None = None,
     *,
     settings: RssSettings,
-) -> tuple[bool, int | None, str | None]:
+) -> tuple[bool, int | None, str | None, bool]:
     '''
     Fetches channel metadata via InnerTube and updates the channel
     data on Scrape Exchange via a priority file.
@@ -1898,11 +1911,13 @@ async def update_channel(
         ``(channel_title, channel_id)`` pair so re-ingest can
         recover ids from legacy display-name-only records.
     :param proxy: Optional proxy URL for the InnerTube request.
-    :returns: Tuple of (success, subscriber_count, resolved_handle).
-        ``success`` is True if the channel data was fetched and
-        uploaded. ``subscriber_count`` is None when it could not be
+    :returns: Tuple of (success, subscriber_count, resolved_handle,
+        is_topic). ``success`` is True if the channel data was fetched
+        and uploaded. ``subscriber_count`` is None when it could not be
         determined (the uploaded record still carries 0).
-        ``resolved_handle`` is None when fetch failed.
+        ``resolved_handle`` is None when fetch failed. ``is_topic`` is
+        True when the record's title makes the channel a YouTube topic
+        channel; False on every failure return.
     :raises: (none)
     '''
 
@@ -1932,7 +1947,7 @@ async def update_channel(
             proxy_port=proxy_port,
             proxy_file=proxy_file_label(proxy or ''),
         ).inc()
-        return False, None, None
+        return False, None, None, False
 
     METRIC_INNERTUBE_SUCCESS.labels(
         platform='youtube',
@@ -2048,6 +2063,7 @@ async def update_channel(
         record_dict['subscriber_count'] = subscriber_count
     if view_count is not None:
         record_dict['view_count'] = view_count
+    is_topic: bool = is_topic_channel_title(record_dict.get('title'))
     marker_suffix: str = _apply_rss_privacy_limits(record_dict, settings)
     err: str | None = validator.validate(record_dict)
     if err is not None:
@@ -2060,7 +2076,7 @@ async def update_channel(
                 'validation_error': err,
             },
         )
-        return False, parsed_subscriber_count, resolved_handle
+        return False, parsed_subscriber_count, resolved_handle, False
 
     await _write_channel(record_dict, settings, marker_suffix)
     METRIC_CHANNEL_PRIORITY_WRITES.labels(
@@ -2069,7 +2085,7 @@ async def update_channel(
         worker_id=get_worker_id(),
     ).inc()
 
-    return True, parsed_subscriber_count, resolved_handle
+    return True, parsed_subscriber_count, resolved_handle, is_topic
 
 
 def read_channel_file(filepath: str) -> dict[str, any]:

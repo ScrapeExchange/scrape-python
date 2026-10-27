@@ -11,7 +11,13 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from scrape_exchange.watchdog import Watchdog
-from scrape_exchange.youtube.youtube_channel_tabs import YouTubeChannelTabs
+from scrape_exchange.youtube.youtube_channel_tabs import (
+    LISTING_TABS,
+    SORTABLE_TABS,
+    YouTubeChannelTabs,
+    _tab_metric_label,
+)
+from scrape_exchange.youtube.youtube_playlist import YouTubePlaylist
 from scrape_exchange.youtube.youtube_types import YouTubeChannelPageType
 
 
@@ -42,6 +48,21 @@ class TestYouTubeChannelTabsInit(unittest.TestCase):
         self.assertEqual(tabs.channel_id, CHANNEL_ID)
         self.assertIsNotNone(tabs.client)
         self.assertEqual(tabs.tabs, [])
+
+
+class TestTabSets(unittest.TestCase):
+    '''The tab-title sets that drive paging, resume and sort chips.'''
+
+    def test_listing_and_sortable_tabs(self) -> None:
+        self.assertIn('uploads', LISTING_TABS)
+        self.assertNotIn('uploads', SORTABLE_TABS)
+        self.assertEqual(
+            SORTABLE_TABS, frozenset({'videos', 'shorts', 'live'}))
+        self.assertTrue(SORTABLE_TABS < LISTING_TABS)
+
+    def test_metric_labels_for_new_tabs(self) -> None:
+        self.assertEqual(_tab_metric_label('uploads'), 'uploads')
+        self.assertEqual(_tab_metric_label('home'), 'home')
 
 
 class TestExtractVideoId(unittest.TestCase):
@@ -247,20 +268,21 @@ class TestGetPlaylistItems(unittest.TestCase):
                 }
             }
         }
-        playlists = self.tabs._get_playlist_items(tab_renderer)
-        self.assertEqual(len(playlists), 1)
-        pl = next(iter(playlists))
+        items = self.tabs._get_playlist_items(tab_renderer)
+        self.assertEqual(len(items), 1)
+        pl = YouTubePlaylist.from_innertube(items[0], CHANNEL_ID)
+        self.assertIsNotNone(pl)
         self.assertEqual(pl.playlist_id, 'PLabc')
         self.assertEqual(pl.title, 'My Playlist')
 
     def test_empty_sections(self) -> None:
         tab_renderer = {'content': {'sectionListRenderer': {'contents': []}}}
-        playlists = self.tabs._get_playlist_items(tab_renderer)
-        self.assertEqual(len(playlists), 0)
+        items = self.tabs._get_playlist_items(tab_renderer)
+        self.assertEqual(len(items), 0)
 
     def test_missing_content(self) -> None:
-        playlists = self.tabs._get_playlist_items({})
-        self.assertEqual(len(playlists), 0)
+        items = self.tabs._get_playlist_items({})
+        self.assertEqual(len(items), 0)
 
 
 class TestGetCourseItems(unittest.TestCase):

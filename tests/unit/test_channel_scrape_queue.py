@@ -2590,3 +2590,143 @@ class TestListingCounts(_RedisQueueTestBase):
         await self.queue.recount_listing('i:UCa')
         await self.queue.recount_listing('i:UCa')
         self.assertEqual(await self._counts(), {(0, 'partial'): 1})
+
+
+class TestTopicTier(_RedisQueueTestBase):
+    '''The tier rule for topic channels: one above the catch-all, or
+    higher when the subscriber count qualifies.'''
+
+    QUEUES: str = '7:1000000,30:100000,90:10000,180:1000,365:100,365:0'
+    TIERS_KEY: str = 'youtube:channel:tiers'
+
+    def _queue(self, queues: str = '') -> RedisChannelScrapeQueue:
+        return RedisChannelScrapeQueue(
+            self.redis,
+            ChannelScrapeQueueSettings(
+                _env_file=None,
+                channel_priority_queues=queues or self.QUEUES,
+            ),
+        )
+
+    def _meta_key(self, channel_id: str) -> str:
+        return f'youtube:channel:meta:i:{channel_id}'
+
+    def test_topic_tier(self) -> None:
+        queue: RedisChannelScrapeQueue = self._queue()
+        # Six tiers: one above the catch-all is index 4.
+        self.assertEqual(queue.topic_tier(), 4)
+        self.assertEqual(queue.topic_tier(5), 4)
+        self.assertEqual(queue.topic_tier(150000), 1)
+        self.assertEqual(self._queue('7:0').topic_tier(), 0)
+
+    async def _seed(self, channel_id: str) -> str:
+        member: str = f'i:{channel_id}'
+        await self.redis.hset(
+            self._meta_key(channel_id),
+            mapping={
+                'state': ChannelState.SCHEDULED.value,
+                'successful_scrapes': '0',
+            },
+        )
+        await self.redis.zadd(
+            'youtube:channel:queue:scheduled:5', {member: 0.0},
+        )
+        return member
+
+    async def test_update_tier_topic_without_count(self) -> None:
+        queue: RedisChannelScrapeQueue = self._queue()
+        member: str = await self._seed('UCtopic1')
+        await queue.update_tier(
+            'UCtopic1',
+            sub_count=None,
+            now=time.time(),
+            progress=ChannelScrapeProgress(
+                successful_scrapes=0, next_full_scrape=1,
+            ),
+            topic=True,
+        )
+        self.assertIsNotNone(await self.redis.zscore(
+            'youtube:channel:queue:scheduled:4', member,
+        ))
+        self.assertIsNone(await self.redis.zscore(
+            'youtube:channel:queue:scheduled:5', member,
+        ))
+        self.assertIsNone(await self.redis.hget(
+            self._meta_key('UCtopic1'), 'missing_subscriber_attempts',
+        ))
+        self.assertEqual(
+            await self.redis.hget(self.TIERS_KEY, 'UCtopic1'), '4',
+        )
+
+    async def test_update_tier_topic_with_high_count(self) -> None:
+        queue: RedisChannelScrapeQueue = self._queue()
+        await self._seed('UCtopic2')
+        await queue.update_tier(
+            'UCtopic2',
+            sub_count=150000,
+            now=time.time(),
+            progress=ChannelScrapeProgress(
+                successful_scrapes=0, next_full_scrape=1,
+            ),
+            topic=True,
+        )
+        self.assertIsNotNone(await self.redis.zscore(
+            'youtube:channel:queue:scheduled:1', 'i:UCtopic2',
+        ))
+
+    async def test_unmark_with_tier(self) -> None:
+        queue: RedisChannelScrapeQueue = self._queue()
+        member: str = 'i:UCtopic3'
+        await self.redis.hset(
+            'youtube:channel:topic', member, json.dumps({'x': 1}),
+        )
+        await self.redis.hset(
+            self._meta_key('UCtopic3'),
+            mapping={'state': ChannelState.TOPIC.value},
+        )
+        await queue.unmark(member, score=0.0, tier=4)
+
+        self.assertIsNotNone(await self.redis.zscore(
+            'youtube:channel:queue:scheduled:4', member,
+        ))
+        self.assertEqual(
+            await self.redis.hget(self.TIERS_KEY, 'UCtopic3'), '4',
+        )
+        self.assertEqual(
+            await self.redis.hget(
+                self._meta_key('UCtopic3'), 'state',
+            ),
+            ChannelState.SCHEDULED.value,
+        )
+        self.assertIsNone(
+            await self.redis.hget('youtube:channel:topic', member),
+        )
+
+    async def test_unmark_handle_ignores_tier(self) -> None:
+        # A handle member goes to the unresolved queue; a tier must not
+        # write the handle into the channel-id keyed tier map.
+        queue: RedisChannelScrapeQueue = self._queue()
+        member: str = 'h:artist - topic'
+        await self.redis.hset(
+            'youtube:channel:topic', member, json.dumps({'x': 1}),
+        )
+        await queue.unmark(member, score=0.0, tier=4)
+
+        self.assertIsNotNone(await self.redis.zscore(
+            'youtube:channel:queue:unresolved', member,
+        ))
+        self.assertEqual(await self.redis.hgetall(self.TIERS_KEY), {})
+
+    async def test_unmark_without_tier_defaults_to_zero(self) -> None:
+        queue: RedisChannelScrapeQueue = self._queue()
+        member: str = 'i:UCtopic4'
+        await self.redis.hset(
+            self._meta_key('UCtopic4'),
+            mapping={'state': ChannelState.LOW_SUBS.value},
+        )
+        await queue.unmark(member, score=0.0)
+
+        self.assertIsNotNone(await self.redis.zscore(
+            'youtube:channel:queue:scheduled:0', member,
+        ))
+        self.assertIsNone(await self.redis.hget(self.TIERS_KEY, 'UCtopic4'))

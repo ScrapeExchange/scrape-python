@@ -459,12 +459,15 @@ return 0
 _UNMARK_LUA: str = '''
 -- KEYS[1] = meta hash
 -- KEYS[2] = target queue (unresolved or scheduled:<tier>)
+-- KEYS[3] = tier map
 -- ARGV[1] = member
 -- ARGV[2] = target state value
 -- ARGV[3] = target score (as string, will be converted)
+-- ARGV[4] = scheduled tier to record ('' keeps the stored tier)
 local member = ARGV[1]
 local target_state = ARGV[2]
 local target_score = tonumber(ARGV[3])
+local target_tier = ARGV[4]
 
 local states = {
     'not_found', 'invalid_handle',
@@ -477,6 +480,9 @@ for _, s in ipairs(states) do
     redis.call(
         'HDEL', 'youtube:channel:' .. s, member
     )
+end
+if target_tier ~= '' then
+    redis.call('HSET', KEYS[3], string.sub(member, 3), target_tier)
 end
 redis.call('ZADD', KEYS[2], target_score, member)
 redis.call('HSET', KEYS[1], 'state', target_state)
@@ -846,6 +852,7 @@ class ChannelScrapeQueue(ABC):
         now: float,
         progress: ChannelScrapeProgress | None = None,
         full_scrape: bool = False,
+        topic: bool = False,
     ) -> bool | None: ...
 
     @abstractmethod
@@ -911,6 +918,7 @@ class ChannelScrapeQueue(ABC):
     @abstractmethod
     async def unmark(
         self, member: str, *, score: float | None = None,
+        tier: int | None = None,
     ) -> None: ...
 
     @abstractmethod
@@ -1036,6 +1044,18 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
             if sub_count >= cfg.min_subscribers:
                 return cfg.tier
         return self._tiers[-1].tier
+
+    def topic_tier(self, sub_count: int | None = None) -> int:
+        '''The scheduled tier of a topic channel.
+
+        The tier one above the catch-all, unless a known subscriber
+        count puts the channel in a higher-priority tier. A missing
+        count is not a demotion: it maps to the topic tier.
+        '''
+        topic_index: int = max(len(self._tiers) - 2, 0)
+        if sub_count is None:
+            return topic_index
+        return min(topic_index, self._tier_for_sub_count(sub_count))
 
     def _k_unresolved(self) -> str:
         return f'{KEY_PREFIX}:queue:unresolved'
@@ -1358,18 +1378,25 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
         now: float,
         progress: ChannelScrapeProgress | None = None,
         full_scrape: bool = False,
+        topic: bool = False,
     ) -> bool | None:
         if progress is not None:
+            # A topic channel's tier comes from the topic rule even
+            # without a count, so the script's missing-subscriber branch
+            # is skipped: there is nothing to retry for.
             completed_tier: int = (
-                self._tier_for_sub_count(sub_count)
-                if sub_count is not None else -1
+                self.topic_tier(sub_count) if topic
+                else (
+                    self._tier_for_sub_count(sub_count)
+                    if sub_count is not None else -1
+                )
             )
             # On a miss the Lua script computes the backoff delay from
             # the base, the cap and the stored attempt count, and ignores
             # this interval.
             completed_interval: int = (
                 self._tiers[completed_tier].interval_seconds
-                if sub_count is not None else -1
+                if completed_tier >= 0 else -1
             )
             next_full: int = progress.next_full_scrape
             if full_scrape and progress.full_scrape_due:
@@ -1417,7 +1444,7 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
                     )
                 return bool(ok)
             return bool(result)
-        if sub_count is None:
+        if sub_count is None and not topic:
             await self.retry_missing_subscriber_count(
                 channel_id=channel_id, now=now,
             )
@@ -1437,7 +1464,10 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
             and current in ChannelState.terminal_states()
         ):
             return
-        new_tier: int = self._tier_for_sub_count(sub_count)
+        new_tier: int = (
+            self.topic_tier(sub_count) if topic
+            else self._tier_for_sub_count(sub_count or 0)
+        )
         interval: int = self._tiers[new_tier].interval_seconds
         old_tier_str: str | None = (
             await self._redis.hget(
@@ -1883,7 +1913,15 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
 
     async def unmark(
         self, member: str, *, score: float | None = None,
+        tier: int | None = None,
     ) -> None:
+        '''Requeue a member that sits in a terminal state.
+
+        *tier* is the scheduled tier to place an ``i:`` member in. It is
+        written to the tier map by the same script, so the member cannot
+        land in a tier the queue does not record for it. Without it the
+        stored tier is used, defaulting to 0.
+        '''
         if member.startswith('h:'):
             target_queue: str = self._k_unresolved()
             target_state: ChannelState = (
@@ -1892,15 +1930,15 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
             target_score: float = time.time()
         elif member.startswith('i:'):
             channel_id: str = member[2:]
-            tier_str: str | None = (
-                await self._redis.hget(
-                    self._k_tiers(), channel_id,
+            effective_tier: int = tier if tier is not None else 0
+            if tier is None:
+                tier_str: str | None = (
+                    await self._redis.hget(
+                        self._k_tiers(), channel_id,
+                    )
                 )
-            )
-            tier: int = (
-                int(tier_str) if tier_str else 0
-            )
-            target_queue = self._k_scheduled(tier)
+                effective_tier = int(tier_str) if tier_str else 0
+            target_queue = self._k_scheduled(effective_tier)
             target_state = ChannelState.SCHEDULED
             target_score = 0.0
         else:
@@ -1914,12 +1952,17 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
             target_score = score
         await self._redis.eval(
             _UNMARK_LUA,
-            2,
+            3,
             self._k_meta(member),
             target_queue,
+            self._k_tiers(),
             member,
             target_state.value,
             str(target_score),
+            # The tier map is keyed by channel ID: a handle member
+            # goes to the unresolved queue and has no tier.
+            str(tier) if tier is not None and member.startswith('i:')
+            else '',
         )
         await self.recount_listing(member)
 

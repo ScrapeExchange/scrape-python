@@ -73,10 +73,11 @@ from scrape_exchange.youtube.derived_metadata import (
     increment_channel_category_count,
 )
 from scrape_exchange.youtube.privacy import (
+    ChannelPrivacyRecord,
     ChannelSize,
     allowed_domains,
     classify_for_settings,
-    lookup_channel_counts,
+    lookup_channel_privacy,
     mask_video,
 )
 from scrape_exchange.youtube.youtube_video import YouTubeVideo
@@ -337,16 +338,22 @@ async def _apply_video_privacy_limits(
     and yt-dlp scrapes are treated alike). Returns the marker suffix to
     save it with: ``.unknown_channel`` when the channel is not in the
     queue, ``.low_subs`` when it is tiny, ``''`` otherwise. Masks the
-    description of a small channel's video in place.'''
-    counts: tuple[int | None, int | None] | None = (
-        await lookup_channel_counts(redis, video.channel_id)
+    description of a small channel's video in place.
+
+    A topic channel's videos are always saved unmasked with no marker:
+    topic channels are exempt from the privacy limits.'''
+    record: ChannelPrivacyRecord | None = (
+        await lookup_channel_privacy(redis, video.channel_id)
         if redis is not None else None
     )
-    if counts is None:
+    if record is None:
         VIDEO_PRIVACY_OUTCOMES.labels(outcome='unknown_channel').inc()
         return UNKNOWN_CHANNEL_SUFFIX
+    if record.topic:
+        VIDEO_PRIVACY_OUTCOMES.labels(outcome='topic').inc()
+        return ''
     size: ChannelSize = classify_for_settings(
-        counts[0], counts[1], settings,
+        record.subscriber_count, record.view_count, settings,
     )
     if size is ChannelSize.TINY:
         VIDEO_PRIVACY_OUTCOMES.labels(outcome='low_subs').inc()

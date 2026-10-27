@@ -66,7 +66,7 @@ class TestProcessChannelCircuitContract(unittest.TestCase):
             )),
         ), patch.object(
             yt_rss_scrape, 'update_channel',
-            new=AsyncMock(return_value=(True, 0, None)),
+            new=AsyncMock(return_value=(True, 0, None, False)),
         ), patch.object(
             yt_rss_scrape, '_get_rss_circuit_breaker',
             return_value=breaker,
@@ -142,7 +142,7 @@ class TestProcessChannelNon404Errors(unittest.TestCase):
             new=AsyncMock(return_value=rss_result),
         ), patch.object(
             yt_rss_scrape, 'update_channel',
-            new=AsyncMock(return_value=(True, 0, None)),
+            new=AsyncMock(return_value=(True, 0, None, False)),
         ), patch.object(
             yt_rss_scrape, '_get_rss_circuit_breaker',
             return_value=breaker,

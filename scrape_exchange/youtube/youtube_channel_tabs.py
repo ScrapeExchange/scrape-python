@@ -59,6 +59,7 @@ from scrape_exchange.util import (
 from scrape_exchange.watchdog import Watchdog
 from .youtube_cookiejar import YouTubeCookieJar
 from .youtube_rate_limiter import YouTubeRateLimiter, YouTubeCallType
+from .privacy import is_topic_channel_title
 from .youtube_playlist import YouTubePlaylist
 from .youtube_course import YouTubeCourse
 from .youtube_post import YouTubePost
@@ -126,23 +127,71 @@ LISTING_CHECKPOINT_PAGES: Final[int] = 100
 # Listing state of a tab whose full listing reached its last page.
 LISTING_TAB_DONE: Final[str] = ''
 
-# Tabs whose items can be ordered newest-first via the 'Latest' chip.
-LATEST_ORDERED_TABS: Final[frozenset[str]] = frozenset(
+# Tabs whose items are paginated as a video listing: they are paged to
+# the end, their continuation token is resumable and they carry the
+# channel's video IDs. 'uploads' is the synthetic tab of a topic
+# channel, built from its uploads playlist instead of a channel tab.
+LISTING_TABS: Final[frozenset[str]] = frozenset(
+    {'videos', 'shorts', 'live', 'uploads'},
+)
+
+# Listing tabs whose items can be ordered via the 'Latest' / 'Oldest'
+# sort chips, which the uploads playlist does not have.
+SORTABLE_TABS: Final[frozenset[str]] = frozenset(
     {'videos', 'shorts', 'live'},
 )
+
+# The synthetic tab holding a topic channel's tracks: it has no Videos
+# tab, so its uploads playlist is listed in its place.
+UPLOADS_TAB: Final[str] = 'uploads'
+# The Home tab, which is the only one a topic channel has. It is not
+# paged as a listing; its 'Albums & Singles' shelf holds the playlists.
+HOME_TAB: Final[str] = 'home'
+# An uploads playlist is browsed as 'VL' + 'UU' + the channel ID
+# without its 'UC' prefix.
+UPLOADS_BROWSE_PREFIX: Final[str] = 'VLUU'
 LATEST_CHIP_TEXT: Final[str] = 'latest'
 OLDEST_CHIP_TEXT: Final[str] = 'oldest'
 
 _KNOWN_TAB_LABELS: Final[set[str]] = {
     'courses',
+    'home',
     'live',
     'playlists',
     'podcasts',
     'posts',
     'shorts',
     'store',
+    'uploads',
     'videos',
 }
+
+
+def _is_trailing_continuation(item: dict[str, any]) -> bool:
+    '''True when *item* is a page's trailing 'load more' item, in
+    either of the two renderers YouTube uses for it.'''
+
+    return (
+        'continuationItemRenderer' in item
+        or 'continuationItemViewModel' in item
+    )
+
+
+def _keep_richest(
+    found: dict[str, YouTubePlaylist], playlist: YouTubePlaylist,
+) -> None:
+    '''Record *playlist* under its ID, keeping the entry that knows the
+    most about it (the shelf lockup carries the song count, the album
+    panel's grid item often does not).'''
+
+    playlist_id: str | None = playlist.playlist_id
+    if playlist_id is None:
+        return
+    existing: YouTubePlaylist | None = found.get(playlist_id)
+    if existing is None or (
+        existing.video_count or 0
+    ) < (playlist.video_count or 0):
+        found[playlist_id] = playlist
 
 
 def _token_rejected(exc: BaseException) -> bool:
@@ -237,6 +286,10 @@ class YouTubeChannelTabs:
         # Lowercase titles of the tabs whose scrape failed in this
         # scrape; their content is missing from the result.
         self.failed_tabs: set[str] = set()
+        # True when the channel is a YouTube topic channel, set from
+        # the browse response's title. Its tracks are listed from the
+        # uploads playlist instead of a Videos tab.
+        self.is_topic: bool = False
 
     @property
     def listing_complete(self) -> bool:
@@ -244,7 +297,7 @@ class YouTubeChannelTabs:
         of every listed tab, possibly over several scrapes.'''
 
         return self.resumable_listing and not (
-            self.failed_tabs & LATEST_ORDERED_TABS
+            self.failed_tabs & LISTING_TABS
         ) and all(
             state == LISTING_TAB_DONE
             for state in self.listing_state.values()
@@ -294,6 +347,11 @@ class YouTubeChannelTabs:
         '''
 
         channel_data: dict = await self._browse()
+
+        metadata: dict = channel_data.get(
+            'metadata', {},
+        ).get('channelMetadataRenderer', {})
+        self.is_topic = is_topic_channel_title(metadata.get('title'))
 
         self.tabs = channel_data.get(
             'contents', {}
@@ -384,12 +442,64 @@ class YouTubeChannelTabs:
                 self._scrape_tab(tab_renderer, title),
             )))
 
+        # A topic channel has no Videos/Shorts/Live tabs: its tracks are
+        # listed from the uploads playlist instead.
+        uploads_task: asyncio.Task[set[str]] | None = None
+        if self.is_topic and not self._listed_before(UPLOADS_TAB):
+            uploads_task = asyncio.create_task(self._scrape_uploads())
+
+        # A topic channel's albums live on the Home tab's 'Albums &
+        # Singles' shelf, which the tab loop skips.
+        home_task: asyncio.Task[set[YouTubePlaylist]] | None = None
+        home_tab: dict[str, any] | None = (
+            self._home_tab_renderer() if self.is_topic else None
+        )
+        if home_tab is not None:
+            home_task = asyncio.create_task(
+                self._scrape_home_playlists(home_tab),
+            )
+
         video_ids: set[str] = set()
         podcast_ids: set[str] = set()
         playlists: set[YouTubePlaylist] = set()
         courses: set[YouTubeCourse] = set()
         posts: set[YouTubePost] = set()
         products: set[YouTubeProduct] = set()
+        side_tasks: list[asyncio.Task] = [
+            task for task in (uploads_task, home_task) if task is not None
+        ]
+        try:
+            await self._collect_tab_results(
+                tab_tasks, video_ids, podcast_ids, playlists, courses,
+                posts, products,
+            )
+            if uploads_task is not None:
+                video_ids.update(await uploads_task)
+            if home_task is not None:
+                playlists.update(await home_task)
+        finally:
+            # A tab that ended the scrape (channel gone, cancelled)
+            # must not leave the uploads and Home tasks browsing.
+            for task in side_tasks:
+                task.cancel()
+            await asyncio.gather(*side_tasks, return_exceptions=True)
+
+        return video_ids, podcast_ids, playlists, courses, posts, products
+
+    async def _collect_tab_results(
+        self,
+        tab_tasks: list[tuple[str, asyncio.Task]],
+        video_ids: set[str],
+        podcast_ids: set[str],
+        playlists: set[YouTubePlaylist],
+        courses: set[YouTubeCourse],
+        posts: set[YouTubePost],
+        products: set[YouTubeProduct],
+    ) -> None:
+        '''Await the tab tasks and add their content to the sets. A
+        tab reporting the channel gone (or a cancellation) is raised.'''
+
+        extra: dict[str, str] = {'channel_id': self.channel_id}
         results: list = await asyncio.gather(
             *(task for _title, task in tab_tasks),
             return_exceptions=True,
@@ -426,8 +536,6 @@ class YouTubeChannelTabs:
             posts.update(tab_posts)
             products.update(tab_products)
 
-        return video_ids, podcast_ids, playlists, courses, posts, products
-
     def _listed_before(self, title: str) -> bool:
         '''True when an earlier scrape of this resumable full listing
         reached the last page of tab *title*, so it is not paged again;
@@ -435,7 +543,7 @@ class YouTubeChannelTabs:
 
         if not (
             self.resumable_listing
-            and title in LATEST_ORDERED_TABS
+            and title in LISTING_TABS
             and self.listing_resume.get(title) == LISTING_TAB_DONE
         ):
             return False
@@ -476,8 +584,9 @@ class YouTubeChannelTabs:
             page_tab: dict[str, any] = self.get_tab(page_data, title)
 
             if title == 'playlists':
-                playlists: set[YouTubePlaylist] = (
-                    self._get_playlist_items(page_tab)
+                playlists: set[YouTubePlaylist] = await self._page_playlists(
+                    self._get_playlist_items(page_tab),
+                    metric_base, title,
                 )
                 CHANNEL_TAB_ITEMS.labels(
                     **metric_base,
@@ -559,14 +668,14 @@ class YouTubeChannelTabs:
 
             latest_order: bool = False
             id_limit: int = 0
-            if title in LATEST_ORDERED_TABS and self.oldest_first_limit:
+            if title in SORTABLE_TABS and self.oldest_first_limit:
                 id_limit = self.oldest_first_limit
                 active_page_type = 'sort'
                 contents, _ = await self._sorted_contents(
                     page_tab, contents, metric_base, OLDEST_CHIP_TEXT,
                 )
                 active_page_type = None
-            elif self.known_video_ids and title in LATEST_ORDERED_TABS:
+            elif self.known_video_ids and title in SORTABLE_TABS:
                 active_page_type = 'sort'
                 contents, latest_order = await self._sorted_contents(
                     page_tab, contents, metric_base, LATEST_CHIP_TEXT,
@@ -578,7 +687,7 @@ class YouTubeChannelTabs:
             continuation_token: str = self.get_continuation_token(
                 contents[-1],
             )
-            if 'continuationItemRenderer' in contents[-1]:
+            if _is_trailing_continuation(contents[-1]):
                 contents = contents[:-1]
 
             _LOGGER.debug(
@@ -597,7 +706,7 @@ class YouTubeChannelTabs:
                 continuation_token = ''
 
             listing: bool = (
-                self.resumable_listing and title in LATEST_ORDERED_TABS
+                self.resumable_listing and title in LISTING_TABS
             )
             # Subsequent pages for one tab keep their tab-local order.
             await self._page_continuations(
@@ -651,6 +760,322 @@ class YouTubeChannelTabs:
                 outcome=outcome,
             ).observe(time.monotonic() - started_at)
 
+    def _home_tab_renderer(self) -> dict[str, any] | None:
+        '''The Home tab's tabRenderer, already loaded by
+        :meth:`browse_channel`; None when the channel has none.'''
+
+        for tab in self.tabs:
+            tab_renderer: dict[str, any] = tab.get('tabRenderer', {})
+            if tab_renderer.get('title', '').lower() == HOME_TAB:
+                return tab_renderer
+        return None
+
+    async def _scrape_home_playlists(
+        self, home_tab: dict,
+    ) -> set[YouTubePlaylist]:
+        '''Collect the playlists of a topic channel's Home tab.
+
+        Every lockup :meth:`YouTubePlaylist.from_innertube` accepts (an
+        album is a playlist) is collected from the shelves already
+        loaded, so no browse is needed for the first page. A shelf whose
+        engagement panel holds a continuation token is then paged to the
+        end: those pages list ``gridPlaylistRenderer`` items, parsed by
+        :meth:`YouTubePlaylist.from_grid_playlist`.
+
+        A page that fails keeps the playlists collected before it and
+        marks the Home tab failed; a token that repeats the last one
+        stops paging.
+
+        :param home_tab: the Home tab's tabRenderer dict
+        :returns: the playlists found, shelf and panel pages combined
+        '''
+
+        metric_base: dict[str, str] = _tab_metric_base(HOME_TAB)
+        extra: dict[str, str] = {
+            'channel_id': self.channel_id, 'tab': HOME_TAB,
+        }
+        started_at: float = time.monotonic()
+        outcome: str = 'success'
+        # Keyed by playlist ID: the shelf lockup and the panel's grid
+        # item describe the same album with different detail, and the
+        # lockup carries the song count.
+        found: dict[str, YouTubePlaylist] = {}
+        try:
+            for shelf in self._home_shelves(home_tab):
+                for item in shelf.get(
+                    'content', {},
+                ).get(
+                    'horizontalListRenderer', {},
+                ).get('items', []):
+                    playlist: YouTubePlaylist | None = (
+                        YouTubePlaylist.from_innertube(
+                            item, self.channel_id,
+                        )
+                    )
+                    if playlist:
+                        _keep_richest(found, playlist)
+                panel_token: str = self._panel_token(shelf)
+                if panel_token:
+                    for playlist in await self._page_album_panel(
+                        panel_token, metric_base,
+                    ):
+                        _keep_richest(found, playlist)
+        except Exception as exc:
+            outcome = 'failure'
+            self._mark_tab_failed(metric_base, HOME_TAB)
+            _LOGGER.warning(
+                'Home tab playlists failed; keeping what was collected',
+                exc=exc,
+                extra=extra,
+            )
+        finally:
+            CHANNEL_TAB_DURATION.labels(
+                **metric_base, outcome=outcome,
+            ).observe(time.monotonic() - started_at)
+
+        CHANNEL_TAB_ITEMS.labels(
+            **metric_base, item_type='playlist',
+        ).inc(len(found))
+        return set(found.values())
+
+    async def _page_album_panel(
+        self, panel_token: str, metric_base: dict[str, str],
+    ) -> set[YouTubePlaylist]:
+        '''Page one shelf's album panel from *panel_token* to the
+        end, returning the albums it lists.'''
+
+        found: set[YouTubePlaylist] = set()
+        seen_tokens: set[str] = set()
+        token: str = panel_token
+        while token and token not in seen_tokens:
+            seen_tokens.add(token)
+            try:
+                panel_data: dict = await self._browse(
+                    continuation_token=token,
+                )
+            except Exception as exc:
+                CHANNEL_TAB_PAGES.labels(
+                    **metric_base,
+                    page_type='continuation',
+                    outcome='failure',
+                ).inc()
+                self._mark_tab_failed(metric_base, HOME_TAB)
+                _LOGGER.warning(
+                    'Album panel page failed; keeping the albums '
+                    'collected before it',
+                    exc=exc,
+                    extra={
+                        'channel_id': self.channel_id,
+                        'albums_found': len(found),
+                    },
+                )
+                return found
+            CHANNEL_TAB_PAGES.labels(
+                **metric_base,
+                page_type='continuation',
+                outcome='success',
+            ).inc()
+            items: list = self._panel_items(panel_data)
+            if not items:
+                return found
+            token = (
+                self.get_continuation_token(items[-1])
+                if _is_trailing_continuation(items[-1]) else ''
+            )
+            if _is_trailing_continuation(items[-1]):
+                items = items[:-1]
+            for item in items:
+                playlist: YouTubePlaylist | None = (
+                    YouTubePlaylist.from_grid_playlist(
+                        item, self.channel_id,
+                    )
+                )
+                if playlist:
+                    found.add(playlist)
+        return found
+
+    @staticmethod
+    def _home_shelves(home_tab: dict) -> list:
+        '''The shelfRenderer dicts of a Home tab.'''
+
+        shelves: list = []
+        for section in home_tab.get(
+            'content', {},
+        ).get(
+            'sectionListRenderer', {},
+        ).get('contents', []):
+            for content in section.get(
+                'itemSectionRenderer', {},
+            ).get('contents', []):
+                shelf: dict | None = content.get('shelfRenderer')
+                if shelf:
+                    shelves.append(shelf)
+        return shelves
+
+    @staticmethod
+    def _panel_items(panel_data: dict) -> list:
+        '''The items of an album-panel page, unwrapping the grid the
+        first page is wrapped in.'''
+
+        endpoints: list = (
+            panel_data.get('onResponseReceivedEndpoints') or []
+        )
+        if not endpoints:
+            return []
+        items: list = endpoints[0].get(
+            'appendContinuationItemsAction', {}
+        ).get('continuationItems') or []
+        if items and 'gridRenderer' in items[0]:
+            return items[0]['gridRenderer'].get('items', []) or []
+        return items
+
+    @staticmethod
+    def _panel_token(shelf: dict) -> str:
+        '''The continuation token of a shelf's engagement panel.'''
+
+        return shelf.get(
+            'endpoint', {},
+        ).get(
+            'showEngagementPanelEndpoint', {},
+        ).get(
+            'engagementPanel', {},
+        ).get(
+            'engagementPanelSectionListRenderer', {},
+        ).get(
+            'content', {},
+        ).get(
+            'sectionListRenderer', {},
+        ).get(
+            'contents', [{}],
+        )[0].get(
+            'itemSectionRenderer', {},
+        ).get(
+            'contents', [{}],
+        )[0].get(
+            'continuationItemRenderer', {},
+        ).get(
+            'continuationEndpoint', {},
+        ).get(
+            'continuationCommand', {},
+        ).get('token', '')
+
+    async def _scrape_uploads(self) -> set[str]:
+        '''List a topic channel's tracks from its uploads playlist.
+
+        A topic channel has no Videos/Shorts/Live tabs; YouTube publishes
+        its tracks in the playlist ``UU`` + the channel ID without its
+        ``UC`` prefix, browsed here as ``VLUU...``. The first page is
+        read here, the rest by :meth:`_page_continuations`, so a full
+        listing is resumable and checkpoints exactly like a video tab.
+
+        Failure is not raised: the tab joins :attr:`failed_tabs` and the
+        IDs collected before it are kept, as for any other tab.
+
+        :returns: the video IDs listed, empty when the browse failed
+        '''
+
+        metric_base: dict[str, str] = _tab_metric_base(UPLOADS_TAB)
+        extra: dict[str, str] = {
+            'channel_id': self.channel_id, 'tab': UPLOADS_TAB,
+        }
+        started_at: float = time.monotonic()
+        outcome: str = 'success'
+        listing: bool = self.resumable_listing
+        video_ids: set[str] = set()
+        try:
+            page_data: dict = await self._browse(
+                browse_id=UPLOADS_BROWSE_PREFIX + self.channel_id[2:],
+            )
+            CHANNEL_TAB_PAGES.labels(
+                **metric_base, page_type='initial', outcome='success',
+            ).inc()
+            contents: list = self._uploads_items(page_data)
+            continuation_token: str = (
+                self.get_continuation_token(contents[-1])
+                if contents and _is_trailing_continuation(contents[-1])
+                else ''
+            )
+            if continuation_token:
+                contents = contents[:-1]
+
+            page_ids: list[str] = []
+            for content in contents:
+                video_id: str | None = self._extract_video_id(
+                    content, UPLOADS_TAB,
+                )
+                if video_id:
+                    page_ids.append(video_id)
+
+            # The uploads playlist is newest first, so a known-ID page
+            # ends an incremental listing. It has no sort chips, so no
+            # 'Latest' browse is needed to get that order.
+            latest_order: bool = bool(self.known_video_ids)
+            if await self._stop_after_page(
+                page_ids, video_ids, continuation_token, latest_order,
+                0, metric_base, UPLOADS_TAB,
+            ):
+                continuation_token = ''
+            await self._page_continuations(
+                UPLOADS_TAB, continuation_token, video_ids,
+                latest_order, 0, metric_base, listing,
+            )
+            if listing and UPLOADS_TAB not in self.listing_state:
+                # Reached the last page, in this or an earlier scrape.
+                self.listing_state[UPLOADS_TAB] = LISTING_TAB_DONE
+        except (
+            asyncio.CancelledError, ChannelNotFoundError,
+            ChannelTerminatedError, ChannelRedirectedError,
+        ):
+            outcome = 'failure'
+            CHANNEL_TAB_PAGES.labels(
+                **metric_base, page_type='initial', outcome='failure',
+            ).inc()
+            raise
+        except Exception as exc:
+            outcome = 'failure'
+            CHANNEL_TAB_PAGES.labels(
+                **metric_base, page_type='initial', outcome='failure',
+            ).inc()
+            self._mark_tab_failed(metric_base, UPLOADS_TAB)
+            _LOGGER.warning(
+                'Uploads playlist listing failed; the other tabs keep '
+                'their content',
+                exc=exc,
+                extra=extra,
+            )
+            return video_ids
+        finally:
+            CHANNEL_TAB_DURATION.labels(
+                **metric_base, outcome=outcome,
+            ).observe(time.monotonic() - started_at)
+
+        CHANNEL_TAB_ITEMS.labels(
+            **metric_base, item_type='video_id',
+        ).inc(len(video_ids))
+        return video_ids
+
+    @staticmethod
+    def _uploads_items(page_data: dict[str, any]) -> list:
+        '''The items of an uploads-playlist browse page.'''
+
+        return page_data.get(
+            'contents', {}
+        ).get(
+            'twoColumnBrowseResultsRenderer', {}
+        ).get(
+            'tabs', [{}]
+        )[0].get(
+            'tabRenderer', {}
+        ).get(
+            'content', {}
+        ).get(
+            'sectionListRenderer', {}
+        ).get(
+            'contents', [{}]
+        )[0].get(
+            'itemSectionRenderer', {}
+        ).get('contents', []) or []
+
     async def _page_continuations(
         self, title: str, continuation_token: str, video_ids: set[str],
         latest_order: bool, id_limit: int, metric_base: dict[str, str],
@@ -678,7 +1103,21 @@ class YouTubeChannelTabs:
             continuation_token = resume_token
         pending: set[str] = set(video_ids)
         pages: int = 0
+        seen_tokens: set[str] = set()
         while continuation_token:
+            if continuation_token in seen_tokens:
+                # The same page again would page forever: stop the tab
+                # like a failed page, so it is not recorded complete.
+                if listing:
+                    self.listing_state[title] = continuation_token
+                self._mark_tab_failed(metric_base, title)
+                _LOGGER.warning(
+                    'Channel tab repeated a continuation token; '
+                    'keeping the IDs collected before it',
+                    extra=extra | {'video_ids_found': len(video_ids)},
+                )
+                return
+            seen_tokens.add(continuation_token)
             try:
                 continued_data: dict = await self._browse(
                     continuation_token=continuation_token
@@ -736,7 +1175,7 @@ class YouTubeChannelTabs:
             continuation_token = self.get_continuation_token(
                 continuation_items[-1]
             )
-            if 'continuationItemRenderer' in continuation_items[-1]:
+            if _is_trailing_continuation(continuation_items[-1]):
                 continuation_items = continuation_items[:-1]
 
             _LOGGER.debug(
@@ -921,7 +1360,7 @@ class YouTubeChannelTabs:
         self.failed_tabs.add(title)
         saved_token: str | None = self.listing_resume.get(title)
         if (
-            self.resumable_listing and title in LATEST_ORDERED_TABS
+            self.resumable_listing and title in LISTING_TABS
             and title not in self.listing_state and saved_token
         ):
             # The tab failed before paging: keep the resume point an
@@ -973,7 +1412,15 @@ class YouTubeChannelTabs:
                 'lockupViewModel', {}
             ).get('contentId')
 
-            return lockup_video_id
+            if lockup_video_id is not None:
+                return lockup_video_id
+
+            # The uploads playlist of a topic channel returns its video
+            # lockups unwrapped, with no richItemRenderer around them.
+            unwrapped: dict = item.get('lockupViewModel', {})
+            if unwrapped.get('contentType') == 'LOCKUP_CONTENT_TYPE_VIDEO':
+                return unwrapped.get('contentId')
+            return None
 
         # Special handling for shorts
         video_url: str | None = item.get(
@@ -1018,17 +1465,21 @@ class YouTubeChannelTabs:
         return podcast_ids
 
     def _get_playlist_items(self, tab_renderer: dict[str, any]
-                            ) -> set[YouTubePlaylist]:
+                            ) -> list[dict[str, any]]:
         '''
-        Parses playlists from the playlists tab.  The playlists tab uses a
-        ``sectionListRenderer`` → ``gridRenderer`` layout instead of the
-        ``richGridRenderer`` used by the videos / shorts / live tabs.
+        Gets the first page's items from the playlists tab.  The
+        playlists tab uses a ``sectionListRenderer`` →
+        ``gridRenderer`` layout instead of the ``richGridRenderer``
+        used by the videos / shorts / live tabs.  The raw items are
+        returned so :meth:`_page_playlists` can parse them along with
+        the pages that follow.
 
         :param tab_renderer: the tabRenderer dict for the playlists tab
-        :returns: a set of YouTubePlaylist instances
+        :returns: the items of the first page, the trailing
+            ``continuationItemRenderer`` included when there is more
         '''
 
-        playlists: set[YouTubePlaylist] = set()
+        items: list[dict[str, any]] = []
 
         sections: list = tab_renderer.get(
             'content', {}
@@ -1037,19 +1488,93 @@ class YouTubeChannelTabs:
         ).get('contents', [])
 
         for section in sections:
-            items: list = section.get(
-                'itemSectionRenderer', {}
-            ).get('contents', [{}])[0].get(
-                'gridRenderer', {}
-            ).get('items', [])
+            items.extend(
+                section.get(
+                    'itemSectionRenderer', {}
+                ).get('contents', [{}])[0].get(
+                    'gridRenderer', {}
+                ).get('items', [])
+            )
 
+        return items
+
+    async def _page_playlists(
+        self, first_items: list, metric_base: dict[str, str], title: str,
+    ) -> set[YouTubePlaylist]:
+        '''Parse *first_items*, the playlists tab's first page, and page
+        its continuation to the end.
+
+        A page that fails after its retries keeps the playlists
+        collected before it, marks the tab failed and stops paging. A
+        continuation token that repeats the one just used stops paging
+        too, so a misbehaving endpoint cannot loop forever.
+
+        :param first_items: the items of the playlists tab's first page
+        :param metric_base: the tab's Prometheus label set
+        :param title: the tab title, for the failure record
+        :returns: the playlists found on every page
+        '''
+
+        playlists: set[YouTubePlaylist] = set()
+        items: list = list(first_items)
+        token: str = (
+            self.get_continuation_token(items[-1])
+            if items and _is_trailing_continuation(items[-1])
+            else ''
+        )
+        if token:
+            items = items[:-1]
+        seen_tokens: set[str] = set()
+        while True:
             for item in items:
-                playlist: YouTubePlaylist | None = \
+                playlist: YouTubePlaylist | None = (
                     YouTubePlaylist.from_innertube(item, self.channel_id)
+                )
                 if playlist:
                     playlists.add(playlist)
-
-        return playlists
+            if not token or token in seen_tokens:
+                return playlists
+            seen_tokens.add(token)
+            try:
+                continued_data: dict = await self._browse(
+                    continuation_token=token,
+                )
+            except Exception as exc:
+                CHANNEL_TAB_PAGES.labels(
+                    **metric_base,
+                    page_type='continuation',
+                    outcome='failure',
+                ).inc()
+                self._mark_tab_failed(metric_base, title)
+                _LOGGER.warning(
+                    'Channel playlists page failed; keeping the '
+                    'playlists collected before it',
+                    exc=exc,
+                    extra={
+                        'channel_id': self.channel_id,
+                        'tab': title,
+                        'playlists_found': len(playlists),
+                    },
+                )
+                return playlists
+            CHANNEL_TAB_PAGES.labels(
+                **metric_base,
+                page_type='continuation',
+                outcome='success',
+            ).inc()
+            continuation_items: list = self._continuation_items(
+                continued_data,
+            )
+            if not continuation_items:
+                return playlists
+            token: str = self.get_continuation_token(
+                continuation_items[-1],
+            )
+            items = (
+                continuation_items[:-1]
+                if _is_trailing_continuation(continuation_items[-1])
+                else continuation_items
+            )
 
     def _get_course_items(self, tab_renderer: dict[str, any]
                           ) -> set[YouTubeCourse]:
@@ -1153,7 +1678,10 @@ class YouTubeChannelTabs:
         return products
 
     async def _browse(self, params: str = '', continuation_token: str = '',
-                      max_retries: int = 4) -> dict:
+                      max_retries: int = 4,
+                      browse_id: str | None = None) -> dict:
+        '''Browse InnerTube for this channel, or for *browse_id* when
+        given (the uploads playlist of a topic channel).'''
         limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
         penalty: float = 4.0
         _PENALTY_MAX: float = 300.0
@@ -1192,7 +1720,7 @@ class YouTubeChannelTabs:
                 result: dict
                 try:
                     result = await self._browse_once(
-                        client, params, continuation_token,
+                        client, params, continuation_token, browse_id,
                     )
                 finally:
                     if pinned is None:
@@ -1321,25 +1849,28 @@ class YouTubeChannelTabs:
 
     async def _browse_once(
         self, client: InnerTube, params: str, continuation_token: str,
+        browse_id: str | None = None,
     ) -> dict:
-        '''Run one InnerTube browse call for this channel.'''
+        '''Run one InnerTube browse call for this channel, or for
+        *browse_id* when given.'''
 
+        target: str = browse_id or self.channel_id
         if params:
             return await _call_innertube_browse(
                 functools.partial(
-                    client.browse, self.channel_id, params=params,
+                    client.browse, target, params=params,
                 ),
             )
         if continuation_token:
             return await _call_innertube_browse(
                 functools.partial(
                     client.browse,
-                    self.channel_id,
+                    target,
                     continuation=continuation_token,
                 ),
             )
         return await _call_innertube_browse(
-            client.browse, self.channel_id,
+            client.browse, target,
         )
 
     async def get_page_tabs(self) -> list[dict[str, any]]:
@@ -1420,7 +1951,21 @@ class YouTubeChannelTabs:
         ).get(
             'token', ''
         )
-        return token
+        if token:
+            return token
+        # The uploads playlist and the album panels of a topic channel
+        # carry the token in a continuationItemViewModel instead.
+        return last_item.get(
+            'continuationItemViewModel', {}
+        ).get(
+            'continuationCommand', {}
+        ).get(
+            'innertubeCommand', {}
+        ).get(
+            'continuationCommand', {}
+        ).get(
+            'token', ''
+        )
 
     def get_tab(self, page_data: dict[str, any], title: str
                 ) -> dict[str, any]:

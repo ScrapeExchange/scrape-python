@@ -9,7 +9,9 @@ import fakeredis
 
 from scrape_exchange.youtube.privacy import (
     HARDCODED_ALLOWED_DOMAINS,
+    ChannelPrivacyRecord,
     lookup_channel_counts,
+    lookup_channel_privacy,
     mask_channel,
     mask_channel_record,
     mask_video,
@@ -113,6 +115,51 @@ class TestLookup(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(
             await lookup_channel_counts(redis, 'UCc'), (7, None))
+
+
+class TestLookupChannelPrivacy(unittest.IsolatedAsyncioTestCase):
+
+    async def asyncSetUp(self) -> None:
+        self.redis: fakeredis.aioredis.FakeRedis = (
+            fakeredis.aioredis.FakeRedis(decode_responses=True)
+        )
+        self.addCleanup(self.redis.close)
+
+    async def test_topic_flag(self) -> None:
+        await self.redis.hset(
+            'youtube:channel:meta:i:UCa', mapping={'topic': '1'},
+        )
+        self.assertEqual(
+            await lookup_channel_privacy(self.redis, 'UCa'),
+            ChannelPrivacyRecord(None, None, True),
+        )
+
+    async def test_counts_and_no_topic_flag(self) -> None:
+        await self.redis.hset('youtube:channel:meta:i:UCb', mapping={
+            'subscriber_count': '12', 'view_count': '345',
+        })
+        self.assertEqual(
+            await lookup_channel_privacy(self.redis, 'UCb'),
+            ChannelPrivacyRecord(12, 345, False),
+        )
+
+    async def test_absent_key_and_missing_id(self) -> None:
+        self.assertIsNone(await lookup_channel_privacy(self.redis, 'UCz'))
+        self.assertIsNone(await lookup_channel_privacy(self.redis, None))
+        self.assertIsNone(await lookup_channel_privacy(self.redis, ''))
+
+    async def test_bytes_topic_flag(self) -> None:
+        redis: fakeredis.aioredis.FakeRedis = (
+            fakeredis.aioredis.FakeRedis()
+        )
+        self.addCleanup(redis.close)
+        await redis.hset(
+            'youtube:channel:meta:i:UCc', mapping={'topic': b'1'},
+        )
+        self.assertEqual(
+            await lookup_channel_privacy(redis, 'UCc'),
+            ChannelPrivacyRecord(None, None, True),
+        )
 
 
 if __name__ == '__main__':

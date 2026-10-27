@@ -164,7 +164,7 @@ class TestRssRedisFirstExistence(unittest.TestCase):
                     new=AsyncMock(return_value=videos),
                 ), patch.object(
                     yt_rss_scrape, 'update_channel',
-                    new=AsyncMock(return_value=(True, 0, 'handle')),
+                    new=AsyncMock(return_value=(True, 0, 'handle', False)),
                 ), patch.object(
                     yt_rss_scrape, '_get_rss_circuit_breaker',
                     return_value=breaker,

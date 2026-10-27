@@ -125,7 +125,7 @@ class TestRssSkipsSmallChannels(unittest.IsolatedAsyncioTestCase):
         ), patch.object(
             yt_rss_scrape, 'update_channel',
             new=AsyncMock(
-                return_value=(True, subscriber_count, 'handle'),
+                return_value=(True, subscriber_count, 'handle', False),
             ),
         ), patch.object(
             yt_rss_scrape, '_get_rss_circuit_breaker',

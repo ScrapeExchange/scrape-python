@@ -15,7 +15,14 @@ from datetime import UTC, datetime
 
 _LOGGER: Logger = getLogger(__name__)
 
-_VIDEO_COUNT_RE: re.Pattern[str] = re.compile(r'(\d+)\s+video')
+_VIDEO_COUNT_RE: re.Pattern[str] = re.compile(r'([\d,]+)\s+(?:video|song)')
+
+# Lockup content types that describe a playlist. An album is a playlist
+# as far as the channel scraper is concerned.
+_PLAYLIST_CONTENT_TYPES: frozenset[str] = frozenset({
+    'LOCKUP_CONTENT_TYPE_PLAYLIST',
+    'LOCKUP_CONTENT_TYPE_ALBUM',
+})
 
 
 class YouTubePlaylist:
@@ -126,7 +133,7 @@ class YouTubePlaylist:
             return None
 
         content_type: str = lvm.get('contentType', '')
-        if content_type != 'LOCKUP_CONTENT_TYPE_PLAYLIST':
+        if content_type not in _PLAYLIST_CONTENT_TYPES:
             _LOGGER.debug(
                 'Skipping non-playlist lockup',
                 extra={'content_type': content_type}
@@ -171,7 +178,7 @@ class YouTubePlaylist:
                     badge_text
                 )
                 if match:
-                    video_count = int(match.group(1))
+                    video_count = int(match.group(1).replace(',', ''))
 
         playlist = YouTubePlaylist(
             playlist_id=playlist_id,
@@ -182,3 +189,51 @@ class YouTubePlaylist:
         )
 
         return playlist
+
+    @staticmethod
+    def from_grid_playlist(item: dict[str, any],
+                           channel_id: str | None = None) -> Self | None:
+        '''Create a YouTubePlaylist from a ``gridPlaylistRenderer`` item,
+        the shape the album list of a topic channel's Home shelf uses.
+
+        :param item: a single item holding a ``gridPlaylistRenderer``
+        :param channel_id: optional channel ID to associate
+        :returns: a YouTubePlaylist or None if the item is not a
+            playlist
+        '''
+
+        gpr: dict = item.get('gridPlaylistRenderer', {})
+        if not gpr:
+            return None
+
+        playlist_id: str | None = gpr.get('playlistId')
+        if not playlist_id:
+            return None
+
+        runs: list = gpr.get('title', {}).get('runs', [])
+        title: str | None = (
+            runs[0].get('text') if runs else None
+        )
+
+        thumbnail_url: str | None = None
+        thumbnails: list = gpr.get('thumbnail', {}).get('thumbnails', [])
+        if thumbnails:
+            thumbnail_url = thumbnails[0].get('url')
+
+        count_text: str | None = gpr.get(
+            'videoCountShortText', {},
+        ).get('simpleText')
+        video_count: int = 0
+        if count_text:
+            try:
+                video_count = int(count_text.replace(',', '').strip())
+            except ValueError:
+                video_count = 0
+
+        return YouTubePlaylist(
+            playlist_id=playlist_id,
+            title=title,
+            video_count=video_count,
+            thumbnail_url=thumbnail_url,
+            channel_id=channel_id,
+        )

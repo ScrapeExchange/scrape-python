@@ -63,6 +63,9 @@ tab on the channel: Videos, Shorts, Live, Podcasts,
 Courses, Playlists, Posts, Store. Output is one
 `channel-<handle>.json.br` per channel.
 
+The Playlists tab is paged to its end, so a channel with
+more than one page of playlists keeps all of them.
+
 ### Priority directory drain
 
 In Redis mode, worker `WORKER_ID=1` periodically drains the channel
@@ -193,6 +196,42 @@ immediately pops the next. This avoids head-of-line blocking
 where one huge channel can hold a whole scrape batch open.
 `CHANNEL_QUEUE_SCRAPE_BATCH` is deprecated and ignored by
 `yt_channel_scrape.py`.
+
+### Topic channels
+
+YouTube gives every artist an auto-generated *topic channel*,
+titled `<artist> - Topic` and with no vanity handle. It is
+scraped like any other channel, with three differences:
+
+- It has no Videos/Shorts/Live tabs. Its tracks are listed from
+  its **uploads playlist** (`VLUU` + the channel ID without its
+  `UC` prefix), paged to the end on the same resumable-listing
+  machinery as the video tabs. The playlist is newest first, so
+  a known-ID page still ends an incremental listing.
+- Its **albums** live on the Home tab's *Albums & Singles*
+  shelf. Each album lockup is stored as a playlist, and a shelf
+  whose panel carries a continuation token is paged to the end.
+  The same album can appear in both the shelf and the panel: it
+  is stored once, with the song count the shelf carries.
+- It is **exempt from the privacy limits**: its records and its
+  videos are never written as `.low_subs`, never masked, and it
+  is never parked in the `low_subs` state. `_channel_size()`
+  reports a topic channel as `LARGE`, which is what exempts the
+  tiny stop, both privacy-limit callers, the listing-checkpoint
+  gate and the end state.
+
+Detection is the title (`is_topic_channel_title()`, from the
+browse response's `channelMetadataRenderer.title`, available
+before any tab runs) only: a handle ending in `-topic` can belong
+to any personal channel, which keeps the privacy rules. The
+channel scraper flags a topic channel `topic=1` in its queue
+meta, which is what the video and RSS scrapers read to apply
+their own exemptions.
+
+A topic channel goes in the **tier one above the catch-all**
+(`ChannelScrapeQueue.topic_tier()`), or higher when its
+subscriber count qualifies. A missing subscriber count is not a
+retry for a topic channel: it is scheduled normally.
 
 ### Failure handling
 
@@ -704,6 +743,46 @@ cat channels.lst \
 
 Useful for piping discovery output (see
 `tools/yt_discover_channels.py`) straight into the queue.
+
+### Requeue parked topic channels (`requeue-topic`)
+
+Topic channels used to be parked in the `topic` state instead of
+being scraped. `requeue-topic` moves the channel-ID members into
+the topic tier and flags `topic=1` on those whose stored record
+has a ` - Topic` title or display-name handle; members parked by
+the old `-topic` handle rule are requeued without the flag, so
+they keep the privacy rules. Handle members (`h:`) go back to
+resolution. Topic channels the old scrapers parked in `low_subs`
+(their stored record has a ` - Topic` title) are flagged and
+requeued the same way; other `low_subs` members stay parked. It is
+a dry run unless `--apply` is given:
+
+```bash
+PYTHONPATH=. uv run tools/yt_channel_queue.py requeue-topic
+PYTHONPATH=. uv run tools/yt_channel_queue.py requeue-topic --limit 100 --apply
+PYTHONPATH=. uv run tools/yt_channel_queue.py requeue-topic --apply
+```
+
+The report line is
+`requeue-topic: inspected=N moved=M flagged=F handles=H
+low_subs_topic=K dry_run=<bool> tier=T`, where `inspected` counts
+the channel-ID members of both states (`--limit` caps it),
+`flagged` the `topic`-state members flagged `topic=1`, `handles`
+the `h:` members and `low_subs_topic` the topic channels found in
+`low_subs`. `tier` is the 0-based topic tier index.
+
+Rollout, once the new scrapers are deployed on every host:
+
+1. Dry run on one host; check `inspected` is plausible and
+   `low_subs_topic` is what you expect.
+2. `--apply --limit 100`, then watch
+   `max by (state) (channel_state_size)` (the `topic` series
+   shrinks), `max by (tier, status) (channel_video_listing_status)`
+   (`tier="5"` — the topic tier, one-based in the metric — fills
+   with `complete`) and the RSS queue size, since a topic
+   channel's first full scrape adds its creator to the RSS queue.
+3. `--apply` for the rest, in batches if you want to watch the
+   rate limiter between them.
 
 ### Inspect and manage the queue
 

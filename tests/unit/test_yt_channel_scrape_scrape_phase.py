@@ -2,9 +2,7 @@
 
 import asyncio
 import json
-import tempfile
 import unittest
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from scrape_exchange.channel_scrape_queue import (
@@ -13,7 +11,6 @@ from scrape_exchange.channel_scrape_queue import (
     ChannelScrapeProgress,
     ChannelState,
 )
-from scrape_exchange.file_management import AssetFileManagement
 from scrape_exchange.youtube.channel_identity import (
     ChannelNotFoundError,
 )
@@ -80,16 +77,28 @@ def _mock_channel(
 
 class TestChannelEndState(unittest.TestCase):
 
-    def test_topic_wins_over_other_terminal_signals(self) -> None:
+    def test_topic_channel_has_no_end_state(self) -> None:
+        from tools.yt_channel_scrape import _channel_end_state
+
+        # A topic channel is exempt from the privacy rules, so neither
+        # low subscribers nor a title-derived topic state applies.
+        self.assertIsNone(_channel_end_state(_mock_channel(
+            subscriber_count=0,
+            title='Bulldog - Topic',
+        )))
+
+    def test_topic_handle_alone_is_not_topic(self) -> None:
+        # Only a ' - Topic' title makes a topic channel: a personal
+        # channel whose handle ends in '-topic' keeps the privacy rules.
         from tools.yt_channel_scrape import _channel_end_state
 
         self.assertEqual(
             _channel_end_state(_mock_channel(
-                subscriber_count=0,
-                video_count=0,
-                title='Example - Topic',
+                subscriber_count=None,
+                title='Artist',
+                channel_handle='artist-topic',
             )),
-            ChannelState.TOPIC,
+            ChannelState.LOW_SUBS,
         )
 
     def test_unknown_counts_mark_low_subs(self) -> None:
@@ -107,54 +116,6 @@ class TestChannelEndState(unittest.TestCase):
 class TestScrapeOne(
     ScrapePhaseTestCase,
 ):
-
-    async def test_topic_handle_marks_invalid_without_scrape(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            queue = _mock_queue()
-            creator_map = AsyncMock()
-            creator_map.get.return_value = 'Artist - Topic'
-            fm = AssetFileManagement(tmp)
-            channel_id: str = 'UCabc00000000000000000000'
-            from tools.yt_channel_scrape import (
-                _scrape_one_queued,
-            )
-            with (
-                patch(
-                    'tools.yt_channel_scrape'
-                    '._channel_exists_on_exchange',
-                    new_callable=AsyncMock,
-                ) as mock_exists,
-                patch(
-                    'tools.yt_channel_scrape'
-                    '._do_scrape_channel_to_disk_typed',
-                    new_callable=AsyncMock,
-                ) as mock_scrape,
-            ):
-                await _scrape_one_queued(
-                    channel_id,
-                    queue=queue,
-                    settings=_mock_settings(),
-                    fm=fm,
-                    creator_map_backend=creator_map,
-                    http_client=MagicMock(),
-                )
-
-            invalid_path: Path = (
-                Path(tmp)
-                / f'channel-{channel_id}.json.br.invalid'
-            )
-            self.assertTrue(invalid_path.exists())
-            self.assertEqual(invalid_path.read_bytes(), b'')
-            mock_exists.assert_not_awaited()
-            mock_scrape.assert_not_awaited()
-            queue.mark.assert_awaited_once_with(
-                f'i:{channel_id}',
-                state=ChannelState.TOPIC,
-                last_error='topic channel skipped',
-                extra={'channel_handle': 'Artist - Topic'},
-            )
 
     @patch(
         'tools.yt_channel_scrape'
@@ -373,88 +334,6 @@ class TestScrapeOne(
         '._do_scrape_channel_to_disk_typed',
         new_callable=AsyncMock,
     )
-    async def test_topic_marks_terminal(
-        self,
-        mock_scrape: AsyncMock,
-        mock_exists: AsyncMock,
-    ) -> None:
-        mock_exists.return_value = False
-        mock_scrape.return_value = _mock_channel(
-            subscriber_count=0,
-            title='Example - Topic',
-            video_count=0,
-        )
-        queue = _mock_queue()
-        creator_map = AsyncMock()
-        creator_map.get.return_value = 'example-topic'
-        from tools.yt_channel_scrape import (
-            _scrape_one_queued,
-        )
-        await _scrape_one_queued(
-            'UCabc00000000000000000000',
-            queue=queue,
-            settings=_mock_settings(),
-            fm=MagicMock(),
-            creator_map_backend=creator_map,
-            http_client=MagicMock(),
-        )
-        self.assertEqual(
-            queue.mark.await_args.kwargs['state'],
-            ChannelState.TOPIC,
-        )
-        queue.update_tier.assert_not_called()
-
-    @patch(
-        'tools.yt_channel_scrape'
-        '._channel_exists_on_exchange',
-        new_callable=AsyncMock,
-    )
-    @patch(
-        'tools.yt_channel_scrape'
-        '._do_scrape_channel_to_disk_typed',
-        new_callable=AsyncMock,
-    )
-    async def test_topic_handle_marks_terminal(
-        self,
-        mock_scrape: AsyncMock,
-        mock_exists: AsyncMock,
-    ) -> None:
-        mock_exists.return_value = False
-        mock_scrape.return_value = _mock_channel(
-            subscriber_count=10,
-            title='Example',
-            channel_handle='example-topic',
-        )
-        queue = _mock_queue()
-        creator_map = AsyncMock()
-        creator_map.get.return_value = 'example-topic'
-        from tools.yt_channel_scrape import (
-            _scrape_one_queued,
-        )
-        await _scrape_one_queued(
-            'UCabc00000000000000000000',
-            queue=queue,
-            settings=_mock_settings(),
-            fm=MagicMock(),
-            creator_map_backend=creator_map,
-            http_client=MagicMock(),
-        )
-        self.assertEqual(
-            queue.mark.await_args.kwargs['state'],
-            ChannelState.TOPIC,
-        )
-        queue.update_tier.assert_not_called()
-
-    @patch(
-        'tools.yt_channel_scrape'
-        '._channel_exists_on_exchange',
-        new_callable=AsyncMock,
-    )
-    @patch(
-        'tools.yt_channel_scrape'
-        '._do_scrape_channel_to_disk_typed',
-        new_callable=AsyncMock,
-    )
     async def test_no_videos_marks_terminal(
         self,
         mock_scrape: AsyncMock,
@@ -485,49 +364,6 @@ class TestScrapeOne(
             ChannelState.NO_VIDEOS,
         )
         queue.update_tier.assert_not_awaited()
-
-    @patch(
-        'tools.yt_channel_scrape'
-        '._channel_exists_on_exchange',
-        new_callable=AsyncMock,
-    )
-    @patch(
-        'tools.yt_channel_scrape'
-        '._do_scrape_channel_to_disk_typed',
-        new_callable=AsyncMock,
-    )
-    async def test_topic_scrape_precedes_low_subs(
-        self,
-        mock_scrape: AsyncMock,
-        mock_exists: AsyncMock,
-    ) -> None:
-        mock_exists.return_value = False
-        channel = MagicMock()
-        channel.subscriber_count = 0
-        channel.video_count = 0
-        channel.channel_id = 'UCabc00000000000000000000'
-        channel.channel_handle = 'artist-topic'
-        channel.title = 'Artist'
-        mock_scrape.return_value = channel
-        queue = _mock_queue()
-        creator_map = AsyncMock()
-        creator_map.get.return_value = 'artist'
-        from tools.yt_channel_scrape import (
-            _scrape_one_queued,
-        )
-        await _scrape_one_queued(
-            'UCabc00000000000000000000',
-            queue=queue,
-            settings=_mock_settings(),
-            fm=MagicMock(),
-            creator_map_backend=creator_map,
-            http_client=MagicMock(),
-        )
-        queue.mark.assert_awaited_once()
-        self.assertEqual(
-            queue.mark.await_args.kwargs['state'],
-            ChannelState.TOPIC,
-        )
 
     @patch(
         'tools.yt_channel_scrape'
@@ -1198,12 +1034,6 @@ class TestTypedScrape(
                 return_value=None,
             ),
             patch(
-                'tools.yt_channel_scrape'
-                '._reject_topic_channel_if_needed',
-                new_callable=AsyncMock,
-                return_value=False,
-            ),
-            patch(
                 'tools.yt_channel_scrape._persist_scraped_channel',
                 new_callable=AsyncMock,
                 return_value=True,
@@ -1761,12 +1591,6 @@ class TestScrapeOneHandleOptional(
                 return_value=None,
             ),
             patch(
-                'tools.yt_channel_scrape'
-                '._reject_topic_channel_if_needed',
-                new_callable=AsyncMock,
-                return_value=False,
-            ),
-            patch(
                 'tools.yt_channel_scrape._channel_has_no_content',
                 return_value=False,
             ),
@@ -2016,6 +1840,106 @@ class TestFullEnumeration(ScrapePhaseTestCase):
         queue.delete_meta.assert_awaited_once_with(
             'i:UCabc00000000000000000000', LISTING_RESUME_FIELD,
         )
+
+
+class TestTopicChannel(ScrapePhaseTestCase):
+    '''A topic channel is scraped, written and scheduled like any
+    other channel, exempt from the privacy limits.'''
+
+    CHANNEL_ID: str = 'UCabc00000000000000000000'
+
+    @patch(
+        'tools.yt_channel_scrape._channel_exists_on_exchange',
+        new_callable=AsyncMock,
+    )
+    @patch(
+        'tools.yt_channel_scrape._do_scrape_channel_to_disk_typed',
+        new_callable=AsyncMock,
+    )
+    async def test_topic_channel_scraped_and_scheduled(
+        self, mock_scrape: AsyncMock, mock_exists: AsyncMock,
+    ) -> None:
+        from tools.yt_channel_scrape import (
+            CHANNEL_SCRAPE_OUTCOMES,
+            _scrape_one_queued,
+        )
+        mock_exists.return_value = False
+        mock_scrape.return_value = _mock_channel(
+            subscriber_count=None, title='Bulldog - Topic',
+            channel_handle='bulldog-topic',
+        )
+        queue: AsyncMock = _mock_queue()
+        creator_map: AsyncMock = AsyncMock()
+        creator_map.get.return_value = 'bulldog-topic'
+        before: float = CHANNEL_SCRAPE_OUTCOMES.labels(
+            outcome='scraped',
+        )._value.get()
+        with patch(
+            'tools.yt_channel_scrape.queue_channel_videos',
+            new_callable=AsyncMock,
+        ):
+            await _scrape_one_queued(
+                self.CHANNEL_ID,
+                queue=queue,
+                settings=_mock_settings(),
+                fm=MagicMock(),
+                creator_map_backend=creator_map,
+                http_client=MagicMock(),
+            )
+        # Not parked, and scheduled with the topic tier rule.
+        queue.mark.assert_not_awaited()
+        self.assertTrue(queue.update_tier.await_args.kwargs['topic'])
+        queue.set_meta.assert_any_await(
+            f'i:{self.CHANNEL_ID}', topic='1',
+        )
+        # A missing subscriber count is not a failure for a topic
+        # channel: the outcome is a plain scrape.
+        self.assertEqual(
+            CHANNEL_SCRAPE_OUTCOMES.labels(
+                outcome='scraped',
+            )._value.get() - before,
+            1,
+        )
+
+    async def test_topic_checkpoint_queues_videos(self) -> None:
+        from tools.yt_channel_scrape import _listing_checkpoint_fn
+        queue: AsyncMock = _mock_queue()
+        events: list[str] = []
+        queue.set_meta.side_effect = (
+            lambda *args, **kwargs: events.append('set_meta')
+        )
+        exchange_ids: MagicMock = MagicMock()
+        exchange_ids.get = AsyncMock(return_value=set())
+        with patch(
+            'tools.yt_channel_scrape.queue_video_ids',
+            new_callable=AsyncMock,
+            side_effect=lambda *args, **kwargs: events.append('queue'),
+        ) as queued, patch(
+            'tools.yt_channel_scrape.AssetFileManagement',
+        ):
+            checkpoint = _listing_checkpoint_fn(
+                queue, f'i:{self.CHANNEL_ID}', {},
+                settings=_mock_settings(),
+                stored_counts=(None, None),
+                redis=MagicMock(),
+                http_client=MagicMock(),
+                exchange_video_ids=exchange_ids,
+                extra={'channel_id': self.CHANNEL_ID},
+            )
+            self.assertIsNotNone(checkpoint)
+            await checkpoint(
+                _mock_channel(
+                    subscriber_count=0, title='Bulldog - Topic',
+                ),
+                'uploads', 'tok', {'vid00000002'},
+            )
+        queued.assert_awaited_once()
+        self.assertEqual(queued.await_args.args[0], {'vid00000002'})
+        # The flag must be set before the tracks are queued; the
+        # resume point is saved after them.
+        self.assertEqual(events[:2], ['set_meta', 'queue'])
+        first_meta: MagicMock = queue.set_meta.await_args_list[0]
+        self.assertEqual(first_meta.kwargs, {'topic': '1'})
 
 
 class TestParseListingResume(unittest.TestCase):

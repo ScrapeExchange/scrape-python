@@ -109,6 +109,13 @@ class TestApplyPrivacyLimits(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await self._apply(channel))
         self.assertEqual(channel.description, 'mail jan@mail.example')
 
+    async def test_topic_channel_written_unmasked(self) -> None:
+        channel: YouTubeChannel = _channel(3)
+        channel.title = 'Bulldog - Topic'
+        self.assertFalse(await self._apply(channel))
+        self.assertFalse(self._path('.low_subs').exists())
+        self.assertEqual(channel.description, 'mail jan@mail.example')
+
 
 class TestTypedScrapeToDisk(unittest.IsolatedAsyncioTestCase):
 
@@ -151,6 +158,44 @@ class TestTypedScrapeToDisk(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(stop_if(tiny))
         self.assertFalse(stop_if(unknown))
         self.assertFalse(stop_if(large))
+
+
+class TestTypedTopicChannel(unittest.IsolatedAsyncioTestCase):
+
+    async def test_topic_channel_is_not_too_small(self) -> None:
+        from tools.yt_channel_scrape import (
+            _do_scrape_channel_to_disk_typed,
+        )
+
+        async def fake_scrape(channel, settings, extra, **kwargs):
+            channel.subscriber_count = 0
+            channel.channel_handle = 'bulldog-topic'
+            channel.title = 'Bulldog - Topic'
+            channel.video_ids = {'vid00000001'}
+            return None
+
+        settings: MagicMock = _mock_settings()
+        with tempfile.TemporaryDirectory() as tmp:
+            settings.channel_data_directory = tmp
+            fm: AssetFileManagement = AssetFileManagement(tmp)
+            with patch(
+                'tools.yt_channel_scrape._try_scrape_channel_typed',
+                side_effect=fake_scrape,
+            ), patch(
+                'tools.yt_channel_scrape._persist_scraped_channel',
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as persisted, patch(
+                'tools.yt_channel_scrape._channel_has_no_content',
+                return_value=False,
+            ):
+                await _do_scrape_channel_to_disk_typed(
+                    settings, fm, 'bulldog-topic', FILENAME,
+                    {'channel_id': CHANNEL_ID},
+                    exchange_video_ids=MagicMock(),
+                )
+        persisted.assert_awaited_once()
+        self.assertFalse((Path(tmp) / f'{FILENAME}.low_subs').exists())
 
 
 class TestScrapeOneTooSmall(ScrapePhaseTestCase):
