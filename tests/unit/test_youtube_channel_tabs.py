@@ -17,6 +17,7 @@ from scrape_exchange.youtube.youtube_channel_tabs import (
     YouTubeChannelTabs,
     _tab_metric_label,
 )
+from scrape_exchange.youtube.youtube_playlist import YouTubePlaylist
 from scrape_exchange.youtube.youtube_types import YouTubeChannelPageType
 
 
@@ -267,20 +268,21 @@ class TestGetPlaylistItems(unittest.TestCase):
                 }
             }
         }
-        playlists = self.tabs._get_playlist_items(tab_renderer)
-        self.assertEqual(len(playlists), 1)
-        pl = next(iter(playlists))
+        items = self.tabs._get_playlist_items(tab_renderer)
+        self.assertEqual(len(items), 1)
+        pl = YouTubePlaylist.from_innertube(items[0], CHANNEL_ID)
+        self.assertIsNotNone(pl)
         self.assertEqual(pl.playlist_id, 'PLabc')
         self.assertEqual(pl.title, 'My Playlist')
 
     def test_empty_sections(self) -> None:
         tab_renderer = {'content': {'sectionListRenderer': {'contents': []}}}
-        playlists = self.tabs._get_playlist_items(tab_renderer)
-        self.assertEqual(len(playlists), 0)
+        items = self.tabs._get_playlist_items(tab_renderer)
+        self.assertEqual(len(items), 0)
 
     def test_missing_content(self) -> None:
-        playlists = self.tabs._get_playlist_items({})
-        self.assertEqual(len(playlists), 0)
+        items = self.tabs._get_playlist_items({})
+        self.assertEqual(len(items), 0)
 
 
 class TestGetCourseItems(unittest.TestCase):

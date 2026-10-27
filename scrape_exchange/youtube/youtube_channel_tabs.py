@@ -487,8 +487,9 @@ class YouTubeChannelTabs:
             page_tab: dict[str, any] = self.get_tab(page_data, title)
 
             if title == 'playlists':
-                playlists: set[YouTubePlaylist] = (
-                    self._get_playlist_items(page_tab)
+                playlists: set[YouTubePlaylist] = await self._page_playlists(
+                    self._get_playlist_items(page_tab),
+                    metric_base, title,
                 )
                 CHANNEL_TAB_ITEMS.labels(
                     **metric_base,
@@ -1029,17 +1030,21 @@ class YouTubeChannelTabs:
         return podcast_ids
 
     def _get_playlist_items(self, tab_renderer: dict[str, any]
-                            ) -> set[YouTubePlaylist]:
+                            ) -> list[dict[str, any]]:
         '''
-        Parses playlists from the playlists tab.  The playlists tab uses a
-        ``sectionListRenderer`` → ``gridRenderer`` layout instead of the
-        ``richGridRenderer`` used by the videos / shorts / live tabs.
+        Gets the first page's items from the playlists tab.  The
+        playlists tab uses a ``sectionListRenderer`` →
+        ``gridRenderer`` layout instead of the ``richGridRenderer``
+        used by the videos / shorts / live tabs.  The raw items are
+        returned so :meth:`_page_playlists` can parse them along with
+        the pages that follow.
 
         :param tab_renderer: the tabRenderer dict for the playlists tab
-        :returns: a set of YouTubePlaylist instances
+        :returns: the items of the first page, the trailing
+            ``continuationItemRenderer`` included when there is more
         '''
 
-        playlists: set[YouTubePlaylist] = set()
+        items: list[dict[str, any]] = []
 
         sections: list = tab_renderer.get(
             'content', {}
@@ -1048,19 +1053,91 @@ class YouTubeChannelTabs:
         ).get('contents', [])
 
         for section in sections:
-            items: list = section.get(
-                'itemSectionRenderer', {}
-            ).get('contents', [{}])[0].get(
-                'gridRenderer', {}
-            ).get('items', [])
+            items.extend(
+                section.get(
+                    'itemSectionRenderer', {}
+                ).get('contents', [{}])[0].get(
+                    'gridRenderer', {}
+                ).get('items', [])
+            )
 
+        return items
+
+    async def _page_playlists(
+        self, first_items: list, metric_base: dict[str, str], title: str,
+    ) -> set[YouTubePlaylist]:
+        '''Parse *first_items*, the playlists tab's first page, and page
+        its continuation to the end.
+
+        A page that fails after its retries keeps the playlists
+        collected before it, marks the tab failed and stops paging. A
+        continuation token that repeats the one just used stops paging
+        too, so a misbehaving endpoint cannot loop forever.
+
+        :param first_items: the items of the playlists tab's first page
+        :param metric_base: the tab's Prometheus label set
+        :param title: the tab title, for the failure record
+        :returns: the playlists found on every page
+        '''
+
+        playlists: set[YouTubePlaylist] = set()
+        items: list = list(first_items)
+        token: str = (
+            self.get_continuation_token(items[-1])
+            if items and 'continuationItemRenderer' in items[-1]
+            else ''
+        )
+        if token:
+            items = items[:-1]
+        seen_tokens: set[str] = set()
+        while True:
             for item in items:
-                playlist: YouTubePlaylist | None = \
+                playlist: YouTubePlaylist | None = (
                     YouTubePlaylist.from_innertube(item, self.channel_id)
+                )
                 if playlist:
                     playlists.add(playlist)
-
-        return playlists
+            if not token or token in seen_tokens:
+                return playlists
+            seen_tokens.add(token)
+            try:
+                continued_data: dict = await self._browse(
+                    continuation_token=token,
+                )
+            except Exception as exc:
+                CHANNEL_TAB_PAGES.labels(
+                    **metric_base,
+                    page_type='continuation',
+                    outcome='failure',
+                ).inc()
+                self._mark_tab_failed(metric_base, title)
+                _LOGGER.warning(
+                    'Channel playlists page failed; keeping the '
+                    'playlists collected before it',
+                    exc=exc,
+                    extra={
+                        'channel_id': self.channel_id,
+                        'tab': title,
+                        'playlists_found': len(playlists),
+                    },
+                )
+                return playlists
+            CHANNEL_TAB_PAGES.labels(
+                **metric_base,
+                page_type='continuation',
+                outcome='success',
+            ).inc()
+            continuation_items: list = self._continuation_items(
+                continued_data,
+            )
+            if not continuation_items:
+                return playlists
+            token = self.get_continuation_token(continuation_items[-1])
+            items = (
+                continuation_items[:-1]
+                if 'continuationItemRenderer' in continuation_items[-1]
+                else continuation_items
+            )
 
     def _get_course_items(self, tab_renderer: dict[str, any]
                           ) -> set[YouTubeCourse]:
