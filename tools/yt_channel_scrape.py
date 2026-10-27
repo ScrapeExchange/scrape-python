@@ -129,6 +129,7 @@ from scrape_exchange.youtube.derived_metadata import (
 from scrape_exchange.youtube.youtube_channel import (
     ListingCheckpointFn,
     YouTubeChannel,
+    fallback_handle,
 )
 from scrape_exchange.youtube.youtube_rate_limiter import YouTubeRateLimiter
 from scrape_exchange.youtube.youtube_video import DENO_PATH, PO_TOKEN_URL
@@ -1923,6 +1924,13 @@ async def _self_heal_identity(
         except InconsistentIdentityError as exc:
             logging.warning(
                 'self-heal identity.bind skipped',
+                extra={'channel_id': cid, 'error': str(exc)},
+            )
+        except ValueError as exc:
+            # A display-name fallback handle ('artist - topic') is not
+            # a YouTube handle, so the identity store rejects it.
+            logging.debug(
+                'self-heal identity.bind skipped: not a handle',
                 extra={'channel_id': cid, 'error': str(exc)},
             )
     if name_map is not None and cid and channel.title:
@@ -3894,6 +3902,10 @@ async def _do_scrape_channel_to_disk_typed(
             f'channel {channel_handle!r} scraped without a channel_id',
         )
 
+    if not channel.channel_handle and _is_topic_channel_scrape(channel):
+        # A topic channel has no vanity handle: its handle is its
+        # title, like the display-name handles in the creator map.
+        channel.channel_handle = fallback_handle(channel.title)
     if not channel.channel_handle:
         raise RuntimeError(
             f'channel {channel.channel_id!r} scraped without a '

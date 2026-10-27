@@ -1619,6 +1619,88 @@ class TestScrapeOneHandleOptional(
         )
         queue.update_tier.assert_not_awaited()
 
+    async def test_topic_without_handle_uses_title_handle(self) -> None:
+        # A topic channel has no vanity handle: its handle is its
+        # title, like the display-name handles in the creator map.
+        channel_id: str = 'UCabc00000000000000000000'
+        channel: MagicMock = MagicMock()
+        channel.subscriber_count = None
+        channel.view_count = None
+        channel.description = None
+        channel.external_urls = set()
+        channel.video_count = 1
+        channel.channel_id = channel_id
+        channel.channel_handle = None
+        channel.title = 'Queen - Topic'
+        channel.about_page_succeeded = True
+        channel.partial_error = None
+        channel.content_partial = False
+        queue: AsyncMock = _mock_queue()
+        creator_map: AsyncMock = AsyncMock()
+        creator_map.get.return_value = None
+        from tools.yt_channel_scrape import _scrape_one_queued
+
+        with (
+            patch(
+                'tools.yt_channel_scrape._channel_exists_on_exchange',
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
+                'tools.yt_channel_scrape.YouTubeChannel',
+                return_value=channel,
+            ),
+            patch(
+                'tools.yt_channel_scrape._try_scrape_channel_typed',
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                'tools.yt_channel_scrape._channel_has_no_content',
+                return_value=False,
+            ),
+            patch(
+                'tools.yt_channel_scrape._persist_scraped_channel',
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as persist,
+        ):
+            await _scrape_one_queued(
+                channel_id,
+                queue=queue,
+                settings=_mock_settings(),
+                fm=MagicMock(),
+                creator_map_backend=creator_map,
+                http_client=MagicMock(),
+            )
+
+        self.assertEqual(channel.channel_handle, 'queen - topic')
+        persist.assert_awaited_once()
+        queue.mark_soft_unavailable.assert_not_awaited()
+        queue.update_tier.assert_awaited_once()
+
+    async def test_self_heal_skips_display_name_handle(self) -> None:
+        # identity.bind rejects a handle with whitespace; the self-heal
+        # must skip it rather than fail the scrape it follows.
+        from tools.yt_channel_scrape import _self_heal_identity
+
+        channel: MagicMock = MagicMock()
+        channel.channel_id = 'UCabc00000000000000000000'
+        channel.channel_handle = 'anower fokir - topic'
+        channel.title = 'Anower Fokir - Topic'
+        identity: AsyncMock = AsyncMock()
+        identity.bind.side_effect = ValueError(
+            "channel_handle contains whitespace: 'anower fokir - topic'",
+        )
+        name_map: AsyncMock = AsyncMock()
+
+        await _self_heal_identity(channel, identity, name_map)
+
+        identity.bind.assert_awaited_once()
+        name_map.put.assert_awaited_once_with(
+            'Anower Fokir - Topic', 'UCabc00000000000000000000',
+        )
+
     async def test_self_heal_binds_and_name_maps(self) -> None:
         p_exists, p_scrape = self._patches()
         with p_exists, p_scrape as mock_scrape:
