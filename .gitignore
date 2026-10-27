@@ -164,6 +164,8 @@ celerybeat.pid
 
 # Environments
 .env
+# The unit tests' settings file holds no secrets.
+!tests/collateral/.env
 .envrc
 .venv
 env/
