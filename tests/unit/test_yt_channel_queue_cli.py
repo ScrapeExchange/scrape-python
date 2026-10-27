@@ -1558,6 +1558,18 @@ class TestImportRevivesTerminal(
             ChannelState.SCHEDULED,
         )
         self.assertIn('revived from terminal: 1', report)
+        # Kept out of the top tier, but a '-topic' handle is not a
+        # topic title: no privacy exemption for its videos.
+        self.assertIsNotNone(
+            await self.redis.zscore(
+                self.queue._k_scheduled(4), member,
+            ),
+        )
+        self.assertIsNone(
+            await self.redis.hget(
+                self.queue._k_meta(member), 'topic',
+            ),
+        )
 
     async def test_new_channel_id_not_revived(
         self,
@@ -3222,6 +3234,55 @@ class TestRequeueTopic(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(
             len(await self.redis.hkeys('youtube:channel:topic')), 1,
+        )
+
+    async def test_requeue_topic_handles_and_non_topic_records(
+        self,
+    ) -> None:
+        topic: str = await self._seed_topic('UCtopic00000000000000009')
+        dashed: str = 'i:UCtopic00000000000000010'
+        await self.queue.mark(
+            dashed,
+            state=ChannelState.TOPIC,
+            extra={'channel_handle': 'my-topic'},
+        )
+        handle: str = 'h:queen - topic'
+        await self.queue.mark(handle, state=ChannelState.TOPIC)
+
+        dry: str = await self._run(self._ns())
+        self.assertIn('inspected=2', dry)
+        self.assertIn('flagged=1', dry)
+        self.assertIn('handles=1', dry)
+        self.assertEqual(
+            await self.queue.get_state(handle), ChannelState.TOPIC,
+        )
+
+        report: str = await self._run(self._ns(apply=True))
+
+        self.assertIn('moved=2', report)
+        self.assertIn('handles=1', report)
+        for member in (topic, dashed):
+            self.assertIsNotNone(
+                await self.redis.zscore(
+                    self.queue._k_scheduled(4), member,
+                ),
+            )
+        self.assertEqual(
+            await self.redis.hget(self.queue._k_meta(topic), 'topic'),
+            '1',
+        )
+        self.assertIsNone(
+            await self.redis.hget(self.queue._k_meta(dashed), 'topic'),
+        )
+        self.assertEqual(
+            await self.queue.get_state(handle),
+            ChannelState.PENDING_RESOLUTION,
+        )
+        self.assertEqual(await self.redis.hkeys('youtube:channel:topic'), [])
+        self.assertIsNone(
+            await self.redis.hget(
+                self.queue._k_tiers(), 'queen - topic',
+            ),
         )
 
     async def test_retier_keeps_topic_in_topic_tier(self) -> None:

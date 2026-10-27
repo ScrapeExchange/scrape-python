@@ -222,8 +222,9 @@ scraped like any other channel, with three differences:
 
 Detection is the title (`is_topic_channel_title()`, from the
 browse response's `channelMetadataRenderer.title`, available
-before any tab runs) or a handle ending in `-topic`. The
-channel scraper flags such a channel `topic=1` in its queue
+before any tab runs) only: a handle ending in `-topic` can belong
+to any personal channel, which keeps the privacy rules. The
+channel scraper flags a topic channel `topic=1` in its queue
 meta, which is what the video and RSS scrapers read to apply
 their own exemptions.
 
@@ -746,8 +747,12 @@ Useful for piping discovery output (see
 ### Requeue parked topic channels (`requeue-topic`)
 
 Topic channels used to be parked in the `topic` state instead of
-being scraped. `requeue-topic` moves them into the topic tier and
-flags them `topic=1`. It is a dry run unless `--apply` is given:
+being scraped. `requeue-topic` moves the channel-ID members into
+the topic tier and flags `topic=1` on those whose stored record
+has a ` - Topic` title or display-name handle; members parked by
+the old `-topic` handle rule are requeued without the flag, so
+they keep the privacy rules. Handle members (`h:`) go back to
+resolution. It is a dry run unless `--apply` is given:
 
 ```bash
 PYTHONPATH=. uv run tools/yt_channel_queue.py requeue-topic
@@ -756,7 +761,9 @@ PYTHONPATH=. uv run tools/yt_channel_queue.py requeue-topic --apply
 ```
 
 The report line is
-`requeue-topic: inspected=N moved=M dry_run=<bool> tier=T`, and a
+`requeue-topic: inspected=N moved=M flagged=F handles=H
+dry_run=<bool> tier=T`, where `flagged` counts the channel-ID
+members flagged `topic=1` and `handles` the `h:` members, and a
 dry run also reports `low_subs_topic=K`: parked `low_subs`
 members whose stored record is a topic channel. Those are not
 touched by this command.

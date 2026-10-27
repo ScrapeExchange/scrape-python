@@ -1959,7 +1959,10 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
             member,
             target_state.value,
             str(target_score),
-            '' if tier is None else str(tier),
+            # The tier map is keyed by channel ID: a handle member
+            # goes to the unresolved queue and has no tier.
+            str(tier) if tier is not None and member.startswith('i:')
+            else '',
         )
         await self.recount_listing(member)
 

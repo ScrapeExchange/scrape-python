@@ -140,8 +140,6 @@ from scrape_exchange.scraper_metrics import (
 )
 
 CHANNEL_FILE_POSTFIX = '.json.br'
-TOPIC_CHANNEL_SUFFIX: str = ' - topic'
-TOPIC_HANDLE_SUFFIX: str = '-topic'
 MIN_CHANNEL_SUBSCRIBERS: int = DEFAULT_CHANNEL_MIN_SUBSCRIBERS
 CHANNEL_BATCH_PROGRESS_INTERVAL_SECONDS: float = 30.0
 
@@ -2612,37 +2610,11 @@ def get_channel_filename(channel_id: str) -> str:
     return f'{CHANNEL_FILE_PREFIX}{channel_id}{CHANNEL_FILE_POSTFIX}'
 
 
-def _is_topic_channel_handle(channel_handle: str | None) -> bool:
-    '''Return True when *channel_handle* is a YouTube Topic label.
-
-    Some no-vanity YouTube channels use a fallback display-name handle,
-    such as ``artist - topic``. Treat those as non-scrapable channel
-    records so they do not enter the upload pipeline.
-    '''
-    if not isinstance(channel_handle, str):
-        return False
-    return (
-        channel_handle.strip().casefold()
-        .endswith(TOPIC_CHANNEL_SUFFIX)
-    )
-
-
 def _is_topic_channel_scrape(channel: YouTubeChannel) -> bool:
-    handle: str | None = (
-        channel.channel_handle
-        if isinstance(channel.channel_handle, str)
-        else None
-    )
-    handle_is_topic: bool = bool(
-        handle
-        and handle.strip().casefold().endswith(
-            TOPIC_HANDLE_SUFFIX,
-        )
-    )
-    return (
-        is_topic_channel_title(channel.title)
-        or handle_is_topic
-    )
+    '''Only a ' - Topic' title makes a topic channel: a handle ending
+    in '-topic' can belong to any personal channel, which must keep the
+    privacy rules.'''
+    return is_topic_channel_title(channel.title)
 
 
 # (subscriber_count, view_count) last stored in the channel queue meta.

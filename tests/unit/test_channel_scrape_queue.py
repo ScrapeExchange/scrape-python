@@ -2702,6 +2702,21 @@ class TestTopicTier(_RedisQueueTestBase):
             await self.redis.hget('youtube:channel:topic', member),
         )
 
+    async def test_unmark_handle_ignores_tier(self) -> None:
+        # A handle member goes to the unresolved queue; a tier must not
+        # write the handle into the channel-id keyed tier map.
+        queue: RedisChannelScrapeQueue = self._queue()
+        member: str = 'h:artist - topic'
+        await self.redis.hset(
+            'youtube:channel:topic', member, json.dumps({'x': 1}),
+        )
+        await queue.unmark(member, score=0.0, tier=4)
+
+        self.assertIsNotNone(await self.redis.zscore(
+            'youtube:channel:queue:unresolved', member,
+        ))
+        self.assertEqual(await self.redis.hgetall(self.TIERS_KEY), {})
+
     async def test_unmark_without_tier_defaults_to_zero(self) -> None:
         queue: RedisChannelScrapeQueue = self._queue()
         member: str = 'i:UCtopic4'

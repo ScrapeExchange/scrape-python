@@ -87,14 +87,19 @@ class TestChannelEndState(unittest.TestCase):
             title='Bulldog - Topic',
         )))
 
-    def test_topic_handle_has_no_end_state(self) -> None:
+    def test_topic_handle_alone_is_not_topic(self) -> None:
+        # Only a ' - Topic' title makes a topic channel: a personal
+        # channel whose handle ends in '-topic' keeps the privacy rules.
         from tools.yt_channel_scrape import _channel_end_state
 
-        self.assertIsNone(_channel_end_state(_mock_channel(
-            subscriber_count=None,
-            title='Artist',
-            channel_handle='artist-topic',
-        )))
+        self.assertEqual(
+            _channel_end_state(_mock_channel(
+                subscriber_count=None,
+                title='Artist',
+                channel_handle='artist-topic',
+            )),
+            ChannelState.LOW_SUBS,
+        )
 
     def test_unknown_counts_mark_low_subs(self) -> None:
         from tools.yt_channel_scrape import _channel_end_state

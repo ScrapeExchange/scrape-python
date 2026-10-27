@@ -1284,9 +1284,13 @@ async def _revive_if_terminal(
     state: ChannelState | None = await queue.get_state(member)
     if state is None or state not in ChannelState.terminal_states():
         return (False, None)
-    if state == ChannelState.TOPIC:
+    if state == ChannelState.TOPIC and member.startswith('i:'):
         meta: dict[str, str] = await queue.get_meta(member)
-        await queue.set_meta(member, topic='1')
+        raw: str | None = await queue._redis.hget(
+            queue._k_state(ChannelState.TOPIC), member,
+        )
+        if _record_is_topic_channel(raw):
+            await queue.set_meta(member, topic='1')
         await queue.unmark(
             member,
             score=time.time(),
@@ -1874,24 +1878,45 @@ async def cmd_requeue_topic(
     now: float = time.time()
     inspected: int = 0
     moved: int = 0
-    async for member, _raw in queue._redis.hscan_iter(
+    flagged: int = 0
+    handles: int = 0
+    # Collected first: moving members while HSCAN walks the hash
+    # could skip or repeat some of them.
+    entries: list[tuple[str, str | None]] = []
+    async for member, raw in queue._redis.hscan_iter(
         topic_key, count=batch_size,
     ):
+        entries.append((member, raw))
+    for member, raw in entries:
+        if member.startswith('h:'):
+            # A handle parked before resolution: back to resolution,
+            # where it gets its channel ID (and tier) like any other.
+            handles += 1
+            if ns.apply:
+                await queue.unmark(member, score=now)
+            continue
         if not member.startswith('i:'):
             continue
         if ns.limit is not None and inspected >= ns.limit:
             break
         inspected += 1
+        # Only a ' - Topic' title or display-name handle is a topic
+        # channel; the rest were parked by the old '-topic' handle
+        # rule and keep the privacy rules.
+        is_topic: bool = _record_is_topic_channel(raw)
+        if is_topic:
+            flagged += 1
         meta: dict[str, str] = await queue.get_meta(member)
         tier: int = queue.topic_tier(_meta_subscriber_count(meta))
         if not ns.apply:
             continue
-        await queue.set_meta(member, topic='1')
+        if is_topic:
+            await queue.set_meta(member, topic='1')
         await queue.unmark(member, score=now, tier=tier)
-        await queue.recount_listing(member)
         moved += 1
     report: str = (
         f'requeue-topic: inspected={inspected} moved={moved} '
+        f'flagged={flagged} handles={handles} '
         f'dry_run={str(not ns.apply).lower()} '
         f'tier={queue.topic_tier()}'
     )
