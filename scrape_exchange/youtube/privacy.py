@@ -38,6 +38,9 @@ PHONE_HIDDEN: str = '<phone hidden>'
 ADDRESS_HIDDEN: str = '<address hidden>'
 URL_WITHHELD: str = '<url withheld>'
 
+# YouTube titles its auto-generated artist channels '<artist> - Topic'.
+TOPIC_TITLE_SUFFIX: str = ' - topic'
+
 PRIVACY_MASKED_ITEMS: Counter = Counter(
     'youtube_privacy_masked_items_total',
     'Personal data items masked in YouTube descriptions',
@@ -96,6 +99,16 @@ def classify_for_settings(
         privacy_subscribers=settings.channel_privacy_subscribers,
         views_per_subscriber=settings.channel_views_per_subscriber,
     )
+
+
+def is_topic_channel_title(title: str | None) -> bool:
+    '''True when *title* is the title of a YouTube topic channel, i.e.
+    it ends with :data:`TOPIC_TITLE_SUFFIX` once stripped and
+    case-folded (``'Queen - Topic'``). A missing title is not a topic
+    title.'''
+    if not isinstance(title, str):
+        return False
+    return title.strip().casefold().endswith(TOPIC_TITLE_SUFFIX)
 
 
 # Domains behind each key of scrape_exchange.datatypes.SocialNetworks.

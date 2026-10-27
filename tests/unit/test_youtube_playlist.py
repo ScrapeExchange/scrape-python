@@ -157,5 +157,103 @@ class TestYouTubePlaylist(unittest.TestCase):
         self.assertIn('3', repr(p))
 
 
+def _lockup(content_id: str, content_type: str, badge: str) -> dict:
+    '''A lockupViewModel with *badge* as its thumbnail overlay text.'''
+
+    return {
+        'lockupViewModel': {
+            'contentId': content_id,
+            'contentType': content_type,
+            'metadata': {
+                'lockupMetadataViewModel': {
+                    'title': {'content': f'Title {content_id}'},
+                }
+            },
+            'contentImage': {
+                'collectionThumbnailViewModel': {
+                    'primaryThumbnail': {
+                        'thumbnailViewModel': {
+                            'image': {
+                                'sources': [{'url': 'https://i.ytimg.com/a'}],
+                            },
+                            'overlays': [
+                                {
+                                    'thumbnailOverlayBadgeViewModel': {
+                                        'thumbnailBadges': [
+                                            {
+                                                'thumbnailBadgeViewModel': {
+                                                    'text': badge,
+                                                }
+                                            }
+                                        ]
+                                    }
+                                }
+                            ],
+                        }
+                    }
+                }
+            },
+        }
+    }
+
+
+class TestAlbumPlaylists(unittest.TestCase):
+
+    def test_album_lockup_is_a_playlist(self) -> None:
+        playlist: YouTubePlaylist | None = YouTubePlaylist.from_innertube(
+            _lockup('OLAK5uy_x', 'LOCKUP_CONTENT_TYPE_ALBUM', '27 songs'),
+            'UCa',
+        )
+        self.assertIsNotNone(playlist)
+        self.assertEqual(
+            (
+                playlist.playlist_id,
+                playlist.video_count,
+                playlist.channel_id,
+            ),
+            ('OLAK5uy_x', 27, 'UCa'),
+        )
+
+    def test_song_counts(self) -> None:
+        counts: list[int] = []
+        for badge in ('1 song', '1,234 songs', '1 video'):
+            playlist: YouTubePlaylist | None = (
+                YouTubePlaylist.from_innertube(
+                    _lockup('OLAK5uy_y', 'LOCKUP_CONTENT_TYPE_ALBUM', badge),
+                    'UCa',
+                )
+            )
+            self.assertIsNotNone(playlist)
+            counts.append(playlist.video_count)
+        self.assertEqual(counts, [1, 1234, 1])
+
+    def test_grid_playlist_renderer(self) -> None:
+        playlist: YouTubePlaylist | None = (
+            YouTubePlaylist.from_grid_playlist({'gridPlaylistRenderer': {
+                'playlistId': 'OLAK5uy_y',
+                'title': {'runs': [{'text': 'Queen II'}]},
+                'videoCountShortText': {'simpleText': '11'},
+                'thumbnail': {
+                    'thumbnails': [{'url': 'https://i.ytimg.com/a'}],
+                },
+            }}, 'UCa')
+        )
+        self.assertIsNotNone(playlist)
+        self.assertEqual((playlist.title, playlist.video_count),
+                         ('Queen II', 11))
+        self.assertIsNone(YouTubePlaylist.from_grid_playlist({}, 'UCa'))
+
+    def test_grid_playlist_renderer_without_count(self) -> None:
+        playlist: YouTubePlaylist | None = (
+            YouTubePlaylist.from_grid_playlist({'gridPlaylistRenderer': {
+                'playlistId': 'OLAK5uy_z',
+                'title': {'runs': [{'text': 'No Count'}]},
+            }}, None)
+        )
+        self.assertIsNotNone(playlist)
+        self.assertEqual(playlist.video_count, 0)
+        self.assertIsNone(playlist.thumbnail_url)
+
+
 if __name__ == '__main__':
     unittest.main()
