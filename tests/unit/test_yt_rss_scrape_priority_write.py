@@ -247,7 +247,7 @@ class TestUpdateChannelWritesPriority(
             tabs_cls.return_value.browse_channel = (
                 mock.AsyncMock(return_value=browse_result)
             )
-            ok, subs, resolved = (
+            ok, subs, resolved, _is_topic = (
                 await self.module.update_channel(
                     channel_handle='inputhandle',
                     channel_id='UC_xyz',
@@ -320,7 +320,7 @@ class TestUpdateChannelWritesPriority(
             tabs_cls.return_value.browse_channel = (
                 mock.AsyncMock(return_value=browse_result)
             )
-            ok, _subs, _resolved = (
+            ok, _subs, _resolved, _is_topic = (
                 await self.module.update_channel(
                     channel_handle='noviews',
                     channel_id='UC_nv',
@@ -394,7 +394,7 @@ class TestUnknownSubscriberCountOmitsField(
             )
             ok: bool
             subs: int | None
-            ok, subs, _resolved = await self.module.update_channel(
+            ok, subs, _resolved, _is_topic = await self.module.update_channel(
                 channel_handle='inputhandle',
                 channel_id='UC_subs',
                 creator_map_backend=mock.AsyncMock(),
@@ -513,6 +513,76 @@ class TestUnknownSubscriberCountOmitsField(
         self.assertTrue(ok)
         self.assertIsNone(subs)
         self.assertNotIn('subscriber_count', record_dict)
+
+
+class TestUpdateChannelTopicFlag(unittest.IsolatedAsyncioTestCase):
+    '''update_channel reports whether the channel is a topic channel, so
+    the RSS poll can exempt it from the privacy limits.'''
+
+    async def asyncSetUp(self) -> None:
+        self.tmp: str = tempfile.mkdtemp()
+        self.module: ModuleType = _load_yt_rss_scrape()
+
+    async def asyncTearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    async def _run(self, title: str) -> bool:
+        settings: mock.MagicMock = mock.MagicMock()
+        settings.channel_data_directory = self.tmp
+        settings.channel_min_subscribers = 0
+        settings.channel_privacy_subscribers = 0
+        settings.channel_views_per_subscriber = 100
+        validator: mock.MagicMock = mock.MagicMock()
+        validator.validate.return_value = None
+        browse_result: dict = {
+            'metadata': {
+                'channelMetadataRenderer': {
+                    'title': title,
+                    'description': '',
+                },
+            },
+        }
+        with mock.patch.object(
+            self.module, 'YouTubeChannelTabs',
+        ) as tabs_cls, mock.patch.object(
+            self.module.YouTubeChannel,
+            'parse_subscriber_count_with_outcome',
+            return_value=(None, 'absent'),
+        ), mock.patch.object(
+            self.module.YouTubeChannel,
+            'parse_view_count',
+            return_value=None,
+        ), mock.patch.object(
+            self.module.YouTubeChannel,
+            'parse_video_count',
+            return_value=0,
+        ), mock.patch.object(
+            self.module,
+            'canonical_handle_from_browse',
+            return_value='artist-topic',
+        ):
+            tabs_cls.return_value.browse_channel = mock.AsyncMock(
+                return_value=browse_result
+            )
+            ok: bool
+            is_topic: bool
+            ok, _subs, _handle, is_topic = await self.module.update_channel(
+                channel_handle='artist-topic',
+                channel_id='UC_topic0',
+                creator_map_backend=mock.AsyncMock(),
+                name_map_backend=mock.AsyncMock(),
+                validator=validator,
+                proxy=None,
+                settings=settings,
+            )
+        self.assertTrue(ok)
+        return is_topic
+
+    async def test_topic_title_reported(self) -> None:
+        self.assertTrue(await self._run('Bulldog - Topic'))
+
+    async def test_plain_title_not_reported(self) -> None:
+        self.assertFalse(await self._run('Bulldog'))
 
 
 if __name__ == '__main__':

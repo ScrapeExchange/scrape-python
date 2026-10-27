@@ -87,6 +87,17 @@ class TestRssPrivacyLimits(unittest.TestCase):
             '')
         self.assertEqual(record['description'], 'site https://myblog.example')
 
+    def test_topic_record_not_masked_or_low_subs(self) -> None:
+        record: dict = {
+            'title': 'Bulldog - Topic',
+            'subscriber_count': 3,
+            'description': 'mail me at a@b.com',
+        }
+        self.assertEqual(
+            yt_rss_scrape._apply_rss_privacy_limits(record, self.settings),
+            '')
+        self.assertEqual(record['description'], 'mail me at a@b.com')
+
 
 class TestRssTinyGate(unittest.TestCase):
 
@@ -99,6 +110,15 @@ class TestRssTinyGate(unittest.TestCase):
         settings.channel_min_subscribers = 0
         self.assertFalse(
             yt_rss_scrape._rss_channel_is_tiny(None, settings))
+
+    def test_topic_title_is_never_tiny(self) -> None:
+        settings: MagicMock = MagicMock()
+        settings.channel_min_subscribers = 10
+        self.assertFalse(
+            yt_rss_scrape._rss_channel_is_tiny(3, settings, topic=True))
+        self.assertFalse(
+            yt_rss_scrape._rss_channel_is_tiny(None, settings, topic=True))
+        self.assertTrue(yt_rss_scrape._rss_channel_is_tiny(3, settings))
 
 
 class TestWriteChannelMarker(unittest.IsolatedAsyncioTestCase):
