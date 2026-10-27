@@ -72,8 +72,6 @@ class TestWritePartialRecord(unittest.IsolatedAsyncioTestCase):
         for target, value in (
             ('YouTubeChannel', MagicMock(return_value=self.channel)),
             ('_try_scrape_channel_typed', AsyncMock(return_value=None)),
-            ('_reject_topic_channel_if_needed',
-             AsyncMock(return_value=False)),
             ('_apply_privacy_limits', self.privacy),
             ('fetch_exchange_video_ids', self.video_ids),
         ):
