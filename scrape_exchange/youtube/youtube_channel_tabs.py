@@ -177,6 +177,23 @@ def _is_trailing_continuation(item: dict[str, any]) -> bool:
     )
 
 
+def _keep_richest(
+    found: dict[str, YouTubePlaylist], playlist: YouTubePlaylist,
+) -> None:
+    '''Record *playlist* under its ID, keeping the entry that knows the
+    most about it (the shelf lockup carries the song count, the album
+    panel's grid item often does not).'''
+
+    playlist_id: str | None = playlist.playlist_id
+    if playlist_id is None:
+        return
+    existing: YouTubePlaylist | None = found.get(playlist_id)
+    if existing is None or (
+        existing.video_count or 0
+    ) < (playlist.video_count or 0):
+        found[playlist_id] = playlist
+
+
 def _token_rejected(exc: BaseException) -> bool:
     '''True when a browse failed because InnerTube rejected the
     request (HTTP 400), as it does for an expired continuation
@@ -751,7 +768,10 @@ class YouTubeChannelTabs:
         }
         started_at: float = time.monotonic()
         outcome: str = 'success'
-        playlists: set[YouTubePlaylist] = set()
+        # Keyed by playlist ID: the shelf lockup and the panel's grid
+        # item describe the same album with different detail, and the
+        # lockup carries the song count.
+        found: dict[str, YouTubePlaylist] = {}
         try:
             for shelf in self._home_shelves(home_tab):
                 for item in shelf.get(
@@ -765,14 +785,13 @@ class YouTubeChannelTabs:
                         )
                     )
                     if playlist:
-                        playlists.add(playlist)
+                        _keep_richest(found, playlist)
                 panel_token: str = self._panel_token(shelf)
                 if panel_token:
-                    playlists.update(
-                        await self._page_album_panel(
-                            panel_token, metric_base,
-                        )
-                    )
+                    for playlist in await self._page_album_panel(
+                        panel_token, metric_base,
+                    ):
+                        _keep_richest(found, playlist)
         except Exception as exc:
             outcome = 'failure'
             self._mark_tab_failed(metric_base, HOME_TAB)
@@ -788,8 +807,8 @@ class YouTubeChannelTabs:
 
         CHANNEL_TAB_ITEMS.labels(
             **metric_base, item_type='playlist',
-        ).inc(len(playlists))
-        return playlists
+        ).inc(len(found))
+        return set(found.values())
 
     async def _page_album_panel(
         self, panel_token: str, metric_base: dict[str, str],

@@ -491,6 +491,27 @@ class TestHomeShelves(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tabs._browse.await_count, 2)
         self.assertEqual(tabs.failed_tabs, set())
 
+    async def test_album_panel_same_album_merged(self) -> None:
+        # The shelf lockup and the panel's grid item describe the same
+        # album with different detail; it must be stored once, with the
+        # song count the shelf carries.
+        home: dict[str, Any] = _home_tab(
+            _shelf(['a1'], panel_token='p1'),
+        )
+        page: dict[str, Any] = _channel_page('Queen - Topic', [home])
+        browser: _Browser = _Browser(page)
+        tabs: YouTubeChannelTabs = _tabs(page, browser)
+        tabs._browse = AsyncMock(
+            return_value=_panel_page(['a1']),
+        )
+
+        playlists = await tabs._scrape_home_playlists(home['tabRenderer'])
+
+        self.assertEqual(len(playlists), 1)
+        playlist = next(iter(playlists))
+        self.assertEqual(playlist.playlist_id, 'a1')
+        self.assertEqual(playlist.video_count, 27)
+
     async def test_album_panel_failure_keeps_shelf(self) -> None:
         home: dict[str, Any] = _home_tab(
             _shelf(['a1', 'a2'], panel_token='p1'),
