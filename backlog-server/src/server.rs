@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -32,6 +33,16 @@ const LEASE_TICK: Duration = Duration::from_secs(10);
 const COMPACTION_TICK: Duration = Duration::from_secs(1);
 /// Upper bound on one POP batch.
 const MAX_POP: usize = 10_000;
+/// How long one connection may wait for the queue owner before the
+/// command is refused. Without this a connection whose request is
+/// stuck behind the owner's channel never reads again, so a client
+/// that gave up is only noticed as a CLOSE-WAIT socket holding a
+/// descriptor it will never release.
+const OWNER_WAIT: Duration = Duration::from_secs(30);
+/// Pause after `accept()` fails, so an exhausted descriptor table
+/// cannot turn the listener into a hot loop that writes ~1,500 log
+/// lines a second and rotates its own evidence away.
+const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(100);
 
 type Envelope = (Request, oneshot::Sender<Reply>);
 
@@ -156,14 +167,21 @@ pub async fn start(cfg: ServeConfig) -> Result<Running> {
     let addr: SocketAddr = listener.local_addr()?;
     let metrics_addr: SocketAddr = mlistener.local_addr()?;
     info!(%addr, %metrics_addr, "listening");
+    let live: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let accept: JoinHandle<()> = tokio::spawn(accept_loop(
         listener,
         ctx,
         Arc::new(Semaphore::new(cfg.max_connections)),
+        live.clone(),
         stop_rx.clone(),
     ));
-    let mserve: JoinHandle<()> =
-        tokio::spawn(metrics_loop(mlistener, all_metrics, stop_rx.clone()));
+    let mserve: JoinHandle<()> = tokio::spawn(metrics_loop(
+        mlistener,
+        all_metrics.clone(),
+        live,
+        cfg.max_connections as u64,
+        stop_rx.clone(),
+    ));
     let mut wait = stop_rx;
     let join: JoinHandle<Result<()>> = tokio::spawn(async move {
         let _ = wait.wait_for(|s| *s).await;
@@ -397,12 +415,16 @@ async fn accept_loop(
     listener: TcpListener,
     ctx: Arc<Ctx>,
     slots: Arc<Semaphore>,
+    live: Arc<AtomicU64>,
     mut stop: watch::Receiver<bool>,
 ) {
     loop {
+        let mut pause: bool = false;
         tokio::select! {
             res = listener.accept() => match res {
                 Ok((mut stream, _)) => {
+                    live.fetch_add(1, Ordering::Relaxed);
+                    let live = live.clone();
                     let Ok(slot) = slots.clone().try_acquire_owned() else {
                         warn!("connection refused: limit reached");
                         tokio::spawn(async move {
@@ -411,6 +433,7 @@ async fn accept_loop(
                                     b"-ERR max number of clients reached\r\n",
                                 )
                                 .await;
+                            live.fetch_sub(1, Ordering::Relaxed);
                         });
                         continue;
                     };
@@ -420,11 +443,21 @@ async fn accept_loop(
                             warn!(error = %e, "connection error");
                         }
                         drop(slot);
+                        live.fetch_sub(1, Ordering::Relaxed);
                     });
                 }
-                Err(e) => warn!(error = %e, "accept failed"),
+                Err(e) => {
+                    // EMFILE and friends: pausing keeps the listener
+                    // from turning one exhausted descriptor table into
+                    // a log flood that rotates the evidence away.
+                    warn!(error = %e, "accept failed");
+                    pause = true;
+                }
             },
             _ = stop.wait_for(|s| *s) => return,
+        }
+        if pause {
+            tokio::time::sleep(ACCEPT_ERROR_PAUSE).await;
         }
     }
 }
@@ -449,7 +482,31 @@ async fn serve_conn(mut stream: TcpStream, ctx: Arc<Ctx>) -> Result<()> {
                         continue;
                     }
                     let quit: bool = args[0].eq_ignore_ascii_case(b"QUIT");
-                    let v: Value = dispatch(&args, &mut conn, &ctx).await;
+                    let v: Value = match tokio::time::timeout(
+                        OWNER_WAIT,
+                        dispatch(&args, &mut conn, &ctx),
+                    )
+                    .await
+                    {
+                        Ok(v) => v,
+                        Err(_) => {
+                            // The owner never got to this command: the
+                            // client is told to retry and the socket is
+                            // closed here, so an abandoned connection
+                            // cannot hold a descriptor as CLOSE-WAIT
+                            // waiting for an owner that is stuck.
+                            warn!("request timed out waiting for the owner");
+                            out.clear();
+                            resp::encode(
+                                &Value::Error(
+                                    "ERR backlog busy, retry".to_string(),
+                                ),
+                                &mut out,
+                            );
+                            stream.write_all(&out).await?;
+                            return Ok(());
+                        }
+                    };
                     resp::encode_proto(&v, &mut out, conn.proto);
                     if quit {
                         stream.write_all(&out).await?;
@@ -478,6 +535,8 @@ async fn serve_conn(mut stream: TcpStream, ctx: Arc<Ctx>) -> Result<()> {
 async fn metrics_loop(
     listener: TcpListener,
     queues: Vec<Arc<QueueMetrics>>,
+    live: Arc<AtomicU64>,
+    connection_limit: u64,
     mut stop: watch::Receiver<bool>,
 ) {
     let queues: Arc<Vec<Arc<QueueMetrics>>> = Arc::new(queues);
@@ -486,8 +545,12 @@ async fn metrics_loop(
             res = listener.accept() => {
                 let Ok((stream, _)) = res else { continue };
                 let queues = queues.clone();
+                let live = live.clone();
                 tokio::spawn(async move {
-                    let _ = serve_metrics(stream, &queues).await;
+                    let _ = serve_metrics(
+                        stream, &queues, &live, connection_limit,
+                    )
+                    .await;
                 });
             }
             _ = stop.wait_for(|s| *s) => return,
@@ -498,6 +561,8 @@ async fn metrics_loop(
 async fn serve_metrics(
     mut s: TcpStream,
     queues: &[Arc<QueueMetrics>],
+    live: &AtomicU64,
+    connection_limit: u64,
 ) -> std::io::Result<()> {
     let mut req: Vec<u8> = Vec::new();
     let mut chunk: [u8; 1024] = [0; 1024];
@@ -516,7 +581,11 @@ async fn serve_metrics(
     let path: &str = first.split_whitespace().nth(1).unwrap_or("");
     let (status, body): (&str, String) =
         if first.starts_with("GET ") && path == "/metrics" {
-            ("200 OK", metrics::render(queues))
+            let stats: metrics::ProcessStats = metrics::process_stats(
+                live.load(Ordering::Relaxed),
+                connection_limit,
+            );
+            ("200 OK", metrics::render(queues, &stats))
         } else {
             ("404 Not Found", "not found\n".to_string())
         };

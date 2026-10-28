@@ -6,6 +6,7 @@ The YouTube video queue lives in backlog-server when
 '''
 
 import asyncio
+import logging
 import weakref
 from typing import Any
 
@@ -75,3 +76,38 @@ def make_video_scrape_queue(
         )
         return BacklogServerVideoScrapeQueue(server, settings)
     return RedisVideoScrapeQueue(redis, settings, platform=platform)
+
+
+async def close_backlog_clients() -> None:
+    '''Close every backlog-server client bound to the running loop.
+
+    The client (and so its connection pool) is cached per event loop
+    because redis-py's async connections are loop-bound. A loop that
+    ends without this leaves its sockets open: the next``asyncio.run()``
+    builds a fresh pool, and the server keeps counting descriptors for
+    connections no client will ever use again. Measured on the fleet
+    before this existed: 19-43 sockets to backlog-server per yt-channel
+    worker, 64 per yt-rss worker, and a server that eventually hit its
+    ``RLIMIT_NOFILE`` and stopped accepting.
+
+    Call it from the ``finally`` of whatever coroutine owns the loop —
+    :func:`scrape_exchange.async_scope.run_async` does that for every
+    tool that uses it.
+    '''
+    try:
+        loop: Any = asyncio.get_running_loop()
+    except RuntimeError:
+        # No loop to close them on: dropping the references is all that
+        # is left, and letting the GC get to them beats keeping a
+        # client that can never be awaited again.
+        _NO_LOOP.clear()
+        return
+    clients: dict[str, Any] = _BY_LOOP.pop(loop, {})
+    for dsn, client in clients.items():
+        try:
+            await client.aclose()
+        except Exception:
+            logging.warning(
+                f'closing backlog-server client for {dsn} failed',
+                exc_info=True,
+            )

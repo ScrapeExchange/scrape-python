@@ -10,6 +10,7 @@ from scrape_exchange.redis_client import (
     DEFAULT_BACKLOG_COMMAND_RETRIES,
     DEFAULT_BACKLOG_CONNECT_TIMEOUT_SECONDS,
     DEFAULT_BACKLOG_HEALTH_CHECK_INTERVAL_SECONDS,
+    DEFAULT_BACKLOG_MAX_CONNECTIONS,
     DEFAULT_BACKLOG_SOCKET_TIMEOUT_SECONDS,
     DEFAULT_MAX_CONNECTIONS,
     BacklogRedisSettings,
@@ -825,6 +826,39 @@ class TestBacklogRedisFromUrl(unittest.TestCase):
             type(backlog_pool), aioredis.BlockingConnectionPool,
         )
 
+    def test_pool_cap_defaults_to_the_shared_client_cap(self) -> None:
+        '''The backlog client stays at the shared client's 4 until a
+        process is known to hold one pool: one pool per event loop
+        multiplies whatever this number is.'''
+        client = backlog_redis_from_url(
+            'redis://localhost:6390/0', component='backlog-test',
+        )
+        self.assertEqual(
+            client.connection_pool.max_connections,
+            DEFAULT_BACKLOG_MAX_CONNECTIONS,
+        )
+        self.assertEqual(
+            DEFAULT_BACKLOG_MAX_CONNECTIONS, DEFAULT_MAX_CONNECTIONS,
+        )
+        shared = redis_from_url(
+            'redis://localhost:6379/0', component='shared-test',
+        )
+        self.assertEqual(
+            shared.connection_pool.max_connections,
+            DEFAULT_MAX_CONNECTIONS,
+        )
+
+    def test_pool_cap_from_environment(self) -> None:
+        with patch.dict(
+            os.environ,
+            {'BACKLOG_REDIS_MAX_CONNECTIONS': '48'},
+            clear=True,
+        ):
+            client = backlog_redis_from_url(
+                'redis://localhost:6390/0', component='backlog-test',
+            )
+        self.assertEqual(client.connection_pool.max_connections, 48)
+
     def test_rejects_invalid_tuning(self) -> None:
         from pydantic import ValidationError
 
@@ -834,6 +868,8 @@ class TestBacklogRedisFromUrl(unittest.TestCase):
             BacklogRedisSettings(command_retries=-1)
         with self.assertRaises(ValidationError):
             BacklogRedisSettings(retry_base_seconds=0)
+        with self.assertRaises(ValidationError):
+            BacklogRedisSettings(max_connections=0)
 
 
 class TestBacklogConnectAttemptsAreBounded(

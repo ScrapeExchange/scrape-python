@@ -448,6 +448,42 @@ groups:
             Video producers and scrapers cannot reach their queue.
             Check the backlog-server container on its host.
 
+      - alert: BacklogFileDescriptorsHigh
+        expr: backlog_open_fds / backlog_fd_limit > 0.85
+        for: 5m
+        labels:
+          severity: critical
+          scraper: video
+        annotations:
+          summary: >-
+            backlog-server is using {{ $value | humanizePercentage }} of
+            its descriptor limit
+          description: >-
+            The process holds one descriptor per client connection. At
+            the limit `accept()` fails with EMFILE and the server stays
+            up but stops accepting — every scraper's queue client then
+            parks and throughput goes to zero with no scrape failures
+            recorded. Check the ulimits of the backlog-server container
+            and the connection count per scraper host.
+
+      - alert: BacklogServerConnectionsHigh
+        expr: backlog_connections / backlog_connection_limit > 0.90
+        for: 10m
+        labels:
+          severity: warning
+          scraper: video
+        annotations:
+          summary: >-
+            backlog-server is at {{ $value | humanizePercentage }} of its
+            connection cap
+          description: >-
+            Something on the client side is holding more connections
+            than one pool per process. Each scraper caches a
+            backlog-server client per event loop, so a tool that creates
+            a loop per unit of work leaks a pool per loop. Look at
+            per-process socket counts on the scraper hosts before
+            raising BACKLOG_MAX_CONNECTIONS.
+
       - alert: BacklogCompactionStale
         expr: |
           (time() - backlog_compaction_last_success_timestamp > 10800)

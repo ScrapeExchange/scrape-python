@@ -24,6 +24,7 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
+from scrape_exchange.async_scope import run_async
 from scrape_exchange.metrics_server import start_metrics_server
 
 from scrape_exchange.exchange_client import (
@@ -228,7 +229,12 @@ class ScraperRunner:
             ))
 
         try:
-            asyncio.run(self.run(worker_func))
+            # run_async, not asyncio.run: a scraper daemon is the one
+            # place where a loop-bound connection pool outlives its
+            # loop, and the sockets of a pool whose loop is already
+            # closed can never be released (see
+            # video_queue_factory.close_backlog_clients).
+            run_async(self.run(worker_func))
         except asyncio.CancelledError:
             logging.info(
                 'Scraper shutdown complete',
