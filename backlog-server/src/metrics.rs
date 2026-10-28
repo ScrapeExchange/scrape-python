@@ -153,8 +153,51 @@ fn family(out: &mut String, name: &str, kind: &str, help: &str) {
     let _ = writeln!(out, "# TYPE {name} {kind}");
 }
 
-/// Render every queue's metrics.
-pub fn render(queues: &[Arc<QueueMetrics>]) -> String {
+/// Process-wide numbers that are not per queue: the connection table
+/// and the descriptor budget the listener depends on. Rendered next to
+/// the queue families so an imminent EMFILE is visible before the
+/// listener stops accepting.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProcessStats {
+    /// Client connections currently open on the RESP listener.
+    pub connections: u64,
+    /// `BACKLOG_MAX_CONNECTIONS`: the cap the semaphore enforces.
+    pub connection_limit: u64,
+    /// Descriptors this process holds right now.
+    pub open_fds: u64,
+    /// `RLIMIT_NOFILE` soft limit: what `accept()` fails against.
+    pub fd_limit: u64,
+}
+
+/// Snapshot the descriptor budget.
+///
+/// `open_fds` is one higher than the real count: the `read_dir`
+/// iterator itself holds a descriptor while it is being counted.
+pub fn process_stats(connections: u64, connection_limit: u64) -> ProcessStats {
+    ProcessStats {
+        connections,
+        connection_limit,
+        open_fds: std::fs::read_dir("/proc/self/fd")
+            .map(|d| d.count() as u64)
+            .unwrap_or(0),
+        fd_limit: nofile_soft_limit(),
+    }
+}
+
+fn nofile_soft_limit() -> u64 {
+    // SAFETY: getrlimit writes into the struct handed to it and reads
+    // nothing else; the struct is fully initialised before the call.
+    let mut rl: libc::rlimit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: see above.
+    let rc: i32 = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) };
+    if rc == 0 { rl.rlim_cur as u64 } else { 0 }
+}
+
+/// Render every queue's metrics plus the process-wide families.
+pub fn render(queues: &[Arc<QueueMetrics>], proc: &ProcessStats) -> String {
     let mut out: String = String::new();
     let snaps: Vec<(String, u64, std::sync::MutexGuard<'_, Inner>)> = queues
         .iter()
@@ -294,6 +337,34 @@ pub fn render(queues: &[Arc<QueueMetrics>]) -> String {
             let _ = writeln!(out, "backlog_disk_bytes{{{l},kind=\"{k}\"}} {v}");
         }
     }
+    family(
+        &mut out,
+        "backlog_connections",
+        "gauge",
+        "Open RESP client connections",
+    );
+    let _ = writeln!(out, "backlog_connections {}", proc.connections);
+    family(
+        &mut out,
+        "backlog_connection_limit",
+        "gauge",
+        "Configured BACKLOG_MAX_CONNECTIONS cap",
+    );
+    let _ = writeln!(out, "backlog_connection_limit {}", proc.connection_limit);
+    family(
+        &mut out,
+        "backlog_open_fds",
+        "gauge",
+        "Open file descriptors in this process",
+    );
+    let _ = writeln!(out, "backlog_open_fds {}", proc.open_fds);
+    family(
+        &mut out,
+        "backlog_fd_limit",
+        "gauge",
+        "RLIMIT_NOFILE soft limit",
+    );
+    let _ = writeln!(out, "backlog_fd_limit {}", proc.fd_limit);
     out
 }
 
@@ -311,7 +382,13 @@ mod tests {
         });
         m.op("ADD", true, 0.0002);
         m.invalid_ids.fetch_add(2, Ordering::Relaxed);
-        let s: String = render(&[m]);
+        let stats: ProcessStats = ProcessStats {
+            connections: 7,
+            connection_limit: 4096,
+            open_fds: 40,
+            fd_limit: 65536,
+        };
+        let s: String = render(&[m], &stats);
         assert!(s.contains(
             "backlog_items{queue=\"youtube:video\",state=\"queued\"} 3"
         ));
@@ -327,5 +404,19 @@ mod tests {
                             \"youtube:video\",op=\"ADD\",le=\"0.0005\"} 1"
         ));
         assert_eq!(s.matches("# TYPE backlog_items gauge").count(), 1);
+        assert!(s.contains("backlog_connections 7"));
+        assert!(s.contains("backlog_connection_limit 4096"));
+        assert!(s.contains("backlog_open_fds 40"));
+        assert!(s.contains("backlog_fd_limit 65536"));
+        assert_eq!(s.matches("# TYPE backlog_open_fds gauge").count(), 1);
+    }
+
+    #[test]
+    fn process_stats_reads_the_real_descriptor_budget() {
+        let s: ProcessStats = process_stats(3, 512);
+        assert!(s.open_fds > 0);
+        assert!(s.fd_limit > 0);
+        // A test process always has at least stdin/stdout/stderr.
+        assert!(s.open_fds >= 3);
     }
 }

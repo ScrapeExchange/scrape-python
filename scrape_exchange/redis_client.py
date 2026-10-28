@@ -31,6 +31,18 @@ DEFAULT_BACKLOG_HEALTH_CHECK_INTERVAL_SECONDS: float = 30.0
 DEFAULT_BACKLOG_COMMAND_RETRIES: int = 5
 DEFAULT_BACKLOG_RETRY_BASE_SECONDS: float = 1.0
 DEFAULT_BACKLOG_RETRY_CAP_SECONDS: float = 30.0
+# Every task in a scraper process shares one backlog-server client, so
+# the pool has to out-number them: a video worker runs
+# ``VIDEO_CONCURRENCY`` (48) tasks that each issue a POP, a STATE and a
+# COMPLETE per video. It stays at the shared client's 4 until a process
+# is known to hold exactly ONE pool: the factory caches a client per
+# event loop, and a scraper that creates a loop per unit of work leaks a
+# pool per loop (measured: 19-43 sockets per yt-channel worker, 64 per
+# yt-rss worker, against 3-4 for one video worker). Raising this while
+# those extra pools exist multiplies the fleet's connection count and
+# reaches the server's descriptor limit sooner. Override with
+# ``BACKLOG_REDIS_MAX_CONNECTIONS`` once the per-process fix has landed.
+DEFAULT_BACKLOG_MAX_CONNECTIONS: int = 4
 
 
 def _redis_max_connections() -> int:
@@ -130,6 +142,10 @@ class BacklogRedisSettings(BaseSettings):
     retry_cap_seconds: float = Field(
         default=DEFAULT_BACKLOG_RETRY_CAP_SECONDS,
         ge=0, allow_inf_nan=False,
+    )
+    max_connections: int = Field(
+        default=DEFAULT_BACKLOG_MAX_CONNECTIONS,
+        ge=1,
     )
 
 
@@ -505,6 +521,15 @@ def backlog_redis_from_url(
       total 60s in the worst case (2+4+8+16+30), plus up to six
       connect timeouts (30s) when the host does not answer: inside
       the watchdog's 180s work-signal window.
+    * ``max_connections`` (``BACKLOG_REDIS_MAX_CONNECTIONS``): the
+      pool is shared by every task in the event loop and each
+      ``BACKLOG.*`` command is sub-millisecond, so the shared
+      client's 4-connection default is what a caller hits first when
+      the server's tail latency rises. It is deliberately still 4:
+      the client is cached per event loop, and a scraper that creates
+      a loop per unit of work leaks a pool per loop, so a bigger pool
+      multiplies the fleet's socket count. Raise it only when a
+      process is known to hold one pool.
 
     The pool's own connect retry (:func:`redis_from_url`'s
     ``connect_retry``) is turned off: redis-py runs this policy on
@@ -531,6 +556,7 @@ def backlog_redis_from_url(
         'health_check_interval', config.health_check_interval_seconds,
     )
     kwargs.setdefault('retry', backlog_command_retry(config))
+    kwargs.setdefault('max_connections', config.max_connections)
     return redis_from_url(
         redis_dsn, component=component, connect_retry=False, **kwargs,
     )

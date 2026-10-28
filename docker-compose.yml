@@ -38,6 +38,15 @@ x-scraper-common: &scraper-common
   restart: unless-stopped
   network_mode: host
   stop_grace_period: 60s
+  # Scrapers hold one socket per proxy tunnel plus their queue
+  # connections: yt-channel measured ~2,600 proxy sockets and ~40 to
+  # backlog-server per worker, against Docker's default soft limit of
+  # 1024. The hard limit is already 524288, so the default soft limit is
+  # the only thing capping them.
+  ulimits:
+    nofile:
+      soft: 65536
+      hard: 65536
 
 services:
   po-token-provider:
@@ -64,6 +73,15 @@ services:
     restart: unless-stopped
     stop_grace_period: 60s
     mem_limit: 20g
+    # The queue server holds one descriptor per client connection and
+    # one per open data file; at Docker's default soft limit of 1024 the
+    # kernel runs out before BACKLOG_MAX_CONNECTIONS refuses anything,
+    # and `accept()` starts failing with EMFILE while the process looks
+    # healthy. Keep this comfortably above BACKLOG_MAX_CONNECTIONS.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     volumes:
       - type: bind
         source: ${BACKLOG_DATA_DIR_HOST:-/path/to/backlog}

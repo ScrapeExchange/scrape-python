@@ -12,6 +12,9 @@ use crate::queue::QueueParams;
 
 pub const MAX_FSYNC_INTERVAL_MS: u64 = 60_000;
 pub const MAX_CHECKPOINT_INTERVAL_SECS: u64 = 60;
+/// Upper bound on `BACKLOG_MAX_CONNECTIONS`, enough for any single
+/// queue server while keeping the semaphore's own bookkeeping small.
+pub const MAX_CONNECTIONS: usize = 65_536;
 
 #[derive(clap::Args, Debug, Clone)]
 pub struct ServeConfig {
@@ -62,7 +65,14 @@ pub struct ServeConfig {
     #[arg(long, env = "BACKLOG_POP_SCAN_LIMIT", default_value_t = 100_000)]
     pub pop_scan_limit: usize,
     /// Most concurrent client connections; extra ones are refused.
-    #[arg(long, env = "BACKLOG_MAX_CONNECTIONS", default_value_t = 1024)]
+    ///
+    /// Keep this below the process's RLIMIT_NOFILE: at the 1024 soft
+    /// limit Docker grants by default the kernel runs out of
+    /// descriptors before this cap refuses anything, and an EMFILE on
+    /// `accept()` kills the listener's usefulness while leaving the
+    /// process alive and silent. The container sets its own nofile
+    /// limit in docker-compose.yml.
+    #[arg(long, env = "BACKLOG_MAX_CONNECTIONS", default_value_t = 4096)]
     pub max_connections: usize,
     #[arg(long, env = "BACKLOG_LOG_LEVEL", default_value = "info")]
     pub log_level: String,
@@ -130,6 +140,9 @@ impl ServeConfig {
         }
         if self.max_connections == 0 {
             bail!("BACKLOG_MAX_CONNECTIONS must be positive");
+        }
+        if self.max_connections > MAX_CONNECTIONS {
+            bail!("BACKLOG_MAX_CONNECTIONS must be <= {MAX_CONNECTIONS}");
         }
         if self.pop_scan_limit == 0 {
             bail!("BACKLOG_POP_SCAN_LIMIT must be positive");
