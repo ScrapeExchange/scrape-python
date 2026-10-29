@@ -459,20 +459,32 @@ class TestHandleFailure(unittest.IsolatedAsyncioTestCase):
 
 class TestScrapeOne(unittest.IsolatedAsyncioTestCase):
 
-    async def test_rejected_user_response_is_rate_limit(self) -> None:
-        api: MagicMock = MagicMock()
-        user_obj: MagicMock = MagicMock()
-        user_obj.as_dict = {
-            'statusCode': 10201,
-            'status_code': 10201,
+    def _page(
+        self,
+        detail: dict,
+        videos: list[dict] | None = None,
+        reposts: list[dict] | None = None,
+        playlists: list[dict] | None = None,
+    ) -> tuple[dict, dict[str, list[dict]]]:
+        captured: dict[str, list[dict]] = {
+            'videos': [{'itemList': videos or []}],
+            'reposts': [{'itemList': reposts or []}],
+            'playlists': [{'collectionList': playlists or []}],
         }
-        user_obj.info = AsyncMock(side_effect=KeyError('user'))
-        api.user = MagicMock(return_value=user_obj)
+        return detail, captured
 
-        with self.assertRaises(tool.TikTokProfileResponseError) as ctx:
-            await tool._scrape_one(
-                api, 'therock', _settings(),
-            )
+    async def test_rejected_user_response_is_rate_limit(self) -> None:
+        detail: dict = {
+            'statusCode': 10201,
+            'statusMsg': 'user is offline',
+        }
+        with patch.object(
+            tool, '_load_profile_page',
+            AsyncMock(return_value=self._page(detail)),
+        ), self.assertRaises(
+            tool.TikTokProfileResponseError,
+        ) as ctx:
+            await tool._scrape_one(MagicMock(), 'therock', _settings())
 
         self.assertIn('status=10201', str(ctx.exception))
         self.assertEqual(
@@ -481,22 +493,18 @@ class TestScrapeOne(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_empty_user_info_is_rate_limit(self) -> None:
-        api: MagicMock = MagicMock()
-        user_obj: MagicMock = MagicMock()
-        user_obj.as_dict = {
-            'userInfo': {
-                'user': {}, 'stats': {}, 'shareMeta': {},
-            },
+        detail: dict = {
+            'userInfo': {'user': {}, 'stats': {}, 'shareMeta': {}},
         }
-        user_obj.info = AsyncMock(side_effect=KeyError('id'))
-        api.user = MagicMock(return_value=user_obj)
+        with patch.object(
+            tool, '_load_profile_page',
+            AsyncMock(return_value=self._page(detail)),
+        ), self.assertRaises(
+            tool.TikTokProfileResponseError,
+        ) as ctx:
+            await tool._scrape_one(MagicMock(), 'mrbeast', _settings())
 
-        with self.assertRaises(tool.TikTokProfileResponseError) as ctx:
-            await tool._scrape_one(
-                api, 'mrbeast', _settings(),
-            )
-
-        self.assertIn("missing='id'", str(ctx.exception))
+        self.assertIn('empty userInfo payload', str(ctx.exception))
         self.assertEqual(
             tool.classify_tiktok_error(ctx.exception),
             'rate_limit',
@@ -505,13 +513,14 @@ class TestScrapeOne(unittest.IsolatedAsyncioTestCase):
     async def test_mismatched_creator_identity_is_transient(
         self,
     ) -> None:
-        api: MagicMock = _api_returning(_raw_user('finneas'))
-
-        with self.assertRaises(
+        with patch.object(
+            tool, '_load_profile_page',
+            AsyncMock(return_value=self._page(_raw_user('finneas'))),
+        ), self.assertRaises(
             tool.TikTokProfileIdentityError,
         ) as ctx:
             await tool._scrape_one(
-                api, 'fifaworldcup', _settings(),
+                MagicMock(), 'fifaworldcup', _settings(),
             )
 
         self.assertIn("requested='fifaworldcup'", str(ctx.exception))
@@ -522,15 +531,18 @@ class TestScrapeOne(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_missing_reported_videos_is_transient(self) -> None:
-        api: MagicMock = _api_returning(
-            _raw_user('finneas', video_count=348),
-        )
-
-        with self.assertRaises(
+        with patch.object(
+            tool, '_load_profile_page',
+            AsyncMock(
+                return_value=self._page(
+                    _raw_user('finneas', video_count=348),
+                ),
+            ),
+        ), self.assertRaises(
             tool.TikTokVideoListResponseError,
         ) as ctx:
             await tool._scrape_one(
-                api, 'finneas', _settings(),
+                MagicMock(), 'finneas', _settings(),
             )
 
         self.assertIn('profile_video_count=348', str(ctx.exception))
@@ -539,47 +551,35 @@ class TestScrapeOne(unittest.IsolatedAsyncioTestCase):
             'transient',
         )
 
-    async def test_collects_video_repost_and_liked_refs(self) -> None:
-        api: MagicMock = MagicMock()
-        user_obj: MagicMock = MagicMock()
-        user_obj.info = AsyncMock(
-            return_value=_raw_user(
-                'charli', followers=42, sec_uid='SEC9',
-            ),
-        )
-        user_obj.videos = MagicMock(
-            return_value=_async_items([
-                _video_item('111', 'charli'),
-            ]),
-        )
-        user_obj.liked = MagicMock(
-            return_value=_async_items([
-                _video_item('333', 'other'),
-            ]),
-        )
-        user_obj.playlists = MagicMock(
-            return_value=_async_items([
-                _playlist_item('444', 'Dance series', 12),
-            ]),
-        )
-        api.user = MagicMock(return_value=user_obj)
-        api.make_request = AsyncMock(
-            return_value={
-                'itemList': [
-                    {
-                        'id': '222',
-                        'author': {'uniqueId': 'reposter'},
+    async def test_collects_video_repost_and_playlist_refs(self) -> None:
+        page = self._page(
+            _raw_user('charli', followers=42, sec_uid='SEC9'),
+            videos=[
+                {'id': '111', 'author': {'uniqueId': 'charli'}},
+            ],
+            reposts=[
+                {'id': '222', 'author': {'uniqueId': 'reposter'}},
+            ],
+            playlists=[
+                {
+                    'collectionId': '444',
+                    'name': 'Dance series',
+                    'videoCount': 12,
+                    'cover': {
+                        'urlList': ['https://example.com/cover.jpg'],
                     },
-                ],
-                'hasMore': False,
-            },
+                },
+            ],
         )
-        creator = await tool._scrape_one(
-            api, 'charli', _settings(
-                creator_video_ref_count=5,
-                creator_playlist_ref_count=5,
-            ),
-        )
+        with patch.object(
+            tool, '_load_profile_page', AsyncMock(return_value=page),
+        ):
+            creator = await tool._scrape_one(
+                MagicMock(), 'charli', _settings(
+                    creator_video_ref_count=5,
+                    creator_playlist_ref_count=5,
+                ),
+            )
         self.assertEqual(
             creator.videos[0].url,
             'https://www.tiktok.com/@charli/video/111',
@@ -587,129 +587,113 @@ class TestScrapeOne(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(creator.videos[0].username, 'charli')
         self.assertEqual(creator.reposts[0].video_id, '222')
         self.assertEqual(creator.reposts[0].username, 'reposter')
-        self.assertEqual(
-            creator.liked[0].url,
-            'https://www.tiktok.com/@other/video/333',
-        )
-        self.assertEqual(creator.liked[0].username, 'other')
         self.assertEqual(creator.playlists[0].playlist_id, '444')
         self.assertEqual(creator.playlists[0].name, 'Dance series')
         self.assertEqual(creator.playlists[0].video_count, 12)
-        api.make_request.assert_awaited_once()
+        self.assertEqual(
+            creator.playlists[0].cover_url,
+            'https://example.com/cover.jpg',
+        )
 
     async def test_zero_video_ref_count_means_unlimited(self) -> None:
-        api: MagicMock = MagicMock()
-        user_obj: MagicMock = MagicMock()
-        user_obj.info = AsyncMock(
-            return_value=_raw_user(
-                'charli', followers=42, sec_uid='SEC9',
-            ),
-        )
-        user_obj.videos = MagicMock(
-            return_value=_async_items([
-                _video_item('111', 'charli'),
-                _video_item('112', 'charli'),
-            ]),
-        )
-        user_obj.liked = MagicMock(
-            return_value=_async_items([
-                _video_item('333', 'other'),
-                _video_item('334', 'other'),
-            ]),
-        )
-        user_obj.playlists = MagicMock(return_value=_async_items([]))
-        api.user = MagicMock(return_value=user_obj)
-        api.make_request = AsyncMock(side_effect=[
+        page: tuple[dict, dict[str, list[dict]]] = (
+            _raw_user('charli', sec_uid='SEC9'),
             {
-                'itemList': [
+                'videos': [
                     {
-                        'id': '221',
-                        'author': {'uniqueId': 'reposter'},
+                        'itemList': [
+                            {'id': '111', 'author': {'uniqueId': 'charli'}},
+                            {'id': '112', 'author': {'uniqueId': 'charli'}},
+                        ],
+                    },
+                    {
+                        'itemList': [
+                            {'id': '113', 'author': {'uniqueId': 'charli'}},
+                        ],
                     },
                 ],
-                'hasMore': True,
-                'cursor': 35,
-            },
-            {
-                'itemList': [
+                'reposts': [
                     {
-                        'id': '222',
-                        'author': {'uniqueId': 'reposter'},
+                        'itemList': [
+                            {'id': '221', 'author': {'uniqueId': 'reposter'}},
+                            {'id': '222', 'author': {'uniqueId': 'reposter'}},
+                        ],
                     },
                 ],
-                'hasMore': False,
-                'cursor': 70,
+                'playlists': [],
             },
-        ])
-        creator = await tool._scrape_one(
-            api, 'charli', _settings(
-                creator_video_ref_count=0,
-                creator_playlist_ref_count=0,
-            ),
         )
+        with patch.object(
+            tool, '_load_profile_page', AsyncMock(return_value=page),
+        ):
+            creator = await tool._scrape_one(
+                MagicMock(), 'charli', _settings(
+                    creator_video_ref_count=0,
+                    creator_playlist_ref_count=0,
+                ),
+            )
         self.assertEqual(
             [v.video_id for v in creator.videos],
-            ['111', '112'],
-        )
-        self.assertEqual(
-            [v.video_id for v in creator.liked],
-            ['333', '334'],
+            ['111', '112', '113'],
         )
         self.assertEqual(
             [v.video_id for v in creator.reposts],
             ['221', '222'],
         )
+
+    async def test_duplicate_items_across_payloads_are_deduped(
+        self,
+    ) -> None:
+        page: tuple[dict, dict[str, list[dict]]] = (
+            _raw_user('charli', sec_uid='SEC9'),
+            {
+                'videos': [
+                    {
+                        'itemList': [
+                            {'id': '111', 'author': {'uniqueId': 'charli'}},
+                        ],
+                    },
+                    {
+                        'itemList': [
+                            {'id': '111', 'author': {'uniqueId': 'charli'}},
+                            {'id': '112', 'author': {'uniqueId': 'charli'}},
+                        ],
+                    },
+                ],
+                'reposts': [],
+                'playlists': [],
+            },
+        )
+        with patch.object(
+            tool, '_load_profile_page', AsyncMock(return_value=page),
+        ):
+            creator = await tool._scrape_one(
+                MagicMock(), 'charli', _settings(
+                    creator_video_ref_count=0,
+                ),
+            )
         self.assertEqual(
-            user_obj.videos.call_args.kwargs['count'],
-            tool.sys.maxsize,
+            [v.video_id for v in creator.videos],
+            ['111', '112'],
         )
-        self.assertEqual(
-            user_obj.liked.call_args.kwargs['count'],
-            tool.sys.maxsize,
-        )
-        self.assertEqual(api.make_request.await_count, 2)
-
-    async def test_liked_failure_is_non_fatal(self) -> None:
-        api: MagicMock = MagicMock()
-        user_obj: MagicMock = MagicMock()
-        user_obj.info = AsyncMock(
-            return_value=_raw_user('charli', sec_uid='SEC9'),
-        )
-        user_obj.videos = MagicMock(
-            return_value=_async_items([
-                _video_item('111', 'charli'),
-            ]),
-        )
-
-        async def _bad_liked() -> object:
-            raise RuntimeError('liked list is private')
-            yield None
-
-        user_obj.liked = MagicMock(return_value=_bad_liked())
-        user_obj.playlists = MagicMock(return_value=_async_items([]))
-        api.user = MagicMock(return_value=user_obj)
-        api.make_request = AsyncMock(
-            return_value={'itemList': [], 'hasMore': False},
-        )
-        creator = await tool._scrape_one(
-            api, 'charli', _settings(
-                creator_video_ref_count=5,
-                creator_playlist_ref_count=5,
-            ),
-        )
-        self.assertEqual(len(creator.videos), 1)
-        self.assertEqual(creator.liked, [])
 
     async def test_private_account_skips_collections(self) -> None:
-        resp: dict = _raw_user('private', sec_uid='SEC9')
-        resp['userInfo']['user']['privateAccount'] = True
-        api: MagicMock = _api_returning(resp)
-        creator = await tool._scrape_one(
-            api, 'private', _settings(creator_video_ref_count=5),
+        detail: dict = _raw_user('private', sec_uid='SEC9')
+        detail['userInfo']['user']['privateAccount'] = True
+        page = self._page(
+            detail,
+            videos=[{'id': '111', 'author': {'uniqueId': 'private'}}],
         )
+        with patch.object(
+            tool, '_load_profile_page', AsyncMock(return_value=page),
+        ):
+            creator = await tool._scrape_one(
+                MagicMock(), 'private',
+                _settings(creator_video_ref_count=5),
+            )
         self.assertTrue(creator.private_account)
         self.assertEqual(creator.videos, [])
-        api.make_request.assert_not_awaited()
+
 
 
 # ---------------------------------------------------------------
@@ -824,12 +808,27 @@ class TestProcessCreator(unittest.IsolatedAsyncioTestCase):
         q.enqueue = AsyncMock(return_value=True)
         return q
 
+    def _page_patch(
+        self,
+        detail: dict,
+        videos: list[dict] | None = None,
+        reposts: list[dict] | None = None,
+    ):
+        '''Patch the profile-page load with a fixed payload.'''
+        captured: dict[str, list[dict]] = {
+            'videos': [{'itemList': videos or []}],
+            'reposts': [{'itemList': reposts or []}],
+            'playlists': [],
+        }
+        return patch.object(
+            tool, '_load_profile_page',
+            AsyncMock(return_value=(detail, captured)),
+        )
+
     async def test_success_writes_record_maps_and_retiers(
         self,
     ) -> None:
-        api: MagicMock = _api_returning(
-            _raw_user('charli', followers=42, sec_uid='S9'),
-        )
+        api: MagicMock = MagicMock()
         pool: MagicMock = MagicMock()
         pool.session_for = MagicMock(
             return_value=_FakeSessionCtx(api),
@@ -838,10 +837,13 @@ class TestProcessCreator(unittest.IsolatedAsyncioTestCase):
         video_q: MagicMock = self._video_queue()
         maps: MagicMock = self._identity_maps()
         s: MagicMock = _settings()
-        await tool._process_creator(
-            'charli', 'http://p:8080', pool, q, video_q, self.fm, s,
-            '0', 'p', maps,
-        )
+        with self._page_patch(
+            _raw_user('charli', followers=42, sec_uid='S9'),
+        ):
+            await tool._process_creator(
+                'charli', 'http://p:8080', pool, q, video_q, self.fm, s,
+                '0', 'p', maps,
+            )
         # record on disk
         written: dict = await self.fm.read_file(
             tool._creator_filename('charli'),
@@ -865,31 +867,7 @@ class TestProcessCreator(unittest.IsolatedAsyncioTestCase):
     async def test_success_enqueues_discovered_video_urls(
         self,
     ) -> None:
-        api: MagicMock = _api_returning(
-            _raw_user('charli', followers=42, sec_uid='S9'),
-        )
-        user_obj: MagicMock = api.user.return_value
-        user_obj.videos = MagicMock(
-            return_value=_async_items([
-                _video_item('v1', 'charli'),
-                _video_item('v2', 'charli'),
-            ]),
-        )
-        user_obj.liked = MagicMock(
-            return_value=_async_items([
-                _video_item('v2', 'charli'),
-                _video_item('v3', 'charli'),
-            ]),
-        )
-        api.make_request = AsyncMock(
-            return_value={
-                'itemList': [
-                    {'id': 'v3', 'author': {'uniqueId': 'charli'}},
-                    {'id': 'v4', 'author': {'uniqueId': 'charli'}},
-                ],
-                'hasMore': False,
-            },
-        )
+        api: MagicMock = MagicMock()
         pool: MagicMock = MagicMock()
         pool.session_for = MagicMock(
             return_value=_FakeSessionCtx(api),
@@ -898,10 +876,21 @@ class TestProcessCreator(unittest.IsolatedAsyncioTestCase):
         video_q: MagicMock = self._video_queue()
         s: MagicMock = _settings(creator_video_ref_count=10)
 
-        await tool._process_creator(
-            'charli', 'http://p:8080', pool, q, video_q, self.fm, s,
-            '0', 'p', self._identity_maps(),
-        )
+        with self._page_patch(
+            _raw_user('charli', followers=42, sec_uid='S9'),
+            videos=[
+                {'id': 'v1', 'author': {'uniqueId': 'charli'}},
+                {'id': 'v2', 'author': {'uniqueId': 'charli'}},
+            ],
+            reposts=[
+                {'id': 'v3', 'author': {'uniqueId': 'charli'}},
+                {'id': 'v4', 'author': {'uniqueId': 'charli'}},
+            ],
+        ):
+            await tool._process_creator(
+                'charli', 'http://p:8080', pool, q, video_q, self.fm, s,
+                '0', 'p', self._identity_maps(),
+            )
 
         self.assertEqual(
             video_q.enqueue.await_args_list,
@@ -930,12 +919,7 @@ class TestProcessCreator(unittest.IsolatedAsyncioTestCase):
     async def test_video_enqueue_failure_does_not_fail_creator(
         self,
     ) -> None:
-        api: MagicMock = _api_returning(
-            _raw_user('charli', followers=42, sec_uid='S9'),
-        )
-        api.user.return_value.videos = MagicMock(
-            return_value=_async_items([_video_item('v1', 'charli')]),
-        )
+        api: MagicMock = MagicMock()
         pool: MagicMock = MagicMock()
         pool.session_for = MagicMock(
             return_value=_FakeSessionCtx(api),
@@ -945,10 +929,14 @@ class TestProcessCreator(unittest.IsolatedAsyncioTestCase):
         video_q.enqueue = AsyncMock(side_effect=RuntimeError('redis'))
         s: MagicMock = _settings(creator_video_ref_count=10)
 
-        await tool._process_creator(
-            'charli', 'http://p:8080', pool, q, video_q, self.fm, s,
-            '0', 'p', self._identity_maps(),
-        )
+        with self._page_patch(
+            _raw_user('charli', followers=42, sec_uid='S9'),
+            videos=[{'id': 'v1', 'author': {'uniqueId': 'charli'}}],
+        ):
+            await tool._process_creator(
+                'charli', 'http://p:8080', pool, q, video_q, self.fm, s,
+                '0', 'p', self._identity_maps(),
+            )
 
         video_q.enqueue.assert_awaited_once_with(
             'https://www.tiktok.com/@charli/video/v1',
@@ -959,11 +947,6 @@ class TestProcessCreator(unittest.IsolatedAsyncioTestCase):
 
     async def test_failure_routes_to_handle_failure(self) -> None:
         api: MagicMock = MagicMock()
-        user_obj: MagicMock = MagicMock()
-        user_obj.info = AsyncMock(
-            side_effect=RuntimeError('user not found'),
-        )
-        api.user = MagicMock(return_value=user_obj)
         pool: MagicMock = MagicMock()
         pool.session_for = MagicMock(
             return_value=_FakeSessionCtx(api),
@@ -971,10 +954,14 @@ class TestProcessCreator(unittest.IsolatedAsyncioTestCase):
         q: MagicMock = self._queue()
         video_q: MagicMock = self._video_queue()
         s: MagicMock = _settings()
-        await tool._process_creator(
-            'ghost', 'http://p:8080', pool, q, video_q, self.fm, s,
-            '0', 'p', self._identity_maps(),
-        )
+        with patch.object(
+            tool, '_load_profile_page',
+            AsyncMock(side_effect=RuntimeError('user not found')),
+        ):
+            await tool._process_creator(
+                'ghost', 'http://p:8080', pool, q, video_q, self.fm, s,
+                '0', 'p', self._identity_maps(),
+            )
         q.remove.assert_awaited_once_with('ghost')
         q.update_tier.assert_not_awaited()
 

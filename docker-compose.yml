@@ -227,6 +227,9 @@ services:
     # Camoufox browsers at roughly 250-300 MB each. The limit keeps an
     # OOM inside this container instead of starving the host.
     mem_limit: 8g
+    # Firefox content processes abort with "Page crashed" when /dev/shm
+    # is the Docker default of 64m; 512m matches the browser's appetite.
+    shm_size: 512m
 
   tt-video:
     <<: *scraper-common
@@ -235,6 +238,9 @@ services:
     # Camoufox browsers at roughly 250-300 MB each. The limit keeps an
     # OOM inside this container instead of starving the host.
     mem_limit: 8g
+    # Firefox content processes abort with "Page crashed" when /dev/shm
+    # is the Docker default of 64m; 512m matches the browser's appetite.
+    shm_size: 512m
 
   ig-creator:
     <<: *scraper-common
@@ -244,6 +250,9 @@ services:
     # 12) at roughly 250-300 MB each. The limit keeps an OOM inside this
     # container instead of starving every scraper on the host.
     mem_limit: 8g
+    # Firefox content processes abort with "Page crashed" when /dev/shm
+    # is the Docker default of 64m; 512m matches the browser's appetite.
+    shm_size: 512m
 
   tw-creator:
     <<: *scraper-common
@@ -253,6 +262,9 @@ services:
     # Camoufox browsers at roughly 250-300 MB each. The limit keeps an
     # OOM inside this container instead of starving the host.
     mem_limit: 8g
+    # Firefox content processes abort with "Page crashed" when /dev/shm
+    # is the Docker default of 64m; 512m matches the browser's appetite.
+    shm_size: 512m
 
   of-creator:
     <<: *scraper-common
@@ -262,6 +274,9 @@ services:
     # Camoufox browsers at roughly 250-300 MB each. The limit keeps an
     # OOM inside this container instead of starving the host.
     mem_limit: 8g
+    # Firefox content processes abort with "Page crashed" when /dev/shm
+    # is the Docker default of 64m; 512m matches the browser's appetite.
+    shm_size: 512m
 
   scrape-upload:
     <<: *scraper-common
