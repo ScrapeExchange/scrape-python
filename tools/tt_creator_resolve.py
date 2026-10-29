@@ -29,14 +29,23 @@ Examples::
 that fail transiently (timeouts, 403/429, bot-check pages) are retried
 with backoff; pages that carry no item payload (deleted or
 region-blocked videos) are reported as ``unavailable``.
+
+Ctrl-C is a clean stop: in-flight requests are cancelled, the summary
+reports how far the run got, the queue is left untouched and the exit
+code is 130. When ``--output-file`` is set each record is appended as
+soon as it resolves, so nothing already done is lost; rerun with
+``--resume`` to skip the ids that file already contains.
 '''
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import random
+import re
+import signal
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,6 +59,7 @@ from scrape_exchange.creator_queue import (
     RedisCreatorQueue,
     TierConfig,
     parse_priority_queues,
+    tier_for_subscriber_count,
 )
 from scrape_exchange.logging import configure_logging
 from scrape_exchange.tiktok import (
@@ -178,6 +188,14 @@ class ResolveSettings(TikTokScraperSettings):
             'Follower count used to pick the queue tier. Default: the '
             'next-to-lowest tier, matching how graduated short URLs '
             'and operator imports are queued.'
+        ),
+    )
+    resume: bool = Field(
+        default=False,
+        validation_alias=AliasChoices('RESUME', 'resume'),
+        description=(
+            'Skip video ids that already appear in --output-file, so '
+            'an interrupted run can be continued.'
         ),
     )
     dry_run: bool = Field(
@@ -353,6 +371,29 @@ def _classify_status(status_code: int) -> str | None:
     return None
 
 
+_RECORD_ID_RE: re.Pattern[str] = re.compile(r'"video_id":\s*(\d+)')
+
+
+def append_record(path: Path, result: Resolution) -> None:
+    '''Append one JSONL record, flushed, so an interrupt keeps it.'''
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('a', encoding='utf-8') as handle:
+        handle.write(json.dumps(result.as_record()) + '\n')
+
+
+def load_done_ids(path: Path | None) -> set[int]:
+    '''Video ids already recorded in *path* (empty when unreadable).'''
+    if path is None or not path.exists():
+        return set()
+    done: set[int] = set()
+    with path.open('r', encoding='utf-8') as handle:
+        for line in handle:
+            match: re.Match[str] | None = _RECORD_ID_RE.search(line)
+            if match is not None:
+                done.add(int(match.group(1)))
+    return done
+
+
 class Resolver:
     '''Fetches video pages through proxies under the shared limiter.'''
 
@@ -437,10 +478,16 @@ class Resolver:
         return last
 
     async def close(self) -> None:
-        '''Close every per-proxy client.'''
-        for client in self._clients.values():
-            await client.aclose()
+        '''Close every per-proxy client, ignoring teardown errors.'''
+        clients: list[httpx2.AsyncClient] = list(
+            self._clients.values(),
+        )
         self._clients.clear()
+        for client in clients:
+            with contextlib.suppress(
+                httpx2.HTTPError, RuntimeError, OSError,
+            ):
+                await client.aclose()
 
 
 def _fallback_weight(settings: ResolveSettings) -> int:
@@ -482,12 +529,25 @@ async def enqueue_creators(
     )
     added: int = 0
     existing: int = 0
+    tier: int = tier_for_subscriber_count(tiers, weight)
     try:
         for username in usernames:
-            if await queue.add_member(username, username, weight):
+            queued: bool = await queue.add_member(
+                username, username, weight,
+            )
+            if queued:
                 added += 1
             else:
                 existing += 1
+            _LOGGER.info(
+                'Creator queue add',
+                extra={
+                    'username': username,
+                    'weight': weight,
+                    'tier': tier,
+                    'outcome': 'queued' if queued else 'already_queued',
+                },
+            )
     finally:
         await queue._redis.aclose()
     return added, existing
@@ -498,6 +558,25 @@ async def run(settings: ResolveSettings) -> int:
     ids: list[int] = read_video_ids(settings.input_file)
     if settings.max_ids:
         ids = ids[: settings.max_ids]
+    if settings.resume:
+        if settings.output_file is None:
+            print(
+                '--resume requires --output-file',
+                file=sys.stderr,
+            )
+            return 1
+        done_ids: set[int] = load_done_ids(settings.output_file)
+        if done_ids:
+            remaining: list[int] = [
+                video_id for video_id in ids
+                if video_id not in done_ids
+            ]
+            print(
+                f'resume: {len(ids) - len(remaining)} of {len(ids)} '
+                f'video id(s) already in {settings.output_file}',
+                file=sys.stderr,
+            )
+            ids = remaining
     if not ids:
         print('no video ids to resolve', file=sys.stderr)
         return 1
@@ -527,13 +606,40 @@ async def run(settings: ResolveSettings) -> int:
 
     semaphore: asyncio.Semaphore = asyncio.Semaphore(concurrency)
     results: list[Resolution] = []
+    interrupted: bool = False
 
     async def one(video_id: int) -> Resolution:
         async with semaphore:
             return await resolver.resolve(video_id)
 
+    # Real tasks, not bare coroutines: an interrupt then cancels work
+    # that is actually scheduled instead of leaving un-awaited
+    # coroutine objects behind.
+    tasks: list[asyncio.Task[Resolution]] = [
+        asyncio.create_task(one(video_id), name=f'resolve-{video_id}')
+        for video_id in ids
+    ]
+    # Turn Ctrl-C into a cancellation of this coroutine so the partial
+    # results are summarised and the HTTP clients are closed; without
+    # this the interrupt unwinds through asyncio.run's teardown and
+    # kills the loop under the tasks.
+    loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+    main_task: asyncio.Task[Any] | None = asyncio.current_task()
+    if main_task is not None:
+        with contextlib.suppress(NotImplementedError, RuntimeError):
+            loop.add_signal_handler(signal.SIGINT, main_task.cancel)
     try:
-        results = list(await asyncio.gather(*(one(v) for v in ids)))
+        for finished in asyncio.as_completed(tasks):
+            result: Resolution = await finished
+            results.append(result)
+            if settings.output_file is not None:
+                append_record(settings.output_file, result)
+    except asyncio.CancelledError:
+        interrupted = True
+        for task in tasks:
+            task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.gather(*tasks, return_exceptions=True)
     finally:
         await resolver.close()
 
@@ -551,19 +657,19 @@ async def run(settings: ResolveSettings) -> int:
         seen_names.add(result.username)
         usernames.append(result.username)
 
-    if settings.output_file:
-        settings.output_file.parent.mkdir(parents=True, exist_ok=True)
-        with settings.output_file.open('a', encoding='utf-8') as handle:
-            for result in results:
-                handle.write(json.dumps(result.as_record()) + '\n')
-
     added: int = 0
     existing: int = 0
-    if settings.enqueue and not settings.dry_run and usernames:
+    if (
+        not interrupted
+        and settings.enqueue
+        and not settings.dry_run
+        and usernames
+    ):
         added, existing = await enqueue_creators(settings, usernames)
 
     summary: dict[str, Any] = {
         'video_ids': len(ids),
+        'done': len(results),
         'resolved': counts.get(STATUS_RESOLVED, 0),
         'unavailable': counts.get(STATUS_UNAVAILABLE, 0),
         'transient': counts.get(STATUS_TRANSIENT, 0),
@@ -571,9 +677,23 @@ async def run(settings: ResolveSettings) -> int:
         'unique_creators': len(usernames),
         'queued_new': added,
         'queue_existing': existing,
+        'interrupted': interrupted,
         'dry_run': settings.dry_run,
     }
     print(json.dumps(summary, indent=2))
+    if interrupted:
+        hint: str = (
+            f'; rerun with --resume to continue (records are in '
+            f'{settings.output_file})'
+            if settings.output_file is not None
+            else '; pass --output-file next time to keep partial results'
+        )
+        print(
+            f'{len(results)} of {len(ids)} video id(s) done before '
+            f'interrupt; queue untouched{hint}',
+            file=sys.stderr,
+        )
+        return 130
     return 0 if counts.get(STATUS_RESOLVED, 0) else 1
 
 
@@ -583,7 +703,11 @@ def main() -> int:
     configure_logging(
         settings.log_level, settings.log_file, settings.log_format,
     )
-    return asyncio.run(run(settings))
+    try:
+        return asyncio.run(run(settings))
+    except KeyboardInterrupt:
+        print('interrupted', file=sys.stderr)
+        return 130
 
 
 if __name__ == '__main__':

@@ -156,6 +156,51 @@ class TestClassifyStatus(unittest.TestCase):
         )
 
 
+class TestOutputRecords(unittest.TestCase):
+
+    def test_append_record_writes_one_jsonl_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path: Path = Path(tmp) / 'nested' / 'out.jsonl'
+            mod.append_record(
+                path,
+                mod.Resolution(
+                    video_id=42,
+                    status=mod.STATUS_RESOLVED,
+                    username='someone',
+                    user_id='7',
+                ),
+            )
+            mod.append_record(
+                path,
+                mod.Resolution(
+                    video_id=43,
+                    status=mod.STATUS_UNAVAILABLE,
+                    detail='gone',
+                ),
+            )
+            lines: list[str] = path.read_text().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(json.loads(lines[0])['video_id'], 42)
+        self.assertEqual(json.loads(lines[0])['username'], 'someone')
+        self.assertEqual(json.loads(lines[1])['status'], 'unavailable')
+
+    def test_load_done_ids_reads_existing_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path: Path = Path(tmp) / 'out.jsonl'
+            path.write_text(
+                '{"video_id": 1, "status": "resolved"}\n'
+                'not json at all\n'
+                '{"video_id": 2, "status": "unavailable"}\n',
+            )
+            self.assertEqual(mod.load_done_ids(path), {1, 2})
+
+    def test_load_done_ids_missing_file_is_empty(self) -> None:
+        self.assertEqual(
+            mod.load_done_ids(Path('/nonexistent/out.jsonl')), set(),
+        )
+        self.assertEqual(mod.load_done_ids(None), set())
+
+
 class TestEnqueueCreators(unittest.TestCase):
 
     def _settings(self, **kwargs: Any) -> mod.ResolveSettings:
@@ -187,7 +232,12 @@ class TestEnqueueCreators(unittest.TestCase):
                 calls.append((creator_id, name, weight))
                 return creator_id == 'new.one'
 
-        with mock.patch.object(mod, 'RedisCreatorQueue', _Queue):
+        with (
+            mock.patch.object(mod, 'RedisCreatorQueue', _Queue),
+            self.assertLogs(
+                'tools.tt_creator_resolve', level='INFO',
+            ) as logs,
+        ):
             added, existing = __import__('asyncio').run(
                 mod.enqueue_creators(
                     self._settings(), ['new.one', 'old.one'],
@@ -198,6 +248,15 @@ class TestEnqueueCreators(unittest.TestCase):
             calls,
             [('new.one', 'new.one', 10000), ('old.one', 'old.one', 10000)],
         )
+        self.assertEqual(len(logs.records), 2)
+        first, second = logs.records
+        self.assertEqual(first.getMessage(), 'Creator queue add')
+        self.assertEqual(first.username, 'new.one')
+        self.assertEqual(first.weight, 10000)
+        self.assertEqual(first.tier, 2)
+        self.assertEqual(first.outcome, 'queued')
+        self.assertEqual(second.username, 'old.one')
+        self.assertEqual(second.outcome, 'already_queued')
 
     def test_explicit_weight_overrides_fallback(self) -> None:
         seen: list[int] = []
