@@ -109,9 +109,28 @@ class TestParseAuthor(unittest.TestCase):
         self.assertEqual(result.detail, 'item not found')
 
     def test_missing_payload_is_unavailable(self) -> None:
-        result = mod.parse_author('<html><body>nope</body></html>', 42)
+        with self.assertLogs(
+            'tools.tt_creator_resolve', level='WARNING',
+        ) as logs:
+            result = mod.parse_author(
+                '<html><body>nope</body></html>', 42,
+            )
         self.assertEqual(result.status, mod.STATUS_UNAVAILABLE)
         self.assertEqual(result.detail, 'no rehydration payload')
+        self.assertEqual(
+            logs.records[0].getMessage(),
+            'Creator username not extracted',
+        )
+        self.assertEqual(logs.records[0].video_id, 42)
+        self.assertEqual(logs.records[0].detail, 'no rehydration payload')
+
+    def test_missing_item_logs_the_reason(self) -> None:
+        with mock.patch.object(mod, 'TikTokVideo', _FakeVideo), self.assertLogs(
+            'tools.tt_creator_resolve', level='WARNING',
+        ) as logs:
+            mod.parse_author(_page(None, status_msg='item not found'), 7)
+        self.assertEqual(logs.records[0].status, mod.STATUS_UNAVAILABLE)
+        self.assertEqual(logs.records[0].detail, 'item not found')
 
     def test_bot_check_page_is_transient(self) -> None:
         result = mod.parse_author(
@@ -184,21 +203,30 @@ class TestOutputRecords(unittest.TestCase):
         self.assertEqual(json.loads(lines[0])['username'], 'someone')
         self.assertEqual(json.loads(lines[1])['status'], 'unavailable')
 
-    def test_load_done_ids_reads_existing_records(self) -> None:
+    def test_load_processed_ids_reads_existing_log(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            path: Path = Path(tmp) / 'out.jsonl'
-            path.write_text(
-                '{"video_id": 1, "status": "resolved"}\n'
-                'not json at all\n'
-                '{"video_id": 2, "status": "unavailable"}\n',
-            )
-            self.assertEqual(mod.load_done_ids(path), {1, 2})
+            path: Path = Path(tmp) / 'processed.lst'
+            path.write_text('1\n2\nnot-an-id\n\n 3 \n')
+            self.assertEqual(mod.load_processed_ids(path), {1, 2, 3})
 
-    def test_load_done_ids_missing_file_is_empty(self) -> None:
+    def test_load_processed_ids_missing_file_is_empty(self) -> None:
         self.assertEqual(
-            mod.load_done_ids(Path('/nonexistent/out.jsonl')), set(),
+            mod.load_processed_ids(Path('/nonexistent/p.lst')), set(),
         )
-        self.assertEqual(mod.load_done_ids(None), set())
+        self.assertEqual(mod.load_processed_ids(None), set())
+
+    def test_processed_log_appends_and_flushes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path: Path = Path(tmp) / 'nested' / 'processed.lst'
+            log: mod.ProcessedLog = mod.ProcessedLog(path)
+            log.record(11)
+            log.record(12)
+            # Visible on disk before close, so a kill keeps it.
+            self.assertEqual(
+                path.read_text().splitlines(), ['11', '12'],
+            )
+            log.close()
+            self.assertEqual(log.recorded, 2)
 
 
 class TestEnqueueCreators(unittest.TestCase):

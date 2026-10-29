@@ -33,8 +33,15 @@ region-blocked videos) are reported as ``unavailable``.
 Ctrl-C is a clean stop: in-flight requests are cancelled, the summary
 reports how far the run got, the queue is left untouched and the exit
 code is 130. When ``--output-file`` is set each record is appended as
-soon as it resolves, so nothing already done is lost; rerun with
-``--resume`` to skip the ids that file already contains.
+soon as it resolves, so nothing already done is lost.
+
+Every id that reaches a terminal outcome is also appended to
+``--processed-file`` (default ``~/tiktok-resolved-video-ids.lst``) as
+it completes, and ids listed there are skipped on later runs, so a
+large input file can be worked through in several passes.
+``--reprocess`` ignores the log; ids whose page fetch stayed
+``transient`` (timeouts, 403/429, bot checks) are deliberately not
+logged so a later run retries them.
 '''
 
 from __future__ import annotations
@@ -190,12 +197,22 @@ class ResolveSettings(TikTokScraperSettings):
             'and operator imports are queued.'
         ),
     )
-    resume: bool = Field(
-        default=False,
-        validation_alias=AliasChoices('RESUME', 'resume'),
+    processed_file: Path | None = Field(
+        default=Path.home() / 'tiktok-resolved-video-ids.lst',
+        validation_alias=AliasChoices(
+            'TIKTOK_RESOLVE_PROCESSED_FILE', 'processed_file',
+        ),
         description=(
-            'Skip video ids that already appear in --output-file, so '
-            'an interrupted run can be continued.'
+            'Append-only log of the video ids this tool has processed, '
+            'one per line. Ids listed there are skipped on later runs. '
+            'Set to an empty value to disable the log.'
+        ),
+    )
+    reprocess: bool = Field(
+        default=False,
+        validation_alias=AliasChoices('REPROCESS', 'reprocess'),
+        description=(
+            'Process every input id even if the processed log lists it.'
         ),
     )
     dry_run: bool = Field(
@@ -317,6 +334,27 @@ def _rehydration_scope(html: str) -> dict[str, Any] | None:
     return scope if isinstance(scope, dict) else None
 
 
+def _no_username(
+    video_id: int,
+    status: str,
+    detail: str,
+) -> Resolution:
+    '''Build and log an outcome where the username is unavailable.'''
+    _LOGGER.warning(
+        'Creator username not extracted',
+        extra={
+            'video_id': video_id,
+            'status': status,
+            'detail': detail,
+        },
+    )
+    return Resolution(
+        video_id=video_id,
+        status=status,
+        detail=detail,
+    )
+
+
 def parse_author(html: str, video_id: int) -> Resolution:
     '''Extract the creator of *video_id* from a fetched video page.'''
     scope: dict[str, Any] | None = _rehydration_scope(html)
@@ -324,33 +362,29 @@ def parse_author(html: str, video_id: int) -> Resolution:
         blocked: bool = any(
             marker in html[:8000].lower() for marker in _BOT_MARKERS
         )
-        return Resolution(
-            video_id=video_id,
-            status=STATUS_TRANSIENT if blocked else STATUS_UNAVAILABLE,
-            detail='bot check' if blocked else 'no rehydration payload',
+        return _no_username(
+            video_id,
+            STATUS_TRANSIENT if blocked else STATUS_UNAVAILABLE,
+            'bot check' if blocked else 'no rehydration payload',
         )
     detail_block: Any = scope.get('webapp.video-detail') or {}
     item: Any = (detail_block.get('itemInfo') or {}).get('itemStruct')
     if not isinstance(item, dict):
         status_msg: str = str(detail_block.get('statusMsg') or 'no item')
-        return Resolution(
-            video_id=video_id,
-            status=STATUS_UNAVAILABLE,
-            detail=status_msg[:120],
+        return _no_username(
+            video_id, STATUS_UNAVAILABLE, status_msg[:120],
         )
     try:
         video: TikTokVideo = TikTokVideo.from_api(item)
     except (ValueError, TypeError, KeyError) as exc:  # shape mismatch
-        return Resolution(
-            video_id=video_id,
-            status=STATUS_ERROR,
-            detail=f'{type(exc).__name__}: {str(exc)[:120]}',
+        return _no_username(
+            video_id,
+            STATUS_ERROR,
+            f'{type(exc).__name__}: {str(exc)[:120]}',
         )
     if not video.username:
-        return Resolution(
-            video_id=video_id,
-            status=STATUS_UNAVAILABLE,
-            detail='item has no author username',
+        return _no_username(
+            video_id, STATUS_UNAVAILABLE, 'item has no author username',
         )
     return Resolution(
         video_id=video_id,
@@ -381,17 +415,41 @@ def append_record(path: Path, result: Resolution) -> None:
         handle.write(json.dumps(result.as_record()) + '\n')
 
 
-def load_done_ids(path: Path | None) -> set[int]:
-    '''Video ids already recorded in *path* (empty when unreadable).'''
+def load_processed_ids(path: Path | None) -> set[int]:
+    '''Video ids listed in the processed log (empty when absent).
+
+    Unparsable lines are ignored so a truncated final line cannot stop
+    a run from starting.
+    '''
     if path is None or not path.exists():
         return set()
     done: set[int] = set()
     with path.open('r', encoding='utf-8') as handle:
         for line in handle:
-            match: re.Match[str] | None = _RECORD_ID_RE.search(line)
-            if match is not None:
-                done.add(int(match.group(1)))
+            value: str = line.strip()
+            if value.isdigit():
+                done.add(int(value))
     return done
+
+
+class ProcessedLog:
+    '''Append-only log of processed video ids, flushed as it goes.'''
+
+    def __init__(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path: Path = path
+        self._handle = path.open('a', encoding='utf-8')
+        self.recorded: int = 0
+
+    def record(self, video_id: int) -> None:
+        '''Append one id and flush so a kill cannot lose it.'''
+        self._handle.write(f'{video_id}\n')
+        self._handle.flush()
+        self.recorded += 1
+
+    def close(self) -> None:
+        '''Close the log.'''
+        self._handle.close()
 
 
 class Resolver:
@@ -558,27 +616,31 @@ async def run(settings: ResolveSettings) -> int:
     ids: list[int] = read_video_ids(settings.input_file)
     if settings.max_ids:
         ids = ids[: settings.max_ids]
-    if settings.resume:
-        if settings.output_file is None:
-            print(
-                '--resume requires --output-file',
-                file=sys.stderr,
-            )
-            return 1
-        done_ids: set[int] = load_done_ids(settings.output_file)
+    input_ids: int = len(ids)
+    already_done: int = 0
+    if settings.processed_file is not None and not settings.reprocess:
+        done_ids: set[int] = load_processed_ids(settings.processed_file)
         if done_ids:
             remaining: list[int] = [
                 video_id for video_id in ids
                 if video_id not in done_ids
             ]
-            print(
-                f'resume: {len(ids) - len(remaining)} of {len(ids)} '
-                f'video id(s) already in {settings.output_file}',
-                file=sys.stderr,
+            already_done = len(ids) - len(remaining)
+            _LOGGER.info(
+                'Skipping already processed video ids',
+                extra={
+                    'skipped': already_done,
+                    'input_ids': input_ids,
+                    'processed_file': str(settings.processed_file),
+                },
             )
             ids = remaining
     if not ids:
-        print('no video ids to resolve', file=sys.stderr)
+        print(
+            f'no video ids to resolve '
+            f'({already_done} already processed)',
+            file=sys.stderr,
+        )
         return 1
 
     limiter: TikTokRateLimiter = TikTokRateLimiter.get(
@@ -607,6 +669,10 @@ async def run(settings: ResolveSettings) -> int:
     semaphore: asyncio.Semaphore = asyncio.Semaphore(concurrency)
     results: list[Resolution] = []
     interrupted: bool = False
+    processed: ProcessedLog | None = (
+        ProcessedLog(settings.processed_file)
+        if settings.processed_file is not None else None
+    )
 
     async def one(video_id: int) -> Resolution:
         async with semaphore:
@@ -634,6 +700,13 @@ async def run(settings: ResolveSettings) -> int:
             results.append(result)
             if settings.output_file is not None:
                 append_record(settings.output_file, result)
+            # Transient outcomes are not recorded: they exhausted their
+            # retries but are worth another attempt on a later run.
+            if (
+                processed is not None
+                and result.status != STATUS_TRANSIENT
+            ):
+                processed.record(result.video_id)
     except asyncio.CancelledError:
         interrupted = True
         for task in tasks:
@@ -642,6 +715,8 @@ async def run(settings: ResolveSettings) -> int:
             await asyncio.gather(*tasks, return_exceptions=True)
     finally:
         await resolver.close()
+        if processed is not None:
+            processed.close()
 
     counts: dict[str, int] = {}
     for result in results:
@@ -674,6 +749,7 @@ async def run(settings: ResolveSettings) -> int:
         'unavailable': counts.get(STATUS_UNAVAILABLE, 0),
         'transient': counts.get(STATUS_TRANSIENT, 0),
         'errors': counts.get(STATUS_ERROR, 0),
+        'skipped_processed': already_done,
         'unique_creators': len(usernames),
         'queued_new': added,
         'queue_existing': existing,
@@ -683,10 +759,10 @@ async def run(settings: ResolveSettings) -> int:
     print(json.dumps(summary, indent=2))
     if interrupted:
         hint: str = (
-            f'; rerun with --resume to continue (records are in '
-            f'{settings.output_file})'
-            if settings.output_file is not None
-            else '; pass --output-file next time to keep partial results'
+            f'; {processed.recorded} id(s) logged to '
+            f'{processed.path}, rerun to continue from there'
+            if processed is not None
+            else '; pass --processed-file next time to keep your place'
         )
         print(
             f'{len(results)} of {len(ids)} video id(s) done before '
