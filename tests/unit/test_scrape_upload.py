@@ -1915,3 +1915,30 @@ class TestOrphanMaxAge(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestTikTokVideoProcessorQueue(unittest.IsolatedAsyncioTestCase):
+    '''The TikTok video queue must never touch MongoDB.'''
+
+    async def test_tiktok_queue_ignores_mongo_dsn(self) -> None:
+        settings: MagicMock = MagicMock()
+        settings.redis_dsn = 'redis://h:6379/0'
+        with (
+            patch.dict(
+                os.environ,
+                {'MONGO_DSN': 'mongodb://user:pw@mongo:27017/q'},
+            ),
+            patch.object(
+                scrape_upload, 'redis_from_url', MagicMock(),
+            ),
+        ):
+            state = await scrape_upload.TikTokVideoProcessor().setup(
+                settings=settings,
+                client=MagicMock(),
+                fm=MagicMock(),
+                descriptor=MagicMock(),
+            )
+        queue = state.scrape_queue
+        self.assertIsNotNone(queue)
+        assert queue is not None
+        self.assertIsNone(queue._backlog)

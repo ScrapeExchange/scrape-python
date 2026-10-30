@@ -545,3 +545,24 @@ class TestScrapeOneQueued(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestBuildQueueIgnoresMongo(unittest.TestCase):
+    '''The TikTok video queue must never touch MongoDB.'''
+
+    def test_queue_ignores_mongo_dsn(self) -> None:
+        settings: MagicMock = MagicMock()
+        settings.redis_dsn = 'redis://h:6379/0'
+        settings.video_queue_batch = 50
+        settings.video_queue_idle_poll_seconds = 5
+        settings.video_transient_max_attempts = 3
+        settings.video_transient_backoff_seconds = 30
+        with (
+            patch.dict(
+                os.environ,
+                {'MONGO_DSN': 'mongodb://user:pw@mongo:27017/q'},
+            ),
+            patch.object(tool, 'redis_from_url', MagicMock()),
+        ):
+            queue = tool._build_queue(settings)
+        self.assertIsNone(queue._backlog)

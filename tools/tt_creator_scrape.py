@@ -98,6 +98,10 @@ from scrape_exchange.tiktok.short_url import (
     is_tiktok_short_url,
     resolve_creator_short_url,
 )
+from scrape_exchange.tiktok.tiktok_metrics import (
+    API_CALL_DURATION_SECONDS,
+    API_CALL_TOTAL,
+)
 from scrape_exchange.util import extract_proxy_ip, extract_proxy_port
 from scrape_exchange.video_scrape_queue import (
     RedisVideoScrapeQueue,
@@ -800,6 +804,68 @@ _CAPTURE_ENDPOINTS: dict[str, str] = {
     '/api/repost/item_list': 'reposts',
     '/api/user/playlist': 'playlists',
 }
+# Endpoint label per bucket, matching ``_endpoint_label`` in
+# ``tiktok_camoufox_api`` so both fetch paths share one metric.
+_CAPTURE_ENDPOINT_LABELS: dict[str, str] = {
+    'videos': 'user_videos',
+    'reposts': 'repost_videos',
+    'playlists': 'user_playlists',
+}
+
+
+def _metrics_context(api: Any) -> tuple[str, str]:
+    '''Return the (scraper, worker_id) labels bound to the API.'''
+    scraper: str = str(getattr(api, '_scraper_label', 'tiktok_creator'))
+    worker_id: str = str(getattr(api, '_worker_id', '0'))
+    return scraper, worker_id
+
+
+def _record_api_call(
+    endpoint: str,
+    outcome: str,
+    scraper: str,
+    worker_id: str,
+    elapsed: float | None = None,
+) -> None:
+    '''Count one TikTok API call and, when measured, its latency.'''
+    API_CALL_TOTAL.labels(
+        platform='tiktok',
+        scraper=scraper,
+        endpoint=endpoint,
+        outcome=outcome,
+        worker_id=worker_id,
+    ).inc()
+    if elapsed is None:
+        return
+    API_CALL_DURATION_SECONDS.labels(
+        platform='tiktok',
+        scraper=scraper,
+        endpoint=endpoint,
+        worker_id=worker_id,
+    ).observe(max(elapsed, 0.0))
+
+
+def _request_latency_seconds(response: Any) -> float | None:
+    '''Return a response's page-side round trip, when Playwright has it.
+
+    ``timing`` values are milliseconds relative to the navigation
+    start, so ``responseEnd - requestStart`` is the time the TikTok
+    endpoint itself took.
+    '''
+    timing: Any = getattr(
+        getattr(response, 'request', None), 'timing', None,
+    )
+    if not isinstance(timing, dict):
+        return None
+    start: Any = timing.get('requestStart')
+    end: Any = timing.get('responseEnd')
+    if not isinstance(start, (int, float)):
+        return None
+    if not isinstance(end, (int, float)):
+        return None
+    if end < start:
+        return None
+    return (end - start) / 1000.0
 
 
 def _rehydration_user_detail(html: str) -> dict:
@@ -824,28 +890,47 @@ def _rehydration_user_detail(html: str) -> dict:
     return detail if isinstance(detail, dict) else {}
 
 
-def _install_page_capture(page: Any) -> tuple[dict[str, list[dict]], Any]:
-    '''Record the API payloads the profile page fetches for itself.'''
+def _install_page_capture(
+    page: Any, scraper: str, worker_id: str,
+) -> tuple[dict[str, list[dict]], Any]:
+    '''Record the API payloads the profile page fetches for itself.
+
+    Every captured endpoint response is also counted in
+    ``tiktok_api_call_total``, because these page-issued requests are
+    the only ones the creator scraper makes; ``run_fetch_script``
+    (which owns the counter for the main-world path) is not used.
+    '''
     captured: dict[str, list[dict]] = {
         'videos': [], 'reposts': [], 'playlists': [],
     }
     tasks: set[asyncio.Task] = set()
 
-    async def store(response: Any, bucket: str) -> None:
+    async def store(
+        response: Any, bucket: str, started: float,
+    ) -> None:
+        endpoint: str = _CAPTURE_ENDPOINT_LABELS[bucket]
+        outcome: str = 'success'
         try:
             payload: Any = json.loads(await response.text())
         except (PlaywrightError, ValueError):
             # Body already consumed, page closed, or not JSON.
-            return
+            payload = None
+            outcome = 'other'
         if isinstance(payload, dict):
             captured[bucket].append(payload)
+        elif outcome == 'success':
+            outcome = 'other'
+        elapsed: float | None = _request_latency_seconds(response)
+        if elapsed is None:
+            elapsed = time.monotonic() - started
+        _record_api_call(endpoint, outcome, scraper, worker_id, elapsed)
 
     def on_response(response: Any) -> None:
         url: str = getattr(response, 'url', '')
         for suffix, bucket in _CAPTURE_ENDPOINTS.items():
             if suffix in url:
                 task: asyncio.Task = asyncio.ensure_future(
-                    store(response, bucket),
+                    store(response, bucket, time.monotonic()),
                 )
                 tasks.add(task)
                 task.add_done_callback(tasks.discard)
@@ -879,11 +964,33 @@ async def _load_profile_page(
             ),
             proxy=getattr(api, '_rate_limit_proxy', ''),
         )
-    captured, handler = _install_page_capture(page)
+    scraper: str
+    worker_id: str
+    scraper, worker_id = _metrics_context(api)
+    captured, handler = _install_page_capture(page, scraper, worker_id)
+    started: float = time.monotonic()
     try:
-        await page.goto(
-            f'https://www.tiktok.com/@{username}',
-            wait_until='domcontentloaded',
+        try:
+            await page.goto(
+                f'https://www.tiktok.com/@{username}',
+                wait_until='domcontentloaded',
+            )
+        except Exception as exc:
+            # The navigation is the only user-detail "call" left.
+            _record_api_call(
+                'user_info',
+                classify_tiktok_error(exc),
+                scraper,
+                worker_id,
+                time.monotonic() - started,
+            )
+            raise
+        _record_api_call(
+            'user_info',
+            'success',
+            scraper,
+            worker_id,
+            time.monotonic() - started,
         )
         deadline: float = time.monotonic() + _PROFILE_SETTLE_SECONDS
         while time.monotonic() < deadline and not captured['videos']:
@@ -1423,14 +1530,23 @@ def _build_queue(
 def _build_video_queue(
     settings: CreatorSettings,
 ) -> RedisVideoScrapeQueue:
-    '''Build the Redis-backed TikTok video scrape queue.'''
+    '''
+    Build the TikTok video scrape queue.
+
+    TikTok video queues live in Redis only. The MongoDB backlog is a
+    YouTube-only feature, so ``mongo_dsn`` is forced off here even when
+    the environment exports MONGO_DSN.
+    '''
     redis = redis_from_url(
         settings.redis_dsn,
         component='tiktok-creator-video-queue',
         decode_responses=True,
     )
+    queue_settings: VideoScrapeQueueSettings = (
+        VideoScrapeQueueSettings(mongo_dsn=None)
+    )
     return RedisVideoScrapeQueue(
-        redis, VideoScrapeQueueSettings(), platform=PLATFORM,
+        redis, queue_settings, platform=PLATFORM,
     )
 
 

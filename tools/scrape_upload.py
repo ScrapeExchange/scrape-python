@@ -1054,10 +1054,15 @@ class TikTokVideoProcessor(AssetProcessor):
             component='scrape-upload-tiktok-video-queue',
             decode_responses=True,
         )
+        # TikTok queues are Redis-only: the MongoDB backlog is a
+        # YouTube-only feature, so MONGO_DSN is not honoured here.
+        queue_settings: VideoScrapeQueueSettings = (
+            VideoScrapeQueueSettings(mongo_dsn=None)
+        )
         return TikTokVideoProcessorState(
             scrape_queue=RedisVideoScrapeQueue(
                 redis,
-                VideoScrapeQueueSettings(),
+                queue_settings,
                 platform='tiktok',
             ),
         )

@@ -224,9 +224,9 @@ services:
     <<: *scraper-common
     command: ["tools/tt_creator_scrape.py"]
     container_name: tt-creator
-    # Camoufox browsers at roughly 250-300 MB each. The limit keeps an
-    # OOM inside this container instead of starving the host.
-    mem_limit: 8g
+    # Camoufox browsers measured at 400-480 MB RSS each in production,
+    # so one browser per worker needs 16g; 8g OOM-killed renderers.
+    mem_limit: 16g
     # Firefox content processes abort with "Page crashed" when /dev/shm
     # is the Docker default of 64m; 512m matches the browser's appetite.
     shm_size: 512m

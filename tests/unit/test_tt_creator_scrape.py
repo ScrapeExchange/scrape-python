@@ -10,10 +10,15 @@ import asyncio
 import os
 import tempfile
 import unittest
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from scrape_exchange.file_management import (
     AssetFileManagement,
+)
+from scrape_exchange.tiktok.tiktok_metrics import (
+    API_CALL_DURATION_SECONDS,
+    API_CALL_TOTAL,
 )
 from tools import tt_creator_scrape as tool
 
@@ -1507,6 +1512,238 @@ class TestCreatorShortUrlSettings(unittest.TestCase):
             s.creator_short_url_retry_interval_seconds, 300,
         )
         self.assertIn('Mobile', s.creator_short_url_user_agent)
+
+
+
+
+class TestBuildVideoQueue(unittest.TestCase):
+    '''TikTok video queues must never touch MongoDB.'''
+
+    def test_queue_ignores_mongo_dsn(self) -> None:
+        with (
+            patch.dict(
+                os.environ,
+                {'MONGO_DSN': 'mongodb://user:pw@mongo:27017/q'},
+            ),
+            patch.object(tool, 'redis_from_url', MagicMock()),
+        ):
+            queue = tool._build_video_queue(_settings())
+        self.assertIsNone(queue._backlog)
+
+
+# ---------------------------------------------------------------
+# _load_profile_page / _install_page_capture instrumentation
+# ---------------------------------------------------------------
+
+_SCRAPER: str = 'tiktok_creator'
+_PLATFORM: str = 'tiktok'
+
+
+def _api_call_value(endpoint: str, outcome: str) -> float:
+    '''Current value of one tiktok_api_call_total child.'''
+    return API_CALL_TOTAL.labels(
+        platform=_PLATFORM,
+        scraper=_SCRAPER,
+        endpoint=endpoint,
+        outcome=outcome,
+        worker_id='0',
+    )._value.get()
+
+
+def _latency_count(endpoint: str) -> float:
+    '''Current sample count of one call-latency histogram child.'''
+    child: Any = API_CALL_DURATION_SECONDS.labels(
+        platform=_PLATFORM,
+        scraper=_SCRAPER,
+        endpoint=endpoint,
+        worker_id='0',
+    )
+    for metric in child.collect():
+        for sample in metric.samples:
+            if sample.name.endswith('_count'):
+                return float(sample.value)
+    raise AssertionError('histogram count sample not found')
+
+
+class _FakeResponse:
+    '''Playwright response double with optional resource timings.'''
+
+    def __init__(
+        self,
+        url: str,
+        body: str,
+        timing: dict | None = None,
+    ) -> None:
+        self.url: str = url
+        self._body: str = body
+        self.text = AsyncMock(return_value=body)
+        self.request: MagicMock = MagicMock()
+        self.request.timing = timing
+
+
+class _FakePage:
+    '''Playwright page double that can replay real responses.'''
+
+    def __init__(self) -> None:
+        self.handlers: list[Any] = []
+        self.content = AsyncMock(return_value='<html></html>')
+        self.goto = AsyncMock()
+        self.removed: list[Any] = []
+
+    def on(self, event: str, handler: Any) -> None:
+        self.handlers.append(handler)
+
+    def remove_listener(self, event: str, handler: Any) -> None:
+        self.removed.append(handler)
+
+    def emit(self, response: Any) -> None:
+        for handler in list(self.handlers):
+            handler(response)
+
+
+class _FakeProfileApi:
+    '''Minimal API double exposing only what _load_profile_page uses.'''
+
+    def __init__(self, page: _FakePage) -> None:
+        self._page: _FakePage = page
+        self._scraper_label: str = _SCRAPER
+        self._worker_id: str = '0'
+
+    def _get_session(self) -> tuple:
+        session: MagicMock = MagicMock()
+        session.page = self._page
+        return None, session
+
+
+class TestProfilePageMetrics(unittest.IsolatedAsyncioTestCase):
+    '''The page-harvest path is the only TikTok API path left, so it
+    must feed tiktok_api_call_total / _duration_seconds.'''
+
+    def _api(self, page: _FakePage) -> _FakeProfileApi:
+        return _FakeProfileApi(page)
+
+    async def test_item_list_and_playlist_responses_are_counted(
+        self,
+    ) -> None:
+        page: _FakePage = _FakePage()
+        api: _FakeProfileApi = self._api(page)
+        videos_before: float = _api_call_value('user_videos', 'success')
+        playlists_before: float = _api_call_value(
+            'user_playlists', 'success',
+        )
+        videos_latency_before: float = _latency_count('user_videos')
+
+        def on_goto(*args: Any, **kwargs: Any) -> None:
+            page.emit(_FakeResponse(
+                'https://www.tiktok.com/api/post/item_list/?x=1',
+                '{"itemList": [{"id": "1"}]}',
+                {'requestStart': 100.0, 'responseEnd': 350.0},
+            ))
+            page.emit(_FakeResponse(
+                'https://www.tiktok.com/api/user/playlist/?x=1',
+                '{"playlistList": []}',
+                {'requestStart': 10.0, 'responseEnd': 40.0},
+            ))
+
+        page.goto.side_effect = on_goto
+        with (
+            patch.object(tool, '_PROFILE_SETTLE_SECONDS', 0.0),
+            patch.object(tool, '_PROFILE_POLL_SECONDS', 0.0),
+        ):
+            _, captured = await tool._load_profile_page(api, 'someone')
+        await asyncio.sleep(0.01)
+
+        self.assertEqual(captured['videos'], [{'itemList': [{'id': '1'}]}])
+        self.assertEqual(
+            _api_call_value('user_videos', 'success') - videos_before,
+            1,
+        )
+        self.assertEqual(
+            _api_call_value('user_playlists', 'success')
+            - playlists_before,
+            1,
+        )
+        self.assertEqual(
+            _latency_count('user_videos') - videos_latency_before,
+            1,
+        )
+
+    async def test_non_json_body_is_counted_as_other(self) -> None:
+        page: _FakePage = _FakePage()
+        api: _FakeProfileApi = self._api(page)
+        before: float = _api_call_value('repost_videos', 'other')
+
+        def on_goto(*args: Any, **kwargs: Any) -> None:
+            page.emit(_FakeResponse(
+                'https://www.tiktok.com/api/repost/item_list/',
+                '<html>blocked</html>',
+            ))
+
+        page.goto.side_effect = on_goto
+        with (
+            patch.object(tool, '_PROFILE_SETTLE_SECONDS', 0.0),
+            patch.object(tool, '_PROFILE_POLL_SECONDS', 0.0),
+        ):
+            await tool._load_profile_page(api, 'someone')
+        await asyncio.sleep(0.01)
+
+        self.assertEqual(
+            _api_call_value('repost_videos', 'other') - before,
+            1,
+        )
+
+    async def test_successful_navigation_counts_user_info(self) -> None:
+        page: _FakePage = _FakePage()
+        api: _FakeProfileApi = self._api(page)
+        before: float = _api_call_value('user_info', 'success')
+        latency_before: float = _latency_count('user_info')
+
+        with (
+            patch.object(tool, '_PROFILE_SETTLE_SECONDS', 0.0),
+            patch.object(tool, '_PROFILE_POLL_SECONDS', 0.0),
+        ):
+            await tool._load_profile_page(api, 'someone')
+
+        self.assertEqual(_api_call_value('user_info', 'success') - before, 1)
+        self.assertEqual(_latency_count('user_info') - latency_before, 1)
+
+    async def test_failed_navigation_counts_classified_outcome(
+        self,
+    ) -> None:
+        page: _FakePage = _FakePage()
+        page.goto.side_effect = RuntimeError('HTTP 429 Too Many Requests')
+        api: _FakeProfileApi = self._api(page)
+        before: float = _api_call_value('user_info', 'rate_limit')
+
+        with (
+            patch.object(tool, '_PROFILE_SETTLE_SECONDS', 0.0),
+            patch.object(tool, '_PROFILE_POLL_SECONDS', 0.0),
+            self.assertRaises(RuntimeError),
+        ):
+            await tool._load_profile_page(api, 'someone')
+
+        self.assertEqual(
+            _api_call_value('user_info', 'rate_limit') - before,
+            1,
+        )
+        self.assertEqual(page.removed, [page.handlers[0]])
+
+    def test_request_latency_uses_resource_timing(self) -> None:
+        response: _FakeResponse = _FakeResponse(
+            'https://www.tiktok.com/api/post/item_list/',
+            '{}',
+            {'requestStart': 250.0, 'responseEnd': 1750.0},
+        )
+        self.assertEqual(
+            tool._request_latency_seconds(response), 1.5,
+        )
+
+    def test_request_latency_falls_back_when_absent(self) -> None:
+        response: _FakeResponse = _FakeResponse(
+            'https://www.tiktok.com/api/post/item_list/', '{}',
+        )
+        response.request.timing = None
+        self.assertIsNone(tool._request_latency_seconds(response))
 
 
 if __name__ == '__main__':

@@ -305,6 +305,11 @@ async def _fetch_video_payload(api: Any, video_ref: str) -> dict:
 
 
 def _build_queue(settings: VideoSettings) -> RedisVideoScrapeQueue:
+    '''Build the TikTok video queue, which lives in Redis only.
+
+    The MongoDB backlog is a YouTube-only feature, so ``mongo_dsn`` is
+    forced off here even when the environment exports MONGO_DSN.
+    '''
     redis = redis_from_url(
         settings.redis_dsn,
         component='tiktok-video-queue',
@@ -312,6 +317,7 @@ def _build_queue(settings: VideoSettings) -> RedisVideoScrapeQueue:
     )
     queue_settings: VideoScrapeQueueSettings = (
         VideoScrapeQueueSettings(
+            mongo_dsn=None,
             video_queue_batch=settings.video_queue_batch,
             video_queue_idle_poll_seconds=(
                 settings.video_queue_idle_poll_seconds
