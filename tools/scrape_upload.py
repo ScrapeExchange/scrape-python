@@ -1054,10 +1054,13 @@ class TikTokVideoProcessor(AssetProcessor):
             component='scrape-upload-tiktok-video-queue',
             decode_responses=True,
         )
+        queue_settings: VideoScrapeQueueSettings = (
+            VideoScrapeQueueSettings()
+        )
         return TikTokVideoProcessorState(
             scrape_queue=RedisVideoScrapeQueue(
                 redis,
-                VideoScrapeQueueSettings(),
+                queue_settings,
                 platform='tiktok',
             ),
         )

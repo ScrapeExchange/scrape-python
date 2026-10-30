@@ -305,6 +305,7 @@ async def _fetch_video_payload(api: Any, video_ref: str) -> dict:
 
 
 def _build_queue(settings: VideoSettings) -> RedisVideoScrapeQueue:
+    '''Build the TikTok video queue, which lives in Redis only.'''
     redis = redis_from_url(
         settings.redis_dsn,
         component='tiktok-video-queue',

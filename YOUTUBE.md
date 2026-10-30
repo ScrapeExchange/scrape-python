@@ -479,48 +479,13 @@ pop-time against a Redis-backed set of uploaded IDs —
 the per-process frozenset cache was retired because it
 ballooned memory on the production server.
 
-### MongoDB backlog and the Redis hot window
-
-Producers (channel scraper, RSS scraper, imports) add
-videos far faster than they can be scraped, so the full
-queue does not fit in Redis. With `MONGO_DSN` set:
-
-- **MongoDB is the source of truth.** The
-  `<platform>_videos` collection holds one document per
-  known video: `queued`, `hot` (copied into Redis) or a
-  terminal state (`unavailable`, `failed`, `removed`)
-  with its diagnostic record. Producers insert into
-  MongoDB; a duplicate ID means "already known".
-- **Redis holds only the hot window**: the oldest queued
-  videos, which the scrapers pop from as before.
-- **`tools/yt_video_queue_refill.py`** (compose service
-  `yt-video-queue-refill`, profile `refill`; run one per
-  platform) copies the oldest queued documents into
-  Redis whenever it holds fewer than
-  `VIDEO_QUEUE_LOW_WATERMARK` (10M) videos, up to
-  `VIDEO_QUEUE_HIGH_WATERMARK` (20M). Metrics on port
-  `REFILL_METRICS_PORT` (9560).
-- **Forced re-scrapes** (`--force`, corrupt files) go
-  straight to the front of the Redis hot window.
-- A scraped video's document is deleted; the
-  uploaded-videos Bloom filter keeps it from being
-  queued again.
-
-Set `MONGO_DSN` on every host that runs a video producer
-or video scraper, or on none: a producer without it
-writes straight into Redis and bypasses the backlog.
-`tools/video_queue_offload.py` moves an existing
-Redis-only queue into MongoDB (steps `terminal`,
-`backlog`, `hot`, in that order, with producers and
-scrapers stopped).
-
 ### backlog-server (the current YouTube queue)
 
 With `BACKLOG_SERVER_DSN` set, the YouTube video queue
 is `backlog-server` (`backlog-server/` in this repo, a
 single Rust process holding every known ID on local
 disk and speaking RESP with its own `BACKLOG.*`
-commands) instead of MongoDB plus the Redis hot window.
+commands) instead of Redis.
 Queue selection is in
 `scrape_exchange/video_queue_factory.py`; the client is
 `scrape_exchange/backlog_server_queue.py`. Every command

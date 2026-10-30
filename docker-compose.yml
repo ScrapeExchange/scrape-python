@@ -130,29 +130,6 @@ services:
 #    command:
 #      - --redis.addr=redis://:topsecret@redis:6379
 
-# Uncomment the mongodb section to run a MongoDB server on your host for
-# the video scrape queue backlog (MONGO_DSN). The root user is created
-# on the first start, when /var/tmp/scrape-mongodb is still empty.
-# mongo:8.x refuses to start on Linux kernels 6.19 and newer
-# (SERVER-121912); mongo:7 does not have that restriction.
-#  mongodb:
-#    container_name: "mongodb"
-#    image: "mongo:7"
-#    ports:
-#      - 27017:27017/tcp
-#    restart: "unless-stopped"
-#    environment:
-#      - MONGO_INITDB_ROOT_USERNAME=root
-#      - MONGO_INITDB_ROOT_PASSWORD=<changeme>    # not committed
-#    volumes:
-#      - type: bind
-#        source: /var/tmp/scrape-mongodb
-#        target: /data/db
-#        bind:
-#          create_host_path: true
-#    command: ["mongod", "--wiredTigerCacheSizeGB", "4",
-#              "--maxConns", "1000"]
-
   yt-video:
     <<: *scraper-common
     command: ["tools/yt_video_scrape.py"]
@@ -212,21 +189,16 @@ services:
         bind:
           create_host_path: false
 
-  # Keeps the Redis hot window of the video queue filled from the
-  # MongoDB backlog (needs MONGO_DSN). Run on exactly one host.
-  yt-video-queue-refill:
-    <<: *scraper-common
-    profiles: ["refill"]
-    command: ["tools/yt_video_queue_refill.py", "--platform", "youtube"]
-    container_name: yt-video-queue-refill
-
   tt-creator:
     <<: *scraper-common
     command: ["tools/tt_creator_scrape.py"]
     container_name: tt-creator
-    # Camoufox browsers at roughly 250-300 MB each. The limit keeps an
-    # OOM inside this container instead of starving the host.
-    mem_limit: 8g
+    # Camoufox browsers measured at 400-480 MB RSS each in production,
+    # so one browser per worker needs 16g; 8g OOM-killed renderers.
+    mem_limit: 16g
+    # Firefox content processes abort with "Page crashed" when /dev/shm
+    # is the Docker default of 64m; 512m matches the browser's appetite.
+    shm_size: 512m
 
   tt-video:
     <<: *scraper-common
@@ -235,6 +207,9 @@ services:
     # Camoufox browsers at roughly 250-300 MB each. The limit keeps an
     # OOM inside this container instead of starving the host.
     mem_limit: 8g
+    # Firefox content processes abort with "Page crashed" when /dev/shm
+    # is the Docker default of 64m; 512m matches the browser's appetite.
+    shm_size: 512m
 
   ig-creator:
     <<: *scraper-common
@@ -244,6 +219,9 @@ services:
     # 12) at roughly 250-300 MB each. The limit keeps an OOM inside this
     # container instead of starving every scraper on the host.
     mem_limit: 8g
+    # Firefox content processes abort with "Page crashed" when /dev/shm
+    # is the Docker default of 64m; 512m matches the browser's appetite.
+    shm_size: 512m
 
   tw-creator:
     <<: *scraper-common
@@ -253,6 +231,9 @@ services:
     # Camoufox browsers at roughly 250-300 MB each. The limit keeps an
     # OOM inside this container instead of starving the host.
     mem_limit: 8g
+    # Firefox content processes abort with "Page crashed" when /dev/shm
+    # is the Docker default of 64m; 512m matches the browser's appetite.
+    shm_size: 512m
 
   of-creator:
     <<: *scraper-common
@@ -262,6 +243,9 @@ services:
     # Camoufox browsers at roughly 250-300 MB each. The limit keeps an
     # OOM inside this container instead of starving the host.
     mem_limit: 8g
+    # Firefox content processes abort with "Page crashed" when /dev/shm
+    # is the Docker default of 64m; 512m matches the browser's appetite.
+    shm_size: 512m
 
   scrape-upload:
     <<: *scraper-common

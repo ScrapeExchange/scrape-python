@@ -19,9 +19,7 @@ DSN: str = 'redis://:pw@localhost:6390/0'
 
 
 def settings(dsn: str | None) -> VideoScrapeQueueSettings:
-    return VideoScrapeQueueSettings(
-        backlog_server_dsn=dsn, mongo_dsn=None,
-    )
+    return VideoScrapeQueueSettings(backlog_server_dsn=dsn)
 
 
 class TestVideoQueueFactory(unittest.TestCase):

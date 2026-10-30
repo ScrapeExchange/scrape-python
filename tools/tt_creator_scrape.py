@@ -22,6 +22,7 @@ Design: docs/superpowers/specs/
 '''
 
 import asyncio
+import json
 import logging
 import os
 import random
@@ -32,6 +33,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 
+from playwright.async_api import Error as PlaywrightError
 from pydantic import AliasChoices, Field, field_validator
 
 from scrape_exchange.creator_map import (
@@ -39,8 +41,8 @@ from scrape_exchange.creator_map import (
     RedisCreatorMap,
 )
 from scrape_exchange.creator_queue import (
-    CreatorQueue,
     DEFAULT_ORPHAN_RECOVERY_INTERVAL_SECONDS,
+    CreatorQueue,
     RedisCreatorQueue,
     TierConfig,
     parse_priority_queues,
@@ -80,8 +82,8 @@ from scrape_exchange.settings import (
     normalize_log_level,
 )
 from scrape_exchange.tiktok import (
-    TikTokCreator,
     TikTokCallType,
+    TikTokCreator,
     TikTokPlaylistRef,
     TikTokRateLimiter,
     TikTokSessionPool,
@@ -96,6 +98,10 @@ from scrape_exchange.tiktok.short_url import (
     is_tiktok_short_url,
     resolve_creator_short_url,
 )
+from scrape_exchange.tiktok.tiktok_metrics import (
+    API_CALL_DURATION_SECONDS,
+    API_CALL_TOTAL,
+)
 from scrape_exchange.util import extract_proxy_ip, extract_proxy_port
 from scrape_exchange.video_scrape_queue import (
     RedisVideoScrapeQueue,
@@ -103,7 +109,6 @@ from scrape_exchange.video_scrape_queue import (
 )
 from scrape_exchange.watchdog import Watchdog
 from scrape_exchange.worker_id import get_worker_id
-
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -791,22 +796,323 @@ async def _collect_playlist_refs_from_iterator(
     return refs
 
 
+_PROFILE_STATE_MARKER: str = 'id="__UNIVERSAL_DATA_FOR_REHYDRATION__"'
+_PROFILE_SETTLE_SECONDS: float = 12.0
+_PROFILE_POLL_SECONDS: float = 0.25
+_CAPTURE_ENDPOINTS: dict[str, str] = {
+    '/api/post/item_list': 'videos',
+    '/api/repost/item_list': 'reposts',
+    '/api/user/playlist': 'playlists',
+}
+# Endpoint label per bucket, matching ``_endpoint_label`` in
+# ``tiktok_camoufox_api`` so both fetch paths share one metric.
+_CAPTURE_ENDPOINT_LABELS: dict[str, str] = {
+    'videos': 'user_videos',
+    'reposts': 'repost_videos',
+    'playlists': 'user_playlists',
+}
+
+
+def _metrics_context(api: Any) -> tuple[str, str]:
+    '''Return the (scraper, worker_id) labels bound to the API.'''
+    scraper: str = str(getattr(api, '_scraper_label', 'tiktok_creator'))
+    worker_id: str = str(getattr(api, '_worker_id', '0'))
+    return scraper, worker_id
+
+
+def _record_api_call(
+    endpoint: str,
+    outcome: str,
+    scraper: str,
+    worker_id: str,
+    elapsed: float | None = None,
+) -> None:
+    '''Count one TikTok API call and, when measured, its latency.'''
+    API_CALL_TOTAL.labels(
+        platform='tiktok',
+        scraper=scraper,
+        endpoint=endpoint,
+        outcome=outcome,
+        worker_id=worker_id,
+    ).inc()
+    if elapsed is None:
+        return
+    API_CALL_DURATION_SECONDS.labels(
+        platform='tiktok',
+        scraper=scraper,
+        endpoint=endpoint,
+        worker_id=worker_id,
+    ).observe(max(elapsed, 0.0))
+
+
+def _request_latency_seconds(response: Any) -> float | None:
+    '''Return a response's page-side round trip, when Playwright has it.
+
+    ``timing`` values are milliseconds relative to the navigation
+    start, so ``responseEnd - requestStart`` is the time the TikTok
+    endpoint itself took.
+    '''
+    timing: Any = getattr(
+        getattr(response, 'request', None), 'timing', None,
+    )
+    if not isinstance(timing, dict):
+        return None
+    start: Any = timing.get('requestStart')
+    end: Any = timing.get('responseEnd')
+    if not isinstance(start, (int, float)):
+        return None
+    if not isinstance(end, (int, float)):
+        return None
+    if end < start:
+        return None
+    return (end - start) / 1000.0
+
+
+def _rehydration_user_detail(html: str) -> dict:
+    '''Return the ``webapp.user-detail`` scope of a profile page.'''
+    start: int = html.find(_PROFILE_STATE_MARKER)
+    if start < 0:
+        return {}
+    begin: int = html.find('>', start) + 1
+    end: int = html.find('</script>', begin)
+    if begin <= 0 or end < 0:
+        return {}
+    try:
+        data: Any = json.loads(html[begin:end])
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    scope: Any = data.get('__DEFAULT_SCOPE__') or {}
+    if not isinstance(scope, dict):
+        return {}
+    detail: Any = scope.get('webapp.user-detail') or {}
+    return detail if isinstance(detail, dict) else {}
+
+
+def _install_page_capture(
+    page: Any, scraper: str, worker_id: str,
+) -> tuple[dict[str, list[dict]], Any]:
+    '''Record the API payloads the profile page fetches for itself.
+
+    Every captured endpoint response is also counted in
+    ``tiktok_api_call_total``, because these page-issued requests are
+    the only ones the creator scraper makes; ``run_fetch_script``
+    (which owns the counter for the main-world path) is not used.
+    '''
+    captured: dict[str, list[dict]] = {
+        'videos': [], 'reposts': [], 'playlists': [],
+    }
+    tasks: set[asyncio.Task] = set()
+
+    async def store(
+        response: Any, bucket: str, started: float,
+    ) -> None:
+        endpoint: str = _CAPTURE_ENDPOINT_LABELS[bucket]
+        outcome: str = 'success'
+        try:
+            payload: Any = json.loads(await response.text())
+        except (PlaywrightError, ValueError):
+            # Body already consumed, page closed, or not JSON.
+            payload = None
+            outcome = 'other'
+        if isinstance(payload, dict):
+            captured[bucket].append(payload)
+        elif outcome == 'success':
+            outcome = 'other'
+        elapsed: float | None = _request_latency_seconds(response)
+        if elapsed is None:
+            elapsed = time.monotonic() - started
+        _record_api_call(endpoint, outcome, scraper, worker_id, elapsed)
+
+    def on_response(response: Any) -> None:
+        url: str = getattr(response, 'url', '')
+        for suffix, bucket in _CAPTURE_ENDPOINTS.items():
+            if suffix in url:
+                task: asyncio.Task = asyncio.ensure_future(
+                    store(response, bucket, time.monotonic()),
+                )
+                tasks.add(task)
+                task.add_done_callback(tasks.discard)
+                return
+
+    page.on('response', on_response)
+    return captured, on_response
+
+
+async def _load_profile_page(
+    api: Any, username: str,
+) -> tuple[dict, dict[str, list[dict]]]:
+    '''
+    Navigate to the creator's profile and harvest what its own
+    requests bring back.
+
+    TikTok answers ``/api/user/detail`` and ``/api/post/item_list``
+    with an empty body when the call is issued by our main-world
+    fetch, but serves the same endpoints to the page's own
+    webmssdk-signed requests. Reading those responses avoids the
+    signature problem: the rehydration JSON carries the user object
+    and the item-list calls carry videos, reposts, and playlists.
+    '''
+    _, session = api._get_session()
+    page = session.page
+    limiter: Any = getattr(api, '_rate_limiter', None)
+    if limiter is not None:
+        await limiter.acquire(
+            getattr(
+                api, '_rate_limit_call_type', TikTokCallType.CREATOR_API,
+            ),
+            proxy=getattr(api, '_rate_limit_proxy', ''),
+        )
+    scraper: str
+    worker_id: str
+    scraper, worker_id = _metrics_context(api)
+    captured, handler = _install_page_capture(page, scraper, worker_id)
+    started: float = time.monotonic()
+    try:
+        try:
+            await page.goto(
+                f'https://www.tiktok.com/@{username}',
+                wait_until='domcontentloaded',
+            )
+        except Exception as exc:
+            # The navigation is the only user-detail "call" left.
+            _record_api_call(
+                'user_info',
+                classify_tiktok_error(exc),
+                scraper,
+                worker_id,
+                time.monotonic() - started,
+            )
+            raise
+        _record_api_call(
+            'user_info',
+            'success',
+            scraper,
+            worker_id,
+            time.monotonic() - started,
+        )
+        deadline: float = time.monotonic() + _PROFILE_SETTLE_SECONDS
+        while time.monotonic() < deadline and not captured['videos']:
+            await asyncio.sleep(_PROFILE_POLL_SECONDS)
+        await asyncio.sleep(_PROFILE_POLL_SECONDS * 4)
+        html: str = await page.content()
+    finally:
+        try:
+            page.remove_listener('response', handler)
+        except PlaywrightError:
+            # Page already closed by a session quarantine.
+            pass
+    return _rehydration_user_detail(html), captured
+
+
+def _refs_from_payloads(
+    payloads: list[dict], count: int,
+) -> list[TikTokVideoRef]:
+    '''Flatten captured item-list payloads into compact video refs.'''
+    limited: bool = count > 0
+    seen: set[str] = set()
+    refs: list[TikTokVideoRef] = []
+    for payload in payloads:
+        items: Any = payload.get('itemList') or []
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            ref: TikTokVideoRef | None = _video_ref_from_payload(item)
+            if ref is None or ref.video_id in seen:
+                continue
+            seen.add(ref.video_id)
+            refs.append(ref)
+            if limited and len(refs) >= count:
+                return refs
+    return refs
+
+
+def _playlist_ref_from_payload(
+    payload: dict,
+) -> TikTokPlaylistRef | None:
+    '''Build a compact playlist reference from a playlist payload.'''
+    playlist_id: str = str(
+        payload.get('mixId')
+        or payload.get('playlistId')
+        or payload.get('collectionId')
+        or payload.get('id')
+        or '',
+    )
+    if not playlist_id:
+        return None
+    name: Any = payload.get('name') or payload.get('title')
+    video_count: Any = (
+        payload.get('videoCount')
+        or payload.get('total')
+        or payload.get('itemCount')
+    )
+    cover: Any = payload.get('cover')
+    cover_url: str | None = None
+    if isinstance(cover, str):
+        cover_url = cover
+    elif isinstance(cover, dict):
+        urls: Any = cover.get('urlList') or []
+        if isinstance(urls, list) and urls:
+            cover_url = str(urls[0])
+    return TikTokPlaylistRef(
+        playlist_id=playlist_id,
+        name=str(name) if name else None,
+        video_count=int(video_count) if video_count else None,
+        cover_url=cover_url,
+    )
+
+
+def _playlist_refs_from_payloads(
+    payloads: list[dict], count: int,
+) -> list[TikTokPlaylistRef]:
+    '''Flatten captured playlist payloads into playlist refs.'''
+    limited: bool = count > 0
+    seen: set[str] = set()
+    refs: list[TikTokPlaylistRef] = []
+    for payload in payloads:
+        for key in ('playlistList', 'collectionList', 'mixList'):
+            items: Any = payload.get(key) or []
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                ref: TikTokPlaylistRef | None = (
+                    _playlist_ref_from_payload(item)
+                )
+                if ref is None or ref.playlist_id in seen:
+                    continue
+                seen.add(ref.playlist_id)
+                refs.append(ref)
+                if limited and len(refs) >= count:
+                    return refs
+    return refs
+
+
 async def _scrape_one(
     api: Any, username: str, settings: CreatorSettings,
 ) -> TikTokCreator:
     '''
-    Issue the live User.info call, then collect compact video refs
-    for public videos, reposts, and liked posts where available.
+    Load the creator's profile page and build the record from what the
+    page itself retrieved.
+
+    TikTok returns an empty body to ``/api/user/detail`` and
+    ``/api/post/item_list`` calls issued by our main-world fetch, but
+    serves them to the page's own requests, so the page is the source
+    of truth: its rehydration JSON carries the user object and its
+    item-list requests carry the video, repost, and playlist payloads.
     '''
-    user: Any = api.user(username=username)
-    try:
-        resp: dict = await user.info()
-    except KeyError as exc:
-        response: object = getattr(user, 'as_dict', None)
+    detail, captured = await _load_profile_page(api, username)
+    user_info: Any = detail.get('userInfo') or {}
+    user: Any = user_info.get('user') or {}
+    if not isinstance(user, dict) or not user:
         raise TikTokProfileResponseError(
-            response, exc.args[0] if exc.args else None,
-        ) from exc
-    creator: TikTokCreator = TikTokCreator.from_user_info(resp)
+            detail, detail.get('statusMsg') or 'empty userInfo payload',
+        )
+    creator: TikTokCreator = TikTokCreator.from_user_info(detail)
     if creator.username.casefold() != username.casefold():
         raise TikTokProfileIdentityError(
             username, creator.username,
@@ -815,37 +1121,21 @@ async def _scrape_one(
         return creator
 
     video_count: int = max(0, settings.creator_video_ref_count)
-    api_video_count: int = (
-        video_count if video_count > 0 else sys.maxsize
-    )
     playlist_count: int = max(
         0, settings.creator_playlist_ref_count,
     )
 
-    creator.videos = await _collect_video_refs_from_iterator(
-        user.videos(count=api_video_count), video_count,
-    )
+    creator.videos = _refs_from_payloads(captured['videos'], video_count)
     if creator.video_count > 0 and not creator.videos:
         raise TikTokVideoListResponseError(
             creator.username, creator.video_count,
         )
-    creator.reposts = await _collect_repost_refs(
-        api, creator.sec_uid, video_count,
+    creator.reposts = _refs_from_payloads(
+        captured['reposts'], video_count,
     )
-    try:
-        creator.liked = await _collect_video_refs_from_iterator(
-            user.liked(count=api_video_count), video_count,
-        )
-    except Exception as exc:
-        _LOGGER.info(
-            'Liked videos unavailable for creator',
-            extra={'username': username, 'error': str(exc)},
-        )
     if playlist_count > 0:
-        creator.playlists = (
-            await _collect_playlist_refs_from_iterator(
-                user.playlists(count=playlist_count), playlist_count,
-            )
+        creator.playlists = _playlist_refs_from_payloads(
+            captured['playlists'], playlist_count,
         )
     return creator
 
@@ -1240,14 +1530,19 @@ def _build_queue(
 def _build_video_queue(
     settings: CreatorSettings,
 ) -> RedisVideoScrapeQueue:
-    '''Build the Redis-backed TikTok video scrape queue.'''
+    '''
+    Build the TikTok video scrape queue, which lives in Redis only.
+    '''
     redis = redis_from_url(
         settings.redis_dsn,
         component='tiktok-creator-video-queue',
         decode_responses=True,
     )
+    queue_settings: VideoScrapeQueueSettings = (
+        VideoScrapeQueueSettings()
+    )
     return RedisVideoScrapeQueue(
-        redis, VideoScrapeQueueSettings(), platform=PLATFORM,
+        redis, queue_settings, platform=PLATFORM,
     )
 
 
