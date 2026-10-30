@@ -193,8 +193,12 @@ services:
     <<: *scraper-common
     command: ["tools/tt_creator_scrape.py"]
     container_name: tt-creator
-    # Camoufox browsers measured at 400-480 MB RSS each in production,
-    # so one browser per worker needs 16g; 8g OOM-killed renderers.
+    # Reaps the Firefox processes orphaned each time a session browser
+    # is closed; without it they pile up as zombies under PID 1.
+    init: true
+    # Camoufox browsers measured at ~700 MiB PSS each after bootstrap,
+    # growing to ~1.5 GiB within an hour (TIKTOK_BROWSER_MAX_AGE
+    # recycles them); 8g OOM-killed renderers.
     mem_limit: 16g
     # Firefox content processes abort with "Page crashed" when /dev/shm
     # is the Docker default of 64m; 512m matches the browser's appetite.
@@ -204,8 +208,10 @@ services:
     <<: *scraper-common
     command: ["tools/tt_video_scrape.py"]
     container_name: tt-video
-    # Camoufox browsers at roughly 250-300 MB each. The limit keeps an
-    # OOM inside this container instead of starving the host.
+    init: true
+    # Camoufox browsers at ~700 MiB each after bootstrap, growing to
+    # ~1.5 GiB (see tt-creator). The limit keeps an OOM inside this
+    # container instead of starving the host.
     mem_limit: 8g
     # Firefox content processes abort with "Page crashed" when /dev/shm
     # is the Docker default of 64m; 512m matches the browser's appetite.

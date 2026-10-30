@@ -35,6 +35,56 @@ class TestTikTokScraperSettings(unittest.TestCase):
             s.bulk_progress_timeout_seconds, 1800.0,
         )
 
+    def test_suppress_resource_types_default_is_media(self) -> None:
+        s: TikTokScraperSettings = TikTokScraperSettings(
+            _env_file=None,
+            _cli_parse_args=[],
+        )
+        self.assertEqual(s.suppress_resource_type_list, ['media'])
+        self.assertFalse(s.browser_webgl)
+        self.assertEqual(s.browser_max_age_seconds, 2700.0)
+
+    def test_browser_max_age_env(self) -> None:
+        with patch.dict(
+            os.environ, {'TIKTOK_BROWSER_MAX_AGE': '0'}, clear=False,
+        ):
+            s: TikTokScraperSettings = TikTokScraperSettings(
+                _env_file=None,
+                _cli_parse_args=[],
+            )
+        self.assertEqual(s.browser_max_age_seconds, 0.0)
+
+    def test_browser_webgl_env(self) -> None:
+        with patch.dict(
+            os.environ, {'TIKTOK_BROWSER_WEBGL': 'true'}, clear=False,
+        ):
+            s: TikTokScraperSettings = TikTokScraperSettings(
+                _env_file=None,
+                _cli_parse_args=[],
+            )
+        self.assertTrue(s.browser_webgl)
+
+    def test_suppress_resource_types_parses_list(self) -> None:
+        env: dict[str, str] = {
+            'TIKTOK_SUPPRESS_RESOURCE_TYPES': ' media, font ,,',
+        }
+        with patch.dict(os.environ, env, clear=False):
+            s: TikTokScraperSettings = TikTokScraperSettings(
+                _env_file=None,
+                _cli_parse_args=[],
+            )
+        self.assertEqual(s.suppress_resource_type_list, ['media', 'font'])
+
+    def test_empty_suppress_resource_types_loads_all(self) -> None:
+        with patch.dict(
+            os.environ, {'TIKTOK_SUPPRESS_RESOURCE_TYPES': ''}, clear=False,
+        ):
+            s: TikTokScraperSettings = TikTokScraperSettings(
+                _env_file=None,
+                _cli_parse_args=[],
+            )
+        self.assertEqual(s.suppress_resource_type_list, [])
+
     def test_env_aliases(self) -> None:
         env: dict = {
             'TIKTOK_CREATOR_DATA_DIR': '/data/tt/creators',

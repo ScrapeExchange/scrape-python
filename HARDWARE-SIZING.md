@@ -213,7 +213,9 @@ fragmentation to accumulate.
   - Plan: 500 MiB-2 GiB depending on browser count and page weight.
 
 TikTok browser memory is the largest uncertainty. Size by selected
-proxies, not by configured proxy files:
+proxies, not by configured proxy files, and measure
+`browser_session_size` on your hosts with
+`sum(tiktok_browser_memory_bytes) / sum(tiktok_session_pool_size{state="ready"})`:
 
 ```
 tiktok_ready_sessions <= min(tiktok_concurrency, proxy_count)

@@ -1592,6 +1592,9 @@ async def _run_worker(ctx: ScraperRunContext) -> None:
         worker_id=worker_id,
         refresh_fraction=settings.ms_token_refresh_fraction,
         bootstrap_timeout_ms=settings.session_bootstrap_timeout_ms,
+        suppress_resource_types=settings.suppress_resource_type_list,
+        browser_webgl=settings.browser_webgl,
+        browser_max_age_seconds=settings.browser_max_age_seconds,
     )
     await pool.bootstrap()
     ready: list[str] = pool.ready_proxies()

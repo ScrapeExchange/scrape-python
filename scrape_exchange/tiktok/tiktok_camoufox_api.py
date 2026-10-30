@@ -31,6 +31,7 @@ from typing import Any
 
 from camoufox import launch_options
 from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import async_playwright
 from TikTokApi import TikTokApi
 from TikTokApi.api.comment import Comment
 from TikTokApi.api.hashtag import Hashtag
@@ -40,6 +41,7 @@ from TikTokApi.api.sound import Sound
 from TikTokApi.api.trending import Trending
 from TikTokApi.api.user import User
 from TikTokApi.api.video import Video
+from TikTokApi.helpers import random_choice
 from TikTokApi.tiktok import (
     TikTokPlaywrightSession,
     stealth_async,
@@ -87,7 +89,9 @@ def camoufox_launch_options(proxy: dict | None) -> dict:
       exit (or this host's public IP when ``proxy`` is None);
     - ``main_world_eval=True`` enables the ``mw:`` prefix the
       signing/fetch overrides rely on;
-    - ``block_webgl=False`` keeps WebGL so canvas/WebGL probes pass;
+    - ``block_webgl=False`` keeps Camoufox's WebGL fingerprint config;
+      WebGL itself only works when the returned
+      ``firefox_user_prefs`` reach Firefox (``TIKTOK_BROWSER_WEBGL``);
     - ``humanize=True`` for realistic input timing.
 
     Returns the dict to splat into the Firefox launch
@@ -127,11 +131,13 @@ def apply_camoufox_env(env: dict) -> None:
         os.environ[key] = str(value)
 
 
+TIKTOK_URL: str = 'https://www.tiktok.com'
+
 # Pages navigated to when the signer is not yet present; mirrors the
 # retry targets TikTokApi itself uses.
 _TRY_URLS: list[str] = [
     'https://www.tiktok.com/foryou',
-    'https://www.tiktok.com',
+    TIKTOK_URL,
     'https://www.tiktok.com/@tiktok',
 ]
 
@@ -190,6 +196,9 @@ def _endpoint_label(url: str) -> str:
 class CamoufoxTikTokApi(TikTokApi):
     '''TikTokApi that signs and fetches in Camoufox's main world.'''
 
+    # True when create_sessions got a driver owned by someone else.
+    _shared_playwright: bool = False
+
     def set_rate_limiter(
         self,
         rate_limiter: TikTokRateLimiter,
@@ -245,9 +254,107 @@ class CamoufoxTikTokApi(TikTokApi):
     def playlist(self, *args: Any, **kwargs: Any) -> Any:
         return self._owned_entity(Playlist, *args, **kwargs)
 
+    async def create_sessions(
+        self,
+        num_sessions: int = 5,
+        headless: bool = True,
+        ms_tokens: list[str] | None = None,
+        proxies: list | None = None,
+        sleep_after: int = 1,
+        starting_url: str = TIKTOK_URL,
+        context_options: dict | None = None,
+        override_browser_args: list | None = None,
+        cookies: list[dict] | None = None,
+        suppress_resource_load_types: list[str] | None = None,
+        browser: str = 'chromium',
+        executable_path: str | None = None,
+        timeout: int = 30000,
+        firefox_user_prefs: dict[str, Any] | None = None,
+        playwright: Any | None = None,
+    ) -> None:
+        '''
+        TikTokApi 7.1.0 launches Firefox with only ``headless``,
+        ``args``, ``proxy`` and ``executable_path``, so the
+        ``firefox_user_prefs`` Camoufox builds (WebGL, autoplay) never
+        reach the browser, and it starts a Playwright driver (a ~75 MiB
+        Node.js process) per instance. With *firefox_user_prefs* or a
+        shared *playwright* driver, launch Firefox here; otherwise
+        defer to TikTokApi. A shared driver is left running by
+        :meth:`stop_playwright`; its owner stops it.
+        '''
+        if browser != 'firefox' or (
+            firefox_user_prefs is None and playwright is None
+        ):
+            await super().create_sessions(
+                num_sessions=num_sessions,
+                headless=headless,
+                ms_tokens=ms_tokens,
+                proxies=proxies,
+                sleep_after=sleep_after,
+                starting_url=starting_url,
+                context_options=context_options or {},
+                override_browser_args=override_browser_args,
+                cookies=cookies,
+                suppress_resource_load_types=suppress_resource_load_types,
+                browser=browser,
+                executable_path=executable_path,
+                timeout=timeout,
+            )
+            return
+        self._shared_playwright = playwright is not None
+        self.playwright = (
+            playwright if playwright is not None
+            else await async_playwright().start()
+        )
+        self.browser = await self.playwright.firefox.launch(
+            headless=headless,
+            args=override_browser_args,
+            proxy=random_choice(proxies),
+            executable_path=executable_path,
+            firefox_user_prefs=firefox_user_prefs,
+        )
+        await asyncio.gather(
+            *(
+                self._TikTokApi__create_session(
+                    proxy=random_choice(proxies),
+                    ms_token=random_choice(ms_tokens),
+                    url=starting_url,
+                    context_options=context_options or {},
+                    sleep_after=sleep_after,
+                    cookies=random_choice(cookies),
+                    suppress_resource_load_types=(
+                        suppress_resource_load_types
+                    ),
+                    timeout=timeout,
+                )
+                for _ in range(num_sessions)
+            )
+        )
+
+    async def close_sessions(self) -> None:
+        '''Close every session, then the browser and, unless it is
+        shared, the Playwright driver.'''
+        for session in self.sessions:
+            await session.page.close()
+            await session.context.close()
+        self.sessions.clear()
+        await self.stop_playwright()
+
+    async def stop_playwright(self) -> None:
+        '''Close the browser and stop the Playwright driver unless it
+        was handed in shared. Safe to call more than once.'''
+        browser: Any | None = getattr(self, 'browser', None)
+        self.browser = None
+        if browser is not None:
+            await browser.close()
+        driver: Any | None = getattr(self, 'playwright', None)
+        self.playwright = None
+        if driver is not None and not self._shared_playwright:
+            await driver.stop()
+
     async def _TikTokApi__create_session(
         self,
-        url: str = 'https://www.tiktok.com',
+        url: str = TIKTOK_URL,
         ms_token: str | None = None,
         proxy: dict | None = None,
         context_options: dict | None = None,

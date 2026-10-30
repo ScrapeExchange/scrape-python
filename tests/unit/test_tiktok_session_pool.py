@@ -17,8 +17,14 @@ from scrape_exchange.tiktok.tiktok_rate_limiter import (
 from scrape_exchange.tiktok.tiktok_session_jar import (
     TikTokSessionJar,
 )
+from scrape_exchange.browser_memory import BrowserMemory
+from scrape_exchange.tiktok.tiktok_metrics import (
+    BROWSER_MEMORY_BYTES,
+    BROWSER_PROCESSES,
+)
 from scrape_exchange.tiktok.tiktok_session_pool import (
     DIRECT_SESSION_PROXY,
+    FIREFOX_MEMORY_PREFS,
     TikTokSessionPool,
     SessionUnavailable,
     _await_with_watchdog,
@@ -60,7 +66,7 @@ def _refresh_count(outcome: str) -> float:
 
 
 @contextlib.contextmanager
-def _patch_camoufox(apis: list):
+def _patch_camoufox(apis: list, launch_opts: dict | None = None):
     '''Patch the Camoufox layer so each CamoufoxTikTokApi() returns
     the next api from `apis` in order. Yields the apply_camoufox_env
     mock for env-lifecycle assertions.'''
@@ -70,7 +76,7 @@ def _patch_camoufox(apis: list):
         side_effect=lambda *a, **k: next(it),
     ), patch(
         f'{_CAMOUFOX_MOD}.camoufox_launch_options',
-        return_value={
+        return_value=launch_opts or {
             'executable_path': '/bin/camoufox',
             'args': [],
             'env': {'CAMOU_CONFIG_1': 'x'},
@@ -79,8 +85,17 @@ def _patch_camoufox(apis: list):
         with patch(
             'scrape_exchange.tiktok.tiktok_session_pool.'
             '_ensure_camoufox_runtime_libs',
+        ), patch(
+            'scrape_exchange.tiktok.tiktok_session_pool._start_playwright',
+            new=AsyncMock(side_effect=lambda: _make_driver()),
         ):
             yield env_mock
+
+
+def _make_driver() -> MagicMock:
+    driver: MagicMock = MagicMock()
+    driver.stop = AsyncMock()
+    return driver
 
 
 class TestCamoufoxRuntimeDeps(unittest.TestCase):
@@ -418,6 +433,256 @@ class TestBootstrap(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs['browser'], 'firefox')
         self.assertEqual(kwargs['timeout'], 123000)
         env_mock.assert_called()
+
+    async def test_bootstrap_omits_webgl_prefs_by_default(self) -> None:
+        launch_opts: dict = {
+            'executable_path': '/bin/camoufox',
+            'args': [],
+            'env': {},
+            'firefox_user_prefs': {'webgl.force-enabled': True},
+        }
+        apis: list = [_make_api()]
+        with _patch_camoufox(apis, launch_opts):
+            await self._pool(['http://p1.example:8080']).bootstrap()
+        self.assertEqual(
+            apis[0].create_sessions.call_args.kwargs['firefox_user_prefs'],
+            FIREFOX_MEMORY_PREFS,
+        )
+
+    async def test_bootstrap_merges_memory_prefs_over_camoufox(
+        self,
+    ) -> None:
+        launch_opts: dict = {
+            'executable_path': '/bin/camoufox',
+            'args': [],
+            'env': {},
+            'firefox_user_prefs': {
+                'webgl.force-enabled': True,
+                'dom.ipc.processCount': 16,
+            },
+        }
+        apis: list = [_make_api()]
+        with _patch_camoufox(apis, launch_opts):
+            await TikTokSessionPool(
+                proxies=['http://p1.example:8080'],
+                state_dir=self.state_dir,
+                ms_token_ttl_seconds=3600,
+                rate_limiter=self.rl,
+                scraper_label='test',
+                api_call_type=TikTokCallType.CREATOR_API,
+                browser_webgl=True,
+            ).bootstrap()
+        prefs: dict = (
+            apis[0].create_sessions.call_args.kwargs['firefox_user_prefs']
+        )
+        self.assertTrue(prefs['webgl.force-enabled'])
+        self.assertEqual(prefs['dom.ipc.processCount'], 16)
+        self.assertEqual(prefs['media.autoplay.default'], 5)
+        self.assertLessEqual(FIREFOX_MEMORY_PREFS.items(), prefs.items())
+
+    async def test_bootstrap_passes_suppressed_resource_types(
+        self,
+    ) -> None:
+        apis: list = [_make_api()]
+        with _patch_camoufox(apis):
+            pool: TikTokSessionPool = TikTokSessionPool(
+                proxies=['http://p1.example:8080'],
+                state_dir=self.state_dir,
+                ms_token_ttl_seconds=3600,
+                rate_limiter=self.rl,
+                scraper_label='test',
+                api_call_type=TikTokCallType.CREATOR_API,
+                suppress_resource_types=['media', 'font'],
+            )
+            await pool.bootstrap()
+        self.assertEqual(
+            apis[0].create_sessions.call_args.kwargs[
+                'suppress_resource_load_types'
+            ],
+            ['media', 'font'],
+        )
+
+    async def test_no_suppressed_types_passes_none(self) -> None:
+        apis: list = [_make_api()]
+        with _patch_camoufox(apis):
+            await self._pool(['http://p1.example:8080']).bootstrap()
+        self.assertIsNone(
+            apis[0].create_sessions.call_args.kwargs[
+                'suppress_resource_load_types'
+            ],
+        )
+
+    async def test_proxies_share_one_playwright_driver(self) -> None:
+        apis: list = [_make_api(), _make_api()]
+        with _patch_camoufox(apis):
+            pool = self._pool([
+                'http://p1.example:8080', 'http://p2.example:8080',
+            ])
+            await pool.bootstrap()
+            first = apis[0].create_sessions.call_args.kwargs['playwright']
+            second = apis[1].create_sessions.call_args.kwargs['playwright']
+            self.assertIs(first, second)
+            await pool.shutdown()
+        first.stop.assert_awaited_once()
+
+    async def test_driver_restarts_when_no_session_is_alive(self) -> None:
+        bad: MagicMock = _make_api()
+        bad.create_sessions = AsyncMock(side_effect=RuntimeError('dead'))
+        apis: list = [bad, _make_api()]
+        with _patch_camoufox(apis):
+            await self._pool([
+                'http://p1.example:8080', 'http://p2.example:8080',
+            ]).bootstrap()
+        first = bad.create_sessions.call_args.kwargs['playwright']
+        second = apis[1].create_sessions.call_args.kwargs['playwright']
+        self.assertIsNot(first, second)
+        first.stop.assert_awaited_once()
+
+    async def test_driver_kept_while_other_sessions_live(self) -> None:
+        apis: list = [_make_api(), _make_api(), _make_api()]
+        proxies: list[str] = [
+            'http://p1.example:8080', 'http://p2.example:8080',
+        ]
+        with _patch_camoufox(apis):
+            pool = self._pool(proxies)
+            await pool.bootstrap()
+            await pool.rebuild(proxies[0])
+        driver = apis[0].create_sessions.call_args.kwargs['playwright']
+        self.assertIs(
+            apis[2].create_sessions.call_args.kwargs['playwright'], driver,
+        )
+        driver.stop.assert_not_awaited()
+
+    def _aging_pool(
+        self, proxies: list[str], max_age: float,
+    ) -> TikTokSessionPool:
+        return TikTokSessionPool(
+            proxies=proxies,
+            state_dir=self.state_dir,
+            ms_token_ttl_seconds=3600,
+            rate_limiter=self.rl,
+            scraper_label='test',
+            api_call_type=TikTokCallType.CREATOR_API,
+            browser_max_age_seconds=max_age,
+        )
+
+    @staticmethod
+    def _age(pool: TikTokSessionPool, proxy: str, seconds: float) -> None:
+        pool._sessions[proxy].created_at -= seconds
+
+    async def test_recycle_replaces_old_browser_keeping_token(self) -> None:
+        proxy: str = 'http://p1.example:8080'
+        old: MagicMock = _make_api(token='tok')
+        new: MagicMock = _make_api(token='tok')
+        with _patch_camoufox([old, new]):
+            pool = self._aging_pool([proxy], max_age=100)
+            await pool.bootstrap()
+            self._age(pool, proxy, 1000)
+            await pool.refresh_tokens()
+        self.assertIs(pool._sessions[proxy].api, new)
+        self.assertEqual(
+            new.create_sessions.call_args.kwargs['ms_tokens'], ['tok'],
+        )
+        old.close_sessions.assert_awaited()
+        new.close_sessions.assert_not_awaited()
+        self.assertEqual(pool.ready_proxies(), [proxy])
+
+    async def test_young_browser_is_not_recycled(self) -> None:
+        apis: list = [_make_api(), _make_api()]
+        with _patch_camoufox(apis):
+            pool = self._aging_pool(['http://p1.example:8080'], max_age=100)
+            await pool.bootstrap()
+            await pool.refresh_tokens()
+        apis[1].create_sessions.assert_not_awaited()
+
+    async def test_one_age_recycle_per_pass_oldest_first(self) -> None:
+        proxies: list[str] = [
+            'http://p1.example:8080', 'http://p2.example:8080',
+        ]
+        apis: list = [_make_api(), _make_api(), _make_api()]
+        with _patch_camoufox(apis):
+            pool = self._aging_pool(proxies, max_age=100)
+            await pool.bootstrap()
+            self._age(pool, proxies[0], 1000)
+            self._age(pool, proxies[1], 5000)
+            await pool.refresh_tokens()
+        self.assertIs(pool._sessions[proxies[1]].api, apis[2])
+        self.assertIs(pool._sessions[proxies[0]].api, apis[0])
+
+    async def test_disconnected_browser_is_recycled(self) -> None:
+        proxy: str = 'http://p1.example:8080'
+        dead: MagicMock = _make_api()
+        dead.browser.is_connected = MagicMock(return_value=False)
+        fresh: MagicMock = _make_api()
+        with _patch_camoufox([dead, fresh]):
+            pool = self._aging_pool([proxy], max_age=0)
+            await pool.bootstrap()
+            await pool.refresh_tokens()
+        self.assertIs(pool._sessions[proxy].api, fresh)
+        dead.close_sessions.assert_awaited()
+
+    async def test_failed_recycle_keeps_old_browser(self) -> None:
+        proxy: str = 'http://p1.example:8080'
+        old: MagicMock = _make_api()
+        bad: MagicMock = _make_api()
+        bad.create_sessions = AsyncMock(side_effect=RuntimeError('boom'))
+        with _patch_camoufox([old, bad]):
+            pool = self._aging_pool([proxy], max_age=100)
+            await pool.bootstrap()
+            self._age(pool, proxy, 1000)
+            await pool.refresh_tokens()
+        self.assertIs(pool._sessions[proxy].api, old)
+        old.close_sessions.assert_not_awaited()
+        bad.close_sessions.assert_awaited()
+        self.assertEqual(pool.failed_proxies(), [])
+
+    async def test_quarantine_during_recycle_drops_new_browser(self) -> None:
+        proxy: str = 'http://p1.example:8080'
+        old: MagicMock = _make_api()
+        new: MagicMock = _make_api()
+        with _patch_camoufox([old, new]):
+            pool = self._aging_pool([proxy], max_age=100)
+            await pool.bootstrap()
+
+            async def _quarantine_then_launch(**_: object) -> None:
+                await pool.quarantine(proxy)
+
+            new.create_sessions = AsyncMock(
+                side_effect=_quarantine_then_launch,
+            )
+            self.assertFalse(await pool._recycle(proxy, 'age'))
+        self.assertNotIn(proxy, pool.ready_proxies())
+        new.close_sessions.assert_awaited()
+
+    async def test_bootstrap_records_browser_memory(self) -> None:
+        usage: BrowserMemory = BrowserMemory(
+            browser_bytes=300 * 1024 ** 2, browser_processes=2,
+            driver_bytes=60 * 1024 ** 2, driver_processes=1,
+        )
+        with _patch_camoufox([_make_api()]), patch(
+            'scrape_exchange.tiktok.tiktok_session_pool.browser_memory',
+            return_value=usage,
+        ):
+            await self._pool(['http://p1.example:8080']).bootstrap()
+        labels: dict[str, str] = {
+            'platform': 'tiktok', 'scraper': 'test', 'worker_id': '0',
+        }
+        self.assertEqual(
+            BROWSER_MEMORY_BYTES.labels(
+                kind='browser', **labels,
+            )._value.get(),
+            300 * 1024 ** 2,
+        )
+        self.assertEqual(
+            BROWSER_MEMORY_BYTES.labels(
+                kind='driver', **labels,
+            )._value.get(),
+            60 * 1024 ** 2,
+        )
+        self.assertEqual(
+            BROWSER_PROCESSES.labels(kind='browser', **labels)._value.get(),
+            2,
+        )
 
     async def test_bootstrap_is_rate_limited(self) -> None:
         proxy = 'http://p1.example:8080'

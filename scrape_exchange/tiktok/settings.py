@@ -88,6 +88,54 @@ class TikTokScraperSettings(ScraperSettings):
             'startup navigation before excluding the proxy.'
         ),
     )
+    suppress_resource_types: str = Field(
+        default='media',
+        validation_alias=AliasChoices(
+            'TIKTOK_SUPPRESS_RESOURCE_TYPES', 'suppress_resource_types',
+        ),
+        description=(
+            'Comma-separated Playwright resource types the TikTok '
+            'session pages never load, to save browser memory, e.g. '
+            '"media" or "media,font". Empty loads everything. '
+            'Blocking images is reported to trigger bot detection.'
+        ),
+    )
+
+    browser_webgl: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            'TIKTOK_BROWSER_WEBGL', 'browser_webgl',
+        ),
+        description=(
+            'Give TikTok session browsers working WebGL by applying '
+            "Camoufox's WebGL prefs. Without them WebGL is unavailable, "
+            'which bot detection may notice; with them each browser '
+            'uses roughly 75-140 MiB more memory.'
+        ),
+    )
+
+    browser_max_age_seconds: float = Field(
+        default=2700.0,
+        ge=0,
+        validation_alias=AliasChoices(
+            'TIKTOK_BROWSER_MAX_AGE', 'browser_max_age_seconds',
+        ),
+        description=(
+            'Replace a TikTok session browser once it is this many '
+            'seconds old (+/-10% jitter), keeping its ms_token, because '
+            'browsers grow from ~0.7 to ~1.5 GiB within an hour. Checked '
+            'on each ms_token refresh pass, one browser per pass. '
+            '0 disables.'
+        ),
+    )
+
+    @property
+    def suppress_resource_type_list(self) -> list[str]:
+        return [
+            kind.strip() for kind in self.suppress_resource_types.split(',')
+            if kind.strip()
+        ]
+
     bulk_batch_size: int = Field(
         default=1000,
         validation_alias=AliasChoices(

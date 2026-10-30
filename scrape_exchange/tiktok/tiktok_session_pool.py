@@ -29,7 +29,11 @@ import time
 from typing import Any, AsyncIterator
 from urllib.parse import urlparse
 
+from scrape_exchange.browser_memory import BrowserMemory, browser_memory
 from scrape_exchange.tiktok.tiktok_metrics import (
+    BROWSER_MEMORY_BYTES,
+    BROWSER_PROCESSES,
+    BROWSER_RECYCLE_TOTAL,
     MS_TOKEN_AGE_SECONDS,
     MS_TOKEN_REFRESH_TOTAL,
     SESSION_ACQUIRE_ACTIVE,
@@ -56,6 +60,16 @@ _REFRESH_URLS: list[str] = [
 ]
 
 _WATCHDOG_TOUCH_INTERVAL_SECONDS: float = 30.0
+
+# Firefox prefs for every session browser: no autoplay (5 = block
+# audio and video), so a session page never buffers feed videos even
+# when TIKTOK_SUPPRESS_RESOURCE_TYPES lets media load. Fission and
+# dom.ipc.processCount were measured to make no difference: under
+# Playwright each session's single tab runs in one content process
+# already.
+FIREFOX_MEMORY_PREFS: dict[str, int] = {
+    'media.autoplay.default': 5,
+}
 DIRECT_SESSION_PROXY: str = '__direct__'
 
 _CAMOUFOX_RUNTIME_LIBS: dict[str, str] = {
@@ -205,6 +219,12 @@ def _load_camoufox() -> tuple:
     )
 
 
+async def _start_playwright() -> Any:
+    '''Start a Playwright driver. Imported lazily, like Camoufox.'''
+    from playwright.async_api import async_playwright
+    return await async_playwright().start()
+
+
 class _BoundSession:
     '''One per-proxy api + its single session + a no-multiplex lock.'''
 
@@ -213,9 +233,22 @@ class _BoundSession:
     ) -> None:
         self.proxy: str = proxy
         self.proxy_key: str = _proxy_key(proxy)
+        self.lock: asyncio.Lock = asyncio.Lock()
+        self.replace(api, session)
+
+    def replace(self, api: Any, session: object) -> None:
+        '''Bind a (new) browser. Its age limit gets +/-10% jitter so
+        browsers launched together are not recycled together.'''
         self.api: Any = api
         self.session: object = session
-        self.lock: asyncio.Lock = asyncio.Lock()
+        self.created_at: float = time.monotonic()
+        self.age_jitter: float = random.uniform(0.9, 1.1)
+
+    def browser_alive(self) -> bool:
+        browser: Any | None = getattr(self.api, 'browser', None)
+        if browser is None:
+            return False
+        return bool(browser.is_connected())
 
 
 class TikTokSessionPool:
@@ -237,6 +270,9 @@ class TikTokSessionPool:
         worker_id: str = '0',
         refresh_fraction: float = 0.75,
         bootstrap_timeout_ms: int = 90_000,
+        suppress_resource_types: list[str] | None = None,
+        browser_webgl: bool = False,
+        browser_max_age_seconds: float = 0.0,
     ) -> None:
         self._configured_proxy_count: int = len(proxies)
         self._proxies: list[str] = (
@@ -250,6 +286,12 @@ class TikTokSessionPool:
         self._worker_id: str = worker_id
         self._refresh_fraction: float = refresh_fraction
         self._bootstrap_timeout_ms: int = bootstrap_timeout_ms
+        # None, not [], when empty: TikTokApi installs a route handler
+        # for any list, which would intercept every request for nothing.
+        self._suppress_resource_types: list[str] | None = (
+            list(suppress_resource_types)
+            if suppress_resource_types else None
+        )
         self._jar: TikTokSessionJar = TikTokSessionJar(
             state_dir=state_dir,
             ttl_seconds=ms_token_ttl_seconds,
@@ -259,6 +301,13 @@ class TikTokSessionPool:
         self._env_lock: asyncio.Lock = asyncio.Lock()
         self._sessions: dict[str, _BoundSession] = {}
         self._failed: set[str] = set()
+        self._browser_webgl: bool = browser_webgl
+        # Browsers grow from ~0.7 to ~1.5 GiB within an hour of
+        # scraping; recycle them past this age. 0 disables.
+        self._browser_max_age_seconds: float = browser_max_age_seconds
+        # One Playwright driver (a ~75 MiB Node.js process) shared by
+        # every browser of this worker instead of one per proxy.
+        self._playwright: Any | None = None
 
     def _set_pool_gauge(self, state: str, value: int) -> None:
         SESSION_POOL_SIZE.labels(
@@ -267,6 +316,59 @@ class TikTokSessionPool:
             state=state,
             worker_id=self._worker_id,
         ).set(value)
+
+    async def _driver(self) -> Any:
+        '''The worker's shared Playwright driver. Restarted when no
+        session is alive, so a crashed driver cannot fail every later
+        bootstrap and rebuild.'''
+        if self._playwright is not None and not self._sessions:
+            await self._stop_driver()
+        if self._playwright is None:
+            self._playwright = await _start_playwright()
+        return self._playwright
+
+    async def _stop_driver(self) -> None:
+        driver: Any | None = self._playwright
+        self._playwright = None
+        if driver is not None:
+            with contextlib.suppress(Exception):
+                await driver.stop()
+
+    def _firefox_prefs(self, opts: dict) -> dict[str, Any]:
+        '''Firefox prefs for one browser. Camoufox's own prefs are
+        only its WebGL ones (webgl.force-enabled, webgl.enable-webgl2):
+        without them WebGL is unavailable, with them a browser was
+        measured at 75-140 MiB more, so they are opt-in.'''
+        prefs: dict[str, Any] = {}
+        if self._browser_webgl:
+            prefs.update(opts.get('firefox_user_prefs') or {})
+        prefs.update(FIREFOX_MEMORY_PREFS)
+        return prefs
+
+    def _record_browser_memory(self) -> None:
+        '''Publish this worker's browser and driver memory.'''
+        usage: BrowserMemory | None = browser_memory()
+        if usage is None:
+            return
+        kind: str
+        bytes_: int
+        processes: int
+        for kind, bytes_, processes in (
+            ('browser', usage.browser_bytes, usage.browser_processes),
+            ('driver', usage.driver_bytes, usage.driver_processes),
+        ):
+            BROWSER_MEMORY_BYTES.labels(
+                platform='tiktok',
+                scraper=self._scraper_label,
+                kind=kind,
+                worker_id=self._worker_id,
+            ).set(bytes_)
+            BROWSER_PROCESSES.labels(
+                platform='tiktok',
+                scraper=self._scraper_label,
+                kind=kind,
+                worker_id=self._worker_id,
+            ).set(processes)
 
     async def bootstrap(self) -> None:
         '''
@@ -289,6 +391,7 @@ class TikTokSessionPool:
         self._set_pool_gauge('ready', len(self._sessions))
         self._set_pool_gauge('failed', len(self._failed))
         self._set_pool_gauge('bootstrapping', 0)
+        self._record_browser_memory()
         _LOGGER.info(
             'TikTok session pool bootstrap complete',
             extra={
@@ -298,7 +401,13 @@ class TikTokSessionPool:
             },
         )
 
-    async def _bootstrap_one(self, proxy: str, camoufox: tuple) -> None:
+    async def _launch(
+        self, proxy: str, camoufox: tuple,
+    ) -> tuple[Any, object, bool]:
+        '''Launch one browser + session for *proxy*, reusing the
+        proxy's stored ms_token when it has not expired. Returns the
+        api, its session and whether the token was reused; on failure
+        closes what it started and raises.'''
         (
             CamoufoxTikTokApi, apply_camoufox_env, camoufox_launch_options,
         ) = camoufox
@@ -306,14 +415,11 @@ class TikTokSessionPool:
         proxy_obj: dict[str, str] | None = _to_session_proxy(proxy)
         api: Any = None
         try:
-            _LOGGER.info(
-                'TikTok proxy bootstrap starting',
-                extra={'proxy_endpoint': proxy_key},
-            )
             await self._rate_limiter.acquire(
                 TikTokCallType.BOOTSTRAP, proxy=proxy,
             )
             async with self._env_lock:
+                driver: Any = await self._driver()
                 opts: dict = camoufox_launch_options(proxy_obj)
                 apply_camoufox_env(opts.get('env') or {})
                 api = CamoufoxTikTokApi()
@@ -336,6 +442,11 @@ class TikTokSessionPool:
                         browser='firefox',
                         executable_path=str(opts['executable_path']),
                         override_browser_args=opts.get('args'),
+                        firefox_user_prefs=self._firefox_prefs(opts),
+                        suppress_resource_load_types=(
+                            self._suppress_resource_types
+                        ),
+                        playwright=driver,
                         proxies=[proxy_obj],
                         ms_tokens=ms_tokens,
                         sleep_after=2,
@@ -349,21 +460,27 @@ class TikTokSessionPool:
                 raise RuntimeError(
                     'create_sessions produced no session',
                 )
-            session: object = sessions[0]
-            self._sessions[proxy] = _BoundSession(
-                proxy=proxy, api=api, session=session,
-            )
-            token: Any = getattr(session, 'ms_token', None)
-            if token:
-                self._jar.set_token(proxy_key, token)
-            _LOGGER.info(
-                'TikTok proxy bootstrap succeeded',
-                extra={
-                    'proxy_endpoint': proxy_key,
-                    'has_ms_token': bool(token),
-                    'reused_ms_token': bool(ms_tokens),
-                },
-            )
+        except Exception:
+            if api is not None:
+                await self._close_api(api)
+            raise
+        session: object = sessions[0]
+        token: Any = getattr(session, 'ms_token', None)
+        if token:
+            self._jar.set_token(proxy_key, token)
+        return api, session, bool(ms_tokens)
+
+    async def _bootstrap_one(self, proxy: str, camoufox: tuple) -> None:
+        proxy_key: str = _proxy_key(proxy)
+        _LOGGER.info(
+            'TikTok proxy bootstrap starting',
+            extra={'proxy_endpoint': proxy_key},
+        )
+        try:
+            api: Any
+            session: object
+            reused: bool
+            api, session, reused = await self._launch(proxy, camoufox)
         except Exception as exc:
             _LOGGER.exception(
                 'TikTok session bootstrap failed; excluding proxy',
@@ -373,8 +490,97 @@ class TikTokSessionPool:
                 },
             )
             self._failed.add(proxy)
-            if api is not None:
-                await self._close_api(api)
+            return
+        self._sessions[proxy] = _BoundSession(
+            proxy=proxy, api=api, session=session,
+        )
+        _LOGGER.info(
+            'TikTok proxy bootstrap succeeded',
+            extra={
+                'proxy_endpoint': proxy_key,
+                'has_ms_token': bool(getattr(session, 'ms_token', None)),
+                'reused_ms_token': reused,
+            },
+        )
+
+    async def _recycle(self, proxy: str, reason: str) -> bool:
+        '''Replace *proxy*'s browser without a gap: launch the new
+        browser while the old one keeps serving, swap it in under the
+        session lock (a worker mid-scrape finishes first), then close
+        the old one. The ms_token is kept: this is a healthy identity.
+        If the launch fails the old browser stays in service.'''
+        bound: _BoundSession | None = self._sessions.get(proxy)
+        if bound is None:
+            return False
+        _LOGGER.info(
+            'TikTok browser recycle starting',
+            extra={'proxy_endpoint': bound.proxy_key, 'reason': reason},
+        )
+        try:
+            api: Any
+            session: object
+            api, session, _ = await self._launch(proxy, _load_camoufox())
+        except Exception as exc:
+            _LOGGER.warning(
+                'TikTok browser recycle failed; keeping old browser',
+                extra={
+                    'proxy_endpoint': bound.proxy_key,
+                    'reason': reason,
+                    'error': str(exc),
+                },
+            )
+            self._record_recycle(reason, 'failure')
+            return False
+        if self._sessions.get(proxy) is not bound:
+            # Quarantined while the new browser launched.
+            await self._close_api(api)
+            return False
+        async with bound.lock:
+            old_api: Any = bound.api
+            bound.replace(api, session)
+        await self._close_api(old_api)
+        self._record_recycle(reason, 'success')
+        _LOGGER.info(
+            'TikTok browser recycle complete',
+            extra={'proxy_endpoint': bound.proxy_key, 'reason': reason},
+        )
+        return True
+
+    def _record_recycle(self, reason: str, outcome: str) -> None:
+        BROWSER_RECYCLE_TOTAL.labels(
+            platform='tiktok',
+            scraper=self._scraper_label,
+            reason=reason,
+            outcome=outcome,
+            worker_id=self._worker_id,
+        ).inc()
+
+    async def recycle_browsers(self) -> None:
+        '''Replace every browser that has disconnected, and the one
+        browser furthest past the age limit. One age recycle per call
+        keeps a launch-time cohort from all restarting at once.'''
+        bound: _BoundSession
+        for bound in list(self._sessions.values()):
+            if not bound.browser_alive():
+                _LOGGER.warning(
+                    'TikTok session browser disconnected',
+                    extra={'proxy_endpoint': bound.proxy_key},
+                )
+                await self._recycle(bound.proxy, 'disconnected')
+        if self._browser_max_age_seconds <= 0:
+            return
+        now: float = time.monotonic()
+        overdue: list[tuple[float, str]] = [
+            (
+                (now - b.created_at)
+                - self._browser_max_age_seconds * b.age_jitter,
+                b.proxy,
+            )
+            for b in self._sessions.values()
+        ]
+        overdue = [item for item in overdue if item[0] >= 0]
+        if overdue:
+            await self._recycle(max(overdue)[1], 'age')
 
     @staticmethod
     async def _close_api(api: Any) -> None:
@@ -412,6 +618,7 @@ class TikTokSessionPool:
         rebuilt: bool = proxy in self._sessions
         self._set_pool_gauge('ready', len(self._sessions))
         self._set_pool_gauge('failed', len(self._failed))
+        self._record_browser_memory()
         _LOGGER.info(
             'TikTok proxy session rebuild complete',
             extra={
@@ -450,6 +657,7 @@ class TikTokSessionPool:
         self._jar.flush()
         self._set_pool_gauge('ready', len(self._sessions))
         self._set_pool_gauge('failed', len(self._failed))
+        self._record_browser_memory()
         _LOGGER.info(
             'TikTok proxy session quarantine complete',
             extra={
@@ -536,10 +744,14 @@ class TikTokSessionPool:
         One refresh pass over every ready proxy. Each proxy is
         handled independently; a failure on one is recorded and
         does not abort the others. Persists the jar once at the end.
+        Starts with :meth:`recycle_browsers`, so dead and over-age
+        browsers are replaced on the same cadence.
         '''
+        await self.recycle_browsers()
         for proxy in list(self._sessions):
             await self._refresh_one(proxy)
         self._jar.flush()
+        self._record_browser_memory()
 
     async def _refresh_one(self, proxy: str) -> None:
         '''
@@ -625,4 +837,5 @@ class TikTokSessionPool:
     async def shutdown(self) -> None:
         for bound in list(self._sessions.values()):
             await self._close_api(bound.api)
+        await self._stop_driver()
         self._jar.flush()

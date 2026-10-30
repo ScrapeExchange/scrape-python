@@ -53,6 +53,28 @@ persisted Chromium profile, and an `ms_token` stored under
 `TIKTOK_SESSION_STATE_DIR`. Scrapers run API calls through the page's
 main world so requests carry the current session state.
 
+Each browser runs with `FIREFOX_MEMORY_PREFS` from
+`scrape_exchange/tiktok/tiktok_session_pool.py` (no autoplay), and
+with Camoufox's WebGL prefs only when `TIKTOK_BROWSER_WEBGL=true`:
+WebGL is otherwise unavailable, but enabling it costs roughly
+75-140 MiB per browser. All sessions of a worker share one Playwright
+driver.
+
+A browser uses about 700 MiB after bootstrap and grows to about
+1.5 GiB within an hour of scraping. Each `ms_token` refresh pass
+replaces the browser furthest past `TIKTOK_BROWSER_MAX_AGE` (default
+2700 s, +/-10% jitter, one per pass) and any browser that has
+disconnected. The replacement launches with the same `ms_token`
+before the old browser closes, so the proxy's worker only waits for
+the swap. Replacements are counted in
+`tiktok_browser_recycle_total{reason="age"|"disconnected"}`.
+Session pages skip
+the resource types in `TIKTOK_SUPPRESS_RESOURCE_TYPES` (default
+`media`). The pool publishes each worker's browser memory (PSS) as
+`tiktok_browser_memory_bytes{kind="browser"|"driver"}` and the
+process counts as `tiktok_browser_processes`, after bootstrap and on
+every `ms_token` refresh pass (Linux only).
+
 Session startup and token refresh are rate-limited separately from
 creator and video API calls. `TikTokRateLimiter` has per-proxy
 buckets for:
