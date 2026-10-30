@@ -22,13 +22,6 @@ from pydantic_settings import (
     SettingsConfigDict,
 )
 
-from scrape_exchange.video_backlog import (
-    STATE_HOT,
-    STATE_QUEUED,
-    MongoVideoBacklog,
-    backlog_document,
-)
-
 KEY_PREFIX: str = 'youtube:video'
 
 # TTL applied to a video's sparse meta hash when it is marked with
@@ -238,55 +231,6 @@ end
 return false
 '''
 
-# With a MongoDB backlog, forced videos jump the Redis hot window:
-# their score is pushed this far into the past (~50 years), ahead
-# of every enqueue timestamp, while forced videos keep their
-# relative order.
-FORCE_PRIORITY_SECONDS: int = 50 * 365 * 24 * 3600
-
-# Backlog mode: drop a video from the hot window when it reaches a
-# terminal state; MongoDB records the state.
-_RELEASE_LUA: str = '''
--- KEYS[1] = qmeta bucket
--- KEYS[2] = meta hash
--- KEYS[3] = queue key
--- ARGV[1] = video_id, ARGV[2] = state, ARGV[3] = meta TTL
-local vid = ARGV[1]
-redis.call('ZREM', KEYS[3], vid)
-redis.call('HDEL', KEYS[1], vid)
-if redis.call('EXISTS', KEYS[2]) == 1 then
-    redis.call('HSET', KEYS[2], 'state', ARGV[2])
-    local ttl = tonumber(ARGV[3])
-    if ttl ~= nil and ttl > 0 then
-        redis.call('EXPIRE', KEYS[2], ttl)
-    end
-end
-return 1
-'''
-
-# Backlog mode: put a forced video at the front of the hot window
-# (ZADD LT moves a waiting video forward, never back) and arm the
-# one-shot force flag.
-_FORCE_HOT_LUA: str = _LUA_MERGE + '''
--- KEYS[1] = queue key
--- KEYS[2] = qmeta bucket
--- KEYS[3] = meta hash
--- ARGV[1] = video_id, ARGV[2] = score, ARGV[3] = source
--- ARGV[4] = channel_id, ARGV[5] = channel_handle
--- ARGV[6] = channel_is_verified, ARGV[7] = packed backlog entry
-local vid = ARGV[1]
-redis.call('ZADD', KEYS[1], 'LT', ARGV[2], vid)
-local cur = redis.call('HGET', KEYS[2], vid)
-if not cur and ARGV[7] ~= '' then cur = ARGV[7] end
-redis.call('HSET', KEYS[2], vid, merge(
-    cur, ARGV[3], ARGV[4], ARGV[5], ARGV[6]
-))
-redis.call('PERSIST', KEYS[3])
-redis.call('HDEL', KEYS[3], 'state')
-redis.call('HSET', KEYS[3], 'force', '1')
-return 1
-'''
-
 _POP_LUA: str = '''
 -- KEYS: queue_key
 -- ARGV: batch
@@ -329,7 +273,7 @@ class VideoQueueChannelContext:
     channel_is_verified: bool | None = None
 
 
-# Videos per MongoDB insert_many in enqueue_many.
+# Videos per backlog-server batch in enqueue_many.
 ENQUEUE_MANY_CHUNK_SIZE: int = 1_000
 
 
@@ -363,16 +307,6 @@ class VideoScrapeQueueSettings(BaseSettings):
     video_transient_backoff_seconds: int = Field(
         default=30,
     )
-    mongo_dsn: str | None = Field(
-        default=None,
-        validation_alias=AliasChoices('MONGO_DSN', 'mongo_dsn'),
-        description=(
-            'MongoDB connection URL for the video backlog. When set, '
-            'MongoDB holds every known video and Redis only the hot '
-            'window that tools/yt_video_queue_refill.py keeps filled; '
-            'when unset the queue lives entirely in Redis.'
-        ),
-    )
     backlog_server_dsn: str | None = Field(
         default=None,
         validation_alias=AliasChoices(
@@ -381,8 +315,7 @@ class VideoScrapeQueueSettings(BaseSettings):
         description=(
             'Redis-protocol URL of backlog-server, e.g. '
             'redis://:<password>@<host>:6390/0. When set, the YouTube '
-            'video queue lives in backlog-server instead of Redis and '
-            'MongoDB.'
+            'video queue lives in backlog-server instead of Redis.'
         ),
     )
 
@@ -480,13 +413,7 @@ class RedisVideoScrapeQueue(VideoScrapeQueue):
     - ``meta:<video_id>``: sparse hash for force, retry and
       retained terminal diagnostics.
     - ``unavailable`` / ``failed`` / ``removed``: terminal
-      tombstone hashes (Redis-only mode).
-
-    With a MongoDB *backlog* (``MONGO_DSN``), MongoDB is the source
-    of truth for every known video and its terminal state. Producers
-    add to MongoDB, the refill service copies the oldest queued
-    videos into the Redis keys above, and the scrapers pop from
-    Redis as before.
+      tombstone hashes.
     '''
 
     def __init__(
@@ -494,7 +421,6 @@ class RedisVideoScrapeQueue(VideoScrapeQueue):
         redis: aioredis.Redis,
         settings: VideoScrapeQueueSettings,
         platform: str = 'youtube',
-        backlog: MongoVideoBacklog | None = None,
     ) -> None:
         if not platform:
             raise ValueError('empty platform')
@@ -503,16 +429,6 @@ class RedisVideoScrapeQueue(VideoScrapeQueue):
             settings
         )
         self._key_prefix: str = f'{platform}:video'
-        if backlog is None and settings.mongo_dsn:
-            backlog = MongoVideoBacklog.from_dsn(
-                settings.mongo_dsn, platform=platform,
-            )
-        self._backlog: MongoVideoBacklog | None = backlog
-
-    @property
-    def backlog(self) -> MongoVideoBacklog | None:
-        '''The MongoDB backlog, or None in Redis-only mode.'''
-        return self._backlog
 
     def _k_queue(self) -> str:
         return f'{self._key_prefix}:queue'
@@ -626,12 +542,6 @@ class RedisVideoScrapeQueue(VideoScrapeQueue):
         not stored; it is derivable from the handle or ID.'''
         if not video_id:
             raise ValueError('empty video_id')
-        if self._backlog is not None:
-            return await self._backlog.add(
-                video_id, source=source, channel_id=channel_id,
-                channel_handle=channel_handle,
-                channel_is_verified=channel_is_verified,
-            )
         now: float = time.time()
         added: int = int(await self._redis.eval(
             _ENQUEUE_LUA, 6,
@@ -662,11 +572,8 @@ class RedisVideoScrapeQueue(VideoScrapeQueue):
     ) -> int:
         '''Queue every ID in *video_ids* that is not already known,
         with the same semantics as :meth:`enqueue` per ID.
-
-        With a MongoDB backlog the IDs are inserted *chunk_size* at a
-        time with one unordered ``insert_many`` each (duplicates are
-        skipped), instead of one ``insert_one`` round trip per video.
-        Redis-only mode falls back to :meth:`enqueue` per ID.
+        *chunk_size* is validated for parity with the backlog-server
+        queue; Redis queues each ID with its own :meth:`enqueue`.
 
         :returns: number of IDs newly queued.
         '''
@@ -676,28 +583,13 @@ class RedisVideoScrapeQueue(VideoScrapeQueue):
             raise ValueError('chunk_size must be positive')
         added: int = 0
         video_id: str
-        if self._backlog is None:
-            for video_id in video_ids:
-                if await self.enqueue(
-                    video_id, source=source, channel_id=channel_id,
-                    channel_handle=channel_handle,
-                    channel_is_verified=channel_is_verified,
-                ):
-                    added += 1
-            return added
-        now: float = time.time()
-        start: int
-        for start in range(0, len(video_ids), chunk_size):
-            docs: list[dict[str, Any]] = [
-                backlog_document(
-                    video_id, state=STATE_QUEUED, enqueued_at=now,
-                    source=source, channel_id=channel_id,
-                    channel_handle=channel_handle,
-                    channel_is_verified=channel_is_verified,
-                )
-                for video_id in video_ids[start:start + chunk_size]
-            ]
-            added += await self._backlog.add_many(docs)
+        for video_id in video_ids:
+            if await self.enqueue(
+                video_id, source=source, channel_id=channel_id,
+                channel_handle=channel_handle,
+                channel_is_verified=channel_is_verified,
+            ):
+                added += 1
         return added
 
     async def force_enqueue(
@@ -723,12 +615,6 @@ class RedisVideoScrapeQueue(VideoScrapeQueue):
         if not video_id:
             raise ValueError('empty video_id')
         now: int = int(time.time())
-        if self._backlog is not None:
-            return await self._force_hot(
-                video_id, source=source, channel_id=channel_id,
-                channel_handle=channel_handle,
-                channel_is_verified=channel_is_verified, now=now,
-            )
         base: str = await self._terminal_base(video_id)
         result: Any = await self._redis.eval(
             _FORCE_ENQUEUE_LUA, 6,
@@ -747,52 +633,6 @@ class RedisVideoScrapeQueue(VideoScrapeQueue):
         if isinstance(result, bytes):
             return result.decode()
         return str(result)
-
-    async def _force_hot(
-        self,
-        video_id: str,
-        *,
-        source: str,
-        channel_id: str | None,
-        channel_handle: str | None,
-        channel_is_verified: bool | None,
-        now: int,
-    ) -> str:
-        '''Backlog-mode force: mark the video hot in MongoDB and put
-        it at the front of the Redis hot window.'''
-        assert self._backlog is not None
-        before: dict[str, Any] | None = await self._backlog.force(
-            video_id, source=source, channel_id=channel_id,
-            channel_handle=channel_handle,
-            channel_is_verified=channel_is_verified, now=now,
-        )
-        base: str = ''
-        if before is not None:
-            base = pack_qmeta(
-                source=before.get('source') or '',
-                channel_id=before.get('channel_id'),
-                channel_handle=before.get('channel_handle'),
-                channel_is_verified=before.get('channel_is_verified'),
-            )
-        await self._redis.eval(
-            _FORCE_HOT_LUA, 3,
-            self._k_queue(),
-            self._k_qmeta(video_id),
-            self._k_meta(video_id),
-            video_id,
-            str(now - FORCE_PRIORITY_SECONDS),
-            _clean(source),
-            _clean(channel_id),
-            _clean(channel_handle),
-            self._redis_bool(channel_is_verified),
-            base,
-        )
-        prior: str | None = (before or {}).get('state')
-        if prior in VideoState.terminal_states_values():
-            return 'revived'
-        if prior in (STATE_QUEUED, STATE_HOT):
-            return 'forced_pending'
-        return 'added'
 
     async def consume_force(self, video_id: str) -> bool:
         '''Atomically read-and-clear the ``force`` meta flag.
@@ -854,13 +694,10 @@ class RedisVideoScrapeQueue(VideoScrapeQueue):
         for s in VideoState.terminal_states():
             pipe.hdel(self._k_state(s), video_id)
         await pipe.execute()
-        if self._backlog is not None:
-            await self._backlog.delete(video_id)
 
     async def flush(self) -> None:
-        '''Send buffered backlog deletes. Call before shutting down.'''
-        if self._backlog is not None:
-            await self._backlog.flush_deletes()
+        '''Nothing is buffered in Redis; kept for parity with the
+        backlog-server queue, which callers flush on shutdown.'''
 
     async def mark(
         self, video_id: str, *,
@@ -889,32 +726,6 @@ class RedisVideoScrapeQueue(VideoScrapeQueue):
         ):
             if meta.get(field):
                 record[field] = meta[field]
-        if self._backlog is not None:
-            await self._redis.eval(
-                _RELEASE_LUA, 3,
-                self._k_qmeta(video_id),
-                self._k_meta(video_id),
-                self._k_queue(),
-                video_id, state.value,
-                str(TERMINAL_META_TTL_SECONDS),
-            )
-            await self._backlog.mark(
-                video_id, state=state.value,
-                record={
-                    'ts': record['ts'],
-                    'last_error': last_error,
-                    'note': note,
-                },
-                context={
-                    'source': meta.get('source'),
-                    'channel_id': meta.get('channel_id'),
-                    'channel_handle': meta.get('channel_handle'),
-                    'channel_is_verified': self._parse_redis_bool(
-                        meta.get('channel_is_verified'),
-                    ),
-                },
-            )
-            return
         await self._redis.eval(
             _MARK_LUA, 7,
             self._k_qmeta(video_id),
@@ -927,15 +738,6 @@ class RedisVideoScrapeQueue(VideoScrapeQueue):
         )
 
     async def unmark(self, video_id: str) -> None:
-        if self._backlog is not None:
-            await self._backlog.requeue(video_id)
-            pipe: aioredis.client.Pipeline = (
-                self._redis.pipeline(transaction=True)
-            )
-            pipe.hdel(self._k_meta(video_id), 'state', 'force')
-            pipe.persist(self._k_meta(video_id))
-            await pipe.execute()
-            return
         base: str = await self._terminal_base(video_id)
         await self._redis.eval(
             _UNMARK_LUA, 6,
@@ -980,8 +782,6 @@ class RedisVideoScrapeQueue(VideoScrapeQueue):
         out: dict[str, VideoState | None] = {}
         if not video_ids:
             return out
-        if self._backlog is not None:
-            return await self._get_states_backlog(video_ids)
         pipe: aioredis.client.Pipeline = (
             self._redis.pipeline(transaction=False)
         )
@@ -1004,30 +804,6 @@ class RedisVideoScrapeQueue(VideoScrapeQueue):
                 out[video_id] = None
         return out
 
-    async def _get_states_backlog(
-        self, video_ids: list[str],
-    ) -> dict[str, VideoState | None]:
-        '''Hot-window membership from Redis, everything else from
-        the MongoDB backlog.'''
-        assert self._backlog is not None
-        pipe: aioredis.client.Pipeline = (
-            self._redis.pipeline(transaction=False)
-        )
-        video_id: str
-        for video_id in video_ids:
-            pipe.hexists(self._k_qmeta(video_id), video_id)
-        hot: list[bool] = await pipe.execute()
-        out: dict[str, VideoState | None] = {
-            video_id: VideoState.QUEUED
-            for video_id, in_redis in zip(video_ids, hot) if in_redis
-        }
-        rest: list[str] = [v for v in video_ids if v not in out]
-        states: dict[str, str | None] = await self._backlog.states(rest)
-        state: str | None
-        for video_id, state in states.items():
-            out[video_id] = _backlog_state(state)
-        return out
-
     async def get_meta(
         self, video_id: str,
     ) -> dict[str, str]:
@@ -1043,16 +819,6 @@ class RedisVideoScrapeQueue(VideoScrapeQueue):
                 )
                 if score is not None:
                     meta['created_at'] = str(int(score))
-            if self._backlog is None or meta.get('state') == 'queued':
-                return meta
-        if self._backlog is not None:
-            doc: dict[str, Any] | None = await self._backlog.get(
-                video_id,
-            )
-            if doc is not None:
-                # The document (state, terminal record) is newer than
-                # any retained retry diagnostics.
-                return {**meta, **_doc_meta(doc)}
             return meta
         state: VideoState | None = await self.get_state(video_id)
         return {'state': state.value} if state is not None else {}
@@ -1069,11 +835,6 @@ class RedisVideoScrapeQueue(VideoScrapeQueue):
     async def count_by_state(
         self,
     ) -> dict[VideoState, int]:
-        if self._backlog is not None:
-            counts: dict[str, int] = await self._backlog.counts()
-            return {
-                state: counts.get(state.value, 0) for state in VideoState
-            }
         pipe: aioredis.client.Pipeline = (
             self._redis.pipeline(transaction=False)
         )
@@ -1161,24 +922,11 @@ class RedisVideoScrapeQueue(VideoScrapeQueue):
                 vid = key.split(':meta:', 1)[1]
                 if await self._redis.hexists(self._k_qmeta(vid), vid):
                     continue
-                if self._backlog is not None:
-                    # Reported with its backlog document below.
-                    continue
                 meta: dict[str, str] = await self._redis.hgetall(key)
                 if meta:
                     yield {'video_id': vid, **meta}
             if cursor == 0:
                 break
-        if self._backlog is None:
-            return
-        doc: dict[str, Any]
-        async for doc in self._backlog.iter_documents(
-            exclude_state=STATE_HOT,
-        ):
-            sparse: dict[str, str] = await self._redis.hgetall(
-                self._k_meta(doc['_id']),
-            )
-            yield {'video_id': doc['_id'], **sparse, **_doc_meta(doc)}
 
 
 def qmeta_bucket(video_id: str) -> int:
@@ -1223,36 +971,3 @@ def unpack_qmeta(packed: str) -> dict[str, str]:
         name: value for name, value in zip(names, parts) if value
     }
 
-
-def _backlog_state(state: str | None) -> VideoState | None:
-    '''Map a backlog document state onto the queue's states.'''
-    if state is None:
-        return None
-    if state in (STATE_QUEUED, STATE_HOT):
-        return VideoState.QUEUED
-    try:
-        return VideoState(state)
-    except ValueError:
-        return None
-
-
-def _doc_meta(doc: dict[str, Any]) -> dict[str, str]:
-    '''Flatten a backlog document into the queue's meta view.'''
-    state: VideoState | None = _backlog_state(doc.get('state'))
-    meta: dict[str, str] = {}
-    if state is not None:
-        meta['state'] = state.value
-    key: str
-    for key in ('source', 'channel_id', 'channel_handle'):
-        if doc.get(key):
-            meta[key] = str(doc[key])
-    verified: Any = doc.get('channel_is_verified')
-    if verified is not None:
-        meta['channel_is_verified'] = '1' if verified else '0'
-    if doc.get('enqueued_at') is not None:
-        meta['created_at'] = str(int(doc['enqueued_at']))
-    record: dict[str, Any] = doc.get('record') or {}
-    for key in ('last_error', 'note'):
-        if record.get(key):
-            meta[key] = str(record[key])
-    return meta

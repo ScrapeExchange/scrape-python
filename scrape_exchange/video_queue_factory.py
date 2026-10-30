@@ -1,8 +1,8 @@
 '''Pick the video scrape queue backend for a platform.
 
 The YouTube video queue lives in backlog-server when
-``BACKLOG_SERVER_DSN`` is set; every other case keeps the Redis
-(and optional MongoDB backlog) implementation.
+``BACKLOG_SERVER_DSN`` is set; every other case uses the Redis
+implementation.
 '''
 
 import asyncio

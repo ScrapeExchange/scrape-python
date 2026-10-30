@@ -130,29 +130,6 @@ services:
 #    command:
 #      - --redis.addr=redis://:topsecret@redis:6379
 
-# Uncomment the mongodb section to run a MongoDB server on your host for
-# the video scrape queue backlog (MONGO_DSN). The root user is created
-# on the first start, when /var/tmp/scrape-mongodb is still empty.
-# mongo:8.x refuses to start on Linux kernels 6.19 and newer
-# (SERVER-121912); mongo:7 does not have that restriction.
-#  mongodb:
-#    container_name: "mongodb"
-#    image: "mongo:7"
-#    ports:
-#      - 27017:27017/tcp
-#    restart: "unless-stopped"
-#    environment:
-#      - MONGO_INITDB_ROOT_USERNAME=root
-#      - MONGO_INITDB_ROOT_PASSWORD=<changeme>    # not committed
-#    volumes:
-#      - type: bind
-#        source: /var/tmp/scrape-mongodb
-#        target: /data/db
-#        bind:
-#          create_host_path: true
-#    command: ["mongod", "--wiredTigerCacheSizeGB", "4",
-#              "--maxConns", "1000"]
-
   yt-video:
     <<: *scraper-common
     command: ["tools/yt_video_scrape.py"]
@@ -211,14 +188,6 @@ services:
         target: /data/discovery
         bind:
           create_host_path: false
-
-  # Keeps the Redis hot window of the video queue filled from the
-  # MongoDB backlog (needs MONGO_DSN). Run on exactly one host.
-  yt-video-queue-refill:
-    <<: *scraper-common
-    profiles: ["refill"]
-    command: ["tools/yt_video_queue_refill.py", "--platform", "youtube"]
-    container_name: yt-video-queue-refill
 
   tt-creator:
     <<: *scraper-common

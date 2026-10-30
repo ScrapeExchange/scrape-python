@@ -1516,21 +1516,6 @@ class TestCreatorShortUrlSettings(unittest.TestCase):
 
 
 
-class TestBuildVideoQueue(unittest.TestCase):
-    '''TikTok video queues must never touch MongoDB.'''
-
-    def test_queue_ignores_mongo_dsn(self) -> None:
-        with (
-            patch.dict(
-                os.environ,
-                {'MONGO_DSN': 'mongodb://user:pw@mongo:27017/q'},
-            ),
-            patch.object(tool, 'redis_from_url', MagicMock()),
-        ):
-            queue = tool._build_video_queue(_settings())
-        self.assertIsNone(queue._backlog)
-
-
 # ---------------------------------------------------------------
 # _load_profile_page / _install_page_capture instrumentation
 # ---------------------------------------------------------------
