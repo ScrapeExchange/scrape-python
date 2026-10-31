@@ -19,6 +19,18 @@ than silently mis-classifying.
 
 
 _ERROR_PATTERNS: list[tuple[str, list[str]]] = [
+    # TikTok user-detail statuses that belong to the account, not the
+    # session: the same code comes back from any proxy and session.
+    # 10221 (banned), 10202 (does not exist), 209002 (unavailable;
+    # meaning unconfirmed). Checked before rate_limit, whose
+    # 'invalid tiktok user detail response' would otherwise claim
+    # them, open the bot-detection circuit and retry the creator.
+    # The trailing space anchors the code in 'status=<code> missing='.
+    ('unavailable', [
+        'status=10221 ',
+        'status=10202 ',
+        'status=209002 ',
+    ]),
     ('rate_limit', [
         'emptyresponseexception',
         'tiktok bot detection',

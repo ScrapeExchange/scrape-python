@@ -435,6 +435,19 @@ class TestHandleFailure(unittest.IsolatedAsyncioTestCase):
             1800,
         )
 
+    async def test_banned_account_is_removed(self) -> None:
+        q: MagicMock = self._queue()
+        s: MagicMock = _settings()
+        reason: str = await tool._handle_failure(
+            tool.TikTokProfileResponseError(
+                {'statusCode': 10221}, 'empty userInfo payload',
+            ),
+            'u', q, s,
+        )
+        self.assertEqual(reason, 'unavailable')
+        q.remove.assert_awaited_once_with('u')
+        q.release.assert_not_awaited()
+
     async def test_unavailable_removes(self) -> None:
         q: MagicMock = self._queue()
         s: MagicMock = _settings()
@@ -495,6 +508,21 @@ class TestScrapeOne(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             tool.classify_tiktok_error(ctx.exception),
             'rate_limit',
+        )
+
+    async def test_banned_account_status_is_unavailable(self) -> None:
+        detail: dict = {'statusCode': 10221, 'statusMsg': ''}
+        with patch.object(
+            tool, '_load_profile_page',
+            AsyncMock(return_value=self._page(detail)),
+        ), self.assertRaises(
+            tool.TikTokProfileResponseError,
+        ) as ctx:
+            await tool._scrape_one(MagicMock(), 'banned', _settings())
+
+        self.assertEqual(
+            tool.classify_tiktok_error(ctx.exception),
+            'unavailable',
         )
 
     async def test_empty_user_info_is_rate_limit(self) -> None:
@@ -1035,6 +1063,45 @@ class TestProxyWorker(unittest.IsolatedAsyncioTestCase):
 
         pool.quarantine.assert_awaited_once_with('http://p:8080')
         pool.rebuild.assert_awaited_once_with('http://p:8080')
+
+    async def test_unavailable_never_opens_circuit(self) -> None:
+        shutdown = asyncio.Event()
+        claims = iter([
+            [('a', 'a', 0.0)], [('b', 'b', 0.0)], [('c', 'c', 0.0)],
+        ])
+
+        async def _claim(*_args: object, **_kwargs: object) -> list:
+            try:
+                return next(claims)
+            except StopIteration:
+                shutdown.set()
+                return []
+
+        q: MagicMock = MagicMock()
+        q.claim_batch = AsyncMock(side_effect=_claim)
+        q.next_due_time = AsyncMock(return_value=None)
+        pool = MagicMock()
+        pool.quarantine = AsyncMock()
+        pool.rebuild = AsyncMock(return_value=True)
+
+        async def _fake_process(*_args: object) -> str:
+            return 'unavailable'
+
+        async def _sleep(_seconds: float) -> None:
+            shutdown.set()
+
+        with patch.object(tool, 'Watchdog'), patch.object(
+            tool, '_process_creator', _fake_process,
+        ), patch.object(tool.asyncio, 'sleep', _sleep):
+            await tool._proxy_worker(
+                'http://p:8080', pool, q, MagicMock(),
+                MagicMock(), _settings(creator_bot_failure_threshold=1),
+                shutdown, '0', MagicMock(),
+            )
+
+        self.assertGreaterEqual(q.claim_batch.await_count, 3)
+        pool.quarantine.assert_not_awaited()
+        pool.rebuild.assert_not_awaited()
 
     async def test_success_resets_bot_failure_count(self) -> None:
         q: MagicMock = MagicMock()

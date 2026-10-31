@@ -625,10 +625,11 @@ async def _handle_failure(
     proxy_endpoint: str | None = None,
 ) -> str:
     '''
-    Classify *exc* and act: unavailable creators are removed from the
-    queue (so they stop re-enqueuing); transient/rate-limit/auth
-    errors are released with a retry floor; everything else is
-    released at the normal tier interval. Returns the reason.
+    Classify *exc* and act: unavailable creators (including banned or
+    missing accounts) are removed from the queue (so they stop
+    re-enqueuing); transient/rate-limit/auth errors are released with
+    a retry floor; everything else is released at the normal tier
+    interval. Returns the reason.
     '''
     reason: str = classify_tiktok_error(exc)
     if reason == 'unavailable':

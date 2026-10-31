@@ -13,6 +13,30 @@ from scrape_exchange.tiktok.tiktok_error_classification import (
 
 class TestClassifier(unittest.TestCase):
 
+    def test_account_statuses_are_unavailable(self) -> None:
+        status: str
+        for status in ('10221', '10202', '209002'):
+            with self.subTest(status=status):
+                self.assertEqual(
+                    classify_tiktok_error(Exception(
+                        'invalid TikTok user detail response: '
+                        f"status={status} missing='empty userInfo payload'",
+                    )),
+                    'unavailable',
+                )
+
+    def test_other_user_detail_statuses_stay_rate_limit(self) -> None:
+        status: str
+        for status in ('10201', '102210', '0'):
+            with self.subTest(status=status):
+                self.assertEqual(
+                    classify_tiktok_error(Exception(
+                        'invalid TikTok user detail response: '
+                        f"status={status} missing='user'",
+                    )),
+                    'rate_limit',
+                )
+
     def test_rate_limit_via_empty_response(self) -> None:
         self.assertEqual(
             classify_tiktok_error(

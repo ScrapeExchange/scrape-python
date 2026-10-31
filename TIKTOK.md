@@ -175,7 +175,10 @@ re-tiered after their first successful profile scrape.
 
 Creator failures are classified by `classify_tiktok_error()`:
 
-- `unavailable` creators are removed from the queue.
+- `unavailable` creators are removed from the queue. This includes
+  accounts TikTok reports as banned, missing or unavailable
+  (user-detail status 10221, 10202 or 209002), which do not feed the
+  bot-detection circuit.
 - `transient`, `auth`, and `rate_limit` failures are released with a
   retry floor and jitter.
 - Other failures are released at the normal tier interval.
