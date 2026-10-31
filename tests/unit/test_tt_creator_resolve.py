@@ -40,6 +40,7 @@ class _FakeVideo:
         self.author_id: str | None = author.get('id')
         self.sec_uid: str = author.get('secUid', '')
         self.author_nickname: str | None = author.get('nickname')
+        self.author_stats: dict[str, int] = item.get('authorStats', {})
 
     @classmethod
     def from_api(cls, payload: dict) -> _FakeVideo:
@@ -48,8 +49,9 @@ class _FakeVideo:
         return cls(payload)
 
 
-def _item() -> dict:
-    return {
+def _item(followers: int | None = 250_000) -> dict:
+    '''A video item; *followers* omitted means the page reported none.'''
+    item: dict[str, Any] = {
         'id': '7691484712954645774',
         'author': {
             'id': '77926453077549056',
@@ -58,6 +60,9 @@ def _item() -> dict:
             'nickname': 'Some Creator',
         },
     }
+    if followers is not None:
+        item['authorStats'] = {'followerCount': followers}
+    return item
 
 
 class TestReadVideoIds(unittest.TestCase):
@@ -101,6 +106,47 @@ class TestParseAuthor(unittest.TestCase):
         self.assertEqual(result.user_id, '77926453077549056')
         self.assertEqual(result.sec_uid, 'MS4wLjABAAAArnYn')
         self.assertEqual(result.nickname, 'Some Creator')
+        self.assertEqual(result.follower_count, 250_000)
+
+    def test_author_below_min_subs_is_not_queueable(self) -> None:
+        with mock.patch.object(
+            mod, 'TikTokVideo', _FakeVideo,
+        ), self.assertLogs(
+            'tools.tt_creator_resolve', level='INFO',
+        ) as logs:
+            result: mod.Resolution = mod.parse_author(
+                _page(_item(followers=42)), 1, None, 100,
+            )
+        self.assertEqual(result.status, mod.STATUS_LOW_SUBS)
+        self.assertEqual(result.username, 'some.creator')
+        self.assertEqual(result.follower_count, 42)
+        self.assertEqual(
+            logs.records[0].getMessage(),
+            'Creator below MIN_SUBS; not queueing',
+        )
+
+    def test_author_at_min_subs_resolves(self) -> None:
+        with mock.patch.object(mod, 'TikTokVideo', _FakeVideo):
+            result = mod.parse_author(
+                _page(_item(followers=100)), 1, None, 100,
+            )
+        self.assertEqual(result.status, mod.STATUS_RESOLVED)
+
+    def test_missing_follower_count_is_resolved(self) -> None:
+        # The scraper decides when the page reports no count.
+        with mock.patch.object(mod, 'TikTokVideo', _FakeVideo):
+            result = mod.parse_author(
+                _page(_item(followers=None)), 1, None, 100,
+            )
+        self.assertEqual(result.status, mod.STATUS_RESOLVED)
+        self.assertIsNone(result.follower_count)
+
+    def test_min_subs_zero_keeps_tiny_authors(self) -> None:
+        with mock.patch.object(mod, 'TikTokVideo', _FakeVideo):
+            result = mod.parse_author(
+                _page(_item(followers=0)), 1, None, 0,
+            )
+        self.assertEqual(result.status, mod.STATUS_RESOLVED)
 
     def test_missing_item_is_unavailable(self) -> None:
         with mock.patch.object(mod, 'TikTokVideo', _FakeVideo):
@@ -200,6 +246,7 @@ class TestResolverResolve(unittest.IsolatedAsyncioTestCase):
         settings: mock.MagicMock = mock.MagicMock()
         settings.max_retries = 3
         settings.proxies = proxies
+        settings.min_subs = 0
         limiter: mock.MagicMock = mock.MagicMock()
         limiter.acquire = mock.AsyncMock(side_effect=proxies)
         resolver: mod.Resolver = mod.Resolver(settings, limiter, {})
@@ -530,6 +577,54 @@ class TestRunQueueing(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(processed_file.read_text(), '1\n')
             enqueuer.close.assert_awaited_once()
+
+    async def test_low_subs_creators_are_logged_but_not_queued(
+        self,
+    ) -> None:
+        class _Resolver:
+            def __init__(self, *args: Any) -> None:
+                pass
+
+            async def resolve(self, video_id: int) -> mod.Resolution:
+                return mod.Resolution(
+                    video_id=video_id,
+                    status=mod.STATUS_LOW_SUBS,
+                    username='tiny.one',
+                    follower_count=3,
+                )
+
+            async def close(self) -> None:
+                pass
+
+        enqueuer: mock.MagicMock = mock.MagicMock()
+        enqueuer.add = mock.AsyncMock(return_value=True)
+        enqueuer.close = mock.AsyncMock()
+        enqueuer.added, enqueuer.existing, enqueuer.failed = 0, 0, 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            input_file: Path = Path(tmp) / 'ids.lst'
+            input_file.write_text('1\n')
+            processed_file: Path = Path(tmp) / 'done.lst'
+            settings: mod.ResolveSettings = _resolve_settings(
+                input_file=input_file, processed_file=processed_file,
+            )
+            with mock.patch.object(
+                mod, 'filter_known_video_ids',
+                mock.AsyncMock(return_value=([1], {})),
+            ), mock.patch.object(
+                mod, 'TikTokRateLimiter',
+            ), mock.patch.object(
+                mod, 'Resolver', _Resolver,
+            ), mock.patch.object(
+                mod, 'CreatorEnqueuer', return_value=enqueuer,
+            ), mock.patch('builtins.print'), self.assertLogs(
+                'tools.tt_creator_resolve', level='INFO',
+            ):
+                exit_code: int = await mod.run(settings)
+
+            self.assertEqual(exit_code, 1)
+            enqueuer.add.assert_not_awaited()
+            self.assertEqual(processed_file.read_text(), '1\n')
 
 
 if __name__ == '__main__':

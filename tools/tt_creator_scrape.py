@@ -64,6 +64,7 @@ from scrape_exchange.redis_client import redis_from_url
 from scrape_exchange.scraper_metrics import (
     METRIC_SCRAPE_DURATION,
     METRIC_SCRAPE_FAILURES,
+    METRIC_SCRAPE_LOW_SUBS,
     METRIC_SCRAPE_QUEUE_ENQUEUES,
     METRIC_SCRAPE_QUEUE_SIZE,
     METRIC_SCRAPE_RECORDS_WRITTEN,
@@ -318,6 +319,16 @@ class CreatorSettings(TikTokScraperSettings):
             'highest priority first; last tier must be :0.'
         ),
     )
+    min_subs: int = Field(
+        default=100,
+        validation_alias=AliasChoices('MIN_SUBS', 'min_subs'),
+        description=(
+            'Minimum follower count a creator must report to be kept. '
+            'A creator below it is not written or queued for videos: '
+            'it is parked in the terminal low_subs state and dropped '
+            'from the scrape queue. 0 disables the filter.'
+        ),
+    )
     creator_claim_ttl_seconds: int = Field(
         default=600,
         validation_alias=AliasChoices(
@@ -508,6 +519,16 @@ def _validate_settings(settings: CreatorSettings) -> None:
 
 def _creator_filename(username: str) -> str:
     return f'{CREATOR_FILE_PREFIX}{username}{CREATOR_FILE_POSTFIX}'
+
+
+def _below_min_subs(
+    creator: TikTokCreator, settings: CreatorSettings,
+) -> bool:
+    '''True when the ``MIN_SUBS`` filter is enabled (a positive
+    threshold) and *creator* reports fewer followers than it. A
+    profile that reports no follower count reads as 0.'''
+    minimum: int = max(settings.min_subs, 0)
+    return minimum > 0 and creator.follower_count < minimum
 
 
 def _effective_creator_concurrency(
@@ -1385,8 +1406,10 @@ async def _process_creator(
     '''
     Scrape one claimed creator through *proxy*, persist the record,
     re-tier by the freshly measured follower count, and release the
-    claim. Failures are classified and the claim is released/removed
-    accordingly — a bad creator never kills the worker.
+    claim. A creator below ``MIN_SUBS`` is not persisted: it is parked
+    in the terminal ``low_subs`` state instead. Failures are classified
+    and the claim is released/removed accordingly — a bad creator never
+    kills the worker.
     '''
     start: float = time.monotonic()
     proxy_port: str = extract_proxy_port(proxy)
@@ -1394,30 +1417,54 @@ async def _process_creator(
         creator: TikTokCreator = await fetcher.scrape(
             proxy, username, settings,
         )
-        await fm.write_file(
-            _creator_filename(creator.username), creator.to_dict(),
-        )
-        METRIC_SCRAPE_RECORDS_WRITTEN.labels(
-            platform=PLATFORM,
-            scraper=SCRAPER_LABEL,
-            entity=ENTITY,
-        ).inc()
-        await _persist_creator_identity(creator, identity_maps)
-        enqueued_videos: int = 0
-        if video_queue is not None:
-            enqueued_videos = await _enqueue_creator_videos(
-                creator, video_queue,
+        if _below_min_subs(creator, settings):
+            await queue.park_low_subs(
+                username,
+                creator.follower_count,
+                worker_id=worker_id,
+                proxy_ip=proxy_ip,
             )
-        if enqueued_videos:
+            METRIC_SCRAPE_LOW_SUBS.labels(
+                platform=PLATFORM,
+                scraper=SCRAPER_LABEL,
+                entity=ENTITY,
+            ).inc()
             _LOGGER.info(
-                'Queued TikTok creator videos for scrape',
+                'Creator below MIN_SUBS; parked in low_subs state',
                 extra={
                     'username': username,
-                    'video_count': enqueued_videos,
+                    'follower_count': creator.follower_count,
+                    'min_subs': settings.min_subs,
                 },
             )
-        await queue.update_tier(username, creator.follower_count)
-        await queue.release(username)
+        else:
+            await fm.write_file(
+                _creator_filename(creator.username),
+                creator.to_dict(),
+            )
+            METRIC_SCRAPE_RECORDS_WRITTEN.labels(
+                platform=PLATFORM,
+                scraper=SCRAPER_LABEL,
+                entity=ENTITY,
+            ).inc()
+            await _persist_creator_identity(creator, identity_maps)
+            enqueued_videos: int = 0
+            if video_queue is not None:
+                enqueued_videos = await _enqueue_creator_videos(
+                    creator, video_queue,
+                )
+            if enqueued_videos:
+                _LOGGER.info(
+                    'Queued TikTok creator videos for scrape',
+                    extra={
+                        'username': username,
+                        'video_count': enqueued_videos,
+                    },
+                )
+            await queue.update_tier(
+                username, creator.follower_count,
+            )
+            await queue.release(username)
         METRIC_SCRAPES_COMPLETED.labels(
             platform=PLATFORM, scraper=SCRAPER_LABEL, entity=ENTITY,
             api=API_LABEL, worker_id=worker_id, proxy_ip=proxy_ip,

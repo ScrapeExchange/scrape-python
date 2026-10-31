@@ -165,6 +165,7 @@ def _settings(**overrides: object) -> MagicMock:
         'creator_priority_queues',
         '168:1000000,336:100000,720:10000,4320:0',
     )
+    s.min_subs = overrides.get('min_subs', 0)
     return s
 
 
@@ -827,6 +828,7 @@ class TestProcessCreator(unittest.IsolatedAsyncioTestCase):
         q: MagicMock = MagicMock()
         q.release = AsyncMock()
         q.remove = AsyncMock()
+        q.park_low_subs = AsyncMock()
         q.update_tier = AsyncMock()
         return q
 
@@ -986,6 +988,92 @@ class TestProcessCreator(unittest.IsolatedAsyncioTestCase):
             )
         q.remove.assert_awaited_once_with('ghost')
         q.update_tier.assert_not_awaited()
+
+    async def test_below_min_subs_is_parked_and_not_persisted(
+        self,
+    ) -> None:
+        api: MagicMock = MagicMock()
+        pool: MagicMock = MagicMock()
+        pool.session_for = MagicMock(
+            return_value=_FakeSessionCtx(api),
+        )
+        q: MagicMock = self._queue()
+        video_q: MagicMock = self._video_queue()
+        maps: MagicMock = self._identity_maps()
+        s: MagicMock = _settings(min_subs=100, creator_video_ref_count=10)
+        with self._page_patch(
+            _raw_user('tiny', followers=42, sec_uid='S9'),
+            videos=[{'id': 'v1', 'author': {'uniqueId': 'tiny'}}],
+        ):
+            outcome: str | None = await tool._process_creator(
+                'tiny', 'http://p:8080',
+                tool.BrowserCreatorFetcher(pool), q, video_q, self.fm, s,
+                '0', 'p', maps,
+            )
+        self.assertIsNone(outcome)
+        # Nothing reaches disk, Redis identity maps, or the video queue.
+        filename: str = tool._creator_filename('tiny')
+        self.assertFalse(
+            os.path.exists(os.path.join(self._tmp.name, filename)),
+        )
+        self.assertFalse(
+            os.path.exists(
+                os.path.join(self._tmp.name, 'uploaded', filename),
+            ),
+        )
+        maps.user_id_to_username.put.assert_not_awaited()
+        maps.username_to_user_id.put.assert_not_awaited()
+        maps.nickname_to_sec_uid.put.assert_not_awaited()
+        video_q.enqueue_many.assert_not_awaited()
+        # Parked as a terminal state instead of being released.
+        q.park_low_subs.assert_awaited_once_with(
+            'tiny', 42, worker_id='0', proxy_ip='p',
+        )
+        q.update_tier.assert_not_awaited()
+        q.release.assert_not_awaited()
+
+    async def test_follower_count_at_min_subs_is_persisted(
+        self,
+    ) -> None:
+        api: MagicMock = MagicMock()
+        pool: MagicMock = MagicMock()
+        pool.session_for = MagicMock(
+            return_value=_FakeSessionCtx(api),
+        )
+        q: MagicMock = self._queue()
+        s: MagicMock = _settings(min_subs=42)
+        with self._page_patch(_raw_user('charli', followers=42)):
+            await tool._process_creator(
+                'charli', 'http://p:8080',
+                tool.BrowserCreatorFetcher(pool), q, self._video_queue(),
+                self.fm, s, '0', 'p', self._identity_maps(),
+            )
+        written: dict = await self.fm.read_file(
+            tool._creator_filename('charli'),
+        )
+        self.assertEqual(written['follower_count'], 42)
+        q.park_low_subs.assert_not_awaited()
+        q.release.assert_awaited_once_with('charli')
+
+    async def test_min_subs_zero_keeps_tiny_creators(self) -> None:
+        api: MagicMock = MagicMock()
+        pool: MagicMock = MagicMock()
+        pool.session_for = MagicMock(
+            return_value=_FakeSessionCtx(api),
+        )
+        q: MagicMock = self._queue()
+        s: MagicMock = _settings(min_subs=0)
+        with self._page_patch(_raw_user('tiny', followers=0)):
+            await tool._process_creator(
+                'tiny', 'http://p:8080',
+                tool.BrowserCreatorFetcher(pool), q, self._video_queue(),
+                self.fm, s, '0', 'p', self._identity_maps(),
+            )
+        written: dict = await self.fm.read_file(
+            tool._creator_filename('tiny'),
+        )
+        self.assertEqual(written['username'], 'tiny')
+        q.park_low_subs.assert_not_awaited()
 
 
 # ---------------------------------------------------------------

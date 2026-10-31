@@ -187,6 +187,17 @@ METRIC_SCRAPE_RECORDS_WRITTEN: Counter = Counter(
 )
 
 # ---------------------------------------------------------------------------
+# scrape_low_subs_total
+#   Incremented when a scraped creator is parked in the terminal
+#   ``low_subs`` state because its follower count is below MIN_SUBS.
+# ---------------------------------------------------------------------------
+METRIC_SCRAPE_LOW_SUBS: Counter = Counter(
+    'scrape_low_subs_total',
+    'Scraped creators parked below the MIN_SUBS follower threshold.',
+    ['platform', 'scraper', 'entity'],
+)
+
+# ---------------------------------------------------------------------------
 # instagram_profile_json_timeouts_total
 #   Evidence summary for Instagram creator pages that reached DOMContentLoaded
 #   but never exposed hydrated profile JSON before the scraper timeout.

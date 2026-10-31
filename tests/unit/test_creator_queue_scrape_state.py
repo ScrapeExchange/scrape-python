@@ -86,6 +86,41 @@ class TestCreatorQueueScrapeState(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state['last_follower_count'], 282_000_000)
         self.assertEqual(counts, {'scraped': 1})
 
+    async def test_park_low_subs_is_terminal_and_not_recovered(
+        self,
+    ) -> None:
+        q: RedisCreatorQueue = await self._queue()
+        await q.add_member('tiny', 'tiny', 42)
+
+        await q.park_low_subs(
+            'tiny', 42, worker_id='w1', proxy_ip='proxy1',
+        )
+
+        rec: dict | None = await q.show_member('tiny')
+        assert rec is not None
+        self.assertEqual(rec['state'], 'removed')
+        self.assertEqual(rec['scrape_status'], 'low_subs')
+        self.assertEqual(
+            rec['scrape_state']['last_follower_count'], 42,
+        )
+        self.assertEqual(await q.queue_size(), 0)
+        self.assertEqual(
+            await q.count_by_scrape_status(), {'low_subs': 1},
+        )
+        # Orphan recovery must not resurrect a parked creator.
+        await q.scan_and_recover_orphans(recover=True)
+        self.assertEqual(await q.queue_size(), 0)
+
+    async def test_park_low_subs_is_restorable(self) -> None:
+        q: RedisCreatorQueue = await self._queue()
+        await q.add_member('tiny', 'tiny', 42)
+        await q.park_low_subs('tiny', 42)
+
+        added: bool = await q.add_member('tiny', 'tiny', 42)
+
+        self.assertTrue(added)
+        self.assertEqual(await q.queue_size(), 1)
+
 
 if __name__ == '__main__':
     unittest.main()

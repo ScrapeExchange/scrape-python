@@ -16,6 +16,12 @@ Every username is added to the TikTok creator scrape queue -- the same
 scraper picks creators up while the run is still going. A creator that
 is already queued, being scraped or excluded is left alone.
 
+An author whose video page reports fewer than ``MIN_SUBS`` followers
+is not queued at all: the record is written with status ``low_subs``
+and the id goes to the processed log, so the scraper never spends a
+fetch on an account it would only park. An author whose follower count
+the page did not report is queued and judged by the scraper.
+
 Before fetching anything, ids the TikTok video scrape queue already
 knows are skipped, whatever state it reports: ``queued`` (still to be
 scraped), ``scraped`` (only the backlog-server backend remembers
@@ -143,6 +149,8 @@ STATUS_RESOLVED: str = 'resolved'
 STATUS_UNAVAILABLE: str = 'unavailable'
 STATUS_TRANSIENT: str = 'transient'
 STATUS_ERROR: str = 'error'
+# Resolved, but the creator is below MIN_SUBS so it is not queued.
+STATUS_LOW_SUBS: str = 'low_subs'
 
 
 class ResolveSettings(TikTokScraperSettings):
@@ -238,6 +246,16 @@ class ResolveSettings(TikTokScraperSettings):
             'and operator imports are queued.'
         ),
     )
+    min_subs: int = Field(
+        default=100,
+        validation_alias=AliasChoices('MIN_SUBS', 'min_subs'),
+        description=(
+            'Minimum follower count an author must report to be '
+            'queued. A creator below it is reported as low_subs and '
+            'left out of the queue; tt_creator_scrape.py would park '
+            'it anyway. 0 disables the filter.'
+        ),
+    )
     processed_file: Path | None = Field(
         default=Path.home() / 'tiktok-resolved-video-ids.lst',
         validation_alias=AliasChoices(
@@ -273,6 +291,8 @@ class Resolution:
     user_id: str | None = None
     sec_uid: str | None = None
     nickname: str | None = None
+    # The author's follower count as the video page reported it.
+    follower_count: int | None = None
     detail: str | None = None
 
     def as_record(self) -> dict[str, Any]:
@@ -284,6 +304,7 @@ class Resolution:
             'user_id': self.user_id,
             'sec_uid': self.sec_uid,
             'nickname': self.nickname,
+            'follower_count': self.follower_count,
             'detail': self.detail,
         }
 
@@ -409,9 +430,19 @@ def _no_username(
 
 
 def parse_author(
-    html: str, video_id: int, proxy: str | None = None,
+    html: str,
+    video_id: int,
+    proxy: str | None = None,
+    min_subs: int = 0,
 ) -> Resolution:
-    '''Extract the creator of *video_id* from a fetched video page.'''
+    '''Extract the creator of *video_id* from a fetched video page.
+
+    When *min_subs* is positive and the page reports an author with
+    fewer followers than that, the outcome is ``low_subs``: the
+    creator is named in the record but must not be queued. An author
+    whose follower count the page did not report is left for
+    ``tt_creator_scrape.py`` to judge.
+    '''
     scope: dict[str, Any] | None = _rehydration_scope(html)
     if scope is None:
         blocked: bool = any(
@@ -451,13 +482,34 @@ def parse_author(
             video_id, STATUS_UNAVAILABLE, 'item has no author username',
             proxy,
         )
+    follower_count: int | None = video.author_stats.get(
+        'followerCount',
+    )
+    status: str = STATUS_RESOLVED
+    if (
+        min_subs > 0
+        and follower_count is not None
+        and follower_count < min_subs
+    ):
+        status = STATUS_LOW_SUBS
+        _LOGGER.info(
+            'Creator below MIN_SUBS; not queueing',
+            extra={
+                'video_id': video_id,
+                'username': video.username,
+                'follower_count': follower_count,
+                'min_subs': min_subs,
+                **_proxy_log_fields(proxy),
+            },
+        )
     return Resolution(
         video_id=video_id,
-        status=STATUS_RESOLVED,
+        status=status,
         username=video.username,
         user_id=video.author_id,
         sec_uid=video.sec_uid,
         nickname=video.author_nickname,
+        follower_count=follower_count,
     )
 
 
@@ -590,7 +642,12 @@ class Resolver:
                         proxy,
                     )
                 else:
-                    last = parse_author(response.text, video_id, proxy)
+                    last = parse_author(
+                        response.text,
+                        video_id,
+                        proxy,
+                        self._settings.min_subs,
+                    )
             if last.status != STATUS_TRANSIENT:
                 return last
             attempt += 1
@@ -924,6 +981,7 @@ async def run(settings: ResolveSettings) -> int:
         'video_ids': len(ids),
         'done': len(results),
         'resolved': counts.get(STATUS_RESOLVED, 0),
+        'low_subs': counts.get(STATUS_LOW_SUBS, 0),
         'unavailable': counts.get(STATUS_UNAVAILABLE, 0),
         'transient': counts.get(STATUS_TRANSIENT, 0),
         'errors': counts.get(STATUS_ERROR, 0),
