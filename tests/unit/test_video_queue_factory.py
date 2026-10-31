@@ -139,18 +139,46 @@ class TestVideoQueueFactory(unittest.TestCase):
         self.assertIsInstance(q, RedisVideoScrapeQueue)
         self.assertIs(q._redis, redis)
 
-    def test_tiktok_ignores_dsn(self) -> None:
+    def test_youtube_backlog_queue_name(self) -> None:
+        with mock.patch(
+            'scrape_exchange.video_queue_factory.backlog_redis_from_url',
+        ):
+            q: Any = make_video_scrape_queue(
+                platform='youtube', redis=mock.Mock(),
+                settings=settings(DSN), component='x',
+            )
+        self.assertEqual(q._queue, 'youtube:video')
+
+    def test_tiktok_with_dsn_uses_its_own_backlog_queue(self) -> None:
         with mock.patch(
             'scrape_exchange.video_queue_factory.backlog_redis_from_url',
         ) as patched:
             q: VideoScrapeQueue = make_video_scrape_queue(
                 platform='tiktok', redis=mock.Mock(),
+                settings=settings(DSN), component='tt-video-queue',
+            )
+        self.assertIsInstance(q, BacklogServerVideoScrapeQueue)
+        self.assertEqual(q._queue, 'tiktok:video')
+        patched.assert_called_once()
+
+    def test_tiktok_without_dsn_uses_redis(self) -> None:
+        q: VideoScrapeQueue = make_video_scrape_queue(
+            platform='tiktok', redis=mock.Mock(),
+            settings=settings(None), component='x',
+        )
+        self.assertIsInstance(q, RedisVideoScrapeQueue)
+        self.assertEqual(q._key_prefix, 'tiktok:video')
+
+    def test_other_platforms_ignore_dsn(self) -> None:
+        with mock.patch(
+            'scrape_exchange.video_queue_factory.backlog_redis_from_url',
+        ) as patched:
+            q: VideoScrapeQueue = make_video_scrape_queue(
+                platform='instagram', redis=mock.Mock(),
                 settings=settings(DSN), component='x',
             )
         self.assertIsInstance(q, RedisVideoScrapeQueue)
-        self.assertEqual(q._key_prefix, 'tiktok:video')
         patched.assert_not_called()
-
 
 if __name__ == '__main__':
     unittest.main()

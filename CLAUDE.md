@@ -91,13 +91,6 @@ the settings it's handed (see `RateLimiter.__init__`):
 3. Neither set → `_InProcessBackend`. Per-process only; every process
    drives its own private buckets.
 
-In production both hosts (`homeserver`, `homedata`) set
-`REDIS_DSN=redis://mongo.scrape.exchange:6379/0`, so all scraper
-types — video, RSS, channel, discover — across both hosts share one
-set of per-proxy buckets. YouTube sees aggregate traffic per IP and
-so does the limiter: running multiple scraper types against the same
-proxy pool is safe.
-
 If Redis is unreachable, Redis-backend operations raise; they do not
 silently fall back to in-process. Watch
 `rate_limit_redis_ops_total` and its failure-label counterpart to

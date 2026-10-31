@@ -30,9 +30,11 @@ import resource
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
+import httpx
+from httpx_curl_cffi import AsyncCurlTransport
 from playwright.async_api import Error as PlaywrightError
 from pydantic import AliasChoices, Field, field_validator
 
@@ -103,8 +105,12 @@ from scrape_exchange.tiktok.tiktok_metrics import (
     API_CALL_TOTAL,
 )
 from scrape_exchange.util import extract_proxy_ip, extract_proxy_port
+from scrape_exchange.video_queue_factory import (
+    close_backlog_clients,
+    make_video_scrape_queue,
+)
 from scrape_exchange.video_scrape_queue import (
-    RedisVideoScrapeQueue,
+    VideoScrapeQueue,
     VideoScrapeQueueSettings,
 )
 from scrape_exchange.watchdog import Watchdog
@@ -125,6 +131,24 @@ REPOST_ITEM_LIST_URL: str = (
 
 # Default fd-heavy ceiling when the hard limit is unbounded.
 _FD_TARGET: int = 1_048_576
+
+FETCH_MODE_HTTP: str = 'http'
+FETCH_MODE_BROWSER: str = 'browser'
+PROFILE_URL_TEMPLATE: str = 'https://www.tiktok.com/@{username}'
+# curl-cffi's Chrome impersonation supplies User-Agent and client
+# hints matching its TLS fingerprint; only add what it leaves out.
+_HTTP_PROFILE_HEADERS: dict[str, str] = {
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Referer': 'https://www.tiktok.com/',
+}
+_HTTP_TIMEOUT_SECONDS: float = 30.0
+_HTTP_BOT_STATUSES: frozenset[int] = frozenset({403, 429})
+# Markers of an anti-bot interstitial instead of a profile page.
+_BOT_CHECK_MARKERS: tuple[str, ...] = (
+    'verify.tiktok.com',
+    'captcha-verify',
+    'please wait',
+)
 
 
 @dataclass
@@ -160,6 +184,15 @@ class TikTokProfileIdentityError(RuntimeError):
             'invalid TikTok profile identity response: '
             f'requested={requested!r} returned={returned!r}',
         )
+
+
+class TikTokProfileHttpError(RuntimeError):
+    '''The profile page could not be fetched over plain HTTP.
+
+    The message carries the classifier keyword: 'tiktok bot
+    detection' (rate_limit) for a block, 'tiktok profile http error'
+    (transient) for everything else.
+    '''
 
 
 class TikTokVideoListResponseError(RuntimeError):
@@ -210,6 +243,18 @@ class CreatorSettings(TikTokScraperSettings):
             'allows at most one in-flight TikTok call.'
         ),
     )
+    creator_fetch_mode: Literal['http', 'browser'] = Field(
+        default='http',
+        validation_alias=AliasChoices(
+            'TIKTOK_CREATOR_FETCH_MODE', 'creator_fetch_mode',
+        ),
+        description=(
+            "'http' reads the profile page over curl-cffi (Chrome "
+            'impersonation, no browser) and records creator info '
+            "only. 'browser' loads the profile in Camoufox and also "
+            'collects video, repost and playlist refs.'
+        ),
+    )
     creator_max_browsers: int = Field(
         default=12,
         validation_alias=AliasChoices(
@@ -218,7 +263,8 @@ class CreatorSettings(TikTokScraperSettings):
         description=(
             'Cap on browser sessions (one per proxy) when '
             'TIKTOK_CREATOR_CONCURRENCY is 0. Each Camoufox browser '
-            'uses roughly 250-300 MB of RAM. 0 = no cap.'
+            'uses roughly 250-300 MB of RAM. 0 = no cap. Ignored in '
+            "'http' fetch mode."
         ),
     )
     creator_num_processes: int = Field(
@@ -497,6 +543,8 @@ def _resolve_creator_concurrency(
     auto: int = _auto_creator_concurrency(
         proxy_count, settings.creator_num_processes,
     )
+    if settings.creator_fetch_mode == FETCH_MODE_HTTP:
+        return auto
     max_browsers: int = int(settings.creator_max_browsers)
     if max_browsers > 0:
         return min(auto, max_browsers)
@@ -574,46 +622,48 @@ async def _persist_creator_identity(
         )
 
 
-def _creator_video_urls(creator: TikTokCreator) -> list[str]:
-    '''Return unique video URLs discovered from a creator scrape.'''
+def _creator_video_ids(creator: TikTokCreator) -> list[str]:
+    '''Return unique video ids discovered from a creator scrape.'''
     seen: set[str] = set()
     out: list[str] = []
     for refs in (creator.videos, creator.reposts, creator.liked):
         for ref in refs:
-            video_url: str = ref.url
-            if video_url and video_url not in seen:
-                seen.add(video_url)
-                out.append(video_url)
+            video_id: str = ref.video_id
+            if video_id and video_id not in seen:
+                seen.add(video_id)
+                out.append(video_id)
     return out
 
 
 async def _enqueue_creator_videos(
     creator: TikTokCreator,
-    video_queue: RedisVideoScrapeQueue,
+    video_queue: VideoScrapeQueue,
 ) -> int:
-    '''Queue videos discovered on a successfully scraped creator.'''
-    enqueued: int = 0
-    for video_url in _creator_video_urls(creator):
-        try:
-            if await video_queue.enqueue(
-                video_url, source='tiktok_creator',
-            ):
-                enqueued += 1
-                METRIC_SCRAPE_QUEUE_ENQUEUES.labels(
-                    platform=PLATFORM,
-                    scraper=SCRAPER_LABEL,
-                    entity='video',
-                    source='tiktok_creator',
-                ).inc()
-        except Exception as exc:
-            _LOGGER.warning(
-                'Failed to enqueue TikTok creator video',
-                extra={
-                    'username': creator.username,
-                    'video_url': video_url,
-                    'error': str(exc),
-                },
-            )
+    '''Queue the ids of videos discovered on a scraped creator.'''
+    video_ids: list[str] = _creator_video_ids(creator)
+    if not video_ids:
+        return 0
+    try:
+        enqueued: int = await video_queue.enqueue_many(
+            video_ids, source='tiktok_creator',
+        )
+    except Exception as exc:
+        _LOGGER.warning(
+            'Failed to enqueue TikTok creator videos',
+            extra={
+                'username': creator.username,
+                'video_count': len(video_ids),
+                'error': str(exc),
+            },
+        )
+        return 0
+    if enqueued:
+        METRIC_SCRAPE_QUEUE_ENQUEUES.labels(
+            platform=PLATFORM,
+            scraper=SCRAPER_LABEL,
+            entity='video',
+            source='tiktok_creator',
+        ).inc(enqueued)
     return enqueued
 
 
@@ -1093,6 +1143,25 @@ def _playlist_refs_from_payloads(
     return refs
 
 
+def _creator_from_detail(detail: dict, username: str) -> TikTokCreator:
+    '''
+    Build the creator from a profile's ``webapp.user-detail`` scope,
+    raising when TikTok returned no user or a different one.
+    '''
+    user_info: Any = detail.get('userInfo') or {}
+    user: Any = user_info.get('user') or {}
+    if not isinstance(user, dict) or not user:
+        raise TikTokProfileResponseError(
+            detail, detail.get('statusMsg') or 'empty userInfo payload',
+        )
+    creator: TikTokCreator = TikTokCreator.from_user_info(detail)
+    if creator.username.casefold() != username.casefold():
+        raise TikTokProfileIdentityError(
+            username, creator.username,
+        )
+    return creator
+
+
 async def _scrape_one(
     api: Any, username: str, settings: CreatorSettings,
 ) -> TikTokCreator:
@@ -1107,17 +1176,7 @@ async def _scrape_one(
     item-list requests carry the video, repost, and playlist payloads.
     '''
     detail, captured = await _load_profile_page(api, username)
-    user_info: Any = detail.get('userInfo') or {}
-    user: Any = user_info.get('user') or {}
-    if not isinstance(user, dict) or not user:
-        raise TikTokProfileResponseError(
-            detail, detail.get('statusMsg') or 'empty userInfo payload',
-        )
-    creator: TikTokCreator = TikTokCreator.from_user_info(detail)
-    if creator.username.casefold() != username.casefold():
-        raise TikTokProfileIdentityError(
-            username, creator.username,
-        )
+    creator: TikTokCreator = _creator_from_detail(detail, username)
     if creator.private_account:
         return creator
 
@@ -1141,12 +1200,182 @@ async def _scrape_one(
     return creator
 
 
+class CreatorFetcher:
+    '''
+    How proxy workers reach TikTok. One implementation per
+    ``TIKTOK_CREATOR_FETCH_MODE``; the worker loop, failure handling
+    and bot-detection circuit are shared.
+    '''
+
+    async def scrape(
+        self, proxy: str, username: str, settings: CreatorSettings,
+    ) -> TikTokCreator:
+        '''Scrape *username* through *proxy*.'''
+        raise NotImplementedError
+
+    async def gate(self, proxy: str) -> None:
+        '''Consume one rate-limit token for a non-profile request.'''
+        raise NotImplementedError
+
+    async def quarantine(self, proxy: str) -> None:
+        '''Drop *proxy*'s identity after repeated bot detection.'''
+        raise NotImplementedError
+
+    async def rebuild(self, proxy: str) -> bool:
+        '''Give *proxy* a fresh identity; False retires its worker.'''
+        raise NotImplementedError
+
+    async def close(self) -> None:
+        '''Release every per-proxy resource.'''
+        raise NotImplementedError
+
+
+class BrowserCreatorFetcher(CreatorFetcher):
+    '''Profile page in a Camoufox session; collects video refs too.'''
+
+    def __init__(self, pool: TikTokSessionPool) -> None:
+        self._pool: TikTokSessionPool = pool
+
+    async def scrape(
+        self, proxy: str, username: str, settings: CreatorSettings,
+    ) -> TikTokCreator:
+        async with self._pool.session_for(proxy) as api:
+            return await _scrape_one(api, username, settings)
+
+    async def gate(self, proxy: str) -> None:
+        await self._pool.gate_api_request(proxy)
+
+    async def quarantine(self, proxy: str) -> None:
+        await self._pool.quarantine(proxy)
+
+    async def rebuild(self, proxy: str) -> bool:
+        return await self._pool.rebuild(proxy)
+
+    async def close(self) -> None:
+        await self._pool.shutdown()
+
+
+class HttpCreatorFetcher(CreatorFetcher):
+    '''
+    Profile page over httpx + curl-cffi (Chrome impersonation). The
+    server-rendered ``webapp.user-detail`` scope carries the full
+    user object but no videos, so only creator info is recorded.
+    One client per proxy keeps TikTok's cookies between requests.
+    '''
+
+    def __init__(
+        self, rate_limiter: TikTokRateLimiter, worker_id: str,
+    ) -> None:
+        self._rate_limiter: TikTokRateLimiter = rate_limiter
+        self._worker_id: str = worker_id
+        self._clients: dict[str, httpx.AsyncClient] = {}
+
+    def _client(self, proxy: str) -> httpx.AsyncClient:
+        client: httpx.AsyncClient | None = self._clients.get(proxy)
+        if client is None:
+            client = httpx.AsyncClient(
+                transport=AsyncCurlTransport(
+                    impersonate='chrome',
+                    default_headers=True,
+                    proxy=proxy,
+                ),
+                headers=_HTTP_PROFILE_HEADERS,
+                follow_redirects=True,
+                timeout=_HTTP_TIMEOUT_SECONDS,
+            )
+            self._clients[proxy] = client
+        return client
+
+    async def _profile_html(self, proxy: str, username: str) -> str:
+        try:
+            response: httpx.Response = await self._client(proxy).get(
+                PROFILE_URL_TEMPLATE.format(username=username),
+            )
+        except httpx.HTTPError as exc:
+            raise TikTokProfileHttpError(
+                'tiktok profile http error: '
+                f'{type(exc).__name__}: {exc}',
+            ) from exc
+        if response.status_code in _HTTP_BOT_STATUSES:
+            raise TikTokProfileHttpError(
+                f'tiktok bot detection: http {response.status_code}',
+            )
+        if response.status_code >= 400:
+            raise TikTokProfileHttpError(
+                'tiktok profile http error: '
+                f'http {response.status_code}',
+            )
+        html: str = response.text
+        if _PROFILE_STATE_MARKER not in html and any(
+            marker in html[:8000].lower()
+            for marker in _BOT_CHECK_MARKERS
+        ):
+            raise TikTokProfileHttpError(
+                'tiktok bot detection: bot-check page',
+            )
+        return html
+
+    async def scrape(
+        self, proxy: str, username: str, settings: CreatorSettings,
+    ) -> TikTokCreator:
+        await self._rate_limiter.acquire(
+            TikTokCallType.CREATOR_API, proxy=proxy,
+        )
+        started: float = time.monotonic()
+        try:
+            html: str = await self._profile_html(proxy, username)
+        except Exception as exc:
+            _record_api_call(
+                'user_info',
+                classify_tiktok_error(exc),
+                SCRAPER_LABEL,
+                self._worker_id,
+                time.monotonic() - started,
+            )
+            raise
+        _record_api_call(
+            'user_info',
+            'success',
+            SCRAPER_LABEL,
+            self._worker_id,
+            time.monotonic() - started,
+        )
+        return _creator_from_detail(
+            _rehydration_user_detail(html), username,
+        )
+
+    async def gate(self, proxy: str) -> None:
+        await self._rate_limiter.acquire(
+            TikTokCallType.CREATOR_API, proxy=proxy,
+        )
+
+    async def quarantine(self, proxy: str) -> None:
+        client: httpx.AsyncClient | None = self._clients.pop(
+            proxy, None,
+        )
+        if client is not None:
+            await client.aclose()
+
+    async def rebuild(self, proxy: str) -> bool:
+        # The next scrape lazily creates a client with no cookies.
+        return True
+
+    async def close(self) -> None:
+        clients: list[httpx.AsyncClient] = list(self._clients.values())
+        self._clients.clear()
+        for client in clients:
+            try:
+                await client.aclose()
+            except (httpx.HTTPError, RuntimeError, OSError):
+                pass
+
+
 async def _process_creator(
     username: str,
     proxy: str,
-    pool: TikTokSessionPool,
+    fetcher: CreatorFetcher,
     queue: CreatorQueue,
-    video_queue: RedisVideoScrapeQueue,
+    video_queue: VideoScrapeQueue | None,
     fm: AssetFileManagement,
     settings: CreatorSettings,
     worker_id: str,
@@ -1162,10 +1391,9 @@ async def _process_creator(
     start: float = time.monotonic()
     proxy_port: str = extract_proxy_port(proxy)
     try:
-        async with pool.session_for(proxy) as api:
-            creator: TikTokCreator = await _scrape_one(
-                api, username, settings,
-            )
+        creator: TikTokCreator = await fetcher.scrape(
+            proxy, username, settings,
+        )
         await fm.write_file(
             _creator_filename(creator.username), creator.to_dict(),
         )
@@ -1175,9 +1403,11 @@ async def _process_creator(
             entity=ENTITY,
         ).inc()
         await _persist_creator_identity(creator, identity_maps)
-        enqueued_videos: int = await _enqueue_creator_videos(
-            creator, video_queue,
-        )
+        enqueued_videos: int = 0
+        if video_queue is not None:
+            enqueued_videos = await _enqueue_creator_videos(
+                creator, video_queue,
+            )
         if enqueued_videos:
             _LOGGER.info(
                 'Queued TikTok creator videos for scrape',
@@ -1304,9 +1534,9 @@ async def _resolve_and_enqueue_short_url(
 
 async def _proxy_worker(
     proxy: str,
-    pool: TikTokSessionPool,
+    fetcher: CreatorFetcher,
     queue: CreatorQueue,
-    video_queue: RedisVideoScrapeQueue,
+    video_queue: VideoScrapeQueue | None,
     fm: AssetFileManagement,
     settings: CreatorSettings,
     shutdown_event: asyncio.Event,
@@ -1315,8 +1545,8 @@ async def _proxy_worker(
 ) -> None:
     '''
     One async worker bound to *proxy*. Claims one due creator at a
-    time from the shared queue and scrapes it through this proxy's
-    session, sleeping until the next is due when the queue is empty.
+    time from the shared queue and scrapes it through *fetcher* on
+    this proxy, sleeping until the next is due when the queue is empty.
     Touches the watchdog every wave (incl. idle) so a healthy idle
     worker is never reaped.
     '''
@@ -1363,13 +1593,13 @@ async def _proxy_worker(
             continue
         username: str = batch[0][0]
         if is_tiktok_short_url(username):
-            await pool.gate_api_request(proxy)
+            await fetcher.gate(proxy)
             await _resolve_and_enqueue_short_url(
                 username, proxy, queue, settings, worker_id, proxy_ip,
             )
             continue
         outcome: str | None = await _process_creator(
-            username, proxy, pool, queue, video_queue, fm, settings,
+            username, proxy, fetcher, queue, video_queue, fm, settings,
             worker_id, proxy_ip, identity_maps,
         )
         if outcome != 'rate_limit':
@@ -1398,7 +1628,7 @@ async def _proxy_worker(
                 ),
             },
         )
-        await pool.quarantine(proxy)
+        await fetcher.quarantine(proxy)
         cooldown_seconds: float = _jittered_retry_delay(
             min(
                 settings.creator_bot_cooldown_seconds
@@ -1418,7 +1648,7 @@ async def _proxy_worker(
             },
         )
         await asyncio.sleep(cooldown_seconds)
-        rebuilt: bool = await pool.rebuild(proxy)
+        rebuilt: bool = await fetcher.rebuild(proxy)
         if not rebuilt:
             _LOGGER.error(
                 'TikTok proxy session rebuild failed; retiring worker',
@@ -1528,22 +1758,16 @@ def _build_queue(
     return queue
 
 
-def _build_video_queue(
-    settings: CreatorSettings,
-) -> RedisVideoScrapeQueue:
+def _build_video_queue(redis: Any) -> VideoScrapeQueue:
     '''
-    Build the TikTok video scrape queue, which lives in Redis only.
+    Build the TikTok video scrape queue: backlog-server when
+    ``BACKLOG_SERVER_DSN`` is set, else Redis through *redis*.
     '''
-    redis = redis_from_url(
-        settings.redis_dsn,
+    return make_video_scrape_queue(
+        platform=PLATFORM,
+        redis=redis,
+        settings=VideoScrapeQueueSettings(),
         component='tiktok-creator-video-queue',
-        decode_responses=True,
-    )
-    queue_settings: VideoScrapeQueueSettings = (
-        VideoScrapeQueueSettings()
-    )
-    return RedisVideoScrapeQueue(
-        redis, queue_settings, platform=PLATFORM,
     )
 
 
@@ -1558,27 +1782,16 @@ def _raise_fd_limit() -> None:
     resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
 
 
-async def _run_worker(ctx: ScraperRunContext) -> None:
+async def _start_browser_fetcher(
+    ctx: ScraperRunContext,
+    settings: CreatorSettings,
+    worker_id: str,
+) -> tuple[CreatorFetcher, list[str], asyncio.Task | None]:
     '''
-    Leaf worker of the supervisor tree. Bootstraps one Camoufox
-    browser per proxy in this child's slice, attaches to the Redis
-    priority queue, then runs one worker per ready proxy plus the ms_token
-    refresh and queue-maintenance background tasks until shutdown.
+    Bootstrap one Camoufox browser per proxy in this child's slice.
+    Returns the fetcher, the proxies whose browser came up, and the
+    ms_token refresh task (``None`` when nothing bootstrapped).
     '''
-    _raise_fd_limit()
-    settings: CreatorSettings = ctx.settings  # type: ignore[assignment]
-    worker_id: str = settings.worker_id or get_worker_id()
-
-    fm: AssetFileManagement = AssetFileManagement(
-        settings.creator_data_directory,
-        prefix_rankings={'creator': [CREATOR_FILE_PREFIX]},
-    )
-    tiers: list[TierConfig] = parse_priority_queues(
-        settings.creator_priority_queues,
-    )
-    identity_maps: CreatorIdentityMaps = _build_creator_identity_maps(
-        settings,
-    )
     proxy_limit: int = _effective_creator_concurrency(
         settings, len(ctx.proxies),
     )
@@ -1607,17 +1820,92 @@ async def _run_worker(ctx: ScraperRunContext) -> None:
                 'selected': len(pool_proxies),
             },
         )
-        return
-
-    queue: CreatorQueue = _build_queue(settings, worker_id, tiers)
-    video_queue: RedisVideoScrapeQueue = _build_video_queue(settings)
-
-    shutdown_event: asyncio.Event = asyncio.Event()
+        return BrowserCreatorFetcher(pool), [], None
     refresh_task: asyncio.Task = asyncio.create_task(
         pool.run_refresh_loop(
             settings.ms_token_refresh_interval_seconds,
         ),
     )
+    return BrowserCreatorFetcher(pool), ready, refresh_task
+
+
+def _start_http_fetcher(
+    ctx: ScraperRunContext, worker_id: str,
+) -> tuple[CreatorFetcher, list[str]]:
+    '''
+    Build the curl-cffi fetcher. Every proxy URL in the slice is
+    usable; ``local://`` source-IP entries are not supported by the
+    curl transport and are skipped.
+    '''
+    usable: list[str] = [
+        proxy for proxy in ctx.proxies
+        if not proxy.startswith('local://')
+    ]
+    skipped: int = len(ctx.proxies) - len(usable)
+    if skipped:
+        _LOGGER.warning(
+            'Skipping local:// entries in http fetch mode',
+            extra={'skipped': skipped},
+        )
+    if not usable:
+        _LOGGER.error(
+            'No usable proxies for http fetch mode; nothing to scrape',
+            extra={'requested': len(ctx.proxies)},
+        )
+    fetcher: HttpCreatorFetcher = HttpCreatorFetcher(
+        ctx.rate_limiter, worker_id,
+    )
+    return fetcher, usable
+
+
+async def _run_worker(ctx: ScraperRunContext) -> None:
+    '''
+    Leaf worker of the supervisor tree. Starts the configured fetcher
+    (curl-cffi clients, or one Camoufox browser per proxy), attaches
+    to the Redis priority queue, then runs one worker per usable
+    proxy plus the queue-maintenance (and, for browsers, ms_token
+    refresh) background tasks until shutdown.
+    '''
+    _raise_fd_limit()
+    settings: CreatorSettings = ctx.settings  # type: ignore[assignment]
+    worker_id: str = settings.worker_id or get_worker_id()
+
+    fm: AssetFileManagement = AssetFileManagement(
+        settings.creator_data_directory,
+        prefix_rankings={'creator': [CREATOR_FILE_PREFIX]},
+    )
+    tiers: list[TierConfig] = parse_priority_queues(
+        settings.creator_priority_queues,
+    )
+    identity_maps: CreatorIdentityMaps = _build_creator_identity_maps(
+        settings,
+    )
+    fetcher: CreatorFetcher
+    ready: list[str]
+    refresh_task: asyncio.Task | None = None
+    video_queue: VideoScrapeQueue | None = None
+    video_queue_redis: Any = None
+    if settings.creator_fetch_mode == FETCH_MODE_BROWSER:
+        fetcher, ready, refresh_task = await _start_browser_fetcher(
+            ctx, settings, worker_id,
+        )
+    else:
+        fetcher, ready = _start_http_fetcher(ctx, worker_id)
+    if not ready:
+        await fetcher.close()
+        return
+
+    queue: CreatorQueue = _build_queue(settings, worker_id, tiers)
+    if settings.creator_fetch_mode == FETCH_MODE_BROWSER:
+        # Only the browser collects video refs worth queueing.
+        video_queue_redis = redis_from_url(
+            settings.redis_dsn,
+            component='tiktok-creator-video-queue',
+            decode_responses=True,
+        )
+        video_queue = _build_video_queue(video_queue_redis)
+
+    shutdown_event: asyncio.Event = asyncio.Event()
     maintenance_task: asyncio.Task = asyncio.create_task(
         _maintenance_loop(
             queue, settings, worker_id, shutdown_event,
@@ -1629,8 +1917,8 @@ async def _run_worker(ctx: ScraperRunContext) -> None:
     _LOGGER.info(
         'TikTok creator active proxy selection complete',
         extra={
+            'fetch_mode': settings.creator_fetch_mode,
             'requested': len(ctx.proxies),
-            'selected': len(pool_proxies),
             'ready': len(ready),
             'active': len(active_proxies),
             'configured_concurrency': settings.creator_concurrency,
@@ -1646,7 +1934,7 @@ async def _run_worker(ctx: ScraperRunContext) -> None:
     worker_tasks: list[asyncio.Task] = [
         asyncio.create_task(
             _proxy_worker(
-                proxy, pool, queue, video_queue, fm, settings,
+                proxy, fetcher, queue, video_queue, fm, settings,
                 shutdown_event, worker_id, identity_maps,
             ),
         )
@@ -1660,14 +1948,16 @@ async def _run_worker(ctx: ScraperRunContext) -> None:
         await asyncio.gather(*worker_tasks)
     finally:
         shutdown_event.set()
-        refresh_task.cancel()
-        maintenance_task.cancel()
-        await asyncio.gather(
-            refresh_task, maintenance_task,
-            return_exceptions=True,
-        )
-        await video_queue._redis.aclose()
-        await pool.shutdown()
+        background: list[asyncio.Task] = [maintenance_task]
+        if refresh_task is not None:
+            background.append(refresh_task)
+        for task in background:
+            task.cancel()
+        await asyncio.gather(*background, return_exceptions=True)
+        if video_queue_redis is not None:
+            await video_queue_redis.aclose()
+            await close_backlog_clients()
+        await fetcher.close()
 
 
 def _build_tiktok_rate_limiter(
@@ -1727,7 +2017,9 @@ def main() -> None:
         split_proxy_pool=True,
         concurrency_env_var='TIKTOK_CREATOR_CONCURRENCY',
         child_concurrencies=child_concurrencies,
-        browser_tmpdir=True,
+        browser_tmpdir=(
+            settings.creator_fetch_mode == FETCH_MODE_BROWSER
+        ),
     )
     sys.exit(runner.run_sync(_run_worker))
 

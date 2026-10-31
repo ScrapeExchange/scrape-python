@@ -3,10 +3,11 @@
 '''
 TikTok video scrape daemon.
 
-Consumes TikTok video URLs from the platform-scoped Redis video queue,
-fetches one item payload per URL through the Camoufox-backed TikTok
-session pool, maps it to ``TikTokVideo``, and writes Brotli JSON
-records to disk.
+Consumes TikTok video ids from the TikTok video scrape queue
+(backlog-server queue ``tiktok:video`` when ``BACKLOG_SERVER_DSN`` is
+set, the Redis queue otherwise), fetches one item payload per id
+through the Camoufox-backed TikTok session pool, maps it to
+``TikTokVideo``, and writes Brotli JSON records to disk.
 
 Design: docs/superpowers/specs/
 2026-06-10-tiktok-video-scrape-tool-design.md
@@ -61,8 +62,12 @@ from scrape_exchange.tiktok import (
 from scrape_exchange.tiktok.settings import TikTokScraperSettings
 from scrape_exchange.tiktok.tiktok_session_pool import DIRECT_SESSION_PROXY
 from scrape_exchange.util import extract_proxy_ip, extract_proxy_port
+from scrape_exchange.video_queue_factory import (
+    close_backlog_clients,
+    make_video_scrape_queue,
+)
 from scrape_exchange.video_scrape_queue import (
-    RedisVideoScrapeQueue,
+    VideoScrapeQueue,
     VideoScrapeQueueSettings,
     VideoState,
 )
@@ -79,9 +84,14 @@ API_LABEL: str = 'tiktokapi'
 
 VIDEO_FILE_PREFIX: str = 'tiktok-video-'
 VIDEO_FILE_POSTFIX: str = '.json.br'
+# Queue entries are bare ids; URL entries predate that and are still
+# accepted.
 VIDEO_URL_RE: re.Pattern[str] = re.compile(
     r'https?://(?:www\.)?tiktok\.com/@[^/]+/video/([^/?#]+)'
 )
+# TikTok serves the video page for any handle, so the placeholder '_'
+# stands in for the author, who is not known from the id alone.
+VIDEO_PAGE_URL_TEMPLATE: str = 'https://www.tiktok.com/@_/video/{video_id}'
 
 _FD_TARGET: int = 1_048_576
 _REDIS_RETRY_INITIAL_SECONDS: float = 1.0
@@ -159,7 +169,7 @@ class VideoSettings(TikTokScraperSettings):
             'TIKTOK_VIDEO_QUEUE_BATCH', 'VIDEO_QUEUE_BATCH',
             'video_queue_batch',
         ),
-        description='Number of video URLs popped per Redis batch.',
+        description='Number of video ids popped per queue batch.',
     )
     video_queue_idle_poll_seconds: float = Field(
         default=2.0,
@@ -287,30 +297,35 @@ def _unwrap_video_payload(resp: dict) -> dict:
 
 
 def _video_id_from_ref(video_ref: str) -> str:
-    '''Return the item id from a queued TikTok video URL.'''
+    '''Return the item id of a queue entry: a bare id or a video URL.'''
+    if video_ref.isdigit():
+        return video_ref
     match: re.Match[str] | None = VIDEO_URL_RE.match(video_ref)
     if not match:
-        raise ValueError('TikTok video queue entries must be URLs')
+        raise ValueError(
+            'TikTok video queue entries must be video ids',
+        )
     return match.group(1)
 
 
 async def _fetch_video_payload(api: Any, video_ref: str) -> dict:
-    '''Fetch one TikTok item payload by queued video URL.'''
-    _video_id_from_ref(video_ref)
-    video_obj: Any = api.video(url=video_ref)
+    '''Fetch one TikTok item payload by queued video id.'''
+    video_id: str = _video_id_from_ref(video_ref)
+    video_obj: Any = api.video(id=video_id)
+    # info() reads the page at .url. Setting it directly skips the
+    # blocking HEAD request Video(url=...) makes to find the id.
+    video_obj.url = VIDEO_PAGE_URL_TEMPLATE.format(video_id=video_id)
     resp: dict | None = await video_obj.info()
     if resp is None:
         raise RuntimeError('TikTok returned an empty video info')
     return _unwrap_video_payload(resp)
 
 
-def _build_queue(settings: VideoSettings) -> RedisVideoScrapeQueue:
-    '''Build the TikTok video queue, which lives in Redis only.'''
-    redis = redis_from_url(
-        settings.redis_dsn,
-        component='tiktok-video-queue',
-        decode_responses=True,
-    )
+def _build_queue(
+    settings: VideoSettings, redis: Any,
+) -> VideoScrapeQueue:
+    '''Build the TikTok video queue: backlog-server when
+    ``BACKLOG_SERVER_DSN`` is set, else Redis through *redis*.'''
     queue_settings: VideoScrapeQueueSettings = (
         VideoScrapeQueueSettings(
             video_queue_batch=settings.video_queue_batch,
@@ -325,8 +340,11 @@ def _build_queue(settings: VideoSettings) -> RedisVideoScrapeQueue:
             ),
         )
     )
-    return RedisVideoScrapeQueue(
-        redis, queue_settings, platform=PLATFORM,
+    return make_video_scrape_queue(
+        platform=PLATFORM,
+        redis=redis,
+        settings=queue_settings,
+        component='tiktok-video-queue',
     )
 
 
@@ -358,7 +376,7 @@ _UNAVAILABLE_REASONS: frozenset[str] = frozenset({
 async def _scrape_one_queued(
     video_ref: str,
     *,
-    queue: RedisVideoScrapeQueue,
+    queue: VideoScrapeQueue,
     settings: VideoSettings,
     pool: TikTokSessionPool,
     proxy: str,
@@ -462,7 +480,7 @@ async def _scrape_one_queued(
 
 
 async def _queue_driven_loop(
-    queue: RedisVideoScrapeQueue,
+    queue: VideoScrapeQueue,
     settings: VideoSettings,
     pool: TikTokSessionPool,
     proxies: list[str],
@@ -533,7 +551,7 @@ async def _queue_driven_loop(
 
 
 async def _publish_video_queue_sizes(
-    queue: RedisVideoScrapeQueue,
+    queue: VideoScrapeQueue,
     *,
     interval: float = 30.0,
 ) -> None:
@@ -610,7 +628,12 @@ async def _run_worker(ctx: ScraperRunContext) -> None:
         await pool.shutdown()
         return
 
-    queue: RedisVideoScrapeQueue = _build_queue(settings)
+    queue_redis: Any = redis_from_url(
+        settings.redis_dsn,
+        component='tiktok-video-queue',
+        decode_responses=True,
+    )
+    queue: VideoScrapeQueue = _build_queue(settings, queue_redis)
     configured: int = settings.video_concurrency
     concurrency: int = configured if configured > 0 else len(ready)
     concurrency = max(1, min(concurrency, len(ready)))
@@ -641,7 +664,8 @@ async def _run_worker(ctx: ScraperRunContext) -> None:
             tasks.append(publisher_task)
         await asyncio.gather(*tasks, return_exceptions=True)
         await pool.shutdown()
-        await queue._redis.aclose()
+        await queue_redis.aclose()
+        await close_backlog_clients()
 
 
 def _build_tiktok_rate_limiter(

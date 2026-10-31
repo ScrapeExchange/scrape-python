@@ -1,6 +1,6 @@
 '''Pick the video scrape queue backend for a platform.
 
-The YouTube video queue lives in backlog-server when
+The YouTube and TikTok video queues live in backlog-server when
 ``BACKLOG_SERVER_DSN`` is set; every other case uses the Redis
 implementation.
 '''
@@ -21,6 +21,13 @@ from scrape_exchange.video_scrape_queue import (
     VideoScrapeQueue,
     VideoScrapeQueueSettings,
 )
+
+# backlog-server queue per platform. The server must declare each one
+# in BACKLOG_QUEUES with the matching codec.
+BACKLOG_QUEUE_NAMES: dict[str, str] = {
+    'youtube': 'youtube:video',
+    'tiktok': 'tiktok:video',
+}
 
 # One backlog-server client (and so one connection pool) per DSN and
 # event loop: callers such as the channel scraper build a queue per
@@ -67,14 +74,17 @@ def make_video_scrape_queue(
 
     :param redis: the caller's Redis client, used by the Redis backend
     :param settings: queue settings; ``backlog_server_dsn`` selects
-        backlog-server for YouTube
+        backlog-server for the platforms in ``BACKLOG_QUEUE_NAMES``
     :param component: client name for the backlog-server connection
     '''
-    if platform == 'youtube' and settings.backlog_server_dsn:
+    queue_name: str | None = BACKLOG_QUEUE_NAMES.get(platform)
+    if queue_name is not None and settings.backlog_server_dsn:
         server: aioredis.Redis = _backlog_client(
             settings.backlog_server_dsn, component,
         )
-        return BacklogServerVideoScrapeQueue(server, settings)
+        return BacklogServerVideoScrapeQueue(
+            server, settings, queue_name=queue_name,
+        )
     return RedisVideoScrapeQueue(redis, settings, platform=platform)
 
 

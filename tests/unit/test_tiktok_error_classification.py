@@ -121,6 +121,16 @@ class TestClassifier(unittest.TestCase):
             'transient',
         )
 
+    def test_transient_via_profile_http_error(self) -> None:
+        self.assertEqual(
+            classify_tiktok_error(
+                RuntimeError(
+                    'tiktok profile http error: ConnectError: refused',
+                ),
+            ),
+            'transient',
+        )
+
     def test_auth_via_ms_token_rejected(self) -> None:
         self.assertEqual(
             classify_tiktok_error(

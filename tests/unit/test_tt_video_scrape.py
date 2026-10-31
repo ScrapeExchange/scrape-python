@@ -209,7 +209,8 @@ class TestRunWorkerTopology(unittest.IsolatedAsyncioTestCase):
         pool.ready_proxies = MagicMock(return_value=proxies[:2])
 
         queue: MagicMock = MagicMock()
-        queue._redis.aclose = AsyncMock()
+        queue_redis: MagicMock = MagicMock()
+        queue_redis.aclose = AsyncMock()
 
         ctx: MagicMock = MagicMock()
         ctx.settings = _settings(video_concurrency=2)
@@ -228,6 +229,10 @@ class TestRunWorkerTopology(unittest.IsolatedAsyncioTestCase):
         ) as pool_cls, patch.object(
             tool, '_build_queue', return_value=queue,
         ), patch.object(
+            tool, 'redis_from_url', return_value=queue_redis,
+        ), patch.object(
+            tool, 'close_backlog_clients', AsyncMock(),
+        ) as close_backlog, patch.object(
             tool, '_queue_driven_loop', _noop_loop,
         ), patch.object(
             tool, 'AssetFileManagement',
@@ -240,7 +245,8 @@ class TestRunWorkerTopology(unittest.IsolatedAsyncioTestCase):
         )
         pool.bootstrap.assert_awaited_once()
         pool.shutdown.assert_awaited_once()
-        queue._redis.aclose.assert_awaited_once()
+        queue_redis.aclose.assert_awaited_once()
+        close_backlog.assert_awaited_once()
 
     async def test_no_configured_proxies_uses_direct_session(
         self,
@@ -254,7 +260,8 @@ class TestRunWorkerTopology(unittest.IsolatedAsyncioTestCase):
         )
 
         queue: MagicMock = MagicMock()
-        queue._redis.aclose = AsyncMock()
+        queue_redis: MagicMock = MagicMock()
+        queue_redis.aclose = AsyncMock()
 
         ctx: MagicMock = MagicMock()
         ctx.settings = _settings(video_concurrency=0)
@@ -283,6 +290,10 @@ class TestRunWorkerTopology(unittest.IsolatedAsyncioTestCase):
         ) as pool_cls, patch.object(
             tool, '_build_queue', return_value=queue,
         ), patch.object(
+            tool, 'redis_from_url', return_value=queue_redis,
+        ), patch.object(
+            tool, 'close_backlog_clients', AsyncMock(),
+        ) as close_backlog, patch.object(
             tool, '_queue_driven_loop', _capture_loop,
         ), patch.object(
             tool, 'AssetFileManagement',
@@ -295,7 +306,8 @@ class TestRunWorkerTopology(unittest.IsolatedAsyncioTestCase):
         )
         pool.bootstrap.assert_awaited_once()
         pool.shutdown.assert_awaited_once()
-        queue._redis.aclose.assert_awaited_once()
+        queue_redis.aclose.assert_awaited_once()
+        close_backlog.assert_awaited_once()
 
 
 class TestRedisRetry(unittest.IsolatedAsyncioTestCase):
@@ -369,7 +381,13 @@ class TestPayloadFetch(unittest.IsolatedAsyncioTestCase):
             'tiktok-video-123.json.br',
         )
 
-    def test_video_id_from_ref_requires_url(self) -> None:
+    def test_video_id_from_ref_accepts_ids_and_legacy_urls(
+        self,
+    ) -> None:
+        self.assertEqual(
+            tool._video_id_from_ref('7000000000000000001'),
+            '7000000000000000001',
+        )
         self.assertEqual(
             tool._video_id_from_ref(
                 'https://www.tiktok.com/@charli/video/'
@@ -378,7 +396,7 @@ class TestPayloadFetch(unittest.IsolatedAsyncioTestCase):
             '7000000000000000001',
         )
         with self.assertRaises(ValueError):
-            tool._video_id_from_ref('7000000000000000001')
+            tool._video_id_from_ref('not-a-video')
 
     def test_unwraps_item_info_shape(self) -> None:
         payload: dict = _payload()
@@ -406,7 +424,9 @@ class TestPayloadFetch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload['id'], '7000000000000000001')
         api.video.assert_called_once()
 
-    async def test_fetch_video_payload_prefers_url_fetch(self) -> None:
+    async def test_fetch_video_payload_by_id_reads_placeholder_page(
+        self,
+    ) -> None:
         api: MagicMock = MagicMock()
         video_obj: MagicMock = MagicMock()
         video_obj.info = AsyncMock(
@@ -417,19 +437,43 @@ class TestPayloadFetch(unittest.IsolatedAsyncioTestCase):
         api.video = MagicMock(return_value=video_obj)
 
         payload: dict = await tool._fetch_video_payload(
+            api, '7000000000000000001',
+        )
+
+        self.assertEqual(payload['id'], '7000000000000000001')
+        # By id, so TikTokApi does not HEAD the URL to find the id.
+        api.video.assert_called_once_with(id='7000000000000000001')
+        self.assertEqual(
+            video_obj.url,
+            'https://www.tiktok.com/@_/video/7000000000000000001',
+        )
+        video_obj.info.assert_awaited_once()
+
+    async def test_fetch_video_payload_legacy_url_entry(self) -> None:
+        api: MagicMock = MagicMock()
+        video_obj: MagicMock = MagicMock()
+        video_obj.info = AsyncMock(return_value={'itemStruct': _payload()})
+        api.video = MagicMock(return_value=video_obj)
+
+        await tool._fetch_video_payload(
             api,
             'https://www.tiktok.com/@charlidamelio/video/'
             '7000000000000000001',
         )
 
-        self.assertEqual(payload['id'], '7000000000000000001')
-        api.video.assert_called_once_with(
-            url=(
-                'https://www.tiktok.com/@charlidamelio/video/'
-                '7000000000000000001'
-            ),
-        )
-        video_obj.info.assert_awaited_once()
+        api.video.assert_called_once_with(id='7000000000000000001')
+
+    def test_build_queue_uses_factory(self) -> None:
+        redis: MagicMock = MagicMock()
+        sentinel: object = object()
+        with patch.object(
+            tool, 'make_video_scrape_queue', return_value=sentinel,
+        ) as factory:
+            queue: object = tool._build_queue(_settings(), redis)
+        self.assertIs(queue, sentinel)
+        kwargs: dict = factory.call_args.kwargs
+        self.assertEqual(kwargs['platform'], 'tiktok')
+        self.assertIs(kwargs['redis'], redis)
 
 
 class TestScrapeOneQueued(unittest.IsolatedAsyncioTestCase):

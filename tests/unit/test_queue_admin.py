@@ -8,7 +8,7 @@ RedisCreatorQueue).
 import os
 import tempfile
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 try:
     import fakeredis.aioredis
@@ -344,7 +344,7 @@ class TestRegistry(unittest.TestCase):
             queue_admin, 'redis_from_url',
             return_value=MagicMock(),
         ), patch.object(
-            queue_admin, 'RedisVideoScrapeQueue',
+            queue_admin, 'make_video_scrape_queue',
             return_value=fake_queue,
         ) as rq:
             adapter = queue_admin.get_adapter(
@@ -355,6 +355,37 @@ class TestRegistry(unittest.TestCase):
         )
         rq.assert_called_once()
 
+
+
+class TestTikTokVideoAdapterOnBacklogServer(
+    unittest.IsolatedAsyncioTestCase,
+):
+
+    async def test_search_falls_back_to_exact_id(self) -> None:
+        queue: MagicMock = MagicMock()
+        queue.get_meta = AsyncMock(return_value={'state': 'queued'})
+        queue.search_meta = AsyncMock(
+            side_effect=queue_admin.BacklogServerUnsupported('no'),
+        )
+        adapter = queue_admin.TikTokVideoQueueAdapter(queue, MagicMock())
+        hits: list[dict] = await adapter.search(
+            'https://www.tiktok.com/@a/video/7000000000000000001', 10,
+        )
+        self.assertEqual(
+            hits,
+            [{'video_id': '7000000000000000001', 'state': 'queued'}],
+        )
+
+    async def test_close_closes_redis_and_backlog_clients(self) -> None:
+        redis: MagicMock = MagicMock()
+        redis.aclose = AsyncMock()
+        adapter = queue_admin.TikTokVideoQueueAdapter(MagicMock(), redis)
+        with patch.object(
+            queue_admin, 'close_backlog_clients', AsyncMock(),
+        ) as close_backlog:
+            await adapter.close()
+        redis.aclose.assert_awaited_once()
+        close_backlog.assert_awaited_once()
 
 if __name__ == '__main__':
     unittest.main()

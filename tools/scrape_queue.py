@@ -26,6 +26,7 @@ from pydantic_settings import (
     SettingsConfigDict,
 )
 
+from scrape_exchange.backlog_server_queue import BacklogServerUnsupported
 from scrape_exchange.onlyfans.settings import DEFAULT_PRIORITY_QUEUES
 from scrape_exchange.queue_admin import (
     ImportReport,
@@ -342,6 +343,13 @@ async def main_async(argv: list[str]) -> int:
 
     try:
         return await _HANDLERS[ns.command](adapter, ns)
+    except BacklogServerUnsupported:
+        print(
+            f'{ns.command} is not supported for {ns.platform}/'
+            f'{ns.entity} when BACKLOG_SERVER_DSN is set',
+            file=sys.stderr,
+        )
+        return 2
     finally:
         await adapter.close()
 

@@ -100,7 +100,6 @@ from scrape_exchange.upload import (
 )
 from scrape_exchange.video_queue_factory import make_video_scrape_queue
 from scrape_exchange.video_scrape_queue import (
-    RedisVideoScrapeQueue,
     VideoScrapeQueue,
     VideoScrapeQueueSettings,
 )
@@ -1032,7 +1031,7 @@ class InstagramCreatorProcessor(AssetProcessor):
 
 @dataclass(frozen=True)
 class TikTokVideoProcessorState:
-    scrape_queue: RedisVideoScrapeQueue | None
+    scrape_queue: VideoScrapeQueue | None
 
 
 class TikTokVideoProcessor(AssetProcessor):
@@ -1058,10 +1057,11 @@ class TikTokVideoProcessor(AssetProcessor):
             VideoScrapeQueueSettings()
         )
         return TikTokVideoProcessorState(
-            scrape_queue=RedisVideoScrapeQueue(
-                redis,
-                queue_settings,
+            scrape_queue=make_video_scrape_queue(
                 platform='tiktok',
+                redis=redis,
+                settings=queue_settings,
+                component='scrape-upload-tiktok-video-queue',
             ),
         )
 

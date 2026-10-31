@@ -307,5 +307,102 @@ class TestBacklogServer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await q.pop(10), ids)
 
 
+
+TWO_QUEUES: str = 'youtube:video=youtube_video,tiktok:video=tiktok_video'
+
+
+@unittest.skipUnless(BIN.exists(), f'backlog-server binary not at {BIN}')
+class TestTikTokQueue(unittest.IsolatedAsyncioTestCase):
+    '''The tiktok:video queue (codec tiktok_video) next to YouTube.'''
+
+    # Same fixtures as TestBacklogServer, without rerunning its tests.
+    setUp = TestBacklogServer.setUp
+    asyncTearDown = TestBacklogServer.asyncTearDown
+    tearDown = TestBacklogServer.tearDown
+    server = TestBacklogServer.server
+    async_client = TestBacklogServer.async_client
+    queue = TestBacklogServer.queue
+
+    def tiktok_queue(self, s: Server) -> BacklogServerVideoScrapeQueue:
+        return BacklogServerVideoScrapeQueue(
+            self.async_client(s, 'integration-test'),
+            VideoScrapeQueueSettings(),
+            queue_name='tiktok:video',
+        )
+
+    async def test_tiktok_ids_roundtrip_beside_youtube(self) -> None:
+        s: Server = self.server(BACKLOG_QUEUES=TWO_QUEUES)
+        tt: BacklogServerVideoScrapeQueue = self.tiktok_queue(s)
+        yt: BacklogServerVideoScrapeQueue = self.queue(s)
+        ids: list[str] = ['7691750271394827541', '7518591945837448504']
+        self.assertEqual(await tt.enqueue_many(ids, source='test'), 2)
+        self.assertEqual(await tt.enqueue_many(ids, source='test'), 0)
+        self.assertEqual(await yt.enqueue('dQw4w9WgXcQ', source='t'), True)
+        # A URL, a leading zero or a YouTube id is not a TikTok id.
+        for bad in (
+            'https://www.tiktok.com/@a/video/7691750271394827541',
+            '0123', 'dQw4w9WgXcQ',
+        ):
+            with self.assertRaises(ValueError):
+                await tt.enqueue(bad, source='test')
+        states: dict = await tt.get_states([*ids, '42'])
+        self.assertEqual(
+            [states[v] for v in ids], [VideoState.QUEUED] * 2,
+        )
+        self.assertIsNone(states['42'])
+        popped: list[str] = await tt.pop(10)
+        self.assertEqual(sorted(popped), sorted(ids))
+        await tt.complete(ids[0])
+        await tt.mark(ids[1], state=VideoState.UNAVAILABLE,
+                      last_error='unavailable')
+        counts: dict[VideoState, int] = await tt.count_by_state()
+        self.assertEqual(counts[VideoState.UNAVAILABLE], 1)
+        self.assertEqual(counts[VideoState.QUEUED], 0)
+        yt_counts: dict[VideoState, int] = await yt.count_by_state()
+        self.assertEqual(yt_counts[VideoState.QUEUED], 1)
+
+    async def test_import_builds_tiktok_queue(self) -> None:
+        src: Path = Path(self.tmp.name) / 'export'
+        src.mkdir()
+        (src / 'scraped.txt').write_text('7000000000000000003\n')
+        # As tt_video_queue_migrate.py writes them; the scraped id
+        # wins over its queued line.
+        (src / 'queued.tsv').write_text(
+            '7000000000000000001\t1700000000\n'
+            '7000000000000000002\t0\n'
+            '7000000000000000003\t1700000001\n',
+        )
+        (src / 'terminal.tsv').write_text(
+            '7000000000000000004\tfailed\trate_limit\t1700000002\n',
+        )
+        done: subprocess.CompletedProcess[str] = await asyncio.to_thread(
+            subprocess.run,
+            [
+                str(BIN), 'import',
+                '--data-dir', str(self.data),
+                '--queue', 'tiktok:video',
+                '--codec', 'tiktok_video',
+                '--scraped', str(src / 'scraped.txt'),
+                '--queued', str(src / 'queued.tsv'),
+                '--terminal', str(src / 'terminal.tsv'),
+                '--memory-limit-gb', '0.1',
+            ],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        self.assertEqual(done.returncode, 0, done.stderr)
+        s: Server = self.server(BACKLOG_QUEUES=TWO_QUEUES)
+        tt: BacklogServerVideoScrapeQueue = self.tiktok_queue(s)
+        counts: dict[VideoState, int] = await tt.count_by_state()
+        self.assertEqual(counts[VideoState.QUEUED], 2)
+        self.assertEqual(counts[VideoState.FAILED], 1)
+        # Front first: enqueued_at 0 before 1700000000.
+        self.assertEqual(
+            await tt.pop(10),
+            ['7000000000000000002', '7000000000000000001'],
+        )
+        self.assertFalse(
+            await tt.enqueue('7000000000000000003', source='test'),
+        )
+
 if __name__ == '__main__':
     unittest.main()

@@ -315,7 +315,8 @@ class VideoScrapeQueueSettings(BaseSettings):
         description=(
             'Redis-protocol URL of backlog-server, e.g. '
             'redis://:<password>@<host>:6390/0. When set, the YouTube '
-            'video queue lives in backlog-server instead of Redis.'
+            'and TikTok video queues live in backlog-server instead '
+            'of Redis.'
         ),
     )
 

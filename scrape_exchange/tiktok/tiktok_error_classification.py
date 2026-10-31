@@ -70,6 +70,7 @@ _ERROR_PATTERNS: list[tuple[str, list[str]]] = [
     ('transient', [
         'invalid tiktok profile identity response',
         'invalid tiktok video list response',
+        'tiktok profile http error',
         'timeout',
         'connection reset',
         'connection refused',
