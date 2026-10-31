@@ -424,22 +424,24 @@ class TestCreatorEnqueuer(unittest.IsolatedAsyncioTestCase):
             mod.CreatorEnqueuer(_resolve_settings(redis_dsn=None))
 
 
-class TestFilterQueuedVideoIds(unittest.IsolatedAsyncioTestCase):
+class TestFilterKnownVideoIds(unittest.IsolatedAsyncioTestCase):
 
-    async def test_drops_queued_ids_in_batches(self) -> None:
+    async def test_drops_every_known_state_in_batches(self) -> None:
         queue: mock.MagicMock = mock.MagicMock()
 
         async def _states(ids: list[str]) -> dict[str, Any]:
             return {
-                video_id: (
-                    mod.VideoState.QUEUED if video_id in ('2', '4')
-                    else mod.VideoState.FAILED if video_id == '3'
-                    else None
-                )
+                video_id: {
+                    '2': 'queued',
+                    '3': 'scraped',
+                    '4': 'failed',
+                    '6': 'unavailable',
+                    '7': 'removed',
+                }.get(video_id)
                 for video_id in ids
             }
 
-        queue.get_states = mock.AsyncMock(side_effect=_states)
+        queue.get_state_names = mock.AsyncMock(side_effect=_states)
         redis: mock.MagicMock = mock.MagicMock()
         redis.aclose = mock.AsyncMock()
         with mock.patch.object(
@@ -451,13 +453,18 @@ class TestFilterQueuedVideoIds(unittest.IsolatedAsyncioTestCase):
         ) as close_backlog, mock.patch.object(
             mod, 'VIDEO_QUEUE_STATE_BATCH', 2,
         ):
-            remaining: list[int] = await mod.filter_queued_video_ids(
-                'redis://x', [1, 2, 3, 4, 5],
+            remaining, skipped = await mod.filter_known_video_ids(
+                'redis://x', [1, 2, 3, 4, 5, 6, 7],
             )
 
-        # Only QUEUED is skipped; failed and unknown ids are fetched.
-        self.assertEqual(remaining, [1, 3, 5])
-        self.assertEqual(queue.get_states.await_count, 3)
+        # Every state the queue reports is skipped; only ids it has
+        # never seen are fetched.
+        self.assertEqual(remaining, [1, 5])
+        self.assertEqual(skipped, {
+            'queued': 1, 'scraped': 1, 'failed': 1,
+            'unavailable': 1, 'removed': 1,
+        })
+        self.assertEqual(queue.get_state_names.await_count, 4)
         self.assertEqual(factory.call_args.kwargs['platform'], 'tiktok')
         redis.aclose.assert_awaited_once()
         close_backlog.assert_awaited_once()
@@ -502,8 +509,8 @@ class TestRunQueueing(unittest.IsolatedAsyncioTestCase):
                 input_file=input_file, processed_file=processed_file,
             )
             with mock.patch.object(
-                mod, 'filter_queued_video_ids',
-                mock.AsyncMock(return_value=[1, 3]),
+                mod, 'filter_known_video_ids',
+                mock.AsyncMock(return_value=([1, 3], {'scraped': 1})),
             ), mock.patch.object(
                 mod, 'TikTokRateLimiter',
             ), mock.patch.object(

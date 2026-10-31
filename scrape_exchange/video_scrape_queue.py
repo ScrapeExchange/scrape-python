@@ -374,6 +374,31 @@ class VideoScrapeQueue(ABC):
     ) -> VideoState | None: ...
 
     @abstractmethod
+    async def get_states(
+        self, video_ids: list[str],
+    ) -> dict[str, VideoState | None]: ...
+
+    async def get_state_names(
+        self, video_ids: list[str],
+    ) -> dict[str, str | None]:
+        '''State name per id, as the backend reports it.
+
+        :meth:`get_states` collapses the backlog server's
+        ``scraped`` state to ``None`` so every backend looks the
+        same (Redis forgets a completed video). Callers that must
+        tell a finished video from an unknown one use this instead:
+        the default derives the name from :meth:`get_states`, and
+        a backend that remembers completions overrides it.
+        '''
+        states: dict[str, VideoState | None] = await self.get_states(
+            video_ids,
+        )
+        return {
+            video_id: None if state is None else state.value
+            for video_id, state in states.items()
+        }
+
+    @abstractmethod
     async def get_meta(
         self, video_id: str,
     ) -> dict[str, str]: ...

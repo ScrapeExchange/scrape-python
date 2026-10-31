@@ -16,9 +16,14 @@ Every username is added to the TikTok creator scrape queue -- the same
 scraper picks creators up while the run is still going. A creator that
 is already queued, being scraped or excluded is left alone.
 
-Before fetching anything, ids already queued in the TikTok video
-scrape queue (backlog-server or Redis, as ``tt_video_scrape.py`` uses
-it) are skipped.
+Before fetching anything, ids the TikTok video scrape queue already
+knows are skipped, whatever state it reports: ``queued`` (still to be
+scraped), ``scraped`` (only the backlog-server backend remembers
+completions -- the Redis backend forgets a completed video, so there it
+can only skip what is queued), and the terminal ``failed`` /
+``unavailable`` / ``removed``. Re-resolving a settled id cannot change
+its outcome and the queue would refuse the video anyway. Ids the queue
+has never seen are the only ones fetched.
 
 Examples::
 
@@ -95,7 +100,6 @@ from scrape_exchange.video_queue_factory import (
 from scrape_exchange.video_scrape_queue import (
     VideoScrapeQueue,
     VideoScrapeQueueSettings,
-    VideoState,
 )
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
@@ -108,6 +112,11 @@ QUEUE_PLATFORM: str = 'tiktok'
 QUEUE_NAMESPACE: str = 'scrape'
 # Video ids looked up per video scrape queue state request.
 VIDEO_QUEUE_STATE_BATCH: int = 1000
+
+# Video queue states that make an id pointless to resolve: the video is
+# either waiting to be scraped or has already been scraped.
+VIDEO_STATE_QUEUED: str = 'queued'
+VIDEO_STATE_SCRAPED: str = 'scraped'
 
 _DEFAULT_USER_AGENT: str = (
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
@@ -697,11 +706,22 @@ class CreatorEnqueuer:
         await self._queue._redis.aclose()
 
 
-async def filter_queued_video_ids(
+async def filter_known_video_ids(
     redis_dsn: str, video_ids: list[int],
-) -> list[int]:
-    '''Return *video_ids* minus those queued in the TikTok video
-    scrape queue, in their original order.'''
+) -> tuple[list[int], dict[str, int]]:
+    '''Split *video_ids* into the ones worth fetching and the ones the
+    TikTok video scrape queue already knows.
+
+    Any id the queue reports a state for is dropped: ``queued`` (it is
+    going to be scraped), ``scraped`` (only the backlog-server backend
+    remembers completions), and the terminal ``failed`` /
+    ``unavailable`` / ``removed``. Re-resolving an id the queue already
+    settled cannot change its outcome, and the queue would reject the
+    video anyway.
+
+    :returns: (remaining ids in their original order, skipped counts
+        keyed by queue state)
+    '''
     redis: Any = redis_from_url(
         redis_dsn,
         component='tiktok-resolve-video-queue',
@@ -714,22 +734,25 @@ async def filter_queued_video_ids(
         component='tiktok-resolve-video-queue',
     )
     remaining: list[int] = []
+    skipped: dict[str, int] = {}
     try:
         for start in range(0, len(video_ids), VIDEO_QUEUE_STATE_BATCH):
             chunk: list[int] = video_ids[
                 start:start + VIDEO_QUEUE_STATE_BATCH
             ]
-            states: dict[str, VideoState | None] = (
-                await queue.get_states([str(v) for v in chunk])
+            states: dict[str, str | None] = await queue.get_state_names(
+                [str(v) for v in chunk],
             )
-            remaining.extend(
-                video_id for video_id in chunk
-                if states.get(str(video_id)) is not VideoState.QUEUED
-            )
+            for video_id in chunk:
+                state: str | None = states.get(str(video_id))
+                if state is None:
+                    remaining.append(video_id)
+                    continue
+                skipped[state] = skipped.get(state, 0) + 1
     finally:
         await redis.aclose()
         await close_backlog_clients()
-    return remaining
+    return remaining, skipped
 
 
 async def run(settings: ResolveSettings) -> int:
@@ -756,15 +779,25 @@ async def run(settings: ResolveSettings) -> int:
                 },
             )
             ids = remaining
-    queued_videos: int = 0
+    skipped_queue: dict[str, int] = {}
     if settings.redis_dsn:
-        remaining = await filter_queued_video_ids(
+        remaining, skipped_queue = await filter_known_video_ids(
             settings.redis_dsn, ids,
         )
-        queued_videos = len(ids) - len(remaining)
+        skipped_total: int = sum(skipped_queue.values())
         _LOGGER.info(
-            'Skipping video ids already in the video scrape queue',
-            extra={'skipped': queued_videos},
+            'Skipping video ids the video scrape queue already knows',
+            extra={
+                'skipped': skipped_total,
+                'queued': skipped_queue.get(VIDEO_STATE_QUEUED, 0),
+                'scraped': skipped_queue.get(VIDEO_STATE_SCRAPED, 0),
+                'terminal': skipped_total - sum(
+                    skipped_queue.get(state, 0)
+                    for state in (
+                        VIDEO_STATE_QUEUED, VIDEO_STATE_SCRAPED,
+                    )
+                ),
+            },
         )
         ids = remaining
     else:
@@ -775,7 +808,9 @@ async def run(settings: ResolveSettings) -> int:
         print(
             f'no video ids to resolve '
             f'({already_done} already processed, '
-            f'{queued_videos} in the video scrape queue)',
+            f'{sum(skipped_queue.values())} known to the '
+            f'video scrape queue: '
+            f'{skipped_queue or "none"})',
             file=sys.stderr,
         )
         return 1
@@ -893,7 +928,8 @@ async def run(settings: ResolveSettings) -> int:
         'transient': counts.get(STATUS_TRANSIENT, 0),
         'errors': counts.get(STATUS_ERROR, 0),
         'skipped_processed': already_done,
-        'skipped_video_queue': queued_videos,
+        'skipped_video_queue': sum(skipped_queue.values()),
+        'skipped_queue_states': skipped_queue,
         'unique_creators': len(usernames),
         'queued_new': enqueuer.added if enqueuer is not None else 0,
         'queue_existing': (

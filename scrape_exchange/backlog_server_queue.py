@@ -64,7 +64,9 @@ def _text(value: Any) -> str:
 
 def _state(value: Any) -> VideoState | None:
     '''Server state name -> VideoState. ``scraped`` maps to None, as a
-    completed video is unknown to the Redis queue too.'''
+    completed video is unknown to the Redis queue too. Use
+    :meth:`BacklogServerVideoScrapeQueue.get_state_names` when the
+    difference between scraped and unknown matters.'''
     if value is None:
         return None
     name: str = _text(value)
@@ -274,6 +276,25 @@ class BacklogServerVideoScrapeQueue(VideoScrapeQueue):
         reply: list[Any] = await self._cmd('STATE', *ids)
         return {
             video_id: _state(value)
+            for video_id, value in zip(ids, reply, strict=True)
+        }
+
+    async def get_state_names(
+        self, video_ids: list[str],
+    ) -> dict[str, str | None]:
+        '''Verbatim server state names, ``scraped`` included.
+
+        :meth:`get_states` hides ``scraped`` (a completed video is
+        unknown to the Redis queue, and callers must not see two
+        different worlds); the server keeps it, so this reports what
+        it actually holds.
+        '''
+        ids: list[str] = list(video_ids)
+        if not ids:
+            return {}
+        reply: list[Any] = await self._cmd('STATE', *ids)
+        return {
+            video_id: None if value is None else _text(value)
             for video_id, value in zip(ids, reply, strict=True)
         }
 

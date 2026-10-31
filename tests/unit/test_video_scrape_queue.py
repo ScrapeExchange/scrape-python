@@ -550,6 +550,23 @@ class TestGetStates(_RedisQueueTestBase):
     async def test_get_states_empty(self) -> None:
         self.assertEqual(await self.queue.get_states([]), {})
 
+    async def test_state_names_are_the_enum_values(self) -> None:
+        await self.queue.enqueue('aaa', source='rss')
+        await self.queue.mark('bbb', state=VideoState.FAILED)
+        names: dict[str, str | None] = await self.queue.get_state_names(
+            ['aaa', 'bbb', 'ccc'],
+        )
+        # Redis forgets a completed video, so it cannot report
+        # 'scraped'; a known id is still named by its queue state.
+        self.assertEqual(
+            names, {'aaa': 'queued', 'bbb': 'failed', 'ccc': None},
+        )
+        await self.queue.complete('aaa')
+        done: dict[str, str | None] = await self.queue.get_state_names(
+            ['aaa'],
+        )
+        self.assertEqual(done, {'aaa': None})
+
 
 class TestTerminalMetaTtl(_RedisQueueTestBase):
     '''Terminal marks arm a TTL on the meta hash; reviving the

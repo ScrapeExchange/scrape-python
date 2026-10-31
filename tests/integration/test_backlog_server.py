@@ -355,6 +355,13 @@ class TestTikTokQueue(unittest.IsolatedAsyncioTestCase):
         await tt.complete(ids[0])
         await tt.mark(ids[1], state=VideoState.UNAVAILABLE,
                       last_error='unavailable')
+        # The server keeps the completed id as 'scraped', which
+        # get_states hides and get_state_names reports.
+        self.assertIsNone((await tt.get_states([ids[0]]))[ids[0]])
+        self.assertEqual(
+            await tt.get_state_names([*ids, '42']),
+            {ids[0]: 'scraped', ids[1]: 'unavailable', '42': None},
+        )
         counts: dict[VideoState, int] = await tt.count_by_state()
         self.assertEqual(counts[VideoState.UNAVAILABLE], 1)
         self.assertEqual(counts[VideoState.QUEUED], 0)
