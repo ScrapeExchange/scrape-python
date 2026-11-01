@@ -1,5 +1,6 @@
 '''Unit tests for tools/tt_creator_resolve.py.'''
 
+import asyncio
 import json
 import tempfile
 import unittest
@@ -626,6 +627,117 @@ class TestRunQueueing(unittest.IsolatedAsyncioTestCase):
             enqueuer.add.assert_not_awaited()
             self.assertEqual(processed_file.read_text(), '1\n')
 
+
+
+class TestRunWorkerPool(unittest.IsolatedAsyncioTestCase):
+
+    def _settings(self, tmp: str, ids: int) -> mod.ResolveSettings:
+        input_file: Path = Path(tmp) / 'ids.lst'
+        input_file.write_text(
+            ''.join(f'{7000000000000000000 + n}\n' for n in range(ids)),
+        )
+        settings: mod.ResolveSettings = _resolve_settings(
+            input_file=input_file,
+            processed_file=Path(tmp) / 'done.lst',
+            concurrency=3,
+            dry_run=True,
+        )
+        object.__setattr__(
+            settings, 'proxies',
+            ('http://p1:1', 'http://p2:2', 'http://p3:3'),
+        )
+        return settings
+
+    def _patches(self, resolver_cls: type) -> Any:
+        return (
+            mock.patch.object(
+                mod, 'filter_known_video_ids',
+                mock.AsyncMock(side_effect=lambda dsn, ids: (ids, {})),
+            ),
+            mock.patch.object(mod, 'TikTokRateLimiter'),
+            mock.patch.object(mod, 'Resolver', resolver_cls),
+            mock.patch('builtins.print'),
+        )
+
+    async def test_only_concurrency_tasks_exist(self) -> None:
+        active: int = 0
+        peak: int = 0
+        peak_tasks: int = 0
+        calls: list[int] = []
+
+        class _Resolver:
+            def __init__(self, *args: Any) -> None:
+                pass
+
+            async def resolve(self, video_id: int) -> mod.Resolution:
+                nonlocal active, peak, peak_tasks
+                active += 1
+                peak = max(peak, active)
+                peak_tasks = max(peak_tasks, len(asyncio.all_tasks()))
+                calls.append(video_id)
+                await asyncio.sleep(0)
+                active -= 1
+                return mod.Resolution(
+                    video_id=video_id, status=mod.STATUS_UNAVAILABLE,
+                )
+
+            async def close(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings: mod.ResolveSettings = self._settings(tmp, 60)
+            p1, p2, p3, p4 = self._patches(_Resolver)
+            with p1, p2, p3, p4, self.assertLogs(
+                'tools.tt_creator_resolve', level='INFO',
+            ):
+                exit_code: int = await mod.run(settings)
+            logged: list[str] = (
+                Path(tmp, 'done.lst').read_text().splitlines()
+            )
+
+        self.assertEqual(exit_code, 1)  # nothing resolved
+        self.assertEqual(len(calls), 60)
+        self.assertEqual(len(set(calls)), 60)
+        self.assertEqual(len(logged), 60)
+        self.assertLessEqual(peak, 3)
+        # Three workers plus the test's own task, not one per id.
+        self.assertLessEqual(peak_tasks, 4)
+
+    async def test_worker_crash_stops_the_others_before_closing(
+        self,
+    ) -> None:
+        closed_while_running: list[bool] = []
+        running: int = 0
+
+        class _Resolver:
+            def __init__(self, *args: Any) -> None:
+                pass
+
+            async def resolve(self, video_id: int) -> mod.Resolution:
+                nonlocal running
+                running += 1
+                try:
+                    # One of the first three ids, so a worker reaches
+                    # it while the other two are mid-request.
+                    if video_id == 7000000000000000001:
+                        raise RuntimeError('boom')
+                    await asyncio.sleep(3600)
+                finally:
+                    running -= 1
+                raise AssertionError('unreachable')
+
+            async def close(self) -> None:
+                closed_while_running.append(running > 0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings: mod.ResolveSettings = self._settings(tmp, 10)
+            p1, p2, p3, p4 = self._patches(_Resolver)
+            with p1, p2, p3, p4, self.assertLogs(
+                'tools.tt_creator_resolve', level='INFO',
+            ), self.assertRaises(RuntimeError):
+                await mod.run(settings)
+
+        self.assertEqual(closed_while_running, [False])
 
 if __name__ == '__main__':
     unittest.main()

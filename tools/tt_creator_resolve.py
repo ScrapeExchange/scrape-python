@@ -75,6 +75,7 @@ import random
 import re
 import signal
 import sys
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -905,24 +906,53 @@ async def run(settings: ResolveSettings) -> int:
         },
     )
 
-    semaphore: asyncio.Semaphore = asyncio.Semaphore(concurrency)
-    results: list[Resolution] = []
+    counts: dict[str, int] = {}
+    usernames: set[str] = set()
+    done: int = 0
     interrupted: bool = False
     processed: ProcessedLog | None = (
         ProcessedLog(settings.processed_file)
         if settings.processed_file is not None else None
     )
 
-    async def one(video_id: int) -> Resolution:
-        async with semaphore:
-            return await resolver.resolve(video_id)
+    async def record(result: Resolution) -> None:
+        '''Count, log and queue one finished id; nothing is kept.'''
+        nonlocal done
+        done += 1
+        counts[result.status] = counts.get(result.status, 0) + 1
+        if result.status == STATUS_RESOLVED and result.username:
+            usernames.add(result.username)
+        if settings.output_file is not None:
+            append_record(settings.output_file, result)
+        queued: bool = True
+        if (
+            enqueuer is not None
+            and result.status == STATUS_RESOLVED
+            and result.username
+        ):
+            queued = await enqueuer.add(result.username)
+        # Transient outcomes are not recorded: they exhausted their
+        # retries but are worth another attempt on a later run.
+        # Neither is a creator Redis would not take.
+        if (
+            processed is not None
+            and result.status != STATUS_TRANSIENT
+            and queued
+        ):
+            processed.record(result.video_id)
 
-    # Real tasks, not bare coroutines: an interrupt then cancels work
-    # that is actually scheduled instead of leaving un-awaited
-    # coroutine objects behind.
-    tasks: list[asyncio.Task[Resolution]] = [
-        asyncio.create_task(one(video_id), name=f'resolve-{video_id}')
-        for video_id in ids
+    pending: Iterator[int] = iter(ids)
+
+    async def worker() -> None:
+        # Workers share one iterator, so only `concurrency` tasks exist
+        # however long the input is. A task per id cost ~1.4 KB each
+        # (3.5 GB for 1.6M ids) and made Ctrl-C quadratic.
+        for video_id in pending:
+            await record(await resolver.resolve(video_id))
+
+    workers: list[asyncio.Task[None]] = [
+        asyncio.create_task(worker(), name=f'resolve-worker-{index}')
+        for index in range(concurrency)
     ]
     # Turn Ctrl-C into a cancellation of this coroutine so the partial
     # results are summarised and the HTTP clients are closed; without
@@ -934,52 +964,24 @@ async def run(settings: ResolveSettings) -> int:
         with contextlib.suppress(NotImplementedError, RuntimeError):
             loop.add_signal_handler(signal.SIGINT, main_task.cancel)
     try:
-        for finished in asyncio.as_completed(tasks):
-            result: Resolution = await finished
-            results.append(result)
-            if settings.output_file is not None:
-                append_record(settings.output_file, result)
-            queued: bool = True
-            if (
-                enqueuer is not None
-                and result.status == STATUS_RESOLVED
-                and result.username
-            ):
-                queued = await enqueuer.add(result.username)
-            # Transient outcomes are not recorded: they exhausted their
-            # retries but are worth another attempt on a later run.
-            # Neither is a creator Redis would not take.
-            if (
-                processed is not None
-                and result.status != STATUS_TRANSIENT
-                and queued
-            ):
-                processed.record(result.video_id)
+        await asyncio.gather(*workers)
     except asyncio.CancelledError:
         interrupted = True
-        for task in tasks:
-            task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await asyncio.gather(*tasks, return_exceptions=True)
     finally:
+        # Also on a worker crash: stop the others before the clients
+        # they use are closed.
+        for task in workers:
+            task.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
         await resolver.close()
         if enqueuer is not None:
             await enqueuer.close()
         if processed is not None:
             processed.close()
 
-    counts: dict[str, int] = {}
-    for result in results:
-        counts[result.status] = counts.get(result.status, 0) + 1
-
-    usernames: set[str] = {
-        result.username for result in results
-        if result.status == STATUS_RESOLVED and result.username
-    }
-
     summary: dict[str, Any] = {
         'video_ids': len(ids),
-        'done': len(results),
+        'done': done,
         'resolved': counts.get(STATUS_RESOLVED, 0),
         'low_subs': counts.get(STATUS_LOW_SUBS, 0),
         'unavailable': counts.get(STATUS_UNAVAILABLE, 0),
@@ -1006,7 +1008,7 @@ async def run(settings: ResolveSettings) -> int:
             else '; pass --processed-file next time to keep your place'
         )
         print(
-            f'{len(results)} of {len(ids)} video id(s) done before '
+            f'{done} of {len(ids)} video id(s) done before '
             f'interrupt; creators found so far are queued{hint}',
             file=sys.stderr,
         )
