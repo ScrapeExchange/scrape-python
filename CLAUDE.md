@@ -1,4 +1,5 @@
 read settings, connectionstrings from LOCAL.md if the file exists.
+for remote shell writes, ask for permission. If permission granted then perform the write
 remember conversations about this code base and repo between sessions
 when creating a new branch, use feature/<feature-name> or bug/<bug-name>
 only use subagents if the user explicitly request them
@@ -89,13 +90,6 @@ the settings it's handed (see `RateLimiter.__init__`):
    cross-process coordination via files.
 3. Neither set → `_InProcessBackend`. Per-process only; every process
    drives its own private buckets.
-
-In production both hosts (`homeserver`, `homedata`) set
-`REDIS_DSN=redis://mongo.scrape.exchange:6379/0`, so all scraper
-types — video, RSS, channel, discover — across both hosts share one
-set of per-proxy buckets. YouTube sees aggregate traffic per IP and
-so does the limiter: running multiple scraper types against the same
-proxy pool is safe.
 
 If Redis is unreachable, Redis-backend operations raise; they do not
 silently fall back to in-process. Watch

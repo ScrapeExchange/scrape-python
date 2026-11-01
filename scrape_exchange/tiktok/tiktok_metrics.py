@@ -73,3 +73,26 @@ API_CALL_DURATION_SECONDS: Histogram = Histogram(
         0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120,
     ),
 )
+
+# Set by the session pool after bootstrap, rebuilds and each ms_token
+# refresh pass, from scrape_exchange.browser_memory (Linux only).
+# kind: browser (Camoufox processes) | driver (Playwright's Node.js)
+BROWSER_MEMORY_BYTES: Gauge = Gauge(
+    'tiktok_browser_memory_bytes',
+    'PSS of the Camoufox browsers and Playwright drivers of a worker',
+    labelnames=('platform', 'scraper', 'kind', 'worker_id'),
+)
+
+BROWSER_PROCESSES: Gauge = Gauge(
+    'tiktok_browser_processes',
+    'Camoufox browser and Playwright driver processes of a worker',
+    labelnames=('platform', 'scraper', 'kind', 'worker_id'),
+)
+
+# reason: age (past TIKTOK_BROWSER_MAX_AGE) | disconnected (browser died)
+# outcome: success|failure (a failed recycle keeps the old browser)
+BROWSER_RECYCLE_TOTAL: Counter = Counter(
+    'tiktok_browser_recycle_total',
+    'TikTok session browsers replaced by the session pool',
+    labelnames=('platform', 'scraper', 'reason', 'outcome', 'worker_id'),
+)

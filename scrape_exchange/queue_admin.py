@@ -21,6 +21,7 @@ import sys
 from abc import ABC, abstractmethod
 from typing import Any, AsyncIterator, Callable
 
+from scrape_exchange.backlog_server_queue import BacklogServerUnsupported
 from scrape_exchange.creator_queue import (
     RedisCreatorQueue,
     TierConfig,
@@ -40,8 +41,12 @@ from scrape_exchange.tiktok.short_url import (
     normalize_tiktok_short_url,
 )
 from scrape_exchange.twitch.normalization import normalize_creator
+from scrape_exchange.video_queue_factory import (
+    close_backlog_clients,
+    make_video_scrape_queue,
+)
 from scrape_exchange.video_scrape_queue import (
-    RedisVideoScrapeQueue,
+    VideoScrapeQueue,
     VideoScrapeQueueSettings,
     VideoState,
 )
@@ -425,15 +430,22 @@ class TikTokCreatorQueueAdapter(OperatorQueue):
 
 
 class TikTokVideoQueueAdapter(OperatorQueue):
-    '''Operator adapter over ``RedisVideoScrapeQueue`` for TikTok
-    videos. States: queued | unavailable | failed | removed.'''
+    '''Operator adapter over the TikTok video scrape queue
+    (backlog-server or Redis). States: queued | unavailable | failed |
+    removed.'''
 
     platform: str = 'tiktok'
     entity: str = 'video'
     member_label: str = 'video_id'
 
-    def __init__(self, queue: RedisVideoScrapeQueue) -> None:
-        self._queue: RedisVideoScrapeQueue = queue
+    def __init__(
+        self, queue: VideoScrapeQueue, redis: Any | None = None,
+    ) -> None:
+        self._queue: VideoScrapeQueue = queue
+        # Redis client behind the fallback queue, closed by close().
+        self._redis: Any = (
+            redis if redis is not None else getattr(queue, '_redis', None)
+        )
 
     def states(self) -> list[str]:
         return [
@@ -465,7 +477,12 @@ class TikTokVideoQueueAdapter(OperatorQueue):
         direct: dict | None = await self.show(term)
         if direct is not None:
             hits.append(direct)
-        ids: list[str] = await self._queue.search_meta(f'*{term}*')
+        try:
+            ids: list[str] = await self._queue.search_meta(f'*{term}*')
+        except BacklogServerUnsupported:
+            # backlog-server keeps no searchable metadata: an exact id
+            # (or video URL) is all it can look up.
+            return hits
         for video_id in ids:
             if len(hits) >= limit:
                 break
@@ -545,7 +562,10 @@ class TikTokVideoQueueAdapter(OperatorQueue):
 
     async def close(self) -> None:
         with contextlib.suppress(Exception):
-            await self._queue._redis.aclose()
+            if self._redis is not None:
+                await self._redis.aclose()
+        with contextlib.suppress(Exception):
+            await close_backlog_clients()
 
 
 class InstagramCreatorQueueAdapter(TikTokCreatorQueueAdapter):
@@ -714,12 +734,13 @@ def _build_tiktok_video_adapter(settings: Any) -> OperatorQueue:
         component='tiktok-video-queue',
         decode_responses=True,
     )
-    queue: RedisVideoScrapeQueue = RedisVideoScrapeQueue(
-        redis,
-        VideoScrapeQueueSettings(),
+    queue: VideoScrapeQueue = make_video_scrape_queue(
         platform='tiktok',
+        redis=redis,
+        settings=VideoScrapeQueueSettings(),
+        component='tiktok-video-queue-cli',
     )
-    return TikTokVideoQueueAdapter(queue)
+    return TikTokVideoQueueAdapter(queue, redis)
 
 
 def _build_instagram_creator_adapter(settings: Any) -> OperatorQueue:

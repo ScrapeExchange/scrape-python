@@ -227,8 +227,18 @@ pub(crate) mod tests {
         let q = parse_queues("youtube:video=youtube_video").unwrap();
         assert_eq!(q.len(), 1);
         assert!(parse_queues("a=youtube_video,a=youtube_video").is_err());
-        assert!(parse_queues("tiktok:video=tiktok_video").is_err());
+        assert!(parse_queues("tiktok:video=instagram_video").is_err());
         assert!(parse_queues("Bad/Name=youtube_video").is_err());
         assert!(parse_queues("").is_err());
+        let q = parse_queues(
+            "youtube:video=youtube_video,tiktok:video=tiktok_video",
+        )
+        .unwrap();
+        assert_eq!(q[1], ("tiktok:video".into(), Codec::TiktokVideo));
+        // Both names map to the same tiktok_video directory.
+        assert!(
+            parse_queues("tiktok:video=tiktok_video,tiktok_video=tiktok_video")
+                .is_err()
+        );
     }
 }

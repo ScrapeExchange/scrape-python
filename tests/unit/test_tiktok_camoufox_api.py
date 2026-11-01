@@ -540,6 +540,100 @@ class TestApplyCamoufoxEnv(unittest.TestCase):
             self.assertEqual(os.environ['CAMOU_CONFIG_1'], '123')
 
 
+class TestCreateSessions(unittest.IsolatedAsyncioTestCase):
+    '''TikTokApi drops firefox_user_prefs; the override must launch
+    Firefox with them and still build sessions the TikTokApi way.'''
+
+    async def test_launches_firefox_with_prefs(self) -> None:
+        api: CamoufoxTikTokApi = CamoufoxTikTokApi()
+        api._TikTokApi__create_session = AsyncMock()
+        driver: MagicMock = MagicMock()
+        driver.firefox.launch = AsyncMock(return_value=MagicMock())
+        starter: MagicMock = MagicMock()
+        starter.start = AsyncMock(return_value=driver)
+        proxy: dict = {'server': 'http://proxy.example:3128'}
+        prefs: dict = {'dom.ipc.processCount': 1}
+        with patch(
+            'scrape_exchange.tiktok.tiktok_camoufox_api.async_playwright',
+            return_value=starter,
+        ):
+            await api.create_sessions(
+                num_sessions=1,
+                browser='firefox',
+                executable_path='/bin/camoufox',
+                override_browser_args=['-x'],
+                proxies=[proxy],
+                ms_tokens=['TOK'],
+                suppress_resource_load_types=['media'],
+                timeout=1234,
+                firefox_user_prefs=prefs,
+            )
+        launch = driver.firefox.launch.call_args.kwargs
+        self.assertEqual(launch['firefox_user_prefs'], prefs)
+        self.assertEqual(launch['proxy'], proxy)
+        self.assertEqual(launch['executable_path'], '/bin/camoufox')
+        self.assertEqual(launch['args'], ['-x'])
+        self.assertTrue(launch['headless'])
+        session = api._TikTokApi__create_session.call_args.kwargs
+        self.assertEqual(session['proxy'], proxy)
+        self.assertEqual(session['ms_token'], 'TOK')
+        self.assertEqual(session['suppress_resource_load_types'], ['media'])
+        self.assertEqual(session['timeout'], 1234)
+        self.assertEqual(session['context_options'], {})
+
+    async def test_shared_driver_is_used_and_not_stopped(self) -> None:
+        api: CamoufoxTikTokApi = CamoufoxTikTokApi()
+        api._TikTokApi__create_session = AsyncMock()
+        browser: MagicMock = MagicMock()
+        browser.close = AsyncMock()
+        driver: MagicMock = MagicMock()
+        driver.firefox.launch = AsyncMock(return_value=browser)
+        driver.stop = AsyncMock()
+        with patch(
+            'scrape_exchange.tiktok.tiktok_camoufox_api.async_playwright',
+        ) as starter:
+            await api.create_sessions(
+                num_sessions=1, browser='firefox', playwright=driver,
+            )
+        starter.assert_not_called()
+        self.assertIsNone(
+            driver.firefox.launch.call_args.kwargs['firefox_user_prefs'],
+        )
+        await api.close_sessions()
+        await api.stop_playwright()
+        browser.close.assert_awaited_once()
+        driver.stop.assert_not_awaited()
+
+    async def test_own_driver_is_stopped(self) -> None:
+        api: CamoufoxTikTokApi = CamoufoxTikTokApi()
+        api._TikTokApi__create_session = AsyncMock()
+        driver: MagicMock = MagicMock()
+        driver.firefox.launch = AsyncMock(return_value=MagicMock(
+            close=AsyncMock(),
+        ))
+        driver.stop = AsyncMock()
+        starter: MagicMock = MagicMock()
+        starter.start = AsyncMock(return_value=driver)
+        with patch(
+            'scrape_exchange.tiktok.tiktok_camoufox_api.async_playwright',
+            return_value=starter,
+        ):
+            await api.create_sessions(
+                num_sessions=1, browser='firefox', firefox_user_prefs={},
+            )
+        await api.close_sessions()
+        driver.stop.assert_awaited_once()
+
+    async def test_without_prefs_defers_to_tiktokapi(self) -> None:
+        api: CamoufoxTikTokApi = CamoufoxTikTokApi()
+        with patch(
+            'TikTokApi.TikTokApi.create_sessions', new_callable=AsyncMock,
+        ) as parent:
+            await api.create_sessions(num_sessions=1, browser='firefox')
+        parent.assert_awaited_once()
+        self.assertEqual(parent.call_args.kwargs['browser'], 'firefox')
+
+
 class TestCamoufoxLaunchOptions(unittest.TestCase):
     '''Centralises the validated anti-detect config so the pool and
     the gated integration test launch identically.'''

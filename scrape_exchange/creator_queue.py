@@ -432,6 +432,24 @@ class CreatorQueue(ABC):
         '''
 
     @abstractmethod
+    async def park_low_subs(
+        self,
+        creator_id: str,
+        follower_count: int | None = None,
+        *,
+        worker_id: str = '',
+        proxy_ip: str = '',
+    ) -> None:
+        '''
+        Park a creator whose follower count is below the scraper's
+        ``MIN_SUBS`` threshold in the terminal ``low_subs`` state.
+
+        The creator leaves every tier queue and the orphan-recovery
+        path must not resurrect it; ``add_member`` or ``reschedule``
+        are the restore paths.
+        '''
+
+    @abstractmethod
     async def queue_size(self) -> int:
         '''Current number of creators across all tiers.'''
 
@@ -1211,6 +1229,23 @@ class FileCreatorQueue(CreatorQueue):
             ]
             heapq.heapify(self._heaps[tier])
         await self._persist_queue()
+
+    async def park_low_subs(
+        self,
+        creator_id: str,
+        follower_count: int | None = None,
+        *,
+        worker_id: str = '',
+        proxy_ip: str = '',
+    ) -> None:
+        '''Park *creator_id* below the follower threshold.
+
+        The file backend keeps no scrape-state record, so the member
+        is only dropped from its heap; it stays in ``_creator_tiers``
+        and ``_names``, which is what stops ``populate()`` re-adding
+        it.
+        '''
+        await self.remove(creator_id)
 
     async def queue_size(self) -> int:
         return sum(
@@ -2114,6 +2149,43 @@ class RedisCreatorQueue(CreatorQueue):
             f'{self._claim_prefix}{creator_id}',
         )
         await pipe.execute()
+
+    async def park_low_subs(
+        self,
+        creator_id: str,
+        follower_count: int | None = None,
+        *,
+        worker_id: str = '',
+        proxy_ip: str = '',
+    ) -> None:
+        '''Park *creator_id* in the terminal ``low_subs`` state.
+
+        Records the ``low_subs`` scrape status with the measured
+        follower count, then excludes the member: it leaves every tier
+        queue and the orphan-recovery path will not re-enqueue it.
+        ``add_member`` or ``reschedule`` restore it.
+        '''
+        state: dict[str, Any] = await self.get_scrape_state(
+            creator_id,
+        )
+        now: str = self._utc_now_iso()
+        state.update({
+            'scrape_status': 'low_subs',
+            'last_attempt_at': now,
+            'last_success_at': now,
+            'failure_count': 0,
+            'worker_id': worker_id,
+            'proxy_ip': proxy_ip,
+        })
+        if follower_count is not None:
+            state['last_follower_count'] = int(follower_count)
+        state.pop('last_error', None)
+        await self._redis.hset(
+            self._key_creator_state,
+            creator_id,
+            orjson.dumps(state).decode('utf-8'),
+        )
+        await self.exclude(creator_id)
 
     async def queue_size(self) -> int:
         total: int = 0

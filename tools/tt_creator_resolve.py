@@ -10,10 +10,26 @@ id and sec_uid. No browser is used: traffic goes through ``httpx2``
 ``TikTokRateLimiter`` so it competes fairly with the live scrapers for
 per-proxy tokens.
 
-Every username found is then added to the TikTok creator scrape queue
--- the same ``RedisCreatorQueue`` (namespace ``scrape``, platform
-``tiktok``) that ``tt_creator_scrape.py`` consumes -- so the scraper
-picks the creators up on its next poll.
+Every username is added to the TikTok creator scrape queue -- the same
+``RedisCreatorQueue`` (namespace ``scrape``, platform ``tiktok``) that
+``tt_creator_scrape.py`` consumes -- as soon as it is found, so the
+scraper picks creators up while the run is still going. A creator that
+is already queued, being scraped or excluded is left alone.
+
+An author whose video page reports fewer than ``MIN_SUBS`` followers
+is not queued at all: the record is written with status ``low_subs``
+and the id goes to the processed log, so the scraper never spends a
+fetch on an account it would only park. An author whose follower count
+the page did not report is queued and judged by the scraper.
+
+Before fetching anything, ids the TikTok video scrape queue already
+knows are skipped, whatever state it reports: ``queued`` (still to be
+scraped), ``scraped`` (only the backlog-server backend remembers
+completions -- the Redis backend forgets a completed video, so there it
+can only skip what is queued), and the terminal ``failed`` /
+``unavailable`` / ``removed``. Re-resolving a settled id cannot change
+its outcome and the queue would refuse the video anyway. Ids the queue
+has never seen are the only ones fetched.
 
 Examples::
 
@@ -26,21 +42,26 @@ Examples::
         --input-file ids.lst --dry-run
 
 ``--dry-run`` resolves and reports without touching the queue. Requests
-that fail transiently (timeouts, 403/429, bot-check pages) are retried
-with backoff; pages that carry no item payload (deleted or
-region-blocked videos) are reported as ``unavailable``.
+that fail transiently (timeouts, 403/429, bot-check pages, redirects
+away from the video page such as ``/hk/about`` or a login wall, and
+TikTok server errors like ``ErrSysPanic``) are retried with backoff,
+each attempt through the proxy the rate limiter hands out; pages that
+carry no item payload (deleted videos) are reported as
+``unavailable``. Outcome log lines name the proxy (``proxy_ip``,
+``proxy_port``) so proxies TikTok geo-blocks can be found.
 
 Ctrl-C is a clean stop: in-flight requests are cancelled, the summary
-reports how far the run got, the queue is left untouched and the exit
-code is 130. When ``--output-file`` is set each record is appended as
-soon as it resolves, so nothing already done is lost.
+reports how far the run got (creators found so far are already queued)
+and the exit code is 130. When ``--output-file`` is set each record is
+appended as soon as it resolves, so nothing already done is lost.
 
 Every id that reaches a terminal outcome is also appended to
 ``--processed-file`` (default ``~/tiktok-resolved-video-ids.lst``) as
 it completes, and ids listed there are skipped on later runs, so a
 large input file can be worked through in several passes.
 ``--reprocess`` ignores the log; ids whose page fetch stayed
-``transient`` (timeouts, 403/429, bot checks) are deliberately not
+``transient`` (timeouts, 403/429, bot checks, redirects, TikTok
+server errors) are deliberately not
 logged so a later run retries them.
 '''
 
@@ -54,6 +75,7 @@ import random
 import re
 import signal
 import sys
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -61,6 +83,7 @@ from typing import Any
 import httpx2
 from pydantic import AliasChoices, Field
 from pydantic_settings import SettingsConfigDict
+from redis.exceptions import RedisError
 
 from scrape_exchange.creator_queue import (
     RedisCreatorQueue,
@@ -69,19 +92,38 @@ from scrape_exchange.creator_queue import (
     tier_for_subscriber_count,
 )
 from scrape_exchange.logging import configure_logging
+from scrape_exchange.redis_client import redis_from_url
 from scrape_exchange.tiktok import (
     TikTokCallType,
     TikTokRateLimiter,
     TikTokVideo,
 )
 from scrape_exchange.tiktok.settings import TikTokScraperSettings
+from scrape_exchange.util import extract_proxy_ip, extract_proxy_port
+from scrape_exchange.video_queue_factory import (
+    close_backlog_clients,
+    make_video_scrape_queue,
+)
+from scrape_exchange.video_scrape_queue import (
+    VideoScrapeQueue,
+    VideoScrapeQueueSettings,
+)
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 VIDEO_URL_TEMPLATE: str = 'https://www.tiktok.com/@_/video/{video_id}'
 TIKTOK_ORIGIN: str = 'https://www.tiktok.com'
+# A followed redirect that leaves this path landed off the video page.
+VIDEO_PATH_MARKER: str = '/video/'
 QUEUE_PLATFORM: str = 'tiktok'
 QUEUE_NAMESPACE: str = 'scrape'
+# Video ids looked up per video scrape queue state request.
+VIDEO_QUEUE_STATE_BATCH: int = 1000
+
+# Video queue states that make an id pointless to resolve: the video is
+# either waiting to be scraped or has already been scraped.
+VIDEO_STATE_QUEUED: str = 'queued'
+VIDEO_STATE_SCRAPED: str = 'scraped'
 
 _DEFAULT_USER_AGENT: str = (
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
@@ -97,11 +139,19 @@ _BOT_MARKERS: tuple[str, ...] = (
     'captcha-verify',
     'please wait',
 )
+# Lowercased ``statusMsg`` fragments of TikTok-side failures: the
+# video may well exist, so these are retried, not reported missing.
+_SERVER_ERROR_MARKERS: tuple[str, ...] = (
+    'errsyspanic',
+    'rpcerror',
+)
 
 STATUS_RESOLVED: str = 'resolved'
 STATUS_UNAVAILABLE: str = 'unavailable'
 STATUS_TRANSIENT: str = 'transient'
 STATUS_ERROR: str = 'error'
+# Resolved, but the creator is below MIN_SUBS so it is not queued.
+STATUS_LOW_SUBS: str = 'low_subs'
 
 
 class ResolveSettings(TikTokScraperSettings):
@@ -197,6 +247,16 @@ class ResolveSettings(TikTokScraperSettings):
             'and operator imports are queued.'
         ),
     )
+    min_subs: int = Field(
+        default=100,
+        validation_alias=AliasChoices('MIN_SUBS', 'min_subs'),
+        description=(
+            'Minimum follower count an author must report to be '
+            'queued. A creator below it is reported as low_subs and '
+            'left out of the queue; tt_creator_scrape.py would park '
+            'it anyway. 0 disables the filter.'
+        ),
+    )
     processed_file: Path | None = Field(
         default=Path.home() / 'tiktok-resolved-video-ids.lst',
         validation_alias=AliasChoices(
@@ -232,6 +292,8 @@ class Resolution:
     user_id: str | None = None
     sec_uid: str | None = None
     nickname: str | None = None
+    # The author's follower count as the video page reported it.
+    follower_count: int | None = None
     detail: str | None = None
 
     def as_record(self) -> dict[str, Any]:
@@ -243,6 +305,7 @@ class Resolution:
             'user_id': self.user_id,
             'sec_uid': self.sec_uid,
             'nickname': self.nickname,
+            'follower_count': self.follower_count,
             'detail': self.detail,
         }
 
@@ -334,10 +397,21 @@ def _rehydration_scope(html: str) -> dict[str, Any] | None:
     return scope if isinstance(scope, dict) else None
 
 
+def _proxy_log_fields(proxy: str | None) -> dict[str, str]:
+    '''Credential-free proxy fields for log records.'''
+    if proxy is None:
+        return {'proxy_ip': 'none', 'proxy_port': 'none'}
+    return {
+        'proxy_ip': extract_proxy_ip(proxy),
+        'proxy_port': extract_proxy_port(proxy),
+    }
+
+
 def _no_username(
     video_id: int,
     status: str,
     detail: str,
+    proxy: str | None = None,
 ) -> Resolution:
     '''Build and log an outcome where the username is unavailable.'''
     _LOGGER.warning(
@@ -346,6 +420,7 @@ def _no_username(
             'video_id': video_id,
             'status': status,
             'detail': detail,
+            **_proxy_log_fields(proxy),
         },
     )
     return Resolution(
@@ -355,8 +430,20 @@ def _no_username(
     )
 
 
-def parse_author(html: str, video_id: int) -> Resolution:
-    '''Extract the creator of *video_id* from a fetched video page.'''
+def parse_author(
+    html: str,
+    video_id: int,
+    proxy: str | None = None,
+    min_subs: int = 0,
+) -> Resolution:
+    '''Extract the creator of *video_id* from a fetched video page.
+
+    When *min_subs* is positive and the page reports an author with
+    fewer followers than that, the outcome is ``low_subs``: the
+    creator is named in the record but must not be queued. An author
+    whose follower count the page did not report is left for
+    ``tt_creator_scrape.py`` to judge.
+    '''
     scope: dict[str, Any] | None = _rehydration_scope(html)
     if scope is None:
         blocked: bool = any(
@@ -366,13 +453,21 @@ def parse_author(html: str, video_id: int) -> Resolution:
             video_id,
             STATUS_TRANSIENT if blocked else STATUS_UNAVAILABLE,
             'bot check' if blocked else 'no rehydration payload',
+            proxy,
         )
     detail_block: Any = scope.get('webapp.video-detail') or {}
     item: Any = (detail_block.get('itemInfo') or {}).get('itemStruct')
     if not isinstance(item, dict):
         status_msg: str = str(detail_block.get('statusMsg') or 'no item')
+        server_error: bool = any(
+            marker in status_msg.lower()
+            for marker in _SERVER_ERROR_MARKERS
+        )
         return _no_username(
-            video_id, STATUS_UNAVAILABLE, status_msg[:120],
+            video_id,
+            STATUS_TRANSIENT if server_error else STATUS_UNAVAILABLE,
+            status_msg[:120],
+            proxy,
         )
     try:
         video: TikTokVideo = TikTokVideo.from_api(item)
@@ -381,18 +476,41 @@ def parse_author(html: str, video_id: int) -> Resolution:
             video_id,
             STATUS_ERROR,
             f'{type(exc).__name__}: {str(exc)[:120]}',
+            proxy,
         )
     if not video.username:
         return _no_username(
             video_id, STATUS_UNAVAILABLE, 'item has no author username',
+            proxy,
+        )
+    follower_count: int | None = video.author_stats.get(
+        'followerCount',
+    )
+    status: str = STATUS_RESOLVED
+    if (
+        min_subs > 0
+        and follower_count is not None
+        and follower_count < min_subs
+    ):
+        status = STATUS_LOW_SUBS
+        _LOGGER.info(
+            'Creator below MIN_SUBS; not queueing',
+            extra={
+                'video_id': video_id,
+                'username': video.username,
+                'follower_count': follower_count,
+                'min_subs': min_subs,
+                **_proxy_log_fields(proxy),
+            },
         )
     return Resolution(
         video_id=video_id,
-        status=STATUS_RESOLVED,
+        status=status,
         username=video.username,
         user_id=video.author_id,
         sec_uid=video.sec_uid,
         nickname=video.author_nickname,
+        follower_count=follower_count,
     )
 
 
@@ -508,13 +626,28 @@ class Resolver:
                 status: str | None = _classify_status(
                     response.status_code,
                 )
-                if status is None:
-                    last = parse_author(response.text, video_id)
-                else:
+                if status is not None:
                     last = Resolution(
                         video_id=video_id,
                         status=status,
                         detail=f'HTTP {response.status_code}',
+                    )
+                elif VIDEO_PATH_MARKER not in response.url.path:
+                    # TikTok sends some proxies to a region page
+                    # (/hk/about) or a login wall instead of the
+                    # video; another proxy usually gets the page.
+                    last = _no_username(
+                        video_id,
+                        STATUS_TRANSIENT,
+                        f'redirected to {response.url.path}'[:120],
+                        proxy,
+                    )
+                else:
+                    last = parse_author(
+                        response.text,
+                        video_id,
+                        proxy,
+                        self._settings.min_subs,
                     )
             if last.status != STATUS_TRANSIENT:
                 return last
@@ -529,6 +662,7 @@ class Resolver:
                     'attempt': attempt,
                     'delay_seconds': round(delay, 1),
                     'reason': last.detail,
+                    **_proxy_log_fields(proxy),
                 },
             )
             await asyncio.sleep(delay)
@@ -557,58 +691,126 @@ def _fallback_weight(settings: ResolveSettings) -> int:
     return max(tier.min_subscribers, 0)
 
 
-async def enqueue_creators(
-    settings: ResolveSettings,
-    usernames: list[str],
-) -> tuple[int, int]:
-    '''Add *usernames* to the creator queue; return (new, existing).'''
-    if not settings.redis_dsn:
-        raise RuntimeError(
-            'REDIS_DSN is required to enqueue creators; '
-            'use --dry-run to resolve without queueing',
+class CreatorEnqueuer:
+    '''Adds resolved creators to the creator scrape queue as they are
+    found, once per username per run.'''
+
+    def __init__(self, settings: ResolveSettings) -> None:
+        if not settings.redis_dsn:
+            raise RuntimeError(
+                'REDIS_DSN is required to enqueue creators; '
+                'use --dry-run to resolve without queueing',
+            )
+        tiers: list[TierConfig] = parse_priority_queues(
+            settings.creator_priority_queues,
         )
-    tiers: list[TierConfig] = parse_priority_queues(
-        settings.creator_priority_queues,
+        self._queue: RedisCreatorQueue = RedisCreatorQueue(
+            settings.redis_dsn,
+            settings.worker_id,
+            QUEUE_PLATFORM,
+            key_namespace=QUEUE_NAMESPACE,
+        )
+        # schedule_if_absent() needs the tier queues that populate()
+        # normally derives; the operator adapters wire them the same
+        # way.
+        self._queue._tiers = tiers
+        self._queue._key_queues = self._queue._build_queue_keys(tiers)
+        self._weight: int = (
+            settings.creator_weight
+            if settings.creator_weight is not None
+            else _fallback_weight(settings)
+        )
+        self._tier: int = tier_for_subscriber_count(tiers, self._weight)
+        self._done: set[str] = set()
+        self.added: int = 0
+        self.existing: int = 0
+        self.failed: int = 0
+
+    async def add(self, username: str) -> bool:
+        '''Queue *username* unless it is already queued, claimed or
+        excluded. Returns False only when Redis could not be reached,
+        so the caller can leave the video id for a later run.'''
+        if username in self._done:
+            return True
+        try:
+            queued: bool = await self._queue.schedule_if_absent(
+                username, username, self._weight,
+            )
+        except (RedisError, OSError, TimeoutError) as exc:
+            self.failed += 1
+            _LOGGER.warning(
+                'Creator queue add failed',
+                extra={'username': username, 'error': str(exc)},
+            )
+            return False
+        self._done.add(username)
+        if queued:
+            self.added += 1
+        else:
+            self.existing += 1
+        _LOGGER.info(
+            'Creator queue add',
+            extra={
+                'username': username,
+                'weight': self._weight,
+                'tier': self._tier,
+                'outcome': 'queued' if queued else 'already_queued',
+            },
+        )
+        return True
+
+    async def close(self) -> None:
+        '''Close the queue's Redis connection pool.'''
+        await self._queue._redis.aclose()
+
+
+async def filter_known_video_ids(
+    redis_dsn: str, video_ids: list[int],
+) -> tuple[list[int], dict[str, int]]:
+    '''Split *video_ids* into the ones worth fetching and the ones the
+    TikTok video scrape queue already knows.
+
+    Any id the queue reports a state for is dropped: ``queued`` (it is
+    going to be scraped), ``scraped`` (only the backlog-server backend
+    remembers completions), and the terminal ``failed`` /
+    ``unavailable`` / ``removed``. Re-resolving an id the queue already
+    settled cannot change its outcome, and the queue would reject the
+    video anyway.
+
+    :returns: (remaining ids in their original order, skipped counts
+        keyed by queue state)
+    '''
+    redis: Any = redis_from_url(
+        redis_dsn,
+        component='tiktok-resolve-video-queue',
+        decode_responses=True,
     )
-    queue: RedisCreatorQueue = RedisCreatorQueue(
-        settings.redis_dsn,
-        settings.worker_id,
-        QUEUE_PLATFORM,
-        key_namespace=QUEUE_NAMESPACE,
+    queue: VideoScrapeQueue = make_video_scrape_queue(
+        platform=QUEUE_PLATFORM,
+        redis=redis,
+        settings=VideoScrapeQueueSettings(),
+        component='tiktok-resolve-video-queue',
     )
-    # add_member() needs the tier queues that populate() normally
-    # derives; the operator adapters wire them the same way.
-    queue._tiers = tiers
-    queue._key_queues = queue._build_queue_keys(tiers)
-    weight: int = (
-        settings.creator_weight
-        if settings.creator_weight is not None
-        else _fallback_weight(settings)
-    )
-    added: int = 0
-    existing: int = 0
-    tier: int = tier_for_subscriber_count(tiers, weight)
+    remaining: list[int] = []
+    skipped: dict[str, int] = {}
     try:
-        for username in usernames:
-            queued: bool = await queue.add_member(
-                username, username, weight,
+        for start in range(0, len(video_ids), VIDEO_QUEUE_STATE_BATCH):
+            chunk: list[int] = video_ids[
+                start:start + VIDEO_QUEUE_STATE_BATCH
+            ]
+            states: dict[str, str | None] = await queue.get_state_names(
+                [str(v) for v in chunk],
             )
-            if queued:
-                added += 1
-            else:
-                existing += 1
-            _LOGGER.info(
-                'Creator queue add',
-                extra={
-                    'username': username,
-                    'weight': weight,
-                    'tier': tier,
-                    'outcome': 'queued' if queued else 'already_queued',
-                },
-            )
+            for video_id in chunk:
+                state: str | None = states.get(str(video_id))
+                if state is None:
+                    remaining.append(video_id)
+                    continue
+                skipped[state] = skipped.get(state, 0) + 1
     finally:
-        await queue._redis.aclose()
-    return added, existing
+        await redis.aclose()
+        await close_backlog_clients()
+    return remaining, skipped
 
 
 async def run(settings: ResolveSettings) -> int:
@@ -635,13 +837,51 @@ async def run(settings: ResolveSettings) -> int:
                 },
             )
             ids = remaining
+    skipped_queue: dict[str, int] = {}
+    if settings.redis_dsn:
+        remaining, skipped_queue = await filter_known_video_ids(
+            settings.redis_dsn, ids,
+        )
+        skipped_total: int = sum(skipped_queue.values())
+        _LOGGER.info(
+            'Skipping video ids the video scrape queue already knows',
+            extra={
+                'skipped': skipped_total,
+                'queued': skipped_queue.get(VIDEO_STATE_QUEUED, 0),
+                'scraped': skipped_queue.get(VIDEO_STATE_SCRAPED, 0),
+                'terminal': skipped_total - sum(
+                    skipped_queue.get(state, 0)
+                    for state in (
+                        VIDEO_STATE_QUEUED, VIDEO_STATE_SCRAPED,
+                    )
+                ),
+            },
+        )
+        ids = remaining
+    else:
+        _LOGGER.warning(
+            'No REDIS_DSN; not checking the video scrape queue',
+        )
     if not ids:
         print(
             f'no video ids to resolve '
-            f'({already_done} already processed)',
+            f'({already_done} already processed, '
+            f'{sum(skipped_queue.values())} known to the '
+            f'video scrape queue: '
+            f'{skipped_queue or "none"})',
             file=sys.stderr,
         )
         return 1
+    enqueuer: CreatorEnqueuer | None = None
+    if settings.enqueue and not settings.dry_run:
+        if not settings.redis_dsn:
+            print(
+                'REDIS_DSN is required to enqueue creators; '
+                'use --dry-run to resolve without queueing',
+                file=sys.stderr,
+            )
+            return 2
+        enqueuer = CreatorEnqueuer(settings)
 
     limiter: TikTokRateLimiter = TikTokRateLimiter.get(
         state_dir=settings.rate_limiter_state_dir,
@@ -666,24 +906,53 @@ async def run(settings: ResolveSettings) -> int:
         },
     )
 
-    semaphore: asyncio.Semaphore = asyncio.Semaphore(concurrency)
-    results: list[Resolution] = []
+    counts: dict[str, int] = {}
+    usernames: set[str] = set()
+    done: int = 0
     interrupted: bool = False
     processed: ProcessedLog | None = (
         ProcessedLog(settings.processed_file)
         if settings.processed_file is not None else None
     )
 
-    async def one(video_id: int) -> Resolution:
-        async with semaphore:
-            return await resolver.resolve(video_id)
+    async def record(result: Resolution) -> None:
+        '''Count, log and queue one finished id; nothing is kept.'''
+        nonlocal done
+        done += 1
+        counts[result.status] = counts.get(result.status, 0) + 1
+        if result.status == STATUS_RESOLVED and result.username:
+            usernames.add(result.username)
+        if settings.output_file is not None:
+            append_record(settings.output_file, result)
+        queued: bool = True
+        if (
+            enqueuer is not None
+            and result.status == STATUS_RESOLVED
+            and result.username
+        ):
+            queued = await enqueuer.add(result.username)
+        # Transient outcomes are not recorded: they exhausted their
+        # retries but are worth another attempt on a later run.
+        # Neither is a creator Redis would not take.
+        if (
+            processed is not None
+            and result.status != STATUS_TRANSIENT
+            and queued
+        ):
+            processed.record(result.video_id)
 
-    # Real tasks, not bare coroutines: an interrupt then cancels work
-    # that is actually scheduled instead of leaving un-awaited
-    # coroutine objects behind.
-    tasks: list[asyncio.Task[Resolution]] = [
-        asyncio.create_task(one(video_id), name=f'resolve-{video_id}')
-        for video_id in ids
+    pending: Iterator[int] = iter(ids)
+
+    async def worker() -> None:
+        # Workers share one iterator, so only `concurrency` tasks exist
+        # however long the input is. A task per id cost ~1.4 KB each
+        # (3.5 GB for 1.6M ids) and made Ctrl-C quadratic.
+        for video_id in pending:
+            await record(await resolver.resolve(video_id))
+
+    workers: list[asyncio.Task[None]] = [
+        asyncio.create_task(worker(), name=f'resolve-worker-{index}')
+        for index in range(concurrency)
     ]
     # Turn Ctrl-C into a cancellation of this coroutine so the partial
     # results are summarised and the HTTP clients are closed; without
@@ -695,64 +964,38 @@ async def run(settings: ResolveSettings) -> int:
         with contextlib.suppress(NotImplementedError, RuntimeError):
             loop.add_signal_handler(signal.SIGINT, main_task.cancel)
     try:
-        for finished in asyncio.as_completed(tasks):
-            result: Resolution = await finished
-            results.append(result)
-            if settings.output_file is not None:
-                append_record(settings.output_file, result)
-            # Transient outcomes are not recorded: they exhausted their
-            # retries but are worth another attempt on a later run.
-            if (
-                processed is not None
-                and result.status != STATUS_TRANSIENT
-            ):
-                processed.record(result.video_id)
+        await asyncio.gather(*workers)
     except asyncio.CancelledError:
         interrupted = True
-        for task in tasks:
-            task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await asyncio.gather(*tasks, return_exceptions=True)
     finally:
+        # Also on a worker crash: stop the others before the clients
+        # they use are closed.
+        for task in workers:
+            task.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
         await resolver.close()
+        if enqueuer is not None:
+            await enqueuer.close()
         if processed is not None:
             processed.close()
 
-    counts: dict[str, int] = {}
-    for result in results:
-        counts[result.status] = counts.get(result.status, 0) + 1
-
-    usernames: list[str] = []
-    seen_names: set[str] = set()
-    for result in results:
-        if result.status != STATUS_RESOLVED or not result.username:
-            continue
-        if result.username in seen_names:
-            continue
-        seen_names.add(result.username)
-        usernames.append(result.username)
-
-    added: int = 0
-    existing: int = 0
-    if (
-        not interrupted
-        and settings.enqueue
-        and not settings.dry_run
-        and usernames
-    ):
-        added, existing = await enqueue_creators(settings, usernames)
-
     summary: dict[str, Any] = {
         'video_ids': len(ids),
-        'done': len(results),
+        'done': done,
         'resolved': counts.get(STATUS_RESOLVED, 0),
+        'low_subs': counts.get(STATUS_LOW_SUBS, 0),
         'unavailable': counts.get(STATUS_UNAVAILABLE, 0),
         'transient': counts.get(STATUS_TRANSIENT, 0),
         'errors': counts.get(STATUS_ERROR, 0),
         'skipped_processed': already_done,
+        'skipped_video_queue': sum(skipped_queue.values()),
+        'skipped_queue_states': skipped_queue,
         'unique_creators': len(usernames),
-        'queued_new': added,
-        'queue_existing': existing,
+        'queued_new': enqueuer.added if enqueuer is not None else 0,
+        'queue_existing': (
+            enqueuer.existing if enqueuer is not None else 0
+        ),
+        'queue_failures': enqueuer.failed if enqueuer is not None else 0,
         'interrupted': interrupted,
         'dry_run': settings.dry_run,
     }
@@ -765,8 +1008,8 @@ async def run(settings: ResolveSettings) -> int:
             else '; pass --processed-file next time to keep your place'
         )
         print(
-            f'{len(results)} of {len(ids)} video id(s) done before '
-            f'interrupt; queue untouched{hint}',
+            f'{done} of {len(ids)} video id(s) done before '
+            f'interrupt; creators found so far are queued{hint}',
             file=sys.stderr,
         )
         return 130

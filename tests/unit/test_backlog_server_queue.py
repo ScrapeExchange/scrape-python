@@ -149,6 +149,22 @@ class TestBacklogServerQueue(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await queue.get_states([]), {})
         self.assertEqual(len(fake.calls), 1)
 
+    async def test_get_state_names_keeps_scraped(self) -> None:
+        queue, fake = make([['queued', 'scraped', None, 'failed']])
+        names: dict[str, str | None] = await queue.get_state_names(
+            ['a' * 11, 'b' * 11, 'c' * 11, 'd' * 11],
+        )
+        self.assertEqual(names, {
+            'a' * 11: 'queued', 'b' * 11: 'scraped',
+            'c' * 11: None, 'd' * 11: 'failed',
+        })
+        self.assertEqual(await queue.get_state_names([]), {})
+        self.assertEqual(
+            fake.calls,
+            [('BACKLOG.STATE', QUEUE, 'a' * 11, 'b' * 11, 'c' * 11,
+              'd' * 11)],
+        )
+
     async def test_count_by_state_maps_info(self) -> None:
         queue, _ = make([[
             'queued', 7, 'scraped', 9, 'failed', 2, 'unavailable', 1,

@@ -24,7 +24,7 @@ tt_discover_search.py ──► discovered usernames JSONL
                          Redis identity maps      scrape_upload.py
                                   │
                                   ▼
-                         Redis video queue
+             video queue (backlog-server or Redis)
                                   │
                                   ▼
                        tt_video_scrape.py ──► TIKTOK_VIDEO_DATA_DIR
@@ -33,12 +33,15 @@ tt_discover_search.py ──► discovered usernames JSONL
                                                  scrape_upload.py
 ```
 
-The creator and video scrapers are decoupled by Redis. The creator
-scraper reads due creators, writes creator records to disk, refreshes
-TikTok identity maps, and enqueues discovered video URLs. The video
-scraper reads those video URLs at its own pace and writes one record
-per item. Backpressure surfaces as Redis queue growth rather than as
-a synchronous stall.
+The creator and video scrapers are decoupled by the video queue. The
+creator scraper reads due creators, writes creator records to disk,
+refreshes TikTok identity maps, and enqueues discovered video ids. The
+video scraper reads those ids at its own pace and writes one record
+per item. Backpressure surfaces as queue growth rather than as a
+synchronous stall. The video queue lives in backlog-server (queue
+`tiktok:video`) when `BACKLOG_SERVER_DSN` is set, and in Redis
+otherwise; see [TikTok video queue on
+backlog-server](#tiktok-video-queue-on-backlog-server).
 
 There is no production file-based fallback for the main TikTok
 creator or video loops. `tt_creator_scrape.py` and
@@ -52,6 +55,28 @@ TikTokApi. Each ready proxy gets one browser/session, its own
 persisted Chromium profile, and an `ms_token` stored under
 `TIKTOK_SESSION_STATE_DIR`. Scrapers run API calls through the page's
 main world so requests carry the current session state.
+
+Each browser runs with `FIREFOX_MEMORY_PREFS` from
+`scrape_exchange/tiktok/tiktok_session_pool.py` (no autoplay), and
+with Camoufox's WebGL prefs only when `TIKTOK_BROWSER_WEBGL=true`:
+WebGL is otherwise unavailable, but enabling it costs roughly
+75-140 MiB per browser. All sessions of a worker share one Playwright
+driver.
+
+A browser uses about 700 MiB after bootstrap and grows to about
+1.5 GiB within an hour of scraping. Each `ms_token` refresh pass
+replaces the browser furthest past `TIKTOK_BROWSER_MAX_AGE` (default
+2700 s, +/-10% jitter, one per pass) and any browser that has
+disconnected. The replacement launches with the same `ms_token`
+before the old browser closes, so the proxy's worker only waits for
+the swap. Replacements are counted in
+`tiktok_browser_recycle_total{reason="age"|"disconnected"}`.
+Session pages skip
+the resource types in `TIKTOK_SUPPRESS_RESOURCE_TYPES` (default
+`media`). The pool publishes each worker's browser memory (PSS) as
+`tiktok_browser_memory_bytes{kind="browser"|"driver"}` and the
+process counts as `tiktok_browser_processes`, after bootstrap and on
+every `ms_token` refresh pass (Linux only).
 
 Session startup and token refresh are rate-limited separately from
 creator and video API calls. `TikTokRateLimiter` has per-proxy
@@ -112,9 +137,39 @@ One maintenance loop recovers stale claims and publishes queue-size
 metrics. A worker crash therefore leaves a temporary claim, not a
 permanently lost creator.
 
+### Fetch mode: http or browser
+
+`TIKTOK_CREATOR_FETCH_MODE` selects how profiles are fetched:
+
+- `http` (default): the profile page is fetched with `httpx` over
+  `httpx_curl_cffi` (`impersonate='chrome'`), one client per proxy so
+  TikTok's cookies persist. The server-rendered
+  `__UNIVERSAL_DATA_FOR_REHYDRATION__` → `webapp.user-detail` scope
+  carries the full user object (followers, video count, ids, private
+  flag, account status codes) but no videos, so records are written
+  with empty `videos`, `reposts`, `liked` and `playlists` lists and no
+  videos are queued for `tt_video_scrape.py`. No browsers are
+  started, `TIKTOK_CREATOR_MAX_BROWSERS` is ignored and `local://`
+  proxy entries are skipped. A 403/429 response or a bot-check page
+  counts as `rate_limit`; transport errors and other HTTP errors are
+  `transient`. When the bot-detection circuit opens, the proxy's
+  client is closed (dropping its cookies) and a fresh one is created
+  after the cooldown.
+- `browser`: the profile is loaded in a Camoufox session and the
+  page's own signed `/api/post/item_list`, `/api/repost/item_list`
+  and `/api/user/playlist` responses supply video, repost and
+  playlist refs, which are queued for the video scraper. TikTok does
+  not serve those endpoints without its browser-side signatures, so
+  this is the only mode that collects lists.
+
+Both modes use the `CREATOR_API` rate-limit bucket and the same
+`TIKTOK_CREATOR_RPM`.
+
 ### One async worker per active proxy
 
-Each worker process bootstraps one session per selected proxy. The
+Each worker process starts one fetcher session per selected proxy
+(a curl-cffi client in `http` mode, a Camoufox browser in `browser`
+mode). The
 creator scraper then starts one asyncio worker per active ready proxy.
 Each async worker claims one creator at a time, scrapes it through
 that proxy's session, and sleeps until the next due creator when the
@@ -124,19 +179,19 @@ queue is empty.
 `TIKTOK_CREATOR_NUM_PROCESSES > 1`, the first invocation becomes a
 supervisor. It chooses the effective fleet-wide concurrency, splits
 that budget across child processes, and gives each child a disjoint
-proxy slice with its own browsers and metrics port.
+proxy slice with its own sessions and metrics port.
 
 ### Creator-to-video handoff
 
-The creator scraper enqueues full TikTok video URLs, not bare video
-IDs. It uses every unique URL discovered from the creator's public
-videos, reposts, and liked posts. This is the TikTok video queue
-contract: video workers expect entries like
-`https://www.tiktok.com/@<username>/video/<id>`.
+Only in `browser` fetch mode. The creator scraper enqueues the bare
+numeric ids of every unique video discovered from the creator's
+public videos, reposts, and liked posts, in one batch per creator.
+This is the TikTok video queue contract: entries are bare ids such as
+`7691750271394827541`, never URLs. An id takes a few bytes where a URL
+took about 60, and backlog-server stores each id as a 64-bit integer.
 
-Keeping full URLs in the queue preserves the author handle needed by
-TikTokApi's `api.video(url=...)` entrypoint and avoids guessing when
-only an item ID is available.
+The author handle is not needed to scrape a video: TikTok serves the
+video page at `https://www.tiktok.com/@_/video/<id>` for any handle.
 
 ### Short URLs in the creator queue
 
@@ -153,7 +208,10 @@ re-tiered after their first successful profile scrape.
 
 Creator failures are classified by `classify_tiktok_error()`:
 
-- `unavailable` creators are removed from the queue.
+- `unavailable` creators are removed from the queue. This includes
+  accounts TikTok reports as banned, missing or unavailable
+  (user-detail status 10221, 10202 or 209002), which do not feed the
+  bot-detection circuit.
 - `transient`, `auth`, and `rate_limit` failures are released with a
   retry floor and jitter.
 - Other failures are released at the normal tier interval.
@@ -168,8 +226,9 @@ If rebuild fails, that proxy worker retires.
 
 ### What it does
 
-Consumes full video URLs from the platform-scoped Redis video queue,
-calls `Video.info`, maps the item payload to `TikTokVideo`, and writes
+Consumes video ids from the TikTok video queue, loads
+`https://www.tiktok.com/@_/video/<id>` through `Video.info`, maps the
+item payload to `TikTokVideo`, and writes
 `tiktok-video-<video_id>.json.br` to `TIKTOK_VIDEO_DATA_DIR`.
 
 The video model keeps public web payload data that can be collected
@@ -179,14 +238,17 @@ images, availability, and the raw item payload.
 
 ### Queue-driven loop
 
-One producer pops `TIKTOK_VIDEO_QUEUE_BATCH` entries from Redis and
-feeds an in-process asyncio queue. Consumer tasks read from that
-queue and scrape through their assigned proxy session. When Redis is
-empty, the producer sleeps for
-`TIKTOK_VIDEO_QUEUE_IDLE_POLL_SECONDS` before polling again.
+One producer pops `TIKTOK_VIDEO_QUEUE_BATCH` entries from the queue
+and feeds an in-process asyncio queue. Consumer tasks read from that
+queue and scrape through their assigned proxy session. When the queue
+is empty, the producer sleeps for
+`TIKTOK_VIDEO_QUEUE_IDLE_POLL_SECONDS` before polling again. On
+backlog-server a popped id is leased; a scraper that dies leaves it to
+come back when the lease expires.
 
-The scraper rejects malformed queue entries. A TikTok video queue
-member must be a full `www.tiktok.com/@.../video/...` URL.
+The scraper rejects malformed queue entries. A queue entry must be a
+bare video id; a full `www.tiktok.com/@.../video/<id>` URL left from
+before the queue held ids is still accepted.
 
 ### Transient retries
 
@@ -211,6 +273,76 @@ Unlike the YouTube yt-dlp path, TikTok video scraping is async I/O
 through TikTokApi and Camoufox. The main ceilings are ready proxy
 count, TikTok API latency, session health, and the Redis-backed
 per-proxy rate-limiter buckets.
+
+### TikTok video queue on backlog-server
+
+With `BACKLOG_SERVER_DSN` set, every TikTok tool uses the
+backlog-server queue `tiktok:video` (codec `tiktok_video`: a canonical
+decimal id stored as a 64-bit integer) instead of the Redis keys
+`tiktok:video:*`. The server must declare the queue:
+
+```
+BACKLOG_QUEUES=youtube:video=youtube_video,tiktok:video=tiktok_video
+```
+
+backlog-server keeps no per-video context (source, last error text,
+attempt counters), so `scrape-queue tiktok video search` only finds an
+exact id or video URL there, and `export` is not available.
+
+#### One-shot migration from Redis
+
+`tools/tt_video_queue_migrate.py` moves an existing Redis queue,
+including entries that are still video URLs, into backlog-server.
+Start every export with `--dry-run`.
+
+1. Build and deploy a backlog-server image that has the
+   `tiktok_video` codec. Do not add the queue to `BACKLOG_QUEUES` yet.
+2. Export the TikTok video ids already on scrape.exchange. Check the
+   dry run first: its plan must be an `IXSCAN` of
+   `_data_platform_entity_id_idx` (a `FETCH` above it is expected),
+   and the sample must hold numeric ids.
+
+   ```
+   uv run --extra migration python tools/tt_video_queue_migrate.py \
+       export-scraped --dry-run
+   uv run --extra migration python tools/tt_video_queue_migrate.py \
+       export-scraped --output-dir /var/tmp/tt-backlog
+   ```
+3. Stop every TikTok video producer and consumer:
+   `tt_video_scrape.py`, `tt_creator_scrape.py` in browser mode and
+   the TikTok `scrape_upload.py`.
+4. Export the Redis queue: waiting ids keep their enqueue time, ids
+   popped but never completed go to the front, and terminal ids keep
+   their state and reason.
+
+   ```
+   uv run python tools/tt_video_queue_migrate.py export-queue --dry-run
+   uv run python tools/tt_video_queue_migrate.py export-queue \
+       --output-dir /var/tmp/tt-backlog
+   ```
+5. Stop backlog-server, build the queue directory and declare it:
+
+   ```
+   backlog-server import --data-dir <BACKLOG_DATA_DIR> \
+       --queue tiktok:video --codec tiktok_video \
+       --scraped scraped.txt --queued queued.tsv \
+       --terminal terminal.tsv
+   ```
+
+   Add `tiktok:video=tiktok_video` to `BACKLOG_QUEUES`, start the
+   server and check that `BACKLOG.INFO tiktok:video` matches the
+   import report.
+6. Deploy the Python changes and start the TikTok tools with
+   `BACKLOG_SERVER_DSN` set.
+7. Free the Redis memory. Without `--apply` it only counts the keys;
+   with it, it checks that backlog-server serves `tiktok:video`
+   first, then deletes `tiktok:video:queue`, the terminal hashes and
+   every `tiktok:video:qmeta:*` and `tiktok:video:meta:*` key.
+
+   ```
+   uv run python tools/tt_video_queue_migrate.py delete-redis
+   uv run python tools/tt_video_queue_migrate.py delete-redis --apply
+   ```
 
 ## 5. Discovery (`tt_discover_search.py`)
 
@@ -255,9 +387,8 @@ creator record still captures public profile metadata, while videos
 are uploaded as first-class `video` records by the video uploader.
 
 Corrupt creator files can be rescheduled into the creator queue when
-Redis is configured. Corrupt video files are not automatically
-requeued, because the filename only preserves the video ID while the
-video queue contract requires the original full URL.
+Redis is configured. Corrupt video files are queued again by the id in
+their filename.
 
 ## 7. Output files and schemas
 
@@ -316,8 +447,9 @@ The Grafana dashboard JSON for the TikTok stack is in
 
 Do not collapse TikTok creator and video queue parsing into generic
 queue CLI logic. Entity-specific normalization belongs in the TikTok
-creator or video queue adapter, because creator handles and video URLs
-have different contracts.
+creator or video queue adapter, because creator handles and video ids
+have different contracts. The video adapter turns a pasted video URL
+into its id.
 
 Keep scraper and uploader mounts aligned. Uploaders only see files in
 their configured data directories, so a scraper writing to one path

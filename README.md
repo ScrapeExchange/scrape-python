@@ -32,10 +32,9 @@ is using Docker Compose, which can run all scrapers, their uploaders
 and the YouTube PO token provider in containers. The scrapers
 require a **Redis** server for scrape queues, identity maps,
 rate-limiter state, and uploaded-content tracking. All
-cross-tool coordination goes through Redis. Large YouTube
-deployments can move the video scrape queue to
-`backlog-server` by setting `BACKLOG_SERVER_DSN` (see
-[YOUTUBE.md](YOUTUBE.md)).
+cross-tool coordination goes through Redis. Large deployments can move the YouTube and TikTok video scrape
+queues to `backlog-server` by setting `BACKLOG_SERVER_DSN` (see
+[YOUTUBE.md](YOUTUBE.md) and [TIKTOK.md](TIKTOK.md)).
 
 1. Create an account on the [scrape.exchange](https://scrape.exchange) and get your API key from your account settings page.
 2. You need a Linux machine that has docker and docker-compose installed, as well as the Python package management tool UV:

@@ -116,6 +116,7 @@ def _settings(**overrides: object) -> MagicMock:
     )
     s.creator_concurrency = overrides.get('creator_concurrency', 0)
     s.creator_max_browsers = overrides.get('creator_max_browsers', 12)
+    s.creator_fetch_mode = overrides.get('creator_fetch_mode', 'browser')
     s.creator_num_processes = overrides.get('creator_num_processes', 1)
     s.creator_retry_interval_seconds = overrides.get(
         'creator_retry_interval_seconds', 300,
@@ -164,6 +165,7 @@ def _settings(**overrides: object) -> MagicMock:
         'creator_priority_queues',
         '168:1000000,336:100000,720:10000,4320:0',
     )
+    s.min_subs = overrides.get('min_subs', 0)
     return s
 
 
@@ -435,6 +437,19 @@ class TestHandleFailure(unittest.IsolatedAsyncioTestCase):
             1800,
         )
 
+    async def test_banned_account_is_removed(self) -> None:
+        q: MagicMock = self._queue()
+        s: MagicMock = _settings()
+        reason: str = await tool._handle_failure(
+            tool.TikTokProfileResponseError(
+                {'statusCode': 10221}, 'empty userInfo payload',
+            ),
+            'u', q, s,
+        )
+        self.assertEqual(reason, 'unavailable')
+        q.remove.assert_awaited_once_with('u')
+        q.release.assert_not_awaited()
+
     async def test_unavailable_removes(self) -> None:
         q: MagicMock = self._queue()
         s: MagicMock = _settings()
@@ -495,6 +510,21 @@ class TestScrapeOne(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             tool.classify_tiktok_error(ctx.exception),
             'rate_limit',
+        )
+
+    async def test_banned_account_status_is_unavailable(self) -> None:
+        detail: dict = {'statusCode': 10221, 'statusMsg': ''}
+        with patch.object(
+            tool, '_load_profile_page',
+            AsyncMock(return_value=self._page(detail)),
+        ), self.assertRaises(
+            tool.TikTokProfileResponseError,
+        ) as ctx:
+            await tool._scrape_one(MagicMock(), 'banned', _settings())
+
+        self.assertEqual(
+            tool.classify_tiktok_error(ctx.exception),
+            'unavailable',
         )
 
     async def test_empty_user_info_is_rate_limit(self) -> None:
@@ -798,6 +828,7 @@ class TestProcessCreator(unittest.IsolatedAsyncioTestCase):
         q: MagicMock = MagicMock()
         q.release = AsyncMock()
         q.remove = AsyncMock()
+        q.park_low_subs = AsyncMock()
         q.update_tier = AsyncMock()
         return q
 
@@ -810,7 +841,7 @@ class TestProcessCreator(unittest.IsolatedAsyncioTestCase):
 
     def _video_queue(self) -> MagicMock:
         q: MagicMock = MagicMock()
-        q.enqueue = AsyncMock(return_value=True)
+        q.enqueue_many = AsyncMock(return_value=0)
         return q
 
     def _page_patch(
@@ -846,7 +877,8 @@ class TestProcessCreator(unittest.IsolatedAsyncioTestCase):
             _raw_user('charli', followers=42, sec_uid='S9'),
         ):
             await tool._process_creator(
-                'charli', 'http://p:8080', pool, q, video_q, self.fm, s,
+                'charli', 'http://p:8080',
+                tool.BrowserCreatorFetcher(pool), q, video_q, self.fm, s,
                 '0', 'p', maps,
             )
         # record on disk
@@ -867,9 +899,9 @@ class TestProcessCreator(unittest.IsolatedAsyncioTestCase):
         # re-tier by measured followers, then release
         q.update_tier.assert_awaited_once_with('charli', 42)
         q.release.assert_awaited_once_with('charli')
-        video_q.enqueue.assert_not_awaited()
+        video_q.enqueue_many.assert_not_awaited()
 
-    async def test_success_enqueues_discovered_video_urls(
+    async def test_success_enqueues_discovered_video_ids(
         self,
     ) -> None:
         api: MagicMock = MagicMock()
@@ -893,30 +925,14 @@ class TestProcessCreator(unittest.IsolatedAsyncioTestCase):
             ],
         ):
             await tool._process_creator(
-                'charli', 'http://p:8080', pool, q, video_q, self.fm, s,
+                'charli', 'http://p:8080',
+                tool.BrowserCreatorFetcher(pool), q, video_q, self.fm, s,
                 '0', 'p', self._identity_maps(),
             )
 
-        self.assertEqual(
-            video_q.enqueue.await_args_list,
-            [
-                unittest.mock.call(
-                    'https://www.tiktok.com/@charli/video/v1',
-                    source='tiktok_creator',
-                ),
-                unittest.mock.call(
-                    'https://www.tiktok.com/@charli/video/v2',
-                    source='tiktok_creator',
-                ),
-                unittest.mock.call(
-                    'https://www.tiktok.com/@charli/video/v3',
-                    source='tiktok_creator',
-                ),
-                unittest.mock.call(
-                    'https://www.tiktok.com/@charli/video/v4',
-                    source='tiktok_creator',
-                ),
-            ],
+        # Bare ids only, in one batch: the queue never stores URLs.
+        video_q.enqueue_many.assert_awaited_once_with(
+            ['v1', 'v2', 'v3', 'v4'], source='tiktok_creator',
         )
         q.update_tier.assert_awaited_once_with('charli', 42)
         q.release.assert_awaited_once_with('charli')
@@ -931,7 +947,9 @@ class TestProcessCreator(unittest.IsolatedAsyncioTestCase):
         )
         q: MagicMock = self._queue()
         video_q: MagicMock = self._video_queue()
-        video_q.enqueue = AsyncMock(side_effect=RuntimeError('redis'))
+        video_q.enqueue_many = AsyncMock(
+            side_effect=RuntimeError('redis'),
+        )
         s: MagicMock = _settings(creator_video_ref_count=10)
 
         with self._page_patch(
@@ -939,13 +957,13 @@ class TestProcessCreator(unittest.IsolatedAsyncioTestCase):
             videos=[{'id': 'v1', 'author': {'uniqueId': 'charli'}}],
         ):
             await tool._process_creator(
-                'charli', 'http://p:8080', pool, q, video_q, self.fm, s,
+                'charli', 'http://p:8080',
+                tool.BrowserCreatorFetcher(pool), q, video_q, self.fm, s,
                 '0', 'p', self._identity_maps(),
             )
 
-        video_q.enqueue.assert_awaited_once_with(
-            'https://www.tiktok.com/@charli/video/v1',
-            source='tiktok_creator',
+        video_q.enqueue_many.assert_awaited_once_with(
+            ['v1'], source='tiktok_creator',
         )
         q.update_tier.assert_awaited_once_with('charli', 42)
         q.release.assert_awaited_once_with('charli')
@@ -964,11 +982,98 @@ class TestProcessCreator(unittest.IsolatedAsyncioTestCase):
             AsyncMock(side_effect=RuntimeError('user not found')),
         ):
             await tool._process_creator(
-                'ghost', 'http://p:8080', pool, q, video_q, self.fm, s,
+                'ghost', 'http://p:8080',
+                tool.BrowserCreatorFetcher(pool), q, video_q, self.fm, s,
                 '0', 'p', self._identity_maps(),
             )
         q.remove.assert_awaited_once_with('ghost')
         q.update_tier.assert_not_awaited()
+
+    async def test_below_min_subs_is_parked_and_not_persisted(
+        self,
+    ) -> None:
+        api: MagicMock = MagicMock()
+        pool: MagicMock = MagicMock()
+        pool.session_for = MagicMock(
+            return_value=_FakeSessionCtx(api),
+        )
+        q: MagicMock = self._queue()
+        video_q: MagicMock = self._video_queue()
+        maps: MagicMock = self._identity_maps()
+        s: MagicMock = _settings(min_subs=100, creator_video_ref_count=10)
+        with self._page_patch(
+            _raw_user('tiny', followers=42, sec_uid='S9'),
+            videos=[{'id': 'v1', 'author': {'uniqueId': 'tiny'}}],
+        ):
+            outcome: str | None = await tool._process_creator(
+                'tiny', 'http://p:8080',
+                tool.BrowserCreatorFetcher(pool), q, video_q, self.fm, s,
+                '0', 'p', maps,
+            )
+        self.assertIsNone(outcome)
+        # Nothing reaches disk, Redis identity maps, or the video queue.
+        filename: str = tool._creator_filename('tiny')
+        self.assertFalse(
+            os.path.exists(os.path.join(self._tmp.name, filename)),
+        )
+        self.assertFalse(
+            os.path.exists(
+                os.path.join(self._tmp.name, 'uploaded', filename),
+            ),
+        )
+        maps.user_id_to_username.put.assert_not_awaited()
+        maps.username_to_user_id.put.assert_not_awaited()
+        maps.nickname_to_sec_uid.put.assert_not_awaited()
+        video_q.enqueue_many.assert_not_awaited()
+        # Parked as a terminal state instead of being released.
+        q.park_low_subs.assert_awaited_once_with(
+            'tiny', 42, worker_id='0', proxy_ip='p',
+        )
+        q.update_tier.assert_not_awaited()
+        q.release.assert_not_awaited()
+
+    async def test_follower_count_at_min_subs_is_persisted(
+        self,
+    ) -> None:
+        api: MagicMock = MagicMock()
+        pool: MagicMock = MagicMock()
+        pool.session_for = MagicMock(
+            return_value=_FakeSessionCtx(api),
+        )
+        q: MagicMock = self._queue()
+        s: MagicMock = _settings(min_subs=42)
+        with self._page_patch(_raw_user('charli', followers=42)):
+            await tool._process_creator(
+                'charli', 'http://p:8080',
+                tool.BrowserCreatorFetcher(pool), q, self._video_queue(),
+                self.fm, s, '0', 'p', self._identity_maps(),
+            )
+        written: dict = await self.fm.read_file(
+            tool._creator_filename('charli'),
+        )
+        self.assertEqual(written['follower_count'], 42)
+        q.park_low_subs.assert_not_awaited()
+        q.release.assert_awaited_once_with('charli')
+
+    async def test_min_subs_zero_keeps_tiny_creators(self) -> None:
+        api: MagicMock = MagicMock()
+        pool: MagicMock = MagicMock()
+        pool.session_for = MagicMock(
+            return_value=_FakeSessionCtx(api),
+        )
+        q: MagicMock = self._queue()
+        s: MagicMock = _settings(min_subs=0)
+        with self._page_patch(_raw_user('tiny', followers=0)):
+            await tool._process_creator(
+                'tiny', 'http://p:8080',
+                tool.BrowserCreatorFetcher(pool), q, self._video_queue(),
+                self.fm, s, '0', 'p', self._identity_maps(),
+            )
+        written: dict = await self.fm.read_file(
+            tool._creator_filename('tiny'),
+        )
+        self.assertEqual(written['username'], 'tiny')
+        q.park_low_subs.assert_not_awaited()
 
 
 # ---------------------------------------------------------------
@@ -983,8 +1088,8 @@ class TestProxyWorker(unittest.IsolatedAsyncioTestCase):
         q.claim_batch = AsyncMock(return_value=[
             (short_url, short_url, 0.0),
         ])
-        pool = MagicMock()
-        pool.gate_api_request = AsyncMock()
+        fetcher = MagicMock()
+        fetcher.gate = AsyncMock()
         shutdown = asyncio.Event()
 
         async def _resolve(*_args: object) -> None:
@@ -994,11 +1099,11 @@ class TestProxyWorker(unittest.IsolatedAsyncioTestCase):
             tool, '_resolve_and_enqueue_short_url', _resolve,
         ):
             await tool._proxy_worker(
-                'http://p:8080', pool, q, MagicMock(),
+                'http://p:8080', fetcher, q, MagicMock(),
                 MagicMock(), _settings(), shutdown, '0', MagicMock(),
             )
 
-        pool.gate_api_request.assert_awaited_once_with(
+        fetcher.gate.assert_awaited_once_with(
             'http://p:8080',
         )
 
@@ -1035,6 +1140,45 @@ class TestProxyWorker(unittest.IsolatedAsyncioTestCase):
 
         pool.quarantine.assert_awaited_once_with('http://p:8080')
         pool.rebuild.assert_awaited_once_with('http://p:8080')
+
+    async def test_unavailable_never_opens_circuit(self) -> None:
+        shutdown = asyncio.Event()
+        claims = iter([
+            [('a', 'a', 0.0)], [('b', 'b', 0.0)], [('c', 'c', 0.0)],
+        ])
+
+        async def _claim(*_args: object, **_kwargs: object) -> list:
+            try:
+                return next(claims)
+            except StopIteration:
+                shutdown.set()
+                return []
+
+        q: MagicMock = MagicMock()
+        q.claim_batch = AsyncMock(side_effect=_claim)
+        q.next_due_time = AsyncMock(return_value=None)
+        pool = MagicMock()
+        pool.quarantine = AsyncMock()
+        pool.rebuild = AsyncMock(return_value=True)
+
+        async def _fake_process(*_args: object) -> str:
+            return 'unavailable'
+
+        async def _sleep(_seconds: float) -> None:
+            shutdown.set()
+
+        with patch.object(tool, 'Watchdog'), patch.object(
+            tool, '_process_creator', _fake_process,
+        ), patch.object(tool.asyncio, 'sleep', _sleep):
+            await tool._proxy_worker(
+                'http://p:8080', pool, q, MagicMock(),
+                MagicMock(), _settings(creator_bot_failure_threshold=1),
+                shutdown, '0', MagicMock(),
+            )
+
+        self.assertGreaterEqual(q.claim_batch.await_count, 3)
+        pool.quarantine.assert_not_awaited()
+        pool.rebuild.assert_not_awaited()
 
     async def test_success_resets_bot_failure_count(self) -> None:
         q: MagicMock = MagicMock()

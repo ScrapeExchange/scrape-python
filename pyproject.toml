@@ -41,6 +41,11 @@ dependencies = [
 scrape-queue = "tools.scrape_queue:main"
 tt-video-scrape = "tools.tt_video_scrape:main"
 
+[project.optional-dependencies]
+migration = [
+    "pymongo>=4.19.0",
+]
+
 [tool.uv]
 package = true
 # httpx2 (exchange API path) needs httpcore2 -> h11>=0.16, while the
