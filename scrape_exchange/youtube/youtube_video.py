@@ -1115,7 +1115,10 @@ class YouTubeVideo:
                 microformat['uploadDate']
             )
 
-        category: str | list[str] | None = video_details.get('category')
+        # YouTube puts the category in the microformat, not in videoDetails
+        category: str | list[str] | None = (
+            microformat.get('category') or video_details.get('category')
+        )
         if category and not self.category:
             if isinstance(category, str):
                 self.category = category
