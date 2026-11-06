@@ -1,9 +1,11 @@
 '''Unit tests for tools/tt_creator_resolve.py.'''
 
 import asyncio
+import io
 import json
 import tempfile
 import unittest
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -66,21 +68,22 @@ def _item(followers: int | None = 250_000) -> dict:
     return item
 
 
-class TestReadVideoIds(unittest.TestCase):
+class TestIterVideoIds(unittest.TestCase):
 
-    def test_dedupes_and_skips_junk(self) -> None:
+    def test_skips_junk_and_streams_lazily(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path: Path = Path(tmp) / 'ids.lst'
             path.write_text(
                 '1\n\n# comment\n2\nabc\n1\n 3 \n', encoding='utf-8',
             )
-            self.assertEqual(mod.read_video_ids(path), [1, 2, 3])
+            ids: Any = mod.iter_video_ids(path)
+            self.assertIsInstance(ids, Iterator)
+            # Duplicates are left to the processed log and the queue.
+            self.assertEqual(list(ids), [1, 2, 1, 3])
 
     def test_reads_stdin_when_path_is_dash(self) -> None:
-        with mock.patch(
-            'sys.stdin', mock.Mock(read=lambda: '5\n6\n'),
-        ):
-            self.assertEqual(mod.read_video_ids(None), [5, 6])
+        with mock.patch('sys.stdin', io.StringIO('5\n6\n')):
+            self.assertEqual(list(mod.iter_video_ids(None)), [5, 6])
 
 
 class TestBrowserHeaders(unittest.TestCase):
@@ -658,6 +661,58 @@ class TestRunWorkerPool(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(mod, 'Resolver', resolver_cls),
             mock.patch('builtins.print'),
         )
+
+    async def test_input_is_filtered_in_bounded_chunks(self) -> None:
+        chunk_sizes: list[int] = []
+
+        async def _filter(
+            dsn: str, ids: list[int],
+        ) -> tuple[list[int], dict[str, int]]:
+            chunk_sizes.append(len(ids))
+            return ids[1:], {'queued': 1}
+
+        class _Resolver:
+            def __init__(self, *args: Any) -> None:
+                pass
+
+            async def resolve(self, video_id: int) -> mod.Resolution:
+                return mod.Resolution(
+                    video_id=video_id, status=mod.STATUS_UNAVAILABLE,
+                )
+
+            async def close(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings: mod.ResolveSettings = self._settings(tmp, 25)
+            object.__setattr__(settings, 'redis_dsn', 'redis://x')
+            Path(tmp, 'done.lst').write_text(
+                f'{7000000000000000000}\n',
+            )
+            with mock.patch.object(
+                mod, 'INPUT_CHUNK_SIZE', 10,
+            ), mock.patch.object(
+                mod, 'filter_known_video_ids', _filter,
+            ), mock.patch.object(
+                mod, 'TikTokRateLimiter',
+            ), mock.patch.object(
+                mod, 'Resolver', _Resolver,
+            ), mock.patch(
+                'builtins.print',
+            ) as printed, self.assertLogs(
+                'tools.tt_creator_resolve', level='INFO',
+            ):
+                await mod.run(settings)
+
+        # 25 ids, one already processed: chunks of 9, 10 and 5.
+        self.assertEqual(chunk_sizes, [9, 10, 5])
+        summary: dict[str, Any] = json.loads(
+            printed.call_args_list[-1].args[0],
+        )
+        self.assertEqual(summary['input_ids'], 25)
+        self.assertEqual(summary['skipped_processed'], 1)
+        self.assertEqual(summary['skipped_video_queue'], 3)
+        self.assertEqual(summary['done'], 21)
 
     async def test_only_concurrency_tasks_exist(self) -> None:
         active: int = 0
