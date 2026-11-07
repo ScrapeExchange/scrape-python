@@ -69,13 +69,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import json
 import logging
 import random
 import re
 import signal
 import sys
-from collections.abc import Iterator
+from collections import deque
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -119,6 +121,9 @@ QUEUE_PLATFORM: str = 'tiktok'
 QUEUE_NAMESPACE: str = 'scrape'
 # Video ids looked up per video scrape queue state request.
 VIDEO_QUEUE_STATE_BATCH: int = 1000
+# Input ids read, de-duplicated against the processed log and checked
+# against the video scrape queue at a time; bounds the id memory.
+INPUT_CHUNK_SIZE: int = 5000
 
 # Video queue states that make an id pointless to resolve: the video is
 # either waiting to be scraped or has already been scraped.
@@ -339,27 +344,32 @@ def browser_headers(user_agent: str) -> dict[str, str]:
     }
 
 
-def read_video_ids(path: Path | None) -> list[int]:
-    '''Read video ids from *path*, or stdin when it is ``None``/``-``.
+def iter_video_ids(path: Path | None) -> Iterator[int]:
+    '''Lazily yield video ids from *path*, or stdin when it is
+    ``None``/``-``.
 
-    Blank lines and ``#`` comments are skipped, ids are de-duplicated
-    while preserving order, and unparsable lines are logged and
-    ignored.
+    The input is streamed line by line, so memory does not grow with
+    the size of the file. Blank lines and ``#`` comments are skipped
+    and unparsable lines are logged and ignored. Ids are not
+    de-duplicated: that would need a set of every id in memory, and a
+    repeated id is cheap -- the processed log and the video scrape
+    queue skip it once the first occurrence is settled.
     '''
     if path is None or str(path) == '-':
-        text: str = sys.stdin.read()
-        origin: str = '<stdin>'
-    else:
-        text = path.read_text(encoding='utf-8')
-        origin = str(path)
-    ids: list[int] = []
-    seen: set[int] = set()
-    for line_no, line in enumerate(text.splitlines(), start=1):
+        yield from _parse_id_lines(sys.stdin, '<stdin>')
+        return
+    with path.open('r', encoding='utf-8') as handle:
+        yield from _parse_id_lines(handle, str(path))
+
+
+def _parse_id_lines(lines: Iterable[str], origin: str) -> Iterator[int]:
+    '''Yield the integer on each line of *lines*, skipping junk.'''
+    for line_no, line in enumerate(lines, start=1):
         value: str = line.strip()
         if not value or value.startswith('#'):
             continue
         try:
-            video_id: int = int(value)
+            yield int(value)
         except ValueError:
             _LOGGER.warning(
                 'Ignoring unparsable video id',
@@ -369,12 +379,6 @@ def read_video_ids(path: Path | None) -> list[int]:
                     'value': value[:40],
                 },
             )
-            continue
-        if video_id in seen:
-            continue
-        seen.add(video_id)
-        ids.append(video_id)
-    return ids
 
 
 def _rehydration_scope(html: str) -> dict[str, Any] | None:
@@ -814,55 +818,72 @@ async def filter_known_video_ids(
 
 
 async def run(settings: ResolveSettings) -> int:
-    '''Resolve every input id, then queue the creators it found.'''
-    ids: list[int] = read_video_ids(settings.input_file)
-    if settings.max_ids:
-        ids = ids[: settings.max_ids]
-    input_ids: int = len(ids)
-    already_done: int = 0
+    '''Resolve every input id, then queue the creators it found.
+
+    The input is streamed in chunks of ``INPUT_CHUNK_SIZE`` ids, each
+    checked against the processed log and the video scrape queue just
+    before it is handed to the workers, so memory stays flat however
+    large the input file is.
+    '''
+    done_ids: set[int] = set()
     if settings.processed_file is not None and not settings.reprocess:
-        done_ids: set[int] = load_processed_ids(settings.processed_file)
-        if done_ids:
-            remaining: list[int] = [
-                video_id for video_id in ids
-                if video_id not in done_ids
-            ]
-            already_done = len(ids) - len(remaining)
-            _LOGGER.info(
-                'Skipping already processed video ids',
-                extra={
-                    'skipped': already_done,
-                    'input_ids': input_ids,
-                    'processed_file': str(settings.processed_file),
-                },
-            )
-            ids = remaining
-    skipped_queue: dict[str, int] = {}
-    if settings.redis_dsn:
-        remaining, skipped_queue = await filter_known_video_ids(
-            settings.redis_dsn, ids,
-        )
-        skipped_total: int = sum(skipped_queue.values())
-        _LOGGER.info(
-            'Skipping video ids the video scrape queue already knows',
-            extra={
-                'skipped': skipped_total,
-                'queued': skipped_queue.get(VIDEO_STATE_QUEUED, 0),
-                'scraped': skipped_queue.get(VIDEO_STATE_SCRAPED, 0),
-                'terminal': skipped_total - sum(
-                    skipped_queue.get(state, 0)
-                    for state in (
-                        VIDEO_STATE_QUEUED, VIDEO_STATE_SCRAPED,
-                    )
-                ),
-            },
-        )
-        ids = remaining
-    else:
+        done_ids = load_processed_ids(settings.processed_file)
+    source: Iterator[int] = iter_video_ids(settings.input_file)
+    if settings.max_ids:
+        source = itertools.islice(source, settings.max_ids)
+    if not settings.redis_dsn:
         _LOGGER.warning(
             'No REDIS_DSN; not checking the video scrape queue',
         )
-    if not ids:
+
+    buffer: deque[int] = deque()
+    buffer_lock: asyncio.Lock = asyncio.Lock()
+    input_ids: int = 0
+    already_done: int = 0
+    dispatched: int = 0
+    skipped_queue: dict[str, int] = {}
+    exhausted: bool = False
+
+    async def refill() -> None:
+        '''Fill *buffer* with the next chunk of ids worth fetching.'''
+        nonlocal input_ids, already_done, exhausted
+        while not buffer and not exhausted:
+            raw: list[int] = list(
+                itertools.islice(source, INPUT_CHUNK_SIZE),
+            )
+            # A short read is the end of the input; an all-processed
+            # full chunk is not.
+            exhausted = len(raw) < INPUT_CHUNK_SIZE
+            input_ids += len(raw)
+            chunk: list[int] = [
+                video_id for video_id in raw if video_id not in done_ids
+            ]
+            already_done += len(raw) - len(chunk)
+            if not chunk:
+                continue
+            if settings.redis_dsn:
+                chunk, skipped = await filter_known_video_ids(
+                    settings.redis_dsn, chunk,
+                )
+                for state, count in skipped.items():
+                    skipped_queue[state] = (
+                        skipped_queue.get(state, 0) + count
+                    )
+            buffer.extend(chunk)
+
+    async def next_id() -> int | None:
+        '''Next id to resolve, or ``None`` when the input is spent.'''
+        nonlocal dispatched
+        async with buffer_lock:
+            if not buffer:
+                await refill()
+            if not buffer:
+                return None
+            dispatched += 1
+            return buffer.popleft()
+
+    first: int | None = await next_id()
+    if first is None:
         print(
             f'no video ids to resolve '
             f'({already_done} already processed, '
@@ -872,6 +893,8 @@ async def run(settings: ResolveSettings) -> int:
             file=sys.stderr,
         )
         return 1
+    buffer.appendleft(first)
+    dispatched -= 1
     enqueuer: CreatorEnqueuer | None = None
     if settings.enqueue and not settings.dry_run:
         if not settings.redis_dsn:
@@ -900,9 +923,9 @@ async def run(settings: ResolveSettings) -> int:
     _LOGGER.info(
         'Resolving video ids',
         extra={
-            'video_ids': len(ids),
             'concurrency': concurrency,
             'proxies': len(settings.proxies),
+            'skipped_processed': already_done,
         },
     )
 
@@ -941,13 +964,12 @@ async def run(settings: ResolveSettings) -> int:
         ):
             processed.record(result.video_id)
 
-    pending: Iterator[int] = iter(ids)
-
     async def worker() -> None:
-        # Workers share one iterator, so only `concurrency` tasks exist
-        # however long the input is. A task per id cost ~1.4 KB each
-        # (3.5 GB for 1.6M ids) and made Ctrl-C quadratic.
-        for video_id in pending:
+        # Workers pull ids from one shared, chunked stream, so only
+        # `concurrency` tasks and one chunk of ids exist however long
+        # the input is. A task per id cost ~1.4 KB each (3.5 GB for
+        # 1.6M ids) and made Ctrl-C quadratic.
+        while (video_id := await next_id()) is not None:
             await record(await resolver.resolve(video_id))
 
     workers: list[asyncio.Task[None]] = [
@@ -980,7 +1002,8 @@ async def run(settings: ResolveSettings) -> int:
             processed.close()
 
     summary: dict[str, Any] = {
-        'video_ids': len(ids),
+        'video_ids': dispatched,
+        'input_ids': input_ids,
         'done': done,
         'resolved': counts.get(STATUS_RESOLVED, 0),
         'low_subs': counts.get(STATUS_LOW_SUBS, 0),
@@ -1008,7 +1031,7 @@ async def run(settings: ResolveSettings) -> int:
             else '; pass --processed-file next time to keep your place'
         )
         print(
-            f'{done} of {len(ids)} video id(s) done before '
+            f'{done} of {dispatched} dispatched video id(s) done before '
             f'interrupt; creators found so far are queued{hint}',
             file=sys.stderr,
         )
