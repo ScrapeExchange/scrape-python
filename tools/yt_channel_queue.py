@@ -232,7 +232,11 @@ def _build_parser() -> ArgumentParser:
             '@), or "-" to read newline-separated entries '
             'from stdin. With no KEY arguments, stdin is '
             'read. Stdin lines may also be JSON with '
-            '"channel_id" and/or "channel_handle" fields.'
+            '"channel_id" and/or "channel_handle" fields. '
+            'Channels the queue already knows (in any state) or '
+            'that have a scraped file in YOUTUBE_CHANNEL_DATA_DIR '
+            '(uploaded or not) are skipped, also with --priority; '
+            'use "rescrape" to bring a known channel forward.'
         ),
     )
     c_add.add_argument('keys', nargs='*')
@@ -288,7 +292,16 @@ def _build_parser() -> ArgumentParser:
     c_unmark: ArgumentParser = sub.add_parser('unmark')
     c_unmark.add_argument('key')
     c_unmark.add_argument('--to', default=None)
-    c_import = sub.add_parser('import')
+    c_import = sub.add_parser(
+        'import',
+        help=(
+            'Import channels from a JSON-lines file. Only '
+            'channels the queue has never seen and that have no '
+            'scraped file in YOUTUBE_CHANNEL_DATA_DIR are added; '
+            'known ones, terminal included, are left alone '
+            '(use "unmark" or "rescrape" for those).'
+        ),
+    )
     c_import.add_argument('file')
     mx: _MutuallyExclusiveGroup = c_import.add_mutually_exclusive_group()
     mx.add_argument(
@@ -913,8 +926,9 @@ async def _resolve_member_for_add(
 
     Returns ``i:<channel_id>`` when a valid channel_id is in
     hand (directly or via identity-store lookup of the handle),
-    ``h:<handle>`` when only an unresolvable handle remains,
-    or ``None`` when neither path applies.
+    ``h:<handle>`` (normalised as :meth:`enqueue_unresolved`
+    stores it) when only an unresolvable handle remains, or
+    ``None`` when neither path applies.
     '''
     if (
         channel_id
@@ -931,7 +945,29 @@ async def _resolve_member_for_add(
         )
         if cid:
             return f'i:{cid}'
-    return f'h:{channel_handle}'
+    try:
+        canonical: str = RedisChannelScrapeQueue._normalise_handle(
+            channel_handle,
+        )
+    except ValueError:
+        return None
+    return f'h:{canonical}'
+
+
+def _has_local_channel_file(
+    channel_data_directory: str | None, member: str,
+) -> bool:
+    '''True when the channel behind *member* (``i:<channel_id>``)
+    has a scraped file in *channel_data_directory*, uploaded or
+    not. Handle members have no channel_id, so no file to check.'''
+    if not channel_data_directory or not member.startswith('i:'):
+        return False
+    filename: str = f'channel-{member.removeprefix("i:")}.json.br'
+    base: str = channel_data_directory
+    return (
+        os.path.exists(os.path.join(base, filename))
+        or os.path.exists(os.path.join(base, 'uploaded', filename))
+    )
 
 
 async def _classify_pre_existing(
@@ -940,6 +976,7 @@ async def _classify_pre_existing(
     *,
     channel_id: str | None,
     channel_handle: str | None,
+    channel_data_directory: str | None = None,
 ) -> str:
     '''Pre-add classification.
 
@@ -949,9 +986,15 @@ async def _classify_pre_existing(
     * a :class:`ChannelState` value (e.g. ``'scheduled'``,
       ``'not_found'``) if meta has a ``state`` field
     * ``'no_state'`` — meta hash exists but no ``state`` field
-    * ``'new'`` — no meta hash at all
+    * ``'local_file'`` — the queue has no record, but the
+      channel has a scraped file (uploaded or not) in
+      *channel_data_directory*
+    * ``'new'`` — none of the above
     * ``'invalid_input'`` — neither channel_id nor a
       resolvable handle was supplied
+
+    Only ``'new'`` channels are added: everything else is a
+    channel that is already known.
     '''
     member: str | None = await _resolve_member_for_add(
         identity,
@@ -962,6 +1005,8 @@ async def _classify_pre_existing(
         return 'invalid_input'
     meta: dict[str, str] = await queue.get_meta(member)
     if not meta:
+        if _has_local_channel_file(channel_data_directory, member):
+            return 'local_file'
         return 'new'
     state: str | None = meta.get('state')
     if state is None:
@@ -980,7 +1025,7 @@ def _ordered_classification_keys(
     '''
     state_order: list[str] = [s.value for s in ChannelState]
     synthetic: list[str] = [
-        'new', 'no_state', 'invalid_input',
+        'new', 'local_file', 'no_state', 'invalid_input',
     ]
     ordered: list[str] = []
     for key in state_order + synthetic:
@@ -1004,8 +1049,16 @@ def _write_classification_report(
     total: int,
     header: str,
 ) -> None:
-    '''Emit the classification breakdown to stdout.'''
+    '''Emit the classification breakdown to stdout. Only the
+    ``new`` inputs were added; every other one was skipped.'''
     sys.stdout.write(f'{header} {total} input(s):\n')
+    skipped: int = sum(
+        n for key, n in counts.items() if key != 'new'
+    )
+    sys.stdout.write(
+        f'  added {counts.get("new", 0)}, skipped {skipped} '
+        f'already known or with a local channel file\n',
+    )
     sys.stdout.write('  pre-existing states:\n')
     keys: list[str] = _ordered_classification_keys(counts)
     if not keys:
@@ -1064,7 +1117,13 @@ async def cmd_add(
     queue: RedisChannelScrapeQueue,
     *,
     identity: ChannelIdentityStore | None = None,
+    channel_data_directory: str | None = None,
 ) -> int:
+    '''Add channels the queue has never seen. A channel the queue
+    already knows (in any state, terminal included) or that has a
+    local scraped file is left alone, with or without
+    ``--priority``; use ``rescrape`` to bring a known channel
+    forward.'''
     counts: dict[str, int] = {}
     total: int = 0
     for raw in _iter_add_inputs(list(ns.keys or [])):
@@ -1079,10 +1138,13 @@ async def cmd_add(
             queue, identity,
             channel_id=channel_id,
             channel_handle=channel_handle,
+            channel_data_directory=channel_data_directory,
         )
         counts[classification] = (
             counts.get(classification, 0) + 1
         )
+        if classification != 'new':
+            continue
         await _enqueue_resolved_channel(
             queue,
             channel_id=channel_id,
@@ -1254,65 +1316,14 @@ def _meta_subscriber_count(meta: dict[str, str]) -> int | None:
     return count if count >= 0 else None
 
 
-async def _revive_if_terminal(
-    queue: RedisChannelScrapeQueue,
-    member: str,
-    *,
-    channel_handle: str = '',
-) -> tuple[bool, ChannelState | None]:
-    '''Re-enqueue *member* if it sits in a terminal state.
-
-    When an imported member is currently parked in any
-    terminal-state hash (``not_found``, ``removed``,
-    ``terminated``, ...), ``enqueue_scheduled`` /
-    ``enqueue_unresolved`` would leave a split record: the
-    member back on an active queue but still listed in the
-    terminal hash with a stale meta ``state``. ``unmark``
-    removes it from every terminal hash, resets meta
-    ``state``, and re-enqueues to the queue matching the
-    member prefix. We pass an explicit normal-position
-    score so revived channels do not jump to the front.
-
-    A topic member is revived into the topic tier and flagged
-    ``topic=1``, so the video scraper exempts it from the privacy
-    limits. Its recorded handle may be a display name with
-    whitespace; that no longer keeps it parked.
-
-    Returns ``(terminal_found, revived_from)``. The second
-    value is ``None`` when there was no terminal state.
-    '''
-    state: ChannelState | None = await queue.get_state(member)
-    if state is None or state not in ChannelState.terminal_states():
-        return (False, None)
-    if state == ChannelState.TOPIC and member.startswith('i:'):
-        meta: dict[str, str] = await queue.get_meta(member)
-        raw: str | None = await queue._redis.hget(
-            queue._k_state(ChannelState.TOPIC), member,
-        )
-        if _record_is_topic_channel(raw):
-            await queue.set_meta(member, topic='1')
-        await queue.unmark(
-            member,
-            score=time.time(),
-            tier=queue.topic_tier(_meta_subscriber_count(meta)),
-        )
-        return (True, state)
-    await queue.unmark(member, score=time.time())
-    return (True, state)
-
-
 async def _enqueue_import_record(
     cid: str,
     handle: str,
     queue: RedisChannelScrapeQueue,
     identity: ChannelIdentityStore | None,
-) -> tuple[int, int, ChannelState | None]:
-    '''Enqueue one record; return
-    ``(resolved, unresolved, revived_from)``.
-
-    ``revived_from`` is the prior :class:`ChannelState` when
-    the member was rescued from a terminal state, else
-    ``None``.
+) -> tuple[int, int]:
+    '''Enqueue one record the queue has no record of; return
+    ``(resolved, unresolved)``.
 
     A ``cid`` is only honoured when it matches the
     modern ``UC[A-Za-z0-9_-]{22}`` format. If the
@@ -1330,47 +1341,20 @@ async def _enqueue_import_record(
             handle = cid
         cid = ''
     if cid:
-        terminal_found: bool
-        revived: ChannelState | None
-        terminal_found, revived = await _revive_if_terminal(
-            queue,
-            f'i:{cid}',
-            channel_handle=handle,
-        )
-        if not terminal_found:
-            await queue.enqueue_scheduled(
-                cid, source='migration',
-            )
-        return (1, 0, revived)
+        await queue.enqueue_scheduled(cid, source='migration')
+        return (1, 0)
     if not handle:
-        return (0, 0, None)
+        return (0, 0)
     hit: str | None = None
     if identity is not None:
         hit = await identity.lookup_id_for_handle(
             handle,
         )
     if hit:
-        terminal_found, revived = await _revive_if_terminal(
-            queue,
-            f'i:{hit}',
-            channel_handle=handle,
-        )
-        if not terminal_found:
-            await queue.enqueue_scheduled(
-                hit, source='migration',
-            )
-        return (1, 0, revived)
-    canonical: str = queue._normalise_handle(handle)
-    terminal_found, revived = await _revive_if_terminal(
-        queue,
-        f'h:{canonical}',
-        channel_handle=handle,
-    )
-    if not terminal_found:
-        await queue.enqueue_unresolved(
-            handle, source='migration',
-        )
-    return (0, 1, revived)
+        await queue.enqueue_scheduled(hit, source='migration')
+        return (1, 0)
+    await queue.enqueue_unresolved(handle, source='migration')
+    return (0, 1)
 
 
 async def _clear_channel_keys(
@@ -1391,12 +1375,16 @@ async def cmd_import(
     queue: RedisChannelScrapeQueue,
     *,
     identity: ChannelIdentityStore | None = None,
+    channel_data_directory: str | None = None,
 ) -> int:
+    '''Import channels the queue has never seen. Channels it
+    already knows, terminal ones included, and channels with a
+    local scraped file are skipped; use ``unmark`` or
+    ``rescrape`` to bring one back.'''
     if ns.replace:
         await _clear_channel_keys(queue)
     added_resolved: int = 0
     added_unresolved: int = 0
-    revived: dict[ChannelState, int] = {}
     counts: dict[str, int] = {}
     total: int = 0
     for raw_line in _read_lines(ns.file):
@@ -1424,35 +1412,22 @@ async def cmd_import(
             queue, identity,
             channel_id=cid_for_lookup or None,
             channel_handle=handle_for_lookup or None,
+            channel_data_directory=channel_data_directory,
         )
         counts[classification] = (
             counts.get(classification, 0) + 1
         )
-        r, u, revived_from = await _enqueue_import_record(
+        if classification != 'new':
+            continue
+        r, u = await _enqueue_import_record(
             cid, handle, queue, identity,
         )
         added_resolved += r
         added_unresolved += u
-        if revived_from is not None:
-            revived[revived_from] = (
-                revived.get(revived_from, 0) + 1
-            )
     sys.stdout.write(
         f'imported: {added_resolved} resolved, '
         f'{added_unresolved} unresolved\n',
     )
-    if revived:
-        breakdown: str = ', '.join(
-            f'{state.value}={n}'
-            for state, n in sorted(
-                revived.items(),
-                key=lambda kv: kv[0].value,
-            )
-        )
-        sys.stdout.write(
-            f'revived from terminal: '
-            f'{sum(revived.values())} ({breakdown})\n',
-        )
     _write_classification_report(
         counts, total=total, header='processed',
     )
@@ -2858,9 +2833,16 @@ async def main_async(argv: list[str]) -> int:
             redis, ChannelScrapeQueueSettings(),
         )
     )
+    # add/import skip channels with a local scraped file, so they
+    # need to know where those files are.
+    kwargs: dict[str, str | None] = {}
+    if ns.command in ('add', 'import'):
+        kwargs['channel_data_directory'] = (
+            settings.channel_data_directory
+        )
     try:
         return await _HANDLERS[ns.command](
-            ns, queue,
+            ns, queue, **kwargs,
         )
     except RedisConnectionError as exc:
         sys.stderr.write(

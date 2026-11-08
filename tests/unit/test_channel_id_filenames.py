@@ -248,7 +248,7 @@ class TestCandidateSelectionById(unittest.IsolatedAsyncioTestCase):
         marker = mock.Mock()
         marker.exists.return_value = False
         fm.marker_path.return_value = marker
-        fm.mark_uploaded = mock.AsyncMock()
+        fm.delete = mock.AsyncMock()
         creator_map = mock.AsyncMock()
         creator_map.get.return_value = '@uploadedhandle'
 
