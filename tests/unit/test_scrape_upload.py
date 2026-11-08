@@ -86,6 +86,7 @@ def _settings(**overrides: object) -> SimpleNamespace:
         'scrape_upload_concurrency': 2,
         'memory_profile_interval_seconds': 0,
         'upload_mode': 'bulk',
+        'rejected_retention_days': 3,
         'delete_after_upload': False,
         'background_drain_timeout_seconds': 1.0,
         'twitch_creator_data_directory': None,
@@ -1809,6 +1810,9 @@ class TestShutdown(unittest.IsolatedAsyncioTestCase):
                 AsyncMock(return_value=['t']),
             ),
             patch.object(scrape_upload, 'pending_count_loop', AsyncMock()),
+            patch.object(
+                scrape_upload, 'rejected_purge_loop', AsyncMock(),
+            ),
             patch.object(scrape_upload, 'drain_targets_round_robin', block),
             patch.object(scrape_upload, 'drain_in_flight', drain),
         ):
@@ -1979,6 +1983,63 @@ class TestOrphanMaxAge(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(bulk_state_is_stale(
             state, now=now, max_age=timedelta(seconds=1),
         ))
+
+
+class RejectedPurgeTest(unittest.IsolatedAsyncioTestCase):
+    '''rejected/ is purged after its retention period.'''
+
+    def test_default_retention_is_three_days(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            settings = scrape_upload.ScrapeUploadSettings(_env_file=None)
+        self.assertEqual(settings.rejected_retention_days, 3)
+
+    def test_retention_is_configurable(self) -> None:
+        with patch.dict(
+            os.environ, {'REJECTED_RETENTION_DAYS': '5'}, clear=True,
+        ):
+            settings = scrape_upload.ScrapeUploadSettings(_env_file=None)
+        self.assertEqual(settings.rejected_retention_days, 5)
+
+    def _target(self, base: str) -> Any:
+        fm: MagicMock = MagicMock()
+        fm.base_dir = Path(base)
+        return SimpleNamespace(fm=fm)
+
+    async def test_one_iteration_purges_every_target(self) -> None:
+        targets: list[Any] = [
+            self._target('/data/a'), self._target('/data/b'),
+        ]
+        with patch.object(
+            scrape_upload.time, 'time', return_value=1_000_000.0,
+        ), patch.object(
+            scrape_upload.asyncio, 'sleep',
+            side_effect=asyncio.CancelledError,
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await scrape_upload.rejected_purge_loop(
+                    targets, 3 * 86400,
+                )
+
+        target: Any
+        for target in targets:
+            target.fm.purge_rejected.assert_called_once_with(
+                3 * 86400, 1_000_000.0)
+
+    async def test_one_failing_target_does_not_stop_the_others(
+        self,
+    ) -> None:
+        targets: list[Any] = [
+            self._target('/data/a'), self._target('/data/b'),
+        ]
+        targets[0].fm.purge_rejected.side_effect = OSError('nope')
+        with patch.object(
+            scrape_upload.asyncio, 'sleep',
+            side_effect=asyncio.CancelledError,
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await scrape_upload.rejected_purge_loop(targets, 86400)
+
+        targets[1].fm.purge_rejected.assert_called_once()
 
 
 if __name__ == '__main__':
