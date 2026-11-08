@@ -19,11 +19,14 @@ import os
 import logging
 import re
 import secrets
+import time
 
 import aiofiles
 import aiofiles.os
+import orjson
 
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .brotli import (
@@ -133,6 +136,9 @@ UNKNOWN_CHANNEL_SUFFIX: str = '.unknown_channel'
 
 COMPRESSED_JSON_SUFFIX: str = '.json.br'
 
+# Why a rejected asset was rejected, written beside it in rejected/.
+_REASON_SUFFIX: str = '.reason.json'
+
 # Suffixes that mark a file as a status indicator (failure, not-found,
 # unresolved, unavailable).  Marker files always have the lowest priority:
 # writing a marker file never causes another file to be deleted, and the
@@ -177,6 +183,11 @@ class AssetFileManagement:
         self.delete_after_upload: bool = delete_after_upload
         self.uploaded_dir: Path = self.base_dir / 'uploaded'
         self.uploaded_dir.mkdir(parents=True, exist_ok=True)
+        # Files the server will never accept. Kept apart from base_dir so
+        # the retention purge scans a small directory, not the millions
+        # of files the base directory holds.
+        self.rejected_dir: Path = self.base_dir / 'rejected'
+        self.rejected_dir.mkdir(parents=True, exist_ok=True)
 
         self.prefix_rankings: dict[str, list[str]] = (
             prefix_rankings
@@ -965,6 +976,120 @@ class AssetFileManagement:
             extra={'src': src, 'dst': dst},
         )
         return dst
+
+    async def mark_rejected(
+        self, filename: str, reason: str, error_class: str,
+        job_id: str,
+    ) -> Path | None:
+        '''
+        Move *filename* from the base directory into ``rejected/`` and
+        write ``<filename>.reason.json`` beside it.
+
+        A rejected record was never accepted by the server, so the file
+        is always moved, also when the manager deletes uploaded files.
+        Its mtime is reset to the rejection time, which is what
+        :meth:`purge_rejected` counts from: the source file may have
+        been scraped days before it was rejected.
+
+        Idempotent against the other uploader process on the same
+        directory: when the source is already gone and the destination
+        exists, that destination is returned instead of raising.
+
+        :param filename: Bare filename inside ``base_dir``.
+        :param reason: The server's failure detail, for the operator.
+        :param error_class: The server's bounded failure class.
+        :param job_id: The bulk job the rejection came from.
+        :returns: The path inside ``rejected/``, or None if neither the
+            source nor a destination file exists.
+        :raises OSError: For any rename failure other than the race
+            described above.
+        '''
+        src: Path = self.base_dir / filename
+        dst: Path = self.rejected_dir / filename
+        now: float = time.time()
+        try:
+            os.rename(src, dst)
+        except FileNotFoundError:
+            if not dst.exists():
+                return None
+            logger.debug(
+                'Source already rejected by another process; '
+                'treating as success',
+                extra={'src': str(src), 'dst': str(dst)},
+            )
+            os.utime(dst, (now, now))
+            return dst
+        os.chmod(dst, WORLD_READABLE_FILE_MODE)
+        os.utime(dst, (now, now))
+        await self._write_rejection_reason(
+            dst, reason, error_class, job_id, now,
+        )
+        logger.warning(
+            'Rejected asset file',
+            extra={
+                'src': str(src), 'dst': str(dst),
+                'reason': reason, 'error_class': error_class,
+                'job_id': job_id,
+            },
+        )
+        return dst
+
+    async def _write_rejection_reason(
+        self, dst: Path, reason: str, error_class: str,
+        job_id: str, now: float,
+    ) -> None:
+        '''Write the audit trail next to a rejected file.'''
+        reason_path: Path = dst.with_name(f'{dst.name}.reason.json')
+        payload: dict[str, str] = {
+            'reason': reason,
+            'error_class': error_class,
+            'job_id': job_id,
+            'rejected_at': datetime.fromtimestamp(now, UTC).isoformat(),
+        }
+        async with aiofiles.open(reason_path, mode='wb') as handle:
+            await handle.write(orjson.dumps(payload))
+        os.chmod(reason_path, WORLD_READABLE_FILE_MODE)
+
+    def purge_rejected(self, max_age_seconds: float, now: float) -> int:
+        '''
+        Delete rejected files, and their reason files, once they are
+        older than *max_age_seconds*. Streamed with ``os.scandir`` so a
+        backlog after a failure storm does not build a list in memory.
+
+        :param max_age_seconds: Retention, counted from the rejection.
+        :param now: Current epoch seconds; injected for tests.
+        :returns: The number of asset files removed.
+        '''
+        removed: int = 0
+        try:
+            scan = os.scandir(self.rejected_dir)
+        except FileNotFoundError:
+            return 0
+        with scan as entries:
+            for entry in entries:
+                if not entry.is_file():
+                    continue
+                if entry.name.endswith(_REASON_SUFFIX):
+                    continue
+                try:
+                    age: float = now - entry.stat().st_mtime
+                except OSError:
+                    continue
+                if age < max_age_seconds:
+                    continue
+                try:
+                    os.remove(entry.path)
+                    os.remove(f'{entry.path}{_REASON_SUFFIX}')
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    logger.warning(
+                        'Failed to purge rejected file',
+                        exc=exc, extra={'path': entry.path},
+                    )
+                    continue
+                removed += 1
+        return removed
 
     async def mark_failed(self, filename: str) -> str:
         '''
