@@ -328,21 +328,30 @@ impl Wal {
     /// Delete segments whose records all lie below *lsn*. The current
     /// segment is never deleted.
     pub fn truncate_before(&mut self, lsn: u64) -> Result<(), WalError> {
-        let firsts: Vec<u64> = segment_firsts(&self.dir)?;
-        for (i, first) in firsts.iter().enumerate() {
-            let Some(next) = firsts.get(i + 1) else { break };
-            if *next <= lsn {
-                fs::remove_file(segment_path(&self.dir, *first))?;
-            }
-        }
-        fsync_dir(&self.dir)?;
-        Ok(())
+        truncate_dir_before(&self.dir, lsn)
     }
 
     #[cfg(test)]
     pub fn fail_next_write(&mut self) {
         self.fail_next = true;
     }
+}
+
+/// Delete the segments in *dir* whose records all lie below *lsn*; the
+/// newest segment is never deleted.
+///
+/// Only touches sealed segments, so it may run on another thread while
+/// the owner keeps appending to (and rotating) the current one.
+pub fn truncate_dir_before(dir: &Path, lsn: u64) -> Result<(), WalError> {
+    let firsts: Vec<u64> = segment_firsts(dir)?;
+    for (i, first) in firsts.iter().enumerate() {
+        let Some(next) = firsts.get(i + 1) else { break };
+        if *next <= lsn {
+            fs::remove_file(segment_path(dir, *first))?;
+        }
+    }
+    fsync_dir(dir)?;
+    Ok(())
 }
 
 /// Create segment *first* atomically (temp file, header, fsync,

@@ -490,6 +490,7 @@ mod tests {
             pop_scan_limit: 100_000,
             compaction_interval: Duration::from_secs(3600),
             compaction_delta_entries: 1_000_000,
+            compaction_pacing: Default::default(),
         }
     }
 

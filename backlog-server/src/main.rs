@@ -43,6 +43,7 @@ fn verify(a: &VerifyArgs) -> anyhow::Result<()> {
         pop_scan_limit: 100_000,
         compaction_interval: std::time::Duration::from_secs(3600),
         compaction_delta_entries: 10_000_000,
+        compaction_pacing: Default::default(),
     };
     let q: Queue = Queue::open(&dir, defaults)?;
     q.verify_base()?;

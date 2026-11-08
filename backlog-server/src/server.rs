@@ -25,7 +25,7 @@ use crate::compaction;
 use crate::config::ServeConfig;
 use crate::fsutil::check_data_dir;
 use crate::metrics::{self, QueueMetrics};
-use crate::queue::{Queue, QueueError, QueueParams};
+use crate::queue::{CompactionCleanup, Queue, QueueError, QueueParams};
 use crate::resp::{self, Value};
 
 const CHANNEL_BOUND: usize = 1024;
@@ -386,20 +386,27 @@ fn finish(
     done: Result<(std::io::Result<BaseInfo>, Instant), tokio::task::JoinError>,
 ) {
     match done {
-        Ok((Ok(info), started)) => match q.finish_compaction(info) {
-            Ok(()) => {
-                let secs: f64 = started.elapsed().as_secs_f64();
-                m.compaction(secs, unix_now_f64());
-                m.set_info(q.info());
-                info!(queue = %name, generation = info.generation,
+        Ok((Ok(info), started)) => {
+            let installing: Instant = Instant::now();
+            match q.finish_compaction(info) {
+                Ok(cleanup) => {
+                    let secs: f64 = started.elapsed().as_secs_f64();
+                    m.compaction(secs, unix_now_f64());
+                    m.set_info(q.info());
+                    info!(queue = %name, generation = info.generation,
                       entries = info.count, seconds = secs,
+                      install_seconds = installing.elapsed().as_secs_f64(),
                       "compaction finished");
+                    if let Some(cleanup) = cleanup {
+                        spawn_cleanup(name.to_string(), cleanup);
+                    }
+                }
+                Err(e) => {
+                    error!(queue = %name, error = %e, "installing compaction");
+                    q.abort_compaction(Instant::now());
+                }
             }
-            Err(e) => {
-                error!(queue = %name, error = %e, "installing compaction");
-                q.abort_compaction(Instant::now());
-            }
-        },
+        }
         Ok((Err(e), _)) => {
             error!(queue = %name, error = %e, "compaction failed");
             q.abort_compaction(Instant::now());
@@ -409,6 +416,23 @@ fn finish(
             q.abort_compaction(Instant::now());
         }
     }
+}
+
+/// Run a compaction's cleanup (unmap and delete the old generation,
+/// truncate the WAL) on a blocking thread so the queue keeps serving.
+/// A failure only leaves files behind: start-up and the next
+/// compaction remove them.
+fn spawn_cleanup(name: String, cleanup: CompactionCleanup) {
+    tokio::task::spawn_blocking(move || {
+        let started: Instant = Instant::now();
+        match cleanup.run() {
+            Ok(()) => info!(queue = %name,
+                            seconds = started.elapsed().as_secs_f64(),
+                            "compaction cleanup finished"),
+            Err(e) => warn!(queue = %name, error = %e,
+                            "compaction cleanup failed"),
+        }
+    });
 }
 
 async fn accept_loop(

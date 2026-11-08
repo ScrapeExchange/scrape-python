@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use memmap2::Mmap;
 
@@ -17,6 +18,7 @@ use crate::fileformat::{
 };
 use crate::fsutil::{fsync_dir, tmp_path};
 use crate::meta::Meta;
+use crate::pacing::{PacedFile, Pacer, WritePacing};
 
 pub fn ids_path(dir: &Path, generation: u64) -> PathBuf {
     dir.join(format!("ids.{generation:08}"))
@@ -42,8 +44,8 @@ pub struct BaseInfo {
 pub struct BaseWriter {
     dir: PathBuf,
     info: BaseInfo,
-    ids: BufWriter<File>,
-    states: BufWriter<File>,
+    ids: BufWriter<PacedFile>,
+    states: BufWriter<PacedFile>,
     ids_crc: crc32fast::Hasher,
     states_crc: crc32fast::Hasher,
     last: Option<u64>,
@@ -55,12 +57,27 @@ impl BaseWriter {
         generation: u64,
         wal_cut: u64,
     ) -> io::Result<BaseWriter> {
+        Self::create_paced(dir, generation, wal_cut, WritePacing::default())
+    }
+
+    /// Like [`BaseWriter::create`], with the files' dirty pages and
+    /// combined write rate bounded by *pacing*.
+    pub fn create_paced(
+        dir: &Path,
+        generation: u64,
+        wal_cut: u64,
+        pacing: WritePacing,
+    ) -> io::Result<BaseWriter> {
         fs::create_dir_all(dir)?;
-        let mut ids: BufWriter<File> =
-            BufWriter::new(File::create(tmp_path(&ids_path(dir, generation)))?);
-        let mut states: BufWriter<File> = BufWriter::new(File::create(
-            tmp_path(&state_path(dir, generation)),
-        )?);
+        let pacer: Arc<Pacer> = Pacer::new(pacing);
+        let mut ids: BufWriter<PacedFile> = BufWriter::new(PacedFile::new(
+            File::create(tmp_path(&ids_path(dir, generation)))?,
+            pacer.clone(),
+        ));
+        let mut states: BufWriter<PacedFile> = BufWriter::new(PacedFile::new(
+            File::create(tmp_path(&state_path(dir, generation)))?,
+            pacer,
+        ));
         ids.write_all(&[0; HEADER_LEN])?;
         states.write_all(&[0; HEADER_LEN])?;
         Ok(BaseWriter {
@@ -115,7 +132,8 @@ impl BaseWriter {
             ),
         ];
         for (w, crc, kind, final_path) in pairs {
-            let mut f: File = w.into_inner().map_err(|e| e.into_error())?;
+            let mut f: File =
+                w.into_inner().map_err(|e| e.into_error())?.into_file();
             let h: Header = Header {
                 count: info.count,
                 generation: g,
@@ -289,6 +307,16 @@ pub fn write_terminal(
     generation: u64,
     terminal: &HashMap<u64, u32>,
 ) -> io::Result<()> {
+    write_terminal_paced(dir, generation, terminal, WritePacing::default())
+}
+
+/// Like [`write_terminal`], with the write bounded by *pacing*.
+pub fn write_terminal_paced(
+    dir: &Path,
+    generation: u64,
+    terminal: &HashMap<u64, u32>,
+    pacing: WritePacing,
+) -> io::Result<()> {
     fs::create_dir_all(dir)?;
     let mut pairs: Vec<(u64, u32)> =
         terminal.iter().map(|(k, v)| (*k, *v)).collect();
@@ -307,10 +335,19 @@ pub fn write_terminal(
     let path: PathBuf = terminal_path(dir, generation);
     let tmp: PathBuf = tmp_path(&path);
     {
-        let mut f: BufWriter<File> = BufWriter::new(File::create(&tmp)?);
+        let mut f: BufWriter<PacedFile> = BufWriter::new(PacedFile::new(
+            File::create(&tmp)?,
+            Pacer::new(pacing),
+        ));
         f.write_all(&h.encode())?;
-        f.write_all(&payload)?;
-        f.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+        // Slices, so the paced file sees the write as it goes.
+        for part in payload.chunks(1 << 20) {
+            f.write_all(part)?;
+        }
+        f.into_inner()
+            .map_err(|e| e.into_error())?
+            .into_file()
+            .sync_all()?;
     }
     fs::rename(&tmp, &path)?;
     fsync_dir(dir)

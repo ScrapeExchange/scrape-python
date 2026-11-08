@@ -8,6 +8,7 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 
 use crate::codec::Codec;
+use crate::pacing::WritePacing;
 use crate::queue::QueueParams;
 
 pub const MAX_FSYNC_INTERVAL_MS: u64 = 60_000;
@@ -58,6 +59,18 @@ pub struct ServeConfig {
         default_value_t = 10_000_000
     )]
     pub compaction_delta_entries: usize,
+    /// Writeback window while a compaction writes the new generation:
+    /// after this many MiB the written range is flushed and waited
+    /// for, so a compaction never leaves GBs of dirty pages for the
+    /// kernel to write in a burst that stalls the WAL's fsync. 0
+    /// disables the window and the rate cap.
+    #[arg(long, env = "BACKLOG_COMPACTION_SYNC_MB", default_value_t = 64)]
+    pub compaction_sync_mb: u64,
+    /// Most MiB per second a compaction writes, on average. A full
+    /// compaction rewrites the whole base, so this sets how long it
+    /// runs: 32 MiB/s is about 9 minutes per 17 GB. 0 is unlimited.
+    #[arg(long, env = "BACKLOG_COMPACTION_MAX_MBPS", default_value_t = 32)]
+    pub compaction_max_mbps: u64,
     /// Default lease length for popped IDs.
     #[arg(long, env = "BACKLOG_LEASE_SECS", default_value_t = 1800)]
     pub lease_secs: u64,
@@ -162,6 +175,10 @@ impl ServeConfig {
                 self.compaction_interval_secs,
             ),
             compaction_delta_entries: self.compaction_delta_entries,
+            compaction_pacing: WritePacing {
+                sync_bytes: self.compaction_sync_mb << 20,
+                max_bytes_per_sec: self.compaction_max_mbps << 20,
+            },
         }
     }
 
@@ -185,6 +202,18 @@ pub(crate) mod tests {
         let mut argv: Vec<&str> = vec!["x", "--data-dir", "/nonexistent"];
         argv.extend_from_slice(extra);
         Wrap::try_parse_from(argv).unwrap().cfg
+    }
+
+    #[test]
+    fn compaction_pacing_defaults_and_overrides() {
+        let p: QueueParams = cfg(&[]).queue_params();
+        assert_eq!(p.compaction_pacing.sync_bytes, 64 << 20);
+        assert_eq!(p.compaction_pacing.max_bytes_per_sec, 32 << 20);
+        let p: QueueParams =
+            cfg(&["--compaction-sync-mb", "8", "--compaction-max-mbps", "0"])
+                .queue_params();
+        assert_eq!(p.compaction_pacing.sync_bytes, 8 << 20);
+        assert_eq!(p.compaction_pacing.max_bytes_per_sec, 0);
     }
 
     #[test]
