@@ -1,4 +1,4 @@
-//! Paced writes for large background rewrites.
+//! Paced writes and drop-behind reads for large background rewrites.
 //!
 //! A compaction streams tens of GB to disk. Left alone the kernel
 //! buffers it as dirty pages and writes them back in bursts, and the
@@ -9,12 +9,21 @@
 //! [`PacedFile`] bounds that in two ways: every `sync_bytes` it starts
 //! writeback of the range it just wrote and waits for it, so only a
 //! small window is ever dirty; and the shared [`Pacer`] sleeps so the
-//! average rate stays under `max_bytes_per_sec`. The written pages stay
-//! in the page cache (nothing is evicted), so the new generation is
-//! warm when it replaces the old one.
+//! average rate stays under `max_bytes_per_sec`. Once a window is on
+//! disk its pages are dropped from the page cache.
+//!
+//! Dropping matters as much as pacing. The live base is mmap'd and
+//! looked up at random, so it only performs while most of it is
+//! cached. A rewrite streams the whole old generation in and the whole
+//! new one out; kept in the cache, those pages evict the ones the
+//! lookups need and every lookup turns into disk reads. [`PacedFile`]
+//! drops what it wrote and [`DropBehindReader`] drops what it read.
+//! The kernel skips pages that a process has mapped, so the pages the
+//! lookups use stay cached. The new generation starts cold and warms
+//! up as lookups fault it in.
 
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -109,7 +118,10 @@ impl PacedFile {
         let len: u64 = self.written - self.synced;
         // Best effort: an unsupported filesystem just loses the
         // windowing. Durability comes from the caller's `sync_all`.
-        let _ = start_writeback(&self.file, self.synced, len);
+        if start_writeback(&self.file, self.synced, len).is_ok() {
+            // The window is clean now, so the kernel can drop it.
+            let _ = drop_cached(&self.file, self.synced, len);
+        }
         self.synced = self.written;
         self.pacer.throttle(len);
     }
@@ -129,6 +141,110 @@ impl Write for PacedFile {
     fn flush(&mut self) -> io::Result<()> {
         self.file.flush()
     }
+}
+
+/// Read buffer of a [`DropBehindReader`].
+pub const READ_CHUNK_BYTES: usize = 4 << 20;
+
+/// A sequential reader that drops each chunk from the page cache once
+/// it has been consumed.
+pub struct DropBehindReader {
+    file: File,
+    buf: Vec<u8>,
+    pos: usize,
+    len: usize,
+    /// File offset just past the bytes in `buf`.
+    end: u64,
+    /// Everything before this offset has been dropped.
+    dropped: u64,
+}
+
+impl DropBehindReader {
+    /// Read `file` from `start` with `chunk`-byte reads.
+    pub fn new(
+        mut file: File,
+        start: u64,
+        chunk: usize,
+    ) -> io::Result<DropBehindReader> {
+        file.seek(SeekFrom::Start(start))?;
+        // Best effort, like the drops: it only widens readahead.
+        let _ = advise_sequential(&file);
+        Ok(DropBehindReader {
+            file,
+            buf: vec![0; chunk.max(1)],
+            pos: 0,
+            len: 0,
+            end: start,
+            dropped: 0,
+        })
+    }
+
+    fn refill(&mut self) -> io::Result<()> {
+        if self.end > self.dropped {
+            let _ =
+                drop_cached(&self.file, self.dropped, self.end - self.dropped);
+            self.dropped = self.end;
+        }
+        self.len = self.file.read(&mut self.buf)?;
+        self.pos = 0;
+        self.end += self.len as u64;
+        Ok(())
+    }
+}
+
+impl Read for DropBehindReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.pos == self.len {
+            self.refill()?;
+        }
+        let n: usize = out.len().min(self.len - self.pos);
+        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+/// Drop the clean cached pages of `[offset, offset + len)`. Pages that
+/// are dirty or mapped by a process are left alone.
+#[cfg(target_os = "linux")]
+fn drop_cached(file: &File, offset: u64, len: u64) -> io::Result<()> {
+    fadvise(file, offset, len, libc::POSIX_FADV_DONTNEED)
+}
+
+#[cfg(target_os = "linux")]
+fn advise_sequential(file: &File) -> io::Result<()> {
+    fadvise(file, 0, 0, libc::POSIX_FADV_SEQUENTIAL)
+}
+
+#[cfg(target_os = "linux")]
+fn fadvise(file: &File, offset: u64, len: u64, advice: i32) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: the fd is open for the duration of the call and no
+    // memory is passed to the kernel.
+    let rc: i32 = unsafe {
+        libc::posix_fadvise(
+            file.as_raw_fd(),
+            offset as libc::off_t,
+            len as libc::off_t,
+            advice,
+        )
+    };
+    // posix_fadvise returns the error number instead of setting errno.
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(rc))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn drop_cached(_file: &File, _offset: u64, _len: u64) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn advise_sequential(_file: &File) -> io::Result<()> {
+    Ok(())
 }
 
 /// Start writeback of `[offset, offset + len)` and wait for it.
@@ -201,6 +317,40 @@ mod tests {
         let mut file: File = File::create(&path).unwrap();
         file.write_all(&[1u8; 4096 * 8]).unwrap();
         start_writeback(&file, 0, 4096 * 8).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn drop_cached_syscall_succeeds() {
+        // The callers ignore a failing hint, so check it directly.
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("f");
+        let mut file: File = File::create(&path).unwrap();
+        file.write_all(&[1u8; 4096 * 8]).unwrap();
+        file.sync_all().unwrap();
+        drop_cached(&file, 0, 4096 * 8).unwrap();
+        advise_sequential(&file).unwrap();
+    }
+
+    #[test]
+    fn drop_behind_reader_reads_every_byte_from_start() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("f");
+        let data: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+        // A chunk smaller than the reads and not a divisor of the file.
+        let mut r: DropBehindReader =
+            DropBehindReader::new(File::open(&path).unwrap(), 10, 7).unwrap();
+        let mut got: Vec<u8> = Vec::new();
+        let mut part: [u8; 9] = [0; 9];
+        loop {
+            let n: usize = r.read(&mut part).unwrap();
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&part[..n]);
+        }
+        assert_eq!(got, &data[10..]);
     }
 
     #[test]
