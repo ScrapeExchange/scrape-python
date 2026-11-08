@@ -1254,6 +1254,23 @@ class MarkRejectedTest(unittest.IsolatedAsyncioTestCase):
                 (fm.rejected_dir / 'old.json.br.reason.json').exists())
             self.assertTrue(new.exists())
 
+    def test_purge_counts_a_file_without_reason_file(self) -> None:
+        '''A rejected file whose reason file is already gone is still
+        purged and counted.'''
+        tmp, base = self._tree()
+        with tmp:
+            fm = AssetFileManagement(base)
+            now: float = time.time()
+            old: Path = fm.rejected_dir / 'old.json.br'
+            old.write_bytes(b'x')
+            four_days: float = now - 4 * 86400
+            os.utime(old, (four_days, four_days))
+
+            removed: int = fm.purge_rejected(3 * 86400, now)
+
+            self.assertEqual(removed, 1)
+            self.assertFalse(old.exists())
+
 
 if __name__ == '__main__':
     unittest.main()
