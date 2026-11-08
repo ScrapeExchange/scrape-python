@@ -41,7 +41,8 @@ This document describes the end-to-end architecture of `scrape-python`, with emp
 - **Scraped data directories**: handoff boundary between scrape tools
   and upload tools. Scrapers write compressed channel and video JSON
   files; uploaders read, validate, upload, and move accepted files
-  into their `uploaded/` directories.
+  into their `uploaded/` directories (or delete them, when
+  `SCRAPE_UPLOAD_DELETE_AFTER_UPLOAD=true`).
 - **`scrape_exchange.schema_validator`**: schema checks for outbound
   entities before upload; uploaders validate disk-backed channel and
   video records, and the RSS path validates the lite channel records
@@ -83,7 +84,8 @@ scraper to its uploader.
      records against the channel schema, and uploads them through the
      exchange client/bulk-upload path.
 6. **Uploaded-file disposition + metrics**
-   - Successfully uploaded files move under `uploaded/`; workers emit
+   - Successfully uploaded files move under `uploaded/` (or are deleted
+     with `SCRAPE_UPLOAD_DELETE_AFTER_UPLOAD=true`); workers emit
      queue, scrape, upload, failure, and latency metrics along the way.
 
 ### RSS/video path
@@ -106,7 +108,8 @@ scraper to its uploader.
      records, and uploads them through the exchange client/bulk-upload
      path.
 7. **Uploaded-file disposition + metrics**
-   - Successfully uploaded video files move under `uploaded/`; Redis
+   - Successfully uploaded video files move under `uploaded/` (or are
+     deleted with `SCRAPE_UPLOAD_DELETE_AFTER_UPLOAD=true`); Redis
      queue state and Prometheus metrics preserve operational progress.
 
 ## 4) Ingestion paths and authoritative fields

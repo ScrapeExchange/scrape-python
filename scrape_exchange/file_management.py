@@ -160,8 +160,21 @@ class AssetFileManagement:
         self,
         base_dir: str,
         prefix_rankings: dict[str, list[str]] | None = None,
+        delete_after_upload: bool = False,
     ) -> None:
+        '''
+        :param base_dir: Directory holding the scraped asset files.
+        :param prefix_rankings: Filename-prefix groups; see
+            ``DEFAULT_PREFIX_RANKINGS``.
+        :param delete_after_upload: When ``True``,
+            :meth:`mark_uploaded` and :meth:`mark_uploaded_from` delete
+            the file instead of moving it to ``uploaded/``. Only the
+            uploader sets this. Tools that read ``uploaded/`` (the
+            derived-metadata enrichment, the channel queue tool and the
+            backfill tools) then find nothing there.
+        '''
         self.base_dir: Path = Path(base_dir)
+        self.delete_after_upload: bool = delete_after_upload
         self.uploaded_dir: Path = self.base_dir / 'uploaded'
         self.uploaded_dir.mkdir(parents=True, exist_ok=True)
 
@@ -839,10 +852,29 @@ class AssetFileManagement:
                 },
             )
 
-    async def mark_uploaded(self, filename: str) -> Path:
+    def _discard_uploaded(self, src: Path) -> None:
+        '''
+        Delete the uploaded file *src* (``delete_after_upload`` mode).
+        A file that is already gone is success: the upload succeeded
+        and another process, or an earlier attempt, removed it.
+        '''
+        try:
+            os.remove(src)
+        except FileNotFoundError:
+            logger.debug(
+                'Uploaded file already deleted; treating as success',
+                extra={'src': str(src)},
+            )
+            return
+        logger.debug(
+            'Deleted uploaded file', extra={'src': str(src)},
+        )
+
+    async def mark_uploaded(self, filename: str) -> Path | None:
         '''
         Move *filename* from the base directory into the uploaded
-        directory. Idempotent: if the source is already absent and
+        directory, or delete it when the manager was created with
+        ``delete_after_upload=True``. Idempotent: if the source is already absent and
         the destination exists (e.g. a concurrent uploader already
         marked it), the call returns the destination silently
         instead of raising. This benign-race case happens in
@@ -853,11 +885,16 @@ class AssetFileManagement:
 
         :param filename: Bare filename (no directory component) inside
             ``base_dir`` to move.
-        :returns: The new path inside the uploaded directory.
+        :returns: The new path inside the uploaded directory, or
+            ``None`` when the file was deleted instead of moved.
         :raises OSError: For any rename failure other than the
-            already-marked race described above.
+            already-marked race described above, or a failure to
+            delete the file.
         '''
         src: Path = self.base_dir / filename
+        if self.delete_after_upload:
+            self._discard_uploaded(src)
+            return None
         dst: Path = self.uploaded_dir / filename
         try:
             os.rename(src, dst)
@@ -880,9 +917,11 @@ class AssetFileManagement:
 
     async def mark_uploaded_from(
         self, filename: str, source_dir: Path,
-    ) -> Path:
+    ) -> Path | None:
         '''
-        Move *filename* from *source_dir* into :attr:`uploaded_dir`.
+        Move *filename* from *source_dir* into :attr:`uploaded_dir`,
+        or delete it when the manager was created with
+        ``delete_after_upload=True``.
 
         Same idempotent semantics as :meth:`mark_uploaded` (a
         prior mover that already placed the destination wins),
@@ -897,11 +936,16 @@ class AssetFileManagement:
         :param filename: Bare filename (no directory component)
             present in *source_dir* to move.
         :param source_dir: Directory the file currently lives in.
-        :returns: The new path inside :attr:`uploaded_dir`.
+        :returns: The new path inside :attr:`uploaded_dir`, or ``None``
+            when the file was deleted instead of moved.
         :raises OSError: For any rename failure other than the
-            already-marked race described above.
+            already-marked race described above, or a failure to
+            delete the file.
         '''
         src: Path = source_dir / filename
+        if self.delete_after_upload:
+            self._discard_uploaded(src)
+            return None
         dst: Path = self.uploaded_dir / filename
         try:
             os.rename(src, dst)

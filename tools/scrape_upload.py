@@ -7,7 +7,9 @@ Reads Brotli-compressed JSON files produced by scraping tools,
 validates each asset against its configured JSON Schema, uploads via
 either the bulk endpoint or the ExchangeClient background queue, and
 moves successfully uploaded files into the ``uploaded/`` subdirectory
-owned by the directory they were read from.
+owned by the directory they were read from. With
+``SCRAPE_UPLOAD_DELETE_AFTER_UPLOAD=true`` it deletes them instead, which
+saves the disk space and the file churn of keeping uploaded copies.
 '''
 
 from __future__ import annotations
@@ -431,6 +433,18 @@ class ScrapeUploadSettings(ScraperSettings):
             'scrape_upload_watch',
         ),
         description='Watch directories for new files after initial drain.',
+    )
+    delete_after_upload: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            'SCRAPE_UPLOAD_DELETE_AFTER_UPLOAD',
+            'ASSET_UPLOAD_DELETE_AFTER_UPLOAD',
+            'delete_after_upload',
+        ),
+        description=(
+            'Delete a file once it has been uploaded instead of moving '
+            'it to the uploaded/ subdirectory. Applies to every target.'
+        ),
     )
     scrape_upload_concurrency: int = Field(
         default=3,
@@ -1332,7 +1346,7 @@ async def prepare_asset_line(
         await fm.mark_invalid(filename)
         return None
     except FileNotFoundError:
-        # Listed, then moved to uploaded/ or removed before the read.
+        # Listed, then moved to uploaded/ or deleted before the read.
         logging.debug(
             'Asset file vanished before upload',
             extra={'filename': filename, 'content_id': content_id},
@@ -2226,6 +2240,7 @@ async def watch_target(
 def build_file_manager(
     directory: str,
     descriptor: AssetDescriptor,
+    delete_after_upload: bool = False,
 ) -> AssetFileManagement:
     if not os.path.isdir(directory):
         logging.info(
@@ -2236,6 +2251,7 @@ def build_file_manager(
     return AssetFileManagement(
         directory,
         prefix_rankings=descriptor.prefix_rankings,
+        delete_after_upload=delete_after_upload,
     )
 
 
@@ -2271,6 +2287,7 @@ async def build_upload_targets(
         fm: AssetFileManagement = build_file_manager(
             spec.directory,
             descriptor,
+            delete_after_upload=settings.delete_after_upload,
         )
         processor: AssetProcessor = processor_for(descriptor)
         state: Any = await processor.setup(

@@ -575,6 +575,42 @@ class TestMarkerHelpers(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(os.path.exists(dst))
         self.assertEqual(_file_mode(dst), WORLD_READABLE_FILE_MODE)
 
+    async def test_mark_uploaded_deletes_when_configured(self):
+        fm = AssetFileManagement(self.base, delete_after_upload=True)
+        src = os.path.join(self.base, 'channel-foo.json.br')
+        Path(src).write_text('x')
+        result = await fm.mark_uploaded('channel-foo.json.br')
+        self.assertIsNone(result)
+        self.assertFalse(os.path.exists(src))
+        self.assertFalse(os.path.exists(
+            os.path.join(self.uploaded, 'channel-foo.json.br')
+        ))
+
+    async def test_mark_uploaded_from_deletes_when_configured(self):
+        fm = AssetFileManagement(self.base, delete_after_upload=True)
+        with tempfile.TemporaryDirectory() as source:
+            src = os.path.join(source, 'channel-foo.json.br')
+            Path(src).write_text('x')
+            result = await fm.mark_uploaded_from(
+                'channel-foo.json.br', Path(source),
+            )
+            self.assertFalse(os.path.exists(src))
+        self.assertIsNone(result)
+        self.assertEqual(os.listdir(self.uploaded), [])
+
+    async def test_delete_mode_missing_source_is_success(self):
+        # The upload succeeded; a file another process already removed
+        # must not turn that into a failure.
+        fm = AssetFileManagement(self.base, delete_after_upload=True)
+        self.assertIsNone(await fm.mark_uploaded('already-gone.json.br'))
+        with tempfile.TemporaryDirectory() as source:
+            self.assertIsNone(
+                await fm.mark_uploaded_from('gone.json.br', Path(source))
+            )
+
+    async def test_delete_mode_is_off_by_default(self):
+        self.assertFalse(self.fm.delete_after_upload)
+
     async def test_mark_uploaded_missing_source_raises(self):
         with self.assertRaises((FileNotFoundError, OSError)):
             await self.fm.mark_uploaded('does-not-exist.json.br')
