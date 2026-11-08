@@ -66,6 +66,7 @@ from scrape_exchange.instagram import InstagramCreator
 from scrape_exchange.logging import (
     configure_logging as configure_shared_logging,
 )
+from scrape_exchange.memory_profiler import run_memory_profiler
 from scrape_exchange.metrics_server import start_metrics_server
 from scrape_exchange.name_map import NameMap, NullNameMap, RedisNameMap
 from scrape_exchange.onlyfans.onlyfans_creator import OnlyFansCreator
@@ -450,6 +451,20 @@ class ScrapeUploadSettings(ScraperSettings):
             'metrics_port',
         ),
         description='Port for the Prometheus metrics HTTP server.',
+    )
+    memory_profile_interval_seconds: int = Field(
+        default=0,
+        ge=0,
+        validation_alias=AliasChoices(
+            'SCRAPE_UPLOAD_MEMORY_PROFILE_SECONDS',
+            'memory_profile_interval_seconds',
+        ),
+        description=(
+            'Debugging aid: when above 0, trace allocations with '
+            'tracemalloc and log the biggest growers since the first '
+            'snapshot every this many seconds. Slows the process; '
+            '0 disables it.'
+        ),
     )
     scrape_upload_log_level: str = Field(
         default='INFO',
@@ -2332,9 +2347,18 @@ async def run(settings: ScrapeUploadSettings) -> None:
         install_shutdown_handlers(loop, main_task)
         if main_task is not None else []
     )
+    profiler: asyncio.Task | None = (
+        asyncio.create_task(
+            run_memory_profiler(settings.memory_profile_interval_seconds),
+            name='memory-profiler',
+        )
+        if settings.memory_profile_interval_seconds > 0 else None
+    )
     try:
         await _run_with_client(settings)
     finally:
+        if profiler is not None:
+            profiler.cancel()
         remove_shutdown_handlers(loop, handled)
 
 

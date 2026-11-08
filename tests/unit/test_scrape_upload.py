@@ -84,6 +84,7 @@ def _settings(**overrides: object) -> SimpleNamespace:
         'max_active_bulk_jobs': 2,
         'bulk_orphan_max_age_hours': 3.0,
         'scrape_upload_concurrency': 2,
+        'memory_profile_interval_seconds': 0,
         'upload_mode': 'bulk',
         'background_drain_timeout_seconds': 1.0,
         'twitch_creator_data_directory': None,
