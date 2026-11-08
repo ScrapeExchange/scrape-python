@@ -21,6 +21,7 @@ use crate::known::KnownSet;
 use crate::lane::{Lane, LaneId};
 use crate::leases::Leases;
 use crate::meta::{Meta, Reason, State};
+use crate::pacing::WritePacing;
 use crate::wal::{Record, Wal, WalError, replay};
 
 #[derive(Debug, Clone, Copy)]
@@ -29,6 +30,7 @@ pub struct QueueParams {
     pub pop_scan_limit: usize,
     pub compaction_interval: Duration,
     pub compaction_delta_entries: usize,
+    pub compaction_pacing: WritePacing,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +77,37 @@ pub enum QueueError {
     Format(#[from] FormatError),
     #[error(transparent)]
     Io(#[from] io::Error),
+}
+
+/// What is left to do after a compaction was installed. Blocking and
+/// slow on a busy disk (it frees tens of GB), so it must not run on the
+/// queue owner's task.
+pub struct CompactionCleanup {
+    /// The superseded generation's mapping; dropped (unmapped) first.
+    old_base: Arc<Base>,
+    base_dir: PathBuf,
+    old_generation: u64,
+    wal_dir: PathBuf,
+    wal_cut: u64,
+}
+
+impl CompactionCleanup {
+    /// Unmap and delete the old generation and the WAL segments below
+    /// the compaction's cut. Both are attempted; the first error is
+    /// returned.
+    pub fn run(self) -> Result<(), QueueError> {
+        drop(self.old_base);
+        let base: Result<(), QueueError> = if self.old_generation != 0 {
+            remove_generation(&self.base_dir, self.old_generation)
+                .map_err(QueueError::from)
+        } else {
+            Ok(())
+        };
+        let wal: Result<(), QueueError> =
+            crate::wal::truncate_dir_before(&self.wal_dir, self.wal_cut)
+                .map_err(QueueError::from);
+        base.and(wal)
+    }
 }
 
 /// Marker file present while `backlog-server import` builds a queue.
@@ -505,20 +538,30 @@ impl Queue {
             terminal: self.known.terminal_ts().clone(),
             generation,
             wal_cut,
+            pacing: self.params.compaction_pacing,
         })
     }
 
-    /// Install a generation built by [`crate::compaction::run`],
-    /// checkpoint it and drop what it superseded.
+    /// Install a generation built by [`crate::compaction::run`] and
+    /// checkpoint it.
+    ///
+    /// Everything slow that does not affect what the queue answers --
+    /// unmapping and deleting the superseded generation and deleting
+    /// the WAL segments the checkpoint no longer needs -- is returned
+    /// as a [`CompactionCleanup`] for the caller to run off the owner
+    /// task. Nothing is lost if it never runs: start-up removes base
+    /// generations the checkpoint does not name, replay skips WAL below
+    /// the checkpoint's cut, and the next compaction truncates it.
     pub fn finish_compaction(
         &mut self,
         info: BaseInfo,
-    ) -> Result<(), QueueError> {
+    ) -> Result<Option<CompactionCleanup>, QueueError> {
         let Some((generation, wal_cut)) = self.compacting else {
-            return Ok(());
+            return Ok(None);
         };
         let base_dir: PathBuf = self.dir.join("base");
-        let old: u64 = self.known.base().info().generation;
+        let old_base: Arc<Base> = self.known.base().clone();
+        let old: u64 = old_base.info().generation;
         let base: Arc<Base> = Arc::new(Base::open(&base_dir, info.generation)?);
         debug_assert_eq!(info.generation, generation);
         self.known.install_base(base);
@@ -527,11 +570,13 @@ impl Queue {
         self.compaction_failures = 0;
         self.compaction_retry_at = None;
         self.write_checkpoint()?;
-        self.wal.truncate_before(wal_cut)?;
-        if old != 0 {
-            remove_generation(&base_dir, old)?;
-        }
-        Ok(())
+        Ok(Some(CompactionCleanup {
+            old_base,
+            base_dir,
+            old_generation: old,
+            wal_dir: self.dir.join("wal"),
+            wal_cut,
+        }))
     }
 
     /// Give the frozen delta back after a failed compaction, remove
@@ -592,6 +637,7 @@ mod tests {
             pop_scan_limit: 100_000,
             compaction_interval: Duration::from_secs(3600),
             compaction_delta_entries: 10_000_000,
+            compaction_pacing: Default::default(),
         }
     }
 

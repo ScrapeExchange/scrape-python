@@ -6,8 +6,9 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::base::{Base, BaseInfo, BaseWriter, write_terminal};
+use crate::base::{Base, BaseInfo, BaseWriter, write_terminal_paced};
 use crate::meta::Meta;
+use crate::pacing::WritePacing;
 
 pub struct CompactionJob {
     /// The queue's `base/` directory.
@@ -17,6 +18,8 @@ pub struct CompactionJob {
     pub terminal: HashMap<u64, u32>,
     pub generation: u64,
     pub wal_cut: u64,
+    /// Bounds on the dirty pages and write rate of the new generation.
+    pub pacing: WritePacing,
 }
 
 /// Write generation `job.generation`: a streaming merge of the base
@@ -25,8 +28,12 @@ pub fn run(job: &CompactionJob) -> io::Result<BaseInfo> {
     let mut delta: Vec<(u64, Meta)> =
         job.frozen.iter().map(|(k, v)| (*k, *v)).collect();
     delta.sort_unstable_by_key(|(id, _)| *id);
-    let mut w: BaseWriter =
-        BaseWriter::create(&job.dir, job.generation, job.wal_cut)?;
+    let mut w: BaseWriter = BaseWriter::create_paced(
+        &job.dir,
+        job.generation,
+        job.wal_cut,
+        job.pacing,
+    )?;
     let mut base = job.base.iter().peekable();
     let mut delta = delta.into_iter().peekable();
     loop {
@@ -49,7 +56,7 @@ pub fn run(job: &CompactionJob) -> io::Result<BaseInfo> {
         w.push(id, meta)?;
     }
     let info: BaseInfo = w.finish()?;
-    write_terminal(&job.dir, job.generation, &job.terminal)?;
+    write_terminal_paced(&job.dir, job.generation, &job.terminal, job.pacing)?;
     Ok(info)
 }
 
@@ -59,6 +66,7 @@ mod tests {
     use crate::base::BaseWriter;
     use crate::base::tests::rng;
     use crate::meta::{ALL_STATES, Reason, State};
+    use crate::pacing::WritePacing;
     use crate::queue::{Queue, QueueParams};
     use std::time::{Duration, Instant};
 
@@ -68,13 +76,16 @@ mod tests {
             pop_scan_limit: 100_000,
             compaction_interval: Duration::from_secs(3600),
             compaction_delta_entries: 10_000_000,
+            compaction_pacing: Default::default(),
         }
     }
 
     fn compact(q: &mut Queue) {
         let job: CompactionJob = q.start_compaction().unwrap();
         let info: BaseInfo = run(&job).unwrap();
-        q.finish_compaction(info).unwrap();
+        if let Some(c) = q.finish_compaction(info).unwrap() {
+            c.run().unwrap();
+        }
     }
 
     #[test]
@@ -120,6 +131,98 @@ mod tests {
     }
 
     #[test]
+    fn paced_compaction_matches_unpaced() {
+        // A tiny window forces many writeback + throttle rounds.
+        let paced_params: QueueParams = QueueParams {
+            compaction_pacing: WritePacing {
+                sync_bytes: 64,
+                max_bytes_per_sec: 50_000_000,
+            },
+            ..params()
+        };
+        let mut results = Vec::new();
+        for p in [params(), paced_params] {
+            let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+            let mut q: Queue = Queue::open(d.path(), p).unwrap();
+            let mut next = rng(11);
+            for _ in 0..4000 {
+                let id: u64 = next() % 3000;
+                match next() % 3 {
+                    0 => {
+                        q.add(id, 0).unwrap();
+                    }
+                    1 => {
+                        q.complete(id, 0).unwrap();
+                    }
+                    _ => {
+                        q.mark(id, State::Failed, Reason::Other, 5).unwrap();
+                    }
+                }
+            }
+            compact(&mut q);
+            q.verify_base().unwrap();
+            results.push((q.info().counts, q.info().base_entries));
+        }
+        assert_eq!(results[0], results[1]);
+    }
+
+    #[test]
+    fn finish_defers_deletes_to_cleanup() {
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let mut q: Queue = Queue::open(d.path(), params()).unwrap();
+        let bdir = d.path().join("base");
+        for id in 0..20 {
+            q.add(id, 0).unwrap();
+        }
+        compact(&mut q);
+        for id in 20..40 {
+            q.add(id, 0).unwrap();
+        }
+        let job: CompactionJob = q.start_compaction().unwrap();
+        let info: BaseInfo = run(&job).unwrap();
+        drop(job);
+        let cleanup = q.finish_compaction(info).unwrap().expect("cleanup");
+        // Generation 2 is serving; generation 1 is only deleted by the
+        // cleanup, which the owner leaves to another thread.
+        assert_eq!(q.info().generation, 2);
+        assert_eq!(q.state(39), Some(State::Queued));
+        assert!(crate::base::ids_path(&bdir, 1).exists());
+        assert!(crate::base::ids_path(&bdir, 2).exists());
+        cleanup.run().unwrap();
+        assert!(!crate::base::ids_path(&bdir, 1).exists());
+        assert!(!crate::base::state_path(&bdir, 1).exists());
+        assert!(crate::base::ids_path(&bdir, 2).exists());
+        assert_eq!(q.state(5), Some(State::Queued));
+    }
+
+    #[test]
+    fn crash_before_cleanup_recovers() {
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let bdir = d.path().join("base");
+        {
+            let mut q: Queue = Queue::open(d.path(), params()).unwrap();
+            for id in 0..20 {
+                q.add(id, 0).unwrap();
+            }
+            compact(&mut q);
+            for id in 20..40 {
+                q.add(id, 0).unwrap();
+            }
+            let job: CompactionJob = q.start_compaction().unwrap();
+            let info: BaseInfo = run(&job).unwrap();
+            drop(job);
+            // The process dies before the cleanup runs.
+            let _lost = q.finish_compaction(info).unwrap();
+            q.sync().unwrap();
+        }
+        assert!(crate::base::ids_path(&bdir, 1).exists());
+        let q: Queue = Queue::open(d.path(), params()).unwrap();
+        assert_eq!(q.info().generation, 2);
+        assert_eq!(q.info().counts[0], 40);
+        assert!(!crate::base::ids_path(&bdir, 1).exists());
+    }
+
+    #[test]
     fn writes_during_compaction_survive() {
         let d: tempfile::TempDir = tempfile::tempdir().unwrap();
         {
@@ -133,7 +236,9 @@ mod tests {
             }
             q.complete(5, 0).unwrap();
             let info: BaseInfo = run(&job).unwrap();
-            q.finish_compaction(info).unwrap();
+            if let Some(c) = q.finish_compaction(info).unwrap() {
+                c.run().unwrap();
+            }
             assert_eq!(q.state(149), Some(State::Queued));
             q.sync().unwrap();
         }

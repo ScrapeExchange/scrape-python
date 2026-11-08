@@ -12,6 +12,7 @@ pub mod lane;
 pub mod leases;
 pub mod meta;
 pub mod metrics;
+pub mod pacing;
 pub mod queue;
 pub mod resp;
 pub mod server;
