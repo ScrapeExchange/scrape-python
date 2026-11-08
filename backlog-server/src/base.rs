@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -18,7 +18,9 @@ use crate::fileformat::{
 };
 use crate::fsutil::{fsync_dir, tmp_path};
 use crate::meta::Meta;
-use crate::pacing::{PacedFile, Pacer, WritePacing};
+use crate::pacing::{
+    DropBehindReader, PacedFile, Pacer, READ_CHUNK_BYTES, WritePacing,
+};
 
 pub fn ids_path(dir: &Path, generation: u64) -> PathBuf {
     dir.join(format!("ids.{generation:08}"))
@@ -149,6 +151,27 @@ impl BaseWriter {
         }
         fsync_dir(&self.dir)?;
         Ok(info)
+    }
+}
+
+/// A sequential pass over a generation; see [`Base::scan`].
+pub struct BaseScan {
+    readers: Option<(DropBehindReader, DropBehindReader)>,
+    left: u64,
+}
+
+impl BaseScan {
+    pub fn next_entry(&mut self) -> io::Result<Option<(u64, Meta)>> {
+        if self.left == 0 {
+            return Ok(None);
+        }
+        let (ids, states) = self.readers.as_mut().expect("non-empty scan");
+        let mut id: [u8; 8] = [0; 8];
+        ids.read_exact(&mut id)?;
+        let mut meta: [u8; 1] = [0; 1];
+        states.read_exact(&mut meta)?;
+        self.left -= 1;
+        Ok(Some((u64::from_le_bytes(id), Meta(meta[0]))))
     }
 }
 
@@ -287,6 +310,34 @@ impl Base {
 
     pub fn iter(&self) -> impl Iterator<Item = (u64, Meta)> + '_ {
         (0..self.info.count as usize).map(|i| (self.id_at(i), self.meta_at(i)))
+    }
+
+    /// Every entry in order, read from the files in `dir` with large
+    /// sequential reads that are dropped from the page cache behind
+    /// them. Use this for a full pass such as a compaction: [`iter`]
+    /// walks the mmap, which is advised random, so it faults one page
+    /// at a time and leaves the whole generation cached.
+    ///
+    /// [`iter`]: Base::iter
+    pub fn scan(&self, dir: &Path) -> io::Result<BaseScan> {
+        if self.is_empty() {
+            return Ok(BaseScan {
+                readers: None,
+                left: 0,
+            });
+        }
+        let g: u64 = self.info.generation;
+        let open = |path: PathBuf| -> io::Result<DropBehindReader> {
+            DropBehindReader::new(
+                File::open(path)?,
+                HEADER_LEN as u64,
+                READ_CHUNK_BYTES,
+            )
+        };
+        Ok(BaseScan {
+            readers: Some((open(ids_path(dir, g))?, open(state_path(dir, g))?)),
+            left: self.info.count,
+        })
     }
 
     /// Check both payload checksums (reads the whole generation).
@@ -507,6 +558,33 @@ pub(crate) mod tests {
         let got: Vec<(u64, Meta)> = b.iter().collect();
         let want: Vec<(u64, Meta)> = ids.into_iter().collect();
         assert_eq!(got, want);
+    }
+
+    fn scan_all(b: &Base, dir: &Path) -> Vec<(u64, Meta)> {
+        let mut s: BaseScan = b.scan(dir).unwrap();
+        let mut got: Vec<(u64, Meta)> = Vec::new();
+        while let Some(e) = s.next_entry().unwrap() {
+            got.push(e);
+        }
+        got
+    }
+
+    #[test]
+    fn scan_matches_iter() {
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let ids: BTreeMap<u64, Meta> = (0..10_000u64)
+            .map(|id| (id * 7 + 3, meta_for(id)))
+            .collect();
+        build(d.path(), 2, &ids);
+        let b: Base = Base::open(d.path(), 2).unwrap();
+        let want: Vec<(u64, Meta)> = b.iter().collect();
+        assert_eq!(scan_all(&b, d.path()), want);
+    }
+
+    #[test]
+    fn scan_of_empty_base_is_empty() {
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        assert!(scan_all(&Base::empty(), d.path()).is_empty());
     }
 
     #[test]

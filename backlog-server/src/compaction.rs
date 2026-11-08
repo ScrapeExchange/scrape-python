@@ -6,7 +6,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::base::{Base, BaseInfo, BaseWriter, write_terminal_paced};
+use crate::base::{Base, BaseInfo, BaseScan, BaseWriter, write_terminal_paced};
 use crate::meta::Meta;
 use crate::pacing::WritePacing;
 
@@ -34,25 +34,29 @@ pub fn run(job: &CompactionJob) -> io::Result<BaseInfo> {
         job.wal_cut,
         job.pacing,
     )?;
-    let mut base = job.base.iter().peekable();
+    let mut scan: BaseScan = job.base.scan(&job.dir)?;
+    let mut base: Option<(u64, Meta)> = scan.next_entry()?;
     let mut delta = delta.into_iter().peekable();
     loop {
-        let next: Option<(u64, Meta)> = match (base.peek(), delta.peek()) {
+        let (id, meta) = match (base, delta.peek()) {
             (None, None) => break,
-            (Some(_), None) => base.next(),
-            (None, Some(_)) => delta.next(),
-            (Some((b, _)), Some((d, _))) => {
-                if b < d {
-                    base.next()
+            (Some(b), None) => {
+                base = scan.next_entry()?;
+                b
+            }
+            (None, Some(_)) => delta.next().expect("peeked"),
+            (Some(b), Some((d, _))) => {
+                if b.0 < *d {
+                    base = scan.next_entry()?;
+                    b
                 } else {
-                    if b == d {
-                        base.next();
+                    if b.0 == *d {
+                        base = scan.next_entry()?;
                     }
-                    delta.next()
+                    delta.next().expect("peeked")
                 }
             }
         };
-        let (id, meta) = next.expect("peeked");
         w.push(id, meta)?;
     }
     let info: BaseInfo = w.finish()?;
