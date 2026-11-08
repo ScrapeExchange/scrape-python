@@ -282,6 +282,19 @@ METRIC_UPLOADS_FAILED: Counter = Counter(
 )
 
 # ---------------------------------------------------------------------------
+# uploads_rejected_total
+#   Bulk-upload records the server rejected permanently. The source file
+#   is moved into rejected/ and deleted after the retention period; it is
+#   never retried. Labelled with the server's bounded error_class, never
+#   its free-form reason text.
+# ---------------------------------------------------------------------------
+METRIC_UPLOADS_REJECTED: Counter = Counter(
+    'uploads_rejected_total',
+    'Bulk-upload records the server will never accept.',
+    ['platform', 'entity', 'error_class'],
+)
+
+# ---------------------------------------------------------------------------
 # channel_priority_writes_total
 #   Incremented each time the RSS scraper writes a channel-stat record
 #   to YOUTUBE_CHANNEL_PRIORITY_DIRECTORY instead of POSTing it via

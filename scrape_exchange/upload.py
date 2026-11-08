@@ -139,6 +139,8 @@ async def finalize_prepared_bulk_batch(
         progress_timeout_seconds=config.progress_timeout_seconds,
         exchange_set=exchange_set,
         id_from_filename=id_from_filename,
+        platform=config.platform,
+        entity=config.entity,
     )
 
 

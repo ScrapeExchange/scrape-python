@@ -5,6 +5,8 @@ import unittest
 
 import fakeredis.aioredis
 
+from pathlib import Path
+
 from scrape_exchange.bulk_upload import apply_bulk_results, BulkResults
 from scrape_exchange.youtube.exchange_channels_set import (
     RedisExchangeChannelsSet,
@@ -14,9 +16,17 @@ from scrape_exchange.youtube.exchange_channels_set import (
 class _StubFM:
     def __init__(self) -> None:
         self.uploaded: list[str] = []
+        self.rejected: list[str] = []
 
     async def mark_uploaded(self, filename: str) -> None:
         self.uploaded.append(filename)
+
+    async def mark_rejected(
+        self, filename: str, reason: str, error_class: str,
+        job_id: str,
+    ) -> Path:
+        self.rejected.append(filename)
+        return Path('/tmp/rejected') / filename
 
 
 def _strip_channel_filename(filename: str) -> str:
@@ -42,6 +52,40 @@ class TestApplyBulkResultsExchangeSet(
     async def asyncTearDown(self) -> None:
         await self.redis.flushall()
         await self.redis.aclose()
+
+    async def test_rejected_record_is_not_added_to_set(self) -> None:
+        batch_records: list[tuple[str, str]] = [
+            ('UC1', 'channel-alpha.json.br'),
+            ('UC2', 'channel-bravo.json.br'),
+        ]
+        results: BulkResults = BulkResults(
+            total=2, succeeded=1, failed=1, duplicate=0,
+            failures=[{
+                'platform_content_id': 'UC2',
+                'status': 'failed',
+                'reason': 'INVALID_PLATFORM_CREATOR_ID',
+                'retryable': False,
+                'error_class': 'INVALID_PLATFORM_CREATOR_ID',
+            }],
+        )
+        fm: _StubFM = _StubFM()
+
+        success, failed, _missing, ids = await apply_bulk_results(
+            batch_records, results, fm,
+            batch_id='b', job_id='j',
+            exchange_set=self.s,
+            id_from_filename=_strip_channel_filename,
+            platform='youtube', entity='channel',
+        )
+
+        present: dict[str, bool] = (
+            await self.s.contains_many(['alpha', 'bravo'])
+        )
+        self.assertEqual(present, {'alpha': True, 'bravo': False})
+        self.assertEqual(fm.rejected, ['channel-bravo.json.br'])
+        self.assertEqual(fm.uploaded, ['channel-alpha.json.br'])
+        self.assertNotIn('UC2', ids)
+        self.assertEqual((success, failed), (1, 1))
 
     async def test_success_records_added_to_set(
         self,
