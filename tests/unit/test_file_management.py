@@ -4,6 +4,8 @@ Unit tests for scrape_exchange.file_management.AssetFileManagement.
 
 import os
 import stat
+import json
+import time
 import asyncio
 import unittest
 import tempfile
@@ -1137,6 +1139,137 @@ class TestAtomicWriteBytes(unittest.TestCase):
             tmp_dir: str = os.path.join(base, TMP_SUBDIR_NAME)
             if os.path.isdir(tmp_dir):
                 self.assertEqual(os.listdir(tmp_dir), [])
+
+
+class MarkRejectedTest(unittest.IsolatedAsyncioTestCase):
+    '''A record the server will never accept leaves the upload loop.'''
+
+    _NAME: str = 'channel-UC1.json.br'
+
+    def _tree(self) -> tuple[tempfile.TemporaryDirectory, str]:
+        tmp = tempfile.TemporaryDirectory()
+        return tmp, tmp.name
+
+    def _write(self, base: str, name: str = _NAME) -> Path:
+        path = Path(base) / name
+        path.write_bytes(b'payload')
+        return path
+
+    async def test_moves_file_and_writes_the_reason(self) -> None:
+        tmp, base = self._tree()
+        with tmp:
+            source: Path = self._write(base)
+            four_days: float = time.time() - 4 * 86400
+            os.utime(source, (four_days, four_days))
+            fm = AssetFileManagement(base)
+
+            moved: Path | None = await fm.mark_rejected(
+                self._NAME, 'INVALID_PLATFORM_CREATOR_ID',
+                'INVALID_PLATFORM_CREATOR_ID', 'job1',
+            )
+
+            self.assertIsNotNone(moved)
+            assert moved is not None
+            self.assertEqual(moved.parent, fm.rejected_dir)
+            self.assertTrue(moved.exists())
+            self.assertFalse(source.exists())
+            self.assertGreater(moved.stat().st_mtime, four_days + 86400)
+
+            reason_path: Path = (
+                fm.rejected_dir / f'{self._NAME}.reason.json')
+            payload: dict = json.loads(reason_path.read_text())
+            self.assertEqual(
+                payload['reason'], 'INVALID_PLATFORM_CREATOR_ID')
+            self.assertEqual(
+                payload['error_class'], 'INVALID_PLATFORM_CREATOR_ID')
+            self.assertEqual(payload['job_id'], 'job1')
+            self.assertIn('rejected_at', payload)
+
+    async def test_moves_even_when_uploads_are_deleted(self) -> None:
+        tmp, base = self._tree()
+        with tmp:
+            source: Path = self._write(base)
+            fm = AssetFileManagement(base, delete_after_upload=True)
+
+            moved: Path | None = await fm.mark_rejected(
+                self._NAME, 'x', 'INVALID_REQUEST_MODEL', 'job2')
+
+            self.assertIsNotNone(moved)
+            assert moved is not None
+            self.assertTrue(moved.exists())
+            self.assertFalse(source.exists())
+
+    async def test_second_process_gets_the_destination(self) -> None:
+        tmp, base = self._tree()
+        with tmp:
+            self._write(base)
+            fm = AssetFileManagement(base)
+            first: Path | None = await fm.mark_rejected(
+                self._NAME, 'x', 'MALFORMED_RECORD', 'job3')
+
+            second: Path | None = await fm.mark_rejected(
+                self._NAME, 'x', 'MALFORMED_RECORD', 'job3')
+
+            self.assertEqual(first, second)
+            assert second is not None
+            self.assertTrue(second.exists())
+
+    async def test_rejected_file_is_not_listed(self) -> None:
+        tmp, base = self._tree()
+        with tmp:
+            self._write(base)
+            fm = AssetFileManagement(base)
+            await fm.mark_rejected(
+                self._NAME, 'x', 'NON_OBJECT_RECORD', 'job4')
+
+            self.assertEqual(fm.list_base(), [])
+
+    async def test_missing_source_and_destination_returns_none(self) -> None:
+        tmp, base = self._tree()
+        with tmp:
+            fm = AssetFileManagement(base)
+            self.assertIsNone(await fm.mark_rejected(
+                self._NAME, 'x', 'NON_OBJECT_RECORD', 'job5'))
+
+    def test_purge_removes_only_files_past_retention(self) -> None:
+        tmp, base = self._tree()
+        with tmp:
+            fm = AssetFileManagement(base)
+            now: float = time.time()
+            old: Path = fm.rejected_dir / 'old.json.br'
+            new: Path = fm.rejected_dir / 'new.json.br'
+            old.write_bytes(b'x')
+            new.write_bytes(b'x')
+            (fm.rejected_dir / 'old.json.br.reason.json').write_bytes(b'{}')
+            (fm.rejected_dir / 'new.json.br.reason.json').write_bytes(b'{}')
+            four_days: float = now - 4 * 86400
+            os.utime(old, (four_days, four_days))
+            os.utime(new, (now - 86400, now - 86400))
+
+            removed: int = fm.purge_rejected(3 * 86400, now)
+
+            self.assertEqual(removed, 1)
+            self.assertFalse(old.exists())
+            self.assertFalse(
+                (fm.rejected_dir / 'old.json.br.reason.json').exists())
+            self.assertTrue(new.exists())
+
+    def test_purge_counts_a_file_without_reason_file(self) -> None:
+        '''A rejected file whose reason file is already gone is still
+        purged and counted.'''
+        tmp, base = self._tree()
+        with tmp:
+            fm = AssetFileManagement(base)
+            now: float = time.time()
+            old: Path = fm.rejected_dir / 'old.json.br'
+            old.write_bytes(b'x')
+            four_days: float = now - 4 * 86400
+            os.utime(old, (four_days, four_days))
+
+            removed: int = fm.purge_rejected(3 * 86400, now)
+
+            self.assertEqual(removed, 1)
+            self.assertFalse(old.exists())
 
 
 if __name__ == '__main__':

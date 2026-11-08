@@ -34,6 +34,7 @@ from httpx2 import Response, Timeout
 
 from .exchange_client import ExchangeClient
 from .file_management import AssetFileManagement, atomic_write_bytes
+from .scraper_metrics import METRIC_UPLOADS_REJECTED
 
 if TYPE_CHECKING:
     from .youtube.exchange_channels_set import (
@@ -424,6 +425,8 @@ async def _resume_one_bulk_state(
         state.batch_id, state.job_id,
         exchange_set=exchange_set,
         id_from_filename=id_from_filename,
+        platform=state.platform,
+        entity=state.entity,
     )
     await delete_bulk_state(fm, state.job_id)
     _LOGGER.info(
@@ -924,13 +927,18 @@ def _match_failures(
     by_id: dict[str, str],
     by_index: dict[int, str],
     job_id: str,
-) -> tuple[set[str], bool]:
+) -> tuple[dict[str, dict | None], bool]:
     '''Map each failure entry to a submitted filename by
-    ``platform_content_id`` then ``record_index``. Returns the set of
-    failed filenames and whether any entry was unmatchable (which
-    blocks salvage, since an unidentifiable failure cannot be left for
-    retry).'''
-    failed_files: set[str] = set()
+    ``platform_content_id`` then ``record_index``.
+
+    Returns a mapping from each failed filename to the entry to reject
+    it with, or ``None`` when it must be retried: a file is rejected
+    only when EVERY entry for it says ``retryable: false``. A missing
+    value (an older server) or ``true`` keeps it for retry. The second
+    element says whether any entry was unmatchable, which blocks
+    salvage, since an unidentifiable failure cannot be left for retry.
+    '''
+    failed_files: dict[str, dict | None] = {}
     unmatched: bool = False
     for entry in failures:
         cid: str | None = entry.get('platform_content_id')
@@ -947,7 +955,11 @@ def _match_failures(
             )
             unmatched = True
             continue
-        failed_files.add(filename)
+        permanent: bool = entry.get('retryable') is False
+        if not permanent:
+            failed_files[filename] = None
+        elif filename not in failed_files:
+            failed_files[filename] = entry
     return failed_files, unmatched
 
 
@@ -959,6 +971,8 @@ async def apply_bulk_results(
     job_id: str,
     exchange_set: 'RedisExchangeChannelsSet | None' = None,
     id_from_filename: Callable[[str], str] | None = None,
+    platform: str = 'unknown',
+    entity: str = 'unknown',
 ) -> tuple[int, int, int, set[str]]:
     '''
     Reconcile a failures-only results payload against the files we
@@ -1010,7 +1024,7 @@ async def apply_bulk_results(
         )
         return 0, 0, submitted, set()
 
-    failed_files: set[str]
+    failed_files: dict[str, dict | None]
     unmatched: bool
     failed_files, unmatched = _match_failures(
         results.failures, by_id, by_index, job_id,
@@ -1053,6 +1067,7 @@ async def apply_bulk_results(
     success_count, success_ids = await _mark_salvaged(
         batch_records, failed_files, fm, job_id,
         exchange_set, id_from_filename,
+        platform=platform, entity=entity,
     )
     failure_count: int = len(failed_files)
 
@@ -1070,26 +1085,82 @@ async def apply_bulk_results(
     return success_count, failure_count, 0, success_ids
 
 
+async def _reject_file(
+    filename: str,
+    entry: dict,
+    fm: AssetFileManagement,
+    job_id: str,
+    platform: str,
+    entity: str,
+) -> None:
+    '''Move one permanently rejected record into ``rejected/``.'''
+    reason: str = str(entry.get('reason') or '')
+    error_class: str = str(entry.get('error_class') or 'unknown')
+    try:
+        moved: Path | None = await fm.mark_rejected(
+            filename, reason, error_class, job_id,
+        )
+    except OSError as exc:
+        logging.warning(
+            'Could not move rejected file, leaving it for retry',
+            exc=exc,
+            extra={'filename': filename, 'job_id': job_id},
+        )
+        return
+    if moved is None:
+        logging.warning(
+            'Rejected file is already gone',
+            extra={'filename': filename, 'job_id': job_id},
+        )
+        return
+    METRIC_UPLOADS_REJECTED.labels(
+        platform=platform, entity=entity, error_class=error_class,
+    ).inc()
+    logging.warning(
+        'Bulk record permanently rejected',
+        extra={
+            'filename': filename, 'job_id': job_id,
+            'reason': reason, 'error_class': error_class,
+            'rejected_path': str(moved),
+        },
+    )
+
+
 async def _mark_salvaged(
     batch_records: list[tuple[str, str]],
-    failed_files: set[str],
+    failed_files: dict[str, dict | None],
     fm: AssetFileManagement,
     job_id: str,
     exchange_set: 'RedisExchangeChannelsSet | None',
     id_from_filename: Callable[[str], str] | None,
+    platform: str = 'unknown',
+    entity: str = 'unknown',
 ) -> tuple[int, set[str]]:
     '''Mark every submitted record not in *failed_files* uploaded
-    (success or duplicate). Returns ``(success_count,
-    success_ids)``. A ``mark_uploaded`` OSError leaves that one file
-    for retry without aborting the batch.'''
+    (success or duplicate), and move a permanently rejected record into
+    ``rejected/``. Returns ``(success_count, success_ids)``. A
+    ``mark_uploaded`` OSError leaves that one file for retry without
+    aborting the batch.
+
+    A rejected record is not an upload: it is not marked uploaded, its
+    id is not added to *success_ids*, and its channel is not recorded
+    in *exchange_set*, so the scraper revisits the channel instead of
+    treating it as done.
+    '''
     success_count: int = 0
     ids_to_add: set[str] = set()
     success_ids: set[str] = set()
     for content_id, filename in batch_records:
         if filename in failed_files:
-            logging.info(
-                'Bulk record failed, leaving file for retry',
-                extra={'filename': filename, 'job_id': job_id},
+            entry: dict | None = failed_files[filename]
+            if entry is None:
+                logging.info(
+                    'Bulk record failed, leaving file for retry',
+                    extra={'filename': filename, 'job_id': job_id},
+                )
+                continue
+            await _reject_file(
+                filename, entry, fm, job_id, platform, entity,
             )
             continue
         try:
@@ -1285,6 +1356,8 @@ async def finalize_bulk_batch(
     progress_timeout_seconds: float,
     exchange_set: 'RedisExchangeChannelsSet | None' = None,
     id_from_filename: Callable[[str], str] | None = None,
+    platform: str = 'unknown',
+    entity: str = 'unknown',
 ) -> BulkBatchOutcome:
     '''
     Wait for the job's terminal status, fetch its per-record
@@ -1324,6 +1397,8 @@ async def finalize_bulk_batch(
         batch_records, results, fm, batch_id, job_id,
         exchange_set=exchange_set,
         id_from_filename=id_from_filename,
+        platform=platform,
+        entity=entity,
     )
     # Reconciliation done — drop the state file so resume on the
     # next startup doesn't re-process a job we've already handled.

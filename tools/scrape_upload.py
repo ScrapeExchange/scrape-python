@@ -18,6 +18,7 @@ import asyncio
 import logging
 import os
 import signal
+import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -424,6 +425,18 @@ class ScrapeUploadSettings(ScraperSettings):
             'upload_mode',
         ),
         description='Upload mode: bulk or background.',
+    )
+    rejected_retention_days: float = Field(
+        default=3,
+        validation_alias=AliasChoices(
+            'REJECTED_RETENTION_DAYS',
+            'rejected_retention_days',
+        ),
+        description=(
+            'Days a permanently rejected file is kept in rejected/ '
+            'before it is purged. Counted from the rejection, not from '
+            'when the record was scraped.'
+        ),
     )
     scrape_upload_watch: bool = Field(
         default=True,
@@ -1876,6 +1889,40 @@ async def pending_count_loop(
         await asyncio.sleep(interval_seconds)
 
 
+async def rejected_purge_loop(
+    targets: list[AssetUploadTarget],
+    retention_seconds: float,
+    interval_seconds: float = 3600.0,
+) -> None:
+    '''Delete rejected files older than *retention_seconds*, hourly.
+
+    One target failing (an unreadable directory, a full disk) must not
+    stop the others, so each purge is guarded on its own.
+    '''
+    while True:
+        for target in targets:
+            try:
+                removed: int = target.fm.purge_rejected(
+                    retention_seconds, time.time(),
+                )
+            except OSError as exc:
+                logging.warning(
+                    'Purging rejected asset files failed',
+                    exc=exc,
+                    extra={'base_dir': str(target.fm.base_dir)},
+                )
+                continue
+            if removed:
+                logging.info(
+                    'Purged rejected asset files',
+                    extra={
+                        'base_dir': str(target.fm.base_dir),
+                        'removed': removed,
+                    },
+                )
+        await asyncio.sleep(interval_seconds)
+
+
 async def drain_in_flight(
     targets: list[AssetUploadTarget], timeout_seconds: float,
 ) -> None:
@@ -2391,9 +2438,14 @@ async def _run_with_client(settings: ScrapeUploadSettings) -> None:
             client,
         )
         count_task: asyncio.Task | None = None
+        purge_task: asyncio.Task | None = None
         if settings.upload_mode == 'bulk':
             count_task = asyncio.create_task(pending_count_loop(
                 targets, settings.pending_count_interval_seconds,
+            ))
+            purge_task = asyncio.create_task(rejected_purge_loop(
+                targets,
+                settings.rejected_retention_days * 86400,
             ))
         try:
             await drain_targets_round_robin(
@@ -2418,9 +2470,11 @@ async def _run_with_client(settings: ScrapeUploadSettings) -> None:
                     for target in targets
                 ))
         finally:
-            if count_task is not None:
-                count_task.cancel()
-                await asyncio.gather(count_task, return_exceptions=True)
+            for task in (count_task, purge_task):
+                if task is None:
+                    continue
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
             await drain_in_flight(
                 targets,
                 min(

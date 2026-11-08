@@ -23,6 +23,9 @@ import orjson
 import websockets.exceptions
 import websockets.frames
 
+from prometheus_client import REGISTRY
+
+from scrape_exchange.file_management import AssetFileManagement
 from scrape_exchange.bulk_upload import (
     BULK_STATE_DIR_NAME,
     _poll_status_until_terminal,
@@ -735,6 +738,146 @@ class TestResumePendingBulkUploads(
 
             touch.assert_called()
             self.assertEqual(len(list_bulk_states(fm)), 1)
+
+
+class RejectedRecordsTest(unittest.IsolatedAsyncioTestCase):
+    '''A record the server will never accept leaves the retry loop.'''
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.base: str = self._tmp.name
+        self.fm: AssetFileManagement = AssetFileManagement(self.base)
+        self.names: list[str] = [
+            'channel-alpha.json.br', 'channel-bravo.json.br',
+        ]
+        name: str
+        for name in self.names:
+            (Path(self.base) / name).write_bytes(b'payload')
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _counter(self, error_class: str) -> float:
+        value: float | None = REGISTRY.get_sample_value(
+            'uploads_rejected_total',
+            {'platform': 'youtube', 'entity': 'channel',
+             'error_class': error_class},
+        )
+        return value if value is not None else 0.0
+
+    def _results(self, failures: list[dict]) -> BulkResults:
+        return BulkResults(
+            total=2, succeeded=2 - len(failures),
+            failed=len(failures), duplicate=0, failures=failures,
+        )
+
+    async def _apply(self, failures: list[dict]) -> tuple:
+        return await apply_bulk_results(
+            [('alpha', self.names[0]), ('bravo', self.names[1])],
+            self._results(failures), self.fm, 'b', 'j',
+            platform='youtube', entity='channel',
+        )
+
+    async def test_permanent_failure_is_rejected(self) -> None:
+        before: float = self._counter('INVALID_PLATFORM_CREATOR_ID')
+        await self._apply([{
+            'platform_content_id': 'alpha',
+            'status': 'failed',
+            'reason': 'INVALID_PLATFORM_CREATOR_ID',
+            'retryable': False,
+            'error_class': 'INVALID_PLATFORM_CREATOR_ID',
+        }])
+
+        rejected: Path = self.fm.rejected_dir / self.names[0]
+        self.assertTrue(rejected.exists())
+        self.assertFalse((Path(self.base) / self.names[0]).exists())
+        self.assertTrue(
+            (self.fm.rejected_dir / f'{self.names[0]}.reason.json')
+            .exists(),
+        )
+        self.assertEqual(
+            self._counter('INVALID_PLATFORM_CREATOR_ID') - before, 1.0)
+        # The clean record was still marked uploaded.
+        self.assertTrue((self.fm.uploaded_dir / self.names[1]).exists())
+
+    async def test_retryable_and_missing_stay_for_retry(self) -> None:
+        await self._apply([
+            {
+                'platform_content_id': 'alpha',
+                'status': 'failed',
+                'reason': 'service unavailable',
+                'retryable': True,
+                'error_class': 'SERVICE_UNAVAILABLE',
+            },
+            {
+                'platform_content_id': 'bravo',
+                'status': 'failed',
+                'reason': 'old server',
+            },
+        ])
+
+        self.assertEqual(list(self.fm.rejected_dir.iterdir()), [])
+        self.assertTrue((Path(self.base) / self.names[0]).exists())
+        self.assertTrue((Path(self.base) / self.names[1]).exists())
+
+    async def test_two_entries_for_one_file(self) -> None:
+        mixed: list[dict] = [
+            {'platform_content_id': 'alpha', 'status': 'failed',
+             'retryable': True, 'error_class': 'SERVICE_UNAVAILABLE'},
+            {'platform_content_id': 'alpha', 'status': 'failed',
+             'retryable': False, 'error_class': 'MALFORMED_RECORD'},
+        ]
+        await self._apply(mixed)
+        self.assertTrue((Path(self.base) / self.names[0]).exists())
+        self.assertEqual(list(self.fm.rejected_dir.iterdir()), [])
+
+    async def test_two_entries_for_one_file_never_reconcile(self) -> None:
+        # The completeness guard compares the number of failure ENTRIES
+        # with the number of failed records, so two entries naming one
+        # file leave the batch unreconciled: nothing is rejected on an
+        # ambiguous list, which is the safe side.
+        both: list[dict] = [
+            {'platform_content_id': 'alpha', 'status': 'failed',
+             'reason': 'x', 'retryable': False,
+             'error_class': 'MALFORMED_RECORD'},
+            {'platform_content_id': 'alpha', 'status': 'failed',
+             'reason': 'y', 'retryable': False,
+             'error_class': 'MALFORMED_RECORD'},
+        ]
+        await self._apply(both)
+        self.assertEqual(list(self.fm.rejected_dir.iterdir()), [])
+        self.assertTrue((Path(self.base) / self.names[0]).exists())
+
+    async def test_one_counter_series_per_error_class(self) -> None:
+        before: float = self._counter('INVALID_REQUEST_MODEL')
+        await self._apply([
+            {'platform_content_id': 'alpha', 'status': 'failed',
+             'reason': 'INVALID_REQUEST_MODEL: field x',
+             'retryable': False,
+             'error_class': 'INVALID_REQUEST_MODEL'},
+            {'platform_content_id': 'bravo', 'status': 'failed',
+             'reason': 'INVALID_REQUEST_MODEL: field y',
+             'retryable': False,
+             'error_class': 'INVALID_REQUEST_MODEL'},
+        ])
+        self.assertEqual(
+            self._counter('INVALID_REQUEST_MODEL') - before, 2.0)
+
+    async def test_unreconciled_batch_rejects_nothing(self) -> None:
+        results: BulkResults = BulkResults(
+            total=99, succeeded=0, failed=1, duplicate=0,
+            failures=[{
+                'platform_content_id': 'alpha', 'status': 'failed',
+                'retryable': False,
+                'error_class': 'INVALID_PLATFORM_CREATOR_ID',
+            }],
+        )
+        await apply_bulk_results(
+            [('alpha', self.names[0]), ('bravo', self.names[1])],
+            results, self.fm, 'b', 'j',
+        )
+        self.assertEqual(list(self.fm.rejected_dir.iterdir()), [])
+        self.assertTrue((Path(self.base) / self.names[0]).exists())
 
 
 if __name__ == '__main__':
