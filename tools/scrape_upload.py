@@ -7,7 +7,9 @@ Reads Brotli-compressed JSON files produced by scraping tools,
 validates each asset against its configured JSON Schema, uploads via
 either the bulk endpoint or the ExchangeClient background queue, and
 moves successfully uploaded files into the ``uploaded/`` subdirectory
-owned by the directory they were read from.
+owned by the directory they were read from. With
+``SCRAPE_UPLOAD_DELETE_AFTER_UPLOAD=true`` it deletes them instead, which
+saves the disk space and the file churn of keeping uploaded copies.
 '''
 
 from __future__ import annotations
@@ -66,6 +68,7 @@ from scrape_exchange.instagram import InstagramCreator
 from scrape_exchange.logging import (
     configure_logging as configure_shared_logging,
 )
+from scrape_exchange.memory_profiler import run_memory_profiler
 from scrape_exchange.metrics_server import start_metrics_server
 from scrape_exchange.name_map import NameMap, NullNameMap, RedisNameMap
 from scrape_exchange.onlyfans.onlyfans_creator import OnlyFansCreator
@@ -431,6 +434,18 @@ class ScrapeUploadSettings(ScraperSettings):
         ),
         description='Watch directories for new files after initial drain.',
     )
+    delete_after_upload: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            'SCRAPE_UPLOAD_DELETE_AFTER_UPLOAD',
+            'ASSET_UPLOAD_DELETE_AFTER_UPLOAD',
+            'delete_after_upload',
+        ),
+        description=(
+            'Delete a file once it has been uploaded instead of moving '
+            'it to the uploaded/ subdirectory. Applies to every target.'
+        ),
+    )
     scrape_upload_concurrency: int = Field(
         default=3,
         validation_alias=AliasChoices(
@@ -450,6 +465,20 @@ class ScrapeUploadSettings(ScraperSettings):
             'metrics_port',
         ),
         description='Port for the Prometheus metrics HTTP server.',
+    )
+    memory_profile_interval_seconds: int = Field(
+        default=0,
+        ge=0,
+        validation_alias=AliasChoices(
+            'SCRAPE_UPLOAD_MEMORY_PROFILE_SECONDS',
+            'memory_profile_interval_seconds',
+        ),
+        description=(
+            'Debugging aid: when above 0, trace allocations with '
+            'tracemalloc and log the biggest growers since the first '
+            'snapshot every this many seconds. Slows the process; '
+            '0 disables it.'
+        ),
     )
     scrape_upload_log_level: str = Field(
         default='INFO',
@@ -1317,7 +1346,7 @@ async def prepare_asset_line(
         await fm.mark_invalid(filename)
         return None
     except FileNotFoundError:
-        # Listed, then moved to uploaded/ or removed before the read.
+        # Listed, then moved to uploaded/ or deleted before the read.
         logging.debug(
             'Asset file vanished before upload',
             extra={'filename': filename, 'content_id': content_id},
@@ -2211,6 +2240,7 @@ async def watch_target(
 def build_file_manager(
     directory: str,
     descriptor: AssetDescriptor,
+    delete_after_upload: bool = False,
 ) -> AssetFileManagement:
     if not os.path.isdir(directory):
         logging.info(
@@ -2221,6 +2251,7 @@ def build_file_manager(
     return AssetFileManagement(
         directory,
         prefix_rankings=descriptor.prefix_rankings,
+        delete_after_upload=delete_after_upload,
     )
 
 
@@ -2256,6 +2287,7 @@ async def build_upload_targets(
         fm: AssetFileManagement = build_file_manager(
             spec.directory,
             descriptor,
+            delete_after_upload=settings.delete_after_upload,
         )
         processor: AssetProcessor = processor_for(descriptor)
         state: Any = await processor.setup(
@@ -2332,9 +2364,18 @@ async def run(settings: ScrapeUploadSettings) -> None:
         install_shutdown_handlers(loop, main_task)
         if main_task is not None else []
     )
+    profiler: asyncio.Task | None = (
+        asyncio.create_task(
+            run_memory_profiler(settings.memory_profile_interval_seconds),
+            name='memory-profiler',
+        )
+        if settings.memory_profile_interval_seconds > 0 else None
+    )
     try:
         await _run_with_client(settings)
     finally:
+        if profiler is not None:
+            profiler.cancel()
         remove_shutdown_handlers(loop, handled)
 
 

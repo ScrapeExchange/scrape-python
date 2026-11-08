@@ -584,7 +584,7 @@ class TestPriorityPostCleanupSuccess(
         )
         self.assertFalse(self.priority_entry.exists())
 
-    async def test_scraped_in_uploaded_dir_deletes_entry(
+    async def test_scraped_in_uploaded_dir_is_ignored(
         self,
     ) -> None:
         prefix: str = _MOD.CHANNEL_FILE_PREFIX
@@ -597,7 +597,14 @@ class TestPriorityPostCleanupSuccess(
         _MOD._priority_post_cleanup(
             self._priority_handles(), fm,
         )
+        # A copy in uploaded/ is not a scrape result: the entry is
+        # renamed to .failed, not deleted.
         self.assertFalse(self.priority_entry.exists())
+        self.assertTrue(
+            self.priority_entry.with_name(
+                self.priority_entry.name + '.failed',
+            ).exists()
+        )
 
 
 class TestPriorityPostCleanupNotFound(

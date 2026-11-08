@@ -87,10 +87,9 @@ async def save_creator(
         raise ProfileIdentityError('Invalid filename identity')
     _check_identity(creator, previous_id)
     filename: str = f'{PREFIX}{creator.username}.json.br'
-    for reader in (fm.read_file, fm.read_uploaded):
-        with contextlib.suppress(FileNotFoundError):
-            previous: dict = await reader(filename)
-            _check_identity(creator, previous.get('user_id'))
+    with contextlib.suppress(FileNotFoundError):
+        previous: dict = await fm.read_file(filename)
+        _check_identity(creator, previous.get('user_id'))
     await fm.write_file(filename, creator.to_dict())
 
 

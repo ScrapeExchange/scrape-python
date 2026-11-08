@@ -145,7 +145,6 @@ from scrape_exchange.youtube.privacy import (
 
 
 CHANNEL_FILENAME_PREFIX: str = 'channel-'
-UPLOADED_DIR: str = '/uploaded'
 
 MIN_CHANNEL_INTERVAL_SECONDS: int = 30 * 60         # 30 minutes
 RETRY_INTERVAL_SECONDS: int = 60 * 60 * 4           # 4 hours
@@ -392,25 +391,6 @@ class RssSettings(YouTubeScraperSettings):
             'channels default to the lowest tier and get '
             're-tiered after their first successful scrape '
             '(which always re-records the subscriber_count).'
-        ),
-    )
-    rss_seed_queue_from_uploaded: bool = Field(
-        default=False,
-        validation_alias=AliasChoices(
-            'RSS_SEED_QUEUE_FROM_UPLOADED',
-            'rss_seed_queue_from_uploaded',
-        ),
-        description=(
-            'Walk the uploaded-channel directory at startup and '
-            'enqueue any channels not already in the Redis queue. '
-            'Useful only for first-time setup, post-flush '
-            'recovery, or fleet rebuilds. The scan reads + '
-            'brotli-decodes every channel file before checking '
-            'whether it is already queued, which on a populated '
-            'archive (~hundreds of thousands of files) is '
-            'multi-tens-of-minutes of work per worker on every '
-            'restart. Default False; flip to True only for '
-            'recovery scenarios.'
         ),
     )
     rss_max_no_feed_failures: int = Field(
@@ -2453,108 +2433,6 @@ async def _hold_back_unscraped_channels(
     return held
 
 
-async def _seed_queue_from_uploaded_channels(
-    creator_queue: CreatorQueue,
-    channel_fm: AssetFileManagement,
-    tiers: list[TierConfig],
-) -> int:
-    '''
-    Walk ``channel_fm.uploaded_dir`` for previously-uploaded channel
-    files and enqueue any whose ``channel_id`` isn't already in the
-    priority queue. Channels in the queue are left alone so this
-    helper is safe to call on every startup.
-
-    Tier selection per file:
-
-    * ``subscriber_count`` is present and > 0 → standard
-      :func:`tier_for_subscriber_count` routing.
-    * ``subscriber_count`` is missing or zero → the **next-to-last**
-      tier (one above the lowest-priority catch-all). Treating
-      "unknown" as second-from-last avoids the populate path's
-      default behaviour of promoting unknown counts to tier 1, which
-      is wrong when bulk-seeding from on-disk archives where most
-      records are simply missing the field.
-
-    Implementation note: tier targeting is achieved by passing a
-    synthetic ``subscriber_count`` equal to the target tier's
-    ``min_subscribers``. This relies on tiers being ordered with
-    monotonically descending min_subscribers (the documented
-    convention in :func:`tier_for_subscriber_count`).
-
-    :returns: Number of channels added to the queue.
-    '''
-
-    if not tiers:
-        return 0
-
-    fallback_tier: TierConfig = (
-        tiers[-2] if len(tiers) >= 2 else tiers[-1]
-    )
-    fallback_min: int = max(fallback_tier.min_subscribers, 0)
-
-    known: set[str] = await creator_queue.known_creator_ids()
-
-    creators: dict[str, str] = {}
-    subscriber_counts: dict[str, int] = {}
-    fallback_count: int = 0
-
-    files: list[str] = channel_fm.list_uploaded(
-        prefix=CHANNEL_FILENAME_PREFIX, suffix='.json.br',
-    )
-
-    for filename in files:
-        try:
-            data: dict = await channel_fm.read_uploaded(filename)
-        except Exception as exc:
-            logging.warning(
-                'Failed to read uploaded channel file during seed',
-                exc=exc, extra={'filename': filename},
-            )
-            continue
-
-        cid: str | None = data.get('channel_id')
-        handle: str | None = data.get('channel_handle')
-        if not cid:
-            continue
-        if cid in known:
-            continue
-
-        # The handle is a display label only; RSS fetches by channel_id.
-        # Fall back to the (unique) channel_id so populate's name-dedup
-        # does not collapse every handle-less channel into one entry.
-        creators[cid] = handle or cid
-        sub_count: int | None = data.get('subscriber_count')
-        if isinstance(sub_count, int) and sub_count > 0:
-            subscriber_counts[cid] = sub_count
-        else:
-            subscriber_counts[cid] = fallback_min
-            fallback_count += 1
-
-    if not creators:
-        logging.info(
-            'No new channels to seed from uploaded directory',
-            extra={
-                'scanned_files': len(files),
-                'already_in_queue': len(files),
-            },
-        )
-        return 0
-
-    added: int = await creator_queue.populate(
-        creators, channel_fm, tiers, subscriber_counts,
-    )
-    logging.info(
-        'Seeded queue from uploaded channel directory',
-        extra={
-            'scanned_files': len(files),
-            'added': added,
-            'unknown_subscriber_count': fallback_count,
-            'fallback_tier': fallback_tier.tier,
-        },
-    )
-    return added
-
-
 def _observe_phase(phase: str, started: float) -> None:
     '''Record a duration observation against
     ``METRIC_PHASE_DURATION`` for *phase*. ``started`` is the
@@ -2773,26 +2651,6 @@ async def worker_loop(
     del channel_map_data
     del known_ids
     del subscriber_counts
-    # Pull in any channels that exist as uploaded files on disk but
-    # are missing from the creator_map (e.g. after a fleet rebuild
-    # or DB wipe where the local archive is the source of truth).
-    # Opt-in: the scan brotli-decodes every uploaded channel file
-    # before checking whether it is already queued, which on a
-    # populated archive is multi-tens-of-minutes per worker. Set
-    # ``RSS_SEED_QUEUE_FROM_UPLOADED=true`` only for first-time
-    # setup or recovery scenarios.
-    if settings.rss_seed_queue_from_uploaded:
-        seeded: int = await _seed_queue_from_uploaded_channels(
-            creator_queue, channel_fm, tiers,
-        )
-        if seeded:
-            added += seeded
-    else:
-        logging.info(
-            'Skipping seed-from-uploaded scan '
-            '(RSS_SEED_QUEUE_FROM_UPLOADED=false); '
-            'queue assumed already populated in Redis',
-        )
     # Re-enqueue creators whose tier hash entry exists but
     # which are missing from every tier zset (abandoned
     # claims from worker crashes, stale state from older

@@ -84,7 +84,9 @@ def _settings(**overrides: object) -> SimpleNamespace:
         'max_active_bulk_jobs': 2,
         'bulk_orphan_max_age_hours': 3.0,
         'scrape_upload_concurrency': 2,
+        'memory_profile_interval_seconds': 0,
         'upload_mode': 'bulk',
+        'delete_after_upload': False,
         'background_drain_timeout_seconds': 1.0,
         'twitch_creator_data_directory': None,
         'onlyfans_creator_data_directory': None,
@@ -199,6 +201,38 @@ class TestScrapeUploadHelpers(unittest.TestCase):
             )
 
         self.assertIsNone(settings.youtube_video_data_directory)
+
+    def test_settings_delete_after_upload_defaults_off(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            settings = scrape_upload.ScrapeUploadSettings(
+                _env_file=None,
+            )
+
+        self.assertFalse(settings.delete_after_upload)
+
+    def test_settings_delete_after_upload_from_env(self) -> None:
+        with patch.dict(
+            os.environ,
+            {'SCRAPE_UPLOAD_DELETE_AFTER_UPLOAD': 'true'},
+            clear=True,
+        ):
+            settings = scrape_upload.ScrapeUploadSettings(
+                _env_file=None,
+            )
+
+        self.assertTrue(settings.delete_after_upload)
+
+    def test_build_file_manager_passes_delete_after_upload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            default_fm = scrape_upload.build_file_manager(
+                directory, _descriptor(),
+            )
+            deleting_fm = scrape_upload.build_file_manager(
+                directory, _descriptor(), delete_after_upload=True,
+            )
+
+        self.assertFalse(default_fm.delete_after_upload)
+        self.assertTrue(deleting_fm.delete_after_upload)
 
     def test_settings_default_log_file_is_regular_file(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
@@ -857,6 +891,40 @@ class TestPrepareAssetLine(unittest.IsolatedAsyncioTestCase):
                 ('drand', 'other', 'item', '2.0.0'),
             ],
         )
+
+
+class TestBuildTargetsDeleteAfterUpload(unittest.IsolatedAsyncioTestCase):
+
+    async def test_targets_inherit_delete_after_upload(self) -> None:
+        descriptor: scrape_upload.AssetDescriptor = _descriptor()
+        schema: dict = {'type': 'object', 'additionalProperties': True}
+        for enabled in (False, True):
+            with (
+                tempfile.TemporaryDirectory() as directory,
+                patch(
+                    'tools.scrape_upload.configured_asset_target_specs',
+                    return_value=[scrape_upload.AssetTargetSpec(
+                        descriptor=descriptor, directory=directory,
+                    )],
+                ),
+                patch(
+                    'tools.scrape_upload.fetch_schema_dict',
+                    new=AsyncMock(return_value=schema),
+                ),
+            ):
+                targets = await scrape_upload.build_upload_targets(
+                    _settings(
+                        schema_owner='boinko',
+                        schema_version='0.0.2',
+                        delete_after_upload=enabled,
+                    ),
+                    client=object(),
+                )
+
+            self.assertEqual(
+                [target.fm.delete_after_upload for target in targets],
+                [enabled],
+            )
 
 
 def _batch_count(outcome: str) -> float:

@@ -1347,11 +1347,12 @@ class TestImportCommand(
             shutil.rmtree(td)
 
 
-class TestImportRevivesTerminal(
+class TestImportSkipsKnown(
     unittest.IsolatedAsyncioTestCase,
 ):
-    '''Importing a member already in a terminal state must
-    remove it from that state and re-enqueue it.'''
+    '''import only adds channels the queue has never seen and that
+    have no local scraped file; known channels, terminal ones
+    included, are left exactly as they are.'''
 
     async def asyncSetUp(self) -> None:
         self.redis = fakeredis.aioredis.FakeRedis(
@@ -1364,6 +1365,8 @@ class TestImportRevivesTerminal(
             )
         )
         self.td: str = tempfile.mkdtemp()
+        self.data_dir: str = os.path.join(self.td, 'channels')
+        os.makedirs(os.path.join(self.data_dir, 'uploaded'))
 
     async def asyncTearDown(self) -> None:
         shutil.rmtree(self.td)
@@ -1388,11 +1391,12 @@ class TestImportRevivesTerminal(
         with patch('sys.stdout', out):
             rc: int = await cmd_import(
                 ns, self.queue, identity=identity,
+                channel_data_directory=self.data_dir,
             )
         self.assertEqual(rc, 0)
         return out.getvalue()
 
-    async def test_revives_not_found_channel_id(
+    async def test_terminal_channel_id_is_not_revived(
         self,
     ) -> None:
         cid: str = 'UCXuqSBlHAE6Xw-yeJA0Tunw'
@@ -1405,187 +1409,198 @@ class TestImportRevivesTerminal(
             {'channel_id': cid, 'channel_handle': None},
         ])
 
-        self.assertFalse(
+        self.assertTrue(
             await self.redis.hexists(
                 'youtube:channel:not_found', member,
             ),
         )
         self.assertEqual(
             await self.queue.get_state(member),
-            ChannelState.SCHEDULED,
+            ChannelState.NOT_FOUND,
         )
-        self.assertIn('revived from terminal: 1', report)
-        self.assertIn('not_found=1', report)
+        self.assertNotIn('revived', report)
+        self.assertIn('added 0, skipped 1', report)
+        self.assertIn('imported: 0 resolved, 0 unresolved', report)
 
-    async def test_revives_removed_channel_id(
+    async def test_terminal_handle_is_not_revived(
+        self,
+    ) -> None:
+        member: str = 'h:LegacyHandle'
+        await self.queue.mark(
+            member, state=ChannelState.NOT_FOUND,
+        )
+
+        report: str = await self._import([
+            {'channel_id': None, 'channel_handle': '@LegacyHandle'},
+        ])
+
+        self.assertEqual(
+            await self.queue.get_state(member),
+            ChannelState.NOT_FOUND,
+        )
+        self.assertIn('added 0, skipped 1', report)
+
+    async def test_scheduled_channel_is_not_rescheduled(
         self,
     ) -> None:
         cid: str = 'UCabc0000000000000000000'
         member: str = f'i:{cid}'
-        await self.queue.mark(
-            member, state=ChannelState.REMOVED,
+        await self.queue.enqueue_scheduled(cid, source='cli')
+        before = await self.redis.zscore(
+            self.queue._k_scheduled(0), member,
         )
+        meta_before: dict = await self.queue.get_meta(member)
 
         report: str = await self._import([
             {'channel_id': cid, 'channel_handle': None},
         ])
 
-        self.assertFalse(
-            await self.redis.hexists(
-                'youtube:channel:removed', member,
-            ),
-        )
         self.assertEqual(
-            await self.queue.get_state(member),
-            ChannelState.SCHEDULED,
-        )
-        self.assertIn('revived from terminal: 1', report)
-        self.assertIn('removed=1', report)
-
-    async def test_revives_not_found_handle(
-        self,
-    ) -> None:
-        handle: str = 'LegacyHandle'
-        member: str = f'h:{handle}'
-        await self.queue.mark(
-            member, state=ChannelState.NOT_FOUND,
-        )
-
-        report: str = await self._import(
-            [{'channel_id': None,
-              'channel_handle': handle}],
-            identity=None,
-        )
-
-        self.assertFalse(
-            await self.redis.hexists(
-                'youtube:channel:not_found', member,
-            ),
-        )
-        self.assertEqual(
-            await self.queue.get_state(member),
-            ChannelState.PENDING_RESOLUTION,
-        )
-        self.assertIn('revived from terminal: 1', report)
-
-    def _topic_queue(self) -> RedisChannelScrapeQueue:
-        '''A six-tier queue, so the topic tier is index 4.'''
-
-        return RedisChannelScrapeQueue(
-            self.redis,
-            ChannelScrapeQueueSettings(
-                _env_file=None,
-                channel_priority_queues=(
-                    '7:1000000,30:100000,90:10000,180:1000,365:100,365:0'
-                ),
-            ),
-        )
-
-    async def test_import_revives_whitespace_topic_into_topic_tier(
-        self,
-    ) -> None:
-        self.queue = self._topic_queue()
-        cid: str = 'UCXuqSBlHAE6Xw-yeJA0Tunw'
-        member: str = f'i:{cid}'
-        await self.queue.mark(
-            member,
-            state=ChannelState.TOPIC,
-            extra={'channel_handle': 'artist - topic'},
-        )
-
-        report: str = await self._import([
-            {'channel_id': cid, 'channel_handle': None},
-        ])
-
-        self.assertFalse(
-            await self.redis.hexists(
-                'youtube:channel:topic', member,
-            ),
-        )
-        self.assertEqual(
-            await self.queue.get_state(member),
-            ChannelState.SCHEDULED,
-        )
-        self.assertIn('revived from terminal: 1', report)
-        # The topic tier, never the highest-priority tier the
-        # default-tier fallback used to pick.
-        self.assertIsNotNone(
-            await self.redis.zscore(
-                self.queue._k_scheduled(4), member,
-            ),
-        )
-        self.assertIsNone(
             await self.redis.zscore(
                 self.queue._k_scheduled(0), member,
             ),
+            before,
         )
-        self.assertEqual(
-            await self.redis.hget(
-                self.queue._k_tiers(), cid,
-            ),
-            '4',
-        )
-        self.assertEqual(
-            await self.redis.hget(
-                self.queue._k_meta(member), 'topic',
-            ),
-            '1',
-        )
+        self.assertEqual(await self.queue.get_meta(member), meta_before)
+        self.assertIn('added 0, skipped 1', report)
 
-    async def test_revives_topic_without_whitespace_handle(
+    async def test_channel_with_local_file_is_skipped(
         self,
     ) -> None:
-        self.queue = self._topic_queue()
+        uploaded_cid: str = 'UCuploaded00000000000000'
+        local_cid: str = 'UClocal00000000000000000'
+        with open(os.path.join(
+            self.data_dir, 'uploaded',
+            f'channel-{uploaded_cid}.json.br',
+        ), 'w') as f:
+            f.write('x')
+        with open(os.path.join(
+            self.data_dir, f'channel-{local_cid}.json.br',
+        ), 'w') as f:
+            f.write('x')
+
+        report: str = await self._import([
+            {'channel_id': uploaded_cid, 'channel_handle': None},
+            {'channel_id': local_cid, 'channel_handle': None},
+        ])
+
+        for cid in (uploaded_cid, local_cid):
+            self.assertEqual(await self.queue.get_meta(f'i:{cid}'), {})
+        self.assertIn('local_file', report)
+        self.assertIn('added 0, skipped 2', report)
+
+    async def test_new_channel_id_is_added(
+        self,
+    ) -> None:
         cid: str = 'UCabc0000000000000000000'
         member: str = f'i:{cid}'
-        await self.queue.mark(
-            member,
-            state=ChannelState.TOPIC,
-            extra={'channel_handle': 'artist-topic'},
-        )
 
         report: str = await self._import([
             {'channel_id': cid, 'channel_handle': None},
         ])
 
-        self.assertFalse(
-            await self.redis.hexists(
-                'youtube:channel:topic', member,
-            ),
-        )
         self.assertEqual(
             await self.queue.get_state(member),
             ChannelState.SCHEDULED,
         )
-        self.assertIn('revived from terminal: 1', report)
-        # Kept out of the top tier, but a '-topic' handle is not a
-        # topic title: no privacy exemption for its videos.
-        self.assertIsNotNone(
+        self.assertIn('added 1, skipped 0', report)
+        self.assertIn('imported: 1 resolved, 0 unresolved', report)
+
+
+class TestAddSkipsKnown(
+    unittest.IsolatedAsyncioTestCase,
+):
+    '''add leaves known channels and channels with a local file
+    alone, also with --priority.'''
+
+    async def asyncSetUp(self) -> None:
+        self.redis = fakeredis.aioredis.FakeRedis(
+            decode_responses=True,
+        )
+        self.queue: RedisChannelScrapeQueue = (
+            RedisChannelScrapeQueue(
+                self.redis,
+                ChannelScrapeQueueSettings(),
+            )
+        )
+        self.td: str = tempfile.mkdtemp()
+
+    async def asyncTearDown(self) -> None:
+        shutil.rmtree(self.td)
+        await self.redis.aclose()
+
+    async def _add(self, keys: list[str], priority: bool) -> str:
+        from tools.yt_channel_queue import cmd_add
+
+        ns = argparse.Namespace(
+            keys=keys, priority=priority, source='cli',
+        )
+        out = StringIO()
+        with patch('sys.stdout', out):
+            rc: int = await cmd_add(
+                ns, self.queue, channel_data_directory=self.td,
+            )
+        self.assertEqual(rc, 0)
+        return out.getvalue()
+
+    async def test_priority_does_not_bump_a_known_channel(
+        self,
+    ) -> None:
+        cid: str = 'UCabc0000000000000000000'
+        member: str = f'i:{cid}'
+        await self.queue.enqueue_scheduled(cid, source='cli')
+        before = await self.redis.zscore(
+            self.queue._k_scheduled(0), member,
+        )
+
+        report: str = await self._add([cid], priority=True)
+
+        self.assertEqual(
             await self.redis.zscore(
-                self.queue._k_scheduled(4), member,
+                self.queue._k_scheduled(0), member,
             ),
+            before,
         )
-        self.assertIsNone(
-            await self.redis.hget(
-                self.queue._k_meta(member), 'topic',
-            ),
-        )
+        self.assertIn('added 0, skipped 1', report)
 
-    async def test_new_channel_id_not_revived(
+    async def test_terminal_channel_is_left_terminal(
         self,
     ) -> None:
         cid: str = 'UCabc0000000000000000000'
         member: str = f'i:{cid}'
+        await self.queue.mark(member, state=ChannelState.REMOVED)
 
-        report: str = await self._import([
-            {'channel_id': cid, 'channel_handle': None},
-        ])
+        await self._add([cid], priority=False)
 
         self.assertEqual(
             await self.queue.get_state(member),
+            ChannelState.REMOVED,
+        )
+
+    async def test_channel_with_local_file_is_skipped(
+        self,
+    ) -> None:
+        cid: str = 'UCabc0000000000000000000'
+        with open(
+            os.path.join(self.td, f'channel-{cid}.json.br'), 'w',
+        ) as f:
+            f.write('x')
+
+        report: str = await self._add([cid], priority=False)
+
+        self.assertEqual(await self.queue.get_meta(f'i:{cid}'), {})
+        self.assertIn('local_file', report)
+
+    async def test_new_channel_is_added(self) -> None:
+        cid: str = 'UCabc0000000000000000000'
+
+        report: str = await self._add([cid], priority=True)
+
+        self.assertEqual(
+            await self.queue.get_state(f'i:{cid}'),
             ChannelState.SCHEDULED,
         )
-        self.assertNotIn('revived from terminal', report)
+        self.assertIn('added 1, skipped 0', report)
 
 
 class TestBackfillRssCommand(

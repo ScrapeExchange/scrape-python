@@ -1248,7 +1248,7 @@ def _priority_post_cleanup(
     * **Delete** the priority file if a scraped
       ``channel-{channel_id}.json.br``, a ``.not_found``
       sentinel, or a ``.unresolved`` sentinel exists in
-      either ``fm.base_dir`` or ``fm.uploaded_dir``.
+      ``fm.base_dir``.
     * **Rename to .failed** otherwise.
     '''
     for channel_id, path in priority_ids.items():
@@ -1269,9 +1269,7 @@ def _priority_post_cleanup(
             scraped, not_found, unresolved, invalid,
         ]
         succeeded: bool = any(
-            (fm.base_dir / name).exists()
-            or (fm.uploaded_dir / name).exists()
-            for name in success_markers
+            (fm.base_dir / name).exists() for name in success_markers
         )
         if succeeded:
             try:
@@ -2889,13 +2887,10 @@ def _failed_marker_is_stale(
     base_path: Path, failed_path: Path,
 ) -> bool:
     '''
-    Return True if a ``.failed`` marker has been superseded by either
-    an uploaded copy of the same channel or a newer (re-scraped) base
-    file. In that case the caller should remove the marker and proceed
-    rather than skip.
+    Return True if a ``.failed`` marker has been superseded by a newer
+    (re-scraped) base file. In that case the caller should remove the
+    marker and proceed rather than skip.
     '''
-    if fm.was_uploaded(filename):
-        return True
     try:
         base_mtime: float = base_path.stat().st_mtime
         failed_mtime: float = failed_path.stat().st_mtime
@@ -2910,7 +2905,9 @@ async def _skip_due_to_existing_state(
 ) -> bool:
     '''
     Decide whether the channel can be skipped without scraping or
-    uploading based on what's already on disk.
+    uploading because of a ``.failed`` or ``.invalid`` marker. Files in
+    ``uploaded/`` play no part: channels are scraped periodically, so
+    an earlier upload is no reason to skip a scrape.
 
     :returns: True if the channel should be skipped (caller returns
         ``False``); False if the caller should proceed.
@@ -2938,27 +2935,6 @@ async def _skip_due_to_existing_state(
         )
         return True
 
-    if not fm.was_uploaded(filename):
-        return False
-
-    if fm.is_superseded(filename):
-        await fm.delete(filename, fail_ok=False)
-        logging.debug(
-            'Channel already uploaded, dropped stale base copy, '
-            'skipping',
-            extra=extra,
-        )
-        return True
-    if not base_path.exists():
-        logging.debug(
-            'Channel already uploaded, no local base copy, skipping',
-            extra=extra,
-        )
-        return True
-    logging.debug(
-        'Local base copy is newer than uploaded copy, re-uploading',
-        extra=extra,
-    )
     return False
 
 
@@ -4120,10 +4096,9 @@ async def _skip_uploaded_channel(
     channel_id: str, filename: str, scraped_path: Path,
     fm: AssetFileManagement,
 ) -> None:
-    '''Relocate a stale base-dir scraped file for an already-uploaded
-    channel into ``uploaded_dir`` so the uploader does not waste a
-    round-trip on it. A no-op (debug log only) when no such file
-    exists.'''
+    '''Delete a stale base-dir scraped file for an already-uploaded
+    channel so the uploader does not waste a round-trip on it. A no-op
+    (debug log only) when no such file exists.'''
     if not scraped_path.exists():
         logging.debug(
             'Skipping channel; already in uploaded channels list',
@@ -4131,16 +4106,14 @@ async def _skip_uploaded_channel(
         )
         return
     try:
-        await fm.mark_uploaded(filename)
+        await fm.delete(filename)
         logging.info(
-            'Channel already uploaded; moved scraped file to '
-            'uploaded directory',
+            'Channel already uploaded; deleted scraped file',
             extra={'channel_id': channel_id, 'filename': filename},
         )
     except OSError as exc:
         logging.warning(
-            'Failed to move scraped channel file to uploaded '
-            'directory',
+            'Failed to delete scraped channel file',
             exc=exc,
             extra={'channel_id': channel_id, 'filename': filename},
         )
@@ -4161,13 +4134,13 @@ async def _filter_unscraped_candidates(
     Resolution is lazy / budget-bounded: a handle in the no-Redis
     legacy path costs an InnerTube call, so we resolve only until the
     budget is met. Bare ids and negative-cached handles cost no HTTP.
-    Dedup keys (``.not_found`` marker, scraped file in ``base_dir``,
-    uploaded file in ``uploaded_dir``) are all channel_id-based. The
-    ``uploaded_handles`` membership test (loaded from
-    ``YOUTUBE_UPLOADED_CHANNELS_LIST``, which is handle-valued) maps the
-    id back to its handle via the creator map; a stale non-uploaded
-    scraped file for such a channel is relocated into ``uploaded_dir``
-    first so the uploader does not waste a round-trip on it.
+    Dedup keys (``.not_found`` marker, scraped file in ``base_dir`` or
+    ``uploaded_dir``) are all channel_id-based: a channel with any local
+    file is not new. The ``uploaded_handles`` membership test
+    (loaded from ``YOUTUBE_UPLOADED_CHANNELS_LIST``, which is
+    handle-valued) maps the id back to its handle via the creator map;
+    a stale scraped file for such a channel is deleted first so the
+    uploader does not waste a round-trip on it.
     '''
 
     candidates: list[str] = []
