@@ -1291,7 +1291,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Fleet-wide exponentially weighted transport failure rate (connection, tunnel, pool, TLS errors) per proxy, as last seen by each process. Above 0.5 a failure puts the proxy in cooldown.",
+      "description": "Fleet-wide exponentially weighted transport failure rate (connection, tunnel, pool, TLS errors) per proxy, as last seen by each process. Above 0.5 a failure puts the proxy in cooldown. Values a process has not updated in 30 min are hidden: processes only refresh proxies they select, so idle scrapers keep stale readings.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1386,7 +1386,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (proxy) (proxy_health_fail_ewma{job=~\"$job\",instance=~\"$instance\"}) > 0.01",
+          "expr": "max by (proxy) (proxy_health_fail_ewma{job=~\"$job\",instance=~\"$instance\"} and (changes(proxy_health_fail_ewma{job=~\"$job\",instance=~\"$instance\"}[30m]) > 0 or changes(proxy_health_in_cooldown{job=~\"$job\",instance=~\"$instance\"}[30m]) > 0)) > 0.01",
           "legendFormat": "{{proxy}}",
           "range": true,
           "refId": "A"
@@ -1400,7 +1400,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Proxies currently skipped by proxy selection after transport failures (30 s cooldown, doubling per reopening up to 10 min). \"total\" is the number of proxies in cooldown.",
+      "description": "Proxies currently skipped by proxy selection after transport failures (30 s cooldown, doubling per reopening up to 10 min). \"total\" is the number of proxies in cooldown. Readings a process has not updated in 30 min are hidden as stale.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1490,7 +1490,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (proxy) (proxy_health_in_cooldown{job=~\"$job\",instance=~\"$instance\"}) > 0",
+          "expr": "max by (proxy) (proxy_health_in_cooldown{job=~\"$job\",instance=~\"$instance\"} and (changes(proxy_health_fail_ewma{job=~\"$job\",instance=~\"$instance\"}[30m]) > 0 or changes(proxy_health_in_cooldown{job=~\"$job\",instance=~\"$instance\"}[30m]) > 0)) > 0",
           "legendFormat": "{{proxy}}",
           "range": true,
           "refId": "A"
@@ -1501,7 +1501,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(max by (proxy) (proxy_health_in_cooldown{job=~\"$job\",instance=~\"$instance\"})) > 0",
+          "expr": "sum(max by (proxy) (proxy_health_in_cooldown{job=~\"$job\",instance=~\"$instance\"} and (changes(proxy_health_fail_ewma{job=~\"$job\",instance=~\"$instance\"}[30m]) > 0 or changes(proxy_health_in_cooldown{job=~\"$job\",instance=~\"$instance\"}[30m]) > 0))) > 0",
           "legendFormat": "total",
           "range": true,
           "refId": "B"
