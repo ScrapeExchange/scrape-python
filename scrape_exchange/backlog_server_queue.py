@@ -62,20 +62,34 @@ def _text(value: Any) -> str:
     return str(value)
 
 
+_DONE_STATES: frozenset[str] = frozenset({'scraped', 'uploaded'})
+
+
 def _state(value: Any) -> VideoState | None:
-    '''Server state name -> VideoState. ``scraped`` maps to None, as a
-    completed video is unknown to the Redis queue too. Use
+    '''Server state name -> VideoState.
+
+    ``scraped`` and ``uploaded`` are the done states and map to None,
+    as a completed video is unknown to the Redis queue too; use
     :meth:`BacklogServerVideoScrapeQueue.get_state_names` when the
-    difference between scraped and unknown matters.'''
+    difference matters. Any other unrecognised name is a deploy-order
+    mistake or a typo: it raises, so it fails loudly instead of
+    looking like an unknown video and turning into duplicate work.
+    '''
     if value is None:
         return None
     name: str = _text(value)
-    if name == 'scraped':
+    if name in _DONE_STATES:
         return None
     try:
         return VideoState(name)
     except ValueError:
-        return None
+        _LOGGER.error(
+            'unknown video queue state name from backlog-server',
+            extra={'state': name},
+        )
+        raise ValueError(
+            f'unknown video queue state: {name!r}',
+        ) from None
 
 
 class BacklogServerVideoScrapeQueue(VideoScrapeQueue):
@@ -91,10 +105,13 @@ class BacklogServerVideoScrapeQueue(VideoScrapeQueue):
         redis: aioredis.Redis,
         settings: VideoScrapeQueueSettings,
         queue_name: str = DEFAULT_QUEUE_NAME,
+        *,
+        supports_uploaded: bool = False,
     ) -> None:
         self._redis: aioredis.Redis = redis
         self._settings: VideoScrapeQueueSettings = settings
         self._queue: str = queue_name
+        self.supports_uploaded: bool = supports_uploaded
         # IDs handed out by pop_entries with the force flag set; read
         # once by consume_force.
         self._forced: set[str] = set()
@@ -296,6 +313,68 @@ class BacklogServerVideoScrapeQueue(VideoScrapeQueue):
         return {
             video_id: None if value is None else _text(value)
             for video_id, value in zip(ids, reply, strict=True)
+        }
+
+    def state_names(self) -> list[str]:
+        '''Verbatim state names, the done ones included.
+
+        A queue that does not track upload state has no ``uploaded``.
+        '''
+        names: list[str] = [state.value for state in VideoState]
+        names.append('scraped')
+        if self.supports_uploaded:
+            names.append('uploaded')
+        return names
+
+    # -- upload state -------------------------------------------------
+
+    async def mark_uploaded(self, video_ids: list[str]) -> None:
+        '''Record *video_ids* as accepted by the bulk upload API.'''
+        if not self.supports_uploaded:
+            return
+        ids: list[str] = [
+            video_id for video_id in video_ids if video_id
+        ]
+        start: int
+        for start in range(0, len(ids), ENQUEUE_MANY_CHUNK_SIZE):
+            await self._cmd(
+                'UPLOADED',
+                *ids[start:start + ENQUEUE_MANY_CHUNK_SIZE],
+            )
+
+    async def uploaded_many(
+        self, video_ids: list[str], *, api_fallback: bool = True,
+    ) -> dict[str, bool]:
+        '''True for IDs the server holds as ``uploaded``.'''
+        del api_fallback
+        if not self.supports_uploaded:
+            return {video_id: False for video_id in video_ids}
+        names: dict[str, str | None] = await self.get_state_names(
+            list(video_ids),
+        )
+        return {
+            video_id: names.get(video_id) == 'uploaded'
+            for video_id in video_ids
+        }
+
+    async def done_many(
+        self, video_ids: list[str], *, api_fallback: bool = True,
+    ) -> dict[str, bool]:
+        '''True for IDs that need no more work.
+
+        ``scraped`` is done even before its file is uploaded: it must
+        not be scraped again, and the uploader reads ``uploaded``
+        itself.
+        '''
+        del api_fallback
+        if not self.supports_uploaded:
+            return {video_id: False for video_id in video_ids}
+        names: dict[str, str | None] = await self.get_state_names(
+            list(video_ids),
+        )
+        return {
+            video_id: names.get(video_id) in _DONE_STATES
+            for video_id in video_ids
         }
 
     async def get_meta(

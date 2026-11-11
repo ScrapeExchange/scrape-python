@@ -84,8 +84,12 @@ def make_video_scrape_queue(
         )
         return BacklogServerVideoScrapeQueue(
             server, settings, queue_name=queue_name,
+            supports_uploaded=(platform == 'youtube'),
         )
-    return RedisVideoScrapeQueue(redis, settings, platform=platform)
+    return RedisVideoScrapeQueue(
+        redis, settings, platform=platform,
+        supports_uploaded=(platform == 'youtube'),
+    )
 
 
 async def close_backlog_clients() -> None:

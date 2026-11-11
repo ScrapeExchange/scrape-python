@@ -29,12 +29,13 @@ class FakeRedis:
         return self.replies.pop(0) if self.replies else None
 
 
-def make(replies: list[Any] | None = None) -> tuple[
-    BacklogServerVideoScrapeQueue, FakeRedis,
-]:
+def make(
+    replies: list[Any] | None = None, *, supports_uploaded: bool = True,
+) -> tuple[BacklogServerVideoScrapeQueue, FakeRedis]:
     fake: FakeRedis = FakeRedis(replies)
     queue: BacklogServerVideoScrapeQueue = BacklogServerVideoScrapeQueue(
         fake, VideoScrapeQueueSettings(),  # type: ignore[arg-type]
+        supports_uploaded=supports_uploaded,
     )
     return queue, fake
 
@@ -195,6 +196,59 @@ class TestBacklogServerQueue(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(issubclass(
             BacklogServerUnsupported, NotImplementedError,
         ))
+
+
+    async def test_mark_uploaded_sends_batch_command(self) -> None:
+        queue, fake = make([2])
+        await queue.mark_uploaded(['a' * 11, 'b' * 11])
+        self.assertEqual(fake.calls, [
+            ('BACKLOG.UPLOADED', QUEUE, 'a' * 11, 'b' * 11),
+        ])
+
+    async def test_uploaded_and_done_read_states(self) -> None:
+        ids: list[str] = ['a' * 11, 'b' * 11, 'c' * 11, 'd' * 11]
+        queue, fake = make([['uploaded', 'scraped', None, 'queued']] * 2)
+        self.assertEqual(
+            await queue.uploaded_many(ids),
+            dict(zip(ids, [True, False, False, False], strict=True)),
+        )
+        self.assertEqual(
+            await queue.done_many(ids),
+            dict(zip(ids, [True, True, False, False], strict=True)),
+        )
+        self.assertEqual(fake.calls, [
+            ('BACKLOG.STATE', QUEUE, *ids),
+            ('BACKLOG.STATE', QUEUE, *ids),
+        ])
+
+    async def test_get_states_maps_done_states_to_none(self) -> None:
+        queue, _ = make([['scraped', 'uploaded']])
+        self.assertEqual(
+            await queue.get_states(['a' * 11, 'b' * 11]),
+            {'a' * 11: None, 'b' * 11: None},
+        )
+
+    async def test_unknown_state_name_raises(self) -> None:
+        queue, _ = make([['bogus']])
+        with self.assertRaises(ValueError):
+            await queue.get_states(['a' * 11])
+
+    async def test_unsupported_queue_makes_no_calls(self) -> None:
+        ids: list[str] = ['a' * 11]
+        queue, fake = make([], supports_uploaded=False)
+        self.assertIsNone(await queue.mark_uploaded(ids))
+        self.assertEqual(await queue.uploaded_many(ids), {'a' * 11: False})
+        self.assertEqual(await queue.done_many(ids), {'a' * 11: False})
+        self.assertEqual(fake.calls, [])
+
+    async def test_state_names_include_done_states(self) -> None:
+        queue, _ = make([], supports_uploaded=True)
+        self.assertEqual(queue.state_names(), [
+            'queued', 'unavailable', 'failed', 'removed',
+            'scraped', 'uploaded',
+        ])
+        plain, _ = make([], supports_uploaded=False)
+        self.assertNotIn('uploaded', plain.state_names())
 
 
 class TestNormalizeReason(unittest.TestCase):
