@@ -224,7 +224,6 @@ class TestProducerSurvivesQueueOutage(
                 settings,
                 proxies=[],
                 concurrency=1,
-                uploaded=AsyncMock(),
                 creator_map_backend=MagicMock(),
             ),
         )
@@ -272,7 +271,6 @@ class TestProducerSurvivesQueueOutage(
                     settings,
                     proxies=[],
                     concurrency=1,
-                    uploaded=AsyncMock(),
                     creator_map_backend=MagicMock(),
                 ),
             )
