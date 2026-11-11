@@ -223,6 +223,7 @@ fn op_name(r: &Request) -> &'static str {
         Request::Pop { .. } => "POP",
         Request::Touch { .. } => "TOUCH",
         Request::Complete(_) => "COMPLETE",
+        Request::Uploaded(_) => "UPLOADED",
         Request::Mark { .. } => "MARK",
         Request::Requeue { .. } => "REQUEUE",
         Request::State(_) => "STATE",
@@ -261,6 +262,13 @@ fn handle(
             let n: u64 = ids.len() as u64;
             for id in ids {
                 q.complete(id, ts)?;
+            }
+            Reply::Count(n)
+        }
+        Request::Uploaded(ids) => {
+            let mut n: u64 = 0;
+            for id in ids {
+                n += u64::from(q.uploaded(id, ts)?);
             }
             Reply::Count(n)
         }
