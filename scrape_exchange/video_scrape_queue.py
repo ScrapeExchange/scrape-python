@@ -457,6 +457,11 @@ class VideoScrapeQueue(ABC):
         '''Every state name this backend can store.'''
         return [state.value for state in VideoState]
 
+    async def count_by_state_name(self) -> dict[str, int]:
+        '''Member counts for every name in :meth:`state_names`.'''
+        counts: dict[VideoState, int] = await self.count_by_state()
+        return {state.value: count for state, count in counts.items()}
+
     @abstractmethod
     async def get_meta(
         self, video_id: str,

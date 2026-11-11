@@ -177,6 +177,29 @@ class TestBacklogServerQueue(unittest.IsolatedAsyncioTestCase):
             VideoState.UNAVAILABLE: 1, VideoState.REMOVED: 0,
         })
 
+    async def test_count_by_state_name_includes_done_states(
+        self,
+    ) -> None:
+        queue, _ = make([[
+            'queued', 7, 'scraped', 9, 'failed', 2, 'unavailable', 1,
+            'removed', 0, 'uploaded', 5, 'leased', 3,
+        ]])
+        self.assertEqual(await queue.count_by_state_name(), {
+            'queued': 7, 'unavailable': 1, 'failed': 2, 'removed': 0,
+            'scraped': 9, 'uploaded': 5,
+        })
+
+    async def test_count_by_state_name_without_upload_state(
+        self,
+    ) -> None:
+        queue, _ = make(
+            [['queued', 1, 'scraped', 2, 'uploaded', 0]],
+            supports_uploaded=False,
+        )
+        counts: dict[str, int] = await queue.count_by_state_name()
+        self.assertEqual(counts['scraped'], 2)
+        self.assertNotIn('uploaded', counts)
+
     async def test_get_meta(self) -> None:
         queue, _ = make([['failed'], ['scraped']])
         self.assertEqual(

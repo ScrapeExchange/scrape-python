@@ -36,9 +36,6 @@ from scrape_exchange.video_scrape_queue import (
     VideoScrapeQueueSettings,
     VideoState,
 )
-from scrape_exchange.youtube.uploaded_video_ids import (
-    UploadedVideoIds,
-)
 
 
 _VIDEO_ID_RE: re.Pattern[str] = re.compile(
@@ -102,15 +99,15 @@ def _add_enqueue_policy_flags(
         help=(
             'scrape regardless of whether the video was already '
             'scraped before (revives terminal records and tags '
-            'them so the scraper bypasses the uploaded-set skip)'
+            'them so the scraper scrapes them again)'
         ),
     )
     parser.add_argument(
         '--no-remote-check', action='store_true',
         help=(
             'skip the scrape.exchange API existence check (the '
-            'expensive per-id lookup); use only the uploaded set '
-            'and terminal state to decide'
+            'expensive per-id lookup); use only the queue\'s '
+            'upload and terminal state to decide'
         ),
     )
     parser.add_argument('--channel-id', default=None)
@@ -327,7 +324,6 @@ class _ScrapedBeforeSources:
     for the operator.
     '''
 
-    uploaded: UploadedVideoIds | None
     exchange_client: ExchangeClient | None
     warnings: list[str]
 
@@ -350,7 +346,7 @@ class EnqueueReport:
     forced_pending: int = 0
     already_scraped: dict[str, int] = dataclasses.field(
         default_factory=lambda: {
-            'uploaded': 0, 'terminal': 0, 'api': 0,
+            'uploaded': 0, 'scraped': 0, 'terminal': 0, 'api': 0,
         },
     )
 
@@ -383,9 +379,6 @@ async def _build_sources(
     a warning rather than failing.
     '''
     warnings: list[str] = []
-    uploaded: UploadedVideoIds = UploadedVideoIds(
-        settings.redis_dsn,
-    )
     exchange_client: ExchangeClient | None = None
     if remote_check:
         if settings.api_key_id and settings.api_key_secret:
@@ -412,32 +405,40 @@ async def _build_sources(
                 'not set',
             )
     return _ScrapedBeforeSources(
-        uploaded=uploaded,
         exchange_client=exchange_client,
         warnings=warnings,
     )
 
 
-async def _source_uploaded(
-    video_ids: list[str], uploaded: UploadedVideoIds | None,
-) -> tuple[list[str], int]:
-    '''Source 1: batched uploaded-set membership.'''
-    if uploaded is None or not video_ids:
-        return list(video_ids), 0
+async def _source_done(
+    video_ids: list[str], queue: VideoScrapeQueue,
+) -> tuple[list[str], int, int]:
+    '''Source 1: upload state from the video queue. Returns the ids
+    still to check, and how many were uploaded and how many scraped
+    but not yet uploaded. The queue's API fallback stays off: source
+    4 is this tool's own API check.'''
+    if not video_ids:
+        return [], 0, 0
     try:
-        flags: dict[str, bool] = await uploaded.contains_many(
-            video_ids,
+        done: dict[str, bool] = await queue.done_many(
+            video_ids, api_fallback=False,
+        )
+        uploaded: dict[str, bool] = await queue.uploaded_many(
+            video_ids, api_fallback=False,
         )
     except Exception:
-        return list(video_ids), 0  # fail-open
+        return list(video_ids), 0, 0  # fail-open
     pending: list[str] = []
-    hits: int = 0
+    uploaded_hits: int = 0
+    scraped_hits: int = 0
     for vid in video_ids:
-        if flags.get(vid):
-            hits += 1
+        if uploaded.get(vid) is True:
+            uploaded_hits += 1
+        elif done.get(vid) is True:
+            scraped_hits += 1
         else:
             pending.append(vid)
-    return pending, hits
+    return pending, uploaded_hits, scraped_hits
 
 
 async def _source_terminal(
@@ -470,17 +471,18 @@ async def _source_api(
     schema_version: str,
     remote_check: bool,
     concurrency: int,
-) -> tuple[list[str], int]:
+) -> tuple[list[str], list[str]]:
     '''Source 4: scrape.exchange API existence, scoped to our
     uploader. A 200 means we already uploaded it; 404 means not;
-    any other error fails open (treated as not scraped).'''
+    any other error fails open (treated as not scraped). Returns the
+    ids still pending and the ids the API confirmed.'''
     enabled: bool = (
         remote_check
         and exchange_client is not None
         and bool(exchange_client.authenticated_username)
     )
     if not enabled or not video_ids:
-        return list(video_ids), 0
+        return list(video_ids), []
     assert exchange_client is not None
     username: str = exchange_client.authenticated_username or ''
     sem: asyncio.Semaphore = asyncio.Semaphore(concurrency)
@@ -508,19 +510,18 @@ async def _source_api(
         *[_exists(vid) for vid in video_ids],
     )
     pending: list[str] = []
-    hits: int = 0
+    confirmed: list[str] = []
     for vid, found in zip(video_ids, results):
         if found is True:
-            hits += 1
+            confirmed.append(vid)
         else:
             pending.append(vid)
-    return pending, hits
+    return pending, confirmed
 
 
 async def _filter_already_scraped(
     video_ids: list[str],
     *,
-    uploaded: UploadedVideoIds | None,
     queue: VideoScrapeQueue,
     exchange_client: ExchangeClient | None,
     schema_version: str,
@@ -533,24 +534,37 @@ async def _filter_already_scraped(
     (fail-open).
     '''
     already: dict[str, int] = {
-        'uploaded': 0, 'terminal': 0, 'api': 0,
+        'uploaded': 0, 'scraped': 0, 'terminal': 0, 'api': 0,
     }
     processed: int = len(video_ids)
 
     pending: list[str]
-    pending, already['uploaded'] = await _source_uploaded(
-        video_ids, uploaded,
+    pending, already['uploaded'], already['scraped'] = (
+        await _source_done(video_ids, queue)
     )
     pending, already['terminal'], duplicates = (
         await _source_terminal(pending, queue)
     )
-    pending, already['api'] = await _source_api(
+    confirmed: list[str]
+    pending, confirmed = await _source_api(
         pending,
         exchange_client=exchange_client,
         schema_version=schema_version,
         remote_check=remote_check,
         concurrency=concurrency,
     )
+    already['api'] = len(confirmed)
+    if confirmed:
+        # Record what the API confirmed, so the queue answers for
+        # these ids from now on. Best effort: a failure only costs a
+        # later API lookup.
+        try:
+            await queue.mark_uploaded(confirmed)
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(
+                f'warning: recording {len(confirmed)} uploaded ids '
+                f'failed: {exc}\n',
+            )
 
     return FilterResult(
         survivors=pending,
@@ -615,7 +629,6 @@ async def _run_enqueue_policy(
         for batch in _chunks(video_ids):
             filtered: FilterResult = await _filter_already_scraped(
                 batch,
-                uploaded=sources.uploaded,
                 queue=queue,
                 exchange_client=sources.exchange_client,
                 schema_version=settings.schema_version,
@@ -656,12 +669,14 @@ def _write_enqueue_status(
         )
         return
     a: dict[str, int] = report.already_scraped
-    total: int = a['uploaded'] + a['terminal'] + a['api']
+    total: int = (
+        a['uploaded'] + a['scraped'] + a['terminal'] + a['api']
+    )
     sys.stdout.write(
         f'{label}: processed={report.processed} '
         f'already_scraped={total} '
-        f'(uploaded={a["uploaded"]} terminal={a["terminal"]} '
-        f'api={a["api"]}) '
+        f'(uploaded={a["uploaded"]} scraped={a["scraped"]} '
+        f'terminal={a["terminal"]} api={a["api"]}) '
         f'duplicates={report.duplicates} added={report.added}\n',
     )
 

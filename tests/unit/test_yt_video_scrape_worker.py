@@ -55,7 +55,7 @@ def _backlog_queue(
     queue: BacklogServerVideoScrapeQueue = (
         BacklogServerVideoScrapeQueue(
             fake,  # type: ignore[arg-type]
-            VideoScrapeQueueSettings(),
+            VideoScrapeQueueSettings(_env_file=None),
             supports_uploaded=True,
         )
     )

@@ -495,15 +495,24 @@ class BacklogServerVideoScrapeQueue(VideoScrapeQueue):
             'set_meta is not supported by the backlog server',
         )
 
-    async def count_by_state(
-        self,
-    ) -> dict[VideoState, int]:
+    async def _info(self) -> dict[str, int]:
         reply: list[Any] = await self._cmd('INFO')
-        info: dict[str, int] = {
+        return {
             _text(reply[i]): int(reply[i + 1])
             for i in range(0, len(reply) - 1, 2)
         }
+
+    async def count_by_state(
+        self,
+    ) -> dict[VideoState, int]:
+        info: dict[str, int] = await self._info()
         return {state: info.get(state.value, 0) for state in VideoState}
+
+    async def count_by_state_name(self) -> dict[str, int]:
+        '''Counts for every state the server stores, ``scraped`` and
+        (when upload state is tracked) ``uploaded`` included.'''
+        info: dict[str, int] = await self._info()
+        return {name: info.get(name, 0) for name in self.state_names()}
 
     async def search_meta(
         self,
