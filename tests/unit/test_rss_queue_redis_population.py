@@ -844,7 +844,6 @@ class TestStreamProcessor(
                     channel_validator=channel_validator,
                     settings=settings,
                     video_queue=video_queue,
-                    uploaded_videos=MagicMock(),
                 ),
             )
             # Yield enough for two iterations (claim + process +
@@ -924,7 +923,6 @@ class TestStreamProcessor(
                     channel_validator=channel_validator,
                     settings=settings,
                     video_queue=video_queue,
-                    uploaded_videos=MagicMock(),
                 ),
             )
             await asyncio.sleep(0.02)

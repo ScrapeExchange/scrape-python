@@ -4,12 +4,14 @@ Tests for RSS scrape.exchange existence-check backpressure.
 
 import asyncio
 import os
+import tempfile
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from httpx2 import Response
 
 from scrape_exchange.youtube._rss_circuit_state import CircuitReport
+from scrape_exchange.youtube.youtube_video import YouTubeVideo
 
 from tools import yt_rss_scrape
 
@@ -126,16 +128,14 @@ class TestRssRedisFirstExistence(unittest.TestCase):
                     'queued-one': 'queued',
                     'unknown-one': None,
                 })
+                video_queue.done_many = AsyncMock(return_value={
+                    'uploaded-one': True,
+                    'queued-one': False,
+                    'unknown-one': False,
+                })
+                video_queue.mark_uploaded = AsyncMock()
                 video_queue.enqueue = AsyncMock()
 
-                uploaded_backend = MagicMock()
-                uploaded_backend.contains_many = AsyncMock(
-                    return_value={
-                        'uploaded-one': True,
-                        'queued-one': False,
-                        'unknown-one': False,
-                    },
-                )
 
                 creator_queue = MagicMock()
                 creator_queue.has_had_feed = AsyncMock(
@@ -180,7 +180,6 @@ class TestRssRedisFirstExistence(unittest.TestCase):
                         channel_validator=MagicMock(),
                         tier=1,
                         video_queue=video_queue,
-                        uploaded_videos=uploaded_backend,
                     )
 
                 self.assertIs(result, True)
@@ -203,3 +202,73 @@ class TestRssRedisFirstExistence(unittest.TestCase):
                 self.assertNotIn('uploaded-one', enqueued)
 
         _run(scenario())
+
+
+class TestRssSelfHealing(unittest.IsolatedAsyncioTestCase):
+    '''An ID the RSS existence check confirms is marked uploaded, so
+    the queue answers it from then on (design 5.4).'''
+
+    async def test_rss_marks_ids_its_check_confirms(self) -> None:
+        video: YouTubeVideo = YouTubeVideo(video_id='confirmed-one')
+        video.channel_id = 'UCX'
+        with tempfile.TemporaryDirectory() as data_dir:
+            settings = MagicMock()
+            settings.redis_dsn = 'redis://fake'
+            settings.exchange_url = 'https://scrape.exchange'
+            settings.video_data_directory = data_dir
+            settings.channel_min_subscribers = 0
+            video_queue = MagicMock()
+            video_queue.get_states = AsyncMock(return_value={
+                'confirmed-one': None,
+            })
+            video_queue.done_many = AsyncMock(return_value={
+                'confirmed-one': False,
+            })
+            video_queue.mark_uploaded = AsyncMock()
+            video_queue.enqueue = AsyncMock()
+            creator_queue = MagicMock()
+            creator_queue.has_had_feed = AsyncMock(return_value=True)
+            creator_queue.get_no_feeds = AsyncMock(return_value=None)
+            creator_queue.update_tier = AsyncMock()
+            creator_queue.set_no_feeds = AsyncMock()
+            creator_queue.rollback_no_feeds = AsyncMock()
+            creator_queue.mark_had_feed = AsyncMock()
+            creator_queue.clear_no_feeds = AsyncMock()
+            breaker = MagicMock()
+            breaker.acquire = AsyncMock(return_value=0.0)
+            breaker.report = AsyncMock(return_value=CircuitReport(
+                transition=None,
+                suppress_channel_failure=False,
+                rollback_channel_ids=[],
+                state_after=None,
+            ))
+            with patch.object(
+                yt_rss_scrape, '_fetch_rss_safe',
+                new=AsyncMock(return_value=[video]),
+            ), patch.object(
+                yt_rss_scrape, 'update_channel',
+                new=AsyncMock(return_value=(True, 0, 'handle', False)),
+            ), patch.object(
+                yt_rss_scrape, '_get_rss_circuit_breaker',
+                return_value=breaker,
+            ), patch.object(
+                yt_rss_scrape, 'check_video_exists',
+                new=AsyncMock(return_value=True),
+            ):
+                result = await yt_rss_scrape.process_channel(
+                    channel_handle='handle',
+                    channel_id='UCX',
+                    client=MagicMock(),
+                    creator_queue=creator_queue,
+                    settings=settings,
+                    creator_map_backend=AsyncMock(),
+                    name_map_backend=AsyncMock(),
+                    channel_validator=MagicMock(),
+                    tier=1,
+                    video_queue=video_queue,
+                )
+            self.assertIs(result, True)
+            video_queue.mark_uploaded.assert_awaited_once_with(
+                ['confirmed-one'],
+            )
+            video_queue.enqueue.assert_not_awaited()

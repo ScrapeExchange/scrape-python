@@ -133,7 +133,6 @@ from scrape_exchange.video_scrape_queue import (
 from scrape_exchange.youtube.exchange_video_exists import (
     exchange_video_exists,
 )
-from scrape_exchange.youtube.uploaded_video_ids import UploadedVideoIds
 from scrape_exchange.youtube.channel_video_refresh import (
     VIDEOS_SKIPPED_MIN_SUBSCRIBERS,
 )
@@ -1246,7 +1245,6 @@ async def process_channel(
     channel_validator: SchemaValidator,
     tier: int,
     video_queue: VideoScrapeQueue,
-    uploaded_videos: UploadedVideoIds,
 ) -> bool | None:
     '''
     Fetches the RSS feed for one channel and checks or stores each video.
@@ -1543,8 +1541,9 @@ async def process_channel(
         candidate_ids: list[str] = [
             str(v.video_id) for v in candidates
         ]
-        uploaded_flags: dict[str, bool] = (
-            await uploaded_videos.contains_many(candidate_ids)
+        uploaded_flags: dict[str, bool] = await video_queue.done_many(
+            candidate_ids,
+            api_fallback=False,
         )
         queue_states: dict = await video_queue.get_states(
             candidate_ids,
@@ -1616,6 +1615,8 @@ async def process_channel(
         elif exists:
             logging.debug('Video already on scrape.exchange', extra=extra)
             videos_existing += 1
+            # Self-healing: the queue answers this ID from now on.
+            await video_queue.mark_uploaded([str(video.video_id)])
         else:
             new_videos.append(video)
 
@@ -2463,7 +2464,6 @@ async def _stream_processor(
     channel_validator: SchemaValidator,
     settings: RssSettings,
     video_queue: VideoScrapeQueue,
-    uploaded_videos: UploadedVideoIds,
 ) -> None:
     '''Single-channel streaming processor.
 
@@ -2522,7 +2522,6 @@ async def _stream_processor(
                     channel_validator,
                     claim_tier,
                     video_queue,
-                    uploaded_videos,
                 )
             except Exception as exc:
                 result = exc
@@ -2584,7 +2583,6 @@ async def worker_loop(
     name_map_backend: NameMap,
     channel_validator: SchemaValidator,
     video_queue: VideoScrapeQueue,
-    uploaded_videos: UploadedVideoIds,
 ) -> None:
     '''
     Runs indefinitely, processing channels in priority order.
@@ -2739,7 +2737,6 @@ async def worker_loop(
                 channel_validator=channel_validator,
                 settings=settings,
                 video_queue=video_queue,
-                uploaded_videos=uploaded_videos,
             ),
         )
         for i in range(effective_concurrency)
@@ -2834,9 +2831,6 @@ async def _run_worker(
     )
     # One shared wrapper over the worker's pool: the per-channel
     # Redis existence pre-check must not open its own connection.
-    uploaded_videos: UploadedVideoIds = UploadedVideoIds(
-        '', redis_client=video_queue_redis,
-    )
 
     creator_map_backend: CreatorMap
     if settings.redis_dsn:
@@ -2886,7 +2880,6 @@ async def _run_worker(
         creator_map_backend, name_map_backend,
         channel_validator,
         video_queue,
-        uploaded_videos,
     )
 
 
