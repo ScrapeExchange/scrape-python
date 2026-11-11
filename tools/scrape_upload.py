@@ -188,6 +188,12 @@ class TargetUploadState:
     # Set when a finalize released its files, so the next drain may
     # need a fresh listing pass to see them again.
     files_released: bool = False
+    # monotonic() of the last bulk POST of this target; None before
+    # the first one.
+    last_post_at: float | None = None
+    # Set while files wait because a partial batch is held back until
+    # partial_batch_interval_seconds after the last POST.
+    partial_deferred: bool = False
 
 
 @dataclass(frozen=True)
@@ -555,6 +561,22 @@ class ScrapeUploadSettings(ScraperSettings):
             '(one whose progress tracking was lost) is considered dead. '
             'Its state file is discarded and its source files are '
             'uploaded again in a later pass.'
+        ),
+    )
+    partial_batch_interval_seconds: float = Field(
+        default=300.0,
+        ge=0,
+        validation_alias=AliasChoices(
+            'SCRAPE_UPLOAD_PARTIAL_BATCH_INTERVAL',
+            'partial_batch_interval_seconds',
+        ),
+        description=(
+            'Minimum seconds between two bulk batches of one upload '
+            'target when fewer than BULK_BATCH_SIZE files are waiting. '
+            'Full batches are always sent right away; small batches '
+            'cost almost as much CPU as full ones, so waiting lets more '
+            'files collect. The first batch after startup is not held '
+            'back. 0 sends partial batches immediately.'
         ),
     )
     pending_count_interval_seconds: float = Field(
@@ -1625,6 +1647,9 @@ async def _post_batch(
         client=client,
         fm=target.fm,
     )
+    # Also after a failed POST, so a failing API is not sent a small
+    # batch on every drain.
+    target.upload.last_post_at = monotonic()
     if err is not None:
         await _emit_batch_outcome(
             err, target=target, processor=processor, context=context,
@@ -1740,6 +1765,105 @@ def _start_orphan_resume(
     upload.in_flight_jobs.add(task)
 
 
+async def _count_upload_candidates(
+    target: AssetUploadTarget, want: int,
+) -> int:
+    '''
+    Count the names *target* could upload next, reading listing
+    chunks into the pending queue until at least *want* are found or
+    the listing pass ends. Only names are read, no file contents.
+
+    When the pass ends with fewer than *want* names, the pending names
+    are dropped and the next call starts a fresh pass, so files
+    written in the meantime are counted and no name is queued twice.
+
+    :param target: the upload target
+    :param want: the number of names that makes a full batch
+    :returns: the number of names found, capped near *want*
+    :raises: OSError when the directory cannot be listed
+    '''
+
+    upload: TargetUploadState = target.upload
+    if upload.listing is None:
+        upload.listing = StreamingListing(
+            target.fm.base_dir, chunk_size=LISTING_CHUNK_SIZE,
+        )
+    count: int = sum(
+        1 for name in upload.pending if name not in upload.in_flight_files
+    )
+    while count < want and not upload.pass_ended:
+        chunk: list[str]
+        ended: bool
+        chunk, ended = await upload.listing.next_chunk()
+        names: list[str] = [
+            name for name in chunk
+            if _is_target_upload_file(name, target.descriptor)
+        ]
+        upload.pending.extend(names)
+        count += sum(
+            1 for name in names if name not in upload.in_flight_files
+        )
+        upload.pass_ended = ended
+    if count < want and upload.pass_ended:
+        upload.pending.clear()
+        upload.pass_ended = False
+    return count
+
+
+async def _hold_partial_batch(
+    settings: ScrapeUploadSettings, target: AssetUploadTarget,
+) -> bool:
+    '''
+    True when *target* must not POST now: its last POST was less than
+    ``partial_batch_interval_seconds`` ago and fewer than
+    ``bulk_batch_size`` files are waiting. Sets
+    ``upload.partial_deferred`` while files wait.
+
+    :param settings: scrape-upload settings
+    :param target: the upload target
+    :returns: whether to skip this target for now
+    :raises: OSError when the directory cannot be listed
+    '''
+
+    upload: TargetUploadState = target.upload
+    interval: float = settings.partial_batch_interval_seconds
+    if (
+        interval <= 0
+        or upload.last_post_at is None
+        or monotonic() - upload.last_post_at >= interval
+    ):
+        upload.partial_deferred = False
+        return False
+    want: int = max(settings.bulk_batch_size, 1)
+    waiting: int = await _count_upload_candidates(target, want)
+    if waiting >= want:
+        upload.partial_deferred = False
+        return False
+    upload.partial_deferred = waiting > 0
+    return True
+
+
+def partial_batch_due(
+    settings: ScrapeUploadSettings, targets: list[AssetUploadTarget],
+) -> bool:
+    '''True when a target holds back a partial batch whose
+    ``partial_batch_interval_seconds`` has passed, so a drain should
+    run even though no file changed.'''
+
+    now: float = monotonic()
+    target: AssetUploadTarget
+    for target in targets:
+        upload: TargetUploadState = target.upload
+        if (
+            upload.partial_deferred
+            and upload.last_post_at is not None
+            and now - upload.last_post_at
+            >= settings.partial_batch_interval_seconds
+        ):
+            return True
+    return False
+
+
 async def drain_bulk_target_once(
     *,
     settings: ScrapeUploadSettings,
@@ -1749,9 +1873,10 @@ async def drain_bulk_target_once(
     '''Prepare and POST at most one batch for *target* without waiting
     for the server to finish it. Returns the number of records POSTed;
     0 when in-flight plus orphaned jobs already reach
-    ``max_active_bulk_jobs``, the POST failed or the listing pass ended
-    without eligible files. Orphaned jobs at the cap with nothing in
-    flight start one background resume.'''
+    ``max_active_bulk_jobs``, a partial batch is held back (see
+    :func:`_hold_partial_batch`), the POST failed or the listing pass
+    ended without eligible files. Orphaned jobs at the cap with nothing
+    in flight start one background resume.'''
     upload: TargetUploadState = target.upload
     if upload.resume_task is not None:
         return 0
@@ -1767,6 +1892,8 @@ async def drain_bulk_target_once(
                 settings=settings, target=target, client=client,
                 orphans=orphans,
             )
+        return 0
+    if await _hold_partial_batch(settings, target):
         return 0
     processor: AssetProcessor
     processor, _context = _processing(settings, target, client)
@@ -2273,9 +2400,14 @@ async def watch_target(
         recursive=False,
         yield_on_timeout=True,
     ):
-        if not changes:
+        # With no file changes the watcher still wakes every few
+        # seconds; drain then only to send a held-back partial batch
+        # that is due.
+        if not changes and not partial_batch_due(settings, targets):
             continue
         async with drain_lock:
+            if not changes and not partial_batch_due(settings, targets):
+                continue
             await drain_targets_round_robin(
                 settings=settings,
                 targets=targets,
