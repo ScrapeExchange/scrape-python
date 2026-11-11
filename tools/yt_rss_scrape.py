@@ -130,6 +130,9 @@ from scrape_exchange.video_scrape_queue import (
     VideoScrapeQueue,
     VideoScrapeQueueSettings,
 )
+from scrape_exchange.youtube.exchange_video_exists import (
+    exchange_video_exists,
+)
 from scrape_exchange.youtube.uploaded_video_ids import UploadedVideoIds
 from scrape_exchange.youtube.channel_video_refresh import (
     VIDEOS_SKIPPED_MIN_SUBSCRIBERS,
@@ -1067,24 +1070,14 @@ async def check_video_exists(
     :raises: RuntimeError on unexpected API response status codes.
     '''
 
-    url: str = (
-        f'{settings.exchange_url}{ExchangeClient.POST_DATA_API}'
-        f'/content/youtube/video/{video_id}'
-    )
     if gate is None:
-        response: Response = await client.get(url)
-    else:
-        async with gate:
-            response = await client.get(url)
-
-    if response.status_code == 200:
-        return True
-    if response.status_code == 404:
-        return False
-    raise RuntimeError(
-        f'Unexpected status {response.status_code} checking video '
-        f'{video_id}: {response.text}'
-    )
+        return await exchange_video_exists(
+            client, settings.exchange_url, video_id,
+        )
+    async with gate:
+        return await exchange_video_exists(
+            client, settings.exchange_url, video_id,
+        )
 
 
 MSG_PROCESSED_VIDEOS: str = 'Processed videos for channel'

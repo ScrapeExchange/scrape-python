@@ -321,6 +321,29 @@ class VideoScrapeQueueSettings(BaseSettings):
             'of Redis.'
         ),
     )
+    backlog_uploaded_api_fallback: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            'BACKLOG_UPLOADED_API_FALLBACK',
+            'backlog_uploaded_api_fallback',
+        ),
+        description=(
+            'Ask scrape.exchange about upload state the backlog '
+            'server cannot answer. On during the migration only; '
+            'see the 2026-11-11 backlog uploaded-state design, 5.4.'
+        ),
+    )
+    exchange_existence_concurrency: int = Field(
+        default=64,
+        validation_alias=AliasChoices(
+            'EXCHANGE_EXISTENCE_CONCURRENCY',
+            'exchange_existence_concurrency',
+        ),
+        description=(
+            'Maximum concurrent video-existence GETs one migration '
+            'fallback call makes.'
+        ),
+    )
 
 
 class VideoScrapeQueue(ABC):

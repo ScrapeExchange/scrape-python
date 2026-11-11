@@ -13,8 +13,10 @@ from typing import Any
 import redis.asyncio as aioredis
 
 from scrape_exchange.backlog_server_queue import (
+    DEFAULT_EXCHANGE_URL,
     BacklogServerVideoScrapeQueue,
 )
+from scrape_exchange.exchange_client import ExchangeClient
 from scrape_exchange.redis_client import backlog_redis_from_url
 from scrape_exchange.video_scrape_queue import (
     RedisVideoScrapeQueue,
@@ -69,6 +71,8 @@ def make_video_scrape_queue(
     redis: aioredis.Redis,
     settings: VideoScrapeQueueSettings,
     component: str,
+    exchange_client: ExchangeClient | None = None,
+    exchange_url: str = DEFAULT_EXCHANGE_URL,
 ) -> VideoScrapeQueue:
     '''Build the video scrape queue for *platform*.
 
@@ -76,6 +80,10 @@ def make_video_scrape_queue(
     :param settings: queue settings; ``backlog_server_dsn`` selects
         backlog-server for the platforms in ``BACKLOG_QUEUE_NAMES``
     :param component: client name for the backlog-server connection
+    :param exchange_client: authenticated API client the backlog queue
+        uses for the migration fallback (see ``BACKLOG_UPLOADED_API_
+        FALLBACK``); ignored by the Redis backend
+    :param exchange_url: scrape.exchange base URL for that fallback
     '''
     queue_name: str | None = BACKLOG_QUEUE_NAMES.get(platform)
     if queue_name is not None and settings.backlog_server_dsn:
@@ -85,6 +93,8 @@ def make_video_scrape_queue(
         return BacklogServerVideoScrapeQueue(
             server, settings, queue_name=queue_name,
             supports_uploaded=(platform == 'youtube'),
+            exchange_client=exchange_client,
+            exchange_url=exchange_url,
         )
     return RedisVideoScrapeQueue(
         redis, settings, platform=platform,

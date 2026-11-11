@@ -12,12 +12,17 @@ Popped IDs are leased; ``complete`` or ``mark`` resolves the lease and
 ``bump_attempts`` extends it while the scraper retries.
 '''
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
 import redis.asyncio as aioredis
 
+from scrape_exchange.exchange_client import ExchangeClient
+from scrape_exchange.scraper_metrics import (
+    METRIC_BACKLOG_UPLOADED_API_FALLBACK,
+)
 from scrape_exchange.video_scrape_queue import (
     ENQUEUE_MANY_CHUNK_SIZE,
     VideoQueueChannelContext,
@@ -26,10 +31,14 @@ from scrape_exchange.video_scrape_queue import (
     VideoScrapeQueueSettings,
     VideoState,
 )
+from scrape_exchange.youtube.exchange_video_exists import (
+    exchange_video_exists,
+)
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 DEFAULT_QUEUE_NAME: str = 'youtube:video'
+DEFAULT_EXCHANGE_URL: str = 'https://scrape.exchange'
 
 # Reason codes the server stores; anything else is stored as 'other'.
 REASON_CODES: frozenset[str] = frozenset({
@@ -107,11 +116,16 @@ class BacklogServerVideoScrapeQueue(VideoScrapeQueue):
         queue_name: str = DEFAULT_QUEUE_NAME,
         *,
         supports_uploaded: bool = False,
+        exchange_client: ExchangeClient | None = None,
+        exchange_url: str = DEFAULT_EXCHANGE_URL,
     ) -> None:
         self._redis: aioredis.Redis = redis
         self._settings: VideoScrapeQueueSettings = settings
         self._queue: str = queue_name
         self.supports_uploaded: bool = supports_uploaded
+        self._exchange_client: ExchangeClient | None = exchange_client
+        self._exchange_url: str = exchange_url
+        self._fallback_logged: bool = False
         # IDs handed out by pop_entries with the force flag set; read
         # once by consume_force.
         self._forced: set[str] = set()
@@ -345,17 +359,32 @@ class BacklogServerVideoScrapeQueue(VideoScrapeQueue):
     async def uploaded_many(
         self, video_ids: list[str], *, api_fallback: bool = True,
     ) -> dict[str, bool]:
-        '''True for IDs the server holds as ``uploaded``.'''
-        del api_fallback
+        '''True for IDs the server holds as ``uploaded``.
+
+        With the migration fallback on, every ID the server does not
+        hold as ``uploaded`` is asked about on scrape.exchange:
+        ``scraped`` is ambiguous until the backfill, because it means
+        "on the exchange" for the original import and "waiting for
+        upload" for a video scraped since.
+        '''
         if not self.supports_uploaded:
             return {video_id: False for video_id in video_ids}
         names: dict[str, str | None] = await self.get_state_names(
             list(video_ids),
         )
-        return {
+        out: dict[str, bool] = {
             video_id: names.get(video_id) == 'uploaded'
             for video_id in video_ids
         }
+        if not (api_fallback and self._fallback_on()):
+            return out
+        ask: list[str] = [
+            video_id for video_id in video_ids if not out.get(video_id)
+        ]
+        if not ask:
+            return out
+        out.update(await self._ask_api(ask))
+        return out
 
     async def done_many(
         self, video_ids: list[str], *, api_fallback: bool = True,
@@ -364,18 +393,94 @@ class BacklogServerVideoScrapeQueue(VideoScrapeQueue):
 
         ``scraped`` is done even before its file is uploaded: it must
         not be scraped again, and the uploader reads ``uploaded``
-        itself.
+        itself. With the migration fallback on, only IDs the server
+        does not know are asked about: every known ID is already
+        answered correctly, and the original import never queued an
+        ID that was on scrape.exchange.
         '''
-        del api_fallback
         if not self.supports_uploaded:
             return {video_id: False for video_id in video_ids}
         names: dict[str, str | None] = await self.get_state_names(
             list(video_ids),
         )
-        return {
+        out: dict[str, bool] = {
             video_id: names.get(video_id) in _DONE_STATES
             for video_id in video_ids
         }
+        if not (api_fallback and self._fallback_on()):
+            return out
+        unknown: list[str] = [
+            video_id for video_id in video_ids
+            if names.get(video_id) is None
+        ]
+        if not unknown:
+            return out
+        out.update(await self._ask_api(unknown))
+        return out
+
+    def _fallback_on(self) -> bool:
+        '''Whether the migration fallback may ask the API at all.'''
+        if not self._settings.backlog_uploaded_api_fallback:
+            return False
+        if self._exchange_client is not None:
+            return True
+        if not self._fallback_logged:
+            _LOGGER.warning(
+                'BACKLOG_UPLOADED_API_FALLBACK is on but the queue '
+                'has no ExchangeClient; skipping the API fallback',
+            )
+            self._fallback_logged = True
+        return False
+
+    async def _ask_api(self, video_ids: list[str]) -> dict[str, bool]:
+        '''Ask scrape.exchange about *video_ids*.
+
+        Answers are bounded by ``exchange_existence_concurrency``;
+        confirmed IDs are marked ``uploaded``, so each one costs at
+        most one lookup during the migration. An error answers False:
+        the cost is a duplicate upload, which the bulk API reports as
+        a duplicate.
+        '''
+        client: ExchangeClient | None = self._exchange_client
+        if client is None:
+            return {}
+        gate: asyncio.Semaphore = asyncio.Semaphore(
+            max(1, self._settings.exchange_existence_concurrency),
+        )
+
+        async def one(video_id: str) -> tuple[str, bool | None]:
+            try:
+                async with gate:
+                    exists: bool = await exchange_video_exists(
+                        client, self._exchange_url, video_id,
+                    )
+            # Fail open: an error answers "not uploaded", which
+            # costs a duplicate upload at worst (design 5.4).
+            except Exception:  # noqa: BLE001
+                METRIC_BACKLOG_UPLOADED_API_FALLBACK.labels(
+                    outcome='error',
+                ).inc()
+                return (video_id, None)
+            return (video_id, exists)
+
+        answers: list[tuple[str, bool | None]] = list(
+            await asyncio.gather(*(one(video_id) for video_id in video_ids)),
+        )
+        out: dict[str, bool] = {}
+        confirmed: list[str] = []
+        for video_id, exists in answers:
+            if exists is None:
+                out[video_id] = False
+                continue
+            out[video_id] = exists
+            METRIC_BACKLOG_UPLOADED_API_FALLBACK.labels(
+                outcome='uploaded' if exists else 'not_uploaded',
+            ).inc()
+            if exists:
+                confirmed.append(video_id)
+        if confirmed:
+            await self.mark_uploaded(confirmed)
+        return out
 
     async def get_meta(
         self, video_id: str,
