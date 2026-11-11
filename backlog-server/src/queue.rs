@@ -58,7 +58,7 @@ pub struct PopItem {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct QueueInfo {
-    pub counts: [u64; 5],
+    pub counts: [u64; 6],
     pub leased: u64,
     pub lane_main: u64,
     pub lane_priority: u64,
@@ -659,7 +659,7 @@ mod tests {
         assert!(!q.add(1, 0).unwrap());
         q.mark(1, State::Failed, Reason::Other, 0).unwrap();
         assert!(!q.add(1, 0).unwrap());
-        assert_eq!(q.info().counts, [0, 0, 1, 0, 0]);
+        assert_eq!(q.info().counts, [0, 0, 1, 0, 0, 0]);
     }
 
     #[test]
@@ -835,7 +835,7 @@ mod tests {
         q.wal_mut().fail_next_write();
         assert!(q.add(2, 0).is_err());
         assert_eq!(q.state(2), None);
-        assert_eq!(q.info().counts, [1, 0, 0, 0, 0]);
+        assert_eq!(q.info().counts, [1, 0, 0, 0, 0, 0]);
         // The lane entry written before the failed log write is stale
         // and harmless: 2 is still unknown and pops exactly once.
         assert_eq!(q.info().lane_main, 2);
@@ -950,7 +950,7 @@ mod tests {
         }
         let q: Queue = q(&d);
         assert_eq!(q.info().counts, before.counts);
-        assert_eq!(q.info().counts, [60, 30, 0, 10, 0]);
+        assert_eq!(q.info().counts, [60, 30, 0, 10, 0, 0]);
     }
 
     fn copy_tree(src: &Path, dst: &Path) {

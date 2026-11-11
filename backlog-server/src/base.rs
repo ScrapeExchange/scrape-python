@@ -39,7 +39,7 @@ pub struct BaseInfo {
     pub generation: u64,
     pub count: u64,
     pub wal_cut: u64,
-    pub state_counts: [u64; 5],
+    pub state_counts: [u64; 6],
 }
 
 /// Streams a new generation to temp files; `finish` publishes it.
@@ -520,7 +520,7 @@ pub(crate) mod tests {
         let ids: BTreeMap<u64, Meta> =
             (0..50u64).map(|id| (id, meta_for(id))).collect();
         let info: BaseInfo = build(d.path(), 3, &ids);
-        assert_eq!(info.state_counts, [10, 10, 10, 10, 10]);
+        assert_eq!(info.state_counts, [10, 10, 10, 10, 10, 0]);
         assert_eq!((info.generation, info.count, info.wal_cut), (3, 50, 11));
         let b: Base = Base::open(d.path(), 3).unwrap();
         assert_eq!(*b.info(), info);

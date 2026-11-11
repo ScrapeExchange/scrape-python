@@ -483,7 +483,7 @@ mod tests {
                 ]),
                 Request::Complete(ids) => Reply::Count(ids.len() as u64),
                 Request::Info => Reply::Info(QueueInfo {
-                    counts: [1, 2, 3, 4, 5],
+                    counts: [1, 2, 3, 4, 5, 6],
                     ..QueueInfo::default()
                 }),
                 _ => Reply::Ok,
@@ -727,7 +727,7 @@ mod tests {
                 Value::Int(2)
             ]
         );
-        assert_eq!(v.len(), 22);
+        assert_eq!(v.len(), 24);
     }
 
     #[tokio::test]

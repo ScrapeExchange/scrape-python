@@ -10,15 +10,18 @@ pub enum State {
     Failed = 2,
     Unavailable = 3,
     Removed = 4,
+    /// Accepted by the bulk upload API: on scrape.exchange.
+    Uploaded = 5,
 }
 
 /// Every state, indexed by its discriminant.
-pub const ALL_STATES: [State; 5] = [
+pub const ALL_STATES: [State; 6] = [
     State::Queued,
     State::Scraped,
     State::Failed,
     State::Unavailable,
     State::Removed,
+    State::Uploaded,
 ];
 
 impl State {
@@ -29,6 +32,7 @@ impl State {
             State::Failed => "failed",
             State::Unavailable => "unavailable",
             State::Removed => "removed",
+            State::Uploaded => "uploaded",
         }
     }
 
@@ -41,9 +45,16 @@ impl State {
     }
 
     fn from_bits(b: u8) -> State {
-        // Bits 0-2 only ever hold values written by Meta::new; 5-7 can
-        // only come from corruption, which file checksums catch.
-        ALL_STATES[usize::from(b).min(4)]
+        // Bits 0-2 only ever hold values written by Meta::new; 6 and 7
+        // can only come from corruption, which file checksums catch.
+        match b {
+            0 => State::Queued,
+            1 => State::Scraped,
+            2 => State::Failed,
+            3 => State::Unavailable,
+            5 => State::Uploaded,
+            _ => State::Removed,
+        }
     }
 }
 
@@ -166,6 +177,20 @@ mod tests {
     }
 
     #[test]
+    fn uploaded_round_trips_and_is_not_terminal() {
+        assert_eq!(State::parse("uploaded"), Some(State::Uploaded));
+        assert_eq!(State::Uploaded.name(), "uploaded");
+        assert!(!State::Uploaded.is_terminal());
+    }
+
+    #[test]
+    fn from_bits_maps_corrupt_values_to_removed() {
+        assert_eq!(State::from_bits(5), State::Uploaded);
+        assert_eq!(State::from_bits(6), State::Removed);
+        assert_eq!(State::from_bits(7), State::Removed);
+    }
+
+    #[test]
     fn state_names() {
         for s in [
             State::Queued,
@@ -173,6 +198,7 @@ mod tests {
             State::Failed,
             State::Unavailable,
             State::Removed,
+            State::Uploaded,
         ] {
             assert_eq!(State::parse(s.name()), Some(s));
         }

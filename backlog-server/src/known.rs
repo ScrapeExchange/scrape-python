@@ -11,13 +11,13 @@ pub struct KnownSet {
     base: Arc<Base>,
     frozen: Option<Arc<HashMap<u64, Meta>>>,
     active: HashMap<u64, Meta>,
-    counts: [u64; 5],
+    counts: [u64; 6],
     terminal_ts: HashMap<u64, u32>,
 }
 
 impl KnownSet {
     pub fn new(base: Arc<Base>, terminal_ts: HashMap<u64, u32>) -> KnownSet {
-        let counts: [u64; 5] = base.info().state_counts;
+        let counts: [u64; 6] = base.info().state_counts;
         KnownSet {
             base,
             frozen: None,
@@ -52,7 +52,7 @@ impl KnownSet {
         }
     }
 
-    pub fn counts(&self) -> [u64; 5] {
+    pub fn counts(&self) -> [u64; 6] {
         self.counts
     }
 
@@ -99,7 +99,7 @@ impl KnownSet {
     /// Swap in a generation that already contains the frozen delta,
     /// and recount from its header plus the active delta.
     pub fn install_base(&mut self, base: Arc<Base>) {
-        let mut counts: [u64; 5] = base.info().state_counts;
+        let mut counts: [u64; 6] = base.info().state_counts;
         for (id, m) in &self.active {
             if let Some(old) = base.get(*id) {
                 counts[old.state() as usize] -= 1;
@@ -141,8 +141,8 @@ mod tests {
         Arc::new(Base::open(dir, g).unwrap())
     }
 
-    fn recount(k: &KnownSet, ids: &[u64]) -> [u64; 5] {
-        let mut c: [u64; 5] = [0; 5];
+    fn recount(k: &KnownSet, ids: &[u64]) -> [u64; 6] {
+        let mut c: [u64; 6] = [0; 6];
         for id in ids {
             if let Some(meta) = k.get(*id) {
                 c[meta.state() as usize] += 1;
@@ -170,15 +170,24 @@ mod tests {
     }
 
     #[test]
+    fn uploaded_is_counted() {
+        let mut k: KnownSet =
+            KnownSet::new(Arc::new(Base::empty()), HashMap::new());
+        k.put(1, m(State::Uploaded), 0);
+        assert_eq!(k.counts()[5], 1);
+        assert_eq!(k.total(), 1);
+    }
+
+    #[test]
     fn put_updates_counts() {
         let mut k: KnownSet =
             KnownSet::new(Arc::new(Base::empty()), HashMap::new());
         k.put(1, m(State::Queued), 0);
-        assert_eq!(k.counts(), [1, 0, 0, 0, 0]);
+        assert_eq!(k.counts(), [1, 0, 0, 0, 0, 0]);
         k.put(1, m(State::Scraped), 0);
-        assert_eq!(k.counts(), [0, 1, 0, 0, 0]);
+        assert_eq!(k.counts(), [0, 1, 0, 0, 0, 0]);
         k.put(1, m(State::Scraped).with_force(true), 0);
-        assert_eq!(k.counts(), [0, 1, 0, 0, 0]);
+        assert_eq!(k.counts(), [0, 1, 0, 0, 0, 0]);
         assert_eq!(k.total(), 1);
     }
 

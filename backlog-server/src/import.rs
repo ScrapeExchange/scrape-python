@@ -69,6 +69,7 @@ pub struct FinalCounts {
     pub failed: u64,
     pub unavailable: u64,
     pub removed: u64,
+    pub uploaded: u64,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -420,6 +421,7 @@ pub fn run(args: &ImportArgs) -> Result<ImportReport> {
                 State::Failed => f.failed += 1,
                 State::Unavailable => f.unavailable += 1,
                 State::Removed => f.removed += 1,
+                State::Uploaded => f.uploaded += 1,
             }
             if meta.state().is_terminal() {
                 terminal.insert(win.id, win.ts);
@@ -550,6 +552,7 @@ mod tests {
         assert_eq!(r.final_counts.queued, 1);
         assert_eq!(r.final_counts.scraped, 1);
         assert_eq!(r.final_counts.unavailable, 1);
+        assert_eq!(r.final_counts.uploaded, 0);
         assert_eq!(r.lane_main, 1);
         let mut q: Queue =
             Queue::open(&data.join("youtube_video"), params()).unwrap();
@@ -640,7 +643,7 @@ mod tests {
         q.write_checkpoint().unwrap();
         drop(q);
         let q: Queue = Queue::open(&qdir, params()).unwrap();
-        assert_eq!(q.info().counts, [2, 1, 0, 0, 0]);
+        assert_eq!(q.info().counts, [2, 1, 0, 0, 0, 0]);
     }
 
     #[test]
