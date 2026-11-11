@@ -82,6 +82,8 @@ def _settings(**overrides: object) -> SimpleNamespace:
         'bulk_batch_size': 1000,
         'bulk_max_batch_bytes': 1024 * 1024,
         'max_active_bulk_jobs': 2,
+        # Send partial batches at once unless a test sets it.
+        'partial_batch_interval_seconds': 0.0,
         'bulk_orphan_max_age_hours': 3.0,
         'scrape_upload_concurrency': 2,
         'memory_profile_interval_seconds': 0,
@@ -2044,3 +2046,179 @@ class RejectedPurgeTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestPartialBatchInterval(unittest.IsolatedAsyncioTestCase):
+    '''Partial bulk batches wait partial_batch_interval_seconds after
+    the previous POST of the same target; full batches do not.'''
+
+    async def _write(
+        self, fm: AssetFileManagement, *ids: str,
+    ) -> None:
+        for asset_id in ids:
+            await fm.write_file(
+                f'asset-{asset_id}.json.br',
+                {'id': asset_id, 'url': f'https://scrape.exchange/{asset_id}'},
+            )
+
+    def _target(
+        self, fm: AssetFileManagement,
+    ) -> scrape_upload.AssetUploadTarget:
+        return scrape_upload.AssetUploadTarget(
+            descriptor=_descriptor(), fm=fm, validator=_validator(),
+        )
+
+    async def _drain(
+        self, settings: SimpleNamespace,
+        target: scrape_upload.AssetUploadTarget,
+    ) -> int:
+        posted: int = await scrape_upload.drain_bulk_target_once(
+            settings=settings, target=target, client=object(),
+        )
+        await asyncio.gather(*target.upload.in_flight_jobs)
+        return posted
+
+    async def test_first_partial_batch_is_not_held(self) -> None:
+        fake: FakeBulkExchange = FakeBulkExchange()
+        with tempfile.TemporaryDirectory() as tmp, fake.patched():
+            fm = AssetFileManagement(
+                tmp, prefix_rankings=_descriptor().prefix_rankings,
+            )
+            await self._write(fm, 'a')
+            target = self._target(fm)
+            settings = _settings(
+                bulk_batch_size=3, partial_batch_interval_seconds=300.0,
+            )
+            self.assertEqual(await self._drain(settings, target), 1)
+        self.assertEqual(len(fake.posts), 1)
+
+    async def test_partial_batch_waits_for_interval(self) -> None:
+        fake: FakeBulkExchange = FakeBulkExchange()
+        now: list[float] = [1000.0]
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            fake.patched(),
+            patch.object(scrape_upload, 'monotonic', lambda: now[0]),
+        ):
+            fm = AssetFileManagement(
+                tmp, prefix_rankings=_descriptor().prefix_rankings,
+            )
+            target = self._target(fm)
+            settings = _settings(
+                bulk_batch_size=3, partial_batch_interval_seconds=300.0,
+            )
+            await self._write(fm, 'a')
+            self.assertEqual(await self._drain(settings, target), 1)
+
+            await self._write(fm, 'b', 'c')
+            now[0] += 60
+            self.assertEqual(await self._drain(settings, target), 0)
+            self.assertTrue(target.upload.partial_deferred)
+            self.assertFalse(
+                scrape_upload.partial_batch_due(settings, [target]),
+            )
+
+            now[0] += 240
+            self.assertTrue(
+                scrape_upload.partial_batch_due(settings, [target]),
+            )
+            self.assertEqual(await self._drain(settings, target), 2)
+            self.assertFalse(target.upload.partial_deferred)
+        self.assertEqual(len(fake.posts), 2)
+
+    async def test_full_batch_is_sent_right_away(self) -> None:
+        fake: FakeBulkExchange = FakeBulkExchange()
+        now: list[float] = [1000.0]
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            fake.patched(),
+            patch.object(scrape_upload, 'monotonic', lambda: now[0]),
+        ):
+            fm = AssetFileManagement(
+                tmp, prefix_rankings=_descriptor().prefix_rankings,
+            )
+            target = self._target(fm)
+            settings = _settings(
+                bulk_batch_size=2, partial_batch_interval_seconds=300.0,
+            )
+            await self._write(fm, 'a')
+            self.assertEqual(await self._drain(settings, target), 1)
+            # One file: held back.
+            await self._write(fm, 'b')
+            now[0] += 1
+            self.assertEqual(await self._drain(settings, target), 0)
+            # A second file makes a full batch: sent without waiting.
+            await self._write(fm, 'c')
+            now[0] += 1
+            self.assertEqual(await self._drain(settings, target), 2)
+        self.assertEqual(len(fake.posts), 2)
+
+    async def test_held_files_are_not_queued_twice(self) -> None:
+        fake: FakeBulkExchange = FakeBulkExchange()
+        now: list[float] = [1000.0]
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            fake.patched(),
+            patch.object(scrape_upload, 'monotonic', lambda: now[0]),
+        ):
+            fm = AssetFileManagement(
+                tmp, prefix_rankings=_descriptor().prefix_rankings,
+            )
+            target = self._target(fm)
+            settings = _settings(
+                bulk_batch_size=10, partial_batch_interval_seconds=300.0,
+            )
+            await self._write(fm, 'a')
+            await self._drain(settings, target)
+            await self._write(fm, 'b', 'c')
+            for _ in range(5):
+                now[0] += 10
+                self.assertEqual(await self._drain(settings, target), 0)
+            now[0] += 300
+            self.assertEqual(await self._drain(settings, target), 2)
+        records: list[str] = [
+            name for _c, _b, recs in fake.posts[1:] for _id, name in recs
+        ]
+        self.assertEqual(len(records), len(set(records)))
+
+    async def test_zero_interval_sends_partial_batches(self) -> None:
+        fake: FakeBulkExchange = FakeBulkExchange()
+        with tempfile.TemporaryDirectory() as tmp, fake.patched():
+            fm = AssetFileManagement(
+                tmp, prefix_rankings=_descriptor().prefix_rankings,
+            )
+            target = self._target(fm)
+            settings = _settings(
+                bulk_batch_size=10, partial_batch_interval_seconds=0.0,
+            )
+            await self._write(fm, 'a')
+            self.assertEqual(await self._drain(settings, target), 1)
+            await self._write(fm, 'b')
+            self.assertEqual(await self._drain(settings, target), 1)
+        self.assertEqual(len(fake.posts), 2)
+
+    async def test_failed_post_also_starts_interval(self) -> None:
+        fake: FakeBulkExchange = FakeBulkExchange()
+        fake.post_outcome = BulkBatchOutcome(
+            status='post_rejected', job_id=None,
+            success=0, failed=0, missing=0,
+        )
+        now: list[float] = [1000.0]
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            fake.patched(),
+            patch.object(scrape_upload, 'monotonic', lambda: now[0]),
+        ):
+            fm = AssetFileManagement(
+                tmp, prefix_rankings=_descriptor().prefix_rankings,
+            )
+            target = self._target(fm)
+            settings = _settings(
+                bulk_batch_size=10, partial_batch_interval_seconds=300.0,
+            )
+            await self._write(fm, 'a')
+            await self._drain(settings, target)
+            self.assertEqual(target.upload.last_post_at, 1000.0)
+            now[0] += 10
+            self.assertEqual(await self._drain(settings, target), 0)
+        self.assertEqual(len(fake.posts), 1)
