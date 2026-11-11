@@ -26,6 +26,7 @@ import websockets.frames
 from prometheus_client import REGISTRY
 
 from scrape_exchange.file_management import AssetFileManagement
+from scrape_exchange import bulk_upload
 from scrape_exchange.bulk_upload import (
     BULK_STATE_DIR_NAME,
     _poll_status_until_terminal,
@@ -878,6 +879,53 @@ class RejectedRecordsTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(list(self.fm.rejected_dir.iterdir()), [])
         self.assertTrue((Path(self.base) / self.names[0]).exists())
+
+
+class TestFinalizeDuplicate(unittest.IsolatedAsyncioTestCase):
+    '''The completed outcome carries the batch's duplicate count, so
+    the uploader can publish it (design 5.2).'''
+
+    async def test_completed_outcome_carries_duplicate(self) -> None:
+        results: BulkResults = BulkResults(
+            total=2, succeeded=1, failed=0, duplicate=1, failures=[],
+        )
+        with (
+            patch.object(
+                bulk_upload, 'stream_bulk_job_progress',
+                AsyncMock(return_value=True),
+            ),
+            patch.object(
+                bulk_upload, 'fetch_settled_bulk_results',
+                AsyncMock(return_value=results),
+            ),
+            patch.object(
+                bulk_upload, 'apply_bulk_results',
+                AsyncMock(return_value=(2, 0, 0, {'a', 'b'})),
+            ),
+            patch.object(bulk_upload, 'delete_bulk_state', AsyncMock()),
+        ):
+            outcome: bulk_upload.BulkBatchOutcome = (
+                await bulk_upload.finalize_bulk_batch(
+                    'job',
+                    'batch',
+                    [('a', 'a.json.br'), ('b', 'b.json.br')],
+                    exchange_url='http://localhost:6390',
+                    client=MagicMock(),
+                    fm=MagicMock(),
+                    progress_timeout_seconds=0.0,
+                )
+            )
+        self.assertEqual(outcome.status, 'completed')
+        self.assertEqual(outcome.duplicate, 1)
+
+    async def test_progress_failure_has_no_duplicate(self) -> None:
+        outcome: bulk_upload.BulkBatchOutcome = (
+            bulk_upload.BulkBatchOutcome(
+                status='progress_failed', job_id='j',
+                success=0, failed=0, missing=0,
+            )
+        )
+        self.assertEqual(outcome.duplicate, 0)
 
 
 if __name__ == '__main__':

@@ -469,6 +469,7 @@ class BulkBatchOutcome:
     failed: int
     missing: int
     success_ids: set[str] = field(default_factory=set)
+    duplicate: int = 0
 
 
 @dataclass
@@ -1407,6 +1408,7 @@ async def finalize_bulk_batch(
         status='completed', job_id=job_id,
         success=success, failed=failed, missing=missing,
         success_ids=success_ids,
+        duplicate=0 if results is None else results.duplicate,
     )
 
 
