@@ -948,7 +948,7 @@ async def _fetch_page_with_retry(
                 ).inc()
             if isinstance(exc, _PROXY_CONNECTION_ERRORS):
                 await YouTubeRateLimiter.get().report_proxy_result(
-                    active_proxy, False,
+                    active_proxy, False, exc,
                 )
             replaced_proxy: bool = (
                 isinstance(exc, _PROXY_CONNECTION_ERRORS)

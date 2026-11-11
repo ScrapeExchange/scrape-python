@@ -224,7 +224,7 @@ async def _resolver_innertube_call(
             proxy, challenged=client,
         )
         if not isinstance(exc, httpx.ReadTimeout):
-            await limiter.report_proxy_result(proxy, False)
+            await limiter.report_proxy_result(proxy, False, exc)
         raise
     finally:
         await release_pooled_innertube(client)

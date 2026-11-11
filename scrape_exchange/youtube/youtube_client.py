@@ -34,6 +34,7 @@ from scrape_exchange.http_timeouts import (
     HTTP_REQUEST_TIMEOUT,
 )
 from scrape_exchange.proxy_loader import proxy_file_label
+from scrape_exchange.proxy_health import is_proxy_auth_error
 from scrape_exchange.util import (
     extract_proxy_ip,
     extract_proxy_port,
@@ -376,7 +377,7 @@ class AsyncYouTubeClient(AsyncClient):
             duration = time.monotonic() - start
             if not isinstance(exc, ReadTimeout):
                 await YouTubeRateLimiter.get().report_proxy_result(
-                    self.proxy, False,
+                    self.proxy, False, exc,
                 )
             METRIC_YT_REQUEST_DURATION.labels(
                 platform='youtube',
@@ -404,6 +405,10 @@ class AsyncYouTubeClient(AsyncClient):
             raise RuntimeError(f'Timeout fetching URL {url}') from exc
         except RequestError as exc:
             duration = time.monotonic() - start
+            if is_proxy_auth_error(exc):
+                await YouTubeRateLimiter.get().report_proxy_result(
+                    self.proxy, False, exc,
+                )
             METRIC_YT_REQUEST_DURATION.labels(
                 platform='youtube',
                 scraper=_get_scraper(),
@@ -420,6 +425,10 @@ class AsyncYouTubeClient(AsyncClient):
             raise
         except Exception as exc:
             duration = time.monotonic() - start
+            if is_proxy_auth_error(exc):
+                await YouTubeRateLimiter.get().report_proxy_result(
+                    self.proxy, False, exc,
+                )
             METRIC_YT_REQUEST_DURATION.labels(
                 platform='youtube',
                 scraper=_get_scraper(),

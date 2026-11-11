@@ -324,8 +324,6 @@ def _export_child_settings(settings: TwitchScraperSettings) -> None:
         os.environ[key] = (
             str(value).lower() if isinstance(value, bool) else str(value)
         )
-    # Parent already resolved proxy files. Children must use their slices.
-    os.environ['PROXY_FILES'] = ''
 
 
 def main() -> None:

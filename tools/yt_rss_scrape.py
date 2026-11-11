@@ -476,6 +476,16 @@ class RssSettings(YouTubeScraperSettings):
         ),
     )
 
+    def proxy_file_paths(self) -> list[Path]:
+        '''``RSS_PROXY_FILES`` when set, else ``PROXY_FILES``.'''
+        if not self.rss_proxy_files:
+            return super().proxy_file_paths()
+        return [
+            Path(p.strip())
+            for p in self.rss_proxy_files.split(',')
+            if p.strip()
+        ]
+
     @model_validator(mode='after')
     def _apply_rss_proxy_files_override(
         self,
@@ -873,12 +883,12 @@ async def fetch_rss(
                         ),
                     },
                 )
-            except _POOL_RETIRING_ERRORS:
+            except _POOL_RETIRING_ERRORS as exc:
                 # A failed proxy tunnel can stay in the pool; once
                 # enough pile up every fetch raises PoolTimeout.
                 await retire_pooled_httpx_client(proxy, expected=http)
                 await YouTubeRateLimiter.get().report_proxy_result(
-                    proxy, False,
+                    proxy, False, exc,
                 )
                 raise
             finally:

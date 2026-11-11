@@ -17,6 +17,11 @@ Health is tracked per proxy from reported outcomes: a transport-level
 failure raises an exponentially weighted failure rate; three failures
 in a row, or a failure rate above FAIL_EWMA_THRESHOLD, puts the proxy
 in cooldown for 30 s, doubling per consecutive opening up to 10 min.
+A proxy that answers with 407 Proxy Authentication Required is put in
+cooldown for AUTH_COOLDOWN_SECONDS (6 h) straight away: the proxy
+provider no longer accepts us on it, which retries will not fix. Such
+a cooldown is flagged so :meth:`ProxyHealth.clear_auth_cooldowns` can
+lift it when the proxy files are edited.
 With Redis the state is shared by every process and scraper on every
 host (a ``proxy_health:<hash>`` hash per proxy, updated atomically by a
 Lua script) and each process refreshes its snapshot every few seconds;
@@ -52,6 +57,8 @@ FAIL_THRESHOLD_CONSECUTIVE: int = 3
 FAIL_EWMA_THRESHOLD: float = 0.5
 BASE_COOLDOWN_SECONDS: float = 30.0
 MAX_COOLDOWN_SECONDS: float = 600.0
+# Cooldown after a 407 Proxy Authentication Required response.
+AUTH_COOLDOWN_SECONDS: float = 6 * 3600.0
 # How often a process refreshes its view of fleet-wide health.
 REFRESH_INTERVAL_SECONDS: float = 5.0
 # Half-life of the per-process recent-selection load counter.
@@ -69,8 +76,9 @@ METRIC_PROXY_SELECTED: Counter = Counter(
 )
 METRIC_PROXY_COOLDOWNS: Counter = Counter(
     'proxy_health_cooldowns_total',
-    'Times a proxy was put in cooldown after transport failures.',
-    ['platform', 'proxy', 'worker_id'],
+    'Times a proxy was put in cooldown, by reason: "failures" for '
+    'transport failures, "proxy_auth" for a 407 from the proxy.',
+    ['platform', 'proxy', 'worker_id', 'reason'],
 )
 METRIC_PROXY_FAIL_EWMA: Gauge = Gauge(
     'proxy_health_fail_ewma',
@@ -85,8 +93,8 @@ METRIC_PROXY_IN_COOLDOWN: Gauge = Gauge(
 )
 
 # KEYS[1] = health hash. ARGV: ok, now, alpha, consecutive threshold,
-# ewma threshold, base cooldown, max cooldown, key ttl.
-# Mirrors apply_outcome().
+# ewma threshold, base cooldown, max cooldown, key ttl, auth failure,
+# auth cooldown. Mirrors apply_outcome().
 _REPORT_LUA: str = '''
 local key = KEYS[1]
 local ok = tonumber(ARGV[1])
@@ -96,21 +104,36 @@ local threshold = tonumber(ARGV[4])
 local ewma_threshold = tonumber(ARGV[5])
 local base = tonumber(ARGV[6])
 local max_cooldown = tonumber(ARGV[7])
+local auth = tonumber(ARGV[9]) or 0
+local auth_cooldown = tonumber(ARGV[10]) or 0
 local v = redis.call(
     'HMGET', key,
-    'fail_ewma', 'consecutive_failures', 'open_count', 'cooldown_until'
+    'fail_ewma', 'consecutive_failures', 'open_count', 'cooldown_until',
+    'auth_failed'
 )
 local ewma = tonumber(v[1]) or 0
 local consecutive = tonumber(v[2]) or 0
 local opens = tonumber(v[3]) or 0
 local cooldown_until = tonumber(v[4]) or 0
+local auth_failed = tonumber(v[5]) or 0
 local opened = 0
 if ok == 1 then
     ewma = ewma * (1 - alpha)
     consecutive = 0
-    if ewma < ewma_threshold / 2 and now >= cooldown_until then
-        opens = 0
+    if now >= cooldown_until then
+        auth_failed = 0
+        if ewma < ewma_threshold / 2 then
+            opens = 0
+        end
     end
+elseif auth == 1 then
+    ewma = ewma * (1 - alpha) + alpha
+    consecutive = 0
+    if auth_failed ~= 1 or now >= cooldown_until then
+        opened = 1
+    end
+    cooldown_until = math.max(cooldown_until, now + auth_cooldown)
+    auth_failed = 1
 else
     ewma = ewma * (1 - alpha) + alpha
     consecutive = consecutive + 1
@@ -119,6 +142,7 @@ else
         cooldown_until = now + math.min(base * 2 ^ opens, max_cooldown)
         opens = opens + 1
         consecutive = 0
+        auth_failed = 0
         opened = 1
     end
 end
@@ -127,14 +151,64 @@ redis.call(
     'fail_ewma', tostring(ewma),
     'consecutive_failures', tostring(consecutive),
     'open_count', tostring(opens),
-    'cooldown_until', tostring(cooldown_until)
+    'cooldown_until', tostring(cooldown_until),
+    'auth_failed', tostring(auth_failed)
 )
 redis.call('EXPIRE', key, tonumber(ARGV[8]))
 return {
     tostring(ewma), tostring(consecutive), tostring(opens),
-    tostring(cooldown_until), opened
+    tostring(cooldown_until), tostring(auth_failed), opened
 }
 '''
+
+# KEYS[1] = health hash. Lifts a cooldown that a 407 opened and resets
+# the failure record; any other cooldown is left alone. Returns 1 when
+# a cooldown was lifted.
+_CLEAR_AUTH_LUA: str = '''
+local key = KEYS[1]
+if tonumber(redis.call('HGET', key, 'auth_failed')) ~= 1 then
+    return 0
+end
+redis.call(
+    'HSET', key,
+    'fail_ewma', '0', 'consecutive_failures', '0', 'open_count', '0',
+    'cooldown_until', '0', 'auth_failed', '0'
+)
+return 1
+'''
+
+_HEALTH_FIELDS: list[str] = [
+    'fail_ewma', 'consecutive_failures', 'open_count', 'cooldown_until',
+    'auth_failed',
+]
+
+
+def is_proxy_auth_error(exc: BaseException | None) -> bool:
+    '''
+    True when *exc*, or an exception it was raised from, is the proxy
+    answering 407 Proxy Authentication Required.
+
+    httpx raises ``ProxyError('407 Proxy Authentication Required')``;
+    curl reports a failed CONNECT tunnel with the status in the text.
+
+    :param exc: the exception a request through a proxy raised
+    :returns: whether it is a proxy authentication failure
+    :raises: (none)
+    '''
+
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        message: str = str(current)
+        if '407' in message and (
+            type(current).__name__ == 'ProxyError'
+            or 'Proxy Authentication' in message
+            or 'CONNECT tunnel' in message
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 @dataclass
@@ -145,22 +219,30 @@ class ProxyHealthState:
     consecutive_failures: int = 0
     open_count: int = 0
     cooldown_until: float = 0.0
+    # True while the cooldown was opened by a 407 from the proxy.
+    auth_failed: bool = False
 
     def is_clean(self) -> bool:
         return (
             self.fail_ewma < CLEAN_EWMA
             and self.consecutive_failures == 0
             and self.open_count == 0
+            and not self.auth_failed
         )
 
 
-def apply_outcome(state: ProxyHealthState, ok: bool, now: float) -> bool:
+def apply_outcome(
+    state: ProxyHealthState, ok: bool, now: float,
+    auth_failure: bool = False,
+) -> bool:
     '''
     Update *state* with one request outcome; mirrors ``_REPORT_LUA``.
 
     :param state: the proxy's health, updated in place
     :param ok: True for success, False for a transport failure
     :param now: wall-clock time of the outcome
+    :param auth_failure: the failure was a 407 from the proxy, which
+        opens an AUTH_COOLDOWN_SECONDS cooldown straight away
     :returns: True when this failure put the proxy in cooldown
     :raises: (none)
     '''
@@ -168,13 +250,22 @@ def apply_outcome(state: ProxyHealthState, ok: bool, now: float) -> bool:
     if ok:
         state.fail_ewma *= 1 - FAILURE_ALPHA
         state.consecutive_failures = 0
-        if (
-            state.fail_ewma < FAIL_EWMA_THRESHOLD / 2
-            and now >= state.cooldown_until
-        ):
-            state.open_count = 0
+        if now >= state.cooldown_until:
+            state.auth_failed = False
+            if state.fail_ewma < FAIL_EWMA_THRESHOLD / 2:
+                state.open_count = 0
         return False
     state.fail_ewma = state.fail_ewma * (1 - FAILURE_ALPHA) + FAILURE_ALPHA
+    if auth_failure:
+        state.consecutive_failures = 0
+        opened: bool = (
+            not state.auth_failed or now >= state.cooldown_until
+        )
+        state.cooldown_until = max(
+            state.cooldown_until, now + AUTH_COOLDOWN_SECONDS,
+        )
+        state.auth_failed = True
+        return opened
     state.consecutive_failures += 1
     if now < state.cooldown_until:
         return False
@@ -188,6 +279,7 @@ def apply_outcome(state: ProxyHealthState, ok: bool, now: float) -> bool:
         )
         state.open_count += 1
         state.consecutive_failures = 0
+        state.auth_failed = False
         return True
     return False
 
@@ -306,7 +398,9 @@ class ProxyHealth:
             + (1.0 - tokens)
         )
 
-    async def report(self, proxy: str | None, ok: bool) -> None:
+    async def report(
+        self, proxy: str | None, ok: bool, auth_failure: bool = False,
+    ) -> None:
         '''
         Record one request outcome for *proxy*.
 
@@ -317,18 +411,21 @@ class ProxyHealth:
 
         :param proxy: the proxy used; None is ignored
         :param ok: True for success, False for a transport failure
+        :param auth_failure: the failure was a 407 from the proxy;
+            puts the proxy in cooldown for AUTH_COOLDOWN_SECONDS
         :raises: (none)
         '''
 
         if not proxy:
             return
+        auth_failure = auth_failure and not ok
         state: ProxyHealthState = self._state(proxy)
         if ok and state.is_clean():
             return
         now: float = time.time()
         opened: bool
         if self._redis is None:
-            opened = apply_outcome(state, ok, now)
+            opened = apply_outcome(state, ok, now, auth_failure)
         else:
             try:
                 result: list[Any] = await self._redis.eval(
@@ -338,25 +435,35 @@ class ProxyHealth:
                     str(FAIL_EWMA_THRESHOLD),
                     str(BASE_COOLDOWN_SECONDS),
                     str(MAX_COOLDOWN_SECONDS), str(KEY_TTL_SECONDS),
+                    '1' if auth_failure else '0',
+                    str(AUTH_COOLDOWN_SECONDS),
                 )
-                self._update(proxy, result[:4])
-                opened = int(result[4]) == 1
+                self._update(proxy, result[:5])
+                opened = int(result[5]) == 1
             except Exception as exc:
                 _LOGGER.debug(
                     'Proxy health update in Redis failed; '
                     'tracking locally',
                     exc=exc, extra={'proxy': proxy},
                 )
-                opened = apply_outcome(state, ok, now)
+                opened = apply_outcome(state, ok, now, auth_failure)
         if opened:
+            reason: str = 'proxy_auth' if auth_failure else 'failures'
             METRIC_PROXY_COOLDOWNS.labels(
                 platform=self._platform, proxy=proxy,
-                worker_id=get_worker_id(),
+                worker_id=get_worker_id(), reason=reason,
             ).inc()
+            message: str = (
+                'Proxy put in cooldown after 407 Proxy '
+                'Authentication Required'
+                if auth_failure else
+                'Proxy put in cooldown after transport failures'
+            )
             _LOGGER.warning(
-                'Proxy put in cooldown after transport failures',
+                message,
                 extra={
                     'proxy': proxy,
+                    'reason': reason,
                     'cooldown_seconds': round(
                         self._state(proxy).cooldown_until - now,
                     ),
@@ -364,6 +471,51 @@ class ProxyHealth:
                 },
             )
         self._publish(proxy, now)
+
+    async def clear_auth_cooldowns(self, proxies: list[str]) -> int:
+        '''
+        Lift the cooldowns that a 407 opened for *proxies*, e.g. after
+        the proxy files were edited; other cooldowns are kept. With
+        Redis this clears them for every process on every host.
+
+        :param proxies: the proxies to clear
+        :returns: the number of cooldowns lifted
+        :raises: (none)
+        '''
+
+        cleared: list[str] = []
+        proxy: str
+        if self._redis is None:
+            for proxy in proxies:
+                state: ProxyHealthState | None = self._states.get(proxy)
+                if state is not None and state.auth_failed:
+                    self._states[proxy] = ProxyHealthState()
+                    cleared.append(proxy)
+        else:
+            for proxy in proxies:
+                try:
+                    lifted: Any = await self._redis.eval(
+                        _CLEAR_AUTH_LUA, 1, _health_key(proxy),
+                    )
+                except Exception as exc:
+                    _LOGGER.warning(
+                        'Clearing proxy authentication cooldown '
+                        'in Redis failed',
+                        exc=exc, extra={'proxy': proxy},
+                    )
+                    continue
+                if int(lifted) == 1:
+                    self._states[proxy] = ProxyHealthState()
+                    cleared.append(proxy)
+        now: float = time.time()
+        for proxy in cleared:
+            self._publish(proxy, now)
+        if cleared:
+            _LOGGER.info(
+                'Cleared proxy authentication cooldowns',
+                extra={'proxies': cleared, 'count': len(cleared)},
+            )
+        return len(cleared)
 
     async def refresh_if_stale(
         self, proxies: list[str] | None, force: bool = False,
@@ -381,13 +533,7 @@ class ProxyHealth:
             pipe: Any = self._redis.pipeline(transaction=False)
             proxy: str
             for proxy in proxies:
-                pipe.hmget(
-                    _health_key(proxy),
-                    [
-                        'fail_ewma', 'consecutive_failures',
-                        'open_count', 'cooldown_until',
-                    ],
-                )
+                pipe.hmget(_health_key(proxy), _HEALTH_FIELDS)
             results: list[list[Any]] = await pipe.execute()
         except Exception as exc:
             _LOGGER.debug(
@@ -416,6 +562,9 @@ class ProxyHealth:
             consecutive_failures=int(number(values[1])),
             open_count=int(number(values[2])),
             cooldown_until=number(values[3]),
+            auth_failed=(
+                len(values) > 4 and int(number(values[4])) == 1
+            ),
         )
 
     def _publish(self, proxy: str, now: float) -> None:
@@ -428,3 +577,37 @@ class ProxyHealth:
         METRIC_PROXY_IN_COOLDOWN.labels(**labels).set(
             1 if now < state.cooldown_until else 0,
         )
+
+
+async def clear_auth_cooldowns_in_redis(
+    redis_dsn: str, proxies: list[str], platform: str,
+) -> int:
+    '''
+    Lift the fleet-wide cooldowns that a 407 Proxy Authentication
+    Required opened for *proxies*, using a short-lived Redis client.
+    For processes without a rate limiter, such as the scraper
+    supervisor.
+
+    :param redis_dsn: Redis holding the proxy health
+    :param proxies: the proxies to clear
+    :param platform: platform label for metrics
+    :returns: the number of cooldowns lifted
+    :raises: (none)
+    '''
+
+    from scrape_exchange.redis_client import redis_from_url
+
+    redis: Any = redis_from_url(
+        redis_dsn,
+        component=f'{platform}-proxy-health',
+        connect_retry=False,
+        decode_responses=True,
+        socket_connect_timeout=5.0,
+        socket_timeout=10.0,
+    )
+    try:
+        return await ProxyHealth(redis, platform).clear_auth_cooldowns(
+            proxies,
+        )
+    finally:
+        await redis.aclose()

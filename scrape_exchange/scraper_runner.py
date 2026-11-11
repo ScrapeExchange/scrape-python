@@ -55,6 +55,10 @@ from scrape_exchange.watchdog import Watchdog, make_log_file_writer
 from scrape_exchange.worker_id import get_worker_id
 from scrape_exchange.browser_tmpdir import isolate_browser_tmpdir
 from scrape_exchange.settings import ScraperSettings
+from scrape_exchange.proxy_file_watcher import (
+    SUPERVISED_CHILD_ENV_VAR,
+    ProxyFileWatcher,
+)
 
 
 # Cadence of the async heartbeat that proves the event loop is alive.
@@ -69,6 +73,54 @@ async def _watchdog_heartbeat() -> None:
     while True:
         Watchdog.get().touch_loop()
         await asyncio.sleep(_HEARTBEAT_INTERVAL_SECONDS)
+
+
+# Exit code of a standalone scraper that stops because its proxy files
+# changed (EX_TEMPFAIL): non-zero so container restart policies that
+# only restart failed containers start it again with the new proxies.
+PROXY_RELOAD_EXIT_CODE: int = 75
+
+
+async def _watch_proxy_files(
+    watcher: ProxyFileWatcher,
+    rate_limiter: RateLimiter,
+    main_task: asyncio.Task[Any],
+    scraper_label: str,
+    on_reload: Callable[[], None] | None = None,
+) -> None:
+    '''
+    Stop a standalone scraper when its proxy files change, so that
+    it is restarted with the new proxies. Lifts the fleet-wide
+    cooldowns that a 407 Proxy Authentication Required opened on the
+    new proxies first, as the edit may have fixed them.
+
+    :param watcher: checks the proxy files
+    :param rate_limiter: the scraper's rate limiter
+    :param main_task: the task to cancel for a graceful stop
+    :param scraper_label: for log messages
+    :param on_reload: called before *main_task* is cancelled
+    :raises: (none)
+    '''
+
+    while True:
+        await asyncio.sleep(watcher.interval)
+        new_proxies: list[str] | None = watcher.check()
+        if new_proxies is None:
+            continue
+        await rate_limiter.clear_proxy_auth_cooldowns(new_proxies)
+        logging.warning(
+            'Proxy files changed; stopping so the scraper is '
+            'restarted with the new proxies',
+            extra={
+                'scraper': scraper_label,
+                'proxies_count': len(new_proxies),
+                'exit_code': PROXY_RELOAD_EXIT_CODE,
+            },
+        )
+        if on_reload is not None:
+            on_reload()
+        main_task.cancel()
+        return
 
 
 def _start_metrics_server_or_skip(metrics_port: int) -> None:
@@ -170,6 +222,7 @@ class ScraperRunner:
         self._concurrency_env_var: str | None = concurrency_env_var
         self._child_concurrencies: list[int] | None = child_concurrencies
         self._browser_tmpdir: bool = browser_tmpdir
+        self._exit_code: int = 0
 
     def run_sync(
         self,
@@ -226,6 +279,12 @@ class ScraperRunner:
                 exchange_url=(
                     self._settings.exchange_url
                 ),
+                proxy_files=self._settings.proxy_file_paths(),
+                proxy_reload_interval=(
+                    self._settings.proxy_reload_interval
+                ),
+                redis_dsn=self._settings.redis_dsn,
+                platform=self._platform,
             ))
 
         try:
@@ -247,7 +306,25 @@ class ScraperRunner:
         # finally; flush logging and exit immediately. rc 0 makes the
         # supervisor retire the slot (no respawn) for an intentional stop.
         logging.shutdown()
-        os._exit(0)
+        os._exit(self._exit_code)
+
+    def _standalone_proxy_watcher(self) -> ProxyFileWatcher | None:
+        '''A proxy-file watcher for a scraper that runs without a
+        supervisor; None under a supervisor (which watches the files
+        itself), when the check is disabled or when the proxies do
+        not come from files.'''
+        if os.environ.get(SUPERVISED_CHILD_ENV_VAR) == '1':
+            return None
+        interval: float = self._settings.proxy_reload_interval
+        paths = self._settings.proxy_file_paths()
+        if interval <= 0 or not paths:
+            return None
+        # Baseline from the files, not settings.proxies: scrapers may
+        # narrow the list (a random subset, the first N) at startup.
+        return ProxyFileWatcher(paths, interval=interval)
+
+    def _mark_proxy_reload(self) -> None:
+        self._exit_code = PROXY_RELOAD_EXIT_CODE
 
     async def run(
         self,
@@ -354,6 +431,20 @@ class ScraperRunner:
             except NotImplementedError:
                 pass
 
+        proxy_watch_task: asyncio.Task[None] | None = None
+        proxy_watcher: ProxyFileWatcher | None = (
+            self._standalone_proxy_watcher()
+        )
+        if proxy_watcher is not None:
+            proxy_watch_task = asyncio.create_task(
+                _watch_proxy_files(
+                    proxy_watcher, rate_limiter, main_task,
+                    self._scraper_label,
+                    on_reload=self._mark_proxy_reload,
+                ),
+                name='proxy-file-watch',
+            )
+
         try:
             ctx: ScraperRunContext = (
                 ScraperRunContext(
@@ -368,6 +459,8 @@ class ScraperRunner:
             )
             raise
         finally:
+            if proxy_watch_task is not None:
+                proxy_watch_task.cancel()
             if watchdog is not None:
                 watchdog.stop()
             if heartbeat_task is not None:

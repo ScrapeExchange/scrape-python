@@ -29,6 +29,7 @@ import subprocess
 import sys
 import time
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -39,6 +40,11 @@ from scrape_exchange.metrics_server import (
 )
 
 from scrape_exchange.exchange_client import ExchangeClient
+from scrape_exchange.proxy_file_watcher import (
+    SUPERVISED_CHILD_ENV_VAR,
+    ProxyFileWatcher,
+)
+from scrape_exchange.proxy_health import clear_auth_cooldowns_in_redis
 from scrape_exchange.scraper_metrics import METRIC_SUPERVISOR_RESPAWNS
 from scrape_exchange.worker_id import get_worker_id
 
@@ -152,6 +158,19 @@ class _ChildSlot:
     backoff: float = _BACKOFF_INITIAL_SECONDS
     spawn_time: float | None = None
     respawn_at: float | None = None
+    # Set when the proxy files changed and this child still runs
+    # with the old proxies; the supervisor restarts such children
+    # one at a time.
+    reload_pending: bool = False
+    # Set while this child is stopping for a proxy reload: the time
+    # by which it must have exited before it is killed.
+    reload_deadline: float | None = None
+    # Number of proxies this child was given at startup; a proxy
+    # reload refills its slice up to this size.
+    proxy_target: int = 0
+    # Set when a proxy reload left this child without proxies: it is
+    # stopped and only started again when proxies become available.
+    no_proxies: bool = False
 
 
 @dataclass
@@ -199,6 +218,16 @@ class SupervisorConfig:
     :param shutdown_grace_seconds: Seconds to wait after
         forwarding SIGTERM/SIGINT to children before escalating
         to SIGKILL. Defaults to 30.
+    :param proxy_files: The proxy files the scraper loads its
+        proxies from. When the proxies listed in them change, the
+        supervisor restarts the affected children one at a time
+        with their new ``PROXIES``.
+    :param proxy_reload_interval: Seconds between checks of
+        *proxy_files*; 0 disables the check.
+    :param redis_dsn: Redis holding the fleet-wide proxy health.
+        After a proxy file change the supervisor lifts the cooldowns
+        that a 407 Proxy Authentication Required opened there.
+    :param platform: Platform label for metrics and logs.
     '''
 
     scraper_label: str
@@ -217,6 +246,10 @@ class SupervisorConfig:
     api_key_secret: str | None = None
     exchange_url: str = 'https://scrape.exchange'
     shutdown_grace_seconds: int = 60
+    proxy_files: list[Path] = field(default_factory=list)
+    proxy_reload_interval: float = 60.0
+    redis_dsn: str | None = None
+    platform: str = 'youtube'
     multiproc_dir: Path = field(
         default_factory=lambda: Path(
             '/run/scrape/_unset_/metrics',
@@ -410,6 +443,11 @@ def spawn_children(
         child_env: dict[str, str] = os.environ.copy()
         child_env[config.num_processes_env_var] = '1'
         child_env['PROXIES'] = ','.join(chunk)
+        child_env[SUPERVISED_CHILD_ENV_VAR] = '1'
+        if config.split_proxy_pool:
+            # PROXY_FILES takes precedence over PROXIES in the
+            # child's settings; blank it so the child uses its slice.
+            child_env['PROXY_FILES'] = ''
         child_env['WORKER_ID'] = str(worker_instance)
         if child_concurrencies is not None:
             child_concurrency: int = child_concurrencies[index]
@@ -447,6 +485,7 @@ def spawn_children(
             instance=worker_instance,
             spawn_env=child_env,
             spawn_argv=[sys.executable, script_path],
+            proxy_target=len(chunk),
         )
         _spawn_one_slot(slot)
         slots.append(slot)
@@ -607,9 +646,214 @@ def _log_respawn(scraper_label: str, slot: _ChildSlot) -> None:
     )
 
 
+def _slot_proxies(slot: _ChildSlot) -> list[str]:
+    value: str = slot.spawn_env.get('PROXIES', '')
+    return [p for p in value.split(',') if p]
+
+
+def reassign_proxy_slices(
+    slices: list[list[str]], targets: list[int], proxies: list[str],
+    rng: random.Random | None = None,
+) -> list[list[str]]:
+    '''
+    Fit the per-child proxy *slices* to a new proxy list: each slice
+    keeps its proxies that are still listed and is topped up to its
+    *target* size with randomly chosen proxies that no slice uses, so
+    a child whose proxies all survived keeps its exact slice.
+
+    :param slices: the current proxies of each child
+    :param targets: the number of proxies each child should have
+    :param proxies: the new proxy list
+    :param rng: random source (tests)
+    :returns: the new slice of each child; may be shorter than its
+        target, or empty, when there are not enough proxies
+    :raises: (none)
+    '''
+
+    listed: set[str] = set(proxies)
+    kept: list[list[str]] = [
+        [p for p in chunk if p in listed] for chunk in slices
+    ]
+    in_use: set[str] = {p for chunk in kept for p in chunk}
+    spare: list[str] = [p for p in proxies if p not in in_use]
+    (rng or random).shuffle(spare)
+    result: list[list[str]] = []
+    chunk: list[str]
+    target: int
+    for chunk, target in zip(kept, targets):
+        needed: int = max(0, target - len(chunk))
+        result.append(chunk + spare[:needed])
+        spare = spare[needed:]
+    return result
+
+
+def _schedule_proxy_reload(
+    scraper_label: str, slots: list[_ChildSlot], proxies: list[str],
+    split_proxy_pool: bool, now: float,
+) -> None:
+    '''
+    Give each child its proxies from the new *proxies* list and mark
+    the running children whose proxies changed for a restart. Without
+    a split pool every child gets the full list.
+    '''
+
+    new_slices: list[list[str]]
+    if split_proxy_pool:
+        new_slices = reassign_proxy_slices(
+            [_slot_proxies(slot) for slot in slots],
+            [slot.proxy_target for slot in slots],
+            proxies,
+        )
+    else:
+        new_slices = [list(proxies) for _ in slots]
+    marked: int = 0
+    slot: _ChildSlot
+    new_slice: list[str]
+    for slot, new_slice in zip(slots, new_slices):
+        unchanged: bool = (
+            new_slice == _slot_proxies(slot) and not slot.no_proxies
+        )
+        if split_proxy_pool and unchanged:
+            # Children of a split pool use only their slice. Without
+            # a split pool children read the proxy files themselves,
+            # so every running child restarts.
+            continue
+        slot.spawn_env['PROXIES'] = ','.join(new_slice)
+        if not new_slice:
+            _LOGGER.error(
+                'No proxies left for child; stopping it',
+                extra={
+                    'scraper': scraper_label,
+                    'instance': slot.instance,
+                },
+            )
+            slot.no_proxies = True
+            if slot.process is None:
+                slot.respawn_at = None
+            elif slot.reload_deadline is None:
+                slot.reload_pending = True
+                marked += 1
+            continue
+        if slot.no_proxies:
+            slot.no_proxies = False
+            if slot.process is None and slot.respawn_at is None:
+                slot.respawn_at = now
+            continue
+        if slot.process is not None and slot.reload_deadline is None:
+            slot.reload_pending = True
+            marked += 1
+    _LOGGER.warning(
+        'Proxy files changed; restarting children one at a time',
+        extra={
+            'scraper': scraper_label,
+            'proxies_count': len(proxies),
+            'children_to_restart': marked,
+        },
+    )
+
+
+def _clear_auth_cooldowns(
+    redis_dsn: str | None, proxies: list[str], platform: str,
+) -> None:
+    '''Lift the fleet-wide 407 cooldowns of *proxies* after a proxy
+    file change; the edit may have fixed them.'''
+
+    if not redis_dsn:
+        return
+    try:
+        asyncio.run(
+            clear_auth_cooldowns_in_redis(redis_dsn, proxies, platform),
+        )
+    except Exception as exc:
+        _LOGGER.warning(
+            'Clearing proxy authentication cooldowns failed',
+            exc=exc,
+        )
+
+
+def _advance_proxy_reload(
+    scraper_label: str, slots: list[_ChildSlot], now: float,
+    grace_seconds: float,
+) -> None:
+    '''Stop the next child marked for a proxy reload once no other
+    child is stopping for one, and kill a child that did not stop
+    within *grace_seconds*.'''
+
+    for slot in slots:
+        if slot.reload_deadline is None:
+            continue
+        if (slot.process is not None
+                and slot.process.poll() is None
+                and now >= slot.reload_deadline):
+            _LOGGER.warning(
+                'Child did not stop for proxy reload; killing it',
+                extra={
+                    'scraper': scraper_label,
+                    'instance': slot.instance,
+                    'pid': slot.process.pid,
+                },
+            )
+            try:
+                slot.process.kill()
+            except ProcessLookupError:
+                pass
+        return
+    for slot in slots:
+        if not slot.reload_pending:
+            continue
+        slot.reload_pending = False
+        if slot.process is None or slot.process.poll() is not None:
+            continue
+        _LOGGER.info(
+            'Stopping child for proxy reload',
+            extra={
+                'scraper': scraper_label,
+                'instance': slot.instance,
+                'pid': slot.process.pid,
+            },
+        )
+        try:
+            slot.process.send_signal(signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        slot.reload_deadline = now + grace_seconds
+        return
+
+
+def _record_reload_exit(
+    scraper_label: str, slot: _ChildSlot, rc: int, now: float,
+) -> None:
+    '''A child stopped for a proxy reload: respawn it right away,
+    without counting a crash or applying backoff, unless it has no
+    proxies left.'''
+
+    pid: int | None = (
+        slot.process.pid if slot.process else None
+    )
+    if pid is not None:
+        multiprocess.mark_process_dead(pid)
+    _LOGGER.info(
+        'Child stopped for proxy reload',
+        extra={
+            'scraper': scraper_label,
+            'instance': slot.instance,
+            'pid': pid,
+            'returncode': rc,
+            'respawn': not slot.no_proxies,
+        },
+    )
+    slot.process = None
+    slot.reload_deadline = None
+    slot.respawn_at = None if slot.no_proxies else now
+
+
 def supervise_children(
     scraper_label: str, slots: list[_ChildSlot],
     shutdown_state: dict[str, float | None] | None = None,
+    proxy_watcher: ProxyFileWatcher | None = None,
+    reload_grace_seconds: float = 60.0,
+    split_proxy_pool: bool = False,
+    on_proxies_changed: Callable[[list[str]], None] | None = None,
 ) -> int:
     '''Supervise *slots* until every slot is retired.
 
@@ -624,7 +868,12 @@ def supervise_children(
        ``_spawn_one_slot(slot)``.
     3. When ``_should_escalate(shutdown_state)`` becomes true,
        SIGKILL all still-running children.
-    4. Return ``0`` once no slot has a running process and none
+    4. When *proxy_watcher* reports changed proxy files, call
+       *on_proxies_changed* with the new list, give each child its
+       new proxies (see :func:`_schedule_proxy_reload`) and restart
+       the affected children one at a time (SIGTERM, then respawn
+       as soon as the child exits).
+    5. Return ``0`` once no slot has a running process and none
        has a pending respawn.
 
     Returns ``0`` in all normal cases — failures self-heal via
@@ -671,6 +920,9 @@ def supervise_children(
                 now - slot.spawn_time
                 if slot.spawn_time is not None else 0.0
             )
+            if slot.reload_deadline is not None and not shutting_down:
+                _record_reload_exit(scraper_label, slot, rc, now)
+                continue
             if shutting_down or rc == 0:
                 _retire_slot(
                     scraper_label, slot, rc, shutting_down,
@@ -679,6 +931,19 @@ def supervise_children(
             _record_crash(
                 scraper_label, slot, rc,
                 ran_seconds=ran_seconds, now=now,
+            )
+
+        if not shutting_down and proxy_watcher is not None:
+            new_proxies: list[str] | None = proxy_watcher.poll()
+            if new_proxies is not None:
+                if on_proxies_changed is not None:
+                    on_proxies_changed(new_proxies)
+                _schedule_proxy_reload(
+                    scraper_label, slots, new_proxies,
+                    split_proxy_pool, now,
+                )
+            _advance_proxy_reload(
+                scraper_label, slots, now, reload_grace_seconds,
             )
 
         if not shutting_down:
@@ -864,9 +1129,28 @@ def run_supervisor(config: SupervisorConfig) -> int:
         grace_seconds=config.shutdown_grace_seconds,
     )
 
+    proxy_watcher: ProxyFileWatcher | None = None
+    if config.proxy_files and config.proxy_reload_interval > 0:
+        # Baseline from the files, not config.proxies: scrapers may
+        # narrow the list (a random subset, the first N) before the
+        # supervisor starts.
+        proxy_watcher = ProxyFileWatcher(
+            config.proxy_files,
+            interval=config.proxy_reload_interval,
+        )
+
+    def on_proxies_changed(new_proxies: list[str]) -> None:
+        _clear_auth_cooldowns(
+            config.redis_dsn, new_proxies, config.platform,
+        )
+
     try:
         return supervise_children(
             config.scraper_label, slots, shutdown_state,
+            proxy_watcher=proxy_watcher,
+            reload_grace_seconds=config.shutdown_grace_seconds,
+            split_proxy_pool=config.split_proxy_pool,
+            on_proxies_changed=on_proxies_changed,
         )
     finally:
         for slot in slots:

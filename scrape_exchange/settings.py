@@ -113,6 +113,21 @@ class ScraperSettings(BaseSettings):
             'supervisor child processes after splitting PROXY_FILES.'
         ),
     )
+    proxy_reload_interval: float = Field(
+        default=60.0,
+        ge=0.0,
+        validation_alias=AliasChoices(
+            'PROXY_RELOAD_INTERVAL', 'proxy_reload_interval',
+        ),
+        description=(
+            'Seconds between checks of the proxy files for edits. '
+            'When the listed proxies change, a supervised scraper '
+            'restarts its worker processes one at a time, and a '
+            'single-process scraper exits so its container restart '
+            'policy starts it with the new list. 0 disables the '
+            'check.'
+        ),
+    )
     # ClassVar: not a pydantic/env field. Instance value is
     # set by _load_proxy_catalog, shadowing the class default.
     proxies: ClassVar[tuple[str, ...]] = ()
@@ -233,15 +248,21 @@ class ScraperSettings(BaseSettings):
             return ','.join(str(p) for p in v)
         return v
 
+    def proxy_file_paths(self) -> list[Path]:
+        '''The proxy files this scraper loads its proxies from;
+        empty when the proxies come from ``PROXIES`` or none are
+        configured.'''
+        if not self.proxy_files:
+            return []
+        return [
+            Path(p.strip())
+            for p in self.proxy_files.split(',')
+            if p.strip()
+        ]
+
     @model_validator(mode='after')
     def _load_proxy_catalog(self) -> 'ScraperSettings':
-        paths: list[Path] = []
-        if self.proxy_files:
-            paths = [
-                Path(p.strip())
-                for p in self.proxy_files.split(',')
-                if p.strip()
-            ]
+        paths: list[Path] = self.proxy_file_paths()
         if paths:
             catalog = load_proxy_catalog(paths)
         elif self.proxies_env:
