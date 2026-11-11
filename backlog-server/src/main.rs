@@ -5,6 +5,7 @@ use tracing_subscriber::EnvFilter;
 
 use backlog_server::config::{ServeConfig, queue_dir_name};
 use backlog_server::import::ImportArgs;
+use backlog_server::mark_uploaded::MarkUploadedArgs;
 use backlog_server::meta::ALL_STATES;
 use backlog_server::queue::{Queue, QueueInfo};
 
@@ -23,6 +24,8 @@ enum Cmd {
     Import(ImportArgs),
     /// Check a stopped queue directory and print its counts as JSON.
     Verify(VerifyArgs),
+    /// Mark exported IDs `uploaded` in a stopped queue directory.
+    MarkUploaded(MarkUploadedArgs),
 }
 
 #[derive(clap::Args)]
@@ -108,6 +111,13 @@ async fn main() -> ExitCode {
         Cmd::Verify(a) => {
             init_logging("info", true);
             exit(verify(&a))
+        }
+        Cmd::MarkUploaded(a) => {
+            init_logging("info", true);
+            exit(backlog_server::mark_uploaded::run(&a).and_then(|r| {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+                Ok(())
+            }))
         }
     }
 }

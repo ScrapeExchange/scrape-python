@@ -554,6 +554,16 @@ impl Queue {
         if self.compacting.is_some() || self.known.delta_len() == 0 {
             return None;
         }
+        self.start_base_rewrite()
+    }
+
+    /// Start a compaction that rewrites the base even when the delta is
+    /// empty: the offline `mark-uploaded` tool builds a fresh
+    /// generation from an external input.
+    pub fn start_base_rewrite(&mut self) -> Option<CompactionJob> {
+        if self.compacting.is_some() {
+            return None;
+        }
         let wal_cut: u64 = self.wal.next_lsn();
         let generation: u64 = self.known.base().info().generation + 1;
         let frozen: Arc<HashMap<u64, Meta>> = self.known.freeze();
