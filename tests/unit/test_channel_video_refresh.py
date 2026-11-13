@@ -5,7 +5,7 @@ import logging
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import fakeredis.aioredis
 import httpx2 as httpx
@@ -19,7 +19,6 @@ from scrape_exchange.channel_scrape_queue import (
     RedisChannelScrapeQueue,
 )
 from scrape_exchange.file_management import AssetFileManagement
-from scrape_exchange.youtube.uploaded_video_ids import UploadedVideoIds
 from scrape_exchange.video_scrape_queue import (
     RedisVideoScrapeQueue,
     VideoScrapeQueueSettings,
@@ -27,6 +26,7 @@ from scrape_exchange.video_scrape_queue import (
 )
 from scrape_exchange.youtube import channel_video_refresh as refresh
 from scrape_exchange.youtube.channel_video_refresh import VIDEO_IDS
+from scrape_exchange.youtube.uploaded_video_ids import UploadedVideoIds
 from scrape_exchange.youtube.youtube_channel import YouTubeChannel
 from tools import yt_channel_scrape as scraper
 
@@ -878,3 +878,62 @@ class TestKnownVideoIds(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary.video_ids_added, 2)
         self.assertEqual(summary.video_ids_queue_known, 1)
         self.assertEqual(summary.video_ids_existing, 1)
+
+
+class TestChannelRefreshDoneLookup(unittest.IsolatedAsyncioTestCase):
+    '''Both filtering paths ask the queue, never the API.'''
+
+    async def test_queue_video_ids_uses_done_many_without_fallback(
+        self,
+    ) -> None:
+        queue: AsyncMock = AsyncMock()
+        queue.done_many.return_value = {'a': False}
+        queue.enqueue_many.return_value = 0
+        summary: MagicMock = MagicMock()
+        with patch.object(
+            refresh, 'make_video_scrape_queue', return_value=queue,
+        ), patch.object(
+            AssetFileManagement, 'video_scrape_output_exists',
+            return_value=False,
+        ):
+            await refresh.queue_video_ids(
+                {'a'},
+                'UCX',
+                None,
+                redis=AsyncMock(),
+                http_client=AsyncMock(),
+                exchange_url='https://scrape.exchange',
+                video_fm=AssetFileManagement('/tmp'),
+                summary=summary,
+                exchange_ids={'a'},
+            )
+        queue.done_many.assert_awaited_once()
+        self.assertFalse(
+            queue.done_many.await_args.kwargs['api_fallback'],
+        )
+
+    async def test_known_video_ids_uses_done_many_without_fallback(
+        self,
+    ) -> None:
+        queue: AsyncMock = AsyncMock()
+        queue.done_many.return_value = {'a': False}
+        queue.get_states.return_value = {'a': None}
+        with patch.object(
+            refresh, 'make_video_scrape_queue', return_value=queue,
+        ), patch.object(
+            AssetFileManagement, 'video_scrape_output_exists',
+            return_value=False,
+        ):
+            known: Any = refresh.KnownVideoIds(
+                redis=AsyncMock(),
+                http_client=AsyncMock(),
+                exchange_url='https://scrape.exchange',
+                channel_id='UCX',
+                video_fm=AssetFileManagement('/tmp'),
+            )
+            known.exchange_ids = set()
+            await known(['a'])
+        queue.done_many.assert_awaited_once()
+        self.assertFalse(
+            queue.done_many.await_args.kwargs['api_fallback'],
+        )

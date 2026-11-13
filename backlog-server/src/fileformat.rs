@@ -1,12 +1,17 @@
 //! The 128-byte header at the start of every data file.
 //!
 //! Layout (little-endian): magic[4], version u16, kind u8, key_type u8,
-//! count u64, generation u64, wal_cut u64, state_counts [u64; 5],
+//! count u64, generation u64, wal_cut u64, state_counts [u64; 6],
 //! payload_crc u32, zero padding, header crc32 of bytes 0..124 at
 //! 124..128.
+//!
+//! Version 1 headers carried five state counts and put the payload CRC
+//! at 72..76. Version 2 carries six and puts it at 80..84. Both layouts
+//! fit inside the padding, so HEADER_LEN does not change. The reader
+//! accepts both versions; the writer writes version 2 only.
 
 pub const MAGIC: [u8; 4] = *b"BKLG";
-pub const FORMAT_VERSION: u16 = 1;
+pub const FORMAT_VERSION: u16 = 2;
 pub const HEADER_LEN: usize = 128;
 
 #[repr(u8)]
@@ -78,7 +83,7 @@ pub struct Header {
     pub count: u64,
     pub generation: u64,
     pub wal_cut: u64,
-    pub state_counts: [u64; 5],
+    pub state_counts: [u64; 6],
     pub payload_crc: u32,
 }
 
@@ -90,7 +95,7 @@ impl Header {
             count: 0,
             generation: 0,
             wal_cut: 0,
-            state_counts: [0; 5],
+            state_counts: [0; 6],
             payload_crc: 0,
         }
     }
@@ -108,7 +113,7 @@ impl Header {
             let o: usize = 32 + i * 8;
             b[o..o + 8].copy_from_slice(&c.to_le_bytes());
         }
-        b[72..76].copy_from_slice(&self.payload_crc.to_le_bytes());
+        b[80..84].copy_from_slice(&self.payload_crc.to_le_bytes());
         let crc: u32 = crc32fast::hash(&b[..124]);
         b[124..128].copy_from_slice(&crc.to_le_bytes());
         b
@@ -126,15 +131,19 @@ impl Header {
             return Err(FormatError::Checksum);
         }
         let version: u16 = u16::from_le_bytes([b[4], b[5]]);
-        if version != FORMAT_VERSION {
-            return Err(FormatError::Version(version));
-        }
+        // Version 1 has five state counts and its payload CRC at 72;
+        // version 2 adds a sixth count and moves the CRC to 80.
+        let (counts, crc_off): (usize, usize) = match version {
+            1 => (5, 72),
+            2 => (6, 80),
+            other => return Err(FormatError::Version(other)),
+        };
         let kind: FileKind =
             FileKind::from_u8(b[6]).ok_or(FormatError::Kind)?;
         let key_type: KeyType =
             KeyType::from_u8(b[7]).ok_or(FormatError::Kind)?;
-        let mut state_counts: [u64; 5] = [0; 5];
-        for (i, c) in state_counts.iter_mut().enumerate() {
+        let mut state_counts: [u64; 6] = [0; 6];
+        for (i, c) in state_counts.iter_mut().take(counts).enumerate() {
             *c = u64_at(b, 32 + i * 8);
         }
         Ok(Header {
@@ -144,7 +153,7 @@ impl Header {
             generation: u64_at(b, 16),
             wal_cut: u64_at(b, 24),
             state_counts,
-            payload_crc: u32_at(b, 72),
+            payload_crc: u32_at(b, crc_off),
         })
     }
 }
@@ -168,7 +177,7 @@ mod tests {
             count: 42,
             generation: 7,
             wal_cut: 99,
-            state_counts: [1, 2, 3, 4, 5],
+            state_counts: [1, 2, 3, 4, 5, 6],
             payload_crc: 0xdead_beef,
         }
     }
@@ -179,6 +188,42 @@ mod tests {
         let b: [u8; HEADER_LEN] = h.encode();
         assert_eq!(&b[..4], &MAGIC);
         assert_eq!(Header::decode(&b).unwrap(), h);
+    }
+
+    #[test]
+    fn header_v2_round_trips_six_counts() {
+        let h: Header = Header {
+            state_counts: [1, 2, 3, 4, 5, 6],
+            ..sample()
+        };
+        let b: [u8; HEADER_LEN] = h.encode();
+        assert_eq!(HEADER_LEN, 128);
+        assert_eq!(Header::decode(&b).unwrap(), h);
+        assert_eq!(Header::decode(&b).unwrap().state_counts[5], 6);
+    }
+
+    /// A version-1 header hand-built at the old offsets: five counts at
+    /// 32..72 and the payload CRC at 72..76.
+    #[test]
+    fn header_v1_decodes_with_uploaded_zero() {
+        let mut b: [u8; HEADER_LEN] = [0; HEADER_LEN];
+        b[0..4].copy_from_slice(&MAGIC);
+        b[4..6].copy_from_slice(&1u16.to_le_bytes());
+        b[6] = FileKind::BaseIds as u8;
+        b[7] = KeyType::U64 as u8;
+        b[8..16].copy_from_slice(&42u64.to_le_bytes());
+        b[16..24].copy_from_slice(&7u64.to_le_bytes());
+        b[24..32].copy_from_slice(&99u64.to_le_bytes());
+        for (i, c) in [1u64, 2, 3, 4, 5].iter().enumerate() {
+            b[32 + i * 8..40 + i * 8].copy_from_slice(&c.to_le_bytes());
+        }
+        b[72..76].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+        let crc: u32 = crc32fast::hash(&b[..124]);
+        b[124..128].copy_from_slice(&crc.to_le_bytes());
+        let h: Header = Header::decode(&b).unwrap();
+        assert_eq!(h.state_counts, [1, 2, 3, 4, 5, 0]);
+        assert_eq!(h.payload_crc, 0xdead_beef);
+        assert_eq!((h.count, h.generation, h.wal_cut), (42, 7, 99));
     }
 
     #[test]

@@ -22,6 +22,8 @@ from pydantic_settings import (
     SettingsConfigDict,
 )
 
+from scrape_exchange.youtube.uploaded_video_ids import UploadedVideoIds
+
 KEY_PREFIX: str = 'youtube:video'
 
 # TTL applied to a video's sparse meta hash when it is marked with
@@ -319,6 +321,29 @@ class VideoScrapeQueueSettings(BaseSettings):
             'of Redis.'
         ),
     )
+    backlog_uploaded_api_fallback: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            'BACKLOG_UPLOADED_API_FALLBACK',
+            'backlog_uploaded_api_fallback',
+        ),
+        description=(
+            'Ask scrape.exchange about upload state the backlog '
+            'server cannot answer. On during the migration only; '
+            'see the 2026-11-11 backlog uploaded-state design, 5.4.'
+        ),
+    )
+    exchange_existence_concurrency: int = Field(
+        default=64,
+        validation_alias=AliasChoices(
+            'EXCHANGE_EXISTENCE_CONCURRENCY',
+            'exchange_existence_concurrency',
+        ),
+        description=(
+            'Maximum concurrent video-existence GETs one migration '
+            'fallback call makes.'
+        ),
+    )
 
 
 class VideoScrapeQueue(ABC):
@@ -398,6 +423,45 @@ class VideoScrapeQueue(ABC):
             for video_id, state in states.items()
         }
 
+    supports_uploaded: bool = False
+    '''Whether this queue records and answers upload state.
+
+    Only the YouTube queues do: the Bloom filter and the backlog
+    server's ``uploaded`` state are YouTube's. A queue built for
+    another platform must answer False without touching either.
+    '''
+
+    async def mark_uploaded(self, video_ids: list[str]) -> None:
+        '''Record *video_ids* as accepted by the bulk upload API.'''
+        return
+
+    async def uploaded_many(
+        self, video_ids: list[str], *, api_fallback: bool = True,
+    ) -> dict[str, bool]:
+        '''Whether each ID is on scrape.exchange.
+
+        A queue that does not track upload state answers False.
+        '''
+        return {video_id: False for video_id in video_ids}
+
+    async def done_many(
+        self, video_ids: list[str], *, api_fallback: bool = True,
+    ) -> dict[str, bool]:
+        '''Whether each ID needs no more work: done (scraped or
+        uploaded) or not.'''
+        return await self.uploaded_many(
+            video_ids, api_fallback=api_fallback,
+        )
+
+    def state_names(self) -> list[str]:
+        '''Every state name this backend can store.'''
+        return [state.value for state in VideoState]
+
+    async def count_by_state_name(self) -> dict[str, int]:
+        '''Member counts for every name in :meth:`state_names`.'''
+        counts: dict[VideoState, int] = await self.count_by_state()
+        return {state.value: count for state, count in counts.items()}
+
     @abstractmethod
     async def get_meta(
         self, video_id: str,
@@ -447,6 +511,8 @@ class RedisVideoScrapeQueue(VideoScrapeQueue):
         redis: aioredis.Redis,
         settings: VideoScrapeQueueSettings,
         platform: str = 'youtube',
+        *,
+        supports_uploaded: bool = False,
     ) -> None:
         if not platform:
             raise ValueError('empty platform')
@@ -455,6 +521,14 @@ class RedisVideoScrapeQueue(VideoScrapeQueue):
             settings
         )
         self._key_prefix: str = f'{platform}:video'
+        self.supports_uploaded: bool = supports_uploaded
+        # Built only for a platform that has upload state: the filter
+        # is the YouTube fleet's, and a TikTok queue must never add to
+        # it.
+        self._uploaded: UploadedVideoIds | None = (
+            UploadedVideoIds('', redis_client=redis)
+            if supports_uploaded else None
+        )
 
     def _k_queue(self) -> str:
         return f'{self._key_prefix}:queue'
@@ -829,6 +903,38 @@ class RedisVideoScrapeQueue(VideoScrapeQueue):
             except ValueError:
                 out[video_id] = None
         return out
+
+    async def mark_uploaded(self, video_ids: list[str]) -> None:
+        '''Add *video_ids* to the fleet-wide uploaded Bloom filter.'''
+        if self._uploaded is None:
+            return
+        await self._uploaded.add_many(video_ids)
+
+    async def uploaded_many(
+        self, video_ids: list[str], *, api_fallback: bool = True,
+    ) -> dict[str, bool]:
+        '''Bloom-filter membership per ID.
+
+        The filter is the fractal one the fleet has always used, so a
+        true answer can be a false positive (never a false negative).
+        '''
+        del api_fallback
+        if self._uploaded is None:
+            return {video_id: False for video_id in video_ids}
+        return await self._uploaded.contains_many(video_ids)
+
+    async def done_many(
+        self, video_ids: list[str], *, api_fallback: bool = True,
+    ) -> dict[str, bool]:
+        '''Nothing more to do once the filter says uploaded; the Redis
+        queue forgets scraped videos, so that is all it knows.'''
+        return await self.uploaded_many(
+            video_ids, api_fallback=api_fallback,
+        )
+
+    def state_names(self) -> list[str]:
+        '''Every state this queue stores, tombstones included.'''
+        return [state.value for state in VideoState]
 
     async def get_meta(
         self, video_id: str,

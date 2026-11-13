@@ -76,7 +76,9 @@ from scrape_exchange.onlyfans.onlyfans_creator import OnlyFansCreator
 from scrape_exchange.redis_client import redis_from_url
 from scrape_exchange.schema_validator import SchemaValidator, fetch_schema_dict
 from scrape_exchange.scraper_metrics import (
+    METRIC_BACKLOG_UPLOAD_STATE_ERRORS,
     METRIC_BULK_JOBS_IN_FLIGHT,
+    METRIC_BULK_UPLOAD_DUPLICATES,
     METRIC_FILES_PENDING_UPLOAD,
     METRIC_UPLOAD_BATCHES,
     METRIC_UPLOADS_FAILED,
@@ -97,8 +99,8 @@ from scrape_exchange.twitch import TwitchCreator
 from scrape_exchange.upload import (
     BulkUploadConfig,
     emit_bulk_batch_metrics,
-    ndjson_line,
     finalize_prepared_bulk_batch,
+    ndjson_line,
     post_prepared_bulk_batch,
     validate_upload_record,
 )
@@ -111,7 +113,6 @@ from scrape_exchange.worker_id import get_worker_id
 from scrape_exchange.youtube.exchange_channels_set import (
     RedisExchangeChannelsSet,
 )
-from scrape_exchange.youtube.uploaded_video_ids import UploadedVideoIds
 from scrape_exchange.youtube.youtube_channel import (
     YouTubeChannel,
     fallback_handle,
@@ -691,6 +692,20 @@ class AssetProcessor:
         del content_id
         del context
 
+    async def on_success_ids(
+        self,
+        content_ids: list[str],
+        context: AssetProcessingContext,
+    ) -> None:
+        '''Called once per finished batch with every accepted ID.
+
+        The default keeps the per-ID hook, so a processor that does
+        not care about batching is unchanged.
+        '''
+        content_id: str
+        for content_id in content_ids:
+            await self.on_success_id(content_id, context)
+
 
 @dataclass(frozen=True)
 class YouTubeChannelProcessorState:
@@ -823,7 +838,6 @@ class YouTubeChannelProcessor(AssetProcessor):
 class YouTubeVideoProcessorState:
     creator_map: CreatorMap
     scrape_queue: VideoScrapeQueue | None
-    uploaded: UploadedVideoIds | None
 
 
 class YouTubeVideoProcessor(AssetProcessor):
@@ -835,7 +849,6 @@ class YouTubeVideoProcessor(AssetProcessor):
         fm: AssetFileManagement,
         descriptor: AssetDescriptor,
     ) -> YouTubeVideoProcessorState:
-        del client
         del fm
         del descriptor
         creator_map: CreatorMap
@@ -852,13 +865,13 @@ class YouTubeVideoProcessor(AssetProcessor):
                     redis=redis_client,
                     settings=VideoScrapeQueueSettings(),
                     component='scrape-upload-youtube-video-queue',
+                    exchange_client=client,
+                    exchange_url=settings.exchange_url,
                 ),
-                uploaded=UploadedVideoIds(settings.redis_dsn),
             )
         return YouTubeVideoProcessorState(
             creator_map=FileCreatorMap(settings.youtube_channel_map_file),
             scrape_queue=None,
-            uploaded=None,
         )
 
     async def _resolve_handle(
@@ -912,9 +925,7 @@ class YouTubeVideoProcessor(AssetProcessor):
         context: AssetProcessingContext,
     ) -> dict[str, Any] | None:
         state: YouTubeVideoProcessorState = context.state
-        if state.uploaded is not None and await state.uploaded.contains(
-            content_id,
-        ):
+        if await self._is_uploaded(state, content_id):
             await context.fm.mark_uploaded(filename)
             return None
         video: YouTubeVideo = YouTubeVideo.from_dict(data)
@@ -967,14 +978,49 @@ class YouTubeVideoProcessor(AssetProcessor):
         await context.fm.delete(filename, fail_ok=False)
         return True
 
-    async def on_success_id(
+    async def _is_uploaded(
         self,
+        state: YouTubeVideoProcessorState,
         content_id: str,
+    ) -> bool:
+        '''Whether *content_id* is already on scrape.exchange.
+
+        A failed lookup fails open: the file is uploaded anyway and
+        counted, because the worst case is a duplicate upload, which
+        the bulk API reports as a duplicate.
+        '''
+        if state.scrape_queue is None:
+            return False
+        try:
+            answers: dict[str, bool] = await state.scrape_queue.uploaded_many(
+                [content_id],
+            )
+        except Exception:  # noqa: BLE001 - fail open, see above
+            METRIC_BACKLOG_UPLOAD_STATE_ERRORS.labels(op='lookup').inc()
+            logging.warning(
+                'Upload-state lookup failed; uploading anyway',
+                extra={'video_id': content_id},
+            )
+            return False
+        return bool(answers.get(content_id))
+
+    async def on_success_ids(
+        self,
+        content_ids: list[str],
         context: AssetProcessingContext,
     ) -> None:
+        '''Record every ID the batch put on scrape.exchange.'''
         state: YouTubeVideoProcessorState = context.state
-        if state.uploaded is not None:
-            await state.uploaded.add(content_id)
+        if state.scrape_queue is None or not content_ids:
+            return
+        try:
+            await state.scrape_queue.mark_uploaded(list(content_ids))
+        except Exception:  # noqa: BLE001 - files are already moved
+            METRIC_BACKLOG_UPLOAD_STATE_ERRORS.labels(op='mark').inc()
+            logging.warning(
+                'Recording uploaded IDs failed',
+                extra={'ids': len(content_ids)},
+            )
 
     def background_kwargs(
         self,
@@ -982,10 +1028,12 @@ class YouTubeVideoProcessor(AssetProcessor):
         content_id: str,
     ) -> dict[str, Any]:
         state: YouTubeVideoProcessorState = context.state
-        if state.uploaded is None:
+        if state.scrape_queue is None:
             return {}
         return {
-            'on_success': lambda: state.uploaded.add(content_id),
+            'on_success': lambda: state.scrape_queue.mark_uploaded(
+                [content_id],
+            ),
         }
 
 
@@ -1507,8 +1555,8 @@ async def _emit_batch_outcome(
     processor: AssetProcessor,
     context: AssetProcessingContext,
 ) -> None:
-    async def _on_success(content_id: str) -> None:
-        await processor.on_success_id(content_id, context)
+    async def _on_success_ids(content_ids: list[str]) -> None:
+        await processor.on_success_ids(content_ids, context)
 
     await emit_bulk_batch_metrics(
         outcome,
@@ -1519,7 +1567,8 @@ async def _emit_batch_outcome(
         uploaded_counter=METRIC_BACKGROUND_UPLOADS,
         failed_counter=METRIC_UPLOADS_FAILED,
         missing_result_counter=METRIC_UPLOADS_MISSING_RESULT,
-        on_success_id=_on_success,
+        on_success_ids=_on_success_ids,
+        duplicates_counter=METRIC_BULK_UPLOAD_DUPLICATES,
     )
 
 

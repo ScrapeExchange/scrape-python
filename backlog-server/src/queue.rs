@@ -58,7 +58,7 @@ pub struct PopItem {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct QueueInfo {
-    pub counts: [u64; 5],
+    pub counts: [u64; 6],
     pub leased: u64,
     pub lane_main: u64,
     pub lane_priority: u64,
@@ -426,10 +426,37 @@ impl Queue {
     }
 
     pub fn complete(&mut self, id: u64, ts: u32) -> Result<(), QueueError> {
+        // A video that was uploaded while this scrape was in flight
+        // keeps `uploaded`: downgrading it to `scraped` would make the
+        // uploader send it again.
+        if self.state(id) == Some(State::Uploaded) {
+            self.leases.remove(id);
+            return Ok(());
+        }
         let m: Meta = Meta::new(State::Scraped, false, Reason::None);
         self.put(id, m, ts)?;
         self.leases.remove(id);
         Ok(())
+    }
+
+    /// Record an accepted upload. Unknown IDs are inserted so that a
+    /// video uploaded without ever being queued is known too. A queued
+    /// ID with the force flag keeps its place: a forced re-scrape is
+    /// still pending. Every other state becomes `uploaded`.
+    ///
+    /// :returns: true when the state changed.
+    pub fn uploaded(&mut self, id: u64, ts: u32) -> Result<bool, QueueError> {
+        match self.known.get(id) {
+            Some(m) if m.state() == State::Uploaded => return Ok(false),
+            Some(m) if m.state() == State::Queued && m.force() => {
+                return Ok(false);
+            }
+            _ => {}
+        }
+        let m: Meta = Meta::new(State::Uploaded, false, Reason::None);
+        self.put(id, m, ts)?;
+        self.leases.remove(id);
+        Ok(true)
     }
 
     pub fn mark(
@@ -525,6 +552,16 @@ impl Queue {
     /// None if a compaction is running or there is nothing to merge.
     pub fn start_compaction(&mut self) -> Option<CompactionJob> {
         if self.compacting.is_some() || self.known.delta_len() == 0 {
+            return None;
+        }
+        self.start_base_rewrite()
+    }
+
+    /// Start a compaction that rewrites the base even when the delta is
+    /// empty: the offline `mark-uploaded` tool builds a fresh
+    /// generation from an external input.
+    pub fn start_base_rewrite(&mut self) -> Option<CompactionJob> {
+        if self.compacting.is_some() {
             return None;
         }
         let wal_cut: u64 = self.wal.next_lsn();
@@ -659,7 +696,7 @@ mod tests {
         assert!(!q.add(1, 0).unwrap());
         q.mark(1, State::Failed, Reason::Other, 0).unwrap();
         assert!(!q.add(1, 0).unwrap());
-        assert_eq!(q.info().counts, [0, 0, 1, 0, 0]);
+        assert_eq!(q.info().counts, [0, 0, 1, 0, 0, 0]);
     }
 
     #[test]
@@ -835,7 +872,7 @@ mod tests {
         q.wal_mut().fail_next_write();
         assert!(q.add(2, 0).is_err());
         assert_eq!(q.state(2), None);
-        assert_eq!(q.info().counts, [1, 0, 0, 0, 0]);
+        assert_eq!(q.info().counts, [1, 0, 0, 0, 0, 0]);
         // The lane entry written before the failed log write is stale
         // and harmless: 2 is still unknown and pops exactly once.
         assert_eq!(q.info().lane_main, 2);
@@ -950,7 +987,7 @@ mod tests {
         }
         let q: Queue = q(&d);
         assert_eq!(q.info().counts, before.counts);
-        assert_eq!(q.info().counts, [60, 30, 0, 10, 0]);
+        assert_eq!(q.info().counts, [60, 30, 0, 10, 0, 0]);
     }
 
     fn copy_tree(src: &Path, dst: &Path) {
@@ -1042,6 +1079,88 @@ mod tests {
         write_gen(d.path(), 1);
         assert!(Queue::open(d.path(), params()).is_err());
         assert!(d.path().join("base/ids.00000001").exists(), "kept");
+    }
+
+    #[test]
+    fn uploaded_inserts_unknown_id() {
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let mut q: Queue = q(&d);
+        assert!(q.uploaded(7, 0).unwrap());
+        assert_eq!(q.state(7), Some(State::Uploaded));
+        assert!(!q.add(7, 0).unwrap());
+    }
+
+    #[test]
+    fn uploaded_keeps_forced_queued() {
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let mut q: Queue = q(&d);
+        assert_eq!(q.force(1, 0).unwrap(), ForceOutcome::Added);
+        assert!(!q.uploaded(1, 0).unwrap());
+        assert_eq!(q.state(1), Some(State::Queued));
+    }
+
+    #[test]
+    fn uploaded_moves_unforced_queued_and_pop_skips_it() {
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let mut q: Queue = q(&d);
+        assert!(q.add(1, 0).unwrap());
+        let now: Instant = Instant::now();
+        assert_eq!(q.pop(10, L, now).unwrap().len(), 1);
+        assert_eq!(q.info().leased, 1);
+        assert!(q.uploaded(1, 0).unwrap());
+        assert_eq!(q.state(1), Some(State::Uploaded));
+        assert_eq!(q.info().leased, 0);
+        assert!(q.pop(10, L, now).unwrap().is_empty());
+    }
+
+    #[test]
+    fn uploaded_moves_scraped_and_terminal() {
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let mut q: Queue = q(&d);
+        q.add(1, 0).unwrap();
+        q.complete(1, 0).unwrap();
+        q.add(2, 0).unwrap();
+        q.mark(2, State::Failed, Reason::Transient, 5).unwrap();
+        q.add(3, 0).unwrap();
+        q.mark(3, State::Unavailable, Reason::Unavailable, 5)
+            .unwrap();
+        q.add(4, 0).unwrap();
+        q.mark(4, State::Removed, Reason::Operator, 5).unwrap();
+        for id in [1, 2, 3, 4] {
+            assert!(q.uploaded(id, 10).unwrap(), "{id}");
+            assert_eq!(q.state(id), Some(State::Uploaded), "{id}");
+        }
+        assert_eq!(q.info().counts[5], 4);
+        // `uploaded` is not terminal, so no retention timestamp stays.
+        assert!(q.known.terminal_ts().get(&2).is_none());
+    }
+
+    #[test]
+    fn uploaded_is_idempotent() {
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let mut q: Queue = q(&d);
+        assert!(q.uploaded(1, 0).unwrap());
+        assert!(!q.uploaded(1, 0).unwrap());
+        assert_eq!(q.info().counts[5], 1);
+    }
+
+    #[test]
+    fn complete_does_not_downgrade_uploaded() {
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let mut q: Queue = q(&d);
+        q.uploaded(1, 0).unwrap();
+        q.complete(1, 0).unwrap();
+        assert_eq!(q.state(1), Some(State::Uploaded));
+    }
+
+    #[test]
+    fn force_then_complete_gives_scraped() {
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let mut q: Queue = q(&d);
+        q.uploaded(1, 0).unwrap();
+        assert_eq!(q.force(1, 0).unwrap(), ForceOutcome::Revived);
+        q.complete(1, 0).unwrap();
+        assert_eq!(q.state(1), Some(State::Scraped));
     }
 
     #[test]

@@ -12,12 +12,17 @@ Popped IDs are leased; ``complete`` or ``mark`` resolves the lease and
 ``bump_attempts`` extends it while the scraper retries.
 '''
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
 import redis.asyncio as aioredis
 
+from scrape_exchange.exchange_client import ExchangeClient
+from scrape_exchange.scraper_metrics import (
+    METRIC_BACKLOG_UPLOADED_API_FALLBACK,
+)
 from scrape_exchange.video_scrape_queue import (
     ENQUEUE_MANY_CHUNK_SIZE,
     VideoQueueChannelContext,
@@ -26,10 +31,14 @@ from scrape_exchange.video_scrape_queue import (
     VideoScrapeQueueSettings,
     VideoState,
 )
+from scrape_exchange.youtube.exchange_video_exists import (
+    exchange_video_exists,
+)
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 DEFAULT_QUEUE_NAME: str = 'youtube:video'
+DEFAULT_EXCHANGE_URL: str = 'https://scrape.exchange'
 
 # Reason codes the server stores; anything else is stored as 'other'.
 REASON_CODES: frozenset[str] = frozenset({
@@ -62,20 +71,34 @@ def _text(value: Any) -> str:
     return str(value)
 
 
+_DONE_STATES: frozenset[str] = frozenset({'scraped', 'uploaded'})
+
+
 def _state(value: Any) -> VideoState | None:
-    '''Server state name -> VideoState. ``scraped`` maps to None, as a
-    completed video is unknown to the Redis queue too. Use
+    '''Server state name -> VideoState.
+
+    ``scraped`` and ``uploaded`` are the done states and map to None,
+    as a completed video is unknown to the Redis queue too; use
     :meth:`BacklogServerVideoScrapeQueue.get_state_names` when the
-    difference between scraped and unknown matters.'''
+    difference matters. Any other unrecognised name is a deploy-order
+    mistake or a typo: it raises, so it fails loudly instead of
+    looking like an unknown video and turning into duplicate work.
+    '''
     if value is None:
         return None
     name: str = _text(value)
-    if name == 'scraped':
+    if name in _DONE_STATES:
         return None
     try:
         return VideoState(name)
     except ValueError:
-        return None
+        _LOGGER.error(
+            'unknown video queue state name from backlog-server',
+            extra={'state': name},
+        )
+        raise ValueError(
+            f'unknown video queue state: {name!r}',
+        ) from None
 
 
 class BacklogServerVideoScrapeQueue(VideoScrapeQueue):
@@ -91,10 +114,18 @@ class BacklogServerVideoScrapeQueue(VideoScrapeQueue):
         redis: aioredis.Redis,
         settings: VideoScrapeQueueSettings,
         queue_name: str = DEFAULT_QUEUE_NAME,
+        *,
+        supports_uploaded: bool = False,
+        exchange_client: ExchangeClient | None = None,
+        exchange_url: str = DEFAULT_EXCHANGE_URL,
     ) -> None:
         self._redis: aioredis.Redis = redis
         self._settings: VideoScrapeQueueSettings = settings
         self._queue: str = queue_name
+        self.supports_uploaded: bool = supports_uploaded
+        self._exchange_client: ExchangeClient | None = exchange_client
+        self._exchange_url: str = exchange_url
+        self._fallback_logged: bool = False
         # IDs handed out by pop_entries with the force flag set; read
         # once by consume_force.
         self._forced: set[str] = set()
@@ -298,6 +329,159 @@ class BacklogServerVideoScrapeQueue(VideoScrapeQueue):
             for video_id, value in zip(ids, reply, strict=True)
         }
 
+    def state_names(self) -> list[str]:
+        '''Verbatim state names, the done ones included.
+
+        A queue that does not track upload state has no ``uploaded``.
+        '''
+        names: list[str] = [state.value for state in VideoState]
+        names.append('scraped')
+        if self.supports_uploaded:
+            names.append('uploaded')
+        return names
+
+    # -- upload state -------------------------------------------------
+
+    async def mark_uploaded(self, video_ids: list[str]) -> None:
+        '''Record *video_ids* as accepted by the bulk upload API.'''
+        if not self.supports_uploaded:
+            return
+        ids: list[str] = [
+            video_id for video_id in video_ids if video_id
+        ]
+        start: int
+        for start in range(0, len(ids), ENQUEUE_MANY_CHUNK_SIZE):
+            await self._cmd(
+                'UPLOADED',
+                *ids[start:start + ENQUEUE_MANY_CHUNK_SIZE],
+            )
+
+    async def uploaded_many(
+        self, video_ids: list[str], *, api_fallback: bool = True,
+    ) -> dict[str, bool]:
+        '''True for IDs the server holds as ``uploaded``.
+
+        With the migration fallback on, every ID the server does not
+        hold as ``uploaded`` is asked about on scrape.exchange:
+        ``scraped`` is ambiguous until the backfill, because it means
+        "on the exchange" for the original import and "waiting for
+        upload" for a video scraped since.
+        '''
+        if not self.supports_uploaded:
+            return {video_id: False for video_id in video_ids}
+        names: dict[str, str | None] = await self.get_state_names(
+            list(video_ids),
+        )
+        out: dict[str, bool] = {
+            video_id: names.get(video_id) == 'uploaded'
+            for video_id in video_ids
+        }
+        if not (api_fallback and self._fallback_on()):
+            return out
+        ask: list[str] = [
+            video_id for video_id in video_ids if not out.get(video_id)
+        ]
+        if not ask:
+            return out
+        out.update(await self._ask_api(ask))
+        return out
+
+    async def done_many(
+        self, video_ids: list[str], *, api_fallback: bool = True,
+    ) -> dict[str, bool]:
+        '''True for IDs that need no more work.
+
+        ``scraped`` is done even before its file is uploaded: it must
+        not be scraped again, and the uploader reads ``uploaded``
+        itself. With the migration fallback on, only IDs the server
+        does not know are asked about: every known ID is already
+        answered correctly, and the original import never queued an
+        ID that was on scrape.exchange.
+        '''
+        if not self.supports_uploaded:
+            return {video_id: False for video_id in video_ids}
+        names: dict[str, str | None] = await self.get_state_names(
+            list(video_ids),
+        )
+        out: dict[str, bool] = {
+            video_id: names.get(video_id) in _DONE_STATES
+            for video_id in video_ids
+        }
+        if not (api_fallback and self._fallback_on()):
+            return out
+        unknown: list[str] = [
+            video_id for video_id in video_ids
+            if names.get(video_id) is None
+        ]
+        if not unknown:
+            return out
+        out.update(await self._ask_api(unknown))
+        return out
+
+    def _fallback_on(self) -> bool:
+        '''Whether the migration fallback may ask the API at all.'''
+        if not self._settings.backlog_uploaded_api_fallback:
+            return False
+        if self._exchange_client is not None:
+            return True
+        if not self._fallback_logged:
+            _LOGGER.warning(
+                'BACKLOG_UPLOADED_API_FALLBACK is on but the queue '
+                'has no ExchangeClient; skipping the API fallback',
+            )
+            self._fallback_logged = True
+        return False
+
+    async def _ask_api(self, video_ids: list[str]) -> dict[str, bool]:
+        '''Ask scrape.exchange about *video_ids*.
+
+        Answers are bounded by ``exchange_existence_concurrency``;
+        confirmed IDs are marked ``uploaded``, so each one costs at
+        most one lookup during the migration. An error answers False:
+        the cost is a duplicate upload, which the bulk API reports as
+        a duplicate.
+        '''
+        client: ExchangeClient | None = self._exchange_client
+        if client is None:
+            return {}
+        gate: asyncio.Semaphore = asyncio.Semaphore(
+            max(1, self._settings.exchange_existence_concurrency),
+        )
+
+        async def one(video_id: str) -> tuple[str, bool | None]:
+            try:
+                async with gate:
+                    exists: bool = await exchange_video_exists(
+                        client, self._exchange_url, video_id,
+                    )
+            # Fail open: an error answers "not uploaded", which
+            # costs a duplicate upload at worst (design 5.4).
+            except Exception:  # noqa: BLE001
+                METRIC_BACKLOG_UPLOADED_API_FALLBACK.labels(
+                    outcome='error',
+                ).inc()
+                return (video_id, None)
+            return (video_id, exists)
+
+        answers: list[tuple[str, bool | None]] = list(
+            await asyncio.gather(*(one(video_id) for video_id in video_ids)),
+        )
+        out: dict[str, bool] = {}
+        confirmed: list[str] = []
+        for video_id, exists in answers:
+            if exists is None:
+                out[video_id] = False
+                continue
+            out[video_id] = exists
+            METRIC_BACKLOG_UPLOADED_API_FALLBACK.labels(
+                outcome='uploaded' if exists else 'not_uploaded',
+            ).inc()
+            if exists:
+                confirmed.append(video_id)
+        if confirmed:
+            await self.mark_uploaded(confirmed)
+        return out
+
     async def get_meta(
         self, video_id: str,
     ) -> dict[str, str]:
@@ -311,15 +495,24 @@ class BacklogServerVideoScrapeQueue(VideoScrapeQueue):
             'set_meta is not supported by the backlog server',
         )
 
-    async def count_by_state(
-        self,
-    ) -> dict[VideoState, int]:
+    async def _info(self) -> dict[str, int]:
         reply: list[Any] = await self._cmd('INFO')
-        info: dict[str, int] = {
+        return {
             _text(reply[i]): int(reply[i + 1])
             for i in range(0, len(reply) - 1, 2)
         }
+
+    async def count_by_state(
+        self,
+    ) -> dict[VideoState, int]:
+        info: dict[str, int] = await self._info()
         return {state: info.get(state.value, 0) for state in VideoState}
+
+    async def count_by_state_name(self) -> dict[str, int]:
+        '''Counts for every state the server stores, ``scraped`` and
+        (when upload state is tracked) ``uploaded`` included.'''
+        info: dict[str, int] = await self._info()
+        return {name: info.get(name, 0) for name in self.state_names()}
 
     async def search_meta(
         self,

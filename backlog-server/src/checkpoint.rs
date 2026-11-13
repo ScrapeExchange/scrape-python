@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::fsutil::write_atomic;
 
-pub const CHECKPOINT_VERSION: u32 = 1;
+/// Version 1 checkpoints load unchanged; version 2 marks a queue whose
+/// files may carry the `uploaded` state. The writer always writes 2.
+pub const CHECKPOINT_VERSION: u32 = 2;
 
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize,
@@ -56,7 +58,7 @@ pub fn read(dir: &Path) -> io::Result<Option<Checkpoint>> {
     match std::fs::read(path(dir)) {
         Ok(b) => {
             let c: Checkpoint = serde_json::from_slice(&b)?;
-            if c.version != CHECKPOINT_VERSION {
+            if !matches!(c.version, 1 | 2) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("unsupported checkpoint version {}", c.version),
@@ -84,5 +86,46 @@ mod tests {
         };
         write(d.path(), &c).unwrap();
         assert_eq!(read(d.path()).unwrap(), Some(c));
+    }
+
+    #[test]
+    fn reads_version_1_checkpoint() {
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let body: &[u8] = br#"{
+            "version": 1,
+            "generation": 3,
+            "replay_from_lsn": 0,
+            "lanes_as_of_lsn": 0,
+            "main": {"tail": 9, "resume": 2},
+            "priority": {"tail": 0, "resume": 0}
+        }"#;
+        std::fs::write(path(d.path()), body).unwrap();
+        let c: Checkpoint = read(d.path()).unwrap().unwrap();
+        assert_eq!(c.version, 1);
+        assert_eq!(c.generation, 3);
+        assert_eq!(c.main, LaneCkpt { tail: 9, resume: 2 });
+    }
+
+    #[test]
+    fn writes_version_2() {
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let c: Checkpoint = Checkpoint::default();
+        assert_eq!(c.version, 2);
+        write(d.path(), &c).unwrap();
+        let body: String = std::fs::read_to_string(path(d.path())).unwrap();
+        assert!(body.contains("\"version\": 2"), "{body}");
+        assert_eq!(read(d.path()).unwrap(), Some(c));
+    }
+
+    #[test]
+    fn rejects_unknown_version() {
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let body: &[u8] = br#"{"version": 3, "generation": 0,
+            "replay_from_lsn": 0, "lanes_as_of_lsn": 0,
+            "main": {"tail": 0, "resume": 0},
+            "priority": {"tail": 0, "resume": 0}}"#;
+        std::fs::write(path(d.path()), body).unwrap();
+        let e: io::Error = read(d.path()).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
     }
 }

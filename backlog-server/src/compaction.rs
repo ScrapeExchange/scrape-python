@@ -122,7 +122,7 @@ mod tests {
             assert_eq!(q.info().generation, round as u64 + 1);
             assert_eq!(q.info().delta_entries, 0);
         }
-        let mut want: [u64; 5] = [0; 5];
+        let mut want: [u64; 6] = [0; 6];
         for (id, s) in &model {
             assert_eq!(q.state(*id), Some(*s), "{id}");
             want[*s as usize] += 1;
@@ -247,7 +247,7 @@ mod tests {
             q.sync().unwrap();
         }
         let mut q: Queue = Queue::open(d.path(), params()).unwrap();
-        assert_eq!(q.info().counts, [149, 1, 0, 0, 0]);
+        assert_eq!(q.info().counts, [149, 1, 0, 0, 0, 0]);
         let got = q.pop(1000, Duration::from_secs(9), Instant::now()).unwrap();
         assert_eq!(got.len(), 149);
     }
@@ -266,7 +266,7 @@ mod tests {
         }
         let q: Queue = Queue::open(d.path(), params()).unwrap();
         assert_eq!(q.info().generation, 0);
-        assert_eq!(q.info().counts, [10, 0, 0, 0, 0]);
+        assert_eq!(q.info().counts, [10, 0, 0, 0, 0, 0]);
         let bdir = d.path().join("base");
         assert!(crate::base::list_generations(&bdir).unwrap().is_empty());
     }
@@ -302,7 +302,7 @@ mod tests {
         assert_eq!(q.info().delta_entries, 2);
         assert_eq!(q.state(1), Some(State::Queued));
         compact(&mut q);
-        assert_eq!(q.info().counts, [1, 1, 0, 0, 0]);
+        assert_eq!(q.info().counts, [1, 1, 0, 0, 0, 0]);
     }
 
     #[test]

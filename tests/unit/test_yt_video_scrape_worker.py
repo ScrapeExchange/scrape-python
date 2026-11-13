@@ -4,9 +4,15 @@ import logging
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from scrape_exchange.backlog_server_queue import (
+    BacklogServerVideoScrapeQueue,
+)
+from scrape_exchange.scraper_metrics import METRIC_UPLOADED_LOOKUPS
 from scrape_exchange.video_scrape_queue import (
+    VideoScrapeQueueSettings,
     VideoState,
 )
+from tests.unit.test_backlog_server_queue import FakeRedis
 from scrape_exchange.creator_map import InMemoryCreatorMap
 from scrape_exchange.youtube.youtube_video_innertube import (
     YouTubeBotDetectionError,
@@ -21,10 +27,39 @@ def _mock_settings() -> MagicMock:
     return s
 
 
+def _queue(is_uploaded: bool = False) -> AsyncMock:
+    '''A Redis-backed queue double: the uploaded lookup answers
+    *is_uploaded* and consume_force defaults to False.'''
+    queue: AsyncMock = AsyncMock()
+    queue.uploaded_many.side_effect = (
+        lambda ids: {video_id: is_uploaded for video_id in ids}
+    )
+    return queue
+
+
 def _mock_uploaded(is_uploaded: bool = False) -> AsyncMock:
     uploaded: AsyncMock = AsyncMock()
     uploaded.contains.return_value = is_uploaded
     return uploaded
+
+
+def _metric(outcome: str) -> float:
+    return METRIC_UPLOADED_LOOKUPS.labels(outcome=outcome)._value.get()
+
+
+def _backlog_queue(
+    replies: list[object] | None = None,
+) -> tuple[BacklogServerVideoScrapeQueue, FakeRedis]:
+    '''A real backlog queue over the recording fake client.'''
+    fake: FakeRedis = FakeRedis(replies)  # type: ignore[arg-type]
+    queue: BacklogServerVideoScrapeQueue = (
+        BacklogServerVideoScrapeQueue(
+            fake,  # type: ignore[arg-type]
+            VideoScrapeQueueSettings(_env_file=None),
+            supports_uploaded=True,
+        )
+    )
+    return queue, fake
 
 
 def _creator_map() -> InMemoryCreatorMap:
@@ -44,7 +79,7 @@ class TestScrapeOneQueued(
         mock_scrape: AsyncMock,
     ) -> None:
         mock_scrape.side_effect = RuntimeError('unexpected failure')
-        queue: AsyncMock = AsyncMock()
+        queue: AsyncMock = _queue()
         settings: MagicMock = _mock_settings()
         settings.video_transient_max_attempts = 1
         settings.video_use_yt_dlp = False
@@ -57,7 +92,6 @@ class TestScrapeOneQueued(
                 queue=queue,
                 settings=settings,
                 proxies=[proxy],
-                uploaded=_mock_uploaded(),
                 creator_map_backend=_creator_map(),
             )
 
@@ -81,7 +115,7 @@ class TestScrapeOneQueued(
         self, mock_scrape: AsyncMock,
     ) -> None:
         mock_scrape.return_value = None
-        queue: AsyncMock = AsyncMock()
+        queue: AsyncMock = _queue()
         from tools.yt_video_scrape import (
             _scrape_one_queued,
         )
@@ -90,7 +124,6 @@ class TestScrapeOneQueued(
             queue=queue,
             settings=_mock_settings(),
             proxies=['http://test-proxy:8080'],
-            uploaded=_mock_uploaded(),
             creator_map_backend=_creator_map(),
         )
         queue.complete.assert_awaited_once_with('aaa')
@@ -106,7 +139,7 @@ class TestScrapeOneQueued(
         mock_scrape.side_effect = RuntimeError(
             'this video is private',
         )
-        queue: AsyncMock = AsyncMock()
+        queue: AsyncMock = _queue()
         from tools.yt_video_scrape import (
             _scrape_one_queued,
         )
@@ -115,7 +148,6 @@ class TestScrapeOneQueued(
             queue=queue,
             settings=_mock_settings(),
             proxies=['http://test-proxy:8080'],
-            uploaded=_mock_uploaded(),
             creator_map_backend=_creator_map(),
         )
         queue.mark.assert_awaited_once()
@@ -137,7 +169,7 @@ class TestScrapeOneQueued(
             RuntimeError(' 429 '),
             RuntimeError(' 429 '),
         ]
-        queue: AsyncMock = AsyncMock()
+        queue: AsyncMock = _queue()
         from tools.yt_video_scrape import (
             _scrape_one_queued,
         )
@@ -146,7 +178,6 @@ class TestScrapeOneQueued(
             queue=queue,
             settings=_mock_settings(),
             proxies=['http://test-proxy:8080'],
-            uploaded=_mock_uploaded(),
             creator_map_backend=_creator_map(),
         )
         self.assertEqual(
@@ -173,7 +204,7 @@ class TestScrapeOneQueued(
             RuntimeError(' 429 '),
             None,
         ]
-        queue: AsyncMock = AsyncMock()
+        queue: AsyncMock = _queue()
         from tools.yt_video_scrape import (
             _scrape_one_queued,
         )
@@ -182,7 +213,6 @@ class TestScrapeOneQueued(
             queue=queue,
             settings=_mock_settings(),
             proxies=['http://test-proxy:8080'],
-            uploaded=_mock_uploaded(),
             creator_map_backend=_creator_map(),
         )
         self.assertEqual(
@@ -205,7 +235,7 @@ class TestScrapeOneQueued(
             YouTubeBotDetectionError('bot challenge'),
             None,
         ]
-        queue: AsyncMock = AsyncMock()
+        queue: AsyncMock = _queue()
         first_proxy: str = 'http://localhost:8080'
         second_proxy: str = 'http://scrape.exchange:8080'
         selections: list[list[str]] = []
@@ -224,7 +254,6 @@ class TestScrapeOneQueued(
                 queue=queue,
                 settings=_mock_settings(),
                 proxies=[first_proxy, second_proxy],
-                uploaded=_mock_uploaded(),
                 creator_map_backend=_creator_map(),
             )
 
@@ -266,7 +295,7 @@ class TestScrapeOneQueued(
             RateLimitWaitExceeded('player', slow, 15.0, 15.0),
             None,
         ]
-        queue: AsyncMock = AsyncMock()
+        queue: AsyncMock = _queue()
         selections: list[list[str]] = []
 
         def choose(candidates: list[str]) -> str:
@@ -279,7 +308,7 @@ class TestScrapeOneQueued(
         ):
             await _scrape_one_queued(
                 'aaa', queue=queue, settings=_mock_settings(),
-                proxies=[slow, fast], uploaded=_mock_uploaded(),
+                proxies=[slow, fast],
                 creator_map_backend=_creator_map(),
             )
         self.assertEqual(selections, [[slow, fast], [fast]])
@@ -304,7 +333,7 @@ class TestScrapeOneQueued(
         mock_scrape.side_effect = RateLimitWaitExceeded(
             'player', None, 15.0, 15.0,
         )
-        queue: AsyncMock = AsyncMock()
+        queue: AsyncMock = _queue()
         from tools.yt_video_scrape import _scrape_one_queued
         with patch(
             'tools.yt_video_scrape._choose_proxy',
@@ -312,7 +341,7 @@ class TestScrapeOneQueued(
         ):
             await _scrape_one_queued(
                 'aaa', queue=queue, settings=_mock_settings(),
-                proxies=proxies, uploaded=_mock_uploaded(),
+                proxies=proxies,
                 creator_map_backend=_creator_map(),
             )
         # 3 attempts, each after trying every proxy once more.
@@ -343,7 +372,7 @@ class TestScrapeOneQueued(
         mock_scrape.side_effect = RuntimeError(
             'totally weird error string',
         )
-        queue: AsyncMock = AsyncMock()
+        queue: AsyncMock = _queue()
         from tools.yt_video_scrape import (
             _scrape_one_queued,
         )
@@ -352,7 +381,6 @@ class TestScrapeOneQueued(
             queue=queue,
             settings=_mock_settings(),
             proxies=['http://test-proxy:8080'],
-            uploaded=_mock_uploaded(),
             creator_map_backend=_creator_map(),
         )
         queue.mark.assert_awaited_once()
@@ -368,7 +396,7 @@ class TestScrapeOneQueued(
     async def test_short_circuits_when_uploaded(
         self, mock_scrape: AsyncMock,
     ) -> None:
-        queue: AsyncMock = AsyncMock()
+        queue: AsyncMock = _queue(True)
         # Not forced: the uploaded skip applies.
         queue.consume_force.return_value = False
         from tools.yt_video_scrape import _scrape_one_queued
@@ -377,7 +405,6 @@ class TestScrapeOneQueued(
             queue=queue,
             settings=_mock_settings(),
             proxies=[],
-            uploaded=_mock_uploaded(True),
             creator_map_backend=_creator_map(),
         )
         queue.consume_force.assert_awaited_once_with('aaa')
@@ -391,7 +418,7 @@ class TestScrapeOneQueued(
     async def test_forced_uploaded_is_scraped(
         self, mock_scrape: AsyncMock,
     ) -> None:
-        queue: AsyncMock = AsyncMock()
+        queue: AsyncMock = _queue(True)
         # Forced: bypass the uploaded skip and scrape anyway.
         queue.consume_force.return_value = True
         from tools.yt_video_scrape import _scrape_one_queued
@@ -400,7 +427,6 @@ class TestScrapeOneQueued(
             queue=queue,
             settings=_mock_settings(),
             proxies=[],
-            uploaded=_mock_uploaded(True),
             creator_map_backend=_creator_map(),
         )
         queue.consume_force.assert_awaited_once_with('aaa')
@@ -415,17 +441,87 @@ class TestScrapeOneQueued(
     async def test_proceeds_when_not_uploaded(
         self, mock_scrape: AsyncMock,
     ) -> None:
-        queue: AsyncMock = AsyncMock()
+        queue: AsyncMock = _queue()
         from tools.yt_video_scrape import _scrape_one_queued
         await _scrape_one_queued(
             'aaa',
             queue=queue,
             settings=_mock_settings(),
             proxies=[],
-            uploaded=_mock_uploaded(False),
             creator_map_backend=_creator_map(),
         )
         mock_scrape.assert_awaited_once()
+
+
+    @patch(
+        'tools.yt_video_scrape._scrape_to_disk',
+        new_callable=AsyncMock,
+    )
+    async def test_backlog_queue_does_no_upload_lookup(
+        self, mock_scrape: AsyncMock,
+    ) -> None:
+        queue, fake = _backlog_queue()
+        hit: float = _metric('hit')
+        miss: float = _metric('miss')
+        from tools.yt_video_scrape import _scrape_one_queued
+        await _scrape_one_queued(
+            'aaa',
+            queue=queue,
+            settings=_mock_settings(),
+            proxies=[],
+            creator_map_backend=_creator_map(),
+        )
+        self.assertEqual(
+            [call for call in fake.calls if call[0] == 'BACKLOG.STATE'],
+            [],
+        )
+        mock_scrape.assert_awaited_once()
+        self.assertEqual(_metric('hit') - hit, 0)
+        self.assertEqual(_metric('miss') - miss, 0)
+
+    @patch(
+        'tools.yt_video_scrape._scrape_to_disk',
+        new_callable=AsyncMock,
+    )
+    async def test_backlog_forced_entry_counts_forced(
+        self, mock_scrape: AsyncMock,
+    ) -> None:
+        queue, _ = _backlog_queue([[['aaa', 1]]])
+        entries = await queue.pop_entries(1)
+        self.assertEqual(entries[0].video_id, 'aaa')
+        before: float = _metric('forced')
+        from tools.yt_video_scrape import _scrape_one_queued
+        await _scrape_one_queued(
+            'aaa',
+            queue=queue,
+            settings=_mock_settings(),
+            proxies=[],
+            creator_map_backend=_creator_map(),
+        )
+        mock_scrape.assert_awaited_once()
+        self.assertEqual(_metric('forced') - before, 1)
+
+    @patch(
+        'tools.yt_video_scrape._scrape_to_disk',
+        new_callable=AsyncMock,
+    )
+    async def test_redis_queue_skips_uploaded_video(
+        self, mock_scrape: AsyncMock,
+    ) -> None:
+        queue: AsyncMock = _queue(True)
+        queue.consume_force.return_value = False
+        before: float = _metric('hit')
+        from tools.yt_video_scrape import _scrape_one_queued
+        await _scrape_one_queued(
+            'aaa',
+            queue=queue,
+            settings=_mock_settings(),
+            proxies=[],
+            creator_map_backend=_creator_map(),
+        )
+        queue.complete.assert_awaited_once_with('aaa')
+        mock_scrape.assert_not_awaited()
+        self.assertEqual(_metric('hit') - before, 1)
 
 
 if __name__ == '__main__':

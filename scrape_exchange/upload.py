@@ -155,6 +155,8 @@ async def emit_bulk_batch_metrics(
     failed_counter: Any,
     missing_result_counter: Any,
     on_success_id: Callable[[str], Awaitable[None]] | None = None,
+    on_success_ids: Callable[[list[str]], Awaitable[None]] | None = None,
+    duplicates_counter: Any | None = None,
     failed_ratio_threshold: float = 0.30,
 ) -> None:
     batches_counter.labels(
@@ -166,7 +168,9 @@ async def emit_bulk_batch_metrics(
         outcome=outcome.status,
     ).inc()
     if outcome.success:
-        if on_success_id is not None:
+        if on_success_ids is not None:
+            await on_success_ids(sorted(outcome.success_ids))
+        elif on_success_id is not None:
             for content_id in outcome.success_ids:
                 await on_success_id(content_id)
         uploaded_counter.labels(
@@ -177,6 +181,11 @@ async def emit_bulk_batch_metrics(
             status='success',
             worker_id=get_worker_id(),
         ).inc(outcome.success)
+    if outcome.duplicate and duplicates_counter is not None:
+        duplicates_counter.labels(
+            platform=platform,
+            entity=entity,
+        ).inc(outcome.duplicate)
     total: int = outcome.success + outcome.failed + outcome.missing
     if outcome.failed and total > 0 and (
         outcome.failed / total >= failed_ratio_threshold

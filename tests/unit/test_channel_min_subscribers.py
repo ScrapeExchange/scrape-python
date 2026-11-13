@@ -141,7 +141,7 @@ class TestRssSkipsSmallChannels(unittest.IsolatedAsyncioTestCase):
                 creator_map_backend=AsyncMock(),
                 name_map_backend=AsyncMock(),
                 channel_validator=MagicMock(), tier=1,
-                video_queue=video_queue, uploaded_videos=uploaded,
+                video_queue=video_queue,
             )
         self.assertIs(result, True)
         self.creator_queue = creator_queue

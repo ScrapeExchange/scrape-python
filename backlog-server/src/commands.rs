@@ -28,6 +28,8 @@ pub enum Request {
         lease: Option<Duration>,
     },
     Complete(Vec<u64>),
+    /// IDs the bulk upload API accepted.
+    Uploaded(Vec<u64>),
     Mark {
         id: u64,
         state: State,
@@ -335,11 +337,22 @@ async fn backlog(op: &str, args: &[Vec<u8>], c: &Ctx) -> Value {
             }
             Request::Complete(ids)
         }
+        "UPLOADED" => {
+            if rest.is_empty() {
+                return wrong_args();
+            }
+            let ids: Vec<u64> = rest.iter().filter_map(|b| one_id(b)).collect();
+            if ids.is_empty() {
+                return Value::Int(0);
+            }
+            Request::Uploaded(ids)
+        }
         "MARK" => {
             let [id, state, reason] = rest else {
                 return wrong_args();
             };
             let state: State = match State::parse(text(state)) {
+                // `uploaded` is not terminal: BACKLOG.UPLOADED sets it.
                 Some(s) if s.is_terminal() => s,
                 _ => return err("ERR bad state"),
             };
@@ -482,8 +495,9 @@ mod tests {
                     },
                 ]),
                 Request::Complete(ids) => Reply::Count(ids.len() as u64),
+                Request::Uploaded(ids) => Reply::Count(ids.len() as u64),
                 Request::Info => Reply::Info(QueueInfo {
-                    counts: [1, 2, 3, 4, 5],
+                    counts: [1, 2, 3, 4, 5, 6],
                     ..QueueInfo::default()
                 }),
                 _ => Reply::Ok,
@@ -625,6 +639,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn uploaded_command_parses_ids_and_counts() {
+        let (c, fake) = ctx(None);
+        let mut conn: ConnState = ConnState::default();
+        let v: Value = run(
+            &c,
+            &mut conn,
+            &[
+                "BACKLOG.UPLOADED",
+                "youtube:video",
+                "AAAAAAAAAAA",
+                "AAAAAAAAAAE",
+            ],
+        )
+        .await;
+        assert_eq!(v, Value::Int(2));
+        assert_eq!(fake.seen.lock().unwrap()[0], Request::Uploaded(vec![0, 1]),);
+    }
+
+    #[tokio::test]
+    async fn uploaded_command_without_ids_is_wrong_args() {
+        let (c, _) = ctx(None);
+        let mut conn: ConnState = ConnState::default();
+        assert_eq!(
+            run(&c, &mut conn, &["BACKLOG.UPLOADED", "youtube:video"]).await,
+            Value::Error("ERR wrong number of arguments".into()),
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_rejects_uploaded() {
+        let (c, _) = ctx(None);
+        let mut conn: ConnState = ConnState::default();
+        assert_eq!(
+            run(
+                &c,
+                &mut conn,
+                &[
+                    "BACKLOG.MARK",
+                    "youtube:video",
+                    "AAAAAAAAAAA",
+                    "uploaded",
+                    "none",
+                ],
+            )
+            .await,
+            Value::Error("ERR bad state".into()),
+        );
+    }
+
+    #[tokio::test]
     async fn pop_reply_shape() {
         let (c, fake) = ctx(None);
         let mut conn: ConnState = ConnState::default();
@@ -727,7 +791,7 @@ mod tests {
                 Value::Int(2)
             ]
         );
-        assert_eq!(v.len(), 22);
+        assert_eq!(v.len(), 24);
     }
 
     #[tokio::test]

@@ -16,7 +16,6 @@ from scrape_exchange.video_scrape_queue import (
     VideoScrapeQueueSettings,
     VideoState,
 )
-from scrape_exchange.youtube.uploaded_video_ids import UploadedVideoIds
 from scrape_exchange.youtube.youtube_channel import YouTubeChannel
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
@@ -240,9 +239,6 @@ class KnownVideoIds:
         self._exchange_url: str = exchange_url
         self._channel_id: str = channel_id
         self._video_fm: AssetFileManagement = video_fm
-        self._uploaded: UploadedVideoIds = UploadedVideoIds(
-            '', redis_client=redis,
-        )
         self._queue: VideoScrapeQueue = make_video_scrape_queue(
             platform='youtube',
             redis=redis,
@@ -272,8 +268,10 @@ class KnownVideoIds:
         ]
         if not rest:
             return known
-        uploaded: dict[str, bool] = await self._uploaded.contains_many(rest)
-        known.update(video_id for video_id in rest if uploaded.get(video_id))
+        done: dict[str, bool] = await self._queue.done_many(
+            rest, api_fallback=False,
+        )
+        known.update(video_id for video_id in rest if done.get(video_id))
         rest = [video_id for video_id in rest if video_id not in known]
         if rest:
             states: dict[str, VideoState | None] = (
@@ -341,7 +339,6 @@ async def queue_video_ids(
     '''Queue those of *video_ids*, all of channel *channel_id*, that
     are not uploaded, scraped locally or on the exchange; see
     :func:`queue_channel_videos`.'''
-    uploaded: UploadedVideoIds = UploadedVideoIds('', redis_client=redis)
     queue: VideoScrapeQueue = make_video_scrape_queue(
         platform='youtube',
         redis=redis,
@@ -357,7 +354,9 @@ async def queue_video_ids(
     start: int
     for start in range(0, len(ids), BATCH_SIZE):
         batch: list[str] = ids[start:start + BATCH_SIZE]
-        flags: dict[str, bool] = await uploaded.contains_many(batch)
+        flags: dict[str, bool] = await queue.done_many(
+            batch, api_fallback=False,
+        )
         video_id: str
         for video_id in batch:
             if flags.get(video_id) or (

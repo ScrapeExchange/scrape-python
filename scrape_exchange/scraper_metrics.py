@@ -107,6 +107,44 @@ METRIC_UPLOADED_ADDS: Counter = Counter(
 )
 
 # ---------------------------------------------------------------------------
+# backlog_uploaded_api_fallback_total
+#   Upload-state answers the backlog server could not give and the
+#   migration fallback asked scrape.exchange for: uploaded (on the
+#   exchange), not_uploaded (404) or error (the lookup failed; the
+#   caller treats the ID as not uploaded, which costs a duplicate
+#   upload at worst).
+# ---------------------------------------------------------------------------
+METRIC_BACKLOG_UPLOADED_API_FALLBACK: Counter = Counter(
+    'backlog_uploaded_api_fallback_total',
+    'Upload-state lookups answered by the scrape.exchange API.',
+    ['outcome'],
+)
+
+# ---------------------------------------------------------------------------
+# bulk_upload_duplicates_total
+#   Records the bulk API reported as duplicates: scrape.exchange already
+#   had them. It is the signal that the uploader sent a video the
+#   exchange already stored, and the guard on the migration.
+# ---------------------------------------------------------------------------
+METRIC_BULK_UPLOAD_DUPLICATES: Counter = Counter(
+    'bulk_upload_duplicates_total',
+    'Bulk upload records scrape.exchange already had.',
+    ['platform', 'entity'],
+)
+
+# ---------------------------------------------------------------------------
+# backlog_upload_state_errors_total
+#   Upload-state calls that failed: 'lookup' on a check that failed open
+#   (the file is uploaded anyway), 'mark' on a failed record of an
+#   accepted upload (the file is moved anyway). See design 5.5.
+# ---------------------------------------------------------------------------
+METRIC_BACKLOG_UPLOAD_STATE_ERRORS: Counter = Counter(
+    'backlog_upload_state_errors_total',
+    'Failed upload-state lookups and marks in the uploader.',
+    ['op'],
+)
+
+# ---------------------------------------------------------------------------
 # scrape_queue_size
 #   Current number of items pending in the scrape queue. Use state='none'
 #   for scrapers that do not partition their queue by tier/state.

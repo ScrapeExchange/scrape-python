@@ -193,7 +193,10 @@ fn nofile_soft_limit() -> u64 {
     };
     // SAFETY: see above.
     let rc: i32 = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) };
-    if rc == 0 { rl.rlim_cur as u64 } else { 0 }
+    match rc {
+        0 => rl.rlim_cur,
+        _ => 0,
+    }
 }
 
 /// Render every queue's metrics plus the process-wide families.
@@ -376,7 +379,7 @@ mod tests {
     fn renders_families_and_labels() {
         let m: Arc<QueueMetrics> = Arc::new(QueueMetrics::new("youtube:video"));
         m.set_info(QueueInfo {
-            counts: [3, 0, 0, 0, 0],
+            counts: [3, 0, 0, 0, 0, 0],
             leased: 1,
             ..QueueInfo::default()
         });

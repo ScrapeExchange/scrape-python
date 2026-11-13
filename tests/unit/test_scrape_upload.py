@@ -12,16 +12,17 @@ import signal
 import sys
 import tempfile
 import unittest
-
-import brotli
-from prometheus_client import REGISTRY
-
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import brotli
+from prometheus_client import REGISTRY
+
+from scrape_exchange import bulk_upload
+from scrape_exchange import upload as exchange_upload
 from scrape_exchange.bulk_upload import (
     BulkBatchOutcome,
     BulkUploadState,
@@ -594,16 +595,15 @@ class TestPrepareAssetLine(unittest.IsolatedAsyncioTestCase):
     async def test_youtube_video_processor_records_successful_ids(
         self,
     ) -> None:
-        added: list[str] = []
+        marked: list[list[str]] = []
 
-        class FakeUploaded:
-            async def add(self, video_id: str) -> None:
-                added.append(video_id)
+        class FakeQueue:
+            async def mark_uploaded(self, ids: list[str]) -> None:
+                marked.append(list(ids))
 
         state = scrape_upload.YouTubeVideoProcessorState(
             creator_map=object(),
-            scrape_queue=None,
-            uploaded=FakeUploaded(),
+            scrape_queue=FakeQueue(),
         )
         context = scrape_upload.AssetProcessingContext(
             settings=_settings(),
@@ -613,12 +613,12 @@ class TestPrepareAssetLine(unittest.IsolatedAsyncioTestCase):
             state=state,
         )
 
-        await scrape_upload.YouTubeVideoProcessor().on_success_id(
-            'video123',
+        await scrape_upload.YouTubeVideoProcessor().on_success_ids(
+            ['video123'],
             context,
         )
 
-        self.assertEqual(added, ['video123'])
+        self.assertEqual(marked, [['video123']])
 
     async def test_tiktok_creator_corrupt_file_requeues_and_deletes(
         self,
@@ -2042,6 +2042,166 @@ class RejectedPurgeTest(unittest.IsolatedAsyncioTestCase):
                 await scrape_upload.rejected_purge_loop(targets, 86400)
 
         targets[1].fm.purge_rejected.assert_called_once()
+
+
+class TestYouTubeUploadState(unittest.IsolatedAsyncioTestCase):
+    '''The uploader records and checks upload state through the
+    video scrape queue (design 5.2 and 5.5).'''
+
+    def _state(self, queue: object) -> object:
+        return scrape_upload.YouTubeVideoProcessorState(
+            creator_map=object(),
+            scrape_queue=queue,
+        )
+
+    def _context(self, state: object, fm: object) -> object:
+        return scrape_upload.AssetProcessingContext(
+            settings=_settings(),
+            client=object(),
+            fm=fm,
+            descriptor=scrape_upload.descriptor_for('youtube', 'video'),
+            state=state,
+        )
+
+    async def test_youtube_marks_success_ids_once_per_batch(self) -> None:
+        marked: list[list[str]] = []
+
+        class FakeQueue:
+            async def mark_uploaded(self, ids: list[str]) -> None:
+                marked.append(list(ids))
+
+        context = self._context(self._state(FakeQueue()), object())
+        await scrape_upload.YouTubeVideoProcessor().on_success_ids(
+            ['b', 'a'], context,
+        )
+        self.assertEqual(marked, [['b', 'a']])
+
+    async def test_no_mark_when_batch_not_successful(self) -> None:
+        calls: list[list[str]] = []
+
+        async def on_ids(ids: list[str]) -> None:
+            calls.append(ids)
+
+        outcome: bulk_upload.BulkBatchOutcome = (
+            bulk_upload.BulkBatchOutcome(
+                status='completed', job_id='j', success=0, failed=1,
+                missing=0,
+            )
+        )
+        await exchange_upload.emit_bulk_batch_metrics(
+            outcome,
+            platform='youtube',
+            scraper='upload',
+            entity='video',
+            batches_counter=scrape_upload.METRIC_UPLOAD_BATCHES,
+            uploaded_counter=scrape_upload.METRIC_BACKGROUND_UPLOADS,
+            failed_counter=scrape_upload.METRIC_UPLOADS_FAILED,
+            missing_result_counter=(
+                scrape_upload.METRIC_UPLOADS_MISSING_RESULT
+            ),
+            on_success_ids=on_ids,
+        )
+        self.assertEqual(calls, [])
+
+    async def test_prepare_record_skips_uploaded_video(self) -> None:
+        class FakeQueue:
+            async def uploaded_many(
+                self, ids: list[str],
+            ) -> dict[str, bool]:
+                return {video_id: True for video_id in ids}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            descriptor = scrape_upload.descriptor_for(
+                'youtube', 'video',
+            )
+            fm: AssetFileManagement = AssetFileManagement(
+                tmp, prefix_rankings=descriptor.prefix_rankings,
+            )
+            name: str = 'youtube-video-abc.json.br'
+            await fm.write_file(name, {'id': 'abc'})
+            context = self._context(self._state(FakeQueue()), fm)
+            record = await scrape_upload.YouTubeVideoProcessor(
+            ).prepare_record(
+                {},
+                filename=name,
+                content_id='abc',
+                context=context,
+            )
+            self.assertIsNone(record)
+            self.assertFalse((Path(tmp) / name).exists())
+
+    async def test_lookup_error_uploads_and_counts(self) -> None:
+        class FakeQueue:
+            async def uploaded_many(
+                self, ids: list[str],
+            ) -> dict[str, bool]:
+                raise ConnectionError('no server')
+
+        metric = scrape_upload.METRIC_BACKLOG_UPLOAD_STATE_ERRORS
+        before: float = metric.labels(op='lookup')._value.get()
+        uploaded: bool = await scrape_upload.YouTubeVideoProcessor(
+        )._is_uploaded(self._state(FakeQueue()), 'abc')
+        self.assertFalse(uploaded)
+        self.assertEqual(
+            metric.labels(op='lookup')._value.get() - before, 1,
+        )
+
+    async def test_mark_error_still_moves_file_and_counts(self) -> None:
+        class FakeQueue:
+            async def mark_uploaded(self, ids: list[str]) -> None:
+                raise ConnectionError('no server')
+
+        metric = scrape_upload.METRIC_BACKLOG_UPLOAD_STATE_ERRORS
+        before: float = metric.labels(op='mark')._value.get()
+        context = self._context(self._state(FakeQueue()), object())
+        await scrape_upload.YouTubeVideoProcessor().on_success_ids(
+            ['abc'], context,
+        )
+        self.assertEqual(
+            metric.labels(op='mark')._value.get() - before, 1,
+        )
+
+    async def test_duplicates_counter(self) -> None:
+        metric = scrape_upload.METRIC_BULK_UPLOAD_DUPLICATES.labels(
+            platform='youtube', entity='video',
+        )
+        before: float = metric._value.get()
+        outcome: bulk_upload.BulkBatchOutcome = (
+            bulk_upload.BulkBatchOutcome(
+                status='completed', job_id='j', success=1, failed=0,
+                missing=0, success_ids={'a'}, duplicate=3,
+            )
+        )
+        await exchange_upload.emit_bulk_batch_metrics(
+            outcome,
+            platform='youtube',
+            scraper='upload',
+            entity='video',
+            batches_counter=scrape_upload.METRIC_UPLOAD_BATCHES,
+            uploaded_counter=scrape_upload.METRIC_BACKGROUND_UPLOADS,
+            failed_counter=scrape_upload.METRIC_UPLOADS_FAILED,
+            missing_result_counter=(
+                scrape_upload.METRIC_UPLOADS_MISSING_RESULT
+            ),
+            on_success_ids=None,
+            duplicates_counter=scrape_upload.METRIC_BULK_UPLOAD_DUPLICATES,
+        )
+        self.assertEqual(metric._value.get() - before, 3)
+
+    async def test_background_mode_marks_one_id(self) -> None:
+        class FakeQueue:
+            def __init__(self) -> None:
+                self.marked: list[str] = []
+
+            async def mark_uploaded(self, ids: list[str]) -> None:
+                self.marked.extend(ids)
+
+        queue: Any = FakeQueue()
+        context = self._context(self._state(queue), object())
+        kwargs: dict[str, Any] = scrape_upload.YouTubeVideoProcessor(
+        ).background_kwargs(context, 'abc')
+        await kwargs['on_success']()
+        self.assertEqual(queue.marked, ['abc'])
 
 
 if __name__ == '__main__':

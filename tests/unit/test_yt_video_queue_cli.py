@@ -117,13 +117,10 @@ class TestShow(
 
 
 def _stub_sources() -> object:
-    '''A _ScrapedBeforeSources with an empty uploaded set and no
-    API source (so the filter passes every id through).'''
+    '''A _ScrapedBeforeSources with no API source (so the filter
+    passes every id the queue does not know through).'''
     from tools.yt_video_queue import _ScrapedBeforeSources
-    uploaded = AsyncMock()
-    uploaded.contains_many.return_value = {}
     return _ScrapedBeforeSources(
-        uploaded=uploaded,
         exchange_client=None,
         warnings=[],
     )
@@ -161,7 +158,7 @@ class TestAdd(
         )
         self.assertIn(
             'add: processed=2 already_scraped=0 '
-            '(uploaded=0 terminal=0 api=0) '
+            '(uploaded=0 scraped=0 terminal=0 api=0) '
             'duplicates=1 added=1',
             out.getvalue(),
         )
@@ -479,17 +476,15 @@ class TestFilterAlreadyScraped(
     unittest.IsolatedAsyncioTestCase,
 ):
 
-    def _queue(self, state: object = None) -> AsyncMock:
+    def _queue(
+        self, state: object = None,
+        done: dict | None = None, uploaded: dict | None = None,
+    ) -> AsyncMock:
         queue = AsyncMock()
         queue.get_state.return_value = state
+        queue.done_many.return_value = done or {}
+        queue.uploaded_many.return_value = uploaded or {}
         return queue
-
-    def _uploaded(
-        self, mapping: dict | None = None,
-    ) -> AsyncMock:
-        uploaded = AsyncMock()
-        uploaded.contains_many.return_value = mapping or {}
-        return uploaded
 
     async def test_uploaded_hit_short_circuits(
         self,
@@ -497,10 +492,11 @@ class TestFilterAlreadyScraped(
         from tools.yt_video_queue import (
             _filter_already_scraped,
         )
-        queue = self._queue()
+        queue = self._queue(
+            done={'aaa': True}, uploaded={'aaa': True},
+        )
         res = await _filter_already_scraped(
             ['aaa'],
-            uploaded=self._uploaded({'aaa': True}),
             queue=queue,
             exchange_client=None,
             schema_version='0.0.2',
@@ -508,8 +504,89 @@ class TestFilterAlreadyScraped(
         )
         self.assertEqual(res.survivors, [])
         self.assertEqual(res.already_scraped['uploaded'], 1)
+        self.assertEqual(res.already_scraped['scraped'], 0)
         # Short-circuit: later sources not consulted.
         queue.get_state.assert_not_called()
+
+    async def test_source_done_separates_uploaded_and_scraped(
+        self,
+    ) -> None:
+        from tools.yt_video_queue import (
+            _filter_already_scraped,
+        )
+        queue = self._queue(
+            done={'aaa': True, 'bbb': True, 'ccc': False},
+            uploaded={'aaa': True, 'bbb': False, 'ccc': False},
+        )
+        res = await _filter_already_scraped(
+            ['aaa', 'bbb', 'ccc'],
+            queue=queue,
+            exchange_client=None,
+            schema_version='0.0.2',
+            remote_check=False,
+        )
+        self.assertEqual(res.survivors, ['ccc'])
+        self.assertEqual(res.already_scraped['uploaded'], 1)
+        self.assertEqual(res.already_scraped['scraped'], 1)
+
+    async def test_done_lookup_skips_api_fallback(self) -> None:
+        # The tool runs its own API source; the queue's fallback would
+        # check every id a second time.
+        from tools.yt_video_queue import (
+            _filter_already_scraped,
+        )
+        queue = self._queue()
+        await _filter_already_scraped(
+            ['aaa'],
+            queue=queue,
+            exchange_client=None,
+            schema_version='0.0.2',
+            remote_check=False,
+        )
+        self.assertEqual(
+            queue.done_many.await_args.kwargs, {'api_fallback': False},
+        )
+        self.assertEqual(
+            queue.uploaded_many.await_args.kwargs,
+            {'api_fallback': False},
+        )
+
+    async def test_api_confirmed_ids_are_marked_uploaded(
+        self,
+    ) -> None:
+        from tools.yt_video_queue import (
+            _filter_already_scraped,
+        )
+        queue = self._queue(None)
+        with patch(
+            'tools.yt_video_queue.get_data_by_param', new=AsyncMock(),
+        ):
+            await _filter_already_scraped(
+                ['aaa'],
+                queue=queue,
+                exchange_client=_api_client('me'),
+                schema_version='0.0.2',
+                remote_check=True,
+            )
+        queue.mark_uploaded.assert_awaited_once_with(['aaa'])
+
+    async def test_api_404_marks_nothing(self) -> None:
+        from tools.yt_video_queue import (
+            _filter_already_scraped,
+        )
+        queue = self._queue(None)
+        with patch(
+            'tools.yt_video_queue.get_data_by_param',
+            new=AsyncMock(side_effect=_http_404()),
+        ):
+            await _filter_already_scraped(
+                ['aaa'],
+                queue=queue,
+                exchange_client=_api_client('me'),
+                schema_version='0.0.2',
+                remote_check=True,
+            )
+        queue.mark_uploaded.assert_not_awaited()
 
     async def test_terminal_state_counts_as_scraped(
         self,
@@ -519,7 +596,6 @@ class TestFilterAlreadyScraped(
         )
         res = await _filter_already_scraped(
             ['aaa'],
-            uploaded=self._uploaded({}),
             queue=self._queue(VideoState.FAILED),
             exchange_client=None,
             schema_version='0.0.2',
@@ -536,7 +612,6 @@ class TestFilterAlreadyScraped(
         )
         res = await _filter_already_scraped(
             ['aaa'],
-            uploaded=self._uploaded({}),
             queue=self._queue(VideoState.QUEUED),
             exchange_client=None,
             schema_version='0.0.2',
@@ -556,8 +631,7 @@ class TestFilterAlreadyScraped(
         ):
             res = await _filter_already_scraped(
                 ['aaa'],
-                uploaded=self._uploaded({}),
-                queue=self._queue(None),
+                    queue=self._queue(None),
                 exchange_client=_api_client('me'),
                 schema_version='0.0.2',
                 remote_check=True,
@@ -580,8 +654,7 @@ class TestFilterAlreadyScraped(
         ):
             res = await _filter_already_scraped(
                 ['aaa'],
-                uploaded=self._uploaded({}),
-                queue=self._queue(None),
+                    queue=self._queue(None),
                 exchange_client=_api_client('me'),
                 schema_version='0.0.2',
                 remote_check=True,
@@ -599,8 +672,7 @@ class TestFilterAlreadyScraped(
         ):
             res = await _filter_already_scraped(
                 ['aaa'],
-                uploaded=self._uploaded({}),
-                queue=self._queue(None),
+                    queue=self._queue(None),
                 exchange_client=_api_client('me'),
                 schema_version='0.0.2',
                 remote_check=True,
@@ -617,8 +689,7 @@ class TestFilterAlreadyScraped(
         ):
             res = await _filter_already_scraped(
                 ['aaa'],
-                uploaded=self._uploaded({}),
-                queue=self._queue(None),
+                    queue=self._queue(None),
                 exchange_client=_api_client('me'),
                 schema_version='0.0.2',
                 remote_check=False,
@@ -632,14 +703,11 @@ class TestFilterAlreadyScraped(
         from tools.yt_video_queue import (
             _filter_already_scraped,
         )
-        uploaded = AsyncMock()
-        uploaded.contains_many.side_effect = RuntimeError(
-            'redis down',
-        )
+        queue = self._queue(None)
+        queue.done_many.side_effect = RuntimeError('server down')
         res = await _filter_already_scraped(
             ['aaa'],
-            uploaded=uploaded,
-            queue=self._queue(None),
+            queue=queue,
             exchange_client=None,
             schema_version='0.0.2',
             remote_check=True,

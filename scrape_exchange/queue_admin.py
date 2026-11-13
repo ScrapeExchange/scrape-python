@@ -448,18 +448,10 @@ class TikTokVideoQueueAdapter(OperatorQueue):
         )
 
     def states(self) -> list[str]:
-        return [
-            VideoState.QUEUED.value,
-            VideoState.UNAVAILABLE.value,
-            VideoState.FAILED.value,
-            VideoState.REMOVED.value,
-        ]
+        return self._queue.state_names()
 
     async def count_by_state(self) -> dict[str, int]:
-        counts: dict[VideoState, int] = (
-            await self._queue.count_by_state()
-        )
-        return {state.value: count for state, count in counts.items()}
+        return await self._queue.count_by_state_name()
 
     async def show(self, member_id: str) -> dict | None:
         video_id: str | None = normalize_tiktok_video_id(member_id)

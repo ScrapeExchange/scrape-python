@@ -69,6 +69,7 @@ pub struct FinalCounts {
     pub failed: u64,
     pub unavailable: u64,
     pub removed: u64,
+    pub uploaded: u64,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -83,7 +84,7 @@ pub struct ImportReport {
 }
 
 /// A fixed-size record that sorts by its natural order.
-trait FixedRecord: Ord + Copy {
+pub(crate) trait FixedRecord: Ord + Copy {
     const LEN: usize;
     fn put(&self, out: &mut [u8]);
     fn get(b: &[u8]) -> Self;
@@ -142,7 +143,7 @@ impl FixedRecord for Order {
 }
 
 /// External merge sort: sorted runs spilled to *dir*, merged on read.
-struct Sorter<T: FixedRecord> {
+pub(crate) struct Sorter<T: FixedRecord> {
     dir: PathBuf,
     tag: &'static str,
     run_len: usize,
@@ -151,7 +152,11 @@ struct Sorter<T: FixedRecord> {
 }
 
 impl<T: FixedRecord> Sorter<T> {
-    fn new(dir: &Path, tag: &'static str, run_len: usize) -> Sorter<T> {
+    pub(crate) fn new(
+        dir: &Path,
+        tag: &'static str,
+        run_len: usize,
+    ) -> Sorter<T> {
         Sorter {
             dir: dir.to_path_buf(),
             tag,
@@ -161,7 +166,7 @@ impl<T: FixedRecord> Sorter<T> {
         }
     }
 
-    fn push(&mut self, r: T) -> io::Result<()> {
+    pub(crate) fn push(&mut self, r: T) -> io::Result<()> {
         self.buf.push(r);
         if self.buf.len() >= self.run_len {
             self.spill()?;
@@ -189,14 +194,14 @@ impl<T: FixedRecord> Sorter<T> {
     }
 
     /// Spill the remainder and return a merged iterator.
-    fn finish(mut self) -> io::Result<(Merged<T>, usize)> {
+    pub(crate) fn finish(mut self) -> io::Result<(Merged<T>, usize)> {
         self.spill()?;
         let n: usize = self.runs.len();
         Ok((Merged::open(self.runs)?, n))
     }
 }
 
-struct Merged<T: FixedRecord> {
+pub(crate) struct Merged<T: FixedRecord> {
     readers: Vec<BufReader<File>>,
     heap: BinaryHeap<Reverse<(T, usize)>>,
     paths: Vec<PathBuf>,
@@ -219,7 +224,7 @@ impl<T: FixedRecord> Merged<T> {
         Ok(m)
     }
 
-    fn next(&mut self) -> io::Result<Option<T>> {
+    pub(crate) fn next(&mut self) -> io::Result<Option<T>> {
         let Some(Reverse((r, i))) = self.heap.pop() else {
             return Ok(None);
         };
@@ -420,6 +425,7 @@ pub fn run(args: &ImportArgs) -> Result<ImportReport> {
                 State::Failed => f.failed += 1,
                 State::Unavailable => f.unavailable += 1,
                 State::Removed => f.removed += 1,
+                State::Uploaded => f.uploaded += 1,
             }
             if meta.state().is_terminal() {
                 terminal.insert(win.id, win.ts);
@@ -550,6 +556,7 @@ mod tests {
         assert_eq!(r.final_counts.queued, 1);
         assert_eq!(r.final_counts.scraped, 1);
         assert_eq!(r.final_counts.unavailable, 1);
+        assert_eq!(r.final_counts.uploaded, 0);
         assert_eq!(r.lane_main, 1);
         let mut q: Queue =
             Queue::open(&data.join("youtube_video"), params()).unwrap();
@@ -640,7 +647,7 @@ mod tests {
         q.write_checkpoint().unwrap();
         drop(q);
         let q: Queue = Queue::open(&qdir, params()).unwrap();
-        assert_eq!(q.info().counts, [2, 1, 0, 0, 0]);
+        assert_eq!(q.info().counts, [2, 1, 0, 0, 0, 0]);
     }
 
     #[test]

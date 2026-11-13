@@ -169,6 +169,36 @@ class TestVideoQueueFactory(unittest.TestCase):
         self.assertIsInstance(q, RedisVideoScrapeQueue)
         self.assertEqual(q._key_prefix, 'tiktok:video')
 
+    def test_youtube_queues_support_upload_state(self) -> None:
+        with mock.patch(
+            'scrape_exchange.video_queue_factory.backlog_redis_from_url',
+        ):
+            backlog_q: Any = make_video_scrape_queue(
+                platform='youtube', redis=mock.Mock(),
+                settings=settings(DSN), component='x',
+            )
+        redis_q: VideoScrapeQueue = make_video_scrape_queue(
+            platform='youtube', redis=mock.Mock(),
+            settings=settings(None), component='x',
+        )
+        self.assertTrue(backlog_q.supports_uploaded)
+        self.assertTrue(redis_q.supports_uploaded)
+
+    def test_tiktok_queues_do_not_support_upload_state(self) -> None:
+        with mock.patch(
+            'scrape_exchange.video_queue_factory.backlog_redis_from_url',
+        ):
+            backlog_q: Any = make_video_scrape_queue(
+                platform='tiktok', redis=mock.Mock(),
+                settings=settings(DSN), component='x',
+            )
+        redis_q: VideoScrapeQueue = make_video_scrape_queue(
+            platform='tiktok', redis=mock.Mock(),
+            settings=settings(None), component='x',
+        )
+        self.assertFalse(backlog_q.supports_uploaded)
+        self.assertFalse(redis_q.supports_uploaded)
+
     def test_other_platforms_ignore_dsn(self) -> None:
         with mock.patch(
             'scrape_exchange.video_queue_factory.backlog_redis_from_url',

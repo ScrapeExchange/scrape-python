@@ -254,6 +254,38 @@ class TestTikTokVideoAdapter(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rec['video_id'], '7000000000000000001')
         self.assertEqual(rec['state'], 'queued')
 
+    async def test_states_follow_redis_queue(self) -> None:
+        adapter = await self._adapter()
+        self.assertEqual(
+            adapter.states(),
+            ['queued', 'unavailable', 'failed', 'removed'],
+        )
+
+    async def test_states_and_counts_on_backlog_server(self) -> None:
+        from scrape_exchange.backlog_server_queue import (
+            BacklogServerVideoScrapeQueue,
+        )
+        server = AsyncMock()
+        server.execute_command.return_value = [
+            'queued', 4, 'scraped', 6, 'failed', 1, 'unavailable', 0,
+            'removed', 0, 'uploaded', 0, 'leased', 2,
+        ]
+        queue = BacklogServerVideoScrapeQueue(
+            server,
+            VideoScrapeQueueSettings(_env_file=None),
+            queue_name='tiktok:video',
+            supports_uploaded=False,
+        )
+        adapter = queue_admin.TikTokVideoQueueAdapter(queue, MagicMock())
+        self.assertEqual(
+            adapter.states(),
+            ['queued', 'unavailable', 'failed', 'removed', 'scraped'],
+        )
+        counts: dict[str, int] = await adapter.count_by_state()
+        self.assertEqual(counts['scraped'], 6)
+        self.assertEqual(counts['queued'], 4)
+        self.assertNotIn('uploaded', counts)
+
     async def test_import_members_accepts_jsonl_video_id(
         self,
     ) -> None:

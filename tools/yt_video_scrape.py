@@ -87,8 +87,10 @@ from scrape_exchange.youtube.youtube_video import (
 from scrape_exchange.youtube.youtube_video_innertube import (
     YouTubeBotDetectionError,
 )
+from scrape_exchange.backlog_server_queue import (
+    BacklogServerVideoScrapeQueue,
+)
 from scrape_exchange.youtube.settings import YouTubeScraperSettings
-from scrape_exchange.youtube.uploaded_video_ids import UploadedVideoIds
 from scrape_exchange.video_queue_factory import make_video_scrape_queue
 from scrape_exchange.video_scrape_queue import (
     VideoQueueChannelContext,
@@ -447,7 +449,6 @@ async def _scrape_one_queued(
     queue: VideoScrapeQueue,
     settings: 'VideoSettings',
     proxies: list[str],
-    uploaded: UploadedVideoIds,
     creator_map_backend: CreatorMap,
     channel_context: VideoQueueChannelContext | None = None,
     redis: aioredis.Redis | None = None,
@@ -472,25 +473,34 @@ async def _scrape_one_queued(
     attempt passes ``proxy=None`` and the inner scrape falls through
     to the rate limiter's ``select_proxy``.
     '''
-    try:
-        is_uploaded: bool = await uploaded.contains(video_id)
-    except Exception:
-        METRIC_UPLOADED_LOOKUPS.labels(outcome='error').inc()
-        raise
-    if is_uploaded:
-        # A forced re-scrape (via yt_video_queue.py add/import
-        # --force) sets a one-shot ``force`` meta flag.
-        # consume_force clears it on read so the force is honoured
-        # exactly once and never leaks into a later scrape.
-        forced: bool = await queue.consume_force(video_id)
-        if not forced:
-            METRIC_UPLOADED_LOOKUPS.labels(outcome='hit').inc()
-            await queue.complete(video_id)
-            VIDEO_QUEUE_OUTCOMES.labels(outcome='scraped').inc()
-            return
-        METRIC_UPLOADED_LOOKUPS.labels(outcome='forced').inc()
+    # A forced re-scrape (via yt_video_queue.py add/import --force)
+    # sets a one-shot ``force`` meta flag. consume_force clears it on
+    # read so the force is honoured exactly once and never leaks into
+    # a later scrape.
+    forced: bool = await queue.consume_force(video_id)
+    if isinstance(queue, BacklogServerVideoScrapeQueue):
+        # A popped ID is `queued` by definition, so the backlog queue
+        # needs no upload lookup: the server drops queued work as soon
+        # as the uploader records the upload. The force flag still
+        # shows up in the metric.
+        if forced:
+            METRIC_UPLOADED_LOOKUPS.labels(outcome='forced').inc()
     else:
-        METRIC_UPLOADED_LOOKUPS.labels(outcome='miss').inc()
+        is_uploaded: bool
+        try:
+            is_uploaded = (await queue.uploaded_many([video_id]))[video_id]
+        except Exception:
+            METRIC_UPLOADED_LOOKUPS.labels(outcome='error').inc()
+            raise
+        if is_uploaded:
+            if not forced:
+                METRIC_UPLOADED_LOOKUPS.labels(outcome='hit').inc()
+                await queue.complete(video_id)
+                VIDEO_QUEUE_OUTCOMES.labels(outcome='scraped').inc()
+                return
+            METRIC_UPLOADED_LOOKUPS.labels(outcome='forced').inc()
+        else:
+            METRIC_UPLOADED_LOOKUPS.labels(outcome='miss').inc()
     attempts_left: int = (
         settings.video_transient_max_attempts
     )
@@ -733,7 +743,6 @@ async def _queue_driven_loop(
     settings: 'VideoSettings',
     proxies: list[str],
     concurrency: int,
-    uploaded: UploadedVideoIds,
     creator_map_backend: CreatorMap,
     redis: aioredis.Redis | None = None,
     exchange_client: ExchangeClient | None = None,
@@ -808,7 +817,6 @@ async def _queue_driven_loop(
                     queue=queue,
                     settings=settings,
                     proxies=proxies,
-                    uploaded=uploaded,
                     creator_map_backend=creator_map_backend,
                     channel_context=entry.channel,
                     redis=redis,
@@ -1295,9 +1303,6 @@ async def _run_worker(
             'and has no filesystem fallback. Set REDIS_DSN in '
             '.env.',
         )
-    uploaded_video_ids: UploadedVideoIds = UploadedVideoIds(
-        settings.redis_dsn,
-    )
     creator_map_backend: CreatorMap = RedisCreatorMap(
         settings.redis_dsn,
         platform='youtube',
@@ -1333,7 +1338,6 @@ async def _run_worker(
             settings,
             list(settings.proxies),
             streaming_concurrency,
-            uploaded_video_ids,
             creator_map_backend,
             video_queue_redis,
             ctx.client,

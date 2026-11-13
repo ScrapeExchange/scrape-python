@@ -10,6 +10,7 @@ pub mod import;
 pub mod known;
 pub mod lane;
 pub mod leases;
+pub mod mark_uploaded;
 pub mod meta;
 pub mod metrics;
 pub mod pacing;
