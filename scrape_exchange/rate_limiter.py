@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from prometheus_client import Counter, Gauge, Histogram
 
 from scrape_exchange.proxy_health import ProxyHealth
+from scrape_exchange.proxy_health import is_proxy_auth_error
 from scrape_exchange.redis_client import redis_from_url
 from scrape_exchange.util import extract_proxy_ip, extract_proxy_port
 from scrape_exchange.worker_id import get_worker_id
@@ -1251,6 +1252,7 @@ class RateLimiter(ABC, Generic[CallTypeT]):
 
     async def report_proxy_result(
         self, proxy: str | None, ok: bool,
+        exc: BaseException | None = None,
     ) -> None:
         '''
         Record the outcome of a request made through *proxy*.
@@ -1259,8 +1261,34 @@ class RateLimiter(ABC, Generic[CallTypeT]):
         (connection, tunnel, pool, TLS errors) and ``ok=True`` for
         completed requests; HTTP status errors and read timeouts are
         not about the proxy and should not be reported.
+
+        :param proxy: the proxy the request went through
+        :param ok: True for a completed request
+        :param exc: the exception of a failed request; a 407 Proxy
+            Authentication Required puts the proxy in a long
+            fleet-wide cooldown
+        :raises: (none)
         '''
-        await self._health.report(proxy, ok)
+        await self._health.report(
+            proxy, ok, auth_failure=is_proxy_auth_error(exc),
+        )
+
+    async def clear_proxy_auth_cooldowns(
+        self, proxies: list[str] | None = None,
+    ) -> int:
+        '''
+        Lift the cooldowns that a 407 Proxy Authentication Required
+        opened for *proxies* (default: this limiter's proxy pool),
+        fleet-wide when the Redis backend is used.
+
+        :param proxies: the proxies to clear
+        :returns: the number of cooldowns lifted
+        :raises: (none)
+        '''
+        targets: list[str] = list(proxies or self._proxies or [])
+        if not targets:
+            return 0
+        return await self._health.clear_auth_cooldowns(targets)
 
     def _labels(
         self, call_type: CallTypeT, proxy: str | None,

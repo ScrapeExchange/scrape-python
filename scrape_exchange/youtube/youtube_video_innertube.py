@@ -503,7 +503,9 @@ class InnerTubeVideoParser:
                 if isinstance(exc, httpx.TransportError) and not (
                     isinstance(exc, httpx.ReadTimeout)
                 ):
-                    await limiter.report_proxy_result(proxy, False)
+                    await limiter.report_proxy_result(
+                        proxy, False, exc,
+                    )
                 if borrowed_player and isinstance(
                     exc, httpx.TransportError
                 ):
@@ -676,7 +678,9 @@ class InnerTubeVideoParser:
                 if isinstance(exc, httpx.TransportError) and not (
                     isinstance(exc, httpx.ReadTimeout)
                 ):
-                    await limiter.report_proxy_result(proxy, False)
+                    await limiter.report_proxy_result(
+                        proxy, False, exc,
+                    )
                 if borrowed_next and isinstance(
                     exc, httpx.TransportError
                 ):

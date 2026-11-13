@@ -337,6 +337,10 @@ http://host:port:user:pass
 local://203.0.113.7
 ```
 
+You can edit the proxy files while the scrapers run. Every `PROXY_RELOAD_INTERVAL` seconds (default 60, `0` turns this off) the scrapers check the files; when the listed proxies change, a scraper with `*_NUM_PROCESSES` > 1 restarts the affected worker processes one at a time, and a single-process scraper exits with code 75 so that its container restart policy starts it again with the new list. A file that is missing, empty or has a malformed line is ignored with a warning and the scraper keeps its current proxies.
+
+A proxy that answers `407 Proxy Authentication Required` is skipped for 6 hours by all scrapers that share the same Redis (`REDIS_DSN`). Editing the proxy files lifts these 6-hour cooldowns for the proxies still listed, so a fixed proxy is used again right away.
+
 The rate limiter will apply the rate limits per proxy server, so using multiple proxy servers can help to increase the overall rate of scraping while still avoiding triggering bot detection. If you don't have a proxy server provider, but you do subscribe to a VPN service, you can use the VPN's proxy server. Check your VPN provider's documentation for the proxy server details.
 
 If you have a VPN subscription (ie., NordVPN, ProtonVPN, etc.), you can also set up your own proxy server using your VPN service. For example, you can use the Gluetun Docker image to set up a VPN connection and a Squid proxy server. Here's how you can do it:

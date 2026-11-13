@@ -1803,7 +1803,9 @@ class YouTubeChannelTabs:
                 if isinstance(
                     exc, (httpx.TransportError, asyncio.TimeoutError),
                 ) and not isinstance(exc, httpx.ReadTimeout):
-                    await limiter.report_proxy_result(self.proxy, False)
+                    await limiter.report_proxy_result(
+                        self.proxy, False, exc,
+                    )
                 if pinned is None and isinstance(
                     exc, (httpx.TransportError, asyncio.TimeoutError),
                 ):
