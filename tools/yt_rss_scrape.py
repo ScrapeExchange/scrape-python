@@ -215,6 +215,7 @@ from scrape_exchange.scraper_metrics import (
     METRIC_SCRAPES_COMPLETED as METRIC_RSS_DOWNLOADED,
     METRIC_SCRAPE_DURATION,
     METRIC_SCRAPE_FAILURES as METRIC_RSS_FAILURES,
+    METRIC_SCRAPE_QUEUE_ENQUEUES,
     METRIC_SCRAPE_QUEUE_SIZE as METRIC_QUEUE_SIZE,
     METRIC_RSS_CIRCUIT_TRANSITIONS,
     METRIC_RSS_CIRCUIT_WAIT_SECONDS,
@@ -1141,7 +1142,7 @@ async def _queue_video_for_scrape(
             video.channel_is_verified
             if isinstance(video.channel_is_verified, bool) else None
         )
-        await video_queue.enqueue(
+        added: bool = await video_queue.enqueue(
             video_id,
             source='rss',
             channel_id=video_channel_id,
@@ -1156,6 +1157,14 @@ async def _queue_video_for_scrape(
             exc=exc, extra=extra,
         )
         return None
+
+    if added:
+        # enqueue() is True only for IDs the queue has never seen in
+        # any state, so this counts newly discovered videos.
+        METRIC_SCRAPE_QUEUE_ENQUEUES.labels(
+            platform='youtube', scraper='rss_scraper',
+            entity='video', source='rss',
+        ).inc()
 
     logging.debug(
         'Queued video-id request for video scraper',
