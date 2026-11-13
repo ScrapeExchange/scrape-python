@@ -94,6 +94,45 @@ class TestQueueVideoForScrape(
         video.from_innertube.assert_not_awaited()
         video.to_file.assert_not_awaited()
 
+    def _new_count(self) -> float:
+        return self.module.METRIC_SCRAPE_QUEUE_ENQUEUES.labels(
+            platform='youtube', scraper='rss_scraper',
+            entity='video', source='rss',
+        )._value.get()
+
+    async def test_counts_newly_queued_video(self) -> None:
+        queue: mock.AsyncMock = self._queue()
+        queue.enqueue.return_value = True
+        before: float = self._new_count()
+        await self.module._queue_video_for_scrape(
+            self._video('vid_c'), channel_handle='hh',
+            video_queue=queue,
+        )
+        self.assertEqual(self._new_count(), before + 1)
+
+    async def test_does_not_count_known_video(self) -> None:
+        queue: mock.AsyncMock = self._queue()
+        queue.enqueue.return_value = False
+        before: float = self._new_count()
+        result: str | None = (
+            await self.module._queue_video_for_scrape(
+                self._video('vid_d'), channel_handle='hh',
+                video_queue=queue,
+            )
+        )
+        self.assertEqual(result, 'vid_d')
+        self.assertEqual(self._new_count(), before)
+
+    async def test_does_not_count_failed_enqueue(self) -> None:
+        queue: mock.AsyncMock = self._queue()
+        queue.enqueue.side_effect = RuntimeError('backlog down')
+        before: float = self._new_count()
+        await self.module._queue_video_for_scrape(
+            self._video('vid_e'), channel_handle='hh',
+            video_queue=queue,
+        )
+        self.assertEqual(self._new_count(), before)
+
 
 if __name__ == '__main__':
     unittest.main()
