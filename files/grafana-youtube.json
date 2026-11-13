@@ -193,7 +193,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "New channels added to the channel scrape queue by yt_discover_search.py over the last 24h.",
+      "description": "Over the last 24h: channels (search) are new channels yt_discover_search added to the channel scrape queue; videos (RSS) are video IDs the RSS scraper found that the video queue had never seen (not already queued, scraped or uploaded).",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -246,12 +246,23 @@
           },
           "editorMode": "code",
           "expr": "sum(increase(discover_enqueue_outcomes_total{outcome=\"enqueued\",job=~\"$job\",instance=~\"$instance\"}[24h]))",
-          "legendFormat": "enqueued",
+          "legendFormat": "channels (search)",
           "range": true,
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(scrape_queue_enqueue_total{scraper=\"rss_scraper\",source=\"rss\",job=~\"$job\",instance=~\"$instance\"}[24h]))",
+          "legendFormat": "videos (RSS)",
+          "range": true,
+          "refId": "B"
         }
       ],
-      "title": "Channels discovered (24h)",
+      "title": "Discovered (24h)",
       "type": "stat"
     },
     {
@@ -7820,6 +7831,6 @@
   "timezone": "",
   "title": "YouTube scrapers — progress, failures & latency",
   "uid": "scrape-youtube",
-  "version": 107,
+  "version": 108,
   "weekStart": ""
 }
