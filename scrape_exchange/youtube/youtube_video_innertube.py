@@ -35,6 +35,7 @@ from scrape_exchange.youtube.youtube_channel_tabs import (
 from dateutil import parser as dateutil_parser
 
 from .youtube_caption import YouTubeCaption
+from scrape_exchange.rate_limiter import RateLimitWaitExceeded
 from scrape_exchange.worker_id import get_worker_id
 from scrape_exchange.proxy_loader import proxy_file_label
 from .youtube_video_badges import (
@@ -45,6 +46,10 @@ from .youtube_client import METRIC_YT_REQUEST_DURATION, _get_scraper
 from .youtube_format import YouTubeFormat
 from .youtube_rate_limiter import YouTubeRateLimiter, YouTubeCallType
 from .youtube_thumbnail import YouTubeThumbnail
+from .youtube_transcript import (
+    build_panel_body, caption_languages, detect_audio_language,
+    has_transcript_panel, match_language, parse_transcript_panel,
+)
 from .youtube_videochapter import YouTubeVideoChapter
 
 from typing import TYPE_CHECKING
@@ -83,6 +88,27 @@ METRIC_INNERTUBE_PLAYER_RESPONSES: Counter = Counter(
         'platform', 'scraper', 'status', 'reason_class',
         'has_title', 'has_thumbnails', 'has_channel_id',
         'worker_id', 'proxy_file',
+    ],
+)
+
+# The transcript is best-effort: never let it hold up a video scrape
+# for longer than this waiting for a rate-limit token.
+_TRANSCRIPT_MAX_WAIT_SECONDS: float = 15.0
+_TRANSCRIPT_PENALTY_SECONDS: float = 30.0
+
+# outcome is one of 'success', 'unavailable' or 'failure'. reason is
+# 'none' for success, 'no_panel' or 'empty' for unavailable and one of
+# 'rate_limited', 'rate_wait', 'http_error', 'transport', 'timeout',
+# 'parse_error' or 'other' for failure.
+METRIC_TRANSCRIPT_SCRAPES: Counter = Counter(
+    'youtube_transcript_scrapes_total',
+    'Attempts to fetch the transcript of a video with InnerTube '
+    'get_panel, by outcome (success, unavailable when YouTube has no '
+    'transcript for the video, failure) and bounded reason. Failures '
+    'never fail the video scrape.',
+    [
+        'platform', 'scraper', 'outcome', 'reason', 'worker_id',
+        'proxy_file',
     ],
 )
 
@@ -148,6 +174,23 @@ async def _call_innertube(
             run_on_innertube_executor(fn, *args),
             timeout=_INNERTUBE_CALL_HARD_TIMEOUT_SECONDS,
         )
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    '''
+    *value* if it is a dict, otherwise an empty dict. YouTube sometimes
+    sends a key with a null value, for which ``dict.get(key, {})`` does
+    not return its default.
+    '''
+
+    return value if isinstance(value, dict) else {}
+
+
+def _as_list(value: Any) -> list[Any]:
+    '''*value* if it is a list, otherwise an empty list, see
+    :func:`_as_dict`'''
+
+    return value if isinstance(value, list) else []
 
 
 def _safe_int(value: str) -> int | None:
@@ -577,6 +620,7 @@ class InnerTubeVideoParser:
         InnerTubeVideoParser._apply_player_data(video, player_data)
 
         _next_penalty: float = _PLAYER_PENALTY_INITIAL
+        next_data: dict[str, Any] | None = None
         for attempt in range(1, max_retries + 1):
             await limiter.acquire(
                 YouTubeCallType.NEXT, proxy=proxy,
@@ -714,7 +758,161 @@ class InnerTubeVideoParser:
                 )
                 break  # NEXT is best-effort; never fail the whole scrape
 
+        if next_data is not None:
+            await self._scrape_transcript(
+                next_data, proxy, max_rate_limit_wait,
+                language=video.default_audio_language,
+                available_languages=caption_languages(player_data),
+            )
+
         return video
+
+    async def _scrape_transcript(
+        self, next_data: dict[str, Any], proxy: str | None,
+        max_rate_limit_wait: float | None = None,
+        language: str | None = None,
+        available_languages: list[str] | None = None,
+    ) -> None:
+        '''
+        Fetch the transcript of the video from the transcript panel and
+        store it in the video. This is best-effort: whatever goes wrong
+        is logged and counted in :data:`METRIC_TRANSCRIPT_SCRAPES`, but
+        never raised, so a missing transcript cannot fail the video.
+
+        :param next_data: the ``next`` response for the video, which
+            tells whether the video has a transcript at all
+        :param proxy: the proxy used for the player and next calls
+        :param max_rate_limit_wait: caps the wait for a rate-limit
+            token, never beyond :data:`_TRANSCRIPT_MAX_WAIT_SECONDS`
+        :param language: the language spoken in the video, in which the
+            transcript is requested. When unknown, YouTube picks the
+            language (usually English).
+        :param available_languages: language codes of the caption tracks
+            of the video, used to work out the language of the
+            transcript, which the panel does not state
+        '''
+
+        video_id: str = self.video.video_id
+        proxy_file: str = proxy_file_label(proxy or '')
+        extra: dict[str, str] = {
+            'api': 'get_panel',
+            'video_id': video_id,
+            'proxy_ip': extract_proxy_ip(proxy) if proxy else 'none',
+            'proxy_port': extract_proxy_port(proxy) if proxy else 'none',
+            'proxy_file': proxy_file,
+        }
+
+        def _count(outcome: str, reason: str = 'none') -> None:
+            METRIC_TRANSCRIPT_SCRAPES.labels(
+                platform='youtube',
+                scraper=_get_scraper(),
+                outcome=outcome,
+                reason=reason,
+                worker_id=get_worker_id(),
+                proxy_file=proxy_file,
+            ).inc()
+
+        if not has_transcript_panel(next_data):
+            _count('unavailable', 'no_panel')
+            return
+
+        limiter: YouTubeRateLimiter = YouTubeRateLimiter.get()
+        max_wait: float = _TRANSCRIPT_MAX_WAIT_SECONDS
+        if max_rate_limit_wait is not None:
+            max_wait = min(max_wait, max_rate_limit_wait)
+
+        borrowed: bool = False
+        client: InnerTube | None = None
+        start: float = 0.0
+        status_class: str = 'error'
+        try:
+            await limiter.acquire(
+                YouTubeCallType.TRANSCRIPT, proxy=proxy, max_wait=max_wait,
+            )
+            borrowed = self.next_innertube is None
+            client = (
+                borrow_pooled_innertube_for_entry(proxy)
+                if borrowed else self.next_innertube
+            )
+            start = time.monotonic()
+            try:
+                panel_data: dict[str, Any] = await _call_innertube(
+                    client, client.adaptor.dispatch, 'get_panel', None,
+                    build_panel_body(video_id, language),
+                )
+            finally:
+                if borrowed:
+                    await release_pooled_innertube(client)
+
+            status_class = '2xx'
+            try:
+                segments, chapters = parse_transcript_panel(panel_data)
+            except Exception as exc:
+                _count('failure', 'parse_error')
+                logging.debug(
+                    'Could not parse transcript', exc=exc, extra=extra,
+                )
+                return
+            if not segments:
+                _count('unavailable', 'empty')
+                return
+
+            self.video.transcript = segments
+            self.video.transcript_chapters = chapters
+            self.video.transcript_language = match_language(
+                available_languages or [], language or 'en',
+            )
+            _count('success')
+            logging.debug(
+                'Fetched transcript',
+                extra=extra | {
+                    'segments': len(segments), 'chapters': len(chapters),
+                },
+            )
+        except RateLimitWaitExceeded:
+            _count('failure', 'rate_wait')
+            logging.debug('Skipping transcript: rate limited', extra=extra)
+        except InnerTubeRequestError as exc:
+            if exc.error.code == 429:
+                status_class = '4xx'
+                await limiter.penalise(
+                    YouTubeCallType.TRANSCRIPT, proxy,
+                    _TRANSCRIPT_PENALTY_SECONDS,
+                )
+                _count('failure', 'rate_limited')
+                logging.warning(
+                    'InnerTube get_panel rate-limited', extra=extra,
+                )
+            else:
+                _count('failure', 'http_error')
+                logging.debug(
+                    'InnerTube get_panel failed', exc=exc, extra=extra,
+                )
+        except asyncio.TimeoutError as exc:
+            _count('failure', 'timeout')
+            logging.debug('Transcript fetch timed out', exc=exc, extra=extra)
+        except httpx.TransportError as exc:
+            if not isinstance(exc, httpx.ReadTimeout):
+                await limiter.report_proxy_result(proxy, False, exc)
+            if borrowed and client is not None:
+                await refresh_pooled_web_innertube_for_entry(
+                    proxy, challenged=client,
+                )
+            _count('failure', 'transport')
+            logging.debug('Transcript fetch failed', exc=exc, extra=extra)
+        except Exception as exc:
+            _count('failure', 'other')
+            logging.debug('Transcript fetch failed', exc=exc, extra=extra)
+        finally:
+            if start:
+                METRIC_YT_REQUEST_DURATION.labels(
+                    platform='youtube',
+                    scraper=_get_scraper(),
+                    api='innertube',
+                    status_class=status_class,
+                    worker_id=get_worker_id(),
+                    proxy_file=proxy_file,
+                ).observe(time.monotonic() - start)
 
     @staticmethod
     def _apply_player_data(
@@ -736,12 +934,16 @@ class InnerTubeVideoParser:
         RSS feed entry).  ``dict.get(k, default)`` only honours the
         default when the key is absent, which is too narrow.
         '''
-        video_details: dict = player_data.get('videoDetails', {})
-        captions_data: dict = player_data.get('captions', {})
-        microformat: dict = player_data.get(
-            'microformat', {}
-        ).get(
-            'playerMicroformatRenderer', {}
+        video_details: dict = _as_dict(player_data.get('videoDetails'))
+        captions_data: dict = _as_dict(player_data.get('captions'))
+        video.default_audio_language = (
+            detect_audio_language(player_data)
+            or video.default_audio_language
+        )
+        microformat: dict = _as_dict(
+            _as_dict(player_data.get('microformat')).get(
+                'playerMicroformatRenderer'
+            )
         )
 
         video.title = (
@@ -752,7 +954,7 @@ class InnerTubeVideoParser:
         )
         video.url = microformat.get('canonicalUrl') or video.url
         video.embed_url = (
-            microformat.get('embed', {}).get('iframeUrl')
+            _as_dict(microformat.get('embed')).get('iframeUrl')
             or video.embed_url
         )
 
@@ -789,10 +991,10 @@ class InnerTubeVideoParser:
         else:
             video.privacy_status = 'public'
 
-        video.keywords |= set(video_details.get('keywords', {}))
-        video.tags |= set(video_details.get('tags', {}))
+        video.keywords |= set(_as_list(video_details.get('keywords')))
+        video.tags |= set(_as_list(video_details.get('tags')))
         video.available_country_codes |= set(
-            microformat.get('availableCountries', [])
+            _as_list(microformat.get('availableCountries'))
         )
         video.is_family_safe = microformat.get(
             'isFamilySafe', video.is_family_safe
@@ -800,17 +1002,19 @@ class InnerTubeVideoParser:
 
         video.view_count = _safe_int(video_details.get('viewCount'))
         video.like_count = _safe_int(microformat.get('likeCount'))
-        playability: dict = player_data.get('playabilityStatus', {})
+        playability: dict = _as_dict(player_data.get('playabilityStatus'))
         video.age_restricted = (
             playability.get('status') == 'LOGIN_REQUIRED'
         )
         video.is_tv_film_video = video_details.get(
             'isTvFilmVideo', video.is_tv_film_video
         )
-        thumbnails_data = video_details.get(
-            'thumbnail', {}
-        ).get('thumbnails', [])
+        thumbnails_data: list = _as_list(
+            _as_dict(video_details.get('thumbnail')).get('thumbnails')
+        )
         for thumbnail_data in thumbnails_data:
+            if not isinstance(thumbnail_data, dict):
+                continue
             thumbnail = YouTubeThumbnail(thumbnail_data)
             # YouTube occasionally returns a thumbnail entry with
             # width/height but no url; without this guard the
@@ -862,8 +1066,12 @@ class InnerTubeVideoParser:
         subtitles: list[dict] = []
         auto_captions: list[dict] = []
 
-        renderer = captions_data.get('playerCaptionsTracklistRenderer', {})
-        for track in renderer.get('captionTracks', []):
+        renderer: dict = _as_dict(
+            captions_data.get('playerCaptionsTracklistRenderer')
+        )
+        for track in _as_list(renderer.get('captionTracks')):
+            if not isinstance(track, dict):
+                continue
             entry: dict[str, any] = {
                 'language_code': track.get('languageCode', 'unknown'),
                 'language_name': _text(track.get('name')),

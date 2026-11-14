@@ -250,6 +250,25 @@
                 "$ref": "#/$defs/chapter"
             }
         },
+        "transcript": {
+            "type": "array",
+            "description": "Transcript from YouTube's transcript panel, ordered by start_time. Omitted when YouTube has no transcript for the video",
+            "items": {
+                "$ref": "#/$defs/transcript_segment"
+            }
+        },
+        "transcript_language": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Language code of the caption track that the transcript comes from, omitted when unknown"
+        },
+        "transcript_chapters": {
+            "type": "array",
+            "description": "Chapter headings listed in the transcript panel, ordered by start_time. Omitted when the transcript has no chapter headings",
+            "items": {
+                "$ref": "#/$defs/transcript_chapter"
+            }
+        },
         "license": {
             "type": [
                 "string",
@@ -481,6 +500,44 @@
                     ]
                 }
             },
+            "additionalProperties": false
+        },
+        "transcript_segment": {
+            "type": "object",
+            "properties": {
+                "start_time": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Start of the segment in seconds"
+                },
+                "text": {
+                    "type": "string",
+                    "minLength": 1
+                }
+            },
+            "required": [
+                "start_time",
+                "text"
+            ],
+            "additionalProperties": false
+        },
+        "transcript_chapter": {
+            "type": "object",
+            "properties": {
+                "start_time": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Start of the chapter in seconds"
+                },
+                "title": {
+                    "type": "string",
+                    "minLength": 1
+                }
+            },
+            "required": [
+                "start_time",
+                "title"
+            ],
             "additionalProperties": false
         },
         "chapter": {

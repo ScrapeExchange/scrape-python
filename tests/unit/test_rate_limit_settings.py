@@ -38,10 +38,14 @@ class TestRateLimitSettingsDefaults(unittest.TestCase):
             )
             self.assertEqual(
                 r.YT_RATE_LIMITS.overall_refill_per_min,
-                400.0,
+                500.0,
             )
             self.assertEqual(
                 r.YT_RATE_LIMITS.search_refill_per_min,
+                60.0,
+            )
+            self.assertEqual(
+                r.YT_RATE_LIMITS.transcript_refill_per_min,
                 60.0,
             )
 
@@ -59,6 +63,19 @@ class TestRateLimitSettingsEnvOverride(unittest.TestCase):
             self.assertEqual(
                 r.YT_RATE_LIMITS.search_refill_per_min,
                 30.0,
+            )
+
+    def test_transcript_override(self) -> None:
+        with mock.patch.dict(
+            'os.environ',
+            {'TRANSCRIPT_REFILL_PER_MIN': '12'},
+            clear=True,
+        ):
+            import scrape_exchange.youtube.rate_limit_settings as r
+            importlib.reload(r)
+            self.assertEqual(
+                r.YT_RATE_LIMITS.transcript_refill_per_min,
+                12.0,
             )
 
     def test_overall_override(self) -> None:
@@ -139,7 +156,7 @@ class TestDefaultConfigsUseSettings(unittest.TestCase):
         import scrape_exchange.youtube.youtube_rate_limiter as yrl
         self.assertAlmostEqual(
             yrl._GLOBAL_CONFIG.refill_rate,
-            400.0 / 60,
+            500.0 / 60,
             places=6,
         )
 
@@ -151,6 +168,22 @@ class TestDefaultConfigsUseSettings(unittest.TestCase):
             ].refill_rate,
             60.0 / 60,
             places=6,
+        )
+
+    def test_transcript_default_in_configs(self) -> None:
+        import scrape_exchange.youtube.youtube_rate_limiter as yrl
+        config = yrl._DEFAULT_CONFIGS[yrl.YouTubeCallType.TRANSCRIPT]
+        self.assertAlmostEqual(config.refill_rate, 60.0 / 60, places=6)
+        self.assertEqual(config.burst, 2)
+        # The call runs serially in the video scrape, so jitter would
+        # lower the videos scraped per second.
+        self.assertEqual(config.jitter_min, 0.0)
+        self.assertEqual(config.jitter_max, 0.0)
+
+    def test_every_call_type_has_a_config(self) -> None:
+        import scrape_exchange.youtube.youtube_rate_limiter as yrl
+        self.assertEqual(
+            set(yrl._DEFAULT_CONFIGS), set(yrl.YouTubeCallType),
         )
 
 
