@@ -463,6 +463,83 @@ class TestBotDetectionResponseHandling(
         )
 
 
+class TestApplyPlayerDataNullValues(unittest.TestCase):
+    '''
+    YouTube sometimes sends a key with a null value instead of leaving
+    it out, for example ``"captions": {"playerCaptionsTracklistRenderer":
+    null}`` for videos without captions. ``dict.get(key, default)`` does
+    not use the default for a present-but-null key, so each of these
+    used to raise and fail the whole video scrape.
+    '''
+
+    def _apply(self, **extra: object) -> YouTubeVideo:
+        video: YouTubeVideo = YouTubeVideo(video_id='vid12345')
+        player_data: dict = {
+            'playabilityStatus': {'status': 'OK'},
+            'videoDetails': {'videoId': 'vid12345', 'title': 'A title'},
+        } | extra
+        InnerTubeVideoParser._apply_player_data(video, player_data)
+        return video
+
+    def test_null_values_do_not_raise(self) -> None:
+        details: dict = {'videoId': 'vid12345', 'title': 'A title'}
+        renderer: str = 'playerMicroformatRenderer'
+        cases: dict[str, dict] = {
+            'captions': {'captions': None},
+            'caption renderer': {
+                'captions': {'playerCaptionsTracklistRenderer': None},
+            },
+            'caption tracks': {
+                'captions': {'playerCaptionsTracklistRenderer': {
+                    'captionTracks': None}},
+            },
+            'caption track': {
+                'captions': {'playerCaptionsTracklistRenderer': {
+                    'captionTracks': [None]}},
+            },
+            'microformat': {'microformat': None},
+            'microformat renderer': {'microformat': {renderer: None}},
+            'embed': {'microformat': {renderer: {'embed': None}}},
+            'available countries': {
+                'microformat': {renderer: {'availableCountries': None}},
+            },
+            'video details': {'videoDetails': None},
+            'thumbnail': {'videoDetails': details | {'thumbnail': None}},
+            'thumbnails': {
+                'videoDetails': details | {
+                    'thumbnail': {'thumbnails': None}},
+            },
+            'keywords': {'videoDetails': details | {'keywords': None}},
+            'tags': {'videoDetails': details | {'tags': None}},
+            'chapters': {'videoDetails': details | {'chapters': None}},
+            'playability status': {'playabilityStatus': None},
+        }
+        for name, extra in cases.items():
+            with self.subTest(name):
+                self._apply(**extra)
+
+    def test_valid_data_is_still_applied(self) -> None:
+        video: YouTubeVideo = self._apply(
+            captions={'playerCaptionsTracklistRenderer': {
+                'captionTracks': [
+                    {'languageCode': 'en', 'kind': 'asr'},
+                    {'languageCode': 'nl'},
+                ],
+            }},
+            microformat={'playerMicroformatRenderer': {
+                'embed': {'iframeUrl': 'https://www.youtube.com/embed/x'},
+                'availableCountries': ['NL', 'US'],
+            }},
+        )
+        self.assertEqual(video.title, 'A title')
+        self.assertEqual(
+            video.embed_url, 'https://www.youtube.com/embed/x',
+        )
+        self.assertEqual(video.available_country_codes, {'NL', 'US'})
+        self.assertEqual(list(video.automatic_captions), ['en'])
+        self.assertEqual(list(video.subtitles), ['nl'])
+
+
 class TestInnerTubeClientRouting(unittest.IsolatedAsyncioTestCase):
     async def test_default_routes_player_to_android_and_next_to_web(
         self,

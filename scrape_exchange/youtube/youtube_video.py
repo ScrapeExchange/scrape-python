@@ -175,6 +175,16 @@ class YouTubeVideo:
         self.automatic_captions: dict[str, YouTubeCaption] = {}
         self.heatmaps: list[dict[str, float]] = []
 
+        # Transcript from YouTube's transcript panel (not the caption
+        # tracks). Segments are {'start_time': seconds, 'text': str},
+        # chapters are {'start_time': seconds, 'title': str}. Both stay
+        # empty when YouTube has no transcript for the video.
+        self.transcript: list[dict[str, int | str]] = []
+        self.transcript_chapters: list[dict[str, int | str]] = []
+        # Language code of the caption track that the transcript comes
+        # from, None if unknown
+        self.transcript_language: str | None = None
+
         # Data for the Byoda table with assets
         self.license: str | None = None
 
@@ -242,6 +252,12 @@ class YouTubeVideo:
         if self.automatic_captions != other.automatic_captions:
             return False
         if self.chapters != other.chapters:
+            return False
+        if self.transcript != other.transcript:
+            return False
+        if self.transcript_chapters != other.transcript_chapters:
+            return False
+        if self.transcript_language != other.transcript_language:
             return False
 
         if len(self.formats) != len(other.formats):
@@ -340,6 +356,17 @@ class YouTubeVideo:
                 lang: caption.to_dict()
                 for lang, caption in self.automatic_captions.items()
             }
+
+        if self.transcript:
+            data['transcript'] = [
+                dict(segment) for segment in self.transcript
+            ]
+        if self.transcript_language:
+            data['transcript_language'] = self.transcript_language
+        if self.transcript_chapters:
+            data['transcript_chapters'] = [
+                dict(chapter) for chapter in self.transcript_chapters
+            ]
 
         if self.formats:
             data['formats'] = {
@@ -450,6 +477,15 @@ class YouTubeVideo:
             for lang, caption_data
             in data.get('automatic_captions', {}).items()
         }
+
+        video.transcript = [
+            dict(segment) for segment in data.get('transcript') or []
+        ]
+        video.transcript_chapters = [
+            dict(chapter)
+            for chapter in data.get('transcript_chapters') or []
+        ]
+        video.transcript_language = data.get('transcript_language') or None
 
         video.formats = {
             format_id: YouTubeFormat.from_dict(fmt_data)

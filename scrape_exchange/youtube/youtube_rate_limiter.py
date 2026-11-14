@@ -115,6 +115,7 @@ class YouTubeCallType(str, Enum):
     HTML = 'html'
     RSS = 'rss'
     SEARCH = 'search'
+    TRANSCRIPT = 'transcript'
 
 
 # Per-type defaults — refill rates come from
@@ -172,6 +173,19 @@ _DEFAULT_CONFIGS: dict[YouTubeCallType, _BucketConfig] = {
         burst=10,
         refill_rate=YT_RATE_LIMITS.search_refill_per_min / 60,
         jitter_min=0.3, jitter_max=1.2,
+    ),
+    # InnerTube get_panel for the transcript of a video. Its own
+    # bucket so that a problem with this best-effort call cannot starve
+    # the player and next calls; still counted against the per-proxy
+    # overall cap. Burst of 2 for the same SYN-drop reasons as PLAYER.
+    # No jitter: the call runs serially after player and next in the
+    # video scrape, so every second of jitter lowers the number of
+    # videos scraped per second (2026-11-14: ~17% drop after the
+    # transcript fetch was added). The bucket already paces the calls.
+    YouTubeCallType.TRANSCRIPT: _BucketConfig(
+        burst=2,
+        refill_rate=YT_RATE_LIMITS.transcript_refill_per_min / 60,
+        jitter_min=0.0, jitter_max=0.0,
     ),
 }
 

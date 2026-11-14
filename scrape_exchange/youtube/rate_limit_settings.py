@@ -24,7 +24,12 @@ the 2026-05-12 rate-limit review:
   3.6s p95 sleep)
 * SEARCH  — 60/min  (InnerTube search by yt_discover_search.py;
   ``YOUTUBE_SEARCH_PER_MIN``)
-* OVERALL — 400/min per proxy across all call types (raised
+* TRANSCRIPT — 60/min (InnerTube ``get_panel`` for the transcript
+  of a video; ``TRANSCRIPT_REFILL_PER_MIN``). No measurements of
+  YouTube's own limit for this endpoint exist yet; watch the
+  ``youtube_transcript_scrapes_total`` metric (``rate_wait``
+  failures) and keep it in line with PLAYER.
+* OVERALL — 500/min per proxy across all call types (raised
   from 250/min on 2026-10-04: no 429s observed while the
   per-proxy budget was ~85% used)
 
@@ -131,8 +136,22 @@ class YouTubeRateLimitSettings(BaseSettings):
             'Default 60/min.'
         ),
     )
+    transcript_refill_per_min: float = Field(
+        default=60.0,
+        validation_alias=AliasChoices(
+            'TRANSCRIPT_REFILL_PER_MIN',
+            'transcript_refill_per_min',
+        ),
+        description=(
+            'Token-bucket refill rate for InnerTube get_panel calls '
+            'that fetch the transcript of a video, in requests per '
+            'minute per proxy. Separate from next so that transcript '
+            'fetches cannot use up the video scraper\'s next budget. '
+            'Default 60/min.'
+        ),
+    )
     overall_refill_per_min: float = Field(
-        default=400.0,
+        default=500.0,
         validation_alias=AliasChoices(
             'YOUTUBE_OVERALL_RATE_LIMIT',
             'overall_refill_per_min',
@@ -141,7 +160,7 @@ class YouTubeRateLimitSettings(BaseSettings):
             'Token-bucket refill rate of the global bucket that '
             'caps all YouTube call types combined, in requests '
             'per minute per proxy. Checked in addition to the '
-            'per-type buckets. Default 400/min.'
+            'per-type buckets. Default 500/min.'
         ),
     )
 

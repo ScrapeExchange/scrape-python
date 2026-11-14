@@ -1,0 +1,375 @@
+{
+  "content": {
+    "engagementPanelSectionListRenderer": {
+      "header": {
+        "engagementPanelTitleHeaderRenderer": {
+          "title": {
+            "runs": [
+              {
+                "text": "Transcript"
+              }
+            ]
+          }
+        }
+      },
+      "content": {
+        "sectionListRenderer": {
+          "contents": [
+            {
+              "itemSectionRenderer": {
+                "contents": [
+                  {
+                    "macroMarkersPanelItemViewModel": {
+                      "item": {
+                        "timelineItemViewModel": {
+                          "timestamp": "0:00",
+                          "contentItems": [
+                            {
+                              "transcriptSegmentViewModel": {
+                                "simpleText": "How pirates actually slept on a freezing ship without heating. Hey guys, tonight we're climbing into a hammock aboard a pirate ship in the middle of the North",
+                                "style": "TIMELINE_VIEW_STYLE_MODERN_INLINE_TIMESTAMPS",
+                                "timestamp": "0:00",
+                                "timestampUtf16Length": 4,
+                                "textUtf16Length": 158
+                              }
+                            }
+                          ],
+                          "style": "TIMELINE_VIEW_STYLE_MODERN"
+                        }
+                      },
+                      "index": 1,
+                      "panelId": "PAmodern_transcript_view",
+                      "onTap": {
+                        "innertubeCommand": {
+                          "watchEndpoint": {
+                            "videoId": "7PCQ7_m9uxw",
+                            "continuePlayback": true,
+                            "startTimeSeconds": 0
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "macroMarkersPanelItemViewModel": {
+                      "item": {
+                        "timelineItemViewModel": {
+                          "timestamp": "0:08",
+                          "contentItems": [
+                            {
+                              "transcriptSegmentViewModel": {
+                                "simpleText": "Atlantic in weather that has absolutely no business showing up in anyone's daydream about pirate life. Ice thick as a man's thumb crusting the rigging.",
+                                "style": "TIMELINE_VIEW_STYLE_MODERN_INLINE_TIMESTAMPS",
+                                "timestamp": "0:08",
+                                "timestampUtf16Length": 4,
+                                "textUtf16Length": 151
+                              }
+                            }
+                          ],
+                          "style": "TIMELINE_VIEW_STYLE_MODERN"
+                        }
+                      },
+                      "index": 2,
+                      "panelId": "PAmodern_transcript_view",
+                      "onTap": {
+                        "innertubeCommand": {
+                          "watchEndpoint": {
+                            "videoId": "7PCQ7_m9uxw",
+                            "continuePlayback": true,
+                            "startTimeSeconds": 8
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "macroMarkersPanelItemViewModel": {
+                      "item": {
+                        "timelineItemViewModel": {
+                          "timestamp": "0:18",
+                          "contentItems": [
+                            {
+                              "transcriptSegmentViewModel": {
+                                "simpleText": "Spray freezing solid before it even lands on deck. and not one single working source of heat anywhere between",
+                                "style": "TIMELINE_VIEW_STYLE_MODERN_INLINE_TIMESTAMPS",
+                                "timestamp": "0:18",
+                                "timestampUtf16Length": 4,
+                                "textUtf16Length": 109
+                              }
+                            }
+                          ],
+                          "style": "TIMELINE_VIEW_STYLE_MODERN"
+                        }
+                      },
+                      "index": 3,
+                      "panelId": "PAmodern_transcript_view",
+                      "onTap": {
+                        "innertubeCommand": {
+                          "watchEndpoint": {
+                            "videoId": "7PCQ7_m9uxw",
+                            "continuePlayback": true,
+                            "startTimeSeconds": 18
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "macroMarkersPanelItemViewModel": {
+                      "item": {
+                        "timelineItemViewModel": {
+                          "timestamp": "0:25",
+                          "contentItems": [
+                            {
+                              "transcriptSegmentViewModel": {
+                                "simpleText": "you and water cold enough to kill a strong swimmer in under 20 minutes.",
+                                "style": "TIMELINE_VIEW_STYLE_MODERN_INLINE_TIMESTAMPS",
+                                "timestamp": "0:25",
+                                "timestampUtf16Length": 4,
+                                "textUtf16Length": 71
+                              }
+                            }
+                          ],
+                          "style": "TIMELINE_VIEW_STYLE_MODERN"
+                        }
+                      },
+                      "index": 4,
+                      "panelId": "PAmodern_transcript_view",
+                      "onTap": {
+                        "innertubeCommand": {
+                          "watchEndpoint": {
+                            "videoId": "7PCQ7_m9uxw",
+                            "continuePlayback": true,
+                            "startTimeSeconds": 25
+                          }
+                        }
+                      }
+                    }
+                  }
+                ],
+                "header": {
+                  "macroMarkersPanelItemViewModel": {
+                    "item": {
+                      "timelineChapterViewModel": {
+                        "title": "Chapter 1: Life in the hammock",
+                        "style": "TIMELINE_VIEW_STYLE_MODERN",
+                        "index": 0
+                      }
+                    },
+                    "index": 0,
+                    "panelId": "PAmodern_transcript_view",
+                    "onTap": {
+                      "innertubeCommand": {
+                        "watchEndpoint": {
+                          "videoId": "7PCQ7_m9uxw",
+                          "continuePlayback": true,
+                          "startTimeSeconds": 0
+                        }
+                      }
+                    }
+                  }
+                },
+                "sectionIdentifier": "timeline_view_section0"
+              }
+            },
+            {
+              "itemSectionRenderer": {
+                "contents": [
+                  {
+                    "macroMarkersPanelItemViewModel": {
+                      "item": {
+                        "timelineItemViewModel": {
+                          "timestamp": "2:18",
+                          "contentItems": [
+                            {
+                              "transcriptSegmentViewModel": {
+                                "simpleText": "were, by the standards of the age, a genuinely clever piece of naval engineering, adapted from Caribbean indigenous designs that European sailors",
+                                "style": "TIMELINE_VIEW_STYLE_MODERN_INLINE_TIMESTAMPS",
+                                "timestamp": "2:18",
+                                "timestampUtf16Length": 4,
+                                "textUtf16Length": 145
+                              }
+                            }
+                          ],
+                          "style": "TIMELINE_VIEW_STYLE_MODERN"
+                        }
+                      },
+                      "index": 19,
+                      "panelId": "PAmodern_transcript_view",
+                      "onTap": {
+                        "innertubeCommand": {
+                          "watchEndpoint": {
+                            "videoId": "7PCQ7_m9uxw",
+                            "continuePlayback": true,
+                            "startTimeSeconds": 138
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "macroMarkersPanelItemViewModel": {
+                      "item": {
+                        "timelineItemViewModel": {
+                          "timestamp": "2:28",
+                          "contentItems": [
+                            {
+                              "transcriptSegmentViewModel": {
+                                "simpleText": "encountered in the 16th century, and never stopped using. Because a swinging bed keeps a sleeping man roughly level, even when the deck beneath him is not.",
+                                "style": "TIMELINE_VIEW_STYLE_MODERN_INLINE_TIMESTAMPS",
+                                "timestamp": "2:28",
+                                "timestampUtf16Length": 4,
+                                "textUtf16Length": 155
+                              }
+                            }
+                          ],
+                          "style": "TIMELINE_VIEW_STYLE_MODERN"
+                        }
+                      },
+                      "index": 20,
+                      "panelId": "PAmodern_transcript_view",
+                      "onTap": {
+                        "innertubeCommand": {
+                          "watchEndpoint": {
+                            "videoId": "7PCQ7_m9uxw",
+                            "continuePlayback": true,
+                            "startTimeSeconds": 148,
+                            "playerParams": "0gcJCUEAhQB8QzpG"
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "macroMarkersPanelItemViewModel": {
+                      "item": {
+                        "timelineItemViewModel": {
+                          "timestamp": "2:37",
+                          "contentItems": [
+                            {
+                              "transcriptSegmentViewModel": {
+                                "simpleText": "On a ship pitching in a heavy sea, that matters. What it does not do is keep you warm. Canvas has no insulating value to",
+                                "style": "TIMELINE_VIEW_STYLE_MODERN_INLINE_TIMESTAMPS",
+                                "timestamp": "2:37",
+                                "timestampUtf16Length": 4,
+                                "textUtf16Length": 120
+                              }
+                            }
+                          ],
+                          "style": "TIMELINE_VIEW_STYLE_MODERN"
+                        }
+                      },
+                      "index": 21,
+                      "panelId": "PAmodern_transcript_view",
+                      "onTap": {
+                        "innertubeCommand": {
+                          "watchEndpoint": {
+                            "videoId": "7PCQ7_m9uxw",
+                            "continuePlayback": true,
+                            "startTimeSeconds": 157
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "macroMarkersPanelItemViewModel": {
+                      "item": {
+                        "timelineItemViewModel": {
+                          "timestamp": "2:46",
+                          "contentItems": [
+                            {
+                              "transcriptSegmentViewModel": {
+                                "simpleText": "speak of. You are in effect sleeping in a sling made of sailcloth, suspended in the coldest, dampest space on the entire",
+                                "style": "TIMELINE_VIEW_STYLE_MODERN_INLINE_TIMESTAMPS",
+                                "timestamp": "2:46",
+                                "timestampUtf16Length": 4,
+                                "textUtf16Length": 120
+                              }
+                            }
+                          ],
+                          "style": "TIMELINE_VIEW_STYLE_MODERN"
+                        }
+                      },
+                      "index": 22,
+                      "panelId": "PAmodern_transcript_view",
+                      "onTap": {
+                        "innertubeCommand": {
+                          "watchEndpoint": {
+                            "videoId": "7PCQ7_m9uxw",
+                            "continuePlayback": true,
+                            "startTimeSeconds": 166
+                          }
+                        }
+                      }
+                    }
+                  }
+                ],
+                "header": {
+                  "macroMarkersPanelItemViewModel": {
+                    "item": {
+                      "timelineChapterViewModel": {
+                        "title": "Chapter 2: The challenges of cold",
+                        "style": "TIMELINE_VIEW_STYLE_MODERN",
+                        "index": 0
+                      }
+                    },
+                    "index": 18,
+                    "panelId": "PAmodern_transcript_view",
+                    "onTap": {
+                      "innertubeCommand": {
+                        "watchEndpoint": {
+                          "videoId": "7PCQ7_m9uxw",
+                          "continuePlayback": true,
+                          "startTimeSeconds": 136
+                        }
+                      }
+                    }
+                  }
+                },
+                "sectionIdentifier": "timeline_view_section1"
+              }
+            }
+          ],
+          "header": {
+            "searchInputViewModel": {
+              "placeholderText": "Search transcript",
+              "isFocused": false,
+              "onInputAction": {
+                "command": {
+                  "innertubeCommand": {
+                    "continuationCommand": {
+                      "token": "kta-ngs0EhhQQW1vZGVybl90cmFuc2NyaXB0X3ZpZXcaGHFna1BDZ3MzVUVOUk4xOXRPWFY0ZHhnQw%3D%3D",
+                      "request": "CONTINUATION_REQUEST_TYPE_GET_PANEL"
+                    }
+                  }
+                }
+              },
+              "formSchema": {
+                "id": "timeline_search_input_form_id"
+              },
+              "clearButtonA11yLabel": "Clear",
+              "backgroundStyle": "SEARCH_INPUT_BACKGROUND_STYLE_EP",
+              "rendererContext": {
+                "loggingContext": {}
+              }
+            }
+          },
+          "hideBottomSeparator": true,
+          "targetId": "PAmodern_transcript_view",
+          "selectedItemAlignmentPercentOffset": 0.1,
+          "webComponentHint": {
+            "componentVersion": "WEB_COMPONENT_VERSION_SHARED"
+          },
+          "headerStyle": "SECTION_LIST_HEADER_STYLE_STICKY"
+        }
+      },
+      "veType": 297672,
+      "disablePullRefresh": true,
+      "identifier": {
+        "surface": "ENGAGEMENT_PANEL_SURFACE_WATCH",
+        "tag": "PAmodern_transcript_view"
+      }
+    }
+  }
+}
