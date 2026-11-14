@@ -1475,6 +1475,7 @@ async def _process_creator(
         METRIC_SCRAPE_DURATION.labels(
             platform=PLATFORM, scraper=SCRAPER_LABEL, entity=ENTITY,
             api=API_LABEL, outcome='success', worker_id=worker_id,
+            innertube_calls='none',
         ).observe(time.monotonic() - start)
         return None
     except Exception as exc:
@@ -1491,6 +1492,7 @@ async def _process_creator(
         METRIC_SCRAPE_DURATION.labels(
             platform=PLATFORM, scraper=SCRAPER_LABEL, entity=ENTITY,
             api=API_LABEL, outcome='failure', worker_id=worker_id,
+            innertube_calls='none',
         ).observe(time.monotonic() - start)
         return reason
 

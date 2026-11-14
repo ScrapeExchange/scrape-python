@@ -79,6 +79,7 @@ def record_outcome(
         **labels,
         outcome=('success' if outcome == 'scraped' else
                  'claim_lost' if outcome == 'claim_lost' else 'failure'),
+        innertube_calls='none',
     ).observe(time.monotonic() - started)
 
 

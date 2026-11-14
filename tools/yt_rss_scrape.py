@@ -1043,6 +1043,7 @@ async def fetch_rss(
             api='rss',
             outcome='success',
             worker_id=get_worker_id(),
+            innertube_calls='none',
         ).observe(duration)
         return videos
     except Exception:
@@ -1054,6 +1055,7 @@ async def fetch_rss(
             api='rss',
             outcome='failure',
             worker_id=get_worker_id(),
+            innertube_calls='none',
         ).observe(duration)
         raise
     finally:

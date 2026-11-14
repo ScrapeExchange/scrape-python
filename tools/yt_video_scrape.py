@@ -15,6 +15,7 @@ import errno
 import os
 import resource
 import sys
+import time
 import asyncio
 import logging
 
@@ -105,10 +106,14 @@ import redis.asyncio as aioredis
 # Prometheus metrics — shared declarations live in scraper_metrics to
 # avoid duplicate-registration errors when multiple tool modules are
 # imported in the same process (e.g. test runners).
+from scrape_exchange.youtube.innertube_calls import (
+    calls_label, record_call, track_calls,
+)
 from scrape_exchange.scraper_metrics import (
     METRIC_QUEUE_CONNECTION_ERRORS,
     METRIC_UPLOADS_SKIPPED as METRIC_VIDEOS_ALREADY_UPLOADED,
     METRIC_SCRAPES_COMPLETED,
+    METRIC_SCRAPE_DURATION,
     METRIC_SCRAPE_FAILURES,
     METRIC_UPLOADED_LOOKUPS,
 )
@@ -285,7 +290,55 @@ async def _scrape_to_disk(
     receives an empty ``proxies`` list and falls through to the
     rate limiter's ``select_proxy``, which returns ``None`` on
     hosts with no proxies configured (e.g. scraper003).
+
+    Each attempt is observed in ``scrape_duration_seconds``, labelled
+    with the YouTube calls it sent (see
+    :mod:`scrape_exchange.youtube.innertube_calls`).
     '''
+    api: str = 'ytdlp' if settings.video_use_yt_dlp else 'innertube'
+    outcome: str = 'failure'
+    start: float = time.monotonic()
+    with track_calls() as calls:
+        try:
+            await _scrape_attempt(
+                video_id,
+                settings=settings,
+                proxy=proxy,
+                download_client=download_client,
+                creator_map_backend=creator_map_backend,
+                channel_context=channel_context,
+                redis=redis,
+                exchange_client=exchange_client,
+                exchange_username=exchange_username,
+                max_rate_limit_wait=max_rate_limit_wait,
+            )
+            outcome = 'success'
+        finally:
+            METRIC_SCRAPE_DURATION.labels(
+                platform='youtube',
+                scraper='video_scraper',
+                entity='video',
+                api=api,
+                outcome=outcome,
+                worker_id=get_worker_id(),
+                innertube_calls=calls_label(calls),
+            ).observe(time.monotonic() - start)
+
+
+async def _scrape_attempt(
+    video_id: str,
+    *,
+    settings: 'VideoSettings',
+    proxy: str | None,
+    download_client: YoutubeDL | None,
+    creator_map_backend: CreatorMap | None,
+    channel_context: VideoQueueChannelContext | None,
+    redis: aioredis.Redis | None,
+    exchange_client: ExchangeClient | None,
+    exchange_username: str | None,
+    max_rate_limit_wait: float | None,
+) -> None:
+    '''The work of one :func:`_scrape_to_disk` attempt, untimed.'''
     video: YouTubeVideo = await YouTubeVideo.scrape(
         video_id, channel_handle=None,
         channel_thumbnail=None,
@@ -417,6 +470,7 @@ async def _resolve_video_channel_handle(
         video.channel_handle = cached
         return
 
+    record_call('channel_browse')
     resolved: str | None = await YouTubeChannel.resolve_channel_id(
         video.channel_id,
         proxy=proxy,
