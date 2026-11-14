@@ -621,157 +621,183 @@ class InnerTubeVideoParser:
         await limiter.report_proxy_result(proxy, True)
         InnerTubeVideoParser._apply_player_data(video, player_data)
 
-        _next_penalty: float = _PLAYER_PENALTY_INITIAL
-        next_data: dict[str, Any] | None = None
-        for attempt in range(1, max_retries + 1):
-            await limiter.acquire(
-                YouTubeCallType.NEXT, proxy=proxy,
-                max_wait=max_rate_limit_wait,
-            )
-            next_start: float = time.monotonic()
-            borrowed_next: bool = self.next_innertube is None
-            next_client: InnerTube = (
-                borrow_pooled_innertube_for_entry(proxy)
-                if borrowed_next
-                else self.next_innertube
-            )
-            try:
-                record_call('next')
+        async def fetch_next() -> dict[str, Any] | None:
+            '''Call NEXT with retries; None when it gave no data.'''
+            _next_penalty: float = _PLAYER_PENALTY_INITIAL
+            next_data: dict[str, Any] | None = None
+            for attempt in range(1, max_retries + 1):
+                await limiter.acquire(
+                    YouTubeCallType.NEXT, proxy=proxy,
+                    max_wait=max_rate_limit_wait,
+                )
+                next_start: float = time.monotonic()
+                borrowed_next: bool = self.next_innertube is None
+                next_client: InnerTube = (
+                    borrow_pooled_innertube_for_entry(proxy)
+                    if borrowed_next
+                    else self.next_innertube
+                )
                 try:
-                    next_data: dict[str, Any] = await _call_innertube(
-                        next_client,
-                        next_client.next,
-                        video.video_id,
-                    )
-                finally:
-                    if borrowed_next:
-                        await release_pooled_innertube(next_client)
-                await limiter.report_proxy_result(proxy, True)
-                duration = time.monotonic() - next_start
-                METRIC_YT_REQUEST_DURATION.labels(
-                    platform='youtube',
-                    scraper=_get_scraper(),
-                    api='innertube',
-                    status_class='2xx',
-                    worker_id=get_worker_id(),
-                    proxy_file=proxy_file,
-                ).observe(duration)
-                logging.debug(
-                    'InnerTube request completed',
-                    extra={
-                        'api': 'next',
-                        'video_id': video.video_id,
-                        'duration': duration,
-                        'proxy_ip': proxy_ip,
-                        'proxy_port': proxy_port,
-                        'proxy_file': proxy_file,
-                        'status_class': '2xx',
-                    },
-                )
-                self._parse_next_data(next_data)
-                break
-            except InnerTubeRequestError as exc:
-                duration = time.monotonic() - next_start
-                status_class = (
-                    '4xx'
-                    if exc.error.code == 429
-                    else 'error'
-                )
-                METRIC_YT_REQUEST_DURATION.labels(
-                    platform='youtube',
-                    scraper=_get_scraper(),
-                    api='innertube',
-                    status_class=status_class,
-                    worker_id=get_worker_id(),
-                    proxy_file=proxy_file,
-                ).observe(duration)
-                logging.debug(
-                    'InnerTube request failed',
-                    exc=exc,
-                    extra={
-                        'api': 'next',
-                        'video_id': video.video_id,
-                        'duration': duration,
-                        'proxy_ip': proxy_ip,
-                        'proxy_port': proxy_port,
-                        'proxy_file': proxy_file,
-                        'status_class': status_class,
-                    },
-                )
-                if exc.error.code == 429:
-                    await limiter.penalise(
-                        YouTubeCallType.NEXT, proxy, _next_penalty
-                    )
-                    await limiter.penalise(
-                        YouTubeCallType.PLAYER, proxy, _next_penalty
-                    )
-                    logging.warning(
-                        'InnerTube NEXT rate-limited',
+                    record_call('next')
+                    try:
+                        next_data: dict[str, Any] = await _call_innertube(
+                            next_client,
+                            next_client.next,
+                            video.video_id,
+                        )
+                    finally:
+                        if borrowed_next:
+                            await release_pooled_innertube(next_client)
+                    await limiter.report_proxy_result(proxy, True)
+                    duration = time.monotonic() - next_start
+                    METRIC_YT_REQUEST_DURATION.labels(
+                        platform='youtube',
+                        scraper=_get_scraper(),
+                        api='innertube',
+                        status_class='2xx',
+                        worker_id=get_worker_id(),
+                        proxy_file=proxy_file,
+                    ).observe(duration)
+                    logging.debug(
+                        'InnerTube request completed',
                         extra={
+                            'api': 'next',
                             'video_id': video.video_id,
-                            'attempt': attempt,
-                            'max_retries': max_retries,
-                            'penalty_seconds': _next_penalty,
+                            'duration': duration,
                             'proxy_ip': proxy_ip,
                             'proxy_port': proxy_port,
+                            'proxy_file': proxy_file,
+                            'status_class': '2xx',
                         },
                     )
-                    _next_penalty = min(
-                        _next_penalty * 2, _PLAYER_PENALTY_MAX
+                    self._parse_next_data(next_data)
+                    break
+                except InnerTubeRequestError as exc:
+                    duration = time.monotonic() - next_start
+                    status_class = (
+                        '4xx'
+                        if exc.error.code == 429
+                        else 'error'
                     )
-                    if attempt < max_retries:
-                        await asyncio.sleep(_next_penalty)
-                else:
-                    break  # non-429 error on NEXT: skip silently
-            except Exception as exc:
-                if isinstance(exc, httpx.TransportError) and not (
-                    isinstance(exc, httpx.ReadTimeout)
-                ):
-                    await limiter.report_proxy_result(
-                        proxy, False, exc,
+                    METRIC_YT_REQUEST_DURATION.labels(
+                        platform='youtube',
+                        scraper=_get_scraper(),
+                        api='innertube',
+                        status_class=status_class,
+                        worker_id=get_worker_id(),
+                        proxy_file=proxy_file,
+                    ).observe(duration)
+                    logging.debug(
+                        'InnerTube request failed',
+                        exc=exc,
+                        extra={
+                            'api': 'next',
+                            'video_id': video.video_id,
+                            'duration': duration,
+                            'proxy_ip': proxy_ip,
+                            'proxy_port': proxy_port,
+                            'proxy_file': proxy_file,
+                            'status_class': status_class,
+                        },
                     )
-                if borrowed_next and isinstance(
-                    exc, httpx.TransportError
-                ):
-                    await refresh_pooled_web_innertube_for_entry(
-                        proxy,
-                        challenged=next_client,
+                    if exc.error.code == 429:
+                        await limiter.penalise(
+                            YouTubeCallType.NEXT, proxy, _next_penalty
+                        )
+                        await limiter.penalise(
+                            YouTubeCallType.PLAYER, proxy, _next_penalty
+                        )
+                        logging.warning(
+                            'InnerTube NEXT rate-limited',
+                            extra={
+                                'video_id': video.video_id,
+                                'attempt': attempt,
+                                'max_retries': max_retries,
+                                'penalty_seconds': _next_penalty,
+                                'proxy_ip': proxy_ip,
+                                'proxy_port': proxy_port,
+                            },
+                        )
+                        _next_penalty = min(
+                            _next_penalty * 2, _PLAYER_PENALTY_MAX
+                        )
+                        if attempt < max_retries:
+                            await asyncio.sleep(_next_penalty)
+                    else:
+                        break  # non-429 error on NEXT: skip silently
+                except Exception as exc:
+                    if isinstance(exc, httpx.TransportError) and not (
+                        isinstance(exc, httpx.ReadTimeout)
+                    ):
+                        await limiter.report_proxy_result(
+                            proxy, False, exc,
+                        )
+                    if borrowed_next and isinstance(
+                        exc, httpx.TransportError
+                    ):
+                        await refresh_pooled_web_innertube_for_entry(
+                            proxy,
+                            challenged=next_client,
+                        )
+                    duration = time.monotonic() - next_start
+                    METRIC_YT_REQUEST_DURATION.labels(
+                        platform='youtube',
+                        scraper=_get_scraper(),
+                        api='innertube',
+                        status_class='error',
+                        worker_id=get_worker_id(),
+                        proxy_file=proxy_file,
+                    ).observe(duration)
+                    logging.debug(
+                        'InnerTube request failed',
+                        exc=exc,
+                        extra={
+                            'api': 'next',
+                            'video_id': video.video_id,
+                            'duration': duration,
+                            'proxy_ip': proxy_ip,
+                            'proxy_port': proxy_port,
+                            'proxy_file': proxy_file,
+                            'status_class': 'error',
+                        },
                     )
-                duration = time.monotonic() - next_start
-                METRIC_YT_REQUEST_DURATION.labels(
-                    platform='youtube',
-                    scraper=_get_scraper(),
-                    api='innertube',
-                    status_class='error',
-                    worker_id=get_worker_id(),
-                    proxy_file=proxy_file,
-                ).observe(duration)
-                logging.debug(
-                    'InnerTube request failed',
-                    exc=exc,
-                    extra={
-                        'api': 'next',
-                        'video_id': video.video_id,
-                        'duration': duration,
-                        'proxy_ip': proxy_ip,
-                        'proxy_port': proxy_port,
-                        'proxy_file': proxy_file,
-                        'status_class': 'error',
-                    },
-                )
-                break  # NEXT is best-effort; never fail the whole scrape
+                    break  # NEXT is best-effort; never fail the whole scrape
+            return next_data
 
-        if next_data is not None:
+        # The transcript request needs only the video ID and the spoken
+        # language, both known after the player call. When the player
+        # lists caption tracks the video has a transcript, so fetch it
+        # concurrently with NEXT instead of after it. Without caption
+        # tracks a transcript is rare: wait for NEXT to tell whether the
+        # video has a transcript panel, so no request is wasted.
+        available_languages: list[str] = caption_languages(player_data)
+        transcript_task: asyncio.Task[None] | None = None
+        if available_languages:
+            transcript_task = asyncio.create_task(self._scrape_transcript(
+                None, proxy, max_rate_limit_wait,
+                language=video.default_audio_language,
+                available_languages=available_languages,
+            ))
+        try:
+            next_data: dict[str, Any] | None = await fetch_next()
+        except BaseException:
+            if transcript_task is not None:
+                transcript_task.cancel()
+            raise
+
+        if transcript_task is not None:
+            await transcript_task
+        elif next_data is not None:
             await self._scrape_transcript(
                 next_data, proxy, max_rate_limit_wait,
                 language=video.default_audio_language,
-                available_languages=caption_languages(player_data),
+                available_languages=available_languages,
             )
 
         return video
 
     async def _scrape_transcript(
-        self, next_data: dict[str, Any], proxy: str | None,
+        self, next_data: dict[str, Any] | None, proxy: str | None,
         max_rate_limit_wait: float | None = None,
         language: str | None = None,
         available_languages: list[str] | None = None,
@@ -783,7 +809,9 @@ class InnerTubeVideoParser:
         never raised, so a missing transcript cannot fail the video.
 
         :param next_data: the ``next`` response for the video, which
-            tells whether the video has a transcript at all
+            tells whether the video has a transcript at all. None when
+            the player response already showed caption tracks, so the
+            transcript is requested without waiting for ``next``
         :param proxy: the proxy used for the player and next calls
         :param max_rate_limit_wait: caps the wait for a rate-limit
             token, never beyond :data:`_TRANSCRIPT_MAX_WAIT_SECONDS`
@@ -815,7 +843,7 @@ class InnerTubeVideoParser:
                 proxy_file=proxy_file,
             ).inc()
 
-        if not has_transcript_panel(next_data):
+        if next_data is not None and not has_transcript_panel(next_data):
             _count('unavailable', 'no_panel')
             return
 
