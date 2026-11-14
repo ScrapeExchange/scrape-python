@@ -62,7 +62,9 @@ class TestConcurrentTranscript(unittest.IsolatedAsyncioTestCase):
         panel_sent: asyncio.Event = asyncio.Event()
         calls: list[str] = []
 
-        async def call_api(client: Any, method: Any, *args: Any) -> Any:
+        async def call_api(
+            client: Any, method: Any, *args: Any, **kwargs: Any,
+        ) -> Any:
             if method is client.player:
                 calls.append('player')
                 return _player(True)
@@ -95,7 +97,9 @@ class TestConcurrentTranscript(unittest.IsolatedAsyncioTestCase):
     async def test_no_captions_but_panel_fetches_after_next(self) -> None:
         order: list[str] = []
 
-        async def call_api(client: Any, method: Any, *args: Any) -> Any:
+        async def call_api(
+            client: Any, method: Any, *args: Any, **kwargs: Any,
+        ) -> Any:
             if method is client.player:
                 order.append('player')
                 return _player(False)
@@ -127,7 +131,9 @@ class TestConcurrentTranscript(unittest.IsolatedAsyncioTestCase):
 
         limiter.acquire = AsyncMock(side_effect=acquire)
 
-        async def call_api(client: Any, method: Any, *args: Any) -> Any:
+        async def call_api(
+            client: Any, method: Any, *args: Any, **kwargs: Any,
+        ) -> Any:
             if method is client.player:
                 return _player(True)
             panel_started.set()

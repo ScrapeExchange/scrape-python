@@ -698,11 +698,12 @@ class TestScrapeTranscript(unittest.IsolatedAsyncioTestCase):
         client: MagicMock = MagicMock()
         with (
             patch.object(
-                innertube_mod, 'borrow_pooled_innertube_for_entry',
+                innertube_mod,
+                'borrow_pooled_transcript_innertube_for_entry',
                 return_value=client,
             ) as borrow,
             patch.object(
-                innertube_mod, 'release_pooled_innertube',
+                innertube_mod, 'release_pooled_transcript_innertube',
                 new=AsyncMock(),
             ) as release,
             patch.object(
@@ -728,7 +729,7 @@ class TestScrapeKeepsVideoOnTranscriptProblems(
         limiter.report_proxy_result = AsyncMock()
 
         async def fake_call(
-            client: Any, function: Any, *args: Any,
+            client: Any, function: Any, *args: Any, **kwargs: Any,
         ) -> dict[str, Any]:
             if function is client.player:
                 return _player_data()
@@ -768,7 +769,7 @@ class TestScrapeKeepsVideoOnTranscriptProblems(
         )
 
         async def fake_call(
-            client: Any, function: Any, *args: Any,
+            client: Any, function: Any, *args: Any, **kwargs: Any,
         ) -> dict[str, Any]:
             if function is client.player:
                 return player

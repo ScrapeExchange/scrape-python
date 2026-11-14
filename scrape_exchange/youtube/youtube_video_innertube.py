@@ -15,20 +15,24 @@ import time
 import httpx
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
 from innertube import InnerTube
 from innertube.errors import RequestError as InnerTubeRequestError
-from prometheus_client import Counter
+from prometheus_client import Counter, Histogram
 
 from scrape_exchange.youtube.youtube_channel_tabs import (
     borrow_pooled_innertube_for_entry,
     borrow_pooled_player_innertube_for_entry,
+    borrow_pooled_transcript_innertube_for_entry,
     refresh_pooled_innertube_for_entry,
+    refresh_pooled_transcript_innertube_for_entry,
     refresh_pooled_web_innertube_for_entry,
     release_pooled_innertube,
     release_pooled_player_innertube,
+    release_pooled_transcript_innertube,
     run_on_innertube_executor,
 )
 
@@ -59,6 +63,38 @@ if TYPE_CHECKING:
 
 
 _INNERTUBE_CALL_LOCKS: dict[int, asyncio.Lock] = {}
+
+# Time an InnerTube call spends queued before its HTTP request starts:
+# phase 'lock' waits for the per-client lock (one call per pooled client
+# at a time), phase 'executor' waits for a free InnerTube executor
+# thread (INNERTUBE_EXECUTOR_THREADS). api_request_duration_seconds
+# excludes this wait.
+METRIC_INNERTUBE_CALL_WAIT: Histogram = Histogram(
+    'innertube_call_wait_seconds',
+    'Seconds an InnerTube call waited before its HTTP request started, '
+    'by call (player, next, get_panel) and phase (lock: per-client '
+    'lock, executor: free InnerTube executor thread).',
+    ['platform', 'scraper', 'call', 'phase', 'worker_id'],
+    buckets=(
+        0.001, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+        60.0,
+    ),
+)
+
+
+@dataclass
+class _CallTiming:
+    '''When the HTTP request of one InnerTube call started, set from
+    the executor thread by :func:`_call_innertube`.'''
+
+    started: float | None = None
+
+    def elapsed(self, fallback_start: float) -> float:
+        '''Seconds since the HTTP request started, or since
+        *fallback_start* when the call never got to run.'''
+        return time.monotonic() - (
+            self.started if self.started is not None else fallback_start
+        )
 
 _BOT_DETECTION_PENALTY_SECONDS: float = 300.0
 
@@ -151,6 +187,8 @@ async def _call_innertube(
     client: InnerTube,
     fn: Callable[..., dict[str, Any]],
     *args: object,
+    call: str = 'other',
+    timing: _CallTiming | None = None,
 ) -> dict[str, Any]:
     '''
     Run the synchronous innertube client call in a worker thread.
@@ -166,15 +204,42 @@ async def _call_innertube(
     indefinitely; on timeout :class:`asyncio.TimeoutError` is raised
     and caught by the generic exception handler in
     :func:`InnerTubeVideoParser.scrape`.
+
+    The time spent waiting for the lock and for an executor thread is
+    recorded in :data:`METRIC_INNERTUBE_CALL_WAIT`; *timing* receives
+    the moment the HTTP request started, so callers can time the
+    request alone.
     '''
+    timing = timing if timing is not None else _CallTiming()
     lock: asyncio.Lock = _INNERTUBE_CALL_LOCKS.setdefault(
         id(client), asyncio.Lock(),
     )
+
+    def run() -> dict[str, Any]:
+        timing.started = time.monotonic()
+        return fn(*args)
+
+    def observe(phase: str, seconds: float) -> None:
+        METRIC_INNERTUBE_CALL_WAIT.labels(
+            platform='youtube', scraper=_get_scraper(), call=call,
+            phase=phase, worker_id=get_worker_id(),
+        ).observe(seconds)
+
+    queued: float = time.monotonic()
     async with lock:
-        return await asyncio.wait_for(
-            run_on_innertube_executor(fn, *args),
-            timeout=_INNERTUBE_CALL_HARD_TIMEOUT_SECONDS,
-        )
+        locked: float = time.monotonic()
+        observe('lock', locked - queued)
+        try:
+            return await asyncio.wait_for(
+                run_on_innertube_executor(run),
+                timeout=_INNERTUBE_CALL_HARD_TIMEOUT_SECONDS,
+            )
+        finally:
+            observe(
+                'executor',
+                (timing.started if timing.started is not None
+                 else time.monotonic()) - locked,
+            )
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -448,6 +513,7 @@ class InnerTubeVideoParser:
             )
             proxy_file: str = proxy_file_label(proxy or '')
             start: float = time.monotonic()
+            player_timing: _CallTiming = _CallTiming()
             borrowed_player: bool = self.player_innertube is None
             player_client = (
                 borrow_pooled_player_innertube_for_entry(proxy)
@@ -461,13 +527,15 @@ class InnerTubeVideoParser:
                         player_client,
                         player_client.player,
                         video.video_id,
+                        call='player',
+                        timing=player_timing,
                     )
                 finally:
                     if borrowed_player:
                         await release_pooled_player_innertube(
                             player_client,
                         )
-                duration: float = time.monotonic() - start
+                duration: float = player_timing.elapsed(start)
                 METRIC_YT_REQUEST_DURATION.labels(
                     platform='youtube',
                     scraper=_get_scraper(),
@@ -490,7 +558,7 @@ class InnerTubeVideoParser:
                 )
                 break
             except InnerTubeRequestError as exc:
-                duration = time.monotonic() - start
+                duration = player_timing.elapsed(start)
                 status_class: str = (
                     '4xx'
                     if exc.error.code == 429
@@ -560,7 +628,7 @@ class InnerTubeVideoParser:
                         proxy,
                         challenged=player_client,
                     )
-                duration = time.monotonic() - start
+                duration = player_timing.elapsed(start)
                 METRIC_YT_REQUEST_DURATION.labels(
                     platform='youtube',
                     scraper=_get_scraper(),
@@ -631,6 +699,7 @@ class InnerTubeVideoParser:
                     max_wait=max_rate_limit_wait,
                 )
                 next_start: float = time.monotonic()
+                next_timing: _CallTiming = _CallTiming()
                 borrowed_next: bool = self.next_innertube is None
                 next_client: InnerTube = (
                     borrow_pooled_innertube_for_entry(proxy)
@@ -644,12 +713,14 @@ class InnerTubeVideoParser:
                             next_client,
                             next_client.next,
                             video.video_id,
+                            call='next',
+                            timing=next_timing,
                         )
                     finally:
                         if borrowed_next:
                             await release_pooled_innertube(next_client)
                     await limiter.report_proxy_result(proxy, True)
-                    duration = time.monotonic() - next_start
+                    duration = next_timing.elapsed(next_start)
                     METRIC_YT_REQUEST_DURATION.labels(
                         platform='youtube',
                         scraper=_get_scraper(),
@@ -673,7 +744,7 @@ class InnerTubeVideoParser:
                     self._parse_next_data(next_data)
                     break
                 except InnerTubeRequestError as exc:
-                    duration = time.monotonic() - next_start
+                    duration = next_timing.elapsed(next_start)
                     status_class = (
                         '4xx'
                         if exc.error.code == 429
@@ -739,7 +810,7 @@ class InnerTubeVideoParser:
                             proxy,
                             challenged=next_client,
                         )
-                    duration = time.monotonic() - next_start
+                    duration = next_timing.elapsed(next_start)
                     METRIC_YT_REQUEST_DURATION.labels(
                         platform='youtube',
                         scraper=_get_scraper(),
@@ -855,14 +926,17 @@ class InnerTubeVideoParser:
         borrowed: bool = False
         client: InnerTube | None = None
         start: float = 0.0
+        timing: _CallTiming = _CallTiming()
         status_class: str = 'error'
         try:
             await limiter.acquire(
                 YouTubeCallType.TRANSCRIPT, proxy=proxy, max_wait=max_wait,
             )
+            # Own client, not the NEXT one: calls on a client are
+            # serialised, which would make this wait for NEXT.
             borrowed = self.next_innertube is None
             client = (
-                borrow_pooled_innertube_for_entry(proxy)
+                borrow_pooled_transcript_innertube_for_entry(proxy)
                 if borrowed else self.next_innertube
             )
             start = time.monotonic()
@@ -871,10 +945,11 @@ class InnerTubeVideoParser:
                 panel_data: dict[str, Any] = await _call_innertube(
                     client, client.adaptor.dispatch, 'get_panel', None,
                     build_panel_body(video_id, language),
+                    call='get_panel', timing=timing,
                 )
             finally:
                 if borrowed:
-                    await release_pooled_innertube(client)
+                    await release_pooled_transcript_innertube(client)
 
             status_class = '2xx'
             try:
@@ -927,7 +1002,7 @@ class InnerTubeVideoParser:
             if not isinstance(exc, httpx.ReadTimeout):
                 await limiter.report_proxy_result(proxy, False, exc)
             if borrowed and client is not None:
-                await refresh_pooled_web_innertube_for_entry(
+                await refresh_pooled_transcript_innertube_for_entry(
                     proxy, challenged=client,
                 )
             _count('failure', 'transport')
@@ -944,7 +1019,7 @@ class InnerTubeVideoParser:
                     status_class=status_class,
                     worker_id=get_worker_id(),
                     proxy_file=proxy_file,
-                ).observe(time.monotonic() - start)
+                ).observe(timing.elapsed(start))
 
     @staticmethod
     def _apply_player_data(
