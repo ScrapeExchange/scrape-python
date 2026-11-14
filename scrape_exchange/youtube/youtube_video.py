@@ -189,6 +189,7 @@ class YouTubeVideo:
         self.tags: set[str] = set()
         self.annotations: set[str] = set()
         self.badges: list[dict[str, str]] = []
+        self.content_disclosure: dict[str, str] | None = None
         self.category: str | None = None
         self.keywords: set[str] = set()
         self.privacy_status: str = 'public'
@@ -228,6 +229,7 @@ class YouTubeVideo:
             and self.default_audio_language == other.default_audio_language
             and self.privacy_status == other.privacy_status
             and self.badges == other.badges
+            and self.content_disclosure == other.content_disclosure
         )
         if not same:
             return False
@@ -296,6 +298,10 @@ class YouTubeVideo:
             'tags': list(self.tags),
             'annotations': list(self.annotations),
             'badges': [dict(badge) for badge in self.badges],
+            'content_disclosure': (
+                dict(self.content_disclosure)
+                if self.content_disclosure else None
+            ),
             'keywords': list(self.keywords),
             'category': self.category,
             'privacy_status': self.privacy_status
@@ -398,6 +404,7 @@ class YouTubeVideo:
         video.tags = set(data.get('tags', []))
         video.annotations = set(data.get('annotations', []))
         video.badges = [dict(badge) for badge in data.get('badges', [])]
+        video.content_disclosure = data.get('content_disclosure') or None
         video.keywords = set(data.get('keywords', []))
         video.privacy_status = data.get('privacy_status', 'public')
         if isinstance(video.privacy_status, bool):
@@ -504,6 +511,7 @@ class YouTubeVideo:
         )
         video.description = info.get('description')
         video.badges = [dict(badge) for badge in info.get('badges', [])]
+        video.content_disclosure = info.get('content_disclosure') or None
         video.title = info.get('title')
         video.long_title = info.get('fulltitle')
         video.view_count = info.get('view_count')
@@ -1339,6 +1347,9 @@ class YouTubeVideo:
 
         self.description = video_info.get('description')
         self.badges = [dict(badge) for badge in video_info.get('badges', [])]
+        self.content_disclosure = (
+            video_info.get('content_disclosure') or None
+        )
         self.title = video_info.get('title')
         self.view_count = video_info.get('view_count')
         self.like_count = video_info.get('like_count')

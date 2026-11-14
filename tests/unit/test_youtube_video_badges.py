@@ -37,6 +37,107 @@ EXPECTED: list[dict[str, str]] = [{
 }]
 
 
+def disclosure_data() -> dict[str, Any]:
+    # Sanitised from video cLh7-2Rqacw's ytInitialData. Tracking omitted.
+    return {'engagementPanels': [
+        None,
+        {'engagementPanelSectionListRenderer': {'content': {
+            'structuredDescriptionContentRenderer': {'items': [
+                {'videoDescriptionHeaderRenderer': {}},
+                {'howThisWasMadeSectionViewModel': {
+                    'sectionTitle': {'content': 'How this was made'},
+                    'bodyHeader': {'content': 'Auto-dubbed'},
+                    'bodyText': {'content': (
+                        'Audio tracks for some languages were '
+                        'automatically generated. Learn more'
+                    )},
+                }},
+            ]},
+        }}},
+    ]}
+
+
+DISCLOSURE: dict[str, str] = {
+    'title': 'Auto-dubbed',
+    'body': (
+        'Audio tracks for some languages were automatically generated. '
+        'Learn more'
+    ),
+}
+
+
+class TestContentDisclosure(unittest.TestCase):
+    def test_extracts_disclosure_and_ignores_malformed_data(self) -> None:
+        from scrape_exchange.youtube.youtube_video_badges import (
+            extract_content_disclosure,
+        )
+        self.assertEqual(
+            extract_content_disclosure(disclosure_data()), DISCLOSURE,
+        )
+        for missing in (
+            {}, None, {'engagementPanels': None},
+            {'engagementPanels': [{'engagementPanelSectionListRenderer': 1}]},
+            {'engagementPanels': [{'engagementPanelSectionListRenderer': {
+                'content': {'structuredDescriptionContentRenderer': {
+                    'items': [{'howThisWasMadeSectionViewModel': {}}],
+                }},
+            }}]},
+        ):
+            self.assertIsNone(extract_content_disclosure(missing))
+
+    def test_innertube_round_trip_and_legacy_default(self) -> None:
+        video: YouTubeVideo = YouTubeVideo(video_id='cLh7-2Rqacw')
+        InnerTubeVideoParser(video)._parse_next_data(disclosure_data())
+        data: dict[str, Any] = video.to_dict()
+        self.assertEqual(data['content_disclosure'], DISCLOSURE)
+        self.assertEqual(
+            YouTubeVideo.from_dict(data).to_dict()['content_disclosure'],
+            DISCLOSURE,
+        )
+        legacy: YouTubeVideo = YouTubeVideo.from_dict({'video_id': 'x'})
+        self.assertIsNone(legacy.to_dict()['content_disclosure'])
+        imported: YouTubeVideo = YouTubeVideo.from_yt_dlp(
+            {'id': 'x', 'content_disclosure': DISCLOSURE},
+        )
+        self.assertEqual(imported.content_disclosure, DISCLOSURE)
+
+    def test_yt_dlp_adapter_resets_between_videos(self) -> None:
+        from scrape_exchange.youtube.youtube_video_badges import (
+            BadgeYoutubeIE,
+        )
+
+        def upstream_extract(
+            extractor: YoutubeIE, url: str,
+        ) -> dict[str, Any]:
+            extractor._download_initial_data('example', '', 'web', {})
+            return {'id': 'example'}
+
+        extractor: BadgeYoutubeIE = BadgeYoutubeIE()
+        with (
+            patch.object(YoutubeIE, '_real_extract', upstream_extract),
+            patch.object(YoutubeIE, '_download_initial_data',
+                         side_effect=[disclosure_data(), {}]),
+        ):
+            first: dict[str, Any] = extractor._real_extract('unused')
+            self.assertEqual(first['content_disclosure'], DISCLOSURE)
+            second: dict[str, Any] = extractor._real_extract('unused')
+            self.assertIsNone(second['content_disclosure'])
+
+    def test_schema_validates_disclosure(self) -> None:
+        schema: dict = orjson.loads(Path(
+            'tests/collateral/boinko-youtube-video-schema.json',
+        ).read_bytes())
+        validator: Draft202012Validator = Draft202012Validator(schema)
+        data: dict = YouTubeVideo(video_id='example').to_dict()
+        self.assertEqual(list(validator.iter_errors(data)), [])
+        data['content_disclosure'] = DISCLOSURE
+        self.assertEqual(list(validator.iter_errors(data)), [])
+        data['content_disclosure'] = {'title': 42}
+        self.assertTrue(list(validator.iter_errors(data)))
+        data.pop('content_disclosure')
+        self.assertEqual(list(validator.iter_errors(data)), [])
+
+
 class TestVideoBadges(unittest.TestCase):
     def test_innertube_persists_observed_ai_badge(self) -> None:
         video: YouTubeVideo = YouTubeVideo(video_id='0FmGgMewBSk')

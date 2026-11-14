@@ -52,6 +52,50 @@ def extract_video_badges(data: Any) -> list[dict[str, str]]:
     return badges
 
 
+def extract_content_disclosure(data: Any) -> dict[str, str] | None:
+    '''Read the "How this was made" disclosure of the main video.
+
+    YouTube lists creator disclosures (altered or synthetic content,
+    auto-dubbing, ...) in the description panel. Returns the first
+    disclosure as {'title': <kind>, 'body': <explanation>}, or None.
+    '''
+    panels: Any = data.get('engagementPanels') if isinstance(
+        data, dict
+    ) else None
+    panel: Any
+    for panel in panels if isinstance(panels, list) else []:
+        content: Any = panel
+        key: str
+        for key in (
+            'engagementPanelSectionListRenderer', 'content',
+            'structuredDescriptionContentRenderer', 'items',
+        ):
+            content = content.get(key) if isinstance(content, dict) else None
+        item: Any
+        for item in content if isinstance(content, list) else []:
+            section: Any = (
+                item.get('howThisWasMadeSectionViewModel')
+                if isinstance(item, dict) else None
+            )
+            if not isinstance(section, dict):
+                continue
+            disclosure: dict[str, str] = {}
+            field: str
+            source: str
+            for field, source in (
+                ('title', 'bodyHeader'), ('body', 'bodyText'),
+            ):
+                text: Any = section.get(source)
+                value: Any = (
+                    text.get('content') if isinstance(text, dict) else None
+                )
+                if isinstance(value, str) and value.strip():
+                    disclosure[field] = value.strip()
+            if disclosure:
+                return disclosure
+    return None
+
+
 class BadgeYoutubeIE(YoutubeIE):
     '''Extend yt-dlp's existing request flow without another page fetch.
 
@@ -74,12 +118,15 @@ class BadgeYoutubeIE(YoutubeIE):
             video_id, webpage, webpage_client, webpage_ytcfg,
         )
         self._video_badges = extract_video_badges(data)
+        self._content_disclosure = extract_content_disclosure(data)
         return data
 
     def _real_extract(self, url: str) -> dict[str, Any]:
         # Extractors are reused: never carry a previous video's disclosure.
         self._video_badges: list[dict[str, str]] = []
+        self._content_disclosure: dict[str, str] | None = None
         result: dict[str, Any] = super()._real_extract(url)
         if result.get('_type', 'video') == 'video':
             result['badges'] = self._video_badges
+            result['content_disclosure'] = self._content_disclosure
         return result

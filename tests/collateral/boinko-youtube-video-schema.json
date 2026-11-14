@@ -24,6 +24,16 @@
                 "additionalProperties": false
             }
         },
+        "content_disclosure": {
+            "type": ["object", "null"],
+            "description": "Creator disclosure from YouTube's 'How this was made' section, e.g. altered or synthetic content or auto-dubbing",
+            "properties": {
+                "title": { "type": "string", "minLength": 1 },
+                "body": { "type": "string", "minLength": 1 }
+            },
+            "minProperties": 1,
+            "additionalProperties": false
+        },
         "video_id": {
             "type": [
                 "string",
@@ -83,8 +93,8 @@
         },
         "channel_country": {
             "type": ["string", "null"],
-            "x-scrape-field": "country",
-            "description": "ISO2 country code associated with the channel"
+            "description": "ISO2 country code associated with the channel",
+            "x-scrape-field": "country"
         },
         "channel_is_verified": {
             "type": [
@@ -309,7 +319,8 @@
                 "string",
                 "null"
             ],
-            "format": "date-time"
+            "format": "date-time",
+            "x-scrape-field": "platform_created_timestamp"
         },
         "thumbnails": {
             "type": "object",
