@@ -34,6 +34,12 @@
             "minProperties": 1,
             "additionalProperties": false
         },
+        "hype_points": {
+            "type": ["integer", "null"],
+            "minimum": 0,
+            "description": "Hype points shown by YouTube next to the views and publish date. Only available for videos of channels with fewer than about 500k subscribers",
+            "x-scrape-gauge": true
+        },
         "video_id": {
             "type": [
                 "string",
