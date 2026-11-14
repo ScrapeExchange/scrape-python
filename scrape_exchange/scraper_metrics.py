@@ -292,7 +292,8 @@ METRIC_WORKER_SLEEP_SECONDS: Gauge = Gauge(
 #   Per-scrape latency histogram. The 'api' label distinguishes yt-dlp,
 #   HTML, InnerTube, and RSS fetches. 'innertube_calls' lists the
 #   YouTube calls a video scrape attempt sent (e.g.
-#   player_next_transcript); 'none' for every other scraper.
+#   player_next_transcript); 'none' for every other scraper. The 15s
+#   and 20s buckets resolve video scrape attempts, which take 10-30s.
 # ---------------------------------------------------------------------------
 METRIC_SCRAPE_DURATION: Histogram = Histogram(
     'scrape_duration_seconds',
@@ -305,7 +306,7 @@ METRIC_SCRAPE_DURATION: Histogram = Histogram(
     ],
     buckets=(
         0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
-        10.0, 30.0, 60.0, 120.0, 300.0,
+        10.0, 15.0, 20.0, 30.0, 60.0, 120.0, 300.0,
         900.0, 3600.0
     ),
 )

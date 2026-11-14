@@ -26,6 +26,15 @@ class TestScrapeDurationBuckets(unittest.TestCase):
         ):
             self.assertIn(existing, bounds)
 
+    def test_video_attempt_buckets_present(self) -> None:
+        # Video scrape attempts take 10-30s through proxies; without
+        # these buckets p50 and p95 interpolate across 10s-30s.
+        bounds: tuple[float, ...] = tuple(
+            METRIC_SCRAPE_DURATION._upper_bounds
+        )
+        self.assertIn(15.0, bounds)
+        self.assertIn(20.0, bounds)
+
     def test_buckets_are_monotonic(self) -> None:
         bounds: list[float] = list(
             METRIC_SCRAPE_DURATION._upper_bounds
