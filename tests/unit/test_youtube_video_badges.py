@@ -276,3 +276,80 @@ class TestScrapeVideoBadges(unittest.IsolatedAsyncioTestCase):
         ):
             await video._scrape_video()
         self.assertEqual(video.to_dict()['badges'], EXPECTED)
+
+
+def hype_data(text: str, tag: str | None = None) -> dict[str, Any]:
+    # Shape taken from video -X5VHEMgICI's InnerTube next response.
+    run: dict[str, Any] = {'text': text}
+    if tag:
+        run['navigationEndpoint'] = {'showEngagementPanelEndpoint': {
+            'identifier': {'tag': tag},
+        }}
+    return {'contents': {'twoColumnWatchNextResults': {'results': {
+        'results': {'contents': [{'videoPrimaryInfoRenderer': {
+            'superTitleLink': {'runs': [run]},
+        }}]},
+    }}}}
+
+
+class TestHypePoints(unittest.TestCase):
+    def test_extracts_hype_points(self) -> None:
+        from scrape_exchange.youtube.youtube_video_badges import (
+            extract_hype_points,
+        )
+        self.assertEqual(extract_hype_points(
+            hype_data('300 hype points', 'PAhype_info_panel'),
+        ), 300)
+        self.assertEqual(
+            extract_hype_points(hype_data('1,234 hype points')), 1234,
+        )
+        self.assertEqual(extract_hype_points(hype_data('1 hype point')), 1)
+
+    def test_ignores_hashtags_and_malformed_data(self) -> None:
+        from scrape_exchange.youtube.youtube_video_badges import (
+            extract_hype_points,
+        )
+        for missing in (
+            {}, None, hype_data('#shorts'), hype_data('hype points'),
+            hype_data('x hype points'),
+            {'contents': {'twoColumnWatchNextResults': 1}},
+        ):
+            self.assertIsNone(extract_hype_points(missing))
+
+    def test_round_trip_and_equality(self) -> None:
+        video: YouTubeVideo = YouTubeVideo(video_id='-X5VHEMgICI')
+        InnerTubeVideoParser(video)._parse_next_data(
+            hype_data('200 hype points'),
+        )
+        data: dict[str, Any] = video.to_dict()
+        self.assertEqual(data['hype_points'], 200)
+        restored: YouTubeVideo = YouTubeVideo.from_dict(data)
+        self.assertEqual(restored.hype_points, 200)
+        other: YouTubeVideo = YouTubeVideo.from_dict(data)
+        self.assertEqual(restored, other)
+        other.hype_points = 300
+        self.assertNotEqual(restored, other)
+        self.assertIsNone(
+            YouTubeVideo.from_dict({'video_id': 'x'}).hype_points,
+        )
+        self.assertEqual(
+            YouTubeVideo.from_yt_dlp(
+                {'id': 'x', 'hype_points': 5},
+            ).hype_points, 5,
+        )
+
+    def test_schema_validates_hype_points(self) -> None:
+        schema: dict = orjson.loads(Path(
+            'tests/collateral/boinko-youtube-video-schema.json',
+        ).read_bytes())
+        self.assertTrue(schema['properties']['hype_points'][
+            'x-scrape-gauge'
+        ])
+        validator: Draft202012Validator = Draft202012Validator(schema)
+        data: dict = YouTubeVideo(video_id='example').to_dict()
+        self.assertIsNone(data['hype_points'])
+        self.assertEqual(list(validator.iter_errors(data)), [])
+        data['hype_points'] = 200
+        self.assertEqual(list(validator.iter_errors(data)), [])
+        data['hype_points'] = -1
+        self.assertTrue(list(validator.iter_errors(data)))

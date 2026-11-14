@@ -1,5 +1,6 @@
 '''Preserve video disclosures from YouTube watch-page metadata.'''
 
+import re
 from typing import Any
 
 from yt_dlp.extractor.youtube import YoutubeIE
@@ -96,6 +97,49 @@ def extract_content_disclosure(data: Any) -> dict[str, str] | None:
     return None
 
 
+HYPE_POINTS_RE: re.Pattern[str] = re.compile(
+    r'^\s*(\d[\d,]*)\s+hype\s+points?\s*$', re.IGNORECASE,
+)
+
+
+def extract_hype_points(data: Any) -> int | None:
+    '''Read the hype points of the main video.
+
+    YouTube shows hype points, e.g. "200 hype points", above the title of
+    videos from small channels. The text shares the ``superTitleLink``
+    slot with hashtags, so only a run reading "<n> hype points" is
+    accepted. Returns None when absent.
+    '''
+    contents: Any = data
+    key: str
+    for key in (
+        'contents', 'twoColumnWatchNextResults', 'results', 'results',
+        'contents',
+    ):
+        contents = contents.get(key) if isinstance(contents, dict) else None
+    item: Any
+    for item in contents if isinstance(contents, list) else []:
+        primary: Any = (
+            item.get('videoPrimaryInfoRenderer')
+            if isinstance(item, dict) else None
+        )
+        link: Any = (
+            primary.get('superTitleLink')
+            if isinstance(primary, dict) else None
+        )
+        runs: Any = link.get('runs') if isinstance(link, dict) else None
+        run: Any
+        for run in runs if isinstance(runs, list) else []:
+            text: Any = run.get('text') if isinstance(run, dict) else None
+            match: re.Match[str] | None = (
+                HYPE_POINTS_RE.match(text) if isinstance(text, str) else None
+            )
+            if not match:
+                continue
+            return int(match.group(1).replace(',', ''))
+    return None
+
+
 class BadgeYoutubeIE(YoutubeIE):
     '''Extend yt-dlp's existing request flow without another page fetch.
 
@@ -119,14 +163,17 @@ class BadgeYoutubeIE(YoutubeIE):
         )
         self._video_badges = extract_video_badges(data)
         self._content_disclosure = extract_content_disclosure(data)
+        self._hype_points = extract_hype_points(data)
         return data
 
     def _real_extract(self, url: str) -> dict[str, Any]:
         # Extractors are reused: never carry a previous video's disclosure.
         self._video_badges: list[dict[str, str]] = []
         self._content_disclosure: dict[str, str] | None = None
+        self._hype_points: int | None = None
         result: dict[str, Any] = super()._real_extract(url)
         if result.get('_type', 'video') == 'video':
             result['badges'] = self._video_badges
             result['content_disclosure'] = self._content_disclosure
+            result['hype_points'] = self._hype_points
         return result

@@ -39,7 +39,7 @@ from scrape_exchange.rate_limiter import RateLimitWaitExceeded
 from scrape_exchange.worker_id import get_worker_id
 from scrape_exchange.proxy_loader import proxy_file_label
 from .youtube_video_badges import (
-    extract_content_disclosure, extract_video_badges,
+    extract_content_disclosure, extract_hype_points, extract_video_badges,
 )
 from scrape_exchange.util import extract_proxy_ip, extract_proxy_port
 from .youtube_client import METRIC_YT_REQUEST_DURATION, _get_scraper
@@ -1196,6 +1196,7 @@ class InnerTubeVideoParser:
 
         self.video.badges = extract_video_badges(next_data)
         self.video.content_disclosure = extract_content_disclosure(next_data)
+        self.video.hype_points = extract_hype_points(next_data)
 
         def _find(contents: list[dict], key: str) -> dict | None:
             '''
