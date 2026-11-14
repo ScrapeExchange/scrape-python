@@ -6684,6 +6684,120 @@
           ],
           "title": "Video transcript fetches /s by outcome and reason",
           "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "description": "Wall time of one successful video scrape attempt (scrape_duration_seconds, scraper=video_scraper): InnerTube calls, channel enrichment and the file write. Split by innertube_calls, the YouTube calls the attempt sent: player, next, transcript (get_panel), ytdlp, channel_browse (handle lookup missed the creator map). Compare player_next with player_next_transcript to see what the transcript fetch costs.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "barWidthFactor": 0.6,
+                "drawStyle": "line",
+                "fillOpacity": 0,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "showValues": false,
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "s"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 259
+          },
+          "id": 146,
+          "options": {
+            "legend": {
+              "calcs": [
+                "mean",
+                "last"
+              ],
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "pluginVersion": "12.3.0",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "expr": "histogram_quantile(0.5, sum by (le, innertube_calls) (rate(scrape_duration_seconds_bucket{scraper=\"video_scraper\",outcome=\"success\",job=~\"$job\",instance=~\"$instance\"}[5m])))",
+              "legendFormat": "p50 {{innertube_calls}}",
+              "range": true,
+              "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "expr": "histogram_quantile(0.95, sum by (le, innertube_calls) (rate(scrape_duration_seconds_bucket{scraper=\"video_scraper\",outcome=\"success\",job=~\"$job\",instance=~\"$instance\"}[5m])))",
+              "legendFormat": "p95 {{innertube_calls}}",
+              "range": true,
+              "refId": "B"
+            }
+          ],
+          "title": "Video scrape attempt duration p50/p95 by InnerTube calls",
+          "type": "timeseries"
         }
       ],
       "title": "Video scrape queue",

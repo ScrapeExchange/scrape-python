@@ -290,15 +290,18 @@ METRIC_WORKER_SLEEP_SECONDS: Gauge = Gauge(
 # ---------------------------------------------------------------------------
 # scrape_duration_seconds
 #   Per-scrape latency histogram. The 'api' label distinguishes yt-dlp,
-#   HTML, InnerTube, and RSS fetches.
+#   HTML, InnerTube, and RSS fetches. 'innertube_calls' lists the
+#   YouTube calls a video scrape attempt sent (e.g.
+#   player_next_transcript); 'none' for every other scraper.
 # ---------------------------------------------------------------------------
 METRIC_SCRAPE_DURATION: Histogram = Histogram(
     'scrape_duration_seconds',
     'Duration of a single scrape call, labelled by api type and '
-    'outcome (success/failure).',
+    'outcome (success/failure). innertube_calls lists the YouTube '
+    'calls made by a video scrape attempt, none for other scrapers.',
     [
         'platform', 'scraper', 'entity', 'api',
-        'outcome', 'worker_id',
+        'outcome', 'worker_id', 'innertube_calls',
     ],
     buckets=(
         0.1, 0.25, 0.5, 1.0, 2.5, 5.0,

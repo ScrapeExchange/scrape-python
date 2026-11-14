@@ -43,6 +43,7 @@ from .youtube_video_badges import (
 )
 from scrape_exchange.util import extract_proxy_ip, extract_proxy_port
 from .youtube_client import METRIC_YT_REQUEST_DURATION, _get_scraper
+from .innertube_calls import record_call
 from .youtube_format import YouTubeFormat
 from .youtube_rate_limiter import YouTubeRateLimiter, YouTubeCallType
 from .youtube_thumbnail import YouTubeThumbnail
@@ -454,6 +455,7 @@ class InnerTubeVideoParser:
                 else self.player_innertube
             )
             try:
+                record_call('player')
                 try:
                     player_data = await _call_innertube(
                         player_client,
@@ -634,6 +636,7 @@ class InnerTubeVideoParser:
                 else self.next_innertube
             )
             try:
+                record_call('next')
                 try:
                     next_data: dict[str, Any] = await _call_innertube(
                         next_client,
@@ -835,6 +838,7 @@ class InnerTubeVideoParser:
                 if borrowed else self.next_innertube
             )
             start = time.monotonic()
+            record_call('transcript')
             try:
                 panel_data: dict[str, Any] = await _call_innertube(
                     client, client.adaptor.dispatch, 'get_panel', None,
