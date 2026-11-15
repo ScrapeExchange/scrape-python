@@ -2207,6 +2207,17 @@ _PLAYER_INNERTUBE_POOL: _LazyAsyncPool[
     aclose_attr='close',
 )
 
+# Web clients for transcript (get_panel) requests. Separate from
+# _INNERTUBE_POOL because calls on one client are serialised: sharing
+# the NEXT client would make a transcript fetch wait for NEXT instead
+# of running alongside it.
+_TRANSCRIPT_INNERTUBE_POOL: _LazyAsyncPool[
+    str | None, InnerTube,
+] = _LazyAsyncPool(
+    factory=_make_pooled_innertube_for_entry,
+    aclose_attr='close',
+)
+
 
 def _make_pooled_localized_innertube_for_key(
     key: tuple[str | None, str, str],
@@ -2295,6 +2306,33 @@ async def release_pooled_innertube(client: InnerTube) -> None:
     await _INNERTUBE_POOL.release(client)
 
 
+def borrow_pooled_transcript_innertube_for_entry(
+    entry: str | None,
+) -> InnerTube:
+    '''Borrow the Web client used for one transcript request.'''
+
+    return _TRANSCRIPT_INNERTUBE_POOL.borrow(entry)
+
+
+async def release_pooled_transcript_innertube(client: InnerTube) -> None:
+    '''Release a Web client borrowed for one transcript request.'''
+
+    await _TRANSCRIPT_INNERTUBE_POOL.release(client)
+
+
+async def refresh_pooled_transcript_innertube_for_entry(
+    entry: str | None,
+    *,
+    challenged: InnerTube,
+) -> bool:
+    '''Retire the transcript-client generation that failed transport.'''
+
+    return await _TRANSCRIPT_INNERTUBE_POOL.retire_key(
+        entry,
+        expected=challenged,
+    )
+
+
 def borrow_pooled_player_innertube_for_entry(
     entry: str | None,
 ) -> InnerTube:
@@ -2348,6 +2386,7 @@ async def aclose_pooled_innertube() -> None:
 
     await _INNERTUBE_POOL.aclose_all()
     await _PLAYER_INNERTUBE_POOL.aclose_all()
+    await _TRANSCRIPT_INNERTUBE_POOL.aclose_all()
     await _LOCALIZED_INNERTUBE_POOL.aclose_all()
 
 
@@ -2357,4 +2396,5 @@ def _reset_pool_for_tests() -> None:
 
     _INNERTUBE_POOL.reset_for_tests()
     _PLAYER_INNERTUBE_POOL.reset_for_tests()
+    _TRANSCRIPT_INNERTUBE_POOL.reset_for_tests()
     _LOCALIZED_INNERTUBE_POOL.reset_for_tests()

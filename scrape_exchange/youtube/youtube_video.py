@@ -55,6 +55,7 @@ from .youtube_videochapter import YouTubeVideoChapter
 from .youtube_rate_limiter import YouTubeRateLimiter, YouTubeCallType
 from .youtube_video_innertube import InnerTubeVideoParser
 from .youtube_video_badges import BadgeYoutubeIE
+from .innertube_calls import record_call
 
 _LOGGER: Logger = getLogger(__name__)
 
@@ -886,6 +887,7 @@ class YouTubeVideo:
             # yt-dlp includes: formats, availability, media_type,
             # aspect_ratio, heatmaps, embedable, license,
             # default_audio_language
+            record_call('ytdlp')
             await self._scrape_video(proxy=proxy)
 
         if save_dir:

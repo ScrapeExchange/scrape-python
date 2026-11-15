@@ -3692,6 +3692,7 @@ async def _do_scrape_channel_to_disk(
             api='html',
             outcome='failure',
             worker_id=get_worker_id(),
+            innertube_calls='none',
         ).observe(time.monotonic() - scrape_start)
         return False, False, None
 
@@ -3754,6 +3755,7 @@ async def _do_scrape_channel_to_disk(
         api=success_api,
         outcome='success',
         worker_id=get_worker_id(),
+        innertube_calls='none',
     ).observe(time.monotonic() - scrape_start)
     logging.info(
         'Downloaded channel',
@@ -3851,6 +3853,7 @@ async def _do_scrape_channel_to_disk_typed(
             api='html',
             outcome='failure',
             worker_id=get_worker_id(),
+            innertube_calls='none',
         ).observe(time.monotonic() - scrape_start)
         raise
 
@@ -3942,6 +3945,7 @@ async def _do_scrape_channel_to_disk_typed(
         api=success_api,
         outcome='partial' if partial else 'success',
         worker_id=get_worker_id(),
+        innertube_calls='none',
     ).observe(time.monotonic() - scrape_start)
     logging.info(
         'Downloaded partial channel' if partial else 'Downloaded channel',

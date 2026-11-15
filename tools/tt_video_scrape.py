@@ -418,6 +418,7 @@ async def _scrape_one_queued(
                 api=API_LABEL,
                 outcome='failure',
                 worker_id=worker_id,
+                innertube_calls='none',
             ).observe(time.monotonic() - started)
             if reason in _UNAVAILABLE_REASONS:
                 await queue.mark(
@@ -470,6 +471,7 @@ async def _scrape_one_queued(
                 api=API_LABEL,
                 outcome='success',
                 worker_id=worker_id,
+                innertube_calls='none',
             ).observe(time.monotonic() - started)
             return
     await queue.mark(

@@ -185,6 +185,7 @@ async def process_creator(
         METRIC_SCRAPE_DURATION.labels(
             platform=PLATFORM, scraper=SCRAPER, entity='creator',
             api='browser', outcome=outcome, worker_id=worker_id,
+            innertube_calls='none',
         ).observe(time.monotonic() - start)
 
 

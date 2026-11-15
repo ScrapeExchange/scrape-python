@@ -16,7 +16,7 @@ default when the key is absent; this test set asserts the new
 '''
 
 import unittest
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
 import httpx
 
@@ -600,8 +600,12 @@ class TestInnerTubeClientRouting(unittest.IsolatedAsyncioTestCase):
                     player_client,
                     player_client.player,
                     'vid123',
+                    call='player', timing=ANY,
                 ),
-                call(web_client, web_client.next, 'vid123'),
+                call(
+                    web_client, web_client.next, 'vid123',
+                    call='next', timing=ANY,
+                ),
             ],
         )
         # Usable player and next responses are proxy successes.
@@ -790,8 +794,14 @@ class TestInnerTubeClientRouting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             call_api.await_args_list,
             [
-                call(injected, injected.player, 'vid123'),
-                call(injected, injected.next, 'vid123'),
+                call(
+                    injected, injected.player, 'vid123',
+                    call='player', timing=ANY,
+                ),
+                call(
+                    injected, injected.next, 'vid123',
+                    call='next', timing=ANY,
+                ),
             ],
         )
 
