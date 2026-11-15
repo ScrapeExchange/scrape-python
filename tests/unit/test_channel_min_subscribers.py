@@ -162,9 +162,9 @@ class TestRssSkipsSmallChannels(unittest.IsolatedAsyncioTestCase):
         # Privacy: a channel of unknown size counts as below the
         # minimum, so its videos are not queued.
         queue.enqueue.assert_not_awaited()
-        # An unknown count is not evidence for the catch-all tier: the
-        # tier is left alone rather than demoted with a fabricated 0.
-        self.creator_queue.update_tier.assert_not_awaited()
+        # Not a Redis queue, so no last known count: the channel moves
+        # to the lowest tier instead of staying in tier 1 for good.
+        self.creator_queue.update_tier.assert_awaited_once_with('UCX', 0)
 
     async def test_disabled_queues_tiny_channel(self) -> None:
         queue: MagicMock = await self._process(0, 0)
