@@ -142,6 +142,7 @@ from scrape_exchange.youtube.privacy import (
     classify_channel_size,
     classify_for_settings,
     is_topic_channel_title,
+    lookup_channel_counts,
     mask_channel_record,
 )
 
@@ -234,6 +235,17 @@ METRIC_CHANNEL_MAP_SIZE: Gauge = Gauge(
     ['platform', 'scraper', 'worker_id'],
     multiprocess_mode='livemostrecent',
 )
+# Where the subscriber count that sets a channel's RSS tier came from
+# after a successful poll: 'parsed' from the channel page, 'last_known'
+# from the channel scrape queue when the page shows no count, or
+# 'lowest_tier' when no count is known at all.
+METRIC_RSS_TIER_COUNT_SOURCE: Counter = Counter(
+    'rss_tier_subscriber_count_source_total',
+    'Source of the subscriber count used to set the RSS tier of a '
+    'polled channel: parsed, last_known or lowest_tier.',
+    ['platform', 'scraper', 'source'],
+)
+
 METRIC_NO_FEED_LIMIT_HIT: Counter = Counter(
     'rss_no_feed_limit_hit_total',
     'Number of times a channel hit the no-feed failure limit',
@@ -1258,6 +1270,56 @@ async def _circuit_gauge_reaper(
         await asyncio.sleep(poll_interval_seconds)
 
 
+async def _tier_subscriber_count(
+    creator_queue: CreatorQueue, channel_id: str, sub_count: int | None,
+) -> int:
+    '''
+    The subscriber count that sets the RSS tier of a channel after a
+    successful poll.
+
+    Many channels show no subscriber count on their page. Leaving such
+    a channel in its tier would keep it in tier 1 forever, because a
+    channel of unknown size starts in tier 1 to be polled quickly; the
+    hourly polls of those channels then starve every other tier. So
+    when the page shows no count, use the last count the channel
+    scraper recorded, so a one-off parse miss does not demote a known
+    channel. Without one, return 0, which puts the channel in the
+    lowest tier.
+
+    :param creator_queue: the RSS queue; only a Redis queue can look up
+        the channel scrape queue's counts
+    :param channel_id: the YouTube channel ID
+    :param sub_count: the count parsed from this poll, or None
+    :returns: the count to pass to ``update_tier``
+    '''
+
+    source: str = 'parsed'
+    count: int | None = sub_count
+    if count is None and isinstance(creator_queue, RedisCreatorQueue):
+        try:
+            counts: tuple[int | None, int | None] | None = (
+                await lookup_channel_counts(
+                    creator_queue.redis_client, channel_id,
+                )
+            )
+        except Exception as exc:
+            logging.debug(
+                'Could not look up the last known subscriber count',
+                exc=exc, extra={'channel_id': channel_id},
+            )
+            counts = None
+        if counts is not None and counts[0] is not None:
+            count = counts[0]
+            source = 'last_known'
+    if count is None:
+        count = 0
+        source = 'lowest_tier'
+    METRIC_RSS_TIER_COUNT_SOURCE.labels(
+        platform='youtube', scraper='rss_scraper', source=source,
+    ).inc()
+    return count
+
+
 async def process_channel(
     channel_handle: str, channel_id: str, client: ExchangeClient,
     creator_queue: CreatorQueue, settings: RssSettings,
@@ -1422,10 +1484,10 @@ async def process_channel(
             channel_id, rss_url, channel_handle, 1,
         )
         return False
-    # An unknown subscriber count must not demote the channel to
-    # the catch-all tier: keep its current RSS tier.
-    if sub_count is not None:
-        await creator_queue.update_tier(channel_id, sub_count)
+    await creator_queue.update_tier(
+        channel_id,
+        await _tier_subscriber_count(creator_queue, channel_id, sub_count),
+    )
 
     # Bind had_feed once; used by both error and success paths.
     had_feed: bool = await creator_queue.has_had_feed(channel_id)
