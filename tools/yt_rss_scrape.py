@@ -1620,6 +1620,7 @@ async def process_channel(
     redis_uploaded: set[str] = set()
     redis_tracked: set[str] = set()
     redis_tracked_videos: list[YouTubeVideo] = []
+    precheck_ok: bool = False
     try:
         candidate_ids: list[str] = [
             str(v.video_id) for v in candidates
@@ -1641,6 +1642,7 @@ async def process_channel(
             for video_id, state in queue_states.items()
             if state is not None
         }
+        precheck_ok = True
     except Exception as exc:
         logging.debug(
             'Redis existence pre-check failed; checking '
@@ -1663,6 +1665,22 @@ async def process_channel(
         else:
             to_check.append(video)
     candidates = to_check
+
+    # When the backlog server records every upload, an ID it has
+    # never seen is not on scrape.exchange: no GET needed. Only if
+    # the lookup above answered; otherwise fall back to the GETs.
+    # ``is True`` keeps a test double's auto-attribute from counting.
+    if (
+        candidates
+        and precheck_ok
+        and video_queue.knows_every_upload is True
+    ):
+        logging.debug(
+            'Videos unknown to the backlog server, treating as new',
+            extra=extra | {'video_count': len(candidates)},
+        )
+        redis_tracked_videos.extend(candidates)
+        candidates = []
 
     exist_started: float = monotonic()
     existence_gate: asyncio.Semaphore = (

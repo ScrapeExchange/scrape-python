@@ -342,6 +342,20 @@ class BacklogServerVideoScrapeQueue(VideoScrapeQueue):
 
     # -- upload state -------------------------------------------------
 
+    @property
+    def knows_every_upload(self) -> bool:
+        '''True once the ``uploaded`` backfill is done.
+
+        The fleet records every upload here, so an ID the server has
+        never seen is not on scrape.exchange. While
+        BACKLOG_UPLOADED_API_FALLBACK is on (the migration), that does
+        not hold yet.
+        '''
+        return (
+            self.supports_uploaded
+            and not self._settings.backlog_uploaded_api_fallback
+        )
+
     async def mark_uploaded(self, video_ids: list[str]) -> None:
         '''Record *video_ids* as accepted by the bulk upload API.'''
         if not self.supports_uploaded:

@@ -431,6 +431,17 @@ class VideoScrapeQueue(ABC):
     another platform must answer False without touching either.
     '''
 
+    @property
+    def knows_every_upload(self) -> bool:
+        '''Whether an ID this queue has never seen is certainly not on
+        scrape.exchange, so callers can skip the existence GET.
+
+        False by default: the Redis queue forgets scraped videos and
+        remembers uploads only in a Bloom filter that predates some of
+        the fleet's uploads.
+        '''
+        return False
+
     async def mark_uploaded(self, video_ids: list[str]) -> None:
         '''Record *video_ids* as accepted by the bulk upload API.'''
         return
