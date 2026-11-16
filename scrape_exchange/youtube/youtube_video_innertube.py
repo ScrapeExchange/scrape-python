@@ -105,6 +105,12 @@ class YouTubeBotDetectionError(RuntimeError):
     through a different proxy.'''
 
 
+class YouTubeVideoUnavailableError(RuntimeError):
+    '''InnerTube PLAYER returned a non-OK playability status without
+    any video metadata (removed, private, sign-in required). There is
+    nothing to save and retrying will not help.'''
+
+
 # Wall-clock safety net for a single innertube player/next call. The
 # inner sync HTTP stack (httpx + curl_cffi) is supposed to enforce its
 # own timeouts, but on 2026-05-17 both video scrapers (scraper001 +
@@ -388,6 +394,30 @@ def _player_response_shape(player_data: dict[str, Any]) -> dict[str, bool]:
         ),
         'has_channel_id': bool(video_details.get('channelId')),
     }
+
+
+def _raise_if_unavailable(
+    video_id: str, player_data: dict[str, Any],
+) -> None:
+    '''
+    Raise :class:`YouTubeVideoUnavailableError` when the PLAYER
+    response has a non-OK playability status and no title. Such a
+    response (removed by the uploader, private, sign-in required)
+    carries no video metadata, so saving it would produce an empty
+    record that the uploader rejects. Non-OK responses that do carry
+    metadata, such as age-restricted videos, are still parsed.
+    '''
+    playability: dict = _as_dict(player_data.get('playabilityStatus'))
+    status: str = _normalise_status(playability.get('status'))
+    if status == 'ok':
+        return
+    if _player_response_shape(player_data)['has_title']:
+        return
+    raise YouTubeVideoUnavailableError(
+        f'InnerTube PLAYER returned no video metadata for '
+        f'video_id={video_id}: status={status}, '
+        f'reason={playability.get("reason")}'
+    )
 
 
 def _record_player_response(
@@ -687,6 +717,7 @@ class InnerTubeVideoParser:
                 f'video_id={video.video_id}'
             )
         await limiter.report_proxy_result(proxy, True)
+        _raise_if_unavailable(video.video_id, player_data)
         InnerTubeVideoParser._apply_player_data(video, player_data)
 
         async def fetch_next() -> dict[str, Any] | None:

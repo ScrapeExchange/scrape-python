@@ -834,6 +834,26 @@ class YouTubeChannelProcessor(AssetProcessor):
         return kwargs
 
 
+async def _mark_video_invalid(
+    context: AssetProcessingContext,
+    filename: str,
+    content_id: str,
+    reason: str,
+) -> None:
+    '''Log why a video file is rejected before schema validation,
+    then mark it ``.invalid``.'''
+    logging.warning(
+        'Video record rejected before schema validation, '
+        'marking invalid',
+        extra={
+            'filename': filename,
+            'content_id': content_id,
+            'reason': reason,
+        },
+    )
+    await context.fm.mark_invalid(filename)
+
+
 @dataclass(frozen=True)
 class YouTubeVideoProcessorState:
     creator_map: CreatorMap
@@ -931,7 +951,10 @@ class YouTubeVideoProcessor(AssetProcessor):
         video: YouTubeVideo = YouTubeVideo.from_dict(data)
         handle: str | None = await self._resolve_handle(video, state)
         if handle is None or any(char.isspace() for char in handle):
-            await context.fm.mark_invalid(filename)
+            await _mark_video_invalid(
+                context, filename, content_id,
+                'no usable channel handle',
+            )
             return None
         video.channel_handle = handle
         if not video.channel_url:
@@ -942,7 +965,9 @@ class YouTubeVideoProcessor(AssetProcessor):
             return None
         thumbnails: dict = getattr(video, 'thumbnails', {})
         if not thumbnails:
-            await context.fm.mark_invalid(filename)
+            await _mark_video_invalid(
+                context, filename, content_id, 'no thumbnails',
+            )
             return None
         for thumbnail in thumbnails.values():
             thumbnail_url: str | None
@@ -951,7 +976,10 @@ class YouTubeVideoProcessor(AssetProcessor):
             else:
                 thumbnail_url = getattr(thumbnail, 'url', None)
             if not thumbnail_url:
-                await context.fm.mark_invalid(filename)
+                await _mark_video_invalid(
+                    context, filename, content_id,
+                    'thumbnail without url',
+                )
                 return None
         return video.to_dict()
 

@@ -87,6 +87,7 @@ from scrape_exchange.youtube.youtube_video import (
 )
 from scrape_exchange.youtube.youtube_video_innertube import (
     YouTubeBotDetectionError,
+    YouTubeVideoUnavailableError,
 )
 from scrape_exchange.backlog_server_queue import (
     BacklogServerVideoScrapeQueue,
@@ -243,6 +244,8 @@ def _classify_scrape_error(exc: BaseException) -> str:
 
     if isinstance(exc, YouTubeBotDetectionError):
         return 'bot_detection'
+    if isinstance(exc, YouTubeVideoUnavailableError):
+        return 'unavailable'
     if _is_bind_failure(exc):
         return 'bind_failed'
     seen: set[int] = set()

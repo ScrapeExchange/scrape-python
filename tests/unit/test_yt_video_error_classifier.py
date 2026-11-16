@@ -14,6 +14,7 @@ import unittest
 
 from scrape_exchange.youtube.youtube_video_innertube import (
     YouTubeBotDetectionError,
+    YouTubeVideoUnavailableError,
 )
 from tools import yt_video_scrape
 from tools.yt_video_scrape import (
@@ -257,6 +258,18 @@ class TestTransientClassification(unittest.TestCase):
                 YouTubeBotDetectionError('bot challenge'),
             ),
             'bot_detection',
+        )
+
+    def test_typed_video_unavailable_error(self) -> None:
+        '''The typed error is unavailable even when its message
+        (e.g. "Please sign in") matches no substring rule.'''
+        self.assertEqual(
+            _classify_scrape_error(
+                YouTubeVideoUnavailableError(
+                    'status=login_required, reason=Please sign in',
+                ),
+            ),
+            'unavailable',
         )
 
     def test_offline_no_period(self) -> None:
