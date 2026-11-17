@@ -233,6 +233,40 @@ A topic channel goes in the **tier one above the catch-all**
 subscriber count qualifies. A missing subscriber count is not a
 retry for a topic channel: it is scheduled normally.
 
+### Re-checking low_subs channels (`--recheck-low-subs`)
+
+A channel below `CHANNEL_MIN_SUBSCRIBERS` is parked in the
+`low_subs` end state and is never scraped again, so a channel that
+grows stays parked, and its videos keep being saved as `.low_subs`.
+The re-check mode fixes that. It runs once and exits; schedule it
+(cron) to run it periodically.
+
+```bash
+# Report what would change, without changing anything
+uv run tools/yt_channel_scrape.py --recheck-low-subs true
+# Make the changes
+uv run tools/yt_channel_scrape.py --recheck-low-subs true \
+    --recheck-apply true
+```
+
+For each channel parked in `low_subs`, largest stored subscriber
+count first, it makes one InnerTube call for the current subscriber
+and view counts (a count YouTube does not show falls back to the
+stored one) and stores them in the queue. Then:
+
+- **No longer tiny:** the channel goes back into the tier for its
+  subscriber count; the regular channel scraper scrapes it again.
+- **Topic channel:** it goes into the topic tier, as with
+  `yt_channel_queue.py requeue-topic`.
+- **Still tiny, or the call failed:** it stays parked and is not
+  checked again for `--recheck-after-days` days (default 30).
+
+`--recheck-limit N` checks at most N channels. Channels that leave
+`low_subs` are added to the Redis set
+`youtube:channel:low_subs_released`; run the video scraper's
+re-check afterwards to release their `.low_subs` videos for upload
+(see [section 4](#releasing-low_subs-videos---recheck-low-subs)).
+
 ### Failure handling
 
 Channels classified `unavailable` accumulate a counter; a

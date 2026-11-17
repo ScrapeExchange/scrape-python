@@ -11,6 +11,7 @@ records into the channel data directory for tools/scrape_upload.py.
 '''
 
 import asyncio
+import itertools
 import json
 import logging
 import os
@@ -19,73 +20,19 @@ import resource
 import shutil
 import sys
 import time
-
-from random import shuffle
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Awaitable, Callable
+from random import shuffle
 
 import aiofiles
 import httpx2 as httpx  # exchange API traffic runs on httpx2 (HTTP/2)
 import redis.asyncio as aioredis
-
 from prometheus_client import Counter, Gauge
 from pydantic import AliasChoices, Field, field_validator
 
-from scrape_exchange.name_map import (
-    NameMap,
-    NullNameMap,
-    RedisNameMap,
-)
-from scrape_exchange.creator_map import (
-    CreatorMap,
-    FileCreatorMap,
-    RedisCreatorMap,
-)
-from scrape_exchange.handle_map import NullHandleMap, RedisHandleMap
-from scrape_exchange.youtube.channel_identity import (
-    ChannelIdentityStore,
-    ChannelNotFoundError,
-    ChannelRedirectedError,
-    ChannelTerminatedError,
-    InconsistentIdentityError,
-    is_valid_channel_handle,
-    resolve_channel_id,
-    resolve_channel_handle,
-)
-from scrape_exchange.youtube.youtube_types import YouTubeChannelLink
 from scrape_exchange.channel_list_parsing import (
     dedupe_preserving_case,
     parse_channel_handle,
-)
-
-from scrape_exchange.file_management import (
-    AssetFileManagement,
-    CHANNEL_FILE_PREFIX,
-    LOW_SUBS_SUFFIX,
-    atomic_write_bytes,
-)
-from scrape_exchange.scraper_runner import (
-    ScraperRunContext,
-    ScraperRunner,
-)
-from scrape_exchange.proxy_loader import proxy_file_label
-from scrape_exchange.settings import normalize_log_level
-from scrape_exchange.util import (
-    extract_proxy_ip,
-    extract_proxy_port,
-    proxy_network_for,
-)
-
-from scrape_exchange.redis_claim import RedisClaim
-from scrape_exchange.worker_id import get_worker_id
-from scrape_exchange.watchdog import Watchdog
-from scrape_exchange.youtube.exchange_channels_set import (
-    RedisExchangeChannelsSet,
-)
-from scrape_exchange.creator_queue import (
-    RedisCreatorQueue,
-    TierConfig,
-    parse_priority_queues,
 )
 from scrape_exchange.channel_scrape_queue import (
     LISTING_RESUME_FIELD,
@@ -98,6 +45,60 @@ from scrape_exchange.channel_scrape_queue import (
     parse_channel_priority_queues,
     parse_channel_priority_weights,
 )
+from scrape_exchange.creator_map import (
+    CreatorMap,
+    FileCreatorMap,
+    RedisCreatorMap,
+)
+from scrape_exchange.creator_queue import (
+    RedisCreatorQueue,
+    TierConfig,
+    parse_priority_queues,
+)
+from scrape_exchange.file_management import (
+    CHANNEL_FILE_PREFIX,
+    LOW_SUBS_SUFFIX,
+    AssetFileManagement,
+    atomic_write_bytes,
+)
+from scrape_exchange.handle_map import NullHandleMap, RedisHandleMap
+from scrape_exchange.name_map import (
+    NameMap,
+    NullNameMap,
+    RedisNameMap,
+)
+from scrape_exchange.proxy_loader import proxy_file_label
+from scrape_exchange.redis_claim import RedisClaim
+from scrape_exchange.redis_client import redis_from_url
+from scrape_exchange.scraper_metrics import (
+    METRIC_SCRAPE_DURATION,
+    METRIC_SCRAPE_FAILURES,
+)
+from scrape_exchange.scraper_metrics import (
+    METRIC_SCRAPES_COMPLETED as METRIC_CHANNELS_SCRAPED,
+)
+from scrape_exchange.scraper_runner import (
+    ScraperRunContext,
+    ScraperRunner,
+)
+from scrape_exchange.settings import normalize_log_level
+from scrape_exchange.util import (
+    extract_proxy_ip,
+    extract_proxy_port,
+    proxy_network_for,
+)
+from scrape_exchange.watchdog import Watchdog
+from scrape_exchange.worker_id import get_worker_id
+from scrape_exchange.youtube.channel_identity import (
+    ChannelIdentityStore,
+    ChannelNotFoundError,
+    ChannelRedirectedError,
+    ChannelTerminatedError,
+    InconsistentIdentityError,
+    is_valid_channel_handle,
+    resolve_channel_handle,
+    resolve_channel_id,
+)
 from scrape_exchange.youtube.channel_video_refresh import (
     FilterQueryError,
     FullScrapeSummary,
@@ -107,11 +108,17 @@ from scrape_exchange.youtube.channel_video_refresh import (
     queue_channel_videos,
     queue_video_ids,
 )
-from scrape_exchange.youtube.settings import (
-    DEFAULT_CHANNEL_MIN_SUBSCRIBERS,
-    DEFAULT_CHANNEL_PRIVACY_SUBSCRIBERS,
-    DEFAULT_CHANNEL_VIEWS_PER_SUBSCRIBER,
-    YouTubeScraperSettings,
+from scrape_exchange.youtube.derived_metadata import (
+    enrich_channel_category,
+    set_channel_country,
+)
+from scrape_exchange.youtube.exchange_channels_set import (
+    RedisExchangeChannelsSet,
+)
+from scrape_exchange.youtube.low_subs_recheck import (
+    BrowseResult,
+    RecheckSummary,
+    recheck_low_subs_channels,
 )
 from scrape_exchange.youtube.privacy import (
     ChannelSize,
@@ -122,23 +129,21 @@ from scrape_exchange.youtube.privacy import (
     mask_channel,
     parse_count,
 )
-from scrape_exchange.youtube.derived_metadata import (
-    enrich_channel_category,
-    set_channel_country,
+from scrape_exchange.youtube.settings import (
+    DEFAULT_CHANNEL_MIN_SUBSCRIBERS,
+    DEFAULT_CHANNEL_PRIVACY_SUBSCRIBERS,
+    DEFAULT_CHANNEL_VIEWS_PER_SUBSCRIBER,
+    YouTubeScraperSettings,
 )
 from scrape_exchange.youtube.youtube_channel import (
     ListingCheckpointFn,
     YouTubeChannel,
     fallback_handle,
 )
+from scrape_exchange.youtube.youtube_channel_tabs import YouTubeChannelTabs
 from scrape_exchange.youtube.youtube_rate_limiter import YouTubeRateLimiter
+from scrape_exchange.youtube.youtube_types import YouTubeChannelLink
 from scrape_exchange.youtube.youtube_video import DENO_PATH, PO_TOKEN_URL
-
-from scrape_exchange.scraper_metrics import (
-    METRIC_SCRAPES_COMPLETED as METRIC_CHANNELS_SCRAPED,
-    METRIC_SCRAPE_DURATION,
-    METRIC_SCRAPE_FAILURES,
-)
 
 CHANNEL_FILE_POSTFIX = '.json.br'
 MIN_CHANNEL_SUBSCRIBERS: int = DEFAULT_CHANNEL_MIN_SUBSCRIBERS
@@ -187,6 +192,54 @@ class ChannelSettings(YouTubeScraperSettings):
     CLI flags > environment variables > .env file > built-in defaults.
     '''
 
+    recheck_low_subs: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            'CHANNEL_RECHECK_LOW_SUBS', 'recheck_low_subs',
+        ),
+        description=(
+            'Run the low_subs re-check once and exit instead of '
+            'scraping. Channels parked as too small (low_subs) get '
+            'their current subscriber and view counts from YouTube; '
+            'those that are no longer below CHANNEL_MIN_SUBSCRIBERS '
+            'go back into the regular scrape queue. Reports only '
+            'unless --recheck-apply is set. Run yt_video_scrape.py '
+            '--recheck-low-subs afterwards to release their videos.'
+        ),
+    )
+    recheck_apply: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            'CHANNEL_RECHECK_APPLY', 'recheck_apply',
+        ),
+        description=(
+            'With --recheck-low-subs: make the changes. Without it '
+            'the re-check only reports what it would do.'
+        ),
+    )
+    recheck_after_days: float = Field(
+        default=30.0,
+        ge=0,
+        validation_alias=AliasChoices(
+            'CHANNEL_RECHECK_AFTER_DAYS', 'recheck_after_days',
+        ),
+        description=(
+            'With --recheck-low-subs: skip channels that were '
+            'checked less than this many days ago and were still '
+            'too small.'
+        ),
+    )
+    recheck_limit: int | None = Field(
+        default=None,
+        ge=1,
+        validation_alias=AliasChoices(
+            'CHANNEL_RECHECK_LIMIT', 'recheck_limit',
+        ),
+        description=(
+            'With --recheck-low-subs: check at most this many '
+            'channels, largest stored subscriber count first.'
+        ),
+    )
     max_new_channels: int = Field(
         default=MAX_NEW_CHANNELS,
         validation_alias=AliasChoices(
@@ -640,7 +693,7 @@ def _validate_settings(settings: ChannelSettings) -> None:
 
 
 def _build_identity_maps(
-    settings: 'ChannelSettings',
+    settings: ChannelSettings,
 ) -> tuple[CreatorMap, NullHandleMap | RedisHandleMap, NameMap]:
     '''Build the creator / handle / name map backends.
 
@@ -674,6 +727,70 @@ def _build_identity_maps(
         handle_map_backend,
         name_map_backend,
     )
+
+
+def _build_channel_queue(
+    settings: ChannelSettings,
+    redis_client: aioredis.Redis,
+) -> RedisChannelScrapeQueue:
+    '''The channel scrape queue, configured from *settings*.'''
+
+    queue_settings: ChannelScrapeQueueSettings = (
+        ChannelScrapeQueueSettings(
+            channel_priority_queues=(
+                settings.channel_priority_queues
+            ),
+            channel_priority_weights=(
+                settings.channel_priority_weights
+            ),
+            channel_queue_resolve_batch=(
+                settings.channel_queue_resolve_batch
+            ),
+            channel_queue_scrape_batch=(
+                settings.channel_queue_scrape_batch
+            ),
+            channel_queue_idle_poll_seconds=(
+                settings.channel_queue_idle_poll_seconds
+            ),
+            channel_resolve_max_attempts=(
+                settings.channel_resolve_max_attempts
+            ),
+            channel_resolve_backoff_seconds=(
+                settings.channel_resolve_backoff_seconds
+            ),
+            channel_unavailable_hard_threshold=(
+                settings
+                .channel_unavailable_hard_threshold
+            ),
+            channel_not_found_terminal_threshold=(
+                settings
+                .channel_not_found_terminal_threshold
+            ),
+            channel_not_found_retry_seconds=(
+                settings
+                .channel_not_found_retry_seconds
+            ),
+            channel_missing_subscriber_retry_seconds=(
+                settings
+                .channel_missing_subscriber_retry_seconds
+            ),
+            channel_unavailable_soft_retry_seconds=(
+                settings
+                .channel_unavailable_soft_retry_seconds
+            ),
+            channel_partial_retry_seconds=(
+                settings.channel_partial_retry_seconds
+            ),
+            channel_partial_max_retries=(
+                settings.channel_partial_max_retries
+            ),
+            channel_soft_reap_interval_seconds=(
+                settings
+                .channel_soft_reap_interval_seconds
+            ),
+        )
+    )
+    return RedisChannelScrapeQueue(redis_client, queue_settings)
 
 
 async def _run_worker(
@@ -728,65 +845,8 @@ async def _run_worker(
         redis_client: aioredis.Redis = (
             creator_map_backend.redis_client
         )
-        queue_settings: ChannelScrapeQueueSettings = (
-            ChannelScrapeQueueSettings(
-                channel_priority_queues=(
-                    settings.channel_priority_queues
-                ),
-                channel_priority_weights=(
-                    settings.channel_priority_weights
-                ),
-                channel_queue_resolve_batch=(
-                    settings.channel_queue_resolve_batch
-                ),
-                channel_queue_scrape_batch=(
-                    settings.channel_queue_scrape_batch
-                ),
-                channel_queue_idle_poll_seconds=(
-                    settings.channel_queue_idle_poll_seconds
-                ),
-                channel_resolve_max_attempts=(
-                    settings.channel_resolve_max_attempts
-                ),
-                channel_resolve_backoff_seconds=(
-                    settings.channel_resolve_backoff_seconds
-                ),
-                channel_unavailable_hard_threshold=(
-                    settings
-                    .channel_unavailable_hard_threshold
-                ),
-                channel_not_found_terminal_threshold=(
-                    settings
-                    .channel_not_found_terminal_threshold
-                ),
-                channel_not_found_retry_seconds=(
-                    settings
-                    .channel_not_found_retry_seconds
-                ),
-                channel_missing_subscriber_retry_seconds=(
-                    settings
-                    .channel_missing_subscriber_retry_seconds
-                ),
-                channel_unavailable_soft_retry_seconds=(
-                    settings
-                    .channel_unavailable_soft_retry_seconds
-                ),
-                channel_partial_retry_seconds=(
-                    settings.channel_partial_retry_seconds
-                ),
-                channel_partial_max_retries=(
-                    settings.channel_partial_max_retries
-                ),
-                channel_soft_reap_interval_seconds=(
-                    settings
-                    .channel_soft_reap_interval_seconds
-                ),
-            )
-        )
         channel_queue: RedisChannelScrapeQueue = (
-            RedisChannelScrapeQueue(
-                redis_client, queue_settings
-            )
+            _build_channel_queue(settings, redis_client)
         )
 
     if not settings.proxies:
@@ -902,7 +962,7 @@ async def _run_worker(
 
 
 def _build_channel_rate_limiter(
-    s: 'ChannelSettings',
+    s: ChannelSettings,
 ) -> YouTubeRateLimiter:
     '''
     Construct (or fetch) the per-process YouTubeRateLimiter
@@ -915,6 +975,53 @@ def _build_channel_rate_limiter(
     return rl
 
 
+async def _run_low_subs_recheck(settings: ChannelSettings) -> int:
+    '''
+    One-shot ``--recheck-low-subs`` pass: re-check the channels parked
+    in ``low_subs`` and print a summary line. Returns the exit code.
+    '''
+
+    if not settings.redis_dsn:
+        logging.error(
+            '--recheck-low-subs needs REDIS_DSN: the channel queue '
+            'lives in Redis',
+        )
+        return 2
+    # browse_channel() acquires through the YouTubeRateLimiter.get()
+    # singleton; building it here seeds it with the Redis DSN and
+    # state directory before the first InnerTube call.
+    _build_channel_rate_limiter(settings)
+    redis_client: aioredis.Redis = redis_from_url(
+        settings.redis_dsn,
+        component='youtube-channel-recheck',
+        decode_responses=True,
+    )
+    queue: RedisChannelScrapeQueue = _build_channel_queue(
+        settings, redis_client,
+    )
+    proxies: list[str] = list(settings.proxies or [])
+    counter: itertools.count = itertools.count()
+
+    async def browse(channel_id: str) -> BrowseResult:
+        proxy: str | None = (
+            proxies[next(counter) % len(proxies)] if proxies else None
+        )
+        tabs: YouTubeChannelTabs = YouTubeChannelTabs(channel_id, proxy)
+        data: dict = await tabs.browse_channel()
+        return BrowseResult(data=data, is_topic=bool(tabs.is_topic))
+
+    summary: RecheckSummary = await recheck_low_subs_channels(
+        queue, settings, browse,
+        apply=settings.recheck_apply,
+        now=time.time(),
+        recheck_after_days=settings.recheck_after_days,
+        limit=settings.recheck_limit,
+        concurrency=max(settings.channel_concurrency, 1),
+    )
+    sys.stdout.write(f'{summary.line(settings.recheck_apply)}\n')
+    return 0
+
+
 def main() -> None:
     '''
     Top-level entry point. Reads settings and dispatches to
@@ -923,6 +1030,8 @@ def main() -> None:
 
     settings: ChannelSettings = ChannelSettings()
     _validate_settings(settings)
+    if settings.recheck_low_subs:
+        sys.exit(asyncio.run(_run_low_subs_recheck(settings)))
 
     runner: ScraperRunner = ScraperRunner(
         settings=settings,
@@ -1117,11 +1226,11 @@ def _is_valid_input_channel_handle(handle: str) -> bool:
 
 
 async def _drain_priority_directory(
-    settings: 'ChannelSettings',
+    settings: ChannelSettings,
     identity_store: ChannelIdentityStore,
     *,
-    channel_queue: 'RedisChannelScrapeQueue | None' = None,
-) -> 'dict[str, Path]':
+    channel_queue: RedisChannelScrapeQueue | None = None,
+) -> dict[str, Path]:
     '''Drain bare channel-ID or channel-handle priority files.
 
     Legacy file mode returns a ``{channel_id: Path}`` map (the path is
@@ -1237,7 +1346,7 @@ async def _drain_priority_directory(
 
 
 def _priority_post_cleanup(
-    priority_ids: 'dict[str, Path]',
+    priority_ids: dict[str, Path],
     fm: AssetFileManagement,
 ) -> None:
     # Legacy file-based path only. Redis mode renames each priority
@@ -1318,7 +1427,7 @@ async def _priority_drain_loop(
                     .channel_priority_drain_interval_seconds
                 ),
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
 
 
@@ -1387,16 +1496,16 @@ async def _publish_channel_queue_sizes(
                 shutdown_event.wait(),
                 timeout=interval,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
 
 
 async def _queue_driven_loop(
-    queue: 'RedisChannelScrapeQueue',
+    queue: RedisChannelScrapeQueue,
     identity: object,
-    settings: 'ChannelSettings',
+    settings: ChannelSettings,
     fm: AssetFileManagement,
-    creator_map_backend: 'CreatorMap',
+    creator_map_backend: CreatorMap,
     *,
     is_reap_worker: bool,
     shutdown_event: asyncio.Event,
@@ -3555,7 +3664,7 @@ async def _persist_scraped_channel(
 async def _try_acquire_scrape_claim(
     channel_id: str,
     creator_map_backend: CreatorMap,
-) -> tuple['RedisClaim | None', str]:
+) -> tuple[RedisClaim | None, str]:
     '''Try to acquire ``claim:youtube:channel:<channel_id>`` on the
     Redis behind ``creator_map_backend``. The claim coordinates
     cross-host scrape work so two hosts running the same channel
