@@ -1223,6 +1223,42 @@ class TestOverlappingBulkUpload(unittest.IsolatedAsyncioTestCase):
             fake.release.set()
             await asyncio.wait_for(drain, 5)
 
+    async def test_prefetch_gets_window_of_upcoming_names(self) -> None:
+        calls: list[tuple[list[str], list[str]]] = []
+
+        class SpyProcessor(scrape_upload.AssetProcessor):
+            async def prefetch(
+                self,
+                filenames: list[str],
+                upcoming: list[str],
+                context: scrape_upload.AssetProcessingContext,
+            ) -> None:
+                calls.append((list(filenames), list(upcoming)))
+
+        fake: FakeBulkExchange = FakeBulkExchange()
+        with tempfile.TemporaryDirectory() as tmp, fake.patched():
+            fm = AssetFileManagement(
+                tmp, prefix_rankings=_descriptor().prefix_rankings,
+            )
+            await self._write(fm, 'a', 'b', 'c', 'd')
+            target = scrape_upload.AssetUploadTarget(
+                descriptor=_descriptor(), fm=fm, validator=_validator(),
+                processor=SpyProcessor(),
+            )
+            await scrape_upload.drain_bulk_target_once(
+                settings=_settings(
+                    bulk_batch_size=3, scrape_upload_concurrency=1,
+                ),
+                target=target, client=object(),
+            )
+            await asyncio.gather(*target.upload.in_flight_jobs)
+
+        self.assertTrue(calls)
+        first_names, first_upcoming = calls[0]
+        self.assertEqual(len(first_names), 1)
+        # The window covers the rest of the batch, not just this chunk.
+        self.assertEqual(len(first_names) + len(first_upcoming), 3)
+
     async def test_in_flight_files_not_resent(self) -> None:
         fake: FakeBulkExchange = FakeBulkExchange(hold_finalize=True)
         with tempfile.TemporaryDirectory() as tmp, fake.patched():
@@ -2173,6 +2209,78 @@ class TestYouTubeUploadState(unittest.IsolatedAsyncioTestCase):
             )
             self.assertIsNone(record)
             self.assertFalse((Path(tmp) / name).exists())
+
+    def _video_context(self, queue: object) -> object:
+        return self._context(self._state(queue), object())
+
+    async def test_prefetch_one_lookup_for_window(self) -> None:
+        calls: list[list[str]] = []
+
+        class FakeQueue:
+            async def uploaded_many(
+                self, ids: list[str],
+            ) -> dict[str, bool]:
+                calls.append(list(ids))
+                return {video_id: video_id == 'bbb' for video_id in ids}
+
+        context = self._video_context(FakeQueue())
+        processor = scrape_upload.YouTubeVideoProcessor()
+        await processor.prefetch(
+            ['video-min-aaa.json.br'],
+            ['video-min-bbb.json.br', 'video-min-ccc.json.br'],
+            context,
+        )
+        state = context.state
+        self.assertFalse(await processor._is_uploaded(state, 'aaa'))
+        self.assertTrue(await processor._is_uploaded(state, 'bbb'))
+        self.assertFalse(await processor._is_uploaded(state, 'ccc'))
+        self.assertEqual(calls, [['aaa', 'bbb', 'ccc']])
+
+    async def test_prefetch_skipped_when_names_cached(self) -> None:
+        calls: list[list[str]] = []
+
+        class FakeQueue:
+            async def uploaded_many(
+                self, ids: list[str],
+            ) -> dict[str, bool]:
+                calls.append(list(ids))
+                return {video_id: False for video_id in ids}
+
+        context = self._video_context(FakeQueue())
+        processor = scrape_upload.YouTubeVideoProcessor()
+        names: list[str] = [
+            'video-min-aaa.json.br', 'video-min-bbb.json.br',
+        ]
+        await processor.prefetch(names[:1], names[1:], context)
+        await processor.prefetch(names[1:], [], context)
+        self.assertEqual(len(calls), 1)
+
+    async def test_prefetch_failure_falls_back_per_file(self) -> None:
+        calls: list[list[str]] = []
+
+        class FakeQueue:
+            async def uploaded_many(
+                self, ids: list[str],
+            ) -> dict[str, bool]:
+                calls.append(list(ids))
+                if len(calls) == 1:
+                    raise ConnectionError('no server')
+                return {video_id: True for video_id in ids}
+
+        metric = scrape_upload.METRIC_BACKLOG_UPLOAD_STATE_ERRORS
+        before: float = metric.labels(op='lookup')._value.get()
+        context = self._video_context(FakeQueue())
+        processor = scrape_upload.YouTubeVideoProcessor()
+        await processor.prefetch(
+            ['video-min-aaa.json.br'], [], context,
+        )
+        self.assertTrue(
+            await processor._is_uploaded(context.state, 'aaa'),
+        )
+        self.assertEqual(calls, [['aaa'], ['aaa']])
+        self.assertEqual(
+            metric.labels(op='lookup')._value.get() - before, 1,
+        )
 
     async def test_lookup_error_uploads_and_counts(self) -> None:
         class FakeQueue:

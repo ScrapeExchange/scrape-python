@@ -15,6 +15,7 @@ saves the disk space and the file churn of keeping uploaded copies.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import os
 import signal
@@ -649,6 +650,20 @@ class AssetProcessor:
         del content_id
         return context.descriptor.load_record(data)
 
+    async def prefetch(
+        self,
+        filenames: list[str],
+        upcoming: list[str],
+        context: AssetProcessingContext,
+    ) -> None:
+        '''Called before *filenames* are prepared, with *upcoming*:
+        the names likely to be prepared next for the same batch. A
+        processor that looks something up per file can fetch it for
+        all of them in one call. The default does nothing.'''
+        del filenames
+        del upcoming
+        del context
+
     async def handle_brotli_error(
         self,
         *,
@@ -858,6 +873,10 @@ async def _mark_video_invalid(
 class YouTubeVideoProcessorState:
     creator_map: CreatorMap
     scrape_queue: VideoScrapeQueue | None
+    # Upload state of the next files to prepare, from one batched
+    # lookup (see YouTubeVideoProcessor.prefetch); each answer is used
+    # once. Replaced on every prefetch, so it never outgrows a window.
+    uploaded_cache: dict[str, bool] = field(default_factory=dict)
 
 
 class YouTubeVideoProcessor(AssetProcessor):
@@ -1006,12 +1025,53 @@ class YouTubeVideoProcessor(AssetProcessor):
         await context.fm.delete(filename, fail_ok=False)
         return True
 
+    async def prefetch(
+        self,
+        filenames: list[str],
+        upcoming: list[str],
+        context: AssetProcessingContext,
+    ) -> None:
+        '''Look up the upload state of *filenames* and *upcoming* in
+        one backlog call, unless every name in *filenames* already has
+        a cached answer. A failed lookup caches nothing, so each file
+        falls back to its own lookup.'''
+        state: YouTubeVideoProcessorState = context.state
+        if state.scrape_queue is None:
+            return
+        ids: list[str] = []
+        name: str
+        for name in [*filenames, *upcoming]:
+            try:
+                ids.append(content_id_from_filename(name, context.descriptor))
+            except ValueError:
+                continue
+        head: set[str] = set(ids[:len(filenames)])
+        if not ids or head <= state.uploaded_cache.keys():
+            return
+        try:
+            answers: dict[str, bool] = await state.scrape_queue.uploaded_many(
+                list(dict.fromkeys(ids)),
+            )
+        except Exception:  # noqa: BLE001 - fail open, see _is_uploaded
+            METRIC_BACKLOG_UPLOAD_STATE_ERRORS.labels(op='lookup').inc()
+            logging.warning(
+                'Batched upload-state lookup failed; checking per file',
+                extra={'videos': len(ids)},
+            )
+            state.uploaded_cache.clear()
+            return
+        state.uploaded_cache.clear()
+        state.uploaded_cache.update(
+            {video_id: bool(answers.get(video_id)) for video_id in ids},
+        )
+
     async def _is_uploaded(
         self,
         state: YouTubeVideoProcessorState,
         content_id: str,
     ) -> bool:
-        '''Whether *content_id* is already on scrape.exchange.
+        '''Whether *content_id* is already on scrape.exchange: the
+        answer :meth:`prefetch` cached, else a lookup of its own.
 
         A failed lookup fails open: the file is uploaded anyway and
         counted, because the worst case is a duplicate upload, which
@@ -1019,6 +1079,9 @@ class YouTubeVideoProcessor(AssetProcessor):
         '''
         if state.scrape_queue is None:
             return False
+        cached: bool | None = state.uploaded_cache.pop(content_id, None)
+        if cached is not None:
+            return cached
         try:
             answers: dict[str, bool] = await state.scrape_queue.uploaded_many(
                 [content_id],
@@ -1989,6 +2052,16 @@ async def drain_bulk_target_once(
                 break
             upload.files_released = False
             continue
+        # Let the processor batch its per-file lookups over the rest
+        # of this batch instead of making one call per file.
+        want: int = max(
+            settings.bulk_batch_size - len(batch_records) - len(names), 0,
+        )
+        upcoming: list[str] = [
+            name for name in itertools.islice(upload.pending, want)
+            if name not in upload.in_flight_files
+        ]
+        await processor.prefetch(names, upcoming, _context)
         prepared = await asyncio.gather(*(
             prepare_asset_line(
                 filename,
