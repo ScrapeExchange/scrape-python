@@ -39,6 +39,32 @@ impl KnownSet {
         self.base.get(id)
     }
 
+    /// [`KnownSet::get`] for many IDs: the in-memory layers answer
+    /// first, and the IDs only the base can answer go to
+    /// [`Base::get_many`] as one batch.
+    pub fn get_many(&self, ids: &[u64]) -> Vec<Option<Meta>> {
+        let mut out: Vec<Option<Meta>> = Vec::with_capacity(ids.len());
+        let mut from_base: Vec<usize> = Vec::new();
+        for (k, id) in ids.iter().enumerate() {
+            let hit: Option<Meta> =
+                self.active.get(id).copied().or_else(|| {
+                    self.frozen.as_ref().and_then(|f| f.get(id).copied())
+                });
+            if hit.is_none() {
+                from_base.push(k);
+            }
+            out.push(hit);
+        }
+        if from_base.is_empty() {
+            return out;
+        }
+        let query: Vec<u64> = from_base.iter().map(|&k| ids[k]).collect();
+        for (k, meta) in from_base.into_iter().zip(self.base.get_many(&query)) {
+            out[k] = meta;
+        }
+        out
+    }
+
     pub fn put(&mut self, id: u64, meta: Meta, ts: u32) {
         if let Some(old) = self.get(id) {
             self.counts[old.state() as usize] -= 1;
@@ -167,6 +193,34 @@ mod tests {
         assert_eq!(k.get(2), Some(m(State::Queued)));
         assert_eq!(k.get(3), None);
         assert_eq!(k.delta_len(), 1);
+    }
+
+    #[test]
+    fn get_many_matches_get_across_layers() {
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let b: Arc<Base> = base_of(
+            d.path(),
+            1,
+            &[
+                (1, m(State::Queued)),
+                (2, m(State::Queued)),
+                (3, m(State::Queued)),
+            ]
+            .into(),
+        );
+        let mut k: KnownSet = KnownSet::new(b, HashMap::new());
+        k.put(1, m(State::Scraped), 0);
+        k.put(4, m(State::Queued), 0);
+        let _frozen: Arc<HashMap<u64, Meta>> = k.freeze();
+        k.put(1, m(State::Failed), 5);
+        k.put(2, m(State::Scraped), 5);
+        let query: [u64; 6] = [1, 2, 3, 4, 5, 1];
+        let want: Vec<Option<Meta>> =
+            query.iter().map(|id| k.get(*id)).collect();
+        assert_eq!(k.get_many(&query), want);
+        assert_eq!(want[0], Some(m(State::Failed)));
+        assert_eq!(want[3], Some(m(State::Queued)));
+        assert_eq!(want[4], None);
     }
 
     #[test]

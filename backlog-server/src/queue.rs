@@ -361,6 +361,16 @@ impl Queue {
         self.known.get(id).map(|m| m.state())
     }
 
+    /// [`Queue::state`] for many IDs, looked up as one batch so the
+    /// base's disk reads for the batch run in parallel.
+    pub fn states(&self, ids: &[u64]) -> Vec<Option<State>> {
+        self.known
+            .get_many(ids)
+            .into_iter()
+            .map(|m| m.map(|m| m.state()))
+            .collect()
+    }
+
     /// Queue a new ID; false if it is already known in any state.
     pub fn add(&mut self, id: u64, ts: u32) -> Result<bool, QueueError> {
         if self.known.get(id).is_some() {
@@ -684,6 +694,20 @@ mod tests {
 
     fn ids(items: &[PopItem]) -> Vec<(u64, bool)> {
         items.iter().map(|p| (p.id, p.force)).collect()
+    }
+
+    #[test]
+    fn states_matches_state() {
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let mut q: Queue = q(&d);
+        q.add(1, 0).unwrap();
+        q.add(2, 0).unwrap();
+        q.complete(2, 0).unwrap();
+        let query: [u64; 4] = [1, 2, 3, 2];
+        let want: Vec<Option<State>> =
+            query.iter().map(|id| q.state(*id)).collect();
+        assert_eq!(q.states(&query), want);
+        assert_eq!(want[2], None);
     }
 
     #[test]

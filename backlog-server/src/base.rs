@@ -291,11 +291,122 @@ impl Base {
                 return None;
             }
         }
+        self.binary_search(id, lo, hi).map(|pos| self.meta_at(pos))
+    }
+
+    /// Ask the kernel to start reading the page holding entry *i* of
+    /// `ids` (when *ids*) or of `states`, without waiting for it.
+    fn will_need(&self, ids: bool, i: usize) {
+        let (m, at, width): (&Mmap, usize, usize) = if ids {
+            (
+                self.ids.as_ref().expect("non-empty base"),
+                HEADER_LEN + i * 8,
+                8,
+            )
+        } else {
+            (
+                self.states.as_ref().expect("non-empty base"),
+                HEADER_LEN + i,
+                1,
+            )
+        };
+        // Advice only: a failure costs a page fault later, nothing more.
+        let _ = m.advise_range(memmap2::Advice::WillNeed, at, width);
+    }
+
+    /// [`Base::get`] for many IDs at once, with the same results.
+    ///
+    /// The interpolation searches run in lockstep: before each round
+    /// every search's next probe page is advised `WillNeed`, so the
+    /// kernel reads the pages of a whole round in parallel instead of
+    /// one fault at a time. On a base larger than the page cache this
+    /// turns ~3 sequential disk reads per ID into ~3 rounds of
+    /// parallel reads for the whole batch.
+    pub fn get_many(&self, ids: &[u64]) -> Vec<Option<Meta>> {
+        if self.is_empty() {
+            return vec![None; ids.len()];
+        }
+        let last: usize = self.info.count as usize - 1;
+        // Per ID: search bounds, or the found position, or a miss.
+        let mut lo: Vec<usize> = vec![0; ids.len()];
+        let mut hi: Vec<usize> = vec![last; ids.len()];
+        let mut found: Vec<Option<usize>> = vec![None; ids.len()];
+        let mut open: Vec<usize> = (0..ids.len()).collect();
+        let mut probe: Vec<usize> = Vec::with_capacity(ids.len());
+        for _ in 0..8 {
+            if open.is_empty() {
+                break;
+            }
+            // Pass 1: decide each probe (bounds pages are already
+            // resident from the previous round) and advise it.
+            probe.clear();
+            open.retain(|&k| {
+                let id: u64 = ids[k];
+                let lv: u64 = self.id_at(lo[k]);
+                let hv: u64 = self.id_at(hi[k]);
+                if id < lv || id > hv {
+                    return false;
+                }
+                if lv == hv {
+                    if lv == id {
+                        found[k] = Some(lo[k]);
+                    }
+                    return false;
+                }
+                let span: u128 = u128::from(hv - lv);
+                let off: u128 =
+                    u128::from(id - lv) * (hi[k] - lo[k]) as u128 / span;
+                let pos: usize = lo[k] + off as usize;
+                self.will_need(true, pos);
+                probe.push(pos);
+                true
+            });
+            // Pass 2: read the probes, which now load in parallel.
+            let mut i: usize = 0;
+            open.retain(|&k| {
+                let pos: usize = probe[i];
+                i += 1;
+                let id: u64 = ids[k];
+                let v: u64 = self.id_at(pos);
+                if v == id {
+                    found[k] = Some(pos);
+                    return false;
+                }
+                if v < id {
+                    lo[k] = pos + 1;
+                } else if pos == 0 {
+                    return false;
+                } else {
+                    hi[k] = pos - 1;
+                }
+                lo[k] <= hi[k]
+            });
+        }
+        // Searches that did not converge finish one at a time, exactly
+        // as `get` does after its interpolation rounds.
+        for &k in &open {
+            found[k] = self.binary_search(ids[k], lo[k], hi[k]);
+        }
+        for pos in found.iter().flatten() {
+            self.will_need(false, *pos);
+        }
+        found
+            .iter()
+            .map(|f| f.map(|pos| self.meta_at(pos)))
+            .collect()
+    }
+
+    fn binary_search(
+        &self,
+        id: u64,
+        mut lo: usize,
+        mut hi: usize,
+    ) -> Option<usize> {
         while lo <= hi {
             let mid: usize = lo + (hi - lo) / 2;
             let v: u64 = self.id_at(mid);
             if v == id {
-                return Some(self.meta_at(mid));
+                return Some(mid);
             }
             if v < id {
                 lo = mid + 1;
@@ -512,6 +623,60 @@ pub(crate) mod tests {
             let id: u64 = other();
             assert_eq!(b.get(id), ids.get(&id).copied());
         }
+    }
+
+    #[test]
+    fn get_many_matches_get() {
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let mut next = rng(3);
+        let ids: BTreeMap<u64, Meta> = (0..100_000)
+            .map(|_| next())
+            .map(|id| (id, meta_for(id)))
+            .collect();
+        build(d.path(), 1, &ids);
+        let b: Base = Base::open(d.path(), 1).unwrap();
+        let mut other = rng(4);
+        let mut query: Vec<u64> = ids.keys().step_by(7).copied().collect();
+        query.extend((0..20_000).map(|_| other()));
+        query.extend([0, 1, u64::MAX]);
+        let want: Vec<Option<Meta>> =
+            query.iter().map(|id| b.get(*id)).collect();
+        assert_eq!(b.get_many(&query), want);
+    }
+
+    #[test]
+    fn get_many_on_skewed_ids() {
+        // Dense small IDs defeat interpolation and force the binary
+        // search fallback.
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let ids: BTreeMap<u64, Meta> = (0..5_000u64)
+            .map(|id| (id * id * id, meta_for(id)))
+            .chain([(u64::MAX, meta_for(1))])
+            .collect();
+        build(d.path(), 1, &ids);
+        let b: Base = Base::open(d.path(), 1).unwrap();
+        let query: Vec<u64> = (0..6_000u64)
+            .map(|i| i * i * i + (i % 3))
+            .chain([u64::MAX, u64::MAX - 1])
+            .collect();
+        let want: Vec<Option<Meta>> =
+            query.iter().map(|id| b.get(*id)).collect();
+        assert_eq!(b.get_many(&query), want);
+    }
+
+    #[test]
+    fn get_many_on_empty_base_and_empty_query() {
+        let b: Base = Base::empty();
+        assert_eq!(b.get_many(&[1, 2, 3]), vec![None, None, None]);
+        assert!(b.get_many(&[]).is_empty());
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let ids: BTreeMap<u64, Meta> = [(42u64, meta_for(42))].into();
+        build(d.path(), 1, &ids);
+        let one: Base = Base::open(d.path(), 1).unwrap();
+        assert_eq!(
+            one.get_many(&[42, 41, 43]),
+            vec![Some(meta_for(42)), None, None]
+        );
     }
 
     #[test]

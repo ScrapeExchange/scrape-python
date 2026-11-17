@@ -277,9 +277,11 @@ fn handle(
             Reply::Ok
         }
         Request::Requeue { id, lane } => Reply::Bool(q.requeue(id, lane, ts)?),
-        Request::State(ids) => {
-            Reply::States(ids.into_iter().map(|id| q.state(id)).collect())
-        }
+        Request::State(ids) => Reply::States(if ids.len() > 1 {
+            q.states(&ids)
+        } else {
+            ids.into_iter().map(|id| q.state(id)).collect()
+        }),
         Request::Info => Reply::Info(q.info()),
         Request::Snapshot => {
             Reply::Path(q.snapshot(snapshot_root)?.display().to_string())
