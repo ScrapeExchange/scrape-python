@@ -596,6 +596,42 @@ Permanent classes (`unavailable`, `private`,
 See `_classify_yt_dlp_error()` in `yt_video_scrape.py`
 for the substring → reason table.
 
+### Releasing low_subs videos (`--recheck-low-subs`)
+
+Videos of a channel below `CHANNEL_MIN_SUBSCRIBERS` are saved as
+`video-min-<id>.json.br.low_subs` and never uploaded. After the
+channel scraper's re-check has moved grown channels out of
+`low_subs` (see section 2), this mode releases their videos. Run it
+on the host that holds the `.low_subs` files; `scrape_upload` on that
+host uploads what it releases.
+
+```bash
+# Report what would change
+uv run tools/yt_video_scrape.py --recheck-low-subs true
+# Make the changes
+uv run tools/yt_video_scrape.py --recheck-low-subs true \
+    --recheck-apply true
+```
+
+Each `.low_subs` file is classified against the channel's current
+counts in Redis, with the same rules as a new scrape:
+
+- **Channel still tiny, or not in the channel queue:** left alone.
+- **Small channel** (below `YOUTUBE_CHANNEL_PRIVACY_SUBSCRIBERS`):
+  the description is masked and the video saved without the suffix.
+- **Larger channel or topic channel:** saved without the suffix.
+- **A regular copy already exists** (a later scrape): the `.low_subs`
+  file is deleted.
+
+The mode keeps an index, `low_subs_index.sqlite`, in the video data
+directory, mapping each `.low_subs` file to its channel. The first
+run reads every `.low_subs` file to build it, which takes long on a
+host with millions of them; later runs only open files they have not
+seen, plus the files of channels listed in
+`youtube:channel:low_subs_released`. The index is a cache: deleting
+it only makes the next run read every file again. In report-only
+mode the index is still updated; nothing else is written.
+
 ## 5. Cross-cutting
 
 ### Rate limiter is shared across scrapers and hosts

@@ -17,6 +17,7 @@ import resource
 import sys
 import time
 import asyncio
+from dataclasses import dataclass
 import logging
 
 import httpx2 as httpx  # exchange client raises httpx2 exception classes
@@ -27,7 +28,9 @@ from prometheus_client import Counter, Gauge
 from pydantic import AliasChoices, Field, field_validator
 from yt_dlp.YoutubeDL import YoutubeDL
 
+from scrape_exchange.brotli import brotli_read_async
 from scrape_exchange.file_management import (
+    COMPRESSED_JSON_SUFFIX,
     AssetFileManagement,
     LOW_SUBS_SUFFIX,
     UNKNOWN_CHANNEL_SUFFIX,
@@ -73,6 +76,8 @@ from scrape_exchange.youtube.derived_metadata import (
     enrich_video_channel_country,
     increment_channel_category_count,
 )
+from scrape_exchange.youtube.low_subs_index import LowSubsIndex
+from scrape_exchange.youtube.low_subs_recheck import LOW_SUBS_RELEASED_KEY
 from scrape_exchange.youtube.privacy import (
     ChannelPrivacyRecord,
     VideoPrivacyClass,
@@ -420,6 +425,262 @@ async def _apply_video_privacy_limits(
     else:
         VIDEO_PRIVACY_OUTCOMES.labels(outcome='unmasked').inc()
     return ''
+
+
+LOW_SUBS_INDEX_FILENAME: str = 'low_subs_index.sqlite'
+LOW_SUBS_FILE_SUFFIX: str = f'{COMPRESSED_JSON_SUFFIX}{LOW_SUBS_SUFFIX}'
+_VIDEO_FILE_PREFIXES: tuple[str, ...] = (
+    VIDEO_MIN_PREFIX, VIDEO_YTDLP_PREFIX,
+)
+# Directory entries handed to the index per batch.
+_RECHECK_BATCH: int = 1000
+
+
+@dataclass
+class VideoRecheckSummary:
+    '''Outcome counts of one ``--recheck-low-subs`` video pass.'''
+
+    scanned_new: int = 0
+    indexed: int = 0
+    released_masked: int = 0
+    released_unmasked: int = 0
+    still_tiny: int = 0
+    unknown_channel: int = 0
+    already_exists: int = 0
+    errors: int = 0
+    channels_released: int = 0
+
+    def line(self, apply: bool) -> str:
+        return (
+            f'recheck-low-subs-videos: scanned_new={self.scanned_new} '
+            f'indexed={self.indexed} '
+            f'released_masked={self.released_masked} '
+            f'released_unmasked={self.released_unmasked} '
+            f'still_tiny={self.still_tiny} '
+            f'unknown_channel={self.unknown_channel} '
+            f'already_exists={self.already_exists} '
+            f'errors={self.errors} '
+            f'channels_released={self.channels_released} '
+            f'dry_run={str(not apply).lower()}'
+        )
+
+
+def _split_low_subs_name(name: str) -> tuple[str, str] | None:
+    '''``(prefix, video_id)`` of a ``.low_subs`` video file name, or
+    None for any other name.'''
+    if not name.endswith(LOW_SUBS_FILE_SUFFIX):
+        return None
+    prefix: str
+    for prefix in _VIDEO_FILE_PREFIXES:
+        if name.startswith(prefix):
+            video_id: str = name[len(prefix):-len(LOW_SUBS_FILE_SUFFIX)]
+            return (prefix, video_id) if video_id else None
+    return None
+
+
+def _plain_copy_exists(video_dir: str, video_id: str) -> bool:
+    '''Whether a regular (uploadable or uploaded) file of *video_id*
+    exists. Same check as
+    ``AssetFileManagement.video_scrape_output_exists``, without
+    constructing it, which creates directories.'''
+    prefix: str
+    directory: str
+    for directory in (video_dir, os.path.join(video_dir, 'uploaded')):
+        for prefix in _VIDEO_FILE_PREFIXES:
+            if os.path.exists(os.path.join(
+                directory, f'{prefix}{video_id}{COMPRESSED_JSON_SUFFIX}',
+            )):
+                return True
+    return False
+
+
+class _LowSubsVideoRecheck:
+    '''One ``--recheck-low-subs`` video pass over *video_dir*.'''
+
+    def __init__(
+        self,
+        video_dir: str,
+        redis: aioredis.Redis,
+        settings: 'VideoSettings',
+        index: LowSubsIndex,
+        *,
+        apply: bool,
+    ) -> None:
+        self.video_dir: str = video_dir
+        self.redis: aioredis.Redis = redis
+        self.settings: VideoSettings = settings
+        self.index: LowSubsIndex = index
+        self.apply: bool = apply
+        self.summary: VideoRecheckSummary = VideoRecheckSummary()
+        self._records: dict[str | None, ChannelPrivacyRecord | None] = {}
+        # Files handled in this run: a new file of a released channel
+        # is seen by the scan and again by the release step.
+        self._handled: set[str] = set()
+
+    async def _record(
+        self, channel_id: str | None,
+    ) -> ChannelPrivacyRecord | None:
+        if channel_id not in self._records:
+            self._records[channel_id] = await lookup_channel_privacy(
+                self.redis, channel_id,
+            )
+        return self._records[channel_id]
+
+    async def _load(self, name: str) -> YouTubeVideo | None:
+        try:
+            data: dict = await brotli_read_async(
+                os.path.join(self.video_dir, name),
+            )
+            return YouTubeVideo.from_dict(data)
+        except Exception as exc:  # noqa: BLE001 - counted as an error
+            self.summary.errors += 1
+            logging.warning(
+                'low_subs recheck: cannot read video file',
+                extra={'video_file': name, 'error': str(exc)},
+            )
+            return None
+
+    def _drop(self, name: str) -> None:
+        os.remove(os.path.join(self.video_dir, name))
+        self.index.remove([name])
+
+    async def handle(
+        self, name: str, channel_id: str | None,
+        video: YouTubeVideo | None = None,
+    ) -> bool:
+        '''Release or leave one ``.low_subs`` file. Returns False when
+        it could not be read.'''
+        parts: tuple[str, str] | None = _split_low_subs_name(name)
+        if parts is None or name in self._handled:
+            return True
+        self._handled.add(name)
+        prefix: str
+        video_id: str
+        prefix, video_id = parts
+        privacy: VideoPrivacyClass = video_privacy_class(
+            await self._record(channel_id), self.settings,
+        )
+        if privacy is VideoPrivacyClass.UNKNOWN_CHANNEL:
+            self.summary.unknown_channel += 1
+            return True
+        if privacy is VideoPrivacyClass.TINY:
+            self.summary.still_tiny += 1
+            return True
+        if _plain_copy_exists(self.video_dir, video_id):
+            self.summary.already_exists += 1
+            if self.apply:
+                self._drop(name)
+            return True
+        if video is None:
+            video = await self._load(name)
+            if video is None:
+                return False
+        if privacy is VideoPrivacyClass.SMALL:
+            mask_video(video, allowed_domains(self.settings))
+            self.summary.released_masked += 1
+        else:
+            self.summary.released_unmasked += 1
+        if self.apply:
+            await video.to_file(self.video_dir, prefix)
+            self._drop(name)
+        return True
+
+    async def scan_batch(self, names: list[str]) -> None:
+        '''Index the files in *names* not seen before and classify
+        them; files already indexed are not opened.'''
+        known: set[str] = self.index.mark_seen(names)
+        name: str
+        for name in names:
+            if name in known:
+                continue
+            self.summary.scanned_new += 1
+            video: YouTubeVideo | None = await self._load(name)
+            if video is None:
+                continue
+            self.index.add([(name, video.video_id, video.channel_id)])
+            self.summary.indexed += 1
+            await self.handle(name, video.channel_id, video)
+
+    async def release_channels(self) -> None:
+        '''Release the indexed files of the channels the channel pass
+        moved out of ``low_subs``.'''
+        channel_id: str
+        for channel_id in sorted(
+            await self.redis.smembers(LOW_SUBS_RELEASED_KEY),
+        ):
+            self.summary.channels_released += 1
+            ok: bool = True
+            name: str
+            for name in self.index.files_for_channel(channel_id):
+                ok = await self.handle(name, channel_id) and ok
+            if self.apply and ok:
+                await self.redis.srem(LOW_SUBS_RELEASED_KEY, channel_id)
+
+
+async def recheck_low_subs_videos(
+    video_dir: str,
+    redis: aioredis.Redis,
+    settings: 'VideoSettings',
+    *,
+    apply: bool,
+) -> VideoRecheckSummary:
+    '''Release the ``.low_subs`` videos in *video_dir* whose channel is
+    no longer tiny. In dry-run only the local index is written.'''
+    index: LowSubsIndex = LowSubsIndex(
+        os.path.join(video_dir, LOW_SUBS_INDEX_FILENAME),
+    )
+    recheck: _LowSubsVideoRecheck = _LowSubsVideoRecheck(
+        video_dir, redis, settings, index, apply=apply,
+    )
+    try:
+        index.start_scan()
+        batch: list[str] = []
+        with os.scandir(video_dir) as entries:
+            entry: os.DirEntry
+            for entry in entries:
+                if _split_low_subs_name(entry.name) is None:
+                    continue
+                batch.append(entry.name)
+                if len(batch) >= _RECHECK_BATCH:
+                    await recheck.scan_batch(batch)
+                    batch = []
+        await recheck.scan_batch(batch)
+        index.prune_unseen()
+        await recheck.release_channels()
+    finally:
+        index.close()
+    return recheck.summary
+
+
+async def _run_video_low_subs_recheck(settings: 'VideoSettings') -> int:
+    '''One-shot ``--recheck-low-subs`` video pass; prints a summary
+    line. Returns the exit code.'''
+    if not settings.redis_dsn or not settings.video_data_directory:
+        logging.error(
+            '--recheck-low-subs needs REDIS_DSN and '
+            'YOUTUBE_VIDEO_DATA_DIR',
+        )
+        return 2
+    if not os.path.isdir(settings.video_data_directory):
+        logging.error(
+            'YOUTUBE_VIDEO_DATA_DIR is not a directory',
+            extra={'video_data_directory': settings.video_data_directory},
+        )
+        return 2
+    redis: aioredis.Redis = redis_from_url(
+        settings.redis_dsn,
+        component='youtube-video-recheck',
+        decode_responses=True,
+    )
+    try:
+        summary: VideoRecheckSummary = await recheck_low_subs_videos(
+            settings.video_data_directory, redis, settings,
+            apply=settings.recheck_apply,
+        )
+    finally:
+        await redis.aclose()
+    sys.stdout.write(f'{summary.line(settings.recheck_apply)}\n')
+    return 0
 
 
 def _apply_queue_channel_context(
@@ -1017,6 +1278,33 @@ class VideoSettings(YouTubeScraperSettings):
     CLI flags > environment variables > .env file > built-in defaults.
     '''
 
+    recheck_low_subs: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            'VIDEO_RECHECK_LOW_SUBS', 'recheck_low_subs',
+        ),
+        description=(
+            'Run the low_subs video re-check once and exit instead of '
+            'scraping. Videos saved as .low_subs whose channel is no '
+            'longer below CHANNEL_MIN_SUBSCRIBERS are saved again '
+            'without the suffix (masked when the channel is small) so '
+            'scrape_upload uploads them. Run it after '
+            'yt_channel_scrape.py --recheck-low-subs. The first run '
+            'reads every .low_subs file to build an index and takes '
+            'long; later runs only open new files. Reports only '
+            'unless --recheck-apply is set.'
+        ),
+    )
+    recheck_apply: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            'VIDEO_RECHECK_APPLY', 'recheck_apply',
+        ),
+        description=(
+            'With --recheck-low-subs: make the changes. Without it '
+            'the re-check only reports what it would do.'
+        ),
+    )
     video_use_yt_dlp: bool = Field(
         default=False,
         validation_alias=AliasChoices(
@@ -1241,6 +1529,8 @@ def main() -> None:
     '''
 
     settings: VideoSettings = VideoSettings()
+    if settings.recheck_low_subs:
+        sys.exit(asyncio.run(_run_video_low_subs_recheck(settings)))
     os.makedirs(
         settings.ytdlp_cache_dir, exist_ok=True,
     )
