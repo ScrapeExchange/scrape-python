@@ -212,6 +212,37 @@ class TestRecheckLowSubsVideos(unittest.IsolatedAsyncioTestCase):
             os.path.join(self.dir, LOW_SUBS_INDEX_FILENAME),
         ))
 
+    async def test_new_files_indexed_in_one_transaction(self) -> None:
+        await self._meta('50')
+        video_id: str
+        for video_id in ('aaaaaaaaaaa', 'bbbbbbbbbbb', 'ccccccccccc'):
+            await self._low_subs_file(video_id=video_id)
+        with patch.object(
+            yt_video_scrape.LowSubsIndex, 'add',
+            autospec=True,
+            side_effect=yt_video_scrape.LowSubsIndex.add,
+        ) as add:
+            summary: VideoRecheckSummary = await self._run()
+        self.assertEqual(summary.indexed, 3)
+        self.assertEqual(add.call_count, 1)
+
+    async def test_unreleased_files_not_remembered(self) -> None:
+        await self._meta('50')
+        await self._low_subs_file()
+        captured: list[set[str]] = []
+        original = yt_video_scrape._LowSubsVideoRecheck.release_channels
+
+        async def spy(recheck: object) -> None:
+            captured.append(set(recheck._handled))
+            await original(recheck)
+
+        with patch.object(
+            yt_video_scrape._LowSubsVideoRecheck, 'release_channels',
+            spy,
+        ):
+            await self._run()
+        self.assertEqual(captured, [set()])
+
     def test_summary_line(self) -> None:
         summary: VideoRecheckSummary = VideoRecheckSummary(
             scanned_new=3, indexed=2, still_tiny=1, errors=1,
@@ -262,9 +293,8 @@ class TestMain(unittest.TestCase):
             yt_video_scrape, 'ScraperRunner',
         ) as runner, patch.object(
             yt_video_scrape, '_run_video_low_subs_recheck', run,
-        ):
-            with self.assertRaises(SystemExit) as raised:
-                yt_video_scrape.main()
+        ), self.assertRaises(SystemExit) as raised:
+            yt_video_scrape.main()
         self.assertEqual(raised.exception.code, 0)
         runner.assert_not_called()
         makedirs.assert_not_called()

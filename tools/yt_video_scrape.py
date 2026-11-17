@@ -513,8 +513,10 @@ class _LowSubsVideoRecheck:
         self.apply: bool = apply
         self.summary: VideoRecheckSummary = VideoRecheckSummary()
         self._records: dict[str | None, ChannelPrivacyRecord | None] = {}
-        # Files handled in this run: a new file of a released channel
-        # is seen by the scan and again by the release step.
+        # Channels to release, read before the scan. A new file of one
+        # of them is seen by the scan and again by the release step, so
+        # those files are remembered; others are not (millions).
+        self._released: set[str] = set()
         self._handled: set[str] = set()
 
     async def _record(
@@ -553,7 +555,8 @@ class _LowSubsVideoRecheck:
         parts: tuple[str, str] | None = _split_low_subs_name(name)
         if parts is None or name in self._handled:
             return True
-        self._handled.add(name)
+        if channel_id in self._released:
+            self._handled.add(name)
         prefix: str
         video_id: str
         prefix, video_id = parts
@@ -589,25 +592,32 @@ class _LowSubsVideoRecheck:
         '''Index the files in *names* not seen before and classify
         them; files already indexed are not opened.'''
         known: set[str] = self.index.mark_seen(names)
+        loaded: list[tuple[str, YouTubeVideo]] = []
         name: str
         for name in names:
             if name in known:
                 continue
             self.summary.scanned_new += 1
             video: YouTubeVideo | None = await self._load(name)
-            if video is None:
-                continue
-            self.index.add([(name, video.video_id, video.channel_id)])
-            self.summary.indexed += 1
+            if video is not None:
+                loaded.append((name, video))
+        if not loaded:
+            return
+        # One transaction per batch, not per file: the first run
+        # indexes millions of files.
+        self.index.add([
+            (name, video.video_id, video.channel_id)
+            for name, video in loaded
+        ])
+        self.summary.indexed += len(loaded)
+        for name, video in loaded:
             await self.handle(name, video.channel_id, video)
 
     async def release_channels(self) -> None:
         '''Release the indexed files of the channels the channel pass
         moved out of ``low_subs``.'''
         channel_id: str
-        for channel_id in sorted(
-            await self.redis.smembers(LOW_SUBS_RELEASED_KEY),
-        ):
+        for channel_id in sorted(self._released):
             self.summary.channels_released += 1
             ok: bool = True
             name: str
@@ -633,6 +643,9 @@ async def recheck_low_subs_videos(
         video_dir, redis, settings, index, apply=apply,
     )
     try:
+        recheck._released = set(
+            await redis.smembers(LOW_SUBS_RELEASED_KEY),
+        )
         index.start_scan()
         batch: list[str] = []
         with os.scandir(video_dir) as entries:
