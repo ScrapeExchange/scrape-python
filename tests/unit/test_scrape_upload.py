@@ -620,6 +620,50 @@ class TestPrepareAssetLine(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(marked, [['video123']])
 
+    async def test_youtube_video_without_thumbnails_logs_and_marks_invalid(
+        self,
+    ) -> None:
+        fm: MagicMock = MagicMock()
+        fm.mark_invalid = AsyncMock()
+        context = scrape_upload.AssetProcessingContext(
+            settings=_settings(),
+            client=object(),
+            fm=fm,
+            descriptor=scrape_upload.descriptor_for('youtube', 'video'),
+            state=object(),
+        )
+        processor: scrape_upload.YouTubeVideoProcessor = (
+            scrape_upload.YouTubeVideoProcessor()
+        )
+        data: dict[str, Any] = {
+            'video_id': 'vid123',
+            'url': 'https://www.youtube.com/watch?v=vid123',
+            'channel_id': 'UCchannel',
+            'channel_handle': 'somechannel',
+        }
+        with (
+            patch.object(
+                processor, '_is_uploaded', new=AsyncMock(return_value=False),
+            ),
+            patch.object(
+                processor,
+                '_resolve_handle',
+                new=AsyncMock(return_value='somechannel'),
+            ),
+            self.assertLogs(level='WARNING') as logs,
+        ):
+            record: dict[str, Any] | None = await processor.prepare_record(
+                data,
+                filename='video-min-vid123.json.br',
+                content_id='vid123',
+                context=context,
+            )
+
+        self.assertIsNone(record)
+        fm.mark_invalid.assert_awaited_once_with('video-min-vid123.json.br')
+        self.assertIn('rejected before schema validation', logs.output[0])
+        self.assertEqual(getattr(logs.records[0], 'reason'), 'no thumbnails')
+
     async def test_tiktok_creator_corrupt_file_requeues_and_deletes(
         self,
     ) -> None:

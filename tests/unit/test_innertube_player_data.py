@@ -463,6 +463,92 @@ class TestBotDetectionResponseHandling(
         )
 
 
+class TestUnavailableResponseHandling(
+    unittest.IsolatedAsyncioTestCase,
+):
+    '''A non-OK PLAYER response without a title (removed, private,
+    sign-in required) must abort the scrape instead of producing an
+    empty video record.'''
+
+    async def test_removed_video_raises_unavailable(self) -> None:
+        proxy: str = 'http://localhost:8080'
+        player_data: dict = {
+            'playabilityStatus': {
+                'status': 'ERROR',
+                'reason': 'This video has been removed by the uploader',
+            },
+        }
+        limiter: MagicMock = MagicMock()
+        limiter.acquire = AsyncMock(return_value=proxy)
+        limiter.report_proxy_result = AsyncMock()
+        limiter.penalise = AsyncMock()
+
+        with (
+            patch.object(
+                innertube_mod,
+                '_call_innertube',
+                new=AsyncMock(return_value=player_data),
+            ) as call_innertube,
+            patch.object(
+                innertube_mod.YouTubeRateLimiter,
+                'get',
+                return_value=limiter,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                innertube_mod.YouTubeVideoUnavailableError,
+                'removed by the uploader',
+            ):
+                await InnerTubeVideoParser.scrape(
+                    YouTubeVideo(video_id='vid123'),
+                    innertube=MagicMock(),
+                    proxy=proxy,
+                )
+
+        # Only PLAYER is called; NEXT is skipped. The proxy worked,
+        # so it is reported healthy and not penalised.
+        self.assertEqual(call_innertube.await_count, 1)
+        limiter.penalise.assert_not_awaited()
+        self.assertEqual(
+            limiter.report_proxy_result.await_args_list,
+            [call(proxy, True)],
+        )
+
+    def test_private_video_without_title_raises(self) -> None:
+        with self.assertRaises(innertube_mod.YouTubeVideoUnavailableError):
+            innertube_mod._raise_if_unavailable(
+                'vid123',
+                {
+                    'playabilityStatus': {
+                        'status': 'LOGIN_REQUIRED',
+                        'reason': 'This video is private',
+                    },
+                    'videoDetails': {},
+                },
+            )
+
+    def test_restricted_video_with_title_is_parsed(self) -> None:
+        innertube_mod._raise_if_unavailable(
+            'vid123',
+            {
+                'playabilityStatus': {
+                    'status': 'LOGIN_REQUIRED',
+                    'reason': 'Sign in to confirm your age',
+                },
+                'videoDetails': {'title': 'Some title'},
+            },
+        )
+
+    def test_ok_video_is_parsed(self) -> None:
+        innertube_mod._raise_if_unavailable(
+            'vid123',
+            {
+                'playabilityStatus': {'status': 'OK'},
+                'videoDetails': {},
+            },
+        )
+
+
 class TestApplyPlayerDataNullValues(unittest.TestCase):
     '''
     YouTube sometimes sends a key with a null value instead of leaving
