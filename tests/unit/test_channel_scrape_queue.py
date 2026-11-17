@@ -2730,3 +2730,60 @@ class TestTopicTier(_RedisQueueTestBase):
             'youtube:channel:queue:scheduled:0', member,
         ))
         self.assertIsNone(await self.redis.hget(self.TIERS_KEY, 'UCtopic4'))
+
+
+class TestParkedRecords(_RedisQueueTestBase):
+    '''Helpers the low_subs re-check uses on parked channels.'''
+
+    async def _record(self, member: str) -> dict:
+        raw: str | None = await self.redis.hget(
+            self.queue._k_state(ChannelState.LOW_SUBS), member,
+        )
+        return json.loads(raw)
+
+    async def test_update_parked_record_merges(self) -> None:
+        await self.queue.mark(
+            'i:UCa', state=ChannelState.LOW_SUBS,
+            extra={'subscriber_count': '50'},
+        )
+        updated: bool = await self.queue.update_parked_record(
+            'i:UCa', ChannelState.LOW_SUBS,
+            {'checked_at': 123, 'subscriber_count': '60'},
+        )
+        self.assertTrue(updated)
+        record: dict = await self._record('i:UCa')
+        self.assertEqual(record['checked_at'], 123)
+        self.assertEqual(record['subscriber_count'], '60')
+        self.assertIn('ts', record)
+
+    async def test_update_parked_record_absent_member(self) -> None:
+        updated: bool = await self.queue.update_parked_record(
+            'i:UCz', ChannelState.LOW_SUBS, {'checked_at': 1},
+        )
+        self.assertFalse(updated)
+        self.assertFalse(await self.redis.hexists(
+            self.queue._k_state(ChannelState.LOW_SUBS), 'i:UCz',
+        ))
+
+    async def test_iter_parked(self) -> None:
+        await self.queue.mark(
+            'i:UCa', state=ChannelState.LOW_SUBS,
+            extra={'subscriber_count': '50'},
+        )
+        await self.queue.mark('i:UCb', state=ChannelState.LOW_SUBS)
+        entries: list[tuple[str, str | None]] = (
+            await self.queue.iter_parked(ChannelState.LOW_SUBS)
+        )
+        found: dict[str, dict] = {
+            member: json.loads(raw) for member, raw in entries
+        }
+        self.assertEqual(set(found), {'i:UCa', 'i:UCb'})
+        self.assertEqual(found['i:UCa']['subscriber_count'], '50')
+
+    async def test_tier_for_sub_count_public(self) -> None:
+        count: int
+        for count in (0, 150, 10**7):
+            self.assertEqual(
+                self.queue.tier_for_sub_count(count),
+                self.queue._tier_for_sub_count(count),
+            )
