@@ -962,6 +962,19 @@ class ChannelScrapeQueue(ABC):
     ) -> None: ...
 
     @abstractmethod
+    def tier_for_sub_count(self, sub_count: int) -> int: ...
+
+    @abstractmethod
+    async def iter_parked(
+        self, state: ChannelState,
+    ) -> list[tuple[str, str | None]]: ...
+
+    @abstractmethod
+    async def update_parked_record(
+        self, member: str, state: ChannelState, fields: dict[str, Any],
+    ) -> bool: ...
+
+    @abstractmethod
     async def delete_meta(
         self, member: str, *fields: str,
     ) -> None: ...
@@ -2127,6 +2140,51 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
             )
             if _LISTING_FIELDS.intersection(fields):
                 await self.recount_listing(member)
+
+    def tier_for_sub_count(self, sub_count: int) -> int:
+        '''The scheduled tier for a channel with *sub_count*
+        subscribers.'''
+        return self._tier_for_sub_count(sub_count)
+
+    async def iter_parked(
+        self, state: ChannelState,
+    ) -> list[tuple[str, str | None]]:
+        '''The ``(member, record)`` pairs parked in *state*, collected
+        before returning: moving members while HSCAN walks the hash
+        could skip or repeat some of them.'''
+        entries: list[tuple[str, str | None]] = []
+        member: str
+        raw: str | None
+        async for member, raw in self._redis.hscan_iter(
+            self._k_state(state),
+        ):
+            entries.append((member, raw))
+        return entries
+
+    async def update_parked_record(
+        self, member: str, state: ChannelState, fields: dict[str, Any],
+    ) -> bool:
+        '''Merge *fields* into the JSON record of *member* in the
+        *state* hash. Returns False, writing nothing, when *member* is
+        not parked in *state*. A record that is not a JSON object is
+        replaced by *fields*.
+
+        Read-modify-write, not atomic: for one-shot maintenance tools,
+        not for the scrape hot path.'''
+        key: str = self._k_state(state)
+        raw: str | None = await self._redis.hget(key, member)
+        if raw is None:
+            return False
+        record: Any
+        try:
+            record = json.loads(raw)
+        except ValueError:
+            record = {}
+        if not isinstance(record, dict):
+            record = {}
+        record.update(fields)
+        await self._redis.hset(key, member, json.dumps(record))
+        return True
 
     async def delete_meta(
         self, member: str, *fields: str,
