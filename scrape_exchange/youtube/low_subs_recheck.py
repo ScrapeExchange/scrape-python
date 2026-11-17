@@ -227,7 +227,7 @@ async def _recheck_one(
     )
     try:
         result: BrowseResult = await browse(entry.channel_id)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - any failure is "failed"
         summary.failed += 1
         _LOGGER.info(
             'low_subs recheck: browse failed',
