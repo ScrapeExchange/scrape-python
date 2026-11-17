@@ -16,6 +16,11 @@ from scrape_exchange.file_management import (
     VIDEO_MIN_FILE_PREFIX,
     VIDEO_YTDLP_FILE_PREFIX,
 )
+from scrape_exchange.youtube.privacy import (
+    ChannelPrivacyRecord,
+    VideoPrivacyClass,
+    video_privacy_class,
+)
 from scrape_exchange.youtube.youtube_video import YouTubeVideo
 
 
@@ -182,3 +187,34 @@ class TestToFileMarkerSuffix(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestVideoPrivacyClass(unittest.TestCase):
+    '''One classification shared by the video scraper and the
+    low_subs re-check.'''
+
+    def test_classes(self) -> None:
+        settings: MagicMock = _settings('/unused')
+        self.assertIs(
+            video_privacy_class(None, settings),
+            VideoPrivacyClass.UNKNOWN_CHANNEL,
+        )
+        self.assertIs(
+            video_privacy_class(
+                ChannelPrivacyRecord(5, None, True), settings,
+            ),
+            VideoPrivacyClass.TOPIC,
+        )
+        count: int
+        expected: VideoPrivacyClass
+        for count, expected in (
+            (5, VideoPrivacyClass.TINY),
+            (500, VideoPrivacyClass.SMALL),
+            (5000, VideoPrivacyClass.LARGE),
+        ):
+            self.assertIs(
+                video_privacy_class(
+                    ChannelPrivacyRecord(count, None, False), settings,
+                ),
+                expected,
+            )

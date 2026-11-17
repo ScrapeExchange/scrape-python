@@ -116,6 +116,33 @@ def classify_for_settings(
     )
 
 
+class VideoPrivacyClass(str, Enum):
+    '''How a video is saved, from its channel's scrape-queue meta.'''
+
+    UNKNOWN_CHANNEL = 'unknown_channel'
+    TOPIC = 'topic'
+    TINY = 'tiny'
+    SMALL = 'small'
+    LARGE = 'large'
+
+
+def video_privacy_class(
+    record: ChannelPrivacyRecord | None,
+    settings: YouTubeScraperSettings,
+) -> VideoPrivacyClass:
+    '''Classify a video by its channel's *record*: unknown when the
+    channel is not in the queue, topic when it is a topic channel
+    (exempt from the privacy limits), else by the channel's size.'''
+    if record is None:
+        return VideoPrivacyClass.UNKNOWN_CHANNEL
+    if record.topic:
+        return VideoPrivacyClass.TOPIC
+    size: ChannelSize = classify_for_settings(
+        record.subscriber_count, record.view_count, settings,
+    )
+    return VideoPrivacyClass(size.value)
+
+
 def is_topic_channel_title(title: str | None) -> bool:
     '''True when *title* is the title of a YouTube topic channel, i.e.
     it ends with :data:`TOPIC_TITLE_SUFFIX` once stripped and

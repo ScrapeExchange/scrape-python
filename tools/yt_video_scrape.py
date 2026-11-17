@@ -75,11 +75,11 @@ from scrape_exchange.youtube.derived_metadata import (
 )
 from scrape_exchange.youtube.privacy import (
     ChannelPrivacyRecord,
-    ChannelSize,
+    VideoPrivacyClass,
     allowed_domains,
-    classify_for_settings,
     lookup_channel_privacy,
     mask_video,
+    video_privacy_class,
 )
 from scrape_exchange.youtube.youtube_video import YouTubeVideo
 from scrape_exchange.youtube.youtube_video import (
@@ -404,19 +404,17 @@ async def _apply_video_privacy_limits(
         await lookup_channel_privacy(redis, video.channel_id)
         if redis is not None else None
     )
-    if record is None:
+    privacy: VideoPrivacyClass = video_privacy_class(record, settings)
+    if privacy is VideoPrivacyClass.UNKNOWN_CHANNEL:
         VIDEO_PRIVACY_OUTCOMES.labels(outcome='unknown_channel').inc()
         return UNKNOWN_CHANNEL_SUFFIX
-    if record.topic:
+    if privacy is VideoPrivacyClass.TOPIC:
         VIDEO_PRIVACY_OUTCOMES.labels(outcome='topic').inc()
         return ''
-    size: ChannelSize = classify_for_settings(
-        record.subscriber_count, record.view_count, settings,
-    )
-    if size is ChannelSize.TINY:
+    if privacy is VideoPrivacyClass.TINY:
         VIDEO_PRIVACY_OUTCOMES.labels(outcome='low_subs').inc()
         return LOW_SUBS_SUFFIX
-    if size is ChannelSize.SMALL:
+    if privacy is VideoPrivacyClass.SMALL:
         mask_video(video, allowed_domains(settings))
         VIDEO_PRIVACY_OUTCOMES.labels(outcome='masked').inc()
     else:
