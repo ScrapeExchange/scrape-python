@@ -322,6 +322,48 @@ class TestSpawnChildrenEnv(unittest.TestCase):
             '/var/log/channel-3.log',
         )
 
+    def _capture_envs(
+        self, config: SupervisorConfig, chunks: list[list[str]],
+    ) -> list[dict[str, str]]:
+        captured_envs: list[dict[str, str]] = []
+
+        def fake_popen(argv, env, **kwargs):
+            captured_envs.append(env)
+            mock = MagicMock()
+            mock.pid = 12345
+            return mock
+
+        with patch(
+            'scrape_exchange.scraper_supervisor.subprocess.Popen',
+            side_effect=fake_popen,
+        ):
+            spawn_children(config, chunks)
+        return captured_envs
+
+    def test_shared_pool_only_first_child_publishes_health(
+        self,
+    ) -> None:
+        from scrape_exchange.proxy_health import PUBLISHER_ENV_VAR
+        config: SupervisorConfig = self._make_config()
+        pool: list[str] = ['http://a', 'http://b', 'http://c']
+        envs: list[dict[str, str]] = self._capture_envs(
+            config, [pool, pool, pool],
+        )
+        self.assertEqual(
+            [env[PUBLISHER_ENV_VAR] for env in envs], ['1', '0', '0'],
+        )
+
+    def test_split_pool_every_child_publishes_health(self) -> None:
+        from scrape_exchange.proxy_health import PUBLISHER_ENV_VAR
+        config: SupervisorConfig = self._make_config()
+        config.split_proxy_pool = True
+        envs: list[dict[str, str]] = self._capture_envs(
+            config, [['http://a'], ['http://b'], ['http://c']],
+        )
+        self.assertEqual(
+            [env[PUBLISHER_ENV_VAR] for env in envs], ['1', '1', '1'],
+        )
+
     def test_dev_stdout_log_file_is_not_suffixed(self) -> None:
         '''
         ``/dev/stdout`` is a stream target; suffixing it would

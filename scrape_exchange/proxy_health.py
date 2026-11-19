@@ -35,6 +35,7 @@ without Redis it is per process.
 import hashlib
 import logging
 import math
+import os
 import random
 import time
 
@@ -68,6 +69,11 @@ FAIL_SCORE_WEIGHT: float = 4.0
 CLEAN_EWMA: float = 0.01
 KEY_PREFIX: str = 'proxy_health'
 KEY_TTL_SECONDS: int = 86400
+# Set by the scraper supervisor on each child: '1' for the child that
+# exports the fleet-wide health gauges, '0' for the others. With
+# Redis every process sees the same health, so one exporter per host
+# is enough. Unset (standalone process) means export.
+PUBLISHER_ENV_VAR: str = 'PROXY_HEALTH_METRICS_PUBLISHER'
 
 METRIC_PROXY_SELECTED: Counter = Counter(
     'proxy_selected_total',
@@ -80,16 +86,23 @@ METRIC_PROXY_COOLDOWNS: Counter = Counter(
     'transport failures, "proxy_auth" for a 407 from the proxy.',
     ['platform', 'proxy', 'worker_id', 'reason'],
 )
+# The health gauges only carry series for proxies that have been
+# unhealthy at some point in this process's life, and with Redis only
+# the publisher process (see PUBLISHER_ENV_VAR) exports them.
 METRIC_PROXY_FAIL_EWMA: Gauge = Gauge(
     'proxy_health_fail_ewma',
     'Fleet-wide exponentially weighted transport failure rate '
-    'of a proxy, as last seen by this process.',
+    'of a proxy, as last seen by this process. Only proxies that '
+    'have been unhealthy have a series.',
     ['platform', 'proxy', 'worker_id'],
+    multiprocess_mode='livemax',
 )
 METRIC_PROXY_IN_COOLDOWN: Gauge = Gauge(
     'proxy_health_in_cooldown',
-    '1 while a proxy is in cooldown, as last seen by this process.',
+    '1 while a proxy is in cooldown, as last seen by this process. '
+    'Only proxies that have been unhealthy have a series.',
     ['platform', 'proxy', 'worker_id'],
+    multiprocess_mode='livemax',
 )
 
 # KEYS[1] = health hash. ARGV: ok, now, alpha, consecutive threshold,
@@ -298,6 +311,10 @@ class ProxyHealth:
         for per-process health
     :param platform: platform label for metrics
     :param rng: random source (tests)
+
+    The health gauges are exported by every process when health is
+    per process (no Redis), and otherwise only when
+    PUBLISHER_ENV_VAR is unset or '1'.
     '''
 
     def __init__(
@@ -313,6 +330,14 @@ class ProxyHealth:
         # proxy -> (decayed selection count, time of last update)
         self._load: dict[str, tuple[float, float]] = {}
         self._last_refresh: float = 0.0
+        self._export_gauges: bool = (
+            redis is None
+            or os.environ.get(PUBLISHER_ENV_VAR, '1') != '0'
+        )
+        # Proxies that have a health gauge series. A series is
+        # created when a proxy is first seen unhealthy; it cannot be
+        # removed again in multiprocess mode, so it then stays.
+        self._exported: set[str] = set()
 
     def _state(self, proxy: str) -> ProxyHealthState:
         state: ProxyHealthState | None = self._states.get(proxy)
@@ -568,14 +593,21 @@ class ProxyHealth:
         )
 
     def _publish(self, proxy: str, now: float) -> None:
+        if not self._export_gauges:
+            return
         state: ProxyHealthState = self._state(proxy)
+        in_cooldown: bool = now < state.cooldown_until
+        if proxy not in self._exported:
+            if state.is_clean() and not in_cooldown:
+                return
+            self._exported.add(proxy)
         labels: dict[str, str] = {
             'platform': self._platform, 'proxy': proxy,
             'worker_id': get_worker_id(),
         }
         METRIC_PROXY_FAIL_EWMA.labels(**labels).set(state.fail_ewma)
         METRIC_PROXY_IN_COOLDOWN.labels(**labels).set(
-            1 if now < state.cooldown_until else 0,
+            1 if in_cooldown else 0,
         )
 
 
