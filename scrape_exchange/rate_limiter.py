@@ -61,11 +61,21 @@ METRIC_WAIT_EXCEEDED: Counter = Counter(
     'would exceed the caller\'s max_wait',
     _METRIC_LABELS,
 )
+# The histogram has no proxy label: with one series per bucket it
+# would multiply the proxy x api x worker cardinality by 13. The
+# per-proxy average sleep is rate(rate_limit_slept_seconds_total) /
+# rate(rate_limit_wait_events_total).
 METRIC_SLEEP_SECONDS: Histogram = Histogram(
     'rate_limit_sleep_seconds',
     'Duration of rate-limit sleep waits in seconds',
-    _METRIC_LABELS,
+    [label for label in _METRIC_LABELS if label != 'proxy'],
     buckets=(.1, .25, .5, 1.0, 2.0, 3.0, 5.0, 10.0, 30.0, 60.0),
+)
+METRIC_SLEPT_SECONDS: Counter = Counter(
+    'rate_limit_slept_seconds',
+    'Total seconds spent in rate-limit sleep waits, per proxy. '
+    'Divide by rate_limit_wait_events_total for the average.',
+    _METRIC_LABELS,
 )
 METRIC_BUCKET_TOKENS: Gauge = Gauge(
     'rate_limit_bucket_tokens',
@@ -1336,6 +1346,10 @@ class RateLimiter(ABC, Generic[CallTypeT]):
         cfg: _BucketConfig = self.default_configs[call_type]
         labels: dict[str, str] = self._labels(call_type, proxy)
         global_labels: dict[str, str] = self._global_labels(proxy)
+        sleep_labels: dict[str, str] = {
+            key: value for key, value in labels.items()
+            if key != 'proxy'
+        }
         lock: asyncio.Lock = self._get_lock(proxy)
 
         waited: float = 0.0
@@ -1380,9 +1394,10 @@ class RateLimiter(ABC, Generic[CallTypeT]):
                 )
                 lock.release()
                 try:
-                    METRIC_SLEEP_SECONDS.labels(**labels).observe(
-                        wait
-                    )
+                    METRIC_SLEEP_SECONDS.labels(
+                        **sleep_labels
+                    ).observe(wait)
+                    METRIC_SLEPT_SECONDS.labels(**labels).inc(wait)
                     await asyncio.sleep(wait)
                     waited += wait
                 finally:

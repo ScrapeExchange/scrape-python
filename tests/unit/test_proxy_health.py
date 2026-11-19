@@ -211,3 +211,117 @@ class _FailingRedis:
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def _ewma_sample(proxy: str) -> float | None:
+    from prometheus_client import REGISTRY
+    return REGISTRY.get_sample_value(
+        'proxy_health_fail_ewma',
+        {'platform': 'youtube', 'proxy': proxy, 'worker_id': '0'},
+    )
+
+
+def _cooldown_sample(proxy: str) -> float | None:
+    from prometheus_client import REGISTRY
+    return REGISTRY.get_sample_value(
+        'proxy_health_in_cooldown',
+        {'platform': 'youtube', 'proxy': proxy, 'worker_id': '0'},
+    )
+
+
+class TestHealthGaugeCardinality(unittest.IsolatedAsyncioTestCase):
+    '''The health gauges only carry series for proxies that have
+    been unhealthy, and with Redis only the designated publisher
+    process exports them.'''
+
+    async def asyncSetUp(self) -> None:
+        from unittest.mock import patch
+        self.redis: fakeredis.aioredis.FakeRedis = (
+            fakeredis.aioredis.FakeRedis(decode_responses=True)
+        )
+        self._env = patch.dict(
+            'os.environ', {ph.PUBLISHER_ENV_VAR: '1'},
+        )
+        self._env.start()
+
+    async def asyncTearDown(self) -> None:
+        self._env.stop()
+        await self.redis.aclose()
+
+    def test_gauges_drop_pid_label_in_multiprocess_mode(self) -> None:
+        self.assertEqual(
+            ph.METRIC_PROXY_FAIL_EWMA._multiprocess_mode, 'livemax',
+        )
+        self.assertEqual(
+            ph.METRIC_PROXY_IN_COOLDOWN._multiprocess_mode, 'livemax',
+        )
+
+    async def test_healthy_proxy_has_no_series(self) -> None:
+        proxy: str = 'http://card-healthy.test:3128'
+        health: ProxyHealth = ProxyHealth(self.redis, 'youtube')
+        await health.report(proxy, True)
+        await health.refresh_if_stale([proxy], force=True)
+        self.assertIsNone(_ewma_sample(proxy))
+        self.assertIsNone(_cooldown_sample(proxy))
+
+    async def test_failed_proxy_keeps_series_after_recovery(
+        self,
+    ) -> None:
+        proxy: str = 'http://card-recovers.test:3128'
+        health: ProxyHealth = ProxyHealth(self.redis, 'youtube')
+        await health.report(proxy, False)
+        self.assertAlmostEqual(_ewma_sample(proxy), ph.FAILURE_ALPHA)
+        self.assertEqual(_cooldown_sample(proxy), 0.0)
+        await self.redis.flushall()
+        await health.refresh_if_stale([proxy], force=True)
+        # Recovered (key expired): the series stays, reading zero.
+        self.assertEqual(_ewma_sample(proxy), 0.0)
+
+    async def test_refresh_publishes_proxy_failed_elsewhere(
+        self,
+    ) -> None:
+        proxy: str = 'http://card-elsewhere.test:3128'
+        other: ProxyHealth = ProxyHealth(self.redis, 'youtube')
+        _: int
+        for _ in range(ph.FAIL_THRESHOLD_CONSECUTIVE):
+            await other.report(proxy, False)
+        health: ProxyHealth = ProxyHealth(self.redis, 'youtube')
+        await health.refresh_if_stale([proxy], force=True)
+        self.assertEqual(_cooldown_sample(proxy), 1.0)
+
+    async def test_non_publisher_with_redis_exports_nothing(
+        self,
+    ) -> None:
+        from unittest.mock import patch
+        proxy: str = 'http://card-silent.test:3128'
+        with patch.dict('os.environ', {ph.PUBLISHER_ENV_VAR: '0'}):
+            health: ProxyHealth = ProxyHealth(self.redis, 'youtube')
+        _: int
+        for _ in range(ph.FAIL_THRESHOLD_CONSECUTIVE):
+            await health.report(proxy, False)
+        await health.refresh_if_stale([proxy], force=True)
+        self.assertFalse(health.available(proxy))
+        self.assertIsNone(_ewma_sample(proxy))
+        self.assertIsNone(_cooldown_sample(proxy))
+
+    async def test_non_publisher_without_redis_still_exports(
+        self,
+    ) -> None:
+        # Without Redis each process has its own health view, so
+        # every process must publish it.
+        from unittest.mock import patch
+        proxy: str = 'http://card-local.test:3128'
+        with patch.dict('os.environ', {ph.PUBLISHER_ENV_VAR: '0'}):
+            health: ProxyHealth = ProxyHealth(None, 'youtube')
+        await health.report(proxy, False)
+        self.assertAlmostEqual(_ewma_sample(proxy), ph.FAILURE_ALPHA)
+
+    async def test_publisher_by_default_when_unsupervised(self) -> None:
+        from unittest.mock import patch
+        import os
+        proxy: str = 'http://card-standalone.test:3128'
+        with patch.dict('os.environ', {}):
+            os.environ.pop(ph.PUBLISHER_ENV_VAR, None)
+            health: ProxyHealth = ProxyHealth(self.redis, 'youtube')
+        await health.report(proxy, False)
+        self.assertAlmostEqual(_ewma_sample(proxy), ph.FAILURE_ALPHA)

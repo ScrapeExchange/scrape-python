@@ -5213,8 +5213,8 @@
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
-              "expr": "sum by (proxy_file) (rate_limit_circuit_open{job=~\"$job\",instance=~\"$instance\"})",
-              "legendFormat": "circuit open {{proxy_file}}",
+              "expr": "sum by (proxy) (rate_limit_circuit_open{job=~\"$job\",instance=~\"$instance\"})",
+              "legendFormat": "circuit open {{proxy}}",
               "refId": "C"
             },
             {
@@ -5222,8 +5222,8 @@
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
-              "expr": "sum by (proxy_file, reason) (rate(rate_limit_circuit_trips_total{job=~\"$job\",instance=~\"$instance\"}[5m]))",
-              "legendFormat": "circuit trips / s {{proxy_file}} {{reason}}",
+              "expr": "sum by (proxy, reason) (rate(rate_limit_circuit_trips_total{job=~\"$job\",instance=~\"$instance\"}[5m]))",
+              "legendFormat": "circuit trips / s {{proxy}} {{reason}}",
               "refId": "D"
             }
           ],
@@ -7209,12 +7209,12 @@
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
-              "expr": "avg by (proxy_file) (rate_limit_global_bucket_tokens{job=~\"$job\",instance=~\"$instance\"})",
-              "legendFormat": "{{proxy_file}}",
+              "expr": "avg by (proxy) (rate_limit_global_bucket_tokens{job=~\"$job\",instance=~\"$instance\"})",
+              "legendFormat": "{{proxy}}",
               "refId": "A"
             }
           ],
-          "title": "Global bucket tokens (per proxy network)",
+          "title": "Global bucket tokens (per proxy)",
           "type": "timeseries"
         }
       ],

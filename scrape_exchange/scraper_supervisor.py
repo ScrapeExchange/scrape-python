@@ -44,6 +44,9 @@ from scrape_exchange.proxy_file_watcher import (
     SUPERVISED_CHILD_ENV_VAR,
     ProxyFileWatcher,
 )
+from scrape_exchange.proxy_health import (
+    PUBLISHER_ENV_VAR as PROXY_HEALTH_PUBLISHER_ENV_VAR,
+)
 from scrape_exchange.proxy_health import clear_auth_cooldowns_in_redis
 from scrape_exchange.scraper_metrics import METRIC_SUPERVISOR_RESPAWNS
 from scrape_exchange.worker_id import get_worker_id
@@ -449,6 +452,13 @@ def spawn_children(
             # child's settings; blank it so the child uses its slice.
             child_env['PROXY_FILES'] = ''
         child_env['WORKER_ID'] = str(worker_instance)
+        # With a shared pool every child sees the same fleet-wide
+        # proxy health, so one exporter per host keeps the
+        # per-proxy health gauges from multiplying by the child
+        # count. Split-pool children each see their own proxies.
+        child_env[PROXY_HEALTH_PUBLISHER_ENV_VAR] = (
+            '1' if config.split_proxy_pool or index == 0 else '0'
+        )
         if child_concurrencies is not None:
             child_concurrency: int = child_concurrencies[index]
             if config.concurrency_env_var:
