@@ -107,8 +107,9 @@ class _RedisQueueTestBase(
                 decode_responses=True,
             )
         )
+        # No jitter, so tests can assert exact due times.
         self.settings: ChannelScrapeQueueSettings = \
-            ChannelScrapeQueueSettings()
+            ChannelScrapeQueueSettings(channel_reschedule_jitter=0.0)
         self.queue: RedisChannelScrapeQueue = \
             RedisChannelScrapeQueue(
                 self.redis, self.settings,
@@ -1928,6 +1929,7 @@ class _MissingSubscriberTestBase(_RedisQueueTestBase):
             _env_file=None,
             channel_priority_queues=queues or self.QUEUES,
             channel_missing_subscriber_retry_seconds=self.BASE,
+            channel_reschedule_jitter=0.0,
         )
 
     def _queue(self, queues: str = '') -> RedisChannelScrapeQueue:
@@ -2787,3 +2789,106 @@ class TestParkedRecords(_RedisQueueTestBase):
                 self.queue.tier_for_sub_count(count),
                 self.queue._tier_for_sub_count(count),
             )
+
+
+class TestRescheduleJitter(unittest.IsolatedAsyncioTestCase):
+    '''The next scrape after a successful one is spread over
+    ``[(1 - jitter) * interval, interval]``, never later.'''
+
+    WEEK: int = 7 * 24 * 60 * 60
+
+    async def asyncSetUp(self) -> None:
+        self.redis: fakeredis.aioredis.FakeRedis = (
+            fakeredis.aioredis.FakeRedis(decode_responses=True)
+        )
+
+    async def asyncTearDown(self) -> None:
+        await self.redis.flushall()
+        await self.redis.aclose()
+
+    def _queue(
+        self, jitter: float, queues: str = '7:1000000,30:0',
+        seed: int = 42,
+    ) -> RedisChannelScrapeQueue:
+        settings: ChannelScrapeQueueSettings = ChannelScrapeQueueSettings(
+            _env_file=None,
+            channel_priority_queues=queues,
+            channel_reschedule_jitter=jitter,
+        )
+        return RedisChannelScrapeQueue(
+            self.redis, settings, rng=random.Random(seed),
+        )
+
+    def test_default_jitter(self) -> None:
+        settings: ChannelScrapeQueueSettings = ChannelScrapeQueueSettings(
+            _env_file=None,
+        )
+        self.assertEqual(settings.channel_reschedule_jitter, 0.1)
+
+    def test_rejects_out_of_range(self) -> None:
+        value: float
+        for value in (-0.01, 0.51):
+            with self.assertRaises(ValueError):
+                ChannelScrapeQueueSettings(
+                    _env_file=None, channel_reschedule_jitter=value,
+                )
+
+    def test_jittered_interval_bounds(self) -> None:
+        queue: RedisChannelScrapeQueue = self._queue(0.1)
+        seen: set[int] = set()
+        for _ in range(1000):
+            interval: int = queue._jittered_interval(self.WEEK)
+            self.assertGreaterEqual(interval, int(self.WEEK * 0.9))
+            self.assertLessEqual(interval, self.WEEK)
+            seen.add(interval)
+        self.assertGreater(len(seen), 1)
+
+    def test_jittered_interval_is_seeded(self) -> None:
+        first: int = self._queue(0.1, seed=7)._jittered_interval(
+            self.WEEK,
+        )
+        second: int = self._queue(0.1, seed=7)._jittered_interval(
+            self.WEEK,
+        )
+        self.assertEqual(first, second)
+
+    def test_zero_jitter_keeps_interval(self) -> None:
+        queue: RedisChannelScrapeQueue = self._queue(0.0)
+        self.assertEqual(queue._jittered_interval(self.WEEK), self.WEEK)
+
+    def test_no_respawn_interval_unchanged(self) -> None:
+        queue: RedisChannelScrapeQueue = self._queue(0.5)
+        self.assertEqual(queue._jittered_interval(-1), -1)
+
+    async def _score(self, channel_id: str, tier: int) -> float | None:
+        return await self.redis.zscore(
+            f'youtube:channel:queue:scheduled:{tier}',
+            f'i:{channel_id}',
+        )
+
+    async def test_fallback_path_uses_jitter(self) -> None:
+        queue: RedisChannelScrapeQueue = self._queue(0.1)
+        expected: int = self._queue(0.1)._jittered_interval(self.WEEK)
+        await queue.update_tier('UCa', sub_count=2_000_000, now=100.0)
+        score: float | None = await self._score('UCa', 0)
+        self.assertEqual(score, 100.0 + expected)
+        self.assertNotEqual(score, 100.0 + self.WEEK)
+
+    async def test_lua_path_uses_jitter(self) -> None:
+        queue: RedisChannelScrapeQueue = self._queue(0.1)
+        expected: int = self._queue(0.1)._jittered_interval(self.WEEK)
+        await queue.enqueue_scheduled('UCa', source='cli')
+        await queue.pop_scheduled(1, now=time.time())
+        progress: ChannelScrapeProgress = (
+            await queue.get_scrape_progress('UCa', existing=False)
+        )
+        # pop_scheduled draws from the same rng; reseed so the
+        # reschedule draw matches ``expected``.
+        queue._rng = random.Random(42)
+        committed: bool | None = await queue.update_tier(
+            'UCa', sub_count=2_000_000, now=100.0, progress=progress,
+        )
+        self.assertTrue(committed)
+        score: float | None = await self._score('UCa', 0)
+        self.assertEqual(score, 100.0 + expected)
+        self.assertNotEqual(score, 100.0 + self.WEEK)

@@ -728,6 +728,18 @@ class ChannelScrapeQueueSettings(BaseSettings):
             'weight. Empty means 1/interval_days per tier.'
         ),
     )
+    channel_reschedule_jitter: float = Field(
+        default=0.1,
+        ge=0.0,
+        le=0.5,
+        description=(
+            'Spread re-scrapes of a tier so channels scraped '
+            'together do not all come due together again. After '
+            'a successful scrape the next one is scheduled at a '
+            'random point between (1 - jitter) * interval and '
+            'the tier interval, never later. 0 disables it.'
+        ),
+    )
     channel_queue_resolve_batch: int = Field(default=25)
     channel_queue_scrape_batch: int = Field(default=50)
     channel_queue_idle_poll_seconds: float = Field(
@@ -1044,6 +1056,18 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
         ]
         keys.sort(reverse=True)
         return [tier for _, tier in keys]
+
+    def _jittered_interval(self, interval: int) -> int:
+        '''Scale a tier *interval* (seconds) by a random factor in
+        ``[1 - channel_reschedule_jitter, 1]`` so the next scrape is
+        never later than the configured interval. Negative intervals
+        (no-respawn) and a jitter of 0 return *interval* unchanged.
+        '''
+        jitter: float = self._settings.channel_reschedule_jitter
+        if interval <= 0 or jitter <= 0:
+            return interval
+        factor: float = self._rng.uniform(1.0 - jitter, 1.0)
+        return min(interval, int(interval * factor))
 
     def _tier_for_sub_count(self, sub_count: int) -> int:
         '''Map a subscriber count to a tier index.
@@ -1408,7 +1432,9 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
             # the base, the cap and the stored attempt count, and ignores
             # this interval.
             completed_interval: int = (
-                self._tiers[completed_tier].interval_seconds
+                self._jittered_interval(
+                    self._tiers[completed_tier].interval_seconds,
+                )
                 if completed_tier >= 0 else -1
             )
             next_full: int = progress.next_full_scrape
@@ -1481,7 +1507,9 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
             self.topic_tier(sub_count) if topic
             else self._tier_for_sub_count(sub_count or 0)
         )
-        interval: int = self._tiers[new_tier].interval_seconds
+        interval: int = self._jittered_interval(
+            self._tiers[new_tier].interval_seconds,
+        )
         old_tier_str: str | None = (
             await self._redis.hget(
                 self._k_tiers(), channel_id,

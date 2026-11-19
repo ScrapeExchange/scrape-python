@@ -371,6 +371,22 @@ class ChannelSettings(YouTubeScraperSettings):
             'weights each tier by 1/interval_days.'
         ),
     )
+    channel_reschedule_jitter: float = Field(
+        default=0.1,
+        ge=0.0,
+        le=0.5,
+        validation_alias=AliasChoices(
+            'CHANNEL_RESCHEDULE_JITTER',
+            'channel_reschedule_jitter',
+        ),
+        description=(
+            'Fraction (0-0.5) by which a channel\'s next scrape may '
+            'come early, so channels scraped together spread out '
+            'over time. The next scrape is scheduled between '
+            '(1 - jitter) and 1 times the tier interval of '
+            'CHANNEL_PRIORITY_QUEUES, never later. 0 disables it.'
+        ),
+    )
     channel_queue_resolve_batch: int = Field(default=25)
     channel_queue_scrape_batch: int = Field(default=50)
     channel_queue_idle_poll_seconds: float = Field(
@@ -742,6 +758,9 @@ def _build_channel_queue(
             ),
             channel_priority_weights=(
                 settings.channel_priority_weights
+            ),
+            channel_reschedule_jitter=(
+                settings.channel_reschedule_jitter
             ),
             channel_queue_resolve_batch=(
                 settings.channel_queue_resolve_batch

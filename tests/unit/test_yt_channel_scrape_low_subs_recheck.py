@@ -22,6 +22,7 @@ def _settings(**overrides: object) -> MagicMock:
     settings.channel_concurrency = 2
     settings.channel_priority_queues = '7:1000,30:100,365:0'
     settings.channel_priority_weights = ''
+    settings.channel_reschedule_jitter = 0.1
     settings.recheck_low_subs = True
     settings.recheck_apply = False
     settings.recheck_after_days = 30.0
