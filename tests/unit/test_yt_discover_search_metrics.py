@@ -10,7 +10,7 @@ import unittest
 from typing import Any
 from unittest import mock
 
-import httpx
+import httpx2
 from prometheus_client import REGISTRY
 
 from tools import yt_discover_search as ds
@@ -131,7 +131,7 @@ class TestErrorAndLatencyMetrics(unittest.IsolatedAsyncioTestCase):
         async def fetch(proxy: str | None) -> dict[str, Any]:
             calls.append(1)
             if len(calls) == 1:
-                raise httpx.ConnectError('down')
+                raise httpx2.ConnectError('down')
             return {'ok': 1}
 
         limiter: mock.Mock = mock.Mock()

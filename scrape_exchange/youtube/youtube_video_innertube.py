@@ -12,7 +12,7 @@ import logging
 import re
 import time
 
-import httpx
+import httpx2
 
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -112,7 +112,7 @@ class YouTubeVideoUnavailableError(RuntimeError):
 
 
 # Wall-clock safety net for a single innertube player/next call. The
-# inner sync HTTP stack (httpx + curl_cffi) is supposed to enforce its
+# inner sync HTTP stack (httpx2) is supposed to enforce its
 # own timeouts, but on 2026-05-17 both video scrapers (scraper001 +
 # scraper002) went silent within the same 30-second window at 09:17 UTC
 # with workers stuck inside the to_thread call, neither raising nor
@@ -645,14 +645,14 @@ class InnerTubeVideoParser:
                         f'InnerTube API call failed: {exc}'
                     )
             except Exception as exc:
-                if isinstance(exc, httpx.TransportError) and not (
-                    isinstance(exc, httpx.ReadTimeout)
+                if isinstance(exc, httpx2.TransportError) and not (
+                    isinstance(exc, httpx2.ReadTimeout)
                 ):
                     await limiter.report_proxy_result(
                         proxy, False, exc,
                     )
                 if borrowed_player and isinstance(
-                    exc, httpx.TransportError
+                    exc, httpx2.TransportError
                 ):
                     await refresh_pooled_innertube_for_entry(
                         proxy,
@@ -828,14 +828,14 @@ class InnerTubeVideoParser:
                     else:
                         break  # non-429 error on NEXT: skip silently
                 except Exception as exc:
-                    if isinstance(exc, httpx.TransportError) and not (
-                        isinstance(exc, httpx.ReadTimeout)
+                    if isinstance(exc, httpx2.TransportError) and not (
+                        isinstance(exc, httpx2.ReadTimeout)
                     ):
                         await limiter.report_proxy_result(
                             proxy, False, exc,
                         )
                     if borrowed_next and isinstance(
-                        exc, httpx.TransportError
+                        exc, httpx2.TransportError
                     ):
                         await refresh_pooled_web_innertube_for_entry(
                             proxy,
@@ -1029,8 +1029,8 @@ class InnerTubeVideoParser:
         except asyncio.TimeoutError as exc:
             _count('failure', 'timeout')
             logging.debug('Transcript fetch timed out', exc=exc, extra=extra)
-        except httpx.TransportError as exc:
-            if not isinstance(exc, httpx.ReadTimeout):
+        except httpx2.TransportError as exc:
+            if not isinstance(exc, httpx2.ReadTimeout):
                 await limiter.report_proxy_result(proxy, False, exc)
             if borrowed and client is not None:
                 await refresh_pooled_transcript_innertube_for_entry(

@@ -18,7 +18,7 @@ default when the key is absent; this test set asserts the new
 import unittest
 from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
-import httpx
+import httpx2
 
 from scrape_exchange.youtube.youtube_video import YouTubeVideo
 from scrape_exchange.youtube import youtube_video_innertube as innertube_mod
@@ -762,7 +762,7 @@ class TestInnerTubeClientRouting(unittest.IsolatedAsyncioTestCase):
         ) as retire_player, patch.object(
             innertube_mod,
             '_call_innertube',
-            new=AsyncMock(side_effect=httpx.ConnectTimeout('tls')),
+            new=AsyncMock(side_effect=httpx2.ConnectTimeout('tls')),
         ), patch.object(
             innertube_mod.YouTubeRateLimiter,
             'get',
@@ -819,7 +819,7 @@ class TestInnerTubeClientRouting(unittest.IsolatedAsyncioTestCase):
             innertube_mod,
             '_call_innertube',
             new=AsyncMock(
-                side_effect=[player_data, httpx.PoolTimeout('pool')]
+                side_effect=[player_data, httpx2.PoolTimeout('pool')]
             ),
         ), patch.object(
             innertube_mod.YouTubeRateLimiter,

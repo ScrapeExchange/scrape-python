@@ -20,7 +20,7 @@ by ``Response.json()`` instead, so such responses behave as before.
 from typing import Any
 
 import orjson
-from httpx import Response
+from httpx2 import Response
 from innertube import api
 from innertube.adaptor import InnerTubeAdaptor
 from innertube.errors import RequestError, ResponseError

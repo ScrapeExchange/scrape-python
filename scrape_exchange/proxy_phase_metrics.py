@@ -1,7 +1,7 @@
 '''Per-phase connection-establishment metrics for proxied
-HTTPS requests, shared across the RSS scraper (vanilla httpx
-+ httpcore trace extension) and the YouTube HTML scrape
-path (httpx_curl_cffi).
+HTTPS requests, shared across the RSS scraper and InnerTube
+sessions (httpx2 + httpcore2 trace extension) and the YouTube
+HTML scrape path (httpx_curl_cffi).
 
 Both paths report into the same three histograms — keyed by
 ``call_type`` plus ``proxy_file`` / ``proxy_network`` — so a
@@ -45,6 +45,8 @@ import sys
 import time
 from typing import Any, Awaitable, Callable
 
+# Stays on httpx (0.23): record_html_phase_metrics reads responses from
+# AsyncYouTubeClient, whose httpx_curl_cffi transport is built on it.
 import httpx
 from curl_cffi import CurlInfo
 from prometheus_client import Counter, Histogram
@@ -205,7 +207,7 @@ def _record_phase_event(
 def make_rss_phase_trace(
     proxy_file: str,
 ) -> AsyncTraceCallback:
-    '''Async trace callback for ``httpx.AsyncClient`` requests.
+    '''Async trace callback for ``httpx2.AsyncClient`` requests.
     Pass via ``extensions={"trace": trace}`` on the
     ``http.get(...)`` call. Records with ``call_type='rss'``.
 
@@ -236,7 +238,7 @@ def make_innertube_phase_trace(
 ) -> SyncTraceCallback:
     '''Sync trace callback for the third-party
     ``innertube.InnerTube`` library, which uses the
-    ``httpx.Client`` sync API internally. Records with
+    ``httpx2.Client`` session we give it. Records with
     ``call_type='innertube'``. Same phase semantics as
     :func:`make_rss_phase_trace`.
     '''
@@ -261,7 +263,7 @@ def install_innertube_phase_tracing(
     session,
     proxy_file: str,
 ) -> None:
-    '''Patch the InnerTube adaptor's ``httpx.Client`` session
+    '''Patch the InnerTube adaptor's ``httpx2.Client`` session
     so every outgoing request carries a phase-tracing trace
     extension. Idempotent (sets a marker attribute).
 
@@ -273,7 +275,7 @@ def install_innertube_phase_tracing(
     closure with private state — safe under concurrent use.
 
     *session* is the InnerTube ``adaptor.session`` attribute
-    (i.e. ``httpx.Client``).
+    (i.e. ``httpx2.Client``).
     '''
 
     if getattr(session, '_phase_tracing_installed', False):

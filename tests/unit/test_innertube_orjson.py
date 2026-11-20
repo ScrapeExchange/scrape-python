@@ -11,7 +11,7 @@ import unittest
 from typing import Any
 from unittest.mock import patch
 
-import httpx
+import httpx2
 import orjson
 from innertube.adaptor import InnerTubeAdaptor
 from innertube.errors import RequestError, ResponseError
@@ -26,16 +26,16 @@ def _adaptor(
 ) -> InnerTubeAdaptor:
     '''An adaptor whose session answers every request with *body*.'''
 
-    def _handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
+    def _handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(
             200, content=body, headers={'Content-Type': content_type},
         )
 
     return InnerTubeAdaptor(
         ClientContext(client_name='WEB', client_version='2.0'),
-        session=httpx.Client(
+        session=httpx2.Client(
             base_url='https://localhost',
-            transport=httpx.MockTransport(_handler),
+            transport=httpx2.MockTransport(_handler),
         ),
     )
 

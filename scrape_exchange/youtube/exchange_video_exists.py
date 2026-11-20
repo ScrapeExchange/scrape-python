@@ -5,7 +5,7 @@ backlog-server queue's migration fallback, which asks about upload
 state the server cannot answer yet.
 '''
 
-from httpx import Response
+from httpx2 import Response
 
 from scrape_exchange.exchange_client import ExchangeClient
 

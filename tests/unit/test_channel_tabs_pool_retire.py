@@ -16,7 +16,7 @@ import logging
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
+import httpx2
 
 from scrape_exchange.youtube import youtube_channel_tabs as tabs_mod
 from scrape_exchange.youtube.youtube_channel_tabs import YouTubeChannelTabs
@@ -50,7 +50,7 @@ class TestBrowseRetiresPooledClient(unittest.IsolatedAsyncioTestCase):
         self, mock_delay: AsyncMock,
     ) -> None:
         broken: MagicMock = MagicMock(name='broken')
-        broken.browse.side_effect = httpx.PoolTimeout('pool full')
+        broken.browse.side_effect = httpx2.PoolTimeout('pool full')
         fresh: MagicMock = MagicMock(name='fresh')
         fresh.browse.return_value = {'data': 'ok'}
         borrow: MagicMock = MagicMock(side_effect=[broken, fresh])
@@ -109,7 +109,7 @@ class TestBrowseRetiresPooledClient(unittest.IsolatedAsyncioTestCase):
             )
             pinned: MagicMock = MagicMock()
             pinned.browse.side_effect = [
-                httpx.ConnectError('down'), {'ok': 1},
+                httpx2.ConnectError('down'), {'ok': 1},
             ]
             tabs.client = pinned
             await tabs._browse(max_retries=2)
@@ -161,7 +161,7 @@ class TestResolverCallRetiresPooledClient(
         release: AsyncMock = AsyncMock()
 
         def call(c: MagicMock) -> dict:
-            raise httpx.ConnectError('down')
+            raise httpx2.ConnectError('down')
 
         with patch.object(
             yc, 'borrow_pooled_innertube_for_entry',
@@ -171,7 +171,7 @@ class TestResolverCallRetiresPooledClient(
         ), patch.object(
             yc, 'refresh_pooled_web_innertube_for_entry', retire,
         ):
-            with self.assertRaises(httpx.ConnectError):
+            with self.assertRaises(httpx2.ConnectError):
                 await yc._resolver_innertube_call(PROXY, call)
             self.assertEqual(
                 await yc._resolver_innertube_call(

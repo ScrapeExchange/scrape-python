@@ -20,7 +20,7 @@ import unittest
 
 from datetime import datetime
 
-import httpx
+import httpx2
 import untangle
 
 from scrape_exchange.youtube.youtube_thumbnail import (
@@ -60,7 +60,7 @@ class TestFromRssEntryLive(unittest.TestCase):
         url: str = RSS_URL_TEMPLATE.format(
             cid=RICK_ASTLEY_CHANNEL_ID,
         )
-        response: httpx.Response = httpx.get(
+        response: httpx2.Response = httpx2.get(
             url, timeout=15.0,
         )
         response.raise_for_status()

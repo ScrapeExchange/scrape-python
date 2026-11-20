@@ -32,6 +32,8 @@ import http.cookiejar
 from typing import Any, ClassVar, Self
 from dataclasses import dataclass, field
 
+# Stays on httpx (0.23): cookies are fetched with AsyncYouTubeClient,
+# whose httpx_curl_cffi transport is built on it.
 import httpx
 
 from scrape_exchange.util import extract_proxy_ip, extract_proxy_port

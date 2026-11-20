@@ -20,7 +20,7 @@ import logging
 from logging import Logger
 from typing import TYPE_CHECKING
 
-from httpx import Response
+from httpx2 import Response
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 
