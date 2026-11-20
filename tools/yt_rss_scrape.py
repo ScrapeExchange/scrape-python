@@ -123,6 +123,7 @@ from scrape_exchange.creator_queue import (
 from scrape_exchange.redis_client import redis_from_url
 from scrape_exchange.channel_scrape_queue import (
     KEY_PREFIX as CHANNEL_QUEUE_KEY_PREFIX,
+    ChannelState,
     awaiting_first_full_scrape,
 )
 from scrape_exchange.video_queue_factory import make_video_scrape_queue
@@ -1578,22 +1579,14 @@ async def process_channel(
         extra=extra | {'video_count': len(videos)},
     )
 
-    # --- Phase 2: filter locally-known videos, then
-    #     batch-check existence on scrape.exchange ---
-    candidates: list[YouTubeVideo] = []
+    # --- Phase 2: check existence in Redis, then on
+    #     scrape.exchange. Redis is the source of truth: local
+    #     files are not consulted, as per-video exists() calls
+    #     flood the kernel dentry cache with negative entries.
+    candidates: list[YouTubeVideo] = [
+        video for video in videos if video
+    ]
     videos_existing: int = 0
-    video_fm = AssetFileManagement(settings.video_data_directory)
-    for video in videos:
-        if not video:
-            continue
-        if video_fm.video_scrape_output_exists(video.video_id):
-            logging.debug(
-                'Found existing file for video, skipping',
-                extra=extra | {'video_id': video.video_id},
-            )
-            videos_existing += 1
-        else:
-            candidates.append(video)
 
     if not candidates:
         logging.info(
@@ -2484,13 +2477,32 @@ async def _enrich_subscriber_counts(
         )
 
 
+# Channel-queue states of channels that no longer exist (or were
+# removed by an operator). The RSS queue does not add them; this
+# replaces the .not_found / .unresolved marker files that are not
+# consulted when Redis is configured.
+RSS_SKIPPED_CHANNEL_STATES: frozenset[str] = frozenset(
+    state.value for state in (
+        ChannelState.NOT_FOUND,
+        ChannelState.INVALID_HANDLE,
+        ChannelState.UNRESOLVED,
+        ChannelState.REMOVED,
+        ChannelState.TERMINATED,
+        ChannelState.HARD_UNAVAILABLE,
+        ChannelState.MOVED,
+    )
+)
+
+
 async def _hold_back_unscraped_channels(
     redis: aioredis.Redis,
     channel_map: dict[str, str],
     known_ids: set[str],
-) -> int:
+) -> tuple[int, int]:
     '''Remove channels from *channel_map* (in place) that the channel
-    scraper queue knows but has not completed a first full scrape for.
+    scraper queue knows but has not completed a first full scrape for,
+    or that it knows to be gone (see
+    :data:`RSS_SKIPPED_CHANNEL_STATES`).
 
     New channels join the RSS queue only after their first full scrape
     (the channel scraper adds them then), so RSS cannot make their
@@ -2498,12 +2510,13 @@ async def _hold_back_unscraped_channels(
     in the RSS queue (*known_ids*) and channels the channel queue has
     never seen are left alone.
 
-    :returns: number of channels held back
+    :returns: (channels held back, gone channels dropped)
     '''
     candidates: list[str] = [
         cid for cid in channel_map if cid not in known_ids
     ]
     held: int = 0
+    gone: int = 0
     chunk_size: int = 1000
     start: int
     for start in range(0, len(candidates), chunk_size):
@@ -2522,10 +2535,13 @@ async def _hold_back_unscraped_channels(
         results: list[list[str | None]] = await pipe.execute()
         fields: list[str | None]
         for cid, fields in zip(chunk, results):
-            if awaiting_first_full_scrape(*fields):
+            if fields[0] in RSS_SKIPPED_CHANNEL_STATES:
+                del channel_map[cid]
+                gone += 1
+            elif awaiting_first_full_scrape(*fields):
                 del channel_map[cid]
                 held += 1
-    return held
+    return held, gone
 
 
 def _observe_phase(phase: str, started: float) -> None:
@@ -2710,13 +2726,15 @@ async def worker_loop(
         await creator_queue.known_creator_ids()
     )
     if isinstance(creator_queue, RedisCreatorQueue):
-        held: int = await _hold_back_unscraped_channels(
+        held: int
+        gone: int
+        held, gone = await _hold_back_unscraped_channels(
             creator_queue.redis_client, channel_map_data, known_ids,
         )
         logging.info(
             'Held back channels awaiting their first full channel '
-            'scrape',
-            extra={'held_back': held},
+            'scrape and dropped channels the channel queue marks gone',
+            extra={'held_back': held, 'gone': gone},
         )
     if settings.rss_enrich_subscriber_counts:
         await _enrich_subscriber_counts(

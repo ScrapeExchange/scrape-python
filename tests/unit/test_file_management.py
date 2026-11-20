@@ -617,18 +617,6 @@ class TestMarkerHelpers(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises((FileNotFoundError, OSError)):
             await self.fm.mark_uploaded('does-not-exist.json.br')
 
-    async def test_mark_failed_renames_with_suffix(self):
-        src = os.path.join(self.base, 'channel-foo.json.br')
-        with open(src, 'w') as f:
-            f.write('x')
-        os.chmod(src, 0o600)
-        new_name = await self.fm.mark_failed('channel-foo.json.br')
-        dst = os.path.join(self.base, 'channel-foo.json.br.failed')
-        self.assertEqual(new_name, 'channel-foo.json.br.failed')
-        self.assertFalse(os.path.exists(src))
-        self.assertTrue(os.path.exists(dst))
-        self.assertEqual(_file_mode(dst), WORLD_READABLE_FILE_MODE)
-
     async def test_touch_marker_rejects_non_marker_filename(self):
         with self.assertRaises(ValueError):
             await self.fm._touch_marker('channel-foo.json.br', None)
@@ -890,46 +878,6 @@ class TestListHelpers(unittest.TestCase):
     def test_list_base_empty_when_no_match(self):
         self._touch(self.base, 'a.txt')
         self.assertEqual(self.fm.list_base(prefix='nope'), [])
-
-    def test_video_scrape_output_false_when_only_bare_marker_exists(
-        self,
-    ):
-        self._touch(self.base, 'vid_a')
-        self.assertFalse(
-            self.fm.video_scrape_output_exists('vid_a'),
-        )
-
-    def test_video_scrape_output_true_for_video_min_in_base_dir(
-        self,
-    ):
-        self._touch(self.base, 'video-min-vid_a.json.br')
-        self.assertTrue(
-            self.fm.video_scrape_output_exists('vid_a'),
-        )
-
-    def test_video_scrape_output_true_for_video_dlp_in_base_dir(
-        self,
-    ):
-        self._touch(self.base, 'video-dlp-vid_a.json.br')
-        self.assertTrue(
-            self.fm.video_scrape_output_exists('vid_a'),
-        )
-
-    def test_video_scrape_output_true_for_video_min_in_uploaded_dir(
-        self,
-    ):
-        self._touch(self.uploaded, 'video-min-vid_a.json.br')
-        self.assertTrue(
-            self.fm.video_scrape_output_exists('vid_a'),
-        )
-
-    def test_video_scrape_output_true_for_video_dlp_in_uploaded_dir(
-        self,
-    ):
-        self._touch(self.uploaded, 'video-dlp-vid_a.json.br')
-        self.assertTrue(
-            self.fm.video_scrape_output_exists('vid_a'),
-        )
 
 
 class TestReadUploaded(unittest.IsolatedAsyncioTestCase):

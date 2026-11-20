@@ -954,29 +954,12 @@ async def _resolve_member_for_add(
     return f'h:{canonical}'
 
 
-def _has_local_channel_file(
-    channel_data_directory: str | None, member: str,
-) -> bool:
-    '''True when the channel behind *member* (``i:<channel_id>``)
-    has a scraped file in *channel_data_directory*, uploaded or
-    not. Handle members have no channel_id, so no file to check.'''
-    if not channel_data_directory or not member.startswith('i:'):
-        return False
-    filename: str = f'channel-{member.removeprefix("i:")}.json.br'
-    base: str = channel_data_directory
-    return (
-        os.path.exists(os.path.join(base, filename))
-        or os.path.exists(os.path.join(base, 'uploaded', filename))
-    )
-
-
 async def _classify_pre_existing(
     queue: RedisChannelScrapeQueue,
     identity: ChannelIdentityStore | None,
     *,
     channel_id: str | None,
     channel_handle: str | None,
-    channel_data_directory: str | None = None,
 ) -> str:
     '''Pre-add classification.
 
@@ -986,9 +969,6 @@ async def _classify_pre_existing(
     * a :class:`ChannelState` value (e.g. ``'scheduled'``,
       ``'not_found'``) if meta has a ``state`` field
     * ``'no_state'`` — meta hash exists but no ``state`` field
-    * ``'local_file'`` — the queue has no record, but the
-      channel has a scraped file (uploaded or not) in
-      *channel_data_directory*
     * ``'new'`` — none of the above
     * ``'invalid_input'`` — neither channel_id nor a
       resolvable handle was supplied
@@ -1005,8 +985,6 @@ async def _classify_pre_existing(
         return 'invalid_input'
     meta: dict[str, str] = await queue.get_meta(member)
     if not meta:
-        if _has_local_channel_file(channel_data_directory, member):
-            return 'local_file'
         return 'new'
     state: str | None = meta.get('state')
     if state is None:
@@ -1025,7 +1003,7 @@ def _ordered_classification_keys(
     '''
     state_order: list[str] = [s.value for s in ChannelState]
     synthetic: list[str] = [
-        'new', 'local_file', 'no_state', 'invalid_input',
+        'new', 'no_state', 'invalid_input',
     ]
     ordered: list[str] = []
     for key in state_order + synthetic:
@@ -1057,7 +1035,7 @@ def _write_classification_report(
     )
     sys.stdout.write(
         f'  added {counts.get("new", 0)}, skipped {skipped} '
-        f'already known or with a local channel file\n',
+        f'already known\n',
     )
     sys.stdout.write('  pre-existing states:\n')
     keys: list[str] = _ordered_classification_keys(counts)
@@ -1117,11 +1095,10 @@ async def cmd_add(
     queue: RedisChannelScrapeQueue,
     *,
     identity: ChannelIdentityStore | None = None,
-    channel_data_directory: str | None = None,
 ) -> int:
     '''Add channels the queue has never seen. A channel the queue
-    already knows (in any state, terminal included) or that has a
-    local scraped file is left alone, with or without
+    already knows (in any state, terminal included) is left
+    alone, with or without
     ``--priority``; use ``rescrape`` to bring a known channel
     forward.'''
     counts: dict[str, int] = {}
@@ -1138,7 +1115,6 @@ async def cmd_add(
             queue, identity,
             channel_id=channel_id,
             channel_handle=channel_handle,
-            channel_data_directory=channel_data_directory,
         )
         counts[classification] = (
             counts.get(classification, 0) + 1
@@ -1375,11 +1351,10 @@ async def cmd_import(
     queue: RedisChannelScrapeQueue,
     *,
     identity: ChannelIdentityStore | None = None,
-    channel_data_directory: str | None = None,
 ) -> int:
     '''Import channels the queue has never seen. Channels it
-    already knows, terminal ones included, and channels with a
-    local scraped file are skipped; use ``unmark`` or
+    already knows, terminal ones included, are skipped; use
+    ``unmark`` or
     ``rescrape`` to bring one back.'''
     if ns.replace:
         await _clear_channel_keys(queue)
@@ -1412,7 +1387,6 @@ async def cmd_import(
             queue, identity,
             channel_id=cid_for_lookup or None,
             channel_handle=handle_for_lookup or None,
-            channel_data_directory=channel_data_directory,
         )
         counts[classification] = (
             counts.get(classification, 0) + 1
@@ -2833,17 +2807,8 @@ async def main_async(argv: list[str]) -> int:
             redis, ChannelScrapeQueueSettings(),
         )
     )
-    # add/import skip channels with a local scraped file, so they
-    # need to know where those files are.
-    kwargs: dict[str, str | None] = {}
-    if ns.command in ('add', 'import'):
-        kwargs['channel_data_directory'] = (
-            settings.channel_data_directory
-        )
     try:
-        return await _HANDLERS[ns.command](
-            ns, queue, **kwargs,
-        )
+        return await _HANDLERS[ns.command](ns, queue)
     except RedisConnectionError as exc:
         sys.stderr.write(
             f'redis connection failed: {exc}\n'

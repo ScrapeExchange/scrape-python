@@ -583,8 +583,10 @@ class TestChannelVideoRefresh(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.requests), 1)
         summary: logging.LogRecord = [r for r in logs.records
                    if hasattr(r, 'video_ids_added')][-1]
-        self.assertEqual(summary.video_ids_added, 1)
-        self.assertEqual(summary.video_ids_existing, 2)
+        # A local scrape file does not make a video known: Redis is
+        # the source of truth, so 'local' is queued.
+        self.assertEqual(summary.video_ids_added, 2)
+        self.assertEqual(summary.video_ids_existing, 1)
         self.assertEqual(summary.channel_id, 'UCexample')
 
     async def test_forced_metadata_defers_due_enumeration(self) -> None:
@@ -814,15 +816,16 @@ class TestKnownVideoIds(unittest.IsolatedAsyncioTestCase):
         known: refresh.KnownVideoIds = refresh.KnownVideoIds(
             redis=self.redis, http_client=self.http,
             exchange_url='https://scrape.exchange',
-            channel_id='UCexample', video_fm=self.fm,
+            channel_id='UCexample',
         )
         await known.load()
         self.assertEqual(known.exchange_ids, {'on-exchange'})
         result: set[str] = await known([
             'on-exchange', 'uploaded', 'queued', 'local', 'new',
         ])
+        # A local scrape file alone does not make 'local' known.
         self.assertEqual(
-            result, {'on-exchange', 'uploaded', 'queued', 'local'},
+            result, {'on-exchange', 'uploaded', 'queued'},
         )
         self.assertEqual(self.filter_calls, 1)
 
@@ -839,7 +842,7 @@ class TestKnownVideoIds(unittest.IsolatedAsyncioTestCase):
         )
         await refresh.queue_channel_videos(
             channel, redis=self.redis, http_client=self.http,
-            exchange_url='https://scrape.exchange', video_fm=self.fm,
+            exchange_url='https://scrape.exchange',
             summary=summary, exchange_ids={'on-exchange'},
         )
         self.assertEqual(self.filter_calls, 0)
@@ -868,7 +871,7 @@ class TestKnownVideoIds(unittest.IsolatedAsyncioTestCase):
             await refresh.queue_channel_videos(
                 channel, redis=self.redis, http_client=self.http,
                 exchange_url='https://scrape.exchange',
-                video_fm=self.fm, summary=summary,
+                summary=summary,
                 exchange_ids={'on-exchange'},
             )
         spy.assert_called_once()
@@ -892,9 +895,6 @@ class TestChannelRefreshDoneLookup(unittest.IsolatedAsyncioTestCase):
         summary: MagicMock = MagicMock()
         with patch.object(
             refresh, 'make_video_scrape_queue', return_value=queue,
-        ), patch.object(
-            AssetFileManagement, 'video_scrape_output_exists',
-            return_value=False,
         ):
             await refresh.queue_video_ids(
                 {'a'},
@@ -903,7 +903,6 @@ class TestChannelRefreshDoneLookup(unittest.IsolatedAsyncioTestCase):
                 redis=AsyncMock(),
                 http_client=AsyncMock(),
                 exchange_url='https://scrape.exchange',
-                video_fm=AssetFileManagement('/tmp'),
                 summary=summary,
                 exchange_ids={'a'},
             )
@@ -920,16 +919,12 @@ class TestChannelRefreshDoneLookup(unittest.IsolatedAsyncioTestCase):
         queue.get_states.return_value = {'a': None}
         with patch.object(
             refresh, 'make_video_scrape_queue', return_value=queue,
-        ), patch.object(
-            AssetFileManagement, 'video_scrape_output_exists',
-            return_value=False,
         ):
             known: Any = refresh.KnownVideoIds(
                 redis=AsyncMock(),
                 http_client=AsyncMock(),
                 exchange_url='https://scrape.exchange',
                 channel_id='UCX',
-                video_fm=AssetFileManagement('/tmp'),
             )
             known.exchange_ids = set()
             await known(['a'])

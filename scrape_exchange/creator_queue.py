@@ -1729,18 +1729,10 @@ class RedisCreatorQueue(CreatorQueue):
         # the creators hash (uses HSCAN, not HGETALL).
         await self._ensure_names_index()
 
-        # Pre-filter candidates that should be skipped
-        # regardless of name dedup.
-        skip_markers: set[str] | None = _load_skip_creator_markers(
-            channel_fm,
-        )
-        candidates: list[tuple[str, str]] = []
-        for cid, name in creators.items():
-            if _should_skip_creator(
-                name, cid, channel_fm, skip_markers,
-            ):
-                continue
-            candidates.append((cid, name))
+        # Local .not_found / .unresolved marker files are not
+        # consulted: with Redis, the caller drops channels the
+        # channel queue marks gone before calling populate.
+        candidates: list[tuple[str, str]] = list(creators.items())
 
         now: float = datetime.now(UTC).timestamp()
         added: int = 0
@@ -1814,7 +1806,6 @@ class RedisCreatorQueue(CreatorQueue):
         creator_name: str,
         tiers: list[TierConfig],
         subscriber_count: int | None,
-        channel_fm: AssetFileManagement,
     ) -> bool:
         '''
         Enqueue one creator without the startup work of
@@ -1826,15 +1817,10 @@ class RedisCreatorQueue(CreatorQueue):
         :param creator_name: display name used for name dedup
         :param tiers: the queue's tier configuration
         :param subscriber_count: picks the tier; None for unknown
-        :param channel_fm: checked for skip-marker files
         :returns: True when the creator was added, False when it was
-            already known, operator-excluded or skip-marked.
+            already known or operator-excluded.
         '''
 
-        if _should_skip_creator(
-            creator_name, creator_id, channel_fm, None,
-        ):
-            return False
         pipe = self._redis.pipeline(transaction=False)
         pipe.hexists(self._key_creators, creator_id)
         pipe.sismember(self._key_names, creator_name.lower())

@@ -480,9 +480,8 @@ def _split_low_subs_name(name: str) -> tuple[str, str] | None:
 
 def _plain_copy_exists(video_dir: str, video_id: str) -> bool:
     '''Whether a regular (uploadable or uploaded) file of *video_id*
-    exists. Same check as
-    ``AssetFileManagement.video_scrape_output_exists``, without
-    constructing it, which creates directories.'''
+    exists. Checked directly rather than through
+    AssetFileManagement, whose constructor creates directories.'''
     prefix: str
     directory: str
     for directory in (video_dir, os.path.join(video_dir, 'uploaded')):

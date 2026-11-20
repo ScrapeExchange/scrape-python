@@ -2625,7 +2625,6 @@ async def _scrape_one_queued(
                 redis=creator_map_backend.redis_client,
                 http_client=http_client,
                 exchange_url=settings.exchange_url,
-                video_fm=AssetFileManagement(settings.video_data_directory),
                 summary=summary,
                 exchange_ids=exchange_video_ids.fetched,
             )
@@ -2662,7 +2661,7 @@ async def _scrape_one_queued(
             # New channels join the RSS queue only now, so RSS cannot
             # make their newest videos 'known' before the first full
             # scrape has enumerated the back catalogue.
-            await _add_channel_to_rss_queue(settings, fm, channel, extra)
+            await _add_channel_to_rss_queue(settings, channel, extra)
         count_outcome: str = 'scraped'
         if channel.subscriber_count is None and not is_topic:
             # The queue decided between a retry and 'not public'; a
@@ -3281,7 +3280,6 @@ def _rss_queue_for(settings: ChannelSettings) -> RedisCreatorQueue | None:
 
 async def _add_channel_to_rss_queue(
     settings: ChannelSettings,
-    fm: AssetFileManagement,
     channel: YouTubeChannel,
     extra: dict[str, str],
 ) -> None:
@@ -3301,7 +3299,6 @@ async def _add_channel_to_rss_queue(
             channel.channel_handle or channel.channel_id,
             _RSS_TIERS,
             channel.subscriber_count,
-            fm,
         )
     except Exception:
         logging.warning(
@@ -3479,9 +3476,6 @@ def _listing_checkpoint_fn(
         return None
     state: dict[str, str] = dict(listing_resume)
     topic_marked: bool = False
-    video_fm: AssetFileManagement = AssetFileManagement(
-        settings.video_data_directory,
-    )
 
     async def checkpoint(
         channel: YouTubeChannel, tab: str, token: str,
@@ -3501,7 +3495,7 @@ def _listing_checkpoint_fn(
         await queue_video_ids(
             video_ids, channel.channel_id, channel.channel_handle,
             redis=redis, http_client=http_client,
-            exchange_url=settings.exchange_url, video_fm=video_fm,
+            exchange_url=settings.exchange_url,
             summary=summary, exchange_ids=exchange_ids,
         )
         state[tab] = token
@@ -3557,7 +3551,6 @@ async def _load_known_video_ids(
         http_client=http_client,
         exchange_url=settings.exchange_url,
         channel_id=channel_id,
-        video_fm=AssetFileManagement(settings.video_data_directory),
     )
     try:
         await known.load()
@@ -4266,9 +4259,11 @@ async def _filter_unscraped_candidates(
     Resolution is lazy / budget-bounded: a handle in the no-Redis
     legacy path costs an InnerTube call, so we resolve only until the
     budget is met. Bare ids and negative-cached handles cost no HTTP.
-    Dedup keys (``.not_found`` marker, scraped file in ``base_dir`` or
-    ``uploaded_dir``) are all channel_id-based: a channel with any local
-    file is not new. The ``uploaded_handles`` membership test
+    Dedup keys (``.not_found`` marker, and without Redis a scraped
+    file in ``base_dir`` or ``uploaded_dir``) are all channel_id-based.
+    With Redis, local channel files are not consulted: the
+    exchange-channels set decides what is new. The
+    ``uploaded_handles`` membership test
     (loaded from ``YOUTUBE_UPLOADED_CHANNELS_LIST``, which is
     handle-valued) maps the id back to its handle via the creator map;
     a stale scraped file for such a channel is deleted first so the
@@ -4304,9 +4299,14 @@ async def _filter_unscraped_candidates(
             f'{CHANNEL_FILE_PREFIX}{channel_id}', '.not_found',
         )
         uploaded_path: Path = fm.uploaded_dir / filename
-        if (not_found_path.exists()
-                or scraped_path.exists()
-                or uploaded_path.exists()):
+        # With Redis, the exchange-channels set (see
+        # _select_new_channels_via_set) decides what is known;
+        # local channel files are only consulted without Redis.
+        has_local_file: bool = (
+            creator_map_backend.redis_client is None
+            and (scraped_path.exists() or uploaded_path.exists())
+        )
+        if not_found_path.exists() or has_local_file:
             logging.debug(
                 'Skipping channel as we already have data for it',
                 extra={'channel_id': channel_id},
