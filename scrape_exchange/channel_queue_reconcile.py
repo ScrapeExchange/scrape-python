@@ -288,6 +288,15 @@ def record_reconcile_error(phase: str) -> None:
     ).inc()
 
 
+@dataclass
+class _MetaOrphanReports:
+    '''The three drift reports filled by the meta-orphan scan.'''
+
+    scheduled: DriftClassReport
+    pending: DriftClassReport
+    terminal: DriftClassReport
+
+
 class ChannelQueueAuditor:
     '''Read-only auditor for channel/RSS queue drift.
 
@@ -319,6 +328,19 @@ class ChannelQueueAuditor:
         self._batch_size: int = batch_size
         self._sample_size: int = sample_size
         self._limit: int | None = limit
+
+    def _limit_reached(self, inspected: int) -> bool:
+        '''Whether *inspected* has reached the scan limit.'''
+        return self._limit is not None and inspected >= self._limit
+
+    def _within_limit(
+        self, members: list[str], inspected: int,
+    ) -> list[str]:
+        '''The leading *members* that still fit under the scan
+        limit, given *inspected* members so far.'''
+        if self._limit is None:
+            return members
+        return members[:max(0, self._limit - inspected)]
 
     async def scan(self) -> ReconcileReport:
         '''Run all Phase 1 scans and return a single
@@ -465,8 +487,8 @@ class ChannelQueueAuditor:
         sub: DriftClassReport,
         inspected: int,
     ) -> int:
-        '''ZSCAN one sorted-set key and emit each member
-        into the RSS-accounting drift reports.
+        '''ZSCAN one sorted-set key and check each page of
+        members against the RSS-accounting drift reports.
 
         Returns the updated ``inspected`` count.
         '''
@@ -477,16 +499,13 @@ class ChannelQueueAuditor:
                 cursor=cursor,
                 count=self._batch_size,
             )
-            for member, _score in items:
-                await self._emit_rss_accounting(
-                    member, seen, main, sub,
-                )
-                inspected += 1
-                if (
-                    self._limit is not None
-                    and inspected >= self._limit
-                ):
-                    return inspected
+            done: bool
+            inspected, done = await self._emit_rss_accounting(
+                [member for member, _score in items],
+                seen, main, sub, inspected,
+            )
+            if done:
+                return inspected
             if cursor == 0:
                 break
         return inspected
@@ -499,8 +518,8 @@ class ChannelQueueAuditor:
         sub: DriftClassReport,
         inspected: int,
     ) -> int:
-        '''HSCAN one hash key and emit each member into
-        the RSS-accounting drift reports.
+        '''HSCAN one hash key and check each page of members
+        against the RSS-accounting drift reports.
 
         Returns the updated ``inspected`` count.
         '''
@@ -513,75 +532,87 @@ class ChannelQueueAuditor:
                     count=self._batch_size,
                 )
             )
-            for member in items_map.keys():
-                await self._emit_rss_accounting(
-                    member, seen, main, sub,
-                )
-                inspected += 1
-                if (
-                    self._limit is not None
-                    and inspected >= self._limit
-                ):
-                    return inspected
+            done: bool
+            inspected, done = await self._emit_rss_accounting(
+                list(items_map.keys()),
+                seen, main, sub, inspected,
+            )
+            if done:
+                return inspected
             if cursor == 0:
                 break
         return inspected
 
     async def _emit_rss_accounting(
         self,
-        member: str,
+        members: list[str],
         seen: set[str],
         main: DriftClassReport,
         sub: DriftClassReport,
-    ) -> None:
-        '''Check a single channel-ID-keyed queue member
-        against RSS accounting and record any drift.
+        inspected: int,
+    ) -> tuple[int, bool]:
+        '''Check one page of channel-ID-keyed queue members
+        against RSS accounting, in one pipeline, and record any
+        drift.
 
         Skips members already in ``seen``, handle-keyed
         members, and malformed channel IDs. Mutates
         ``main`` and ``sub`` in place.
+
+        :returns: the updated ``inspected`` count, and whether
+            the scan limit was reached
         '''
-        if member in seen:
-            return
-        seen.add(member)
-        if not member.startswith('i:'):
-            return
-        channel_id: str = member[2:]
-        if not _CHANNEL_ID_RE.match(channel_id):
-            return
+        batch: list[str] = []
+        done: bool = False
+        member: str
+        for member in members:
+            if member not in seen:
+                seen.add(member)
+                if member.startswith('i:') and _CHANNEL_ID_RE.match(
+                    member[2:],
+                ):
+                    batch.append(member)
+            inspected += 1
+            if self._limit is not None and inspected >= self._limit:
+                done = True
+                break
+        if not batch:
+            return inspected, done
         pipe: aioredis.client.Pipeline = (
             self._redis.pipeline(transaction=False)
         )
-        pipe.hexists(KEY_RSS_CREATORS, channel_id)
-        pipe.hexists(KEY_RSS_SUPPRESSED, channel_id)
-        pipe.hget(KEY_CREATOR_MAP, channel_id)
-        pipe.hget(
-            self._queue._k_meta(member), 'handle',
-        )
-        pipe.hget(
-            self._queue._k_meta(member), 'name',
-        )
-        (
-            in_creators,
-            in_suppressed,
-            map_handle,
-            meta_handle,
-            meta_name,
-        ) = await pipe.execute()
-        if in_creators or in_suppressed:
-            return
-        main.count += 1
-        if len(main.samples) < self._sample_size:
-            main.samples.append(DriftSample(member=member))
-        label: str | None = (
-            map_handle or meta_handle or meta_name
-        )
-        if not label:
-            sub.count += 1
-            if len(sub.samples) < self._sample_size:
-                sub.samples.append(
-                    DriftSample(member=member),
-                )
+        for member in batch:
+            channel_id: str = member[2:]
+            pipe.hexists(KEY_RSS_CREATORS, channel_id)
+            pipe.hexists(KEY_RSS_SUPPRESSED, channel_id)
+            pipe.hget(KEY_CREATOR_MAP, channel_id)
+            pipe.hget(self._queue._k_meta(member), 'handle')
+            pipe.hget(self._queue._k_meta(member), 'name')
+        results: list[Any] = await pipe.execute()
+        index: int
+        for index, member in enumerate(batch):
+            (
+                in_creators,
+                in_suppressed,
+                map_handle,
+                meta_handle,
+                meta_name,
+            ) = results[index * 5:(index + 1) * 5]
+            if in_creators or in_suppressed:
+                continue
+            main.count += 1
+            if len(main.samples) < self._sample_size:
+                main.samples.append(DriftSample(member=member))
+            label: str | None = (
+                map_handle or meta_handle or meta_name
+            )
+            if not label:
+                sub.count += 1
+                if len(sub.samples) < self._sample_size:
+                    sub.samples.append(
+                        DriftSample(member=member),
+                    )
+        return inspected, done
 
     async def _scan_rss_missing(
         self,
@@ -835,55 +866,105 @@ class ChannelQueueAuditor:
             self._queue._k_unresolved()
         )
         prefix: str = self._queue._k_meta('')
+        reports: _MetaOrphanReports = _MetaOrphanReports(
+            scheduled=scheduled_missing,
+            pending=pending_missing,
+            terminal=terminal_missing,
+        )
         inspected: int = 0
+        keys: list[str] = []
         async for key in self._redis.scan_iter(
             match=f'{prefix}*',
             count=self._batch_size,
         ):
-            member: str = key[len(prefix):]
-            state_value: str | None = (
-                await self._redis.hget(key, 'state')
+            keys.append(key)
+            inspected += 1
+            limit_hit: bool = (
+                self._limit is not None
+                and inspected >= self._limit
             )
+            if len(keys) >= self._batch_size or limit_hit:
+                await self._check_meta_orphan_page(
+                    keys, prefix, scheduled_keys, unresolved_key,
+                    terminal_states, reports,
+                )
+                keys = []
+            if limit_hit:
+                break
+        if keys:
+            await self._check_meta_orphan_page(
+                keys, prefix, scheduled_keys, unresolved_key,
+                terminal_states, reports,
+            )
+        return scheduled_missing, pending_missing, terminal_missing
+
+    async def _check_meta_orphan_page(
+        self,
+        keys: list[str],
+        prefix: str,
+        scheduled_keys: list[str],
+        unresolved_key: str,
+        terminal_states: set[str],
+        reports: '_MetaOrphanReports',
+    ) -> None:
+        '''Check one page of meta keys in two pipelines: one
+        reads each record's ``state``, the other checks the
+        queue structure that state names.'''
+        pipe: aioredis.client.Pipeline = (
+            self._redis.pipeline(transaction=False)
+        )
+        key: str
+        for key in keys:
+            pipe.hget(key, 'state')
+        states: list[str | None] = await pipe.execute()
+        # (report, member, sample context, number of results)
+        checks: list[
+            tuple[DriftClassReport, str, dict[str, str], int]
+        ] = []
+        pipe = self._redis.pipeline(transaction=False)
+        state_value: str | None
+        for key, state_value in zip(keys, states):
+            member: str = key[len(prefix):]
             if state_value == (
                 ChannelState.SCHEDULED.value
             ) and member.startswith('i:'):
-                await self._check_scheduled_member(
-                    member,
-                    scheduled_keys,
-                    scheduled_missing,
+                for scheduled_key in scheduled_keys:
+                    pipe.zscore(scheduled_key, member)
+                checks.append(
+                    (reports.scheduled, member, {},
+                     len(scheduled_keys)),
                 )
             elif state_value == (
                 ChannelState.PENDING_RESOLUTION.value
             ) and member.startswith('h:'):
-                await self._check_pending_member(
-                    member,
-                    unresolved_key,
-                    pending_missing,
-                )
+                pipe.zscore(unresolved_key, member)
+                checks.append((reports.pending, member, {}, 1))
             elif state_value in terminal_states:
-                state = ChannelState(state_value)
-                exists: bool = await self._redis.hexists(
-                    self._queue._k_state(state), member,
+                state: ChannelState = ChannelState(state_value)
+                pipe.hexists(self._queue._k_state(state), member)
+                checks.append(
+                    (reports.terminal, member,
+                     {'state': state.value}, 1),
                 )
-                if not exists:
-                    terminal_missing.count += 1
-                    if (
-                        len(terminal_missing.samples)
-                        < self._sample_size
-                    ):
-                        terminal_missing.samples.append(
-                            DriftSample(
-                                member=member,
-                                context={'state': state.value},
-                            ),
-                        )
-            inspected += 1
-            if (
-                self._limit is not None
-                and inspected >= self._limit
-            ):
-                break
-        return scheduled_missing, pending_missing, terminal_missing
+        if not checks:
+            return
+        results: list[object] = await pipe.execute()
+        offset: int = 0
+        report: DriftClassReport
+        context: dict[str, str]
+        width: int
+        for report, member, context, width in checks:
+            group: list[object] = results[offset:offset + width]
+            offset += width
+            # ZSCORE returns 0.0 for a score-zero member; only
+            # None (or False from HEXISTS) means absent.
+            if any(_is_present(value) for value in group):
+                continue
+            report.count += 1
+            if len(report.samples) < self._sample_size:
+                report.samples.append(
+                    DriftSample(member=member, context=context),
+                )
 
     async def _scan_rss_suppressed_active(
         self,
@@ -1019,12 +1100,22 @@ class ChannelQueueAuditor:
                 cursor=cursor,
                 count=self._batch_size,
             )
-            for member, _score in items:
-                inspected += 1
-                exists: bool = await self._redis.exists(
-                    self._queue._k_meta(member),
+            members: list[str] = self._within_limit(
+                [member for member, _score in items], inspected,
+            )
+            if members:
+                pipe: aioredis.client.Pipeline = (
+                    self._redis.pipeline(transaction=False)
                 )
-                if not exists:
+                member: str
+                for member in members:
+                    pipe.exists(self._queue._k_meta(member))
+                found: list[int] = await pipe.execute()
+                exists: int
+                for member, exists in zip(members, found):
+                    inspected += 1
+                    if exists:
+                        continue
                     report.count += 1
                     if len(report.samples) < self._sample_size:
                         report.samples.append(
@@ -1033,11 +1124,8 @@ class ChannelQueueAuditor:
                                 context={'state': state.value},
                             ),
                         )
-                if (
-                    self._limit is not None
-                    and inspected >= self._limit
-                ):
-                    return inspected
+            if self._limit_reached(inspected):
+                return inspected
             if cursor == 0:
                 break
         return inspected
@@ -1057,40 +1145,49 @@ class ChannelQueueAuditor:
                 cursor=cursor,
                 count=self._batch_size,
             )
-            for member in items.keys():
-                inspected += 1
-                meta_key: str = self._queue._k_meta(member)
-                meta: dict[str, str] = await self._redis.hgetall(
-                    meta_key,
+            members: list[str] = self._within_limit(
+                list(items.keys()), inspected,
+            )
+            if members:
+                pipe: aioredis.client.Pipeline = (
+                    self._redis.pipeline(transaction=False)
                 )
-                if not meta:
-                    missing.count += 1
-                    if len(missing.samples) < self._sample_size:
-                        missing.samples.append(
-                            DriftSample(
-                                member=member,
-                                context={'state': state.value},
-                            ),
-                        )
-                elif meta.get('state') != state.value:
-                    disagrees.count += 1
-                    if len(disagrees.samples) < self._sample_size:
-                        disagrees.samples.append(
-                            DriftSample(
-                                member=member,
-                                context={
-                                    'terminal_state': state.value,
-                                    'meta_state': (
-                                        meta.get('state') or ''
-                                    ),
-                                },
-                            ),
-                        )
-                if (
-                    self._limit is not None
-                    and inspected >= self._limit
-                ):
-                    return inspected
+                member: str
+                for member in members:
+                    meta_key: str = self._queue._k_meta(member)
+                    # EXISTS + HGET state answers what HGETALL did:
+                    # Redis drops a hash with no fields.
+                    pipe.exists(meta_key)
+                    pipe.hget(meta_key, 'state')
+                results: list[Any] = await pipe.execute()
+                index: int
+                for index, member in enumerate(members):
+                    inspected += 1
+                    has_meta: int = results[2 * index]
+                    meta_state: str | None = results[2 * index + 1]
+                    if not has_meta:
+                        missing.count += 1
+                        if len(missing.samples) < self._sample_size:
+                            missing.samples.append(
+                                DriftSample(
+                                    member=member,
+                                    context={'state': state.value},
+                                ),
+                            )
+                    elif meta_state != state.value:
+                        disagrees.count += 1
+                        if len(disagrees.samples) < self._sample_size:
+                            disagrees.samples.append(
+                                DriftSample(
+                                    member=member,
+                                    context={
+                                        'terminal_state': state.value,
+                                        'meta_state': meta_state or '',
+                                    },
+                                ),
+                            )
+            if self._limit_reached(inspected):
+                return inspected
             if cursor == 0:
                 break
         return inspected
@@ -1111,46 +1208,62 @@ class ChannelQueueAuditor:
                     cursor=cursor,
                     count=self._batch_size,
                 )
-                for member, _score in items:
-                    inspected += 1
-                    if not member.startswith('i:'):
-                        continue
-                    raw: str | None = await self._redis.hget(
-                        self._queue._k_tiers(), member[2:],
+                members: list[str] = self._within_limit(
+                    [member for member, _score in items], inspected,
+                )
+                inspected += len(members)
+                channel_members: list[str] = [
+                    member for member in members
+                    if member.startswith('i:')
+                ]
+                if channel_members:
+                    desired: list[str | None] = await self._redis.hmget(
+                        self._queue._k_tiers(),
+                        [member[2:] for member in channel_members],
                     )
-                    if raw is None:
-                        continue
-                    try:
-                        desired_tier: int = int(raw)
-                    except ValueError:
-                        continue
-                    if (
-                        0 <= desired_tier < len(self._queue._tiers)
-                        and desired_tier != current_tier
-                    ):
-                        report.count += 1
-                        if len(report.samples) < self._sample_size:
-                            report.samples.append(
-                                DriftSample(
-                                    member=member,
-                                    context={
-                                        'current_tier': str(
-                                            current_tier,
-                                        ),
-                                        'desired_tier': str(
-                                            desired_tier,
-                                        ),
-                                    },
-                                ),
-                            )
-                    if (
-                        self._limit is not None
-                        and inspected >= self._limit
-                    ):
-                        return report
+                    self._record_tier_mismatches(
+                        report, current_tier, channel_members, desired,
+                    )
+                if self._limit_reached(inspected):
+                    return report
                 if cursor == 0:
                     break
         return report
+
+    def _record_tier_mismatches(
+        self,
+        report: DriftClassReport,
+        current_tier: int,
+        members: list[str],
+        desired: list[str | None],
+    ) -> None:
+        '''Record members of *current_tier* whose stored tier
+        (*desired*, from the tiers hash) names another valid tier.'''
+        member: str
+        raw: str | None
+        for member, raw in zip(members, desired):
+            if raw is None:
+                continue
+            try:
+                desired_tier: int = int(raw)
+            except ValueError:
+                continue
+            if not (
+                0 <= desired_tier < len(self._queue._tiers)
+                and desired_tier != current_tier
+            ):
+                continue
+            report.count += 1
+            if len(report.samples) < self._sample_size:
+                report.samples.append(
+                    DriftSample(
+                        member=member,
+                        context={
+                            'current_tier': str(current_tier),
+                            'desired_tier': str(desired_tier),
+                        },
+                    ),
+                )
 
     async def _scan_identity_map_missing(
         self,
@@ -1160,26 +1273,42 @@ class ChannelQueueAuditor:
         )
         seen: set[str] = set()
         inspected: int = 0
+        batch: list[str] = []
         async for member in self._iter_channel_id_authority_members():
             if member in seen:
                 continue
             seen.add(member)
             inspected += 1
-            exists: bool = await self._redis.hexists(
-                KEY_CREATOR_MAP, member[2:],
-            )
-            if not exists:
-                report.count += 1
-                if len(report.samples) < self._sample_size:
-                    report.samples.append(
-                        DriftSample(member=member),
-                    )
-            if (
-                self._limit is not None
-                and inspected >= self._limit
-            ):
+            batch.append(member)
+            limit_hit: bool = self._limit_reached(inspected)
+            if len(batch) >= self._batch_size or limit_hit:
+                await self._check_identity_map_batch(batch, report)
+                batch = []
+            if limit_hit:
                 break
+        if batch:
+            await self._check_identity_map_batch(batch, report)
         return report
+
+    async def _check_identity_map_batch(
+        self, members: list[str], report: DriftClassReport,
+    ) -> None:
+        '''Record the *members* missing from the creator map,
+        checked in one pipeline.'''
+        pipe: aioredis.client.Pipeline = (
+            self._redis.pipeline(transaction=False)
+        )
+        member: str
+        for member in members:
+            pipe.hexists(KEY_CREATOR_MAP, member[2:])
+        found: list[bool] = await pipe.execute()
+        exists: bool
+        for member, exists in zip(members, found):
+            if exists:
+                continue
+            report.count += 1
+            if len(report.samples) < self._sample_size:
+                report.samples.append(DriftSample(member=member))
 
     async def _scan_multiple_states(
         self,
@@ -1300,60 +1429,6 @@ class ChannelQueueAuditor:
                         yield member
                 if cursor == 0:
                     break
-
-    async def _check_scheduled_member(
-        self,
-        member: str,
-        scheduled_keys: list[str],
-        report: DriftClassReport,
-    ) -> None:
-        '''Pipeline ZSCORE over all scheduled tiers for
-        ``member``. Record drift if absent from all tiers.
-
-        Note: ZSCORE returns 0.0 (not None) for a
-        score-zero member — use ``v is not None`` to
-        distinguish presence from absence.
-        '''
-        pipe: aioredis.client.Pipeline = (
-            self._redis.pipeline(transaction=False)
-        )
-        for sk in scheduled_keys:
-            pipe.zscore(sk, member)
-        scores: list[object] = await pipe.execute()
-        # 0.0 is a valid score; None means absent.
-        present: bool = any(
-            v is not None for v in scores
-        )
-        if not present:
-            report.count += 1
-            if len(report.samples) < self._sample_size:
-                report.samples.append(
-                    DriftSample(member=member),
-                )
-
-    async def _check_pending_member(
-        self,
-        member: str,
-        unresolved_key: str,
-        report: DriftClassReport,
-    ) -> None:
-        '''ZSCORE the unresolved queue for ``member``.
-        Record drift if absent.
-
-        Note: ZSCORE returns 0.0 (not None) for a
-        score-zero member — use ``v is not None`` to
-        distinguish presence from absence.
-        '''
-        score: object = await self._redis.zscore(
-            unresolved_key, member,
-        )
-        # 0.0 is a valid score; None means absent.
-        if score is None:
-            report.count += 1
-            if len(report.samples) < self._sample_size:
-                report.samples.append(
-                    DriftSample(member=member),
-                )
 
     async def _populate_inspected(
         self, report: ReconcileReport,
