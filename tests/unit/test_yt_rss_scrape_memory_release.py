@@ -1,138 +1,92 @@
-'''Source-level assertion that ``tools.yt_rss_scrape.worker_loop``
-releases the startup-only data structures (``channel_map_data``,
-``known_ids``, ``subscriber_counts``) before spawning the
-long-running streamer tasks.
+'''Startup of ``tools.yt_rss_scrape.worker_loop`` must not load the
+creator map when the RSS queue lives in Redis.
 
-The streamers run for the lifetime of the process; if the dict
-of ~500k channel_id->handle entries stays in the function's
-local frame, it stays in RSS for hours of normal operation
-even though no streamer reads it.
+Loading the whole creator map (millions of channels) in every worker
+cost hundreds of MB per process that the allocator never returned. New
+channels reach the Redis RSS queue from the channel scraper and from
+``yt_channel_queue reconcile --repair rss-seed`` instead. Only the
+file-backed (no Redis) queue is still populated from the creator map
+at startup.
 
-A runtime test of ``worker_loop`` would require extensive
-mocking of populate / cleanup_stale_claims / streamers /
-background tasks. Instead, an AST scan locks in the cheaper
-structural invariant: every del statement is present, and
-each appears AFTER the populate call and BEFORE the streamer
-spawn.
+Each test stops ``worker_loop`` at ``cleanup_stale_claims``, which runs
+right after the startup population step.
 '''
 
 from __future__ import annotations
 
-import ast
-import inspect
 import unittest
+from unittest.mock import AsyncMock, MagicMock
 
+from scrape_exchange.creator_queue import (
+    FileCreatorQueue,
+    RedisCreatorQueue,
+    TierConfig,
+)
 from tools import yt_rss_scrape
 
+_TIERS: list[TierConfig] = [
+    TierConfig(tier=1, min_subscribers=0, interval_hours=24),
+]
 
-class TestWorkerLoopReleasesStartupDicts(unittest.TestCase):
 
-    def _worker_loop_ast(self) -> ast.AsyncFunctionDef:
-        src: str = inspect.getsource(
-            yt_rss_scrape.worker_loop,
+class _StopStartup(Exception):
+    '''Raised by the cleanup_stale_claims mock to end the test.'''
+
+
+async def _run_startup(
+    creator_queue: MagicMock, creator_map: AsyncMock,
+) -> None:
+    settings: MagicMock = MagicMock()
+    settings.rss_enrich_subscriber_counts = False
+    with unittest.TestCase().assertRaises(_StopStartup):
+        await yt_rss_scrape.worker_loop(
+            settings, MagicMock(), MagicMock(), creator_queue,
+            _TIERS, creator_map, MagicMock(), MagicMock(),
+            MagicMock(),
         )
-        module: ast.Module = ast.parse(src)
-        node: ast.AST = module.body[0]
-        assert isinstance(node, ast.AsyncFunctionDef)
-        return node
 
-    def _line_of_call(
-        self,
-        node: ast.AsyncFunctionDef,
-        attr_name: str,
-    ) -> int | None:
-        for child in ast.walk(node):
-            if (
-                isinstance(child, ast.Call)
-                and isinstance(child.func, ast.Attribute)
-                and child.func.attr == attr_name
-            ):
-                return child.lineno
-        return None
 
-    def _line_of_del(
-        self,
-        node: ast.AsyncFunctionDef,
-        target_name: str,
-    ) -> int | None:
-        for child in ast.walk(node):
-            if isinstance(child, ast.Delete):
-                for tgt in child.targets:
-                    if (
-                        isinstance(tgt, ast.Name)
-                        and tgt.id == target_name
-                    ):
-                        return child.lineno
-        return None
+def _creator_map() -> AsyncMock:
+    creator_map: AsyncMock = AsyncMock()
+    creator_map.get_all.return_value = {'UCa': 'a'}
+    creator_map.size.return_value = 1
+    return creator_map
 
-    def test_del_channel_map_data_after_populate(
-        self,
-    ) -> None:
-        node: ast.AsyncFunctionDef = self._worker_loop_ast()
-        populate_ln: int | None = self._line_of_call(
-            node, 'populate',
-        )
-        del_ln: int | None = self._line_of_del(
-            node, 'channel_map_data',
-        )
-        self.assertIsNotNone(populate_ln)
-        self.assertIsNotNone(del_ln)
-        self.assertGreater(del_ln, populate_ln)
 
-    def test_del_known_ids_after_populate(self) -> None:
-        node: ast.AsyncFunctionDef = self._worker_loop_ast()
-        populate_ln: int | None = self._line_of_call(
-            node, 'populate',
-        )
-        del_ln: int | None = self._line_of_del(
-            node, 'known_ids',
-        )
-        self.assertIsNotNone(populate_ln)
-        self.assertIsNotNone(del_ln)
-        self.assertGreater(del_ln, populate_ln)
+class TestWorkerLoopStartup(unittest.IsolatedAsyncioTestCase):
 
-    def test_del_subscriber_counts_after_populate(
+    async def test_redis_queue_is_prepared_not_populated(self) -> None:
+        queue: MagicMock = MagicMock(spec=RedisCreatorQueue)
+        queue.prepare = AsyncMock()
+        queue.populate = AsyncMock()
+        queue.known_creator_ids = AsyncMock()
+        queue.cleanup_stale_claims = AsyncMock(side_effect=_StopStartup)
+        creator_map: AsyncMock = _creator_map()
+
+        await _run_startup(queue, creator_map)
+
+        queue.prepare.assert_awaited_once_with(_TIERS)
+        queue.populate.assert_not_awaited()
+        queue.known_creator_ids.assert_not_awaited()
+        creator_map.get_all.assert_not_awaited()
+        creator_map.size.assert_awaited_once()
+
+    async def test_file_queue_is_populated_from_creator_map(
         self,
     ) -> None:
-        node: ast.AsyncFunctionDef = self._worker_loop_ast()
-        populate_ln: int | None = self._line_of_call(
-            node, 'populate',
-        )
-        del_ln: int | None = self._line_of_del(
-            node, 'subscriber_counts',
-        )
-        self.assertIsNotNone(populate_ln)
-        self.assertIsNotNone(del_ln)
-        self.assertGreater(del_ln, populate_ln)
+        queue: MagicMock = MagicMock(spec=FileCreatorQueue)
+        queue.populate = AsyncMock(return_value=1)
+        queue.known_creator_ids = AsyncMock(return_value=set())
+        queue.cleanup_stale_claims = AsyncMock(side_effect=_StopStartup)
+        creator_map: AsyncMock = _creator_map()
 
-    def test_dels_before_streamer_spawn(self) -> None:
-        '''All three releases must happen before
-        ``_stream_processor`` tasks are spawned, otherwise
-        the streamers' lifetime extends the dicts' lifetime.
-        '''
-        node: ast.AsyncFunctionDef = self._worker_loop_ast()
-        # The streamer is referenced by name inside the
-        # asyncio.create_task call. Find the line of the
-        # first such reference.
-        streamer_ln: int | None = None
-        for child in ast.walk(node):
-            if (
-                isinstance(child, ast.Name)
-                and child.id == '_stream_processor'
-            ):
-                streamer_ln = child.lineno
-                break
-        self.assertIsNotNone(streamer_ln)
-        for name in (
-            'channel_map_data',
-            'known_ids',
-            'subscriber_counts',
-        ):
-            del_ln: int | None = self._line_of_del(
-                node, name,
-            )
-            self.assertIsNotNone(del_ln)
-            self.assertLess(del_ln, streamer_ln)
+        await _run_startup(queue, creator_map)
+
+        creator_map.get_all.assert_awaited_once()
+        queue.populate.assert_awaited_once()
+        self.assertEqual(
+            queue.populate.await_args.args[0], {'UCa': 'a'},
+        )
 
 
 if __name__ == '__main__':

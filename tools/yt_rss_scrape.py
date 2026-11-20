@@ -121,11 +121,6 @@ from scrape_exchange.creator_queue import (
     parse_priority_queues,
 )
 from scrape_exchange.redis_client import redis_from_url
-from scrape_exchange.channel_scrape_queue import (
-    KEY_PREFIX as CHANNEL_QUEUE_KEY_PREFIX,
-    ChannelState,
-    awaiting_first_full_scrape,
-)
 from scrape_exchange.video_queue_factory import make_video_scrape_queue
 from scrape_exchange.video_scrape_queue import (
     VideoScrapeQueue,
@@ -397,9 +392,9 @@ class RssSettings(YouTubeScraperSettings):
             'rss_enrich_subscriber_counts',
         ),
         description=(
-            'Run the startup pass that GETs subscriber counts '
-            'from scrape.exchange for every channel not already '
-            'in the Redis "known_creator_ids" set. Useful only '
+            'Without Redis only: run the startup pass that GETs '
+            'subscriber counts from scrape.exchange for every '
+            'channel not already in the queue. Useful only '
             'for first-time setup or post-recovery; routine '
             'restarts should leave this False because the pass '
             'serializes ~80k API GETs and blocks the scrape loop '
@@ -2477,71 +2472,38 @@ async def _enrich_subscriber_counts(
         )
 
 
-# Channel-queue states of channels that no longer exist (or were
-# removed by an operator). The RSS queue does not add them; this
-# replaces the .not_found / .unresolved marker files that are not
-# consulted when Redis is configured.
-RSS_SKIPPED_CHANNEL_STATES: frozenset[str] = frozenset(
-    state.value for state in (
-        ChannelState.NOT_FOUND,
-        ChannelState.INVALID_HANDLE,
-        ChannelState.UNRESOLVED,
-        ChannelState.REMOVED,
-        ChannelState.TERMINATED,
-        ChannelState.HARD_UNAVAILABLE,
-        ChannelState.MOVED,
-    )
-)
+async def _populate_file_queue(
+    settings: RssSettings,
+    client: ExchangeClient,
+    channel_fm: AssetFileManagement,
+    creator_queue: CreatorQueue,
+    tiers: list[TierConfig],
+    creator_map_backend: CreatorMap,
+) -> int:
+    '''Fill a file-backed (no Redis) creator queue from the creator
+    map at startup.
 
-
-async def _hold_back_unscraped_channels(
-    redis: aioredis.Redis,
-    channel_map: dict[str, str],
-    known_ids: set[str],
-) -> tuple[int, int]:
-    '''Remove channels from *channel_map* (in place) that the channel
-    scraper queue knows but has not completed a first full scrape for,
-    or that it knows to be gone (see
-    :data:`RSS_SKIPPED_CHANNEL_STATES`).
-
-    New channels join the RSS queue only after their first full scrape
-    (the channel scraper adds them then), so RSS cannot make their
-    newest videos 'known' and cut that scrape short. Channels already
-    in the RSS queue (*known_ids*) and channels the channel queue has
-    never seen are left alone.
-
-    :returns: (channels held back, gone channels dropped)
+    :returns: number of creators added
     '''
-    candidates: list[str] = [
-        cid for cid in channel_map if cid not in known_ids
-    ]
-    held: int = 0
-    gone: int = 0
-    chunk_size: int = 1000
-    start: int
-    for start in range(0, len(candidates), chunk_size):
-        # Runs at startup before any streamer touches the watchdog;
-        # over a high-latency Redis link it can outlast the work
-        # timeout while still making progress.
-        Watchdog.get().touch_work()
-        chunk: list[str] = candidates[start:start + chunk_size]
-        pipe: aioredis.client.Pipeline = redis.pipeline(transaction=False)
-        cid: str
-        for cid in chunk:
-            pipe.hmget(
-                f'{CHANNEL_QUEUE_KEY_PREFIX}:meta:i:{cid}',
-                ['state', 'successful_scrapes', 'last_attempt_at'],
-            )
-        results: list[list[str | None]] = await pipe.execute()
-        fields: list[str | None]
-        for cid, fields in zip(chunk, results):
-            if fields[0] in RSS_SKIPPED_CHANNEL_STATES:
-                del channel_map[cid]
-                gone += 1
-            elif awaiting_first_full_scrape(*fields):
-                del channel_map[cid]
-                held += 1
-    return held, gone
+    channel_map_data: dict[str, str] = (
+        await creator_map_backend.get_all()
+    )
+    subscriber_counts: dict[str, int] = {}
+    known_ids: set[str] = await creator_queue.known_creator_ids()
+    if settings.rss_enrich_subscriber_counts:
+        await _enrich_subscriber_counts(
+            client, channel_map_data, subscriber_counts,
+            known_ids=known_ids,
+        )
+    else:
+        logging.info(
+            'Skipping subscriber-count enrichment '
+            '(RSS_ENRICH_SUBSCRIBER_COUNTS=false); '
+            'un-enriched channels default to lowest tier',
+        )
+    return await creator_queue.populate(
+        channel_map_data, channel_fm, tiers, subscriber_counts,
+    )
 
 
 def _observe_phase(phase: str, started: float) -> None:
@@ -2718,49 +2680,21 @@ async def worker_loop(
     :param creator_map_backend: Creator map backend (file or Redis).
     '''
 
-    channel_map_data: dict[str, str] = (
-        await creator_map_backend.get_all()
-    )
-    subscriber_counts: dict[str, int] = {}
-    known_ids: set[str] = (
-        await creator_queue.known_creator_ids()
-    )
+    added: int = 0
     if isinstance(creator_queue, RedisCreatorQueue):
-        held: int
-        gone: int
-        held, gone = await _hold_back_unscraped_channels(
-            creator_queue.redis_client, channel_map_data, known_ids,
-        )
-        logging.info(
-            'Held back channels awaiting their first full channel '
-            'scrape and dropped channels the channel queue marks gone',
-            extra={'held_back': held, 'gone': gone},
-        )
-    if settings.rss_enrich_subscriber_counts:
-        await _enrich_subscriber_counts(
-            client, channel_map_data, subscriber_counts,
-            known_ids=known_ids,
-        )
+        # No startup populate: loading the whole creator map in
+        # every worker costs hundreds of MB that the allocator never
+        # returns. New channels join the RSS queue when the channel
+        # scraper finishes their first full scrape (add_creator);
+        # ``yt_channel_queue reconcile --repair rss-seed`` is the
+        # periodic safety net for any it missed.
+        await creator_queue.prepare(tiers)
     else:
-        logging.info(
-            'Skipping subscriber-count enrichment '
-            '(RSS_ENRICH_SUBSCRIBER_COUNTS=false); '
-            'un-enriched channels default to lowest tier',
+        added = await _populate_file_queue(
+            settings, client, channel_fm, creator_queue, tiers,
+            creator_map_backend,
         )
-    added: int = await creator_queue.populate(
-        channel_map_data, channel_fm, tiers, subscriber_counts,
-    )
-    # Capture the cardinality for the gauge + startup log line
-    # before releasing the dict itself. ``channel_map_data`` and
-    # ``known_ids`` are populate-time inputs; the streamers that
-    # run for the lifetime of the process do their own per-
-    # channel lookups against ``creator_map_backend``, so holding
-    # the full ~500k-entry dict + set in this frame is dead
-    # weight that adds hundreds of MB of RSS per worker.
-    channel_map_size: int = len(channel_map_data)
-    del channel_map_data
-    del known_ids
-    del subscriber_counts
+    channel_map_size: int = await creator_map_backend.size()
     # Re-enqueue creators whose tier hash entry exists but
     # which are missing from every tier zset (abandoned
     # claims from worker crashes, stale state from older
