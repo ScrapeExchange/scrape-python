@@ -470,6 +470,24 @@ class RssSettings(YouTubeScraperSettings):
             'fetches.'
         ),
     )
+    reschedule_jitter: float = Field(
+        default=0.1,
+        ge=0.0,
+        le=0.5,
+        validation_alias=AliasChoices(
+            'RSS_RESCHEDULE_JITTER',
+            'reschedule_jitter',
+        ),
+        description=(
+            'Spread RSS polls of a tier so channels polled '
+            'together do not all come due together again. After '
+            'a successful poll the next one is scheduled at a '
+            'random point between (1 - jitter) and 1 times the '
+            'usual delay (tier interval x eligibility fraction), '
+            'never later. Failed polls are not jittered. 0 '
+            'disables it.'
+        ),
+    )
     rss_proxy_files: str | None = Field(
         default=None,
         validation_alias=AliasChoices(
@@ -2851,6 +2869,7 @@ async def _run_worker(
             get_worker_id(),
             platform='youtube',
             eligibility_fraction=settings.eligibility_fraction,
+            reschedule_jitter=settings.reschedule_jitter,
         )
     else:
         creator_queue = FileCreatorQueue(
@@ -2858,6 +2877,7 @@ async def _run_worker(
             settings.no_feeds_file,
             eligibility_fraction=settings.eligibility_fraction,
             had_feed_file=settings.had_feed_file,
+            reschedule_jitter=settings.reschedule_jitter,
         )
 
     # The video scrape queue is Redis-only by design (see ADR
