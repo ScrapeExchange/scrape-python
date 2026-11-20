@@ -25,6 +25,7 @@ interval); the last tier is lowest priority.
 import heapq
 import logging
 import os
+import random
 import shutil
 
 from abc import ABC, abstractmethod
@@ -84,6 +85,18 @@ def _load_skip_creator_markers(
             extra={'base_dir': str(channel_fm.base_dir)},
         )
         return None
+
+
+def jittered_delay(
+    delay_seconds: float, jitter: float, rng: random.Random,
+) -> float:
+    '''Scale *delay_seconds* by a random factor in ``[1 - jitter, 1]``
+    so creators released together do not all come due together again.
+    The result is never later than *delay_seconds*; a jitter of 0
+    returns it unchanged.'''
+    if jitter <= 0 or delay_seconds <= 0:
+        return delay_seconds
+    return delay_seconds * rng.uniform(1.0 - jitter, 1.0)
 
 
 # -----------------------------------------------------------
@@ -314,7 +327,9 @@ class CreatorQueue(ABC):
             matching the success path. ``None`` (the
             default) means no floor — i.e. the normal
             tier interval is used, which is the right
-            choice for successful releases.
+            choice for successful releases. Only a
+            successful release is shortened by the
+            queue's ``reschedule_jitter``.
         '''
 
     @abstractmethod
@@ -582,8 +597,12 @@ class FileCreatorQueue(CreatorQueue):
         eligibility_fraction: float = 1.0,
         *,
         had_feed_file: str | None = None,
+        reschedule_jitter: float = 0.0,
+        rng: random.Random | None = None,
     ) -> None:
         self._queue_file: str = queue_file
+        self._reschedule_jitter: float = reschedule_jitter
+        self._rng: random.Random = rng or random.Random()
         self._no_feeds_file: str = no_feeds_file
         self._had_feed_file: str = (
             had_feed_file
@@ -1051,10 +1070,14 @@ class FileCreatorQueue(CreatorQueue):
                 retry_interval_seconds,
             )
         now: float = datetime.now(UTC).timestamp()
-        next_check: float = (
-            now
-            + interval_seconds * self._eligibility_fraction
+        delay_seconds: float = (
+            interval_seconds * self._eligibility_fraction
         )
+        if retry_interval_seconds is None:
+            delay_seconds = jittered_delay(
+                delay_seconds, self._reschedule_jitter, self._rng,
+            )
+        next_check: float = now + delay_seconds
         name: str = self._names.get(
             creator_id, creator_id,
         )
@@ -1445,7 +1468,12 @@ class RedisCreatorQueue(CreatorQueue):
         platform: str = 'youtube',
         eligibility_fraction: float = 1.0,
         key_namespace: str = 'rss',
+        *,
+        reschedule_jitter: float = 0.0,
+        rng: random.Random | None = None,
     ) -> None:
+        self._reschedule_jitter: float = reschedule_jitter
+        self._rng: random.Random = rng or random.Random()
         self._redis = (
             redis_from_url(
                 redis_dsn,
@@ -1918,10 +1946,14 @@ class RedisCreatorQueue(CreatorQueue):
                 retry_interval_seconds,
             )
         now: float = datetime.now(UTC).timestamp()
-        next_check: float = (
-            now
-            + interval_seconds * self._eligibility_fraction
+        delay_seconds: float = (
+            interval_seconds * self._eligibility_fraction
         )
+        if retry_interval_seconds is None:
+            delay_seconds = jittered_delay(
+                delay_seconds, self._reschedule_jitter, self._rng,
+            )
+        next_check: float = now + delay_seconds
         pipe = self._redis.pipeline()
         pipe.delete(
             f'{self._claim_prefix}{creator_id}',

@@ -435,6 +435,14 @@ interval has elapsed — the fractional headroom lets the
 SLA panel report on-time fetches rather than "always
 overdue."
 
+After a successful poll the next one is scheduled a random
+amount earlier, by up to `RSS_RESCHEDULE_JITTER` (default
+0.1, so up to 10%) of that delay, so channels polled
+together drift apart instead of coming due in the same
+burst every cycle. It never schedules later than the tier
+cadence, and failed polls are not jittered. Channels have
+the same mechanism, `CHANNEL_RESCHEDULE_JITTER`.
+
 ### Stream-processor concurrency model
 
 The worker spawns `RSS_CONCURRENCY` independent
