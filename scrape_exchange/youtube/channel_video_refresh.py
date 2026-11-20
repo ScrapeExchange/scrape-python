@@ -9,7 +9,6 @@ import httpx2 as httpx  # exchange API traffic runs on httpx2 (HTTP/2)
 import redis.asyncio as aioredis
 from prometheus_client import Counter, Histogram
 
-from scrape_exchange.file_management import AssetFileManagement
 from scrape_exchange.video_queue_factory import make_video_scrape_queue
 from scrape_exchange.video_scrape_queue import (
     VideoScrapeQueue,
@@ -221,7 +220,8 @@ class KnownVideoIds:
     Used to stop paging a 'Latest'-ordered channel tab once a page
     holds only known IDs. A video is known when it is on the exchange
     for this channel, in the uploaded set, in the video queue in any
-    state (including tombstones) or has a local scrape output file.
+    state (including tombstones). Local files are not consulted:
+    Redis is the source of truth.
     Call :meth:`load` once before use; it runs the exchange filter
     query, whose result :func:`queue_channel_videos` can reuse.
     '''
@@ -233,12 +233,10 @@ class KnownVideoIds:
         http_client: httpx.AsyncClient,
         exchange_url: str,
         channel_id: str,
-        video_fm: AssetFileManagement,
     ) -> None:
         self._http_client: httpx.AsyncClient = http_client
         self._exchange_url: str = exchange_url
         self._channel_id: str = channel_id
-        self._video_fm: AssetFileManagement = video_fm
         self._queue: VideoScrapeQueue = make_video_scrape_queue(
             platform='youtube',
             redis=redis,
@@ -261,7 +259,6 @@ class KnownVideoIds:
         known: set[str] = {
             video_id for video_id in video_ids
             if video_id in self.exchange_ids
-            or self._video_fm.video_scrape_output_exists(video_id)
         }
         rest: list[str] = [
             video_id for video_id in video_ids if video_id not in known
@@ -290,7 +287,6 @@ async def queue_channel_videos(
     redis: aioredis.Redis,
     http_client: httpx.AsyncClient,
     exchange_url: str,
-    video_fm: AssetFileManagement,
     summary: FullScrapeSummary,
     exchange_ids: set[str] | None = None,
 ) -> None:
@@ -300,8 +296,8 @@ async def queue_channel_videos(
     paginated ``POST /api/v1/filter`` (filter:
     ``platform_creator_id=<channel_id>``) instead of one existence
     GET per video, so a full scrape costs a couple of API requests
-    regardless of channel size. Locally-known IDs (uploaded set,
-    scrape output files) are filtered first and never hit the API.
+    regardless of channel size. IDs in the Redis uploaded set are
+    filtered first and never hit the API.
 
     Normal enqueue preserves existing queue entries and tombstones,
     so IDs that are neither on the exchange nor locally known are
@@ -320,7 +316,7 @@ async def queue_channel_videos(
     await queue_video_ids(
         channel.video_ids, channel.channel_id, channel.channel_handle,
         redis=redis, http_client=http_client, exchange_url=exchange_url,
-        video_fm=video_fm, summary=summary, exchange_ids=exchange_ids,
+        summary=summary, exchange_ids=exchange_ids,
     )
 
 
@@ -332,12 +328,11 @@ async def queue_video_ids(
     redis: aioredis.Redis,
     http_client: httpx.AsyncClient,
     exchange_url: str,
-    video_fm: AssetFileManagement,
     summary: FullScrapeSummary,
     exchange_ids: set[str] | None = None,
 ) -> None:
     '''Queue those of *video_ids*, all of channel *channel_id*, that
-    are not uploaded, scraped locally or on the exchange; see
+    are not uploaded or on the exchange; see
     :func:`queue_channel_videos`.'''
     queue: VideoScrapeQueue = make_video_scrape_queue(
         platform='youtube',
@@ -348,8 +343,8 @@ async def queue_video_ids(
     ids: list[str] = sorted(video_ids)
     summary.video_ids_found = len(ids)
 
-    # Local filtering: the uploaded set and scrape output files
-    # already answer "handled" for these IDs without any API call.
+    # The Redis uploaded set answers "handled" for these IDs
+    # without any API call.
     known: set[str] = set()
     start: int
     for start in range(0, len(ids), BATCH_SIZE):
@@ -359,9 +354,7 @@ async def queue_video_ids(
         )
         video_id: str
         for video_id in batch:
-            if flags.get(video_id) or (
-                video_fm.video_scrape_output_exists(video_id)
-            ):
+            if flags.get(video_id):
                 known.add(video_id)
     summary.video_ids_existing = len(known)
     candidates: list[str] = [

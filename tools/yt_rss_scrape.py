@@ -1578,22 +1578,14 @@ async def process_channel(
         extra=extra | {'video_count': len(videos)},
     )
 
-    # --- Phase 2: filter locally-known videos, then
-    #     batch-check existence on scrape.exchange ---
-    candidates: list[YouTubeVideo] = []
+    # --- Phase 2: check existence in Redis, then on
+    #     scrape.exchange. Redis is the source of truth: local
+    #     files are not consulted, as per-video exists() calls
+    #     flood the kernel dentry cache with negative entries.
+    candidates: list[YouTubeVideo] = [
+        video for video in videos if video
+    ]
     videos_existing: int = 0
-    video_fm = AssetFileManagement(settings.video_data_directory)
-    for video in videos:
-        if not video:
-            continue
-        if video_fm.video_scrape_output_exists(video.video_id):
-            logging.debug(
-                'Found existing file for video, skipping',
-                extra=extra | {'video_id': video.video_id},
-            )
-            videos_existing += 1
-        else:
-            candidates.append(video)
 
     if not candidates:
         logging.info(

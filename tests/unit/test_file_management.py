@@ -891,46 +891,6 @@ class TestListHelpers(unittest.TestCase):
         self._touch(self.base, 'a.txt')
         self.assertEqual(self.fm.list_base(prefix='nope'), [])
 
-    def test_video_scrape_output_false_when_only_bare_marker_exists(
-        self,
-    ):
-        self._touch(self.base, 'vid_a')
-        self.assertFalse(
-            self.fm.video_scrape_output_exists('vid_a'),
-        )
-
-    def test_video_scrape_output_true_for_video_min_in_base_dir(
-        self,
-    ):
-        self._touch(self.base, 'video-min-vid_a.json.br')
-        self.assertTrue(
-            self.fm.video_scrape_output_exists('vid_a'),
-        )
-
-    def test_video_scrape_output_true_for_video_dlp_in_base_dir(
-        self,
-    ):
-        self._touch(self.base, 'video-dlp-vid_a.json.br')
-        self.assertTrue(
-            self.fm.video_scrape_output_exists('vid_a'),
-        )
-
-    def test_video_scrape_output_true_for_video_min_in_uploaded_dir(
-        self,
-    ):
-        self._touch(self.uploaded, 'video-min-vid_a.json.br')
-        self.assertTrue(
-            self.fm.video_scrape_output_exists('vid_a'),
-        )
-
-    def test_video_scrape_output_true_for_video_dlp_in_uploaded_dir(
-        self,
-    ):
-        self._touch(self.uploaded, 'video-dlp-vid_a.json.br')
-        self.assertTrue(
-            self.fm.video_scrape_output_exists('vid_a'),
-        )
-
 
 class TestReadUploaded(unittest.IsolatedAsyncioTestCase):
 

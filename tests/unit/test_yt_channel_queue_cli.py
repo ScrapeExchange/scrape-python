@@ -1391,7 +1391,6 @@ class TestImportSkipsKnown(
         with patch('sys.stdout', out):
             rc: int = await cmd_import(
                 ns, self.queue, identity=identity,
-                channel_data_directory=self.data_dir,
             )
         self.assertEqual(rc, 0)
         return out.getvalue()
@@ -1464,9 +1463,11 @@ class TestImportSkipsKnown(
         self.assertEqual(await self.queue.get_meta(member), meta_before)
         self.assertIn('added 0, skipped 1', report)
 
-    async def test_channel_with_local_file_is_skipped(
+    async def test_local_file_does_not_skip_import(
         self,
     ) -> None:
+        # Redis is the source of truth: a local channel file
+        # without a queue record does not make a channel known.
         uploaded_cid: str = 'UCuploaded00000000000000'
         local_cid: str = 'UClocal00000000000000000'
         with open(os.path.join(
@@ -1485,9 +1486,11 @@ class TestImportSkipsKnown(
         ])
 
         for cid in (uploaded_cid, local_cid):
-            self.assertEqual(await self.queue.get_meta(f'i:{cid}'), {})
-        self.assertIn('local_file', report)
-        self.assertIn('added 0, skipped 2', report)
+            self.assertNotEqual(
+                await self.queue.get_meta(f'i:{cid}'), {},
+            )
+        self.assertNotIn('local_file', report)
+        self.assertIn('added 2, skipped 0', report)
 
     async def test_new_channel_id_is_added(
         self,
@@ -1537,9 +1540,7 @@ class TestAddSkipsKnown(
         )
         out = StringIO()
         with patch('sys.stdout', out):
-            rc: int = await cmd_add(
-                ns, self.queue, channel_data_directory=self.td,
-            )
+            rc: int = await cmd_add(ns, self.queue)
         self.assertEqual(rc, 0)
         return out.getvalue()
 
@@ -1577,9 +1578,11 @@ class TestAddSkipsKnown(
             ChannelState.REMOVED,
         )
 
-    async def test_channel_with_local_file_is_skipped(
+    async def test_local_file_does_not_skip_add(
         self,
     ) -> None:
+        # Redis is the source of truth: a local channel file
+        # without a queue record does not make a channel known.
         cid: str = 'UCabc0000000000000000000'
         with open(
             os.path.join(self.td, f'channel-{cid}.json.br'), 'w',
@@ -1588,8 +1591,9 @@ class TestAddSkipsKnown(
 
         report: str = await self._add([cid], priority=False)
 
-        self.assertEqual(await self.queue.get_meta(f'i:{cid}'), {})
-        self.assertIn('local_file', report)
+        self.assertNotEqual(await self.queue.get_meta(f'i:{cid}'), {})
+        self.assertNotIn('local_file', report)
+        self.assertIn('added 1, skipped 0', report)
 
     async def test_new_channel_is_added(self) -> None:
         cid: str = 'UCabc0000000000000000000'

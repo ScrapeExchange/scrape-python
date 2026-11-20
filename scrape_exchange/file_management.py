@@ -556,21 +556,6 @@ class AssetFileManagement:
         '''
         return self._list_dir(self.uploaded_dir, prefix, suffix)
 
-    def video_scrape_output_exists(self, video_id: str) -> bool:
-        '''
-        True when a scraped YouTube video output already exists in
-        either the base directory or the uploaded directory.
-        '''
-        filenames: tuple[str, str] = (
-            f'{VIDEO_MIN_FILE_PREFIX}{video_id}.json.br',
-            f'{VIDEO_YTDLP_FILE_PREFIX}{video_id}.json.br',
-        )
-        return any(
-            (directory / filename).exists()
-            for directory in (self.base_dir, self.uploaded_dir)
-            for filename in filenames
-        )
-
     def iter_assets(
         self, group: str, suffix: str = COMPRESSED_JSON_SUFFIX,
     ) -> Iterator[tuple[str, bool, float]]:

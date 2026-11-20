@@ -70,9 +70,9 @@ class TestChannelScraperIgnoresUploadedDir(
         self.assertFalse(skipped)
         self.assertFalse(failed_path.exists())
 
-    async def test_uploaded_copy_excludes_a_candidate(self) -> None:
-        # Discovery: a channel with a local file, uploaded or not, is
-        # already known and not new.
+    async def _filter_with_uploaded_copy(
+        self, redis_client: object | None,
+    ) -> list[str]:
         await self._write_uploaded_copy()
 
         async def resolver(identifier, identity_store, fm):
@@ -80,14 +80,32 @@ class TestChannelScraperIgnoresUploadedDir(
 
         creator_map = mock.AsyncMock()
         creator_map.get.return_value = None
+        creator_map.redis_client = redis_client
         with mock.patch.object(
             mod, '_resolve_handle_to_channel_id', new=resolver,
         ):
-            candidates: list[str] = await mod._filter_unscraped_candidates(
+            return await mod._filter_unscraped_candidates(
                 ['@someone'], self.fm, set(), mock.Mock(), creator_map,
                 max_candidates=5,
             )
+
+    async def test_uploaded_copy_excludes_a_candidate_without_redis(
+        self,
+    ) -> None:
+        # Discovery without Redis: a channel with a local file,
+        # uploaded or not, is already known and not new.
+        candidates: list[str] = await self._filter_with_uploaded_copy(
+            redis_client=None,
+        )
         self.assertEqual(candidates, [])
+
+    async def test_uploaded_copy_ignored_with_redis(self) -> None:
+        # With Redis, local channel files are not consulted; the
+        # exchange-channels set decides what is new.
+        candidates: list[str] = await self._filter_with_uploaded_copy(
+            redis_client=mock.Mock(),
+        )
+        self.assertEqual(candidates, [CHANNEL_ID])
 
     async def test_stale_file_of_listed_channel_is_deleted(self) -> None:
         await self.fm.write_file(self.filename, {'channel_id': CHANNEL_ID})
