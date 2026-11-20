@@ -9,7 +9,7 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
+import httpx2
 
 from scrape_exchange.video_scrape_queue import (
     VideoState,
@@ -458,10 +458,10 @@ class TestSearch(
         )
 
 
-def _http_404() -> httpx.HTTPStatusError:
-    request = httpx.Request('GET', 'http://x/data')
-    response = httpx.Response(404, request=request)
-    return httpx.HTTPStatusError(
+def _http_404() -> httpx2.HTTPStatusError:
+    request = httpx2.Request('GET', 'http://x/data')
+    response = httpx2.Response(404, request=request)
+    return httpx2.HTTPStatusError(
         '404', request=request, response=response,
     )
 

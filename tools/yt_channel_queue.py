@@ -29,7 +29,7 @@ from pydantic_settings import (
     BaseSettings,
     SettingsConfigDict,
 )
-from httpx import Response
+from httpx2 import Response
 
 from scrape_exchange.channel_queue_reconcile import (
     ChannelQueueAuditor,

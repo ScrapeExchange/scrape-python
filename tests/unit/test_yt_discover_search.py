@@ -8,7 +8,6 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import httpx  # original: InnerTube raises these classes
 import httpx2  # word-source fetches migrated to httpx2
 from innertube.errors import RequestError as InnerTubeRequestError
 from innertube.errors import ResponseError as InnerTubeResponseError
@@ -583,7 +582,7 @@ class TestSearchPageLocalizedWithRetry(
     async def test_retries_once_then_succeeds(self) -> None:
         payload = {'ok': True}
         search = mock.AsyncMock(
-            side_effect=[httpx.ReadTimeout('slow'), payload],
+            side_effect=[httpx2.ReadTimeout('slow'), payload],
         )
         with mock.patch(
             'tools.yt_discover_search._innertube_search_localized',
@@ -602,7 +601,7 @@ class TestSearchPageLocalizedWithRetry(
     ) -> None:
         search = mock.AsyncMock(
             side_effect=[
-                httpx.ConnectError('boom'),
+                httpx2.ConnectError('boom'),
                 InnerTubeRequestError('500'),
             ],
         )
@@ -618,13 +617,13 @@ class TestSearchPageLocalizedWithRetry(
         self.assertEqual(search.await_count, 2)
 
     async def test_proxy_error_is_transient(self) -> None:
-        '''A proxy 503 (httpx.ProxyError) must be treated as
+        '''A proxy 503 (httpx2.ProxyError) must be treated as
         transient and retried/skipped, not crash the tool.'''
 
         search = mock.AsyncMock(
             side_effect=[
-                httpx.ProxyError('503 Service Unavailable'),
-                httpx.ProxyError('503 Service Unavailable'),
+                httpx2.ProxyError('503 Service Unavailable'),
+                httpx2.ProxyError('503 Service Unavailable'),
             ],
         )
         with mock.patch(
@@ -874,7 +873,7 @@ class TestRunSearchWorkers(unittest.IsolatedAsyncioTestCase):
             proxy: object = kwargs['proxy']
             proxies_seen.append(proxy)
             if proxy != 'proxy-3':
-                raise httpx.ProxyError('connection failed')
+                raise httpx2.ProxyError('connection failed')
             return {
                 'channelRenderer': {
                     'channelId': 'UC22BdTgxefuvUivrjesETjg',
@@ -909,7 +908,7 @@ class TestRunSearchWorkers(unittest.IsolatedAsyncioTestCase):
             proxy: object = kwargs['proxy']
             calls.append((term, proxy))
             if proxy == 'proxy-1':
-                raise httpx.ProxyError('connection failed')
+                raise httpx2.ProxyError('connection failed')
             await asyncio.sleep(0)
             return {}
 
@@ -1265,7 +1264,7 @@ class TestPopularForMarketFailover(unittest.IsolatedAsyncioTestCase):
             del term, params, continuation, gl, hl, limiter
             proxies_seen.append(proxy)
             if proxy == 'proxy-1':
-                raise httpx.ProxyError('connection failed')
+                raise httpx2.ProxyError('connection failed')
             return _channel_payload(cid, 'alpha')
 
         pool: _SearchProxyPool = _SearchProxyPool(['proxy-2'])

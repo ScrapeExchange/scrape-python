@@ -679,10 +679,10 @@ class TestScrapeTranscript(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_count('failure', 'timeout'), before + 1)
 
     async def test_transport_error_reports_proxy_failure(self) -> None:
-        import httpx
+        import httpx2
 
         before: float = _count('failure', 'transport')
-        error: httpx.ConnectError = httpx.ConnectError('refused')
+        error: httpx2.ConnectError = httpx2.ConnectError('refused')
 
         await self._scrape(_next_data(), AsyncMock(side_effect=error))
 

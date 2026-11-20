@@ -36,9 +36,7 @@ from typing import (
     TypeVar,
 )
 
-import httpx  # InnerTube still runs on original httpx: its exception
-# classes must be caught as httpx.*, not httpx2.*
-import httpx2  # word-source fetches migrated to httpx2
+import httpx2
 from innertube.errors import RequestError as InnerTubeRequestError
 from innertube.errors import ResponseError as InnerTubeResponseError
 from prometheus_client import Counter, Gauge, Histogram
@@ -109,20 +107,20 @@ _OFFLINE_RANDOM_TERMS: tuple[str, ...] = (
 # covers HTTP 4xx/5xx responses from YouTube. ``InnerTubeResponseError``
 # covers non-JSON responses, such as HTML interstitials.
 _TRANSIENT_SEARCH_ERRORS: tuple[type[BaseException], ...] = (
-    # Base class for all httpx transport-level failures: timeouts,
+    # Base class for all httpx2 transport-level failures: timeouts,
     # connect errors, network errors, proxy errors (e.g. a proxy
     # returning 503), and protocol errors. A flapping proxy is
     # transient, so the whole family is retried/skipped rather than
-    # crashing the run.
-    httpx.TransportError,
+    # crashing the run. The InnerTube sessions run on httpx2.
+    httpx2.TransportError,
     ConnectionResetError,
     ConnectionRefusedError,
     InnerTubeRequestError,
     InnerTubeResponseError,
 )
 _PROXY_CONNECTION_ERRORS: tuple[type[BaseException], ...] = (
-    # Original httpx: the InnerTube client raises these.
-    httpx.TransportError,
+    # The InnerTube sessions run on httpx2 and raise these.
+    httpx2.TransportError,
     ConnectionResetError,
     ConnectionRefusedError,
 )

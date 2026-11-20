@@ -32,7 +32,7 @@ class TestPooledInnerTube(unittest.IsolatedAsyncioTestCase):
             'InnerTube',
             return_value=client,
         ) as innertube_type, patch.object(
-            youtube_channel_tabs.httpx,
+            youtube_channel_tabs.httpx2,
             'Client',
             return_value=MagicMock(),
         ):
@@ -57,7 +57,7 @@ class TestPooledInnerTube(unittest.IsolatedAsyncioTestCase):
             'InnerTube',
             return_value=client,
         ) as innertube_type, patch.object(
-            youtube_channel_tabs.httpx,
+            youtube_channel_tabs.httpx2,
             'Client',
             return_value=MagicMock(),
         ), patch.object(
@@ -108,7 +108,7 @@ class TestPooledInnerTube(unittest.IsolatedAsyncioTestCase):
                 session=MagicMock(),
             )),
         ), patch.object(
-            youtube_channel_tabs.httpx, 'Client',
+            youtube_channel_tabs.httpx2, 'Client',
             return_value=MagicMock(),
         ), patch.object(
             youtube_channel_tabs.YouTubeCookieJar, 'get',
@@ -138,7 +138,7 @@ class TestPooledInnerTube(unittest.IsolatedAsyncioTestCase):
             'InnerTube',
             return_value=client,
         ) as innertube_type, patch.object(
-            youtube_channel_tabs.httpx,
+            youtube_channel_tabs.httpx2,
             'Client',
             return_value=replacement_session,
         ) as httpx_client, patch.object(
@@ -280,7 +280,7 @@ class TestPooledInnerTube(unittest.IsolatedAsyncioTestCase):
                 session=MagicMock(),
             )),
         ), patch.object(
-            youtube_channel_tabs.httpx, 'Client',
+            youtube_channel_tabs.httpx2, 'Client',
             return_value=MagicMock(),
         ), patch.object(
             youtube_channel_tabs.YouTubeCookieJar, 'get',
@@ -307,7 +307,7 @@ class TestPooledInnerTube(unittest.IsolatedAsyncioTestCase):
                 session=MagicMock(),
             )),
         ), patch.object(
-            youtube_channel_tabs.httpx, 'Client',
+            youtube_channel_tabs.httpx2, 'Client',
             return_value=MagicMock(),
         ), patch.object(
             youtube_channel_tabs.YouTubeCookieJar, 'get',

@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 from urllib.parse import urlparse
 
+# Stays on httpx (0.23): httpx_curl_cffi's transport is built on it.
 import httpx
 from httpx_curl_cffi import AsyncCurlTransport
 from playwright.async_api import Error as PlaywrightError

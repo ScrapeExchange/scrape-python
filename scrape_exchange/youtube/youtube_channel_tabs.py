@@ -19,7 +19,7 @@ from logging import getLogger
 import time
 from typing import Any, Awaitable, Callable, Final
 
-import httpx
+import httpx2
 from prometheus_client import Counter, Histogram
 
 from innertube import InnerTube
@@ -1802,13 +1802,13 @@ class YouTubeChannelTabs:
                 Watchdog.get().touch_work()
                 last_exc = exc
                 if isinstance(
-                    exc, (httpx.TransportError, asyncio.TimeoutError),
-                ) and not isinstance(exc, httpx.ReadTimeout):
+                    exc, (httpx2.TransportError, asyncio.TimeoutError),
+                ) and not isinstance(exc, httpx2.ReadTimeout):
                     await limiter.report_proxy_result(
                         self.proxy, False, exc,
                     )
                 if pinned is None and isinstance(
-                    exc, (httpx.TransportError, asyncio.TimeoutError),
+                    exc, (httpx2.TransportError, asyncio.TimeoutError),
                 ):
                     # httpcore 0.16 leaves failed proxy tunnels in the
                     # pool until it is exhausted (PoolTimeout on every
@@ -2016,7 +2016,7 @@ class YouTubeChannelTabs:
 # 8 s lets the retry/penalty loop in
 # :func:`InnerTubeVideoParser.scrape` rotate to a different proxy
 # while the outer cap stays a safety net.
-_INNERTUBE_SYNC_HTTPX_TIMEOUT: Final[httpx.Timeout] = httpx.Timeout(
+_INNERTUBE_SYNC_HTTPX_TIMEOUT: Final[httpx2.Timeout] = httpx2.Timeout(
     connect=5.0, read=8.0, write=5.0, pool=5.0,
 )
 
@@ -2097,24 +2097,22 @@ def shutdown_innertube_executor() -> None:
 # One TLS context shared by the InnerTube sessions built below. Each
 # ssl.SSLContext loads the whole CA bundle (~1.4 MiB); pooled clients
 # per proxy, each with its own context, cost hundreds of MB per worker.
-# These sessions are HTTP/1.1 only, so the ALPN list httpcore writes on
-# the context at each connect is always the same value.
+# These sessions are HTTP/1.1 only, so the ALPN list httpcore2 writes
+# on the context at each connect is always the same value.
 _INNERTUBE_SSL_CONTEXT: ssl.SSLContext | None = None
 _INNERTUBE_SSL_CONTEXT_LOCK: threading.Lock = threading.Lock()
 
 
 def _innertube_ssl_context() -> ssl.SSLContext:
     '''Return the process-wide TLS context for InnerTube sessions,
-    creating it on first use. Same verification settings as httpx's
+    creating it on first use. Same verification settings as httpx2's
     default (``verify=True``).'''
 
     global _INNERTUBE_SSL_CONTEXT
     if _INNERTUBE_SSL_CONTEXT is None:
         with _INNERTUBE_SSL_CONTEXT_LOCK:
             if _INNERTUBE_SSL_CONTEXT is None:
-                _INNERTUBE_SSL_CONTEXT = httpx.create_ssl_context(
-                    http2=False,
-                )
+                _INNERTUBE_SSL_CONTEXT = httpx2.create_ssl_context()
     return _INNERTUBE_SSL_CONTEXT
 
 
@@ -2126,7 +2124,7 @@ def build_innertube_with_pool_limits(
     locale: Locale | None = None,
 ) -> InnerTube:
     '''Construct an :class:`InnerTube` whose underlying
-    ``httpx.Client`` carries our shared pool limits
+    ``httpx2.Client`` session carries our shared pool limits
     (:data:`_POOLED_HTTPX_LIMITS` — max_keepalive 100,
     keepalive_expiry 120s) rather than the third-party
     library's defaults (5s keepalive_expiry, which evicts
@@ -2135,6 +2133,11 @@ def build_innertube_with_pool_limits(
     :data:`_INNERTUBE_SYNC_HTTPX_TIMEOUT` — see that
     constant's docstring for why it is tighter than the
     shared default.
+
+    The innertube library builds an httpx (0.23) session itself; it is
+    replaced with an httpx2 one. The library only calls the session's
+    ``build_request``/``send``, so it works with either, and network
+    errors from InnerTube calls are ``httpx2`` exceptions.
 
     Cookie loading, visitor_id, header setup, and phase-
     tracing are NOT applied here; callers do that
@@ -2153,13 +2156,15 @@ def build_innertube_with_pool_limits(
     client: InnerTube = InnerTube(
         client_name, client_version, **kwargs,
     )
-    old_session: httpx.Client = client.adaptor.session
-    client.adaptor.session = httpx.Client(
-        base_url=old_session.base_url,
-        headers=old_session.headers.copy(),
+    # The library's own httpx (0.23) session; only its base URL and
+    # headers are kept.
+    old_session: Any = client.adaptor.session
+    client.adaptor.session = httpx2.Client(
+        base_url=str(old_session.base_url),
+        headers=dict(old_session.headers),
         limits=_POOLED_HTTPX_LIMITS,
         timeout=_INNERTUBE_SYNC_HTTPX_TIMEOUT,
-        proxies=entry,
+        proxy=entry,
         verify=_innertube_ssl_context(),
     )
     setattr(client, 'close', client.adaptor.session.close)

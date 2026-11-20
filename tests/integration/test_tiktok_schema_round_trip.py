@@ -15,7 +15,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
-from httpx import Response
+from httpx2 import Response
 from jsonschema import Draft202012Validator
 
 from scrape_exchange.exchange_client import ExchangeClient

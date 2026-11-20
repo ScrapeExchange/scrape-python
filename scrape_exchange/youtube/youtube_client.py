@@ -16,6 +16,7 @@ import random
 from logging import Logger
 from logging import getLogger
 
+# Stays on httpx (0.23): httpx_curl_cffi's transport is built on it.
 from httpx import AsyncClient
 from httpx import Response
 from httpx import ReadTimeout

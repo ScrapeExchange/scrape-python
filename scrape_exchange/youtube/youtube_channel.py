@@ -21,7 +21,7 @@ from ..brotli import brotli_write_async
 import orjson
 import country_converter
 
-import httpx
+import httpx2
 from innertube import InnerTube
 from yt_dlp import YoutubeDL
 
@@ -219,11 +219,11 @@ async def _resolver_innertube_call(
     client: InnerTube = borrow_pooled_innertube_for_entry(proxy)
     try:
         result: dict = call(client)
-    except httpx.TransportError as exc:
+    except httpx2.TransportError as exc:
         await refresh_pooled_web_innertube_for_entry(
             proxy, challenged=client,
         )
-        if not isinstance(exc, httpx.ReadTimeout):
+        if not isinstance(exc, httpx2.ReadTimeout):
             await limiter.report_proxy_result(proxy, False, exc)
         raise
     finally:

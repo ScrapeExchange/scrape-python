@@ -11,7 +11,7 @@ import time
 import unittest
 
 import fakeredis.aioredis
-import httpx
+import httpx2
 
 from scrape_exchange import proxy_health as ph
 from scrape_exchange.proxy_health import (
@@ -27,17 +27,17 @@ PROXIES: list[str] = [f'http://p{i}.test:3128' for i in range(3)]
 class TestIsProxyAuthError(unittest.TestCase):
 
     def test_httpx_proxy_error_407(self) -> None:
-        exc: httpx.ProxyError = httpx.ProxyError(
+        exc: httpx2.ProxyError = httpx2.ProxyError(
             '407 Proxy Authentication Required',
         )
         self.assertTrue(is_proxy_auth_error(exc))
 
     def test_other_proxy_error(self) -> None:
-        exc: httpx.ProxyError = httpx.ProxyError('502 Bad Gateway')
+        exc: httpx2.ProxyError = httpx2.ProxyError('502 Bad Gateway')
         self.assertFalse(is_proxy_auth_error(exc))
 
     def test_connect_error(self) -> None:
-        exc: httpx.ConnectError = httpx.ConnectError(
+        exc: httpx2.ConnectError = httpx2.ConnectError(
             'All connection attempts failed',
         )
         self.assertFalse(is_proxy_auth_error(exc))
@@ -54,10 +54,10 @@ class TestIsProxyAuthError(unittest.TestCase):
     def test_wrapped_in_runtime_error(self) -> None:
         try:
             try:
-                raise httpx.ProxyError(
+                raise httpx2.ProxyError(
                     '407 Proxy Authentication Required',
                 )
-            except httpx.ProxyError as inner:
+            except httpx2.ProxyError as inner:
                 raise RuntimeError('InnerTube API call failed') from inner
         except RuntimeError as outer:
             self.assertTrue(is_proxy_auth_error(outer))
@@ -235,10 +235,10 @@ class TestRateLimiterReport(unittest.IsolatedAsyncioTestCase):
         limiter.set_proxies(list(PROXIES))
         await limiter.report_proxy_result(
             PROXIES[0], False,
-            httpx.ProxyError('407 Proxy Authentication Required'),
+            httpx2.ProxyError('407 Proxy Authentication Required'),
         )
         await limiter.report_proxy_result(
-            PROXIES[1], False, httpx.ConnectError('refused'),
+            PROXIES[1], False, httpx2.ConnectError('refused'),
         )
         health: ProxyHealth = limiter._health
         self.assertFalse(health.available(PROXIES[0]))
