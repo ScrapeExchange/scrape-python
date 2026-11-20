@@ -2159,8 +2159,12 @@ class TestReconcileCommand(
         )
         await self.redis.hset(
             'youtube:channel:meta:i:UCxxxxxxxxxxxxxxxxxxxxxx',
-            'handle',
-            'ExampleHandle',
+            mapping={
+                'handle': 'ExampleHandle',
+                # Completed a first full scrape: rss-seed holds back
+                # channels that have not.
+                'successful_scrapes': '1',
+            },
         )
         with patch('sys.stdout', io.StringIO()):
             await cmd_reconcile(

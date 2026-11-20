@@ -23,6 +23,7 @@ import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from logging import Logger
+from typing import Any
 
 import redis.asyncio as aioredis
 from prometheus_client import Counter, Gauge, Histogram
@@ -30,11 +31,13 @@ from prometheus_client import Counter, Gauge, Histogram
 from scrape_exchange.channel_scrape_queue import (
     ChannelState,
     RedisChannelScrapeQueue,
+    awaiting_first_full_scrape,
 )
 
 
 KEY_RSS_CREATORS: str = 'rss:youtube:creators'
 KEY_RSS_SUPPRESSED: str = 'rss:youtube:suppressed'
+KEY_CREATOR_MAP: str = 'youtube:creator_map'
 
 RSS_SUPPRESSING_STATES: frozenset[ChannelState] = (
     frozenset({
@@ -62,6 +65,7 @@ DEFAULT_REPAIR_SPREAD_SECONDS: int = 24 * 60 * 60
 DEFAULT_META_ORPHAN_SPREAD_SECONDS: int = 6 * 60 * 60
 
 REPAIR_MODES: frozenset[str] = frozenset({
+    'creator-map-missing',
     'rss-missing',
     'rss-seed',
     'rss-suppress',
@@ -550,7 +554,7 @@ class ChannelQueueAuditor:
         )
         pipe.hexists(KEY_RSS_CREATORS, channel_id)
         pipe.hexists(KEY_RSS_SUPPRESSED, channel_id)
-        pipe.hget('youtube:creator_map', channel_id)
+        pipe.hget(KEY_CREATOR_MAP, channel_id)
         pipe.hget(
             self._queue._k_meta(member), 'handle',
         )
@@ -1162,7 +1166,7 @@ class ChannelQueueAuditor:
             seen.add(member)
             inspected += 1
             exists: bool = await self._redis.hexists(
-                'youtube:creator_map', member[2:],
+                KEY_CREATOR_MAP, member[2:],
             )
             if not exists:
                 report.count += 1
@@ -1430,6 +1434,7 @@ class ChannelQueueRepairer:
         modes: tuple[str, ...]
         if options.mode == 'all-safe':
             modes = (
+                'creator-map-missing',
                 'rss-missing',
                 'rss-seed',
                 'rss-suppress',
@@ -1444,7 +1449,11 @@ class ChannelQueueRepairer:
         for mode in modes:
             if self._limit_reached(counts, options):
                 break
-            if mode == 'rss-missing':
+            if mode == 'creator-map-missing':
+                counts[mode] = await self._repair_creator_map_missing(
+                    options, counts,
+                )
+            elif mode == 'rss-missing':
                 counts[mode] = await self._repair_rss_missing(
                     options, counts,
                 )
@@ -1568,24 +1577,6 @@ class ChannelQueueRepairer:
         results: list[object] = await pipe.execute()
         return any(_is_present(v) for v in results)
 
-    async def _terminal_state(
-        self, member: str,
-    ) -> ChannelState | None:
-        pipe: aioredis.client.Pipeline = (
-            self._redis.pipeline(transaction=False)
-        )
-        states: list[ChannelState] = sorted(
-            ChannelState.terminal_states(),
-            key=lambda state: state.value,
-        )
-        for state in states:
-            pipe.hexists(self._queue._k_state(state), member)
-        results: list[bool] = await pipe.execute()
-        for state, present in zip(states, results):
-            if present:
-                return state
-        return None
-
     def _score_for_member(
         self,
         member: str,
@@ -1700,53 +1691,226 @@ class ChannelQueueRepairer:
                 break
         return repaired
 
+    async def _repair_creator_map_missing(
+        self,
+        options: RepairOptions,
+        counts: dict[str, int],
+    ) -> int:
+        '''Schedule creator-map channels the channel queue has never
+        seen. Once the channel scraper completes such a channel's
+        first full scrape it adds the channel to the RSS queue.'''
+        repaired: int = 0
+        cursor: int = 0
+        while True:
+            items: dict[str, str]
+            cursor, items = await self._redis.hscan(
+                KEY_CREATOR_MAP,
+                cursor=cursor,
+                count=self._batch_size,
+            )
+            channel_ids: list[str] = [
+                channel_id for channel_id in items
+                if _CHANNEL_ID_RE.match(channel_id)
+            ]
+            channel_id: str
+            for channel_id in await self._absent_channel_ids(
+                channel_ids,
+            ):
+                if await self._schedule_channel(
+                    channel_id,
+                    reason='creator_map_missing_channel_state',
+                    options=options,
+                ):
+                    repaired += 1
+                if self._budget_done(
+                    repaired, counts, options,
+                ):
+                    return repaired
+            if cursor == 0:
+                break
+        return repaired
+
+    async def _absent_channel_ids(
+        self, channel_ids: list[str],
+    ) -> list[str]:
+        '''The *channel_ids* that are in no channel-queue structure
+        (unresolved queue, scheduled tiers, terminal states): the
+        batched form of :meth:`_channel_present`.'''
+        if not channel_ids:
+            return []
+        keys: list[tuple[str, str]] = (
+            [('zscore', self._queue._k_unresolved())]
+            + [
+                ('zscore', self._queue._k_scheduled(tier))
+                for tier in range(len(self._queue._tiers))
+            ]
+            + [
+                ('hexists', self._queue._k_state(state))
+                for state in ChannelState.terminal_states()
+            ]
+        )
+        pipe: aioredis.client.Pipeline = (
+            self._redis.pipeline(transaction=False)
+        )
+        channel_id: str
+        for channel_id in channel_ids:
+            member: str = f'i:{channel_id}'
+            command: str
+            key: str
+            for command, key in keys:
+                if command == 'zscore':
+                    pipe.zscore(key, member)
+                else:
+                    pipe.hexists(key, member)
+        results: list[object] = await pipe.execute()
+        absent: list[str] = []
+        index: int
+        for index, channel_id in enumerate(channel_ids):
+            group: list[object] = results[
+                index * len(keys):(index + 1) * len(keys)
+            ]
+            if not any(_is_present(value) for value in group):
+                absent.append(channel_id)
+        return absent
+
     async def _repair_rss_seed(
         self,
         options: RepairOptions,
         counts: dict[str, int],
     ) -> int:
+        '''Seed channel-queue channels that are missing from the RSS
+        queue. Members are checked a batch at a time, one pipeline
+        per batch, so a pass over millions of members stays cheap
+        enough to run on a schedule.'''
         repaired: int = 0
-        seen: set[str] = set()
+        batch: list[str] = []
         async for member in self._iter_channel_id_members():
-            if member in seen:
+            batch.append(member)
+            if len(batch) < self._batch_size:
                 continue
-            seen.add(member)
-            terminal: ChannelState | None = (
-                await self._terminal_state(member)
+            repaired += await self._rss_seed_batch(
+                batch, options, self._batch_budget(
+                    repaired, counts, options,
+                ),
             )
-            if terminal in RSS_SUPPRESSING_STATES:
-                continue
-            channel_id: str = member[2:]
-            existing_label: str | None
-            in_creators: bool
-            in_suppressed: bool
-            in_creators, in_suppressed, existing_label = (
-                await self._rss_accounting_state(channel_id)
-            )
-            if in_suppressed:
-                continue
-            if in_creators:
-                if existing_label:
-                    added: int = await self._redis.sadd(
-                        'rss:youtube:names',
-                        existing_label.lower(),
-                    )
-                    if added:
-                        repaired += 1
-                if self._budget_done(repaired, counts, options):
-                    return repaired
-                continue
-            label: str | None = await self._rss_label(
-                member, channel_id,
-            )
-            if not label:
-                continue
-            await self._write_rss_seed(
-                channel_id, label, options,
-            )
-            repaired += 1
+            batch = []
             if self._budget_done(repaired, counts, options):
                 return repaired
+        if batch:
+            repaired += await self._rss_seed_batch(
+                batch, options, self._batch_budget(
+                    repaired, counts, options,
+                ),
+            )
+        return repaired
+
+    def _batch_budget(
+        self,
+        repaired_in_mode: int,
+        prior_counts: dict[str, int],
+        options: RepairOptions,
+    ) -> int | None:
+        '''Repairs a batch may still apply, or None when unlimited.'''
+        remaining: int | None = self._remaining_budget(
+            prior_counts, options,
+        )
+        if remaining is None:
+            return None
+        return max(0, remaining - repaired_in_mode)
+
+    async def _rss_seed_batch(
+        self,
+        members: list[str],
+        options: RepairOptions,
+        budget: int | None,
+    ) -> int:
+        '''Seed the members of one batch that belong in the RSS
+        queue but are missing from it.
+
+        A member is skipped when it is in an RSS-suppressing terminal
+        state, explicitly suppressed, or has not completed its first
+        full channel scrape: the channel scraper adds such a channel
+        to the RSS queue itself once that scrape completes, so RSS
+        cannot make its newest videos 'known' and cut it short. A
+        member already in the RSS creators hash only gets its names
+        index entry healed.
+
+        :returns: number of repairs applied
+        '''
+        if budget == 0:
+            return 0
+        states: list[ChannelState] = sorted(
+            ChannelState.terminal_states(),
+            key=lambda state: state.value,
+        )
+        pipe: aioredis.client.Pipeline = (
+            self._redis.pipeline(transaction=False)
+        )
+        member: str
+        for member in members:
+            channel_id: str = member[2:]
+            for state in states:
+                pipe.hexists(self._queue._k_state(state), member)
+            pipe.hexists(KEY_RSS_SUPPRESSED, channel_id)
+            pipe.hget(KEY_RSS_CREATORS, channel_id)
+            pipe.hmget(
+                self._queue._k_meta(member),
+                [
+                    'state', 'successful_scrapes',
+                    'last_attempt_at', 'handle', 'name',
+                ],
+            )
+            pipe.hget(KEY_CREATOR_MAP, channel_id)
+        results: list[Any] = await pipe.execute()
+        per_member: int = len(states) + 4
+        repaired: int = 0
+        done: set[str] = set()
+        index: int
+        for index, member in enumerate(members):
+            if member in done:
+                continue
+            done.add(member)
+            group: list[Any] = results[
+                index * per_member:(index + 1) * per_member
+            ]
+            terminal: ChannelState | None = next(
+                (
+                    state for state, present
+                    in zip(states, group[:len(states)])
+                    if present
+                ),
+                None,
+            )
+            in_suppressed: Any
+            existing_label: str | None
+            meta: list[str | None]
+            map_handle: str | None
+            in_suppressed, existing_label, meta, map_handle = (
+                group[len(states):]
+            )
+            if terminal in RSS_SUPPRESSING_STATES or in_suppressed:
+                continue
+            if existing_label is not None:
+                if existing_label and await self._redis.sadd(
+                    'rss:youtube:names', existing_label.lower(),
+                ):
+                    repaired += 1
+            elif awaiting_first_full_scrape(
+                meta[0], meta[1], meta[2],
+            ):
+                continue
+            else:
+                label: str | None = (
+                    map_handle or meta[3] or meta[4]
+                )
+                if not label:
+                    continue
+                await self._write_rss_seed(
+                    member[2:], label, options,
+                )
+                repaired += 1
+            if budget is not None and repaired >= budget:
+                break
         return repaired
 
     async def _repair_rss_suppress(
@@ -2019,37 +2183,6 @@ class ChannelQueueRepairer:
             remaining is not None
             and repaired_in_mode >= remaining
         )
-
-    async def _rss_accounting_state(
-        self, channel_id: str,
-    ) -> tuple[bool, bool, str | None]:
-        pipe: aioredis.client.Pipeline = (
-            self._redis.pipeline(transaction=False)
-        )
-        pipe.hexists(KEY_RSS_CREATORS, channel_id)
-        pipe.hexists(KEY_RSS_SUPPRESSED, channel_id)
-        pipe.hget(KEY_RSS_CREATORS, channel_id)
-        in_creators, in_suppressed, label = await pipe.execute()
-        return bool(in_creators), bool(in_suppressed), label
-
-    async def _rss_label(
-        self,
-        member: str,
-        channel_id: str,
-    ) -> str | None:
-        pipe: aioredis.client.Pipeline = (
-            self._redis.pipeline(transaction=False)
-        )
-        pipe.hget('youtube:creator_map', channel_id)
-        pipe.hget(self._queue._k_meta(member), 'handle')
-        pipe.hget(self._queue._k_meta(member), 'name')
-        map_handle, meta_handle, meta_name = (
-            await pipe.execute()
-        )
-        label: str | None = (
-            map_handle or meta_handle or meta_name
-        )
-        return label or None
 
     async def _write_rss_seed(
         self,

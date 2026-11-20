@@ -388,6 +388,35 @@ the `channel-rss-` prefix and POSTs them alongside the
 full `channel-<handle>` records, so subscriber counts
 stay fresh without a full channel rescrape.
 
+### Seeding the RSS queue
+
+With Redis, the RSS workers do not fill the RSS queue at
+startup. Channels get into it in two ways:
+
+- The channel scraper adds a channel once its first full
+  scrape completes. Waiting for that scrape keeps RSS from
+  marking the channel's newest videos as known and cutting
+  the first full scrape short.
+- `yt_channel_queue.py reconcile --repair rss-seed` adds
+  channel-queue channels that are missing from the RSS
+  queue. It skips channels in an RSS-suppressing end state
+  (`not_found`, `low_subs`, `topic`, ...), channels in
+  `rss:youtube:suppressed`, and channels whose first full
+  scrape has not completed. Run it from one host on a
+  schedule, for example a daily cron entry:
+
+```bash
+docker compose run --rm yt-channel \
+    tools/yt_channel_queue.py reconcile --repair rss-seed
+```
+
+Channels in the creator map that the channel queue has
+never seen are added to the channel queue (not to RSS)
+with `reconcile --repair creator-map-missing`; the channel
+scraper then hands them to RSS after their first full
+scrape. Both modes also run as part of
+`reconcile --repair all-safe`.
+
 ### Tiered polling cadence
 
 Channels are bucketed by subscriber count into priority

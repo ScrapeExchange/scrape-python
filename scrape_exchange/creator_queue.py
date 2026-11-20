@@ -1707,13 +1707,21 @@ class RedisCreatorQueue(CreatorQueue):
         )
         return len(members)
 
-    async def populate(
+    async def prepare(
         self,
-        creators: dict[str, str],
-        channel_fm: AssetFileManagement,
         tiers: list[TierConfig],
-        subscriber_counts: dict[str, int],
-    ) -> int:
+        subscriber_counts: dict[str, int] | None = None,
+    ) -> None:
+        '''
+        Make the queue usable without adding any creators: set the
+        tier configuration, load the Lua scripts, migrate the legacy
+        single-queue key and backfill the names index once.
+
+        :param tiers: the queue's tier configuration
+        :param subscriber_counts: tiers for creators migrated from
+            the legacy key; unknown counts get the lowest tier
+        '''
+
         self._tiers = tiers
         self._key_queues = self._build_queue_keys(
             tiers,
@@ -1722,12 +1730,21 @@ class RedisCreatorQueue(CreatorQueue):
 
         # Migrate old single-queue key if present.
         await self._migrate_legacy_key(
-            tiers, subscriber_counts,
+            tiers, subscriber_counts or {},
         )
 
         # One-time backfill of the names index from
         # the creators hash (uses HSCAN, not HGETALL).
         await self._ensure_names_index()
+
+    async def populate(
+        self,
+        creators: dict[str, str],
+        channel_fm: AssetFileManagement,
+        tiers: list[TierConfig],
+        subscriber_counts: dict[str, int],
+    ) -> int:
+        await self.prepare(tiers, subscriber_counts)
 
         # Local .not_found / .unresolved marker files are not
         # consulted: with Redis, the caller drops channels the

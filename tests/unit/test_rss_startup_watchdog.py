@@ -18,33 +18,11 @@ from scrape_exchange import creator_queue
 from scrape_exchange.creator_queue import RedisCreatorQueue, TierConfig
 from scrape_exchange.file_management import AssetFileManagement
 
-from tests.unit.test_yt_rss_hold_back_unscraped import yt_rss_scrape
 
 _TIERS: list[TierConfig] = [
     TierConfig(tier=1, min_subscribers=1_000_000, interval_hours=6),
     TierConfig(tier=2, min_subscribers=0, interval_hours=24),
 ]
-
-
-class TestHoldBackTouchesWatchdog(unittest.IsolatedAsyncioTestCase):
-
-    async def test_touches_once_per_chunk(self) -> None:
-        redis: fakeredis.aioredis.FakeRedis = (
-            fakeredis.aioredis.FakeRedis(decode_responses=True)
-        )
-        channel_map: dict[str, str] = {
-            f'UC{i:022d}': f'name{i}' for i in range(2500)
-        }
-        watchdog: mock.Mock = mock.Mock()
-        with mock.patch.object(
-            yt_rss_scrape.Watchdog, 'get', return_value=watchdog,
-        ):
-            await yt_rss_scrape._hold_back_unscraped_channels(
-                redis, channel_map, known_ids=set(),
-            )
-        await redis.aclose()
-        # 2500 candidates in chunks of 1000 -> 3 chunks.
-        self.assertEqual(watchdog.touch_work.call_count, 3)
 
 
 class TestPopulateTouchesWatchdog(unittest.IsolatedAsyncioTestCase):
