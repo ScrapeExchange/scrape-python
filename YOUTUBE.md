@@ -417,6 +417,10 @@ scraper then hands them to RSS after their first full
 scrape. Both modes also run as part of
 `reconcile --repair all-safe`.
 
+A `--repair` run prints only the repair counts. Add
+`--report` to also run the full read-only drift scan
+afterwards; `reconcile` without `--repair` always runs it.
+
 ### Tiered polling cadence
 
 Channels are bucketed by subscriber count into priority

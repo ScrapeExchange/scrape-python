@@ -377,6 +377,18 @@ def _build_parser() -> ArgumentParser:
         ),
     )
     c_reconcile.add_argument(
+        '--report',
+        action='store_true',
+        default=False,
+        help=(
+            'With --repair, also run the full read-only drift scan '
+            'after repairing and print its report. Without it, a '
+            'repair run only prints the repair counts: the scan '
+            'walks every channel and takes much longer than most '
+            'repairs.'
+        ),
+    )
+    c_reconcile.add_argument(
         '--source',
         default='reconcile',
         help='Source label written to repaired channel/RSS meta',
@@ -1704,14 +1716,18 @@ async def cmd_reconcile(
                     ),
                 )
             )
-        auditor: ChannelQueueAuditor = ChannelQueueAuditor(
-            queue,
-            queue._redis,
-            batch_size=ns.batch_size,
-            sample_size=ns.sample,
-            limit=ns.limit,
-        )
-        report: ReconcileReport = await auditor.scan()
+        report: ReconcileReport
+        if repair_mode and not getattr(ns, 'report', False):
+            report = ReconcileReport()
+        else:
+            auditor: ChannelQueueAuditor = ChannelQueueAuditor(
+                queue,
+                queue._redis,
+                batch_size=ns.batch_size,
+                sample_size=ns.sample,
+                limit=ns.limit,
+            )
+            report = await auditor.scan()
         report.dry_run = repair_mode is None
         report.repaired = repaired
         if metrics_port is not None:
@@ -1739,6 +1755,12 @@ async def cmd_reconcile(
             json_mod.dumps(report.to_dict(), indent=2),
         )
         sys.stdout.write('\n')
+        return 0
+    if not report.dry_run and not report.drift:
+        # A repair run without --report: only the repair counts.
+        sys.stdout.write('repaired:\n')
+        for mode, count in sorted(report.repaired.items()):
+            sys.stdout.write(f'  {mode:<48} {count:>12}\n')
         return 0
     sys.stdout.write(
         f'{"inspected":<32} {"count":>12}\n',

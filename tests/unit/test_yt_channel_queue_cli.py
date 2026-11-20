@@ -2149,6 +2149,84 @@ class TestReconcileCommand(
         )
         self.assertEqual(score, 0.0)
 
+    async def _seed_rss_only_creator(self) -> None:
+        await self.redis.hset(
+            'rss:youtube:creators',
+            'UCxxxxxxxxxxxxxxxxxxxxxx', 'x',
+        )
+
+    async def test_repair_skips_drift_report_by_default(
+        self,
+    ) -> None:
+        await self._seed_rss_only_creator()
+        buf: io.StringIO = io.StringIO()
+        with patch(
+            'tools.yt_channel_queue.ChannelQueueAuditor.scan',
+            new=AsyncMock(),
+        ) as scan, patch('sys.stdout', buf):
+            rc: int = await cmd_reconcile(
+                self._ns(repair='rss-missing'), self.queue,
+            )
+        self.assertEqual(rc, 0)
+        scan.assert_not_awaited()
+        output: str = buf.getvalue()
+        self.assertIn('repaired:', output)
+        self.assertIn('rss-missing', output)
+        self.assertNotIn('drift:', output)
+        self.assertNotIn('inspected', output)
+
+    async def test_repair_json_without_report_has_no_drift(
+        self,
+    ) -> None:
+        await self._seed_rss_only_creator()
+        buf: io.StringIO = io.StringIO()
+        with patch('sys.stdout', buf):
+            await cmd_reconcile(
+                self._ns(repair='rss-missing', json=True),
+                self.queue,
+            )
+        payload: dict = json_mod.loads(buf.getvalue())
+        self.assertFalse(payload['dry_run'])
+        self.assertEqual(payload['repaired']['rss-missing'], 1)
+        self.assertEqual(payload['drift'], {})
+
+    async def test_repair_with_report_runs_drift_scan(
+        self,
+    ) -> None:
+        await self._seed_rss_only_creator()
+        buf: io.StringIO = io.StringIO()
+        with patch('sys.stdout', buf):
+            await cmd_reconcile(
+                self._ns(
+                    repair='rss-missing', json=True, report=True,
+                ),
+                self.queue,
+            )
+        payload: dict = json_mod.loads(buf.getvalue())
+        self.assertEqual(payload['repaired']['rss-missing'], 1)
+        # The scan ran after the repair: the RSS-only creator is
+        # now scheduled, so that drift class reads zero.
+        self.assertEqual(
+            payload['drift']
+                   ['rss_creator_missing_channel_state']
+                   ['count'],
+            0,
+        )
+
+    async def test_dry_run_still_runs_drift_scan(self) -> None:
+        await self._seed_rss_only_creator()
+        buf: io.StringIO = io.StringIO()
+        with patch('sys.stdout', buf):
+            await cmd_reconcile(self._ns(json=True), self.queue)
+        payload: dict = json_mod.loads(buf.getvalue())
+        self.assertTrue(payload['dry_run'])
+        self.assertEqual(
+            payload['drift']
+                   ['rss_creator_missing_channel_state']
+                   ['count'],
+            1,
+        )
+
     async def test_repair_rss_seed_uses_meta_handle(
         self,
     ) -> None:
