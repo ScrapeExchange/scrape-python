@@ -73,13 +73,59 @@ class TestHoldBackUnscrapedChannels(unittest.IsolatedAsyncioTestCase):
             'UClegacy': 'l', 'UCknown': 'k', 'UCprogressless': 'q',
             'UCterminal': 't',
         }
-        held: int = await yt_rss_scrape._hold_back_unscraped_channels(
+        held: int
+        gone: int
+        held, gone = await yt_rss_scrape._hold_back_unscraped_channels(
             self.redis, channel_map, known_ids={'UCknown'},
         )
         self.assertEqual(held, 3)
+        self.assertEqual(gone, 0)
         self.assertEqual(
             set(channel_map),
             {'UCdone', 'UClegacy', 'UCknown', 'UCprogressless'},
+        )
+
+    async def test_drops_channels_the_channel_queue_marks_gone(
+        self,
+    ) -> None:
+        meta: str = 'youtube:channel:meta:i:'
+        gone_states: list[str] = sorted(
+            yt_rss_scrape.RSS_SKIPPED_CHANNEL_STATES,
+        )
+        channel_map: dict[str, str] = {}
+        state: str
+        for state in gone_states:
+            cid: str = f'UC{state}'
+            # A completed scrape: only the gone state drops it.
+            await self.redis.hset(f'{meta}{cid}', mapping={
+                'state': state, 'successful_scrapes': '3',
+            })
+            channel_map[cid] = state
+        await self.redis.hset(f'{meta}UCknowngone', mapping={
+            'state': 'not_found', 'successful_scrapes': '3',
+        })
+        await self.redis.hset(f'{meta}UClive', mapping={
+            'state': 'scheduled', 'successful_scrapes': '3',
+        })
+        channel_map['UCknowngone'] = 'k'
+        channel_map['UClive'] = 'l'
+        held: int
+        gone: int
+        held, gone = await yt_rss_scrape._hold_back_unscraped_channels(
+            self.redis, channel_map, known_ids={'UCknowngone'},
+        )
+        self.assertEqual(held, 0)
+        self.assertEqual(gone, len(gone_states))
+        # Channels already in the RSS queue are left alone.
+        self.assertEqual(set(channel_map), {'UCknowngone', 'UClive'})
+
+    def test_skipped_states_cover_the_marker_meanings(self) -> None:
+        self.assertEqual(
+            set(yt_rss_scrape.RSS_SKIPPED_CHANNEL_STATES),
+            {
+                'not_found', 'invalid_handle', 'unresolved', 'removed',
+                'terminated', 'hard_unavailable', 'moved',
+            },
         )
 
 

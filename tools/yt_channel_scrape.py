@@ -2661,7 +2661,7 @@ async def _scrape_one_queued(
             # New channels join the RSS queue only now, so RSS cannot
             # make their newest videos 'known' before the first full
             # scrape has enumerated the back catalogue.
-            await _add_channel_to_rss_queue(settings, fm, channel, extra)
+            await _add_channel_to_rss_queue(settings, channel, extra)
         count_outcome: str = 'scraped'
         if channel.subscriber_count is None and not is_topic:
             # The queue decided between a retry and 'not public'; a
@@ -3280,7 +3280,6 @@ def _rss_queue_for(settings: ChannelSettings) -> RedisCreatorQueue | None:
 
 async def _add_channel_to_rss_queue(
     settings: ChannelSettings,
-    fm: AssetFileManagement,
     channel: YouTubeChannel,
     extra: dict[str, str],
 ) -> None:
@@ -3300,7 +3299,6 @@ async def _add_channel_to_rss_queue(
             channel.channel_handle or channel.channel_id,
             _RSS_TIERS,
             channel.subscriber_count,
-            fm,
         )
     except Exception:
         logging.warning(

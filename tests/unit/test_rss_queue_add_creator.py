@@ -8,7 +8,6 @@ first full scrape has completed.
 :license    : GPLv3
 '''
 
-import tempfile
 import unittest
 
 import fakeredis.aioredis
@@ -18,7 +17,6 @@ from scrape_exchange.creator_queue import (
     TierConfig,
     parse_priority_queues,
 )
-from scrape_exchange.file_management import AssetFileManagement
 
 
 class TestAddCreator(unittest.IsolatedAsyncioTestCase):
@@ -34,20 +32,13 @@ class TestAddCreator(unittest.IsolatedAsyncioTestCase):
         self.tiers: list[TierConfig] = parse_priority_queues(
             '1:1000000,12:4000,168:0',
         )
-        self.directory: tempfile.TemporaryDirectory = (
-            tempfile.TemporaryDirectory()
-        )
-        self.addCleanup(self.directory.cleanup)
-        self.fm: AssetFileManagement = AssetFileManagement(
-            self.directory.name,
-        )
 
     async def asyncTearDown(self) -> None:
         await self.redis.aclose()
 
     async def test_adds_to_tier_for_subscriber_count(self) -> None:
         added: bool = await self.queue.add_creator(
-            'UCnew', 'newhandle', self.tiers, 5000, self.fm,
+            'UCnew', 'newhandle', self.tiers, 5000,
         )
         self.assertTrue(added)
         self.assertIsNotNone(
@@ -66,10 +57,10 @@ class TestAddCreator(unittest.IsolatedAsyncioTestCase):
 
     async def test_existing_creator_is_not_re_added(self) -> None:
         await self.queue.add_creator(
-            'UCnew', 'newhandle', self.tiers, 5000, self.fm,
+            'UCnew', 'newhandle', self.tiers, 5000,
         )
         self.assertFalse(await self.queue.add_creator(
-            'UCnew', 'newhandle', self.tiers, 2_000_000, self.fm,
+            'UCnew', 'newhandle', self.tiers, 2_000_000,
         ))
         self.assertEqual(
             await self.redis.hget('rss:youtube:tiers', 'UCnew'), '2',
@@ -78,7 +69,7 @@ class TestAddCreator(unittest.IsolatedAsyncioTestCase):
     async def test_excluded_creator_is_not_added(self) -> None:
         await self.redis.sadd('rss:youtube:excluded', 'UCgone')
         self.assertFalse(await self.queue.add_creator(
-            'UCgone', 'gone', self.tiers, 10, self.fm,
+            'UCgone', 'gone', self.tiers, 10,
         ))
         self.assertEqual(await self.redis.zcard('rss:youtube:queue:3'), 0)
 

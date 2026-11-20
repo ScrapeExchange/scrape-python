@@ -1076,17 +1076,6 @@ class AssetFileManagement:
                 removed += 1
         return removed
 
-    async def mark_failed(self, filename: str) -> str:
-        '''
-        Rename *filename* in the base directory by appending ``.failed`` so
-        future runs can recognize it as a previously failed upload.
-
-        :param filename: Bare filename inside ``base_dir`` to mark.
-        :returns: The new filename (``{filename}.failed``).
-        :raises OSError: If the rename fails.
-        '''
-        return await self._rename_with_suffix(filename, FAILED_SUFFIX)
-
     async def mark_unavailable(self, filename: str) -> str:
         '''
         Rename *filename* in the base directory by appending ``.unavailable``
