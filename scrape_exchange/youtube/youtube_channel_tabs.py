@@ -11,6 +11,7 @@ the video IDs, playlist data, course data, post data, and product data.
 import asyncio
 import functools
 import random
+import ssl
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from logging import Logger
@@ -2093,6 +2094,30 @@ def shutdown_innertube_executor() -> None:
         executor.shutdown(wait=False, cancel_futures=True)
 
 
+# One TLS context shared by the InnerTube sessions built below. Each
+# ssl.SSLContext loads the whole CA bundle (~1.4 MiB); pooled clients
+# per proxy, each with its own context, cost hundreds of MB per worker.
+# These sessions are HTTP/1.1 only, so the ALPN list httpcore writes on
+# the context at each connect is always the same value.
+_INNERTUBE_SSL_CONTEXT: ssl.SSLContext | None = None
+_INNERTUBE_SSL_CONTEXT_LOCK: threading.Lock = threading.Lock()
+
+
+def _innertube_ssl_context() -> ssl.SSLContext:
+    '''Return the process-wide TLS context for InnerTube sessions,
+    creating it on first use. Same verification settings as httpx's
+    default (``verify=True``).'''
+
+    global _INNERTUBE_SSL_CONTEXT
+    if _INNERTUBE_SSL_CONTEXT is None:
+        with _INNERTUBE_SSL_CONTEXT_LOCK:
+            if _INNERTUBE_SSL_CONTEXT is None:
+                _INNERTUBE_SSL_CONTEXT = httpx.create_ssl_context(
+                    http2=False,
+                )
+    return _INNERTUBE_SSL_CONTEXT
+
+
 def build_innertube_with_pool_limits(
     entry: str | None,
     client_name: str = 'WEB',
@@ -2135,6 +2160,7 @@ def build_innertube_with_pool_limits(
         limits=_POOLED_HTTPX_LIMITS,
         timeout=_INNERTUBE_SYNC_HTTPX_TIMEOUT,
         proxies=entry,
+        verify=_innertube_ssl_context(),
     )
     setattr(client, 'close', client.adaptor.session.close)
     old_session.close()

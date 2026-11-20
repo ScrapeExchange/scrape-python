@@ -23,6 +23,7 @@ import asyncio
 import ipaddress
 import logging
 import random
+import ssl
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,6 +36,24 @@ _ALLOWED_URL_SCHEMES: Final[tuple[str, ...]] = ('http://', 'https://')
 _LOCAL_SCHEME: Final[str] = 'local://'
 
 _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
+
+# One TLS context shared by every client built here. Each
+# ssl.SSLContext loads the whole CA bundle (~1.4 MiB), so a client per
+# proxy with its own context cost hundreds of MB per worker. Every
+# client here negotiates HTTP/2, so the ALPN list httpcore2 writes on
+# the context at each connect is always the same value.
+_SHARED_SSL_CONTEXT: ssl.SSLContext | None = None
+
+
+def shared_ssl_context() -> ssl.SSLContext:
+    '''Return the process-wide TLS context for the httpx2 clients
+    built by this module, creating it on first use. Same verification
+    settings as httpx2's default (``verify=True``).'''
+
+    global _SHARED_SSL_CONTEXT
+    if _SHARED_SSL_CONTEXT is None:
+        _SHARED_SSL_CONTEXT = httpx.create_ssl_context()
+    return _SHARED_SSL_CONTEXT
 
 
 def _parse_entry(raw: str) -> str:
@@ -287,13 +306,15 @@ def httpx_client_for_entry(
     Extra kwargs are forwarded unchanged to ``httpx.AsyncClient``.
     """
 
+    kwargs.setdefault('verify', shared_ssl_context())
     if entry is None:
         return httpx.AsyncClient(http2=True, **kwargs)
     if entry.startswith(_LOCAL_SCHEME):
         ip: str = entry.removeprefix(_LOCAL_SCHEME)
+        verify: ssl.SSLContext | bool = kwargs.pop('verify')
         return httpx.AsyncClient(
             transport=httpx.AsyncHTTPTransport(
-                local_address=ip, http2=True,
+                local_address=ip, http2=True, verify=verify,
             ),
             **kwargs,
         )
@@ -337,9 +358,11 @@ def _make_pooled_httpx_client_for_entry(
     timeout overrides are still applied at call time via
     ``client.get(url, timeout=...)``."""
 
+    ssl_context: ssl.SSLContext = shared_ssl_context()
     if entry is None:
         return httpx.AsyncClient(
             http2=True,
+            verify=ssl_context,
             limits=_POOLED_HTTPX_LIMITS,
             timeout=_POOLED_HTTPX_DEFAULT_TIMEOUT,
         )
@@ -347,7 +370,7 @@ def _make_pooled_httpx_client_for_entry(
         ip: str = entry.removeprefix(_LOCAL_SCHEME)
         return httpx.AsyncClient(
             transport=httpx.AsyncHTTPTransport(
-                local_address=ip, http2=True,
+                local_address=ip, http2=True, verify=ssl_context,
             ),
             limits=_POOLED_HTTPX_LIMITS,
             timeout=_POOLED_HTTPX_DEFAULT_TIMEOUT,
@@ -355,6 +378,7 @@ def _make_pooled_httpx_client_for_entry(
     return httpx.AsyncClient(
         proxy=entry,
         http2=True,
+        verify=ssl_context,
         limits=_POOLED_HTTPX_LIMITS,
         timeout=_POOLED_HTTPX_DEFAULT_TIMEOUT,
     )
