@@ -29,6 +29,7 @@ from tools.yt_discover_search import (
     _normalise_handle,
     _parse_markets,
     _parse_subscriber_text,
+    _terms_language,
     _run_popular_discovery,
     _run_search_workers,
     _search_page_localized_with_retry,
@@ -37,6 +38,8 @@ from tools.yt_discover_search import (
     enqueue_discovered_channels,
     extract_channels,
     main_async,
+    markets_for_language,
+    pick_random_word_language,
 )
 
 
@@ -95,7 +98,7 @@ class TestDiscoverSearchSettings(unittest.TestCase):
             '/var/tmp/yt_discover_search.pid',
         )
 
-    def test_defaults_include_50_additional_languages(self) -> None:
+    def test_defaults_include_69_additional_languages(self) -> None:
         settings = DiscoverSearchSettings(_cli_parse_args=[])
         original_languages: set[str] = {
             'en', 'es', 'it', 'de', 'fr', 'zh', 'pt-br', 'ro',
@@ -107,12 +110,16 @@ class TestDiscoverSearchSettings(unittest.TestCase):
             'ka', 'kk', 'ko', 'lt', 'lv', 'mk', 'ms', 'nl', 'no',
             'pl', 'ru', 'sk', 'sl', 'sq', 'sr', 'sv', 'sw', 'ta',
             'th', 'tr', 'uk', 'ur', 'vi',
+            # Languages of subscriber_counts.py added later.
+            'am', 'as', 'fil', 'gu', 'km', 'kn', 'ky', 'lo', 'ml',
+            'mn', 'mr', 'my', 'ne', 'or', 'pa', 'si', 'te', 'uz',
+            'zu',
         }
         configured_languages: list[str] = (
             settings.random_word_languages.split(',')
         )
 
-        self.assertEqual(len(configured_languages), 58)
+        self.assertEqual(len(configured_languages), 77)
         self.assertEqual(
             set(configured_languages) - original_languages,
             additional_languages,
@@ -194,6 +201,31 @@ class TestRandomSearchTerms(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(terms, ['Geschiedenis', 'Amsterdam'])
+
+    async def test_filipino_words_come_from_tl_wikipedia(self) -> None:
+        settings = DiscoverSearchSettings(_cli_parse_args=[])
+        response = mock.Mock()
+        response.json.return_value = {
+            'query': {'random': [{'title': 'Kasaysayan ng Maynila'}]},
+        }
+        client = mock.AsyncMock()
+        client.get.return_value = response
+
+        with mock.patch(
+            'tools.yt_discover_search.httpx2.AsyncClient',
+        ) as client_type:
+            client_type.return_value.__aenter__.return_value = client
+            terms = await choose_random_search_terms(
+                settings,
+                count=2,
+                random_word_language='fil',
+            )
+
+        self.assertEqual(terms, ['Kasaysayan', 'Maynila'])
+        self.assertEqual(
+            client.get.await_args.args[0],
+            'https://tl.wikipedia.org/w/api.php',
+        )
 
     async def test_wikimedia_failure_uses_offline_fallback(self) -> None:
         settings = DiscoverSearchSettings(_cli_parse_args=[])
@@ -1122,11 +1154,114 @@ class TestParseMarkets(unittest.TestCase):
             _parse_markets('in, de:'), [('IN', 'en'), ('DE', 'en')],
         )
 
+    def test_allows_several_languages_per_country(self) -> None:
+        self.assertEqual(
+            _parse_markets('IN:hi, IN:ta, US:en, IN:TA'),
+            [('IN', 'hi'), ('IN', 'ta'), ('US', 'en')],
+        )
+
     def test_drops_invalid_entries(self) -> None:
         self.assertEqual(
             _parse_markets(' , usa:en, X:en, JP:ja, '),
             [('JP', 'ja')],
         )
+
+
+_MARKETS: list[tuple[str, str]] = [
+    ('IN', 'hi'), ('US', 'en'), ('BR', 'pt'), ('MX', 'es'),
+    ('ES', 'es'), ('ES', 'ca'), ('IN', 'ta'), ('LK', 'si'),
+    ('PT', 'pt-PT'), ('IL', 'iw'), ('TW', 'zh-TW'),
+]
+
+
+class TestMarketsForLanguage(unittest.TestCase):
+    def _markets(self, language: str | None) -> list[tuple[str, str]]:
+        return markets_for_language(_MARKETS, language)
+
+    def test_english_and_unknown_search_every_market(self) -> None:
+        self.assertEqual(self._markets('en'), _MARKETS)
+        self.assertEqual(self._markets('en-IN'), _MARKETS)
+        self.assertEqual(self._markets(None), _MARKETS)
+
+    def test_language_searches_its_countries_and_us(self) -> None:
+        # Priority order is kept; one market per country.
+        self.assertEqual(
+            self._markets('es'),
+            [('US', 'en'), ('MX', 'es'), ('ES', 'es')],
+        )
+
+    def test_prefers_market_in_word_language(self) -> None:
+        # IN:ta over IN:hi; LK speaks Tamil but has no Tamil market,
+        # so its first market is used.
+        self.assertEqual(
+            self._markets('ta'),
+            [('US', 'en'), ('IN', 'ta'), ('LK', 'si')],
+        )
+        self.assertEqual(
+            self._markets('ca'), [('US', 'en'), ('ES', 'ca')],
+        )
+
+    def test_regional_codes_and_aliases_match_base_language(
+        self,
+    ) -> None:
+        self.assertEqual(
+            self._markets('pt-br'),
+            [('US', 'en'), ('BR', 'pt'), ('PT', 'pt-PT')],
+        )
+        self.assertEqual(
+            self._markets('he'), [('US', 'en'), ('IL', 'iw')],
+        )
+        self.assertEqual(
+            self._markets('zh'), [('US', 'en'), ('TW', 'zh-TW')],
+        )
+
+    def test_language_without_market_searches_us_only(self) -> None:
+        self.assertEqual(self._markets('fa'), [('US', 'en')])
+
+    def test_market_language_counts_without_country_table(
+        self,
+    ) -> None:
+        markets: list[tuple[str, str]] = [
+            ('US', 'en'), ('CH', 'de'), ('CH', 'fr'),
+        ]
+        self.assertEqual(
+            markets_for_language(markets, 'fr'),
+            [('US', 'en'), ('CH', 'fr')],
+        )
+
+    def test_without_us_market_us_is_not_added(self) -> None:
+        self.assertEqual(
+            markets_for_language([('MX', 'es'), ('JP', 'ja')], 'es'),
+            [('MX', 'es')],
+        )
+
+
+class TestTermLanguage(unittest.TestCase):
+    def test_fetched_words_keep_language(self) -> None:
+        self.assertEqual(_terms_language(['Kasaysayan'], 'fil'), 'fil')
+
+    def test_padded_fallback_keeps_language(self) -> None:
+        self.assertEqual(
+            _terms_language(['Kasaysayan', 'water'], 'fil'), 'fil',
+        )
+
+    def test_all_fallback_words_have_no_language(self) -> None:
+        self.assertIsNone(_terms_language(['water', 'cocina'], 'fil'))
+
+    def test_pick_uses_configured_language(self) -> None:
+        settings = DiscoverSearchSettings(
+            _cli_parse_args=['--random-word-language', 'ta'],
+            _env_file=None,
+        )
+        self.assertEqual(pick_random_word_language(settings), 'ta')
+
+    def test_pick_chooses_from_configured_languages(self) -> None:
+        settings = DiscoverSearchSettings(
+            _cli_parse_args=['--random-word-languages', 'nl,sv'],
+            _env_file=None,
+        )
+        for _ in range(20):
+            self.assertIn(pick_random_word_language(settings), {'nl', 'sv'})
 
 
 class TestParseSubscriberText(unittest.TestCase):
@@ -1152,7 +1287,7 @@ class TestPopularSearchSettings(unittest.TestCase):
         self.assertEqual(settings.discover_source, 'discovered_popular')
         self.assertEqual(settings.discover_popular_continuations, 5)
         self.assertEqual(settings.discover_min_subscribers, 4000)
-        self.assertEqual(len(_parse_markets(settings.discover_markets)), 30)
+        self.assertEqual(len(_parse_markets(settings.discover_markets)), 82)
 
     def test_cli_flags(self) -> None:
         settings = DiscoverSearchSettings(
@@ -1658,6 +1793,49 @@ class TestSearchUsesSearchTokens(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class TestRunPopularDiscoveryMarkets(unittest.IsolatedAsyncioTestCase):
+    '''The pass searches only the markets of its terms' language.'''
+
+    async def _jobs(self, term_language: str | None) -> list[tuple]:
+        jobs_seen: list[tuple] = []
+
+        async def workers(jobs: list, **kwargs: object):
+            del kwargs
+            jobs_seen.extend((job.gl, job.hl, job.term) for job in jobs)
+            return
+            yield
+
+        settings: mock.Mock = mock.Mock()
+        settings.discover_markets = 'IN:hi, US:en, MX:es, IN:ta, JP:ja'
+        settings.discover_popular_continuations = 0
+        settings.youtube_search_concurrency = 1
+        settings.proxies = ()
+        settings.output_file = None
+        with mock.patch(
+            'tools.yt_discover_search._build_queue_backends',
+            new=mock.AsyncMock(return_value=(None, None, None)),
+        ), mock.patch(
+            'tools.yt_discover_search._run_search_workers', new=workers,
+        ):
+            await _run_popular_discovery(
+                settings, _LimiterStub(), ['w'],
+                term_language=term_language,
+            )
+        return jobs_seen
+
+    async def test_language_limits_markets(self) -> None:
+        jobs: list[tuple] = await self._jobs('ta')
+        # 2 markets x 1 term x 2 facets, in priority order.
+        self.assertEqual(
+            [(gl, hl) for gl, hl, _ in jobs],
+            [('US', 'en')] * 2 + [('IN', 'ta')] * 2,
+        )
+
+    async def test_unknown_language_searches_all_markets(self) -> None:
+        jobs: list[tuple] = await self._jobs(None)
+        self.assertEqual(len(jobs), 10)
+
+
 class TestRunDiscoveryRounds(unittest.IsolatedAsyncioTestCase):
     '''Without --keyword-count or explicit terms, discovery runs
     rounds of random keywords indefinitely.'''
@@ -1729,6 +1907,25 @@ class TestRunDiscoveryRounds(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(run.await_count, 1)
         self.assertEqual(choose.await_args.kwargs['count'], 7)
 
+    async def test_round_passes_word_language_to_pass(self) -> None:
+        choose: mock.AsyncMock
+        run: mock.AsyncMock
+        choose, run = await self._run(
+            ['--random-word-language', 'ta'], stop_after=2,
+        )
+        self.assertEqual(
+            choose.await_args.kwargs['random_word_language'], 'ta',
+        )
+        self.assertEqual(run.await_args.kwargs['term_language'], 'ta')
+
+    async def test_round_picks_language_once_for_both(self) -> None:
+        choose: mock.AsyncMock
+        run: mock.AsyncMock
+        choose, run = await self._run(['--keyword-count', '2'])
+        language: str = choose.await_args.kwargs['random_word_language']
+        self.assertTrue(language)
+        self.assertEqual(run.await_args.kwargs['term_language'], language)
+
     async def test_explicit_terms_run_one_pass(self) -> None:
         choose: mock.AsyncMock
         run: mock.AsyncMock
@@ -1736,6 +1933,7 @@ class TestRunDiscoveryRounds(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(run.await_count, 1)
         choose.assert_not_awaited()
         self.assertEqual(run.await_args.args[2], ['cats', 'dogs'])
+        self.assertIsNone(run.await_args.kwargs.get('term_language'))
 
     async def test_stdin_terms_run_one_pass(self) -> None:
         choose: mock.AsyncMock

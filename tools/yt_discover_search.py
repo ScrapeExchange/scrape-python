@@ -77,12 +77,16 @@ _RANDOM_WORD_API_LANGUAGES: tuple[str, ...] = (
 )
 # Additional languages backed by each language's Wikipedia edition.
 _WIKIMEDIA_RANDOM_WORD_LANGUAGES: tuple[str, ...] = (
-    'af', 'ar', 'az', 'be', 'bg', 'bn', 'bs', 'ca', 'cs', 'cy',
-    'da', 'el', 'eo', 'et', 'eu', 'fa', 'fi', 'ga', 'gl', 'he',
-    'hi', 'hr', 'hu', 'hy', 'id', 'is', 'ja', 'ka', 'kk', 'ko',
-    'lt', 'lv', 'mk', 'ms', 'nl', 'no', 'pl', 'ru', 'sk', 'sl',
-    'sq', 'sr', 'sv', 'sw', 'ta', 'th', 'tr', 'uk', 'ur', 'vi',
+    'af', 'am', 'ar', 'as', 'az', 'be', 'bg', 'bn', 'bs', 'ca',
+    'cs', 'cy', 'da', 'el', 'eo', 'et', 'eu', 'fa', 'fi', 'fil',
+    'ga', 'gl', 'gu', 'he', 'hi', 'hr', 'hu', 'hy', 'id', 'is',
+    'ja', 'ka', 'kk', 'km', 'kn', 'ko', 'ky', 'lo', 'lt', 'lv',
+    'mk', 'ml', 'mn', 'mr', 'ms', 'my', 'ne', 'nl', 'no', 'or',
+    'pa', 'pl', 'ru', 'si', 'sk', 'sl', 'sq', 'sr', 'sv', 'sw',
+    'ta', 'te', 'th', 'tr', 'uk', 'ur', 'uz', 'vi', 'zu',
 )
+# Wikipedia editions whose subdomain differs from the language code.
+_WIKIMEDIA_EDITIONS: dict[str, str] = {'fil': 'tl'}
 _DEFAULT_RANDOM_WORD_LANGUAGES: tuple[str, ...] = (
     _RANDOM_WORD_API_LANGUAGES + _WIKIMEDIA_RANDOM_WORD_LANGUAGES
 )
@@ -135,21 +139,64 @@ _SEARCH_RETRY_BACKOFF_SECONDS: float = 2.0
 _SEARCH_SORT_POPULARITY: int = 3
 # Random words searched per round when running without --keyword-count.
 # Each round re-picks the random-word language, so batches rotate
-# languages; with 30 markets, 2 facets and up to 6 pages a word costs up
-# to ~360 search requests.
+# languages. A word is searched in the markets that speak its language
+# plus the US (English: every market); each market costs 2 facets x up
+# to 6 pages = 12 search requests per word.
 UNLIMITED_KEYWORD_BATCH: int = 10
 _SEARCH_TYPE_VIDEO: int = 1
 _SEARCH_TYPE_CHANNEL: int = 2
 
 
 # Prioritised markets (densest 10M-100M channel populations first),
-# as ``GL:hl`` pairs. Overridable via DISCOVER_MARKETS.
+# as ``GL:hl`` pairs. Overridable via DISCOVER_MARKETS. A country may
+# appear with several interface languages. After the first 30, each
+# market gives a language of scrape_exchange/youtube/subscriber_counts.py
+# a market of its own; am, fa, ky, mn, my and uz have none because
+# YouTube offers no location where they are the main language. The hl
+# codes are YouTube's own (Hebrew is 'iw').
 _DEFAULT_MARKETS: str = (
     'IN:hi, US:en, BR:pt, ID:id, MX:es, RU:ru, TR:tr, EG:ar, '
     'SA:ar, KR:ko, JP:ja, PH:fil, VN:vi, TH:th, PK:ur, BD:bn, '
     'NG:en, DE:de, GB:en, FR:fr, IT:it, ES:es, AR:es, CO:es, '
-    'PL:pl, UA:uk, DZ:ar, MA:ar, IQ:ar, TW:zh-TW'
+    'PL:pl, UA:uk, DZ:ar, MA:ar, IQ:ar, TW:zh-TW, '
+    'IN:te, IN:mr, IN:ta, IN:gu, IN:kn, IN:ml, IN:or, IN:pa, '
+    'IN:as, IN:en-IN, MY:ms, NL:nl, RO:ro, KE:sw, ZA:zu, ZA:af, '
+    'NP:ne, LK:si, KH:km, GR:el, CZ:cs, HU:hu, SE:sv, PT:pt-PT, '
+    'BY:be, AZ:az, KZ:kk, RS:sr, ME:sr-Latn, BG:bg, HK:zh-HK, '
+    'SG:zh-CN, IL:iw, DK:da, FI:fi, NO:no, SK:sk, HR:hr, BA:bs, '
+    'GE:ka, AM:hy, LA:lo, LT:lt, LV:lv, MK:mk, MK:sq, SI:sl, '
+    'EE:et, IS:is, ES:ca, ES:gl, ES:eu'
 )
+
+# Main languages spoken in each market country, as base language
+# codes (see _base_language). A word in a language is searched in the
+# markets of every country listed as speaking it, plus the US.
+_COUNTRY_LANGUAGES: dict[str, frozenset[str]] = {
+    gl: frozenset(langs.split()) for gl, langs in {
+        'AM': 'hy ru', 'AR': 'es', 'AZ': 'az', 'BA': 'bs hr sr',
+        'BD': 'bn', 'BG': 'bg', 'BR': 'pt', 'BY': 'be ru',
+        'CO': 'es', 'CZ': 'cs', 'DE': 'de', 'DK': 'da',
+        'DZ': 'ar fr', 'EE': 'et ru', 'EG': 'ar', 'ES': 'es ca gl eu',
+        'FI': 'fi sv', 'FR': 'fr', 'GB': 'en cy', 'GE': 'ka',
+        'GR': 'el', 'HK': 'zh en', 'HR': 'hr', 'HU': 'hu',
+        'ID': 'id', 'IL': 'he ar',
+        'IN': 'hi en bn te mr ta ur gu kn ml or pa as ne',
+        'IQ': 'ar', 'IS': 'is', 'IT': 'it', 'JP': 'ja',
+        'KE': 'sw en', 'KH': 'km', 'KR': 'ko', 'KZ': 'kk ru',
+        'LA': 'lo', 'LK': 'si ta', 'LT': 'lt', 'LV': 'lv ru',
+        'MA': 'ar fr', 'ME': 'sr', 'MK': 'mk sq', 'MX': 'es',
+        'MY': 'ms en zh ta', 'NG': 'en', 'NL': 'nl', 'NO': 'no',
+        'NP': 'ne', 'PH': 'fil en', 'PK': 'ur en pa', 'PL': 'pl',
+        'PT': 'pt', 'RO': 'ro', 'RS': 'sr', 'RU': 'ru', 'SA': 'ar',
+        'SE': 'sv', 'SG': 'en zh ms ta', 'SI': 'sl', 'SK': 'sk',
+        'TH': 'th', 'TR': 'tr', 'TW': 'zh', 'UA': 'uk ru',
+        'US': 'en es', 'VN': 'vi', 'ZA': 'en af zu',
+    }.items()
+}
+# Words in every language are also searched in this country.
+_ALWAYS_SEARCHED_COUNTRY: str = 'US'
+# Language codes that name the same language as another code.
+_LANGUAGE_ALIASES: dict[str, str] = {'iw': 'he', 'tl': 'fil'}
 
 
 def _encode_varint(value: int) -> bytes:
@@ -321,10 +368,11 @@ def _parse_subscriber_text(
 def _parse_markets(raw: str) -> list[tuple[str, str]]:
     '''Parse a ``GL:hl`` comma-separated market list into
     ``(gl, hl)`` pairs, preserving order and dropping invalid or
-    duplicate entries. An empty language defaults to ``en``.'''
+    duplicate entries. A country may appear with several languages.
+    An empty language defaults to ``en``.'''
 
     markets: list[tuple[str, str]] = []
-    seen: set[str] = set()
+    seen: set[tuple[str, str]] = set()
     for part in raw.split(','):
         token: str = part.strip()
         if not token:
@@ -332,11 +380,55 @@ def _parse_markets(raw: str) -> list[tuple[str, str]]:
         gl, _, hl = token.partition(':')
         gl = gl.strip().upper()
         hl = hl.strip() or 'en'
-        if len(gl) != 2 or not gl.isalpha() or gl in seen:
+        key: tuple[str, str] = (gl, hl.lower())
+        if len(gl) != 2 or not gl.isalpha() or key in seen:
             continue
-        seen.add(gl)
+        seen.add(key)
         markets.append((gl, hl))
     return markets
+
+
+def _base_language(code: str) -> str:
+    '''The base language of a language code: ``pt-br`` -> ``pt``,
+    ``zh-TW`` -> ``zh``, YouTube's ``iw`` -> ``he``.'''
+    base: str = code.strip().split('-')[0].split('_')[0].lower()
+    return _LANGUAGE_ALIASES.get(base, base)
+
+
+def markets_for_language(
+    markets: list[tuple[str, str]], language: str | None,
+) -> list[tuple[str, str]]:
+    '''The markets to search a word in *language* in, in priority
+    order.
+
+    English words and words of unknown language (``None``) are
+    searched in every market. Words in another language are searched
+    once in each country that speaks it (see ``_COUNTRY_LANGUAGES``,
+    or a market of the country using that interface language) and in
+    the US. Within a country, the market with the word's interface
+    language is used, otherwise the country's first market.'''
+
+    if language is None:
+        return list(markets)
+    base: str = _base_language(language)
+    if base == 'en':
+        return list(markets)
+    by_country: dict[str, list[tuple[str, str]]] = {}
+    for market in markets:
+        by_country.setdefault(market[0], []).append(market)
+    chosen: set[tuple[str, str]] = set()
+    for gl, country_markets in by_country.items():
+        matching: list[tuple[str, str]] = [
+            market for market in country_markets
+            if _base_language(market[1]) == base
+        ]
+        if (
+            matching
+            or base in _COUNTRY_LANGUAGES.get(gl, frozenset())
+            or gl == _ALWAYS_SEARCHED_COUNTRY
+        ):
+            chosen.add(matching[0] if matching else country_markets[0])
+    return [market for market in markets if market in chosen]
 
 
 @dataclass(frozen=True)
@@ -565,6 +657,25 @@ def _normalise_languages(raw: str) -> tuple[str, ...]:
     return langs or _DEFAULT_RANDOM_WORD_LANGUAGES
 
 
+def _terms_language(terms: list[str], language: str) -> str | None:
+    '''The language of *terms* fetched for *language*: ``None`` when
+    the lookup failed and they are all offline fallback words, which
+    are of mixed languages.'''
+    if terms and all(term in _OFFLINE_RANDOM_TERMS for term in terms):
+        return None
+    return language
+
+
+def pick_random_word_language(settings: DiscoverSearchSettings) -> str:
+    '''The random-word language of the next batch: the configured
+    ``random_word_language``, or one of ``random_word_languages``.'''
+    if settings.random_word_language:
+        return settings.random_word_language
+    return random.choice(
+        _normalise_languages(settings.random_word_languages),
+    )
+
+
 def _extract_word_from_random_payload(payload: Any) -> str | None:
     words = _extract_words_from_random_payload(payload)
     return words[0] if words else None
@@ -666,7 +777,7 @@ async def choose_random_search_terms(
         ) as client:
             if lang in _WIKIMEDIA_RANDOM_WORD_LANGUAGES:
                 url = _WIKIMEDIA_RANDOM_WORD_URL_TEMPLATE.format(
-                    language=lang,
+                    language=_WIKIMEDIA_EDITIONS.get(lang, lang),
                 )
                 params = {
                     'action': 'query',
@@ -1372,6 +1483,7 @@ async def _run_popular_discovery(
     settings: DiscoverSearchSettings,
     limiter: YouTubeRateLimiter,
     terms: list[str],
+    term_language: str | None = None,
 ) -> int:
     '''Run the market x term popularity-scoped discovery pass.
 
@@ -1379,14 +1491,17 @@ async def _run_popular_discovery(
     on one shared queue, processed by up to
     ``YOUTUBE_SEARCH_CONCURRENCY`` workers, each holding its own
     proxy (see :func:`_run_search_workers`). Jobs are queued in
-    market priority order. When Redis is configured, each job's
+    market priority order. *term_language* is the language of all
+    *terms*; it limits the markets searched (see
+    :func:`markets_for_language`), and ``None`` searches all of them.
+    When Redis is configured, each job's
     channels are enqueued on the channel scrape queue after the
     known/on-exchange dedupe. Channels are also written to
     ``--output-file`` only when it is set; SIGHUP reopens that file.
     '''
 
-    markets: list[tuple[str, str]] = _parse_markets(
-        settings.discover_markets,
+    markets: list[tuple[str, str]] = markets_for_language(
+        _parse_markets(settings.discover_markets), term_language,
     )
     creator_map, queue, redis = await _build_queue_backends(settings)
     continuations: int = settings.discover_popular_continuations
@@ -1459,6 +1574,7 @@ async def _run_popular_discovery(
     _LOGGER.info(
         'Popular discovery pass complete',
         extra={
+            'term_language': term_language,
             'markets': len(markets),
             'terms': len(terms),
             'totals': totals,
@@ -1741,29 +1857,39 @@ async def _run_discovery(settings: DiscoverSearchSettings) -> int:
     try:
         if terms:
             return await _run_popular_discovery(settings, limiter, terms)
+        language: str
         if settings.keyword_count is not None:
+            language = pick_random_word_language(settings)
             terms = await choose_random_search_terms(
                 settings,
                 count=settings.keyword_count,
-                random_word_language=settings.random_word_language,
+                random_word_language=language,
             )
-            return await _run_popular_discovery(settings, limiter, terms)
+            return await _run_popular_discovery(
+                settings, limiter, terms,
+                term_language=_terms_language(terms, language),
+            )
         discovery_round: int = 0
         while True:
             discovery_round += 1
+            language = pick_random_word_language(settings)
             terms = await choose_random_search_terms(
                 settings,
                 count=UNLIMITED_KEYWORD_BATCH,
-                random_word_language=settings.random_word_language,
+                random_word_language=language,
             )
             _LOGGER.info(
                 'Starting discovery round',
                 extra={
                     'discovery_round': discovery_round,
                     'terms': len(terms),
+                    'term_language': language,
                 },
             )
-            await _run_popular_discovery(settings, limiter, terms)
+            await _run_popular_discovery(
+                settings, limiter, terms,
+                term_language=_terms_language(terms, language),
+            )
     finally:
         await aclose_pooled_innertube()
         shutdown_innertube_executor()
