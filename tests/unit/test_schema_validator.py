@@ -6,7 +6,7 @@ import unittest
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from jsonschema.exceptions import SchemaError
+import jsonschema_rs
 
 from scrape_exchange.schema_validator import (
     SchemaValidator,
@@ -116,38 +116,47 @@ class TestSchemaValidatorValidate(unittest.TestCase):
         }
         self.assertIsNone(validator.validate(record))
 
-    def test_unconvertible_value_falls_back_to_jsonschema(
-        self,
-    ) -> None:
-        '''jsonschema-rs raises on Python types it cannot convert;
-        the record must get a verdict, not an exception.'''
+    def test_non_json_value_is_rejected_and_logged(self) -> None:
+        '''jsonschema-rs raises on Python values with no JSON
+        equivalent; the record must be rejected, not raise.'''
         validator: SchemaValidator = SchemaValidator(_SIMPLE_SCHEMA)
         record: dict = {
             'channel_id': datetime(2026, 1, 1, tzinfo=UTC),
             'channel_handle': 'somehandle',
             'url': 'https://www.youtube.com/@somehandle',
         }
-        msg: str | None = validator.validate(record)
+        with self.assertLogs(
+            'scrape_exchange.schema_validator', level='WARNING',
+        ):
+            msg: str | None = validator.validate(record)
         self.assertIsNotNone(msg)
-        self.assertTrue(msg.startswith('/channel_id: '), msg)
+        self.assertTrue(
+            msg.startswith('<root>: non-JSON value in record: '), msg,
+        )
 
-    def test_fallback_valid_record_returns_none(self) -> None:
+    def test_conversion_error_is_rejected(self) -> None:
         schema: dict = {
             '$schema': 'https://json-schema.org/draft/2020-12/schema',
             'type': 'object',
-            'properties': {'when': {}},
+            'properties': {'when': {}, 'n': {'type': 'integer'}},
         }
         validator: SchemaValidator = SchemaValidator(schema)
         rust_validator: MagicMock = MagicMock()
         rust_validator.is_valid.side_effect = ValueError(
-            'Unsupported type',
+            "Unsupported type: 'datetime'",
         )
-        with patch.object(validator, '_validator', rust_validator):
-            self.assertIsNone(validator.validate({'when': 1}))
-        rust_validator.is_valid.assert_called_once()
+        with (
+            patch.object(validator, '_validator', rust_validator),
+            self.assertLogs(
+                'scrape_exchange.schema_validator', level='WARNING',
+            ),
+        ):
+            msg: str | None = validator.validate({'when': 1})
+        self.assertIsNotNone(msg)
+        self.assertIn('datetime', msg)
 
-    def test_malformed_schema_raises_schema_error(self) -> None:
-        with self.assertRaises(SchemaError):
+    def test_malformed_schema_raises(self) -> None:
+        with self.assertRaises(jsonschema_rs.ValidationError):
             SchemaValidator({'type': 12})
 
 

@@ -23,7 +23,6 @@ from typing import TYPE_CHECKING
 
 import jsonschema_rs
 from httpx2 import Response
-from jsonschema import Draft202012Validator
 
 if TYPE_CHECKING:
     from .exchange_client import ExchangeClient
@@ -42,27 +41,19 @@ class SchemaValidator:
 
     Records are validated with the Rust ``jsonschema-rs`` validator,
     which is two orders of magnitude faster than the pure-Python
-    ``jsonschema`` one and dominated the uploader's CPU time. A record
-    holding a Python value ``jsonschema-rs`` cannot convert (e.g. a
-    ``datetime``) is validated with ``jsonschema`` instead, so such
-    records keep their previous verdict.
+    ``jsonschema`` one, which dominated the uploader's CPU time.
     '''
 
     def __init__(self, json_schema: dict) -> None:
         '''
-        Compile *json_schema* for draft 2020-12. Raises whatever
-        ``jsonschema.Draft202012Validator.check_schema`` raises if the
-        schema itself is malformed; callers should let that propagate
-        so the scraper fails fast at startup.
+        Compile *json_schema* for draft 2020-12. Raises
+        ``jsonschema_rs.ValidationError`` if the schema itself is
+        malformed; callers should let that propagate so the scraper
+        fails fast at startup.
         '''
-        Draft202012Validator.check_schema(json_schema)
-        self._json_schema: dict = json_schema
         self._validator: jsonschema_rs.Draft202012Validator = (
             jsonschema_rs.Draft202012Validator(json_schema)
         )
-        # Built on first use: only records jsonschema-rs rejects as
-        # unconvertible need it.
-        self._fallback: Draft202012Validator | None = None
 
     def validate(self, data: dict) -> str | None:
         '''
@@ -71,6 +62,11 @@ class SchemaValidator:
         ``"<json-pointer>: <message>"`` built from the first
         validation error (validators are deterministic in
         iteration order so this is stable across runs).
+
+        A record holding a Python value that has no JSON equivalent
+        (e.g. a ``datetime`` a model's ``to_dict()`` forgot to
+        convert) fails validation: that is a model bug, so it is
+        also logged as a warning.
         '''
         try:
             if self._validator.is_valid(data):
@@ -79,19 +75,12 @@ class SchemaValidator:
                 return _format_error(error.instance_path, error.message)
             return None
         except ValueError as exc:
-            _LOGGER.debug(
-                'Record has a value jsonschema-rs cannot convert, '
-                'validating with jsonschema',
-                extra={'error': repr(exc)},
+            _LOGGER.warning(
+                'Record holds a value with no JSON equivalent; '
+                'the model that built it did not convert it',
+                extra={'error': str(exc)},
             )
-        return self._validate_with_fallback(data)
-
-    def _validate_with_fallback(self, data: dict) -> str | None:
-        if self._fallback is None:
-            self._fallback = Draft202012Validator(self._json_schema)
-        for error in self._fallback.iter_errors(data):
-            return _format_error(error.absolute_path, error.message)
-        return None
+            return _format_error((), f'non-JSON value in record: {exc}')
 
 
 def _format_error(path: Iterable[str | int], message: str) -> str:

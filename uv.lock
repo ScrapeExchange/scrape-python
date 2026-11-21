@@ -2337,7 +2337,6 @@ dependencies = [
     { name = "httpx2", extra = ["http2"] },
     { name = "huggingface-hub" },
     { name = "innertube" },
-    { name = "jsonschema" },
     { name = "jsonschema-rs" },
     { name = "kagglehub" },
     { name = "orjson" },
@@ -2364,6 +2363,7 @@ migration = [
 dev = [
     { name = "coverage" },
     { name = "fakeredis", extra = ["lua", "probabilistic"] },
+    { name = "jsonschema" },
     { name = "ruff" },
     { name = "ty" },
 ]
@@ -2381,7 +2381,6 @@ requires-dist = [
     { name = "httpx2", extras = ["http2"], specifier = ">=2.15.1" },
     { name = "huggingface-hub", specifier = ">=2.2.0" },
     { name = "innertube", specifier = "==2.1.19" },
-    { name = "jsonschema", specifier = ">=4.26.0" },
     { name = "jsonschema-rs", specifier = ">=0.60.3,<0.61" },
     { name = "kagglehub", specifier = ">=1.0.2" },
     { name = "orjson", specifier = ">=3.13.0" },
@@ -2405,6 +2404,7 @@ provides-extras = ["migration"]
 dev = [
     { name = "coverage", specifier = ">=7.16.2" },
     { name = "fakeredis", extras = ["lua", "probabilistic"], specifier = ">=2.40.0" },
+    { name = "jsonschema", specifier = ">=4.26.0" },
     { name = "ruff", specifier = ">=0.17.1" },
     { name = "ty", specifier = ">=0.0.89" },
 ]

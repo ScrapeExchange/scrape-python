@@ -10,8 +10,8 @@ from pathlib import Path
 from typing import Any, TextIO
 
 import brotli
-from jsonschema import Draft202012Validator
-from jsonschema.exceptions import SchemaError, ValidationError
+import jsonschema_rs
+from jsonschema_rs import ValidationError
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -19,21 +19,28 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         schema: Any = _load_json_file(args.schema)
-        Draft202012Validator.check_schema(schema)
+        validator: jsonschema_rs.Draft202012Validator = (
+            jsonschema_rs.Draft202012Validator(schema)
+        )
     except OSError as exc:
         print(f'{args.schema}: failed to read schema: {exc}', file=sys.stderr)
         return 2
     except json.JSONDecodeError as exc:
         print(f'{args.schema}: invalid schema JSON: {exc}', file=sys.stderr)
         return 2
-    except SchemaError as exc:
+    except ValidationError as exc:
         print(
             f'{args.schema}: invalid JSON Schema: {exc.message}',
             file=sys.stderr,
         )
         return 2
+    except jsonschema_rs.ReferencingError as exc:
+        print(
+            f'{args.schema}: unresolvable JSON Schema reference: {exc}',
+            file=sys.stderr,
+        )
+        return 2
 
-    validator = Draft202012Validator(schema)
     inputs: list[str] = args.inputs or ['-']
     valid: bool = True
 
@@ -58,7 +65,7 @@ def main(argv: list[str] | None = None) -> int:
 
         errors: list[ValidationError] = sorted(
             validator.iter_errors(data),
-            key=lambda error: list(error.absolute_path),
+            key=lambda error: [str(p) for p in error.instance_path],
         )
         if errors:
             valid = False
@@ -104,7 +111,7 @@ def _load_input(input_name: str, stdin: TextIO) -> Any:
 
 
 def _format_error(error: ValidationError) -> str:
-    pointer: str = '/' + '/'.join(str(part) for part in error.absolute_path)
+    pointer: str = '/' + '/'.join(str(part) for part in error.instance_path)
     if pointer == '/':
         pointer = '<root>'
     return f'{pointer}: {error.message}'

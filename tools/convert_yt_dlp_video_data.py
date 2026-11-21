@@ -27,7 +27,7 @@ import sys
 import time
 from pathlib import Path
 
-from jsonschema import Draft202012Validator
+from jsonschema_rs import Draft202012Validator
 
 from scrape_exchange.brotli import brotli_write
 
