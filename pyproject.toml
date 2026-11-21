@@ -39,6 +39,7 @@ dependencies = [
     "playwright==1.51.0",
     "camoufox[geoip]>=0.4.11,<0.5",
     "bgutil-ytdlp-pot-provider==1.3.1",
+    "jsonschema-rs>=0.60.3,<0.61",
 ]
 
 [project.scripts]

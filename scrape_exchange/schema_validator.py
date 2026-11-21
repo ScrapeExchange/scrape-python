@@ -17,12 +17,13 @@ call-site context (filename, content_id, etc.).
 '''
 
 import logging
+from collections.abc import Iterable
 from logging import Logger
 from typing import TYPE_CHECKING
 
+import jsonschema_rs
 from httpx2 import Response
 from jsonschema import Draft202012Validator
-from jsonschema.exceptions import ValidationError
 
 if TYPE_CHECKING:
     from .exchange_client import ExchangeClient
@@ -38,41 +39,66 @@ class SchemaValidator:
     Compiled JSON-Schema validator for one
     ``(owner, platform, entity, version)`` tuple. Pure predicate;
     holds no I/O state.
+
+    Records are validated with the Rust ``jsonschema-rs`` validator,
+    which is two orders of magnitude faster than the pure-Python
+    ``jsonschema`` one and dominated the uploader's CPU time. A record
+    holding a Python value ``jsonschema-rs`` cannot convert (e.g. a
+    ``datetime``) is validated with ``jsonschema`` instead, so such
+    records keep their previous verdict.
     '''
 
     def __init__(self, json_schema: dict) -> None:
         '''
-        Compile *json_schema* with
-        :class:`jsonschema.Draft202012Validator`. Raises whatever
-        ``Draft202012Validator.check_schema`` raises if the schema
-        itself is malformed; callers should let that propagate so
-        the scraper fails fast at startup.
+        Compile *json_schema* for draft 2020-12. Raises whatever
+        ``jsonschema.Draft202012Validator.check_schema`` raises if the
+        schema itself is malformed; callers should let that propagate
+        so the scraper fails fast at startup.
         '''
         Draft202012Validator.check_schema(json_schema)
-        self._validator: Draft202012Validator = Draft202012Validator(
-            json_schema,
+        self._json_schema: dict = json_schema
+        self._validator: jsonschema_rs.Draft202012Validator = (
+            jsonschema_rs.Draft202012Validator(json_schema)
         )
+        # Built on first use: only records jsonschema-rs rejects as
+        # unconvertible need it.
+        self._fallback: Draft202012Validator | None = None
 
     def validate(self, data: dict) -> str | None:
         '''
         Return ``None`` when *data* validates. On failure, return a
         short human-readable string of the form
         ``"<json-pointer>: <message>"`` built from the first
-        ``ValidationError`` (validators are deterministic in
+        validation error (validators are deterministic in
         iteration order so this is stable across runs).
         '''
-        for error in self._validator.iter_errors(data):
-            return _format_error(error)
+        try:
+            if self._validator.is_valid(data):
+                return None
+            for error in self._validator.iter_errors(data):
+                return _format_error(error.instance_path, error.message)
+            return None
+        except ValueError as exc:
+            _LOGGER.debug(
+                'Record has a value jsonschema-rs cannot convert, '
+                'validating with jsonschema',
+                extra={'error': repr(exc)},
+            )
+        return self._validate_with_fallback(data)
+
+    def _validate_with_fallback(self, data: dict) -> str | None:
+        if self._fallback is None:
+            self._fallback = Draft202012Validator(self._json_schema)
+        for error in self._fallback.iter_errors(data):
+            return _format_error(error.absolute_path, error.message)
         return None
 
 
-def _format_error(error: ValidationError) -> str:
-    pointer: str = '/' + '/'.join(
-        str(p) for p in error.absolute_path
-    )
+def _format_error(path: Iterable[str | int], message: str) -> str:
+    pointer: str = '/' + '/'.join(str(p) for p in path)
     if pointer == '/':
         pointer = '<root>'
-    return f'{pointer}: {error.message}'
+    return f'{pointer}: {message}'
 
 
 async def fetch_schema_dict(

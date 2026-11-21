@@ -3,13 +3,15 @@ Unit tests for ``scrape_exchange.schema_validator``.
 '''
 
 import unittest
-from unittest.mock import AsyncMock, MagicMock
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from jsonschema.exceptions import SchemaError
 
 from scrape_exchange.schema_validator import (
     SchemaValidator,
     fetch_schema_dict,
 )
-
 
 _SIMPLE_SCHEMA: dict = {
     '$schema': 'https://json-schema.org/draft/2020-12/schema',
@@ -75,6 +77,78 @@ class TestSchemaValidatorValidate(unittest.TestCase):
         msg: str | None = validator.validate(record)
         self.assertIsNotNone(msg)
         self.assertIn('unknown_field', msg)
+
+    def test_root_error_uses_root_pointer(self) -> None:
+        validator: SchemaValidator = SchemaValidator(_SIMPLE_SCHEMA)
+        msg: str | None = validator.validate({})
+        self.assertIsNotNone(msg)
+        self.assertTrue(msg.startswith('<root>: '), msg)
+
+    def test_nested_error_pointer(self) -> None:
+        schema: dict = {
+            '$schema': 'https://json-schema.org/draft/2020-12/schema',
+            'type': 'object',
+            'properties': {
+                'items': {
+                    'type': 'array',
+                    'items': {
+                        'type': 'object',
+                        'properties': {'n': {'type': 'integer'}},
+                    },
+                },
+            },
+        }
+        validator: SchemaValidator = SchemaValidator(schema)
+        msg: str | None = validator.validate(
+            {'items': [{'n': 1}, {'n': 'x'}]},
+        )
+        self.assertIsNotNone(msg)
+        self.assertTrue(msg.startswith('/items/1/n: '), msg)
+
+    def test_formats_are_not_asserted(self) -> None:
+        '''Draft 2020-12 treats ``format`` as an annotation; the
+        previous validator did not check it either.'''
+        validator: SchemaValidator = SchemaValidator(_SIMPLE_SCHEMA)
+        record: dict = {
+            'channel_id': 'UC1234567890abcdefghij',
+            'channel_handle': 'somehandle',
+            'url': 'not a uri',
+        }
+        self.assertIsNone(validator.validate(record))
+
+    def test_unconvertible_value_falls_back_to_jsonschema(
+        self,
+    ) -> None:
+        '''jsonschema-rs raises on Python types it cannot convert;
+        the record must get a verdict, not an exception.'''
+        validator: SchemaValidator = SchemaValidator(_SIMPLE_SCHEMA)
+        record: dict = {
+            'channel_id': datetime(2026, 1, 1, tzinfo=UTC),
+            'channel_handle': 'somehandle',
+            'url': 'https://www.youtube.com/@somehandle',
+        }
+        msg: str | None = validator.validate(record)
+        self.assertIsNotNone(msg)
+        self.assertTrue(msg.startswith('/channel_id: '), msg)
+
+    def test_fallback_valid_record_returns_none(self) -> None:
+        schema: dict = {
+            '$schema': 'https://json-schema.org/draft/2020-12/schema',
+            'type': 'object',
+            'properties': {'when': {}},
+        }
+        validator: SchemaValidator = SchemaValidator(schema)
+        rust_validator: MagicMock = MagicMock()
+        rust_validator.is_valid.side_effect = ValueError(
+            'Unsupported type',
+        )
+        with patch.object(validator, '_validator', rust_validator):
+            self.assertIsNone(validator.validate({'when': 1}))
+        rust_validator.is_valid.assert_called_once()
+
+    def test_malformed_schema_raises_schema_error(self) -> None:
+        with self.assertRaises(SchemaError):
+            SchemaValidator({'type': 12})
 
 
 class TestFetchSchemaDict(unittest.IsolatedAsyncioTestCase):
