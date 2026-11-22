@@ -168,8 +168,8 @@ class _ChildSlot:
     # Set while this child is stopping for a proxy reload: the time
     # by which it must have exited before it is killed.
     reload_deadline: float | None = None
-    # Number of proxies this child was given at startup; a proxy
-    # reload refills its slice up to this size.
+    # Number of proxies this child should have: its startup slice
+    # size, recomputed on each proxy reload of a split pool.
     proxy_target: int = 0
     # Set when a proxy reload left this child without proxies: it is
     # stopped and only started again when proxies become available.
@@ -690,9 +690,10 @@ def reassign_proxy_slices(
 ) -> list[list[str]]:
     '''
     Fit the per-child proxy *slices* to a new proxy list: each slice
-    keeps its proxies that are still listed and is topped up to its
-    *target* size with randomly chosen proxies that no slice uses, so
-    a child whose proxies all survived keeps its exact slice.
+    keeps its proxies that are still listed, up to its *target* size,
+    and is topped up to that size with randomly chosen proxies that
+    no slice uses, so a child whose proxies all survived and whose
+    target did not change keeps its exact slice.
 
     :param slices: the current proxies of each child
     :param targets: the number of proxies each child should have
@@ -705,7 +706,8 @@ def reassign_proxy_slices(
 
     listed: set[str] = set(proxies)
     kept: list[list[str]] = [
-        [p for p in chunk if p in listed] for chunk in slices
+        [p for p in chunk if p in listed][:target]
+        for chunk, target in zip(slices, targets)
     ]
     in_use: set[str] = {p for chunk in kept for p in chunk}
     spare: list[str] = [p for p in proxies if p not in in_use]
@@ -720,6 +722,42 @@ def reassign_proxy_slices(
     return result
 
 
+def rebalanced_proxy_targets(
+    slices: list[list[str]], proxies: list[str],
+) -> list[int]:
+    '''
+    The number of proxies each child should have after a proxy
+    reload: the new list spread evenly over the children, as at
+    startup, so added proxies are put to use and a shorter list
+    shrinks every slice. The children left with the most of their
+    current proxies get the larger shares, so a slice whose proxies
+    all survived is not trimmed just to even out the sizes.
+
+    :param slices: the current proxies of each child
+    :param proxies: the new proxy list
+    :returns: the target size of each child's slice, in slot order
+    :raises: (none)
+    '''
+
+    if not slices:
+        return []
+    listed: set[str] = set(proxies)
+    kept_sizes: list[int] = [
+        sum(1 for p in chunk if p in listed) for chunk in slices
+    ]
+    base: int
+    extra: int
+    base, extra = divmod(len(proxies), len(slices))
+    # Stable sort: ties go to the lower slot index.
+    order: list[int] = sorted(
+        range(len(slices)), key=lambda i: -kept_sizes[i],
+    )
+    targets: list[int] = [base] * len(slices)
+    for i in order[:extra]:
+        targets[i] = base + 1
+    return targets
+
+
 def _schedule_proxy_reload(
     scraper_label: str, slots: list[_ChildSlot], proxies: list[str],
     split_proxy_pool: bool, now: float,
@@ -732,11 +770,11 @@ def _schedule_proxy_reload(
 
     new_slices: list[list[str]]
     if split_proxy_pool:
-        new_slices = reassign_proxy_slices(
-            [_slot_proxies(slot) for slot in slots],
-            [slot.proxy_target for slot in slots],
-            proxies,
-        )
+        current: list[list[str]] = [_slot_proxies(slot) for slot in slots]
+        targets: list[int] = rebalanced_proxy_targets(current, proxies)
+        new_slices = reassign_proxy_slices(current, targets, proxies)
+        for slot, target in zip(slots, targets):
+            slot.proxy_target = target
     else:
         new_slices = [list(proxies) for _ in slots]
     marked: int = 0
