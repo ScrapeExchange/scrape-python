@@ -19,7 +19,11 @@ import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
-from scrape_exchange.proxy_loader import ProxyCatalog, load_proxy_catalog
+from scrape_exchange.proxy_loader import (
+    ProxyCatalog,
+    load_proxy_catalog,
+    set_active_catalog,
+)
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -133,6 +137,9 @@ class ProxyFileWatcher:
                 extra={'proxy_files': [str(p) for p in self._paths]},
             )
             return None
+        # Label the proxies by the files they are in now, so the
+        # supervisor passes the right PROXY_SOURCES to its children.
+        set_active_catalog(catalog)
         if set(catalog.entries) == set(self._baseline):
             return None
         added: int = len(set(catalog.entries) - set(self._baseline))

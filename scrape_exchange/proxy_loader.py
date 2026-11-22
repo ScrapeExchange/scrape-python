@@ -226,17 +226,39 @@ def load_proxy_catalog(paths: Sequence[Path]) -> ProxyCatalog:
     return ProxyCatalog(entries=entries, source=source)
 
 
+# Comma-separated proxy_file labels, one per PROXIES entry, that a
+# supervisor passes to its children so they label each proxy with the
+# file it came from instead of 'env'.
+PROXY_SOURCES_ENV_VAR: Final[str] = 'PROXY_SOURCES'
+
+
 def load_proxy_entries(
     entries: Sequence[str],
     *,
     label: str = 'env',
+    labels: Sequence[str] | None = None,
 ) -> ProxyCatalog:
     """Parse direct proxy entries from an environment variable.
 
     Used for supervisor-spawned workers, where the parent has already
     read ``PROXY_FILES`` and passes a comma-separated proxy slice via
     ``PROXIES``.
+
+    :param label: the proxy_file label of every entry when *labels*
+        is not given
+    :param labels: the proxy_file label of each entry, in the same
+        order (``PROXY_SOURCES``); ignored with a warning when it does
+        not have one label per entry. An empty label falls back to
+        *label*.
     """
+
+    if labels is not None and len(labels) != len(entries):
+        _LOGGER.warning(
+            'proxy_loader: %d proxy source labels for %d PROXIES '
+            'entries; labelling all as %r',
+            len(labels), len(entries), label,
+        )
+        labels = None
 
     parsed: list[str] = []
     source: dict[str, str] = {}
@@ -255,7 +277,10 @@ def load_proxy_entries(
             dup_count += 1
             continue
         parsed.append(canonical)
-        source[canonical] = label
+        entry_label: str = (
+            labels[index - 1].strip() if labels is not None else ''
+        )
+        source[canonical] = entry_label or label
     if dup_count:
         _LOGGER.info(
             'proxy_loader: dropped %d duplicate entries from PROXIES',
@@ -289,6 +314,13 @@ def proxy_file_label(entry: str) -> str:
     entry isn't in the active catalog."""
 
     return _ACTIVE_CATALOG.source.get(entry, 'none')
+
+
+def proxy_sources_env(entries: Sequence[str]) -> str:
+    """The ``PROXY_SOURCES`` value for a ``PROXIES`` slice: the
+    proxy_file label of each entry in the active catalog."""
+
+    return ','.join(proxy_file_label(entry) for entry in entries)
 
 
 def httpx_client_for_entry(
