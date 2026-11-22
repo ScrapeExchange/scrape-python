@@ -27,6 +27,7 @@ from scrape_exchange.scraper_supervisor import (
     SupervisorConfig,
     _ChildSlot,
     reassign_proxy_slices,
+    rebalanced_proxy_targets,
     spawn_children,
     supervise_children,
 )
@@ -321,6 +322,36 @@ class TestSupervisorProxyReload(unittest.TestCase):
         self.assertEqual(self.spawned, [])
         self.assertTrue(slots[1].no_proxies)
 
+    def test_split_pool_added_proxies_are_used(self) -> None:
+        a: str = 'http://slice1.test:1'
+        b: str = 'http://slice2.test:1'
+        c: str = 'http://slice3.test:1'
+        d: str = 'http://slice4.test:1'
+        first: _ReloadableProcess = _ReloadableProcess(1)
+        second: _ReloadableProcess = _ReloadableProcess(2)
+        slots: list[_ChildSlot] = [
+            self._slot(1, first, [a]), self._slot(2, second, [b]),
+        ]
+        # c and d are added: each child keeps its proxy, gets one of
+        # the new ones and restarts once.
+        self._run(
+            slots, _FakeWatcher([a, b, c, d], on_poll=1), 8,
+            split=True,
+        )
+        self.assertEqual(first.signals, [signal.SIGTERM])
+        self.assertEqual(second.signals, [signal.SIGTERM])
+        slices: dict[int, list[str]] = {
+            instance: env['PROXIES'].split(',')
+            for instance, env in self.spawned
+        }
+        self.assertEqual(sorted(slices), [1, 2])
+        self.assertEqual(slices[1][0], a)
+        self.assertEqual(slices[2][0], b)
+        self.assertEqual(
+            sorted(slices[1][1:] + slices[2][1:]), [c, d],
+        )
+        self.assertEqual([s.proxy_target for s in slots], [2, 2])
+
     def test_no_change_no_restart(self) -> None:
         proc: _ReloadableProcess = _ReloadableProcess(1)
         self._run(
@@ -372,6 +403,63 @@ class TestReassignProxySlices(unittest.TestCase):
             [['a'], ['b']], [1, 1], ['a'],
         )
         self.assertEqual(result, [['a'], []])
+
+
+class TestRebalancedProxyTargets(unittest.TestCase):
+
+    def test_unchanged_list_keeps_sizes(self) -> None:
+        self.assertEqual(
+            rebalanced_proxy_targets(
+                [['a', 'b'], ['c']], ['a', 'b', 'c'],
+            ),
+            [2, 1],
+        )
+
+    def test_added_proxies_raise_targets(self) -> None:
+        self.assertEqual(
+            rebalanced_proxy_targets(
+                [['a'], ['b']], ['a', 'b', 'c', 'd', 'e'],
+            ),
+            [3, 2],
+        )
+
+    def test_larger_share_goes_to_child_with_most_kept(self) -> None:
+        # b is removed: child 1 now keeps fewer proxies than child 2,
+        # so child 2 gets the larger share and is not trimmed.
+        self.assertEqual(
+            rebalanced_proxy_targets(
+                [['a', 'b'], ['c', 'd'], ['e']],
+                ['a', 'c', 'd', 'e'],
+            ),
+            [1, 2, 1],
+        )
+
+    def test_shorter_list_shrinks_targets(self) -> None:
+        self.assertEqual(
+            rebalanced_proxy_targets([['a', 'b', 'c'], ['d']], ['a']),
+            [1, 0],
+        )
+
+    def test_no_slots(self) -> None:
+        self.assertEqual(rebalanced_proxy_targets([], ['a']), [])
+
+
+class TestReassignTrimsToTarget(unittest.TestCase):
+
+    def test_over_target_slice_gives_proxies_to_short_one(
+        self,
+    ) -> None:
+        # Child 2 lost its proxies; child 1 is trimmed to its new
+        # target and the freed proxies refill child 2.
+        current: list[list[str]] = [['a', 'b', 'c', 'd'], ['e', 'f']]
+        proxies: list[str] = ['a', 'b', 'c', 'd']
+        targets: list[int] = rebalanced_proxy_targets(current, proxies)
+        self.assertEqual(targets, [2, 2])
+        result: list[list[str]] = reassign_proxy_slices(
+            current, targets, proxies, rng=random.Random(3),
+        )
+        self.assertEqual(result[0], ['a', 'b'])
+        self.assertEqual(sorted(result[1]), ['c', 'd'])
 
 
 class TestSplitChildrenUseTheirSlice(unittest.TestCase):

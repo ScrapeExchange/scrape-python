@@ -55,6 +55,9 @@ from scrape_exchange.scraper_runner import (
     ScraperRunContext,
     ScraperRunner,
 )
+from scrape_exchange.scraper_supervisor import (
+    split_child_concurrency,
+)
 from scrape_exchange.settings import normalize_log_level
 from scrape_exchange.http_timeouts import (
     HTTP_CONNECT_TIMEOUT,
@@ -2981,10 +2984,10 @@ def main() -> None:
         scraper_label='rss',
         platform='youtube',
         num_processes=settings.rss_num_processes,
-        concurrency=max(
+        concurrency=split_child_concurrency(
             settings.rss_concurrency,
             len(settings.proxies),
-            1,
+            settings.rss_num_processes,
         ),
         metrics_port=settings.metrics_port,
         log_file=settings.rss_log_file,
@@ -2995,6 +2998,10 @@ def main() -> None:
                 redis_dsn=s.redis_dsn,
             )
         ),
+        # Each child gets a disjoint slice of the proxies instead of
+        # the full pool, which made every child run len(proxies)
+        # tasks whatever RSS_CONCURRENCY said.
+        split_proxy_pool=True,
     )
     sys.exit(runner.run_sync(_run_worker))
 

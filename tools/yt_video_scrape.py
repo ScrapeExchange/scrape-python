@@ -66,6 +66,9 @@ from scrape_exchange.scraper_runner import (
     ScraperRunContext,
     ScraperRunner,
 )
+from scrape_exchange.scraper_supervisor import (
+    split_child_concurrency,
+)
 from scrape_exchange.rate_limiter import RateLimitWaitExceeded
 from scrape_exchange.youtube.youtube_rate_limiter import (
     YouTubeCallType,
@@ -1552,16 +1555,21 @@ def main() -> None:
         scraper_label='video',
         platform='youtube',
         num_processes=settings.video_num_processes,
-        concurrency=max(
+        concurrency=split_child_concurrency(
             settings.video_concurrency,
             len(settings.proxies),
-            1,
+            settings.video_num_processes,
         ),
         metrics_port=settings.metrics_port,
         log_file=settings.video_log_file,
         log_level=settings.video_log_level,
         rate_limiter_factory=_build_video_rate_limiter,
         client_required=False,
+        # Each child gets a disjoint slice of the proxies. With the
+        # full pool in every child, the one-consumer-per-proxy floor
+        # in _run_worker ran len(proxies) tasks per child (about
+        # 1 GB RSS each), whatever VIDEO_CONCURRENCY said.
+        split_proxy_pool=True,
     )
     sys.exit(runner.run_sync(_run_worker))
 
