@@ -2,73 +2,76 @@
 
 Scrape duration metrics should show how long YouTube (or another
 platform) takes to answer, not how long a worker waited for a
-rate-limiter token or slept between retries. Waits are recorded as
-wall-clock intervals:
+rate-limiter token or slept between retries. Code that waits wraps the
+wait in :func:`waiting`:
 
-* :meth:`RateLimiter.acquire` records its whole duration (per-proxy
-  lock, token sleeps, jitter).
+* :meth:`RateLimiter.acquire` counts as one wait (per-proxy lock,
+  token sleeps, jitter).
 * :func:`tracked_sleep` replaces ``asyncio.sleep`` for retry and
   penalty backoff inside a timed scrape.
 
-A :class:`ScrapeTimer` subtracts the waits recorded since it started.
+A :class:`ScrapeTimer` subtracts the waiting done since it started.
 Each asyncio task gets its own tracker the first time it starts a
-timer; tasks it creates afterwards (for example the transcript fetch
-that runs alongside NEXT) inherit that tracker, so their waits count
-too. Waits that overlap are counted once.
+timer. Tasks it creates afterwards inherit that tracker, so their
+waits count too (for example the transcript fetch that runs alongside
+NEXT). A task that starts its own timer gets a tracker linked to the
+one it inherited, and passes its waits up, so a channel scrape still
+sees the waits of the tab scrapes it runs in child tasks.
+
+A tracker counts the waits in progress and adds to its total when the
+count drops back to zero, so overlapping waits are counted once and a
+tracker keeps no history: memory stays constant however long a worker
+task lives.
 '''
 
 import asyncio
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Self
-
-# Intervals that ended longer ago than this are dropped. No timed
-# scrape runs this long, so pruning never loses a wait that matters.
-_RETENTION_SECONDS: float = 7200.0
-
-
-@dataclass
-class _WaitTracker:
-    '''Wait intervals recorded by one asyncio task and its children.'''
-
-    owner: asyncio.Task | None
-    intervals: list[tuple[float, float]] = field(default_factory=list)
-
-    def add(self, start: float, end: float) -> None:
-        if end <= start:
-            return
-        cutoff: float = end - _RETENTION_SECONDS
-        if self.intervals and self.intervals[0][1] < cutoff:
-            self.intervals = [
-                iv for iv in self.intervals if iv[1] >= cutoff
-            ]
-        self.intervals.append((start, end))
-
-    def waited_between(self, start: float, end: float) -> float:
-        '''Seconds within [start, end] covered by any wait interval.'''
-        clipped: list[tuple[float, float]] = sorted(
-            (max(s, start), min(e, end))
-            for s, e in self.intervals
-            if e > start and s < end
-        )
-        total: float = 0.0
-        cur_start: float | None = None
-        cur_end: float = 0.0
-        for s, e in clipped:
-            if cur_start is None or s > cur_end:
-                if cur_start is not None:
-                    total += cur_end - cur_start
-                cur_start, cur_end = s, e
-            elif e > cur_end:
-                cur_end = e
-        if cur_start is not None:
-            total += cur_end - cur_start
-        return total
 
 
 def _now() -> float:
     return time.monotonic()
+
+
+@dataclass
+class _WaitTracker:
+    '''Running total of the time one asyncio task (and the tasks it
+    created) spent waiting.'''
+
+    owner: asyncio.Task | None
+    parent: _WaitTracker | None = None
+    # Number of waits in progress, and when the current run of
+    # overlapping waits began.
+    in_progress: int = 0
+    run_started: float = 0.0
+    # Seconds of waiting in finished runs.
+    total: float = 0.0
+
+    def begin(self, now: float) -> None:
+        if self.in_progress == 0:
+            self.run_started = now
+        self.in_progress += 1
+
+    def end(self, now: float) -> None:
+        self.in_progress -= 1
+        if self.in_progress == 0:
+            self.total += now - self.run_started
+
+    def waited_until(self, now: float) -> float:
+        '''Seconds of waiting so far, including a run in progress.'''
+        if self.in_progress:
+            return self.total + (now - self.run_started)
+        return self.total
+
+    def chain(self) -> Iterator[_WaitTracker]:
+        tracker: _WaitTracker | None = self
+        while tracker is not None:
+            yield tracker
+            tracker = tracker.parent
 
 
 _TRACKER: ContextVar[_WaitTracker | None] = ContextVar(
@@ -83,23 +86,32 @@ def _current_task() -> asyncio.Task | None:
         return None
 
 
-def record_wait(start: float, end: float) -> None:
-    '''Record that the current task waited from *start* to *end*
-    (``time.monotonic`` values). A no-op when no timer is running in
-    this task or a parent task.'''
+@contextmanager
+def waiting() -> Iterator[None]:
+    '''Count the time spent in the block as waiting, for the timers
+    of the current task and the tasks above it. A no-op when no timer
+    has been started in this task or a parent task.'''
     tracker: _WaitTracker | None = _TRACKER.get()
-    if tracker is not None:
-        tracker.add(start, end)
+    if tracker is None:
+        yield
+        return
+    trackers: list[_WaitTracker] = list(tracker.chain())
+    started: float = _now()
+    for t in trackers:
+        t.begin(started)
+    try:
+        yield
+    finally:
+        ended: float = _now()
+        for t in trackers:
+            t.end(ended)
 
 
 async def tracked_sleep(seconds: float) -> None:
     '''``asyncio.sleep`` that counts as waiting, for retry and
     penalty backoff inside a timed scrape.'''
-    start: float = _now()
-    try:
+    with waiting():
         await asyncio.sleep(seconds)
-    finally:
-        record_wait(start, _now())
 
 
 @dataclass
@@ -108,6 +120,8 @@ class ScrapeTimer:
 
     started: float
     tracker: _WaitTracker
+    # The tracker's waiting total when the timer started.
+    waited_at_start: float
 
     @classmethod
     def start(cls) -> Self:
@@ -116,9 +130,13 @@ class ScrapeTimer:
         task: asyncio.Task | None = _current_task()
         tracker: _WaitTracker | None = _TRACKER.get()
         if tracker is None or tracker.owner is not task:
-            tracker = _WaitTracker(owner=task)
+            tracker = _WaitTracker(owner=task, parent=tracker)
             _TRACKER.set(tracker)
-        return cls(started=_now(), tracker=tracker)
+        now: float = _now()
+        return cls(
+            started=now, tracker=tracker,
+            waited_at_start=tracker.waited_until(now),
+        )
 
     def elapsed(self) -> float:
         '''Wall-clock seconds since the timer started.'''
@@ -127,15 +145,14 @@ class ScrapeTimer:
     def waited(self) -> float:
         '''Seconds since the timer started spent waiting for
         rate-limiter tokens or in backoff sleeps.'''
-        return self.tracker.waited_between(
-            self.started, _now(),
+        return (
+            self.tracker.waited_until(_now()) - self.waited_at_start
         )
 
     def active(self) -> float:
         '''Seconds since the timer started, not counting waits.'''
         now: float = _now()
-        return max(
-            0.0,
-            now - self.started
-            - self.tracker.waited_between(self.started, now),
+        waited: float = (
+            self.tracker.waited_until(now) - self.waited_at_start
         )
+        return max(0.0, now - self.started - waited)
