@@ -28,6 +28,7 @@ from scrape_exchange.scraper_supervisor import (
     publish_config_metrics,
     proxy_pool_for_children,
     random_proxy_subset,
+    split_child_concurrency,
     spawn_children,
     split_proxies,
 )
@@ -140,6 +141,26 @@ class TestDistributeTotalConcurrency(unittest.TestCase):
             distribute_total_concurrency(0, 2)
         with self.assertRaises(ValueError):
             distribute_total_concurrency(2, 0)
+
+
+class TestSplitChildConcurrency(unittest.TestCase):
+
+    def test_configured_wins_over_small_slice(self) -> None:
+        # 166 proxies over 12 children: slices of at most 14.
+        self.assertEqual(split_child_concurrency(32, 166, 12), 32)
+
+    def test_slice_wins_over_small_configured(self) -> None:
+        # 166 proxies over 3 children: slices of at most 56.
+        self.assertEqual(split_child_concurrency(32, 166, 3), 56)
+
+    def test_single_process_uses_whole_pool(self) -> None:
+        self.assertEqual(split_child_concurrency(32, 96, 1), 96)
+
+    def test_more_processes_than_proxies(self) -> None:
+        self.assertEqual(split_child_concurrency(1, 3, 12), 1)
+
+    def test_no_proxies(self) -> None:
+        self.assertEqual(split_child_concurrency(0, 0, 4), 1)
 
 
 class TestRandomProxySubset(unittest.TestCase):
@@ -363,6 +384,36 @@ class TestSpawnChildrenEnv(unittest.TestCase):
         self.assertEqual(
             [env[PUBLISHER_ENV_VAR] for env in envs], ['1', '1', '1'],
         )
+
+    def test_split_pool_blanks_proxy_files(self) -> None:
+        config: SupervisorConfig = self._make_config()
+        config.split_proxy_pool = True
+        env: dict[str, str] = {
+            'PROXY_FILES': '/data/proxies/a.lst',
+            'CHANNEL_PROXY_FILES': '/data/proxies/b.lst',
+        }
+        with patch.dict(os.environ, env):
+            envs: list[dict[str, str]] = self._capture_envs(
+                config, [['http://a'], ['http://b'], ['http://c']],
+            )
+        for child_env in envs:
+            self.assertEqual(child_env['PROXY_FILES'], '')
+            self.assertEqual(child_env['CHANNEL_PROXY_FILES'], '')
+
+    def test_shared_pool_keeps_proxy_files(self) -> None:
+        config: SupervisorConfig = self._make_config()
+        pool: list[str] = ['http://a', 'http://b', 'http://c']
+        with patch.dict(
+            os.environ, {'PROXY_FILES': '/data/proxies/a.lst'},
+        ):
+            envs: list[dict[str, str]] = self._capture_envs(
+                config, [pool, pool, pool],
+            )
+        for child_env in envs:
+            self.assertEqual(
+                child_env['PROXY_FILES'], '/data/proxies/a.lst',
+            )
+            self.assertNotIn('CHANNEL_PROXY_FILES', child_env)
 
     def test_dev_stdout_log_file_is_not_suffixed(self) -> None:
         '''

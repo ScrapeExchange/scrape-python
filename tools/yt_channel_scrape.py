@@ -81,6 +81,9 @@ from scrape_exchange.scraper_runner import (
     ScraperRunContext,
     ScraperRunner,
 )
+from scrape_exchange.scraper_supervisor import (
+    split_child_concurrency,
+)
 from scrape_exchange.settings import normalize_log_level
 from scrape_exchange.util import (
     extract_proxy_ip,
@@ -1057,16 +1060,20 @@ def main() -> None:
         scraper_label='channel',
         platform='youtube',
         num_processes=(settings.channel_num_processes),
-        concurrency=max(
+        concurrency=split_child_concurrency(
             settings.channel_concurrency,
             len(settings.proxies),
-            1,
+            settings.channel_num_processes,
         ),
         metrics_port=settings.metrics_port,
         log_file=settings.channel_log_file,
         log_level=settings.channel_log_level,
         rate_limiter_factory=_build_channel_rate_limiter,
         client_required=False,
+        # Each child gets a disjoint slice of the proxies instead of
+        # the full pool, which made every child run len(proxies)
+        # tasks whatever CHANNEL_CONCURRENCY said.
+        split_proxy_pool=True,
     )
     sys.exit(runner.run_sync(_run_worker))
 

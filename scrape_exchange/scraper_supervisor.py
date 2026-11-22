@@ -378,6 +378,24 @@ def proxy_pool_for_children(
     return [list(proxies) for _ in range(n)]
 
 
+def split_child_concurrency(
+    configured: int, proxy_count: int, num_processes: int,
+) -> int:
+    '''
+    The concurrency of one split-pool child that runs at least one
+    task per proxy in its slice. The supervisor publishes this so
+    its gauge matches what each child runs.
+
+    :param configured: the scraper's configured concurrency
+    :param proxy_count: number of proxies before the split
+    :param num_processes: number of child processes requested
+    :returns: the per-child concurrency
+    '''
+    children: int = max(1, min(num_processes, proxy_count))
+    slice_size: int = -(-proxy_count // children)
+    return max(configured, slice_size, 1)
+
+
 def distribute_total_concurrency(total: int, n: int) -> list[int]:
     '''Split a total concurrency limit across child processes.'''
     if total <= 0:
@@ -450,7 +468,12 @@ def spawn_children(
         if config.split_proxy_pool:
             # PROXY_FILES takes precedence over PROXIES in the
             # child's settings; blank it so the child uses its slice.
+            # A scraper-specific override (e.g. RSS_PROXY_FILES)
+            # would reload the full pool too.
             child_env['PROXY_FILES'] = ''
+            child_env[
+                f'{config.scraper_label.upper()}_PROXY_FILES'
+            ] = ''
         child_env['WORKER_ID'] = str(worker_instance)
         # With a shared pool every child sees the same fleet-wide
         # proxy health, so one exporter per host keeps the
