@@ -505,7 +505,7 @@ class InnerTubeVideoParser:
         self.player_innertube: InnerTube | None = innertube
         self.next_innertube: InnerTube | None = innertube
         if innertube is None and proxy is None:
-            logging.warning(
+            logging.debug(
                 'No proxy configured, proceeding without proxy'
             )
 
