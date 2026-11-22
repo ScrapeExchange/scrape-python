@@ -38,18 +38,30 @@ Usage:
   ``curl_infos=[...]`` argument so curl populates the timing
   dict, then call :func:`record_html_phase_metrics` on every
   successful response.
+
+Response transfer metrics (``api_response_bytes``,
+``api_response_wait_seconds``, ``api_response_body_seconds``)
+are recorded for every InnerTube request (by the same
+``session.send`` wrapper) and for every request through
+:class:`TransferMetricsCurlTransport`. Throughput per proxy
+file is ``rate(api_response_bytes_sum) /
+rate(api_response_body_seconds_sum)``.
 '''
 
 import os
 import sys
 import time
-from typing import Any, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import Any
 
 # Stays on httpx (0.23): record_html_phase_metrics reads responses from
 # AsyncYouTubeClient, whose httpx_curl_cffi transport is built on it.
 import httpx
 from curl_cffi import CurlInfo
+from httpx_curl_cffi import AsyncCurlTransport
 from prometheus_client import Counter, Histogram
+
+from .proxy_loader import proxy_file_label
 
 # Mirror youtube_client._SCRAPER_BY_SCRIPT so all metrics
 # carry a consistent ``scraper`` label without each call
@@ -121,6 +133,74 @@ METRIC_PROXY_REQUESTS: Counter = Counter(
     ),
 )
 
+# --- Response transfer: size, wait and body time ---------------
+
+_TRANSFER_LABELS: tuple[str, ...] = (
+    'platform', 'scraper', 'call', 'proxy_file',
+)
+_BYTES_BUCKETS: tuple[float, ...] = (
+    1_000, 4_000, 16_000, 64_000, 256_000,
+    1_000_000, 4_000_000, 16_000_000,
+)
+_TRANSFER_BUCKETS: tuple[float, ...] = (
+    0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
+    5.0, 10.0, 30.0, 60.0,
+)
+
+METRIC_API_RESPONSE_BYTES: Histogram = Histogram(
+    'api_response_bytes',
+    'Response body size as received over the network, before '
+    'decompression. Divide rate(api_response_bytes_sum) by '
+    'rate(api_response_body_seconds_sum) for throughput.',
+    labelnames=_TRANSFER_LABELS,
+    buckets=_BYTES_BUCKETS,
+)
+METRIC_API_RESPONSE_WAIT_SECONDS: Histogram = Histogram(
+    'api_response_wait_seconds',
+    'Time from sending the request to receiving the response '
+    'headers: server processing plus one round trip.',
+    labelnames=_TRANSFER_LABELS,
+    buckets=_TRANSFER_BUCKETS,
+)
+METRIC_API_RESPONSE_BODY_SECONDS: Histogram = Histogram(
+    'api_response_body_seconds',
+    'Time from receiving the response headers to receiving '
+    'the last byte of the body.',
+    labelnames=_TRANSFER_LABELS,
+    buckets=_TRANSFER_BUCKETS,
+)
+
+
+def record_response_transfer(
+    *,
+    platform: str,
+    scraper: str,
+    call: str,
+    proxy_file: str,
+    num_bytes: int,
+    wait_seconds: float,
+    body_seconds: float,
+) -> None:
+    '''Observe one response on the three transfer histograms.
+    Records nothing when a value is negative, so the bytes and
+    body-time sums always cover the same responses.'''
+
+    if num_bytes < 0 or wait_seconds < 0 or body_seconds < 0:
+        return
+    labels: dict[str, str] = {
+        'platform': platform,
+        'scraper': scraper,
+        'call': call,
+        'proxy_file': proxy_file,
+    }
+    METRIC_API_RESPONSE_BYTES.labels(**labels).observe(num_bytes)
+    METRIC_API_RESPONSE_WAIT_SECONDS.labels(**labels).observe(
+        wait_seconds,
+    )
+    METRIC_API_RESPONSE_BODY_SECONDS.labels(**labels).observe(
+        body_seconds,
+    )
+
 
 # --- httpcore trace extension (RSS async + InnerTube sync) ---
 
@@ -128,6 +208,29 @@ AsyncTraceCallback = Callable[
     [str, dict[str, Any]], Awaitable[None],
 ]
 SyncTraceCallback = Callable[[str, dict[str, Any]], None]
+
+# Trace events that mark the transfer phases, and the state key
+# each one sets. A proxied request also fires these for the
+# CONNECT exchange; the real request's events come later and
+# overwrite them.
+_TRANSFER_EVENTS: tuple[tuple[str, str], ...] = (
+    ('send_request_body.complete', 'request_sent_at'),
+    ('receive_response_headers.complete', 'headers_at'),
+    ('receive_response_body.complete', 'body_done_at'),
+)
+
+
+def _record_transfer_event(
+    state: dict[str, float | None], name: str, now: float,
+) -> bool:
+    '''Store the time of a transfer-phase event in *state*.
+    Returns True when *name* was one of them.'''
+
+    for event, key in _TRANSFER_EVENTS:
+        if event in name:
+            state[key] = now
+            return True
+    return False
 
 
 def _record_phase_event(
@@ -243,13 +346,26 @@ def make_innertube_phase_trace(
     :func:`make_rss_phase_trace`.
     '''
 
-    state: dict[str, float | None] = {
+    return _make_innertube_trace(_new_trace_state(), proxy_file)
+
+
+def _new_trace_state() -> dict[str, float | None]:
+    return {
         'tcp_started_at': None,
         'tcp_completed_at': None,
         'tls_started_at': None,
     }
 
+
+def _make_innertube_trace(
+    state: dict[str, float | None], proxy_file: str,
+) -> SyncTraceCallback:
+    '''InnerTube trace callback that records the connection
+    phases and keeps the transfer timestamps in *state*.'''
+
     def trace(name: str, info: dict[str, Any]) -> None:
+        if _record_transfer_event(state, name, time.perf_counter()):
+            return
         _record_phase_event(
             state, name,
             call_type='innertube',
@@ -257,6 +373,45 @@ def make_innertube_phase_trace(
         )
 
     return trace
+
+
+def _innertube_call(request: Any) -> str:
+    '''The InnerTube endpoint name, from the last segment of the
+    request path: ``/youtubei/v1/player`` gives ``player``.'''
+
+    path: str = str(getattr(request.url, 'path', '') or '')
+    return path.rstrip('/').rsplit('/', 1)[-1] or 'unknown'
+
+
+def _record_innertube_transfer(
+    request: Any,
+    response: Any,
+    state: dict[str, float | None],
+    proxy_file: str,
+) -> None:
+    '''Observe the transfer metrics for one InnerTube response.
+    No-op when the body was not read (a streamed response) or
+    the trace events are missing.'''
+
+    sent: float | None = state.get('request_sent_at')
+    headers: float | None = state.get('headers_at')
+    done: float | None = state.get('body_done_at')
+    if sent is None or headers is None or done is None:
+        return
+    if not sent <= headers <= done:
+        return
+    num_bytes: Any = getattr(response, 'num_bytes_downloaded', None)
+    if not isinstance(num_bytes, int):
+        return
+    record_response_transfer(
+        platform='youtube',
+        scraper=_SCRAPER_LABEL,
+        call=_innertube_call(request),
+        proxy_file=proxy_file,
+        num_bytes=num_bytes,
+        wait_seconds=headers - sent,
+        body_seconds=done - headers,
+    )
 
 
 def install_innertube_phase_tracing(
@@ -273,6 +428,8 @@ def install_innertube_phase_tracing(
     built trace callback into each request before delegating
     to the original method, so each request gets its own
     closure with private state — safe under concurrent use.
+    After the original ``send`` returns, the response transfer
+    metrics are recorded from that state.
 
     *session* is the InnerTube ``adaptor.session`` attribute
     (i.e. ``httpx2.Client``).
@@ -283,13 +440,18 @@ def install_innertube_phase_tracing(
     original_send = session.send
 
     def patched_send(request, **kwargs):
+        state: dict[str, float | None] | None = None
         if 'trace' not in request.extensions:
-            request.extensions['trace'] = (
-                make_innertube_phase_trace(
-                    proxy_file=proxy_file,
-                )
+            state = _new_trace_state()
+            request.extensions['trace'] = _make_innertube_trace(
+                state, proxy_file,
             )
-        return original_send(request, **kwargs)
+        response = original_send(request, **kwargs)
+        if state is not None:
+            _record_innertube_transfer(
+                request, response, state, proxy_file,
+            )
+        return response
 
     session.send = patched_send  # type: ignore[method-assign]
     session._phase_tracing_installed = True
@@ -357,3 +519,135 @@ def record_html_phase_metrics(
         proxy_file=proxy_file,
         reused=reused_html,
     ).inc()
+
+
+# --- curl_cffi transport with response transfer metrics ------
+
+_SIZE_DOWNLOAD_KEY: int = int(CurlInfo.SIZE_DOWNLOAD_T)
+_PRETRANSFER_KEY: int = int(CurlInfo.PRETRANSFER_TIME)
+_STARTTRANSFER_KEY: int = int(CurlInfo.STARTTRANSFER_TIME)
+_TOTAL_KEY: int = int(CurlInfo.TOTAL_TIME)
+_TRANSFER_CURL_INFOS: tuple[CurlInfo, ...] = (
+    CurlInfo.SIZE_DOWNLOAD_T,
+    CurlInfo.PRETRANSFER_TIME,
+    CurlInfo.STARTTRANSFER_TIME,
+    CurlInfo.TOTAL_TIME,
+)
+
+
+def _curl_transfer_values(
+    response: httpx.Response,
+) -> tuple[int, float, float] | None:
+    '''Return ``(bytes, wait_seconds, body_seconds)`` for a curl
+    response whose body has been read, or None without curl info.
+
+    In stream mode curl captures its infos when the headers
+    arrive, so the final size and total time are read from the
+    curl handle, which still belongs to this response until it
+    is closed. Without a handle (stream mode off) the captured
+    infos are already final.
+    '''
+
+    curl_ext: dict = (
+        (getattr(response, 'extensions', None) or {}).get('curl')
+        or {}
+    )
+    handle: Any = getattr(curl_ext.get('response'), 'curl', None)
+    if handle is not None:
+        values: dict[int, Any] = {
+            int(info): handle.getinfo(info)
+            for info in _TRANSFER_CURL_INFOS
+        }
+    else:
+        values = {
+            int(key): value
+            for key, value in (curl_ext.get('infos') or {}).items()
+        }
+    try:
+        num_bytes: int = int(values[_SIZE_DOWNLOAD_KEY])
+        pretransfer: float = float(values[_PRETRANSFER_KEY])
+        starttransfer: float = float(values[_STARTTRANSFER_KEY])
+        total: float = float(values[_TOTAL_KEY])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return num_bytes, starttransfer - pretransfer, total - starttransfer
+
+
+class _TransferMetricsStream(httpx.AsyncByteStream):
+    '''Response body stream that calls *on_complete* once the
+    last chunk has been read, before the stream is closed.'''
+
+    def __init__(
+        self,
+        inner: httpx.AsyncByteStream,
+        response: httpx.Response,
+        on_complete: Callable[[httpx.Response], None],
+    ) -> None:
+        self._inner: httpx.AsyncByteStream = inner
+        self._response: httpx.Response = response
+        self._on_complete: Callable[[httpx.Response], None] = (
+            on_complete
+        )
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        async for chunk in self._inner:
+            yield chunk
+        self._on_complete(self._response)
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
+class TransferMetricsCurlTransport(AsyncCurlTransport):
+    '''``AsyncCurlTransport`` that records the response transfer
+    metrics (bytes, wait time, body time) for every response
+    whose body is read in full. The ``proxy_file`` label is
+    looked up from *proxy* when each response completes.'''
+
+    def __init__(
+        self,
+        *,
+        platform: str,
+        scraper: str,
+        call: str,
+        proxy: str | None = None,
+        curl_infos: list[CurlInfo] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        infos: list[CurlInfo] = list(curl_infos or [])
+        for info in _TRANSFER_CURL_INFOS:
+            if info not in infos:
+                infos.append(info)
+        super().__init__(proxy=proxy, curl_infos=infos, **kwargs)
+        self._platform: str = platform
+        self._scraper: str = scraper
+        self._call: str = call
+        self._proxy_entry: str = proxy or ''
+
+    async def handle_async_request(
+        self, request: httpx.Request,
+    ) -> httpx.Response:
+        response: httpx.Response = (
+            await super().handle_async_request(request)
+        )
+        response.stream = _TransferMetricsStream(
+            response.stream, response, self._record,
+        )
+        return response
+
+    def _record(self, response: httpx.Response) -> None:
+        values: tuple[int, float, float] | None = (
+            _curl_transfer_values(response)
+        )
+        if values is None:
+            return
+        num_bytes, wait_seconds, body_seconds = values
+        record_response_transfer(
+            platform=self._platform,
+            scraper=self._scraper,
+            call=self._call,
+            proxy_file=proxy_file_label(self._proxy_entry),
+            num_bytes=num_bytes,
+            wait_seconds=wait_seconds,
+            body_seconds=body_seconds,
+        )

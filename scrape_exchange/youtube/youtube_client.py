@@ -26,7 +26,6 @@ from httpx import ConnectTimeout
 from httpx import Timeout
 from httpx import TimeoutException
 
-from httpx_curl_cffi import AsyncCurlTransport
 from prometheus_client import Histogram
 
 from scrape_exchange.worker_id import get_worker_id
@@ -45,6 +44,7 @@ from scrape_exchange.util import (
 from .youtube_rate_limiter import YouTubeRateLimiter, YouTubeCallType
 from scrape_exchange.proxy_phase_metrics import (
     HTML_CURL_INFOS,
+    TransferMetricsCurlTransport,
     record_html_phase_metrics,
 )
 from scrape_exchange._lazy_async_pool import _LazyAsyncPool
@@ -192,7 +192,10 @@ class AsyncYouTubeClient(AsyncClient):
         # channel scraper's about-page success rate to zero under
         # fleet load.
         super().__init__(
-            transport=AsyncCurlTransport(
+            transport=TransferMetricsCurlTransport(
+                platform='youtube',
+                scraper=_get_scraper(),
+                call='html',
                 impersonate='chrome',
                 default_headers=True,
                 proxy=self.proxy,

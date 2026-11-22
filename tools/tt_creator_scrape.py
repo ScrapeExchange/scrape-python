@@ -35,7 +35,6 @@ from urllib.parse import urlparse
 
 # Stays on httpx (0.23): httpx_curl_cffi's transport is built on it.
 import httpx
-from httpx_curl_cffi import AsyncCurlTransport
 from playwright.async_api import Error as PlaywrightError
 from pydantic import AliasChoices, Field, field_validator
 
@@ -60,6 +59,9 @@ from scrape_exchange.handle_map import (
 from scrape_exchange.name_map import (
     NameMap,
     RedisNameMap,
+)
+from scrape_exchange.proxy_phase_metrics import (
+    TransferMetricsCurlTransport,
 )
 from scrape_exchange.redis_client import redis_from_url
 from scrape_exchange.scraper_metrics import (
@@ -1297,7 +1299,10 @@ class HttpCreatorFetcher(CreatorFetcher):
         client: httpx.AsyncClient | None = self._clients.get(proxy)
         if client is None:
             client = httpx.AsyncClient(
-                transport=AsyncCurlTransport(
+                transport=TransferMetricsCurlTransport(
+                    platform=PLATFORM,
+                    scraper=SCRAPER_LABEL,
+                    call='profile',
                     impersonate='chrome',
                     default_headers=True,
                     proxy=proxy,
