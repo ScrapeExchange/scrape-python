@@ -30,6 +30,7 @@ from httpx_curl_cffi import AsyncCurlTransport
 from prometheus_client import Histogram
 
 from scrape_exchange.worker_id import get_worker_id
+from scrape_exchange.wait_tracking import tracked_sleep
 from scrape_exchange.http_timeouts import (
     HTTP_CONNECT_TIMEOUT,
     HTTP_REQUEST_TIMEOUT,
@@ -76,7 +77,8 @@ def _get_scraper() -> str:
 METRIC_YT_REQUEST_DURATION: Histogram = Histogram(
     'api_request_duration_seconds',
     'Duration of requests to YouTube, by api type '
-    '(html/innertube), HTTP status class, and the '
+    '(html/innertube), call (html, player, next, get_panel, '
+    'browse, resolve_url), HTTP status class, and the '
     'outbound proxy network/file. The previously-present '
     '``proxy_ip`` label was dropped because its ~108 '
     'unique values multiplied series cardinality enough '
@@ -85,7 +87,7 @@ METRIC_YT_REQUEST_DURATION: Histogram = Histogram(
     'and rate-limit metrics that still carry the label; '
     'this histogram aggregates by network/file only.',
     [
-        'platform', 'scraper', 'api',
+        'platform', 'scraper', 'api', 'call',
         'status_class', 'worker_id',
         'proxy_file',
     ],
@@ -350,6 +352,7 @@ class AsyncYouTubeClient(AsyncClient):
                 platform='youtube',
                 scraper=_get_scraper(),
                 api='html',
+                call='html',
                 status_class='error',
                 worker_id=get_worker_id(),
                 proxy_file=proxy_file,
@@ -365,7 +368,7 @@ class AsyncYouTubeClient(AsyncClient):
                 extra=extra | {'duration': duration},
             )
             if retries > 0:
-                await asyncio.sleep(random.uniform(delay - 1, delay))
+                await tracked_sleep(random.uniform(delay - 1, delay))
                 return await self.get(
                     url, retries=retries - 1, delay=delay * 2, **kwargs
                 )
@@ -384,6 +387,7 @@ class AsyncYouTubeClient(AsyncClient):
                 platform='youtube',
                 scraper=_get_scraper(),
                 api='html',
+                call='html',
                 status_class='error',
                 worker_id=get_worker_id(),
                 proxy_file=proxy_file,
@@ -394,7 +398,7 @@ class AsyncYouTubeClient(AsyncClient):
                 extra=extra | {'duration': duration},
             )
             if retries > 0:
-                await asyncio.sleep(random.uniform(delay-1, delay))
+                await tracked_sleep(random.uniform(delay-1, delay))
                 _LOGGER.debug(
                     'Retrying GET request',
                     extra=extra | {'retries_left': retries, 'delay': delay},
@@ -414,6 +418,7 @@ class AsyncYouTubeClient(AsyncClient):
                 platform='youtube',
                 scraper=_get_scraper(),
                 api='html',
+                call='html',
                 status_class='error',
                 worker_id=get_worker_id(),
                 proxy_file=proxy_file,
@@ -434,6 +439,7 @@ class AsyncYouTubeClient(AsyncClient):
                 platform='youtube',
                 scraper=_get_scraper(),
                 api='html',
+                call='html',
                 status_class='error',
                 worker_id=get_worker_id(),
                 proxy_file=proxy_file,
@@ -444,7 +450,7 @@ class AsyncYouTubeClient(AsyncClient):
                 extra=extra | {'duration': duration},
             )
             if retries > 0:
-                await asyncio.sleep(random.uniform(delay-1, delay))
+                await tracked_sleep(random.uniform(delay-1, delay))
                 _LOGGER.debug(
                     'Retrying GET request',
                     extra=extra | {'retries_left': retries, 'delay': delay}
@@ -461,6 +467,7 @@ class AsyncYouTubeClient(AsyncClient):
             platform='youtube',
             scraper=_get_scraper(),
             api='html',
+            call='html',
             status_class=_yt_status_class(resp.status_code),
             worker_id=get_worker_id(),
             proxy_file=proxy_file,
@@ -506,7 +513,8 @@ class AsyncYouTubeClient(AsyncClient):
 
     @staticmethod
     async def _delay(min: float = 0.3, max: float = 0.8) -> None:
-        await asyncio.sleep(random.uniform(min, max))
+        '''Backoff sleep; counts as waiting, not scrape time.'''
+        await tracked_sleep(random.uniform(min, max))
 
     def create_cookie_header(self, cookies: dict) -> str:
         '''

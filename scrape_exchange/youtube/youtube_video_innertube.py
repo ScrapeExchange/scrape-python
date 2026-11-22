@@ -41,6 +41,7 @@ from dateutil import parser as dateutil_parser
 from .youtube_caption import YouTubeCaption
 from scrape_exchange.rate_limiter import RateLimitWaitExceeded
 from scrape_exchange.worker_id import get_worker_id
+from scrape_exchange.wait_tracking import tracked_sleep
 from scrape_exchange.proxy_loader import proxy_file_label
 from .youtube_video_badges import (
     extract_content_disclosure, extract_hype_points, extract_video_badges,
@@ -570,6 +571,7 @@ class InnerTubeVideoParser:
                     platform='youtube',
                     scraper=_get_scraper(),
                     api='innertube',
+                    call='player',
                     status_class='2xx',
                     worker_id=get_worker_id(),
                     proxy_file=proxy_file,
@@ -598,6 +600,7 @@ class InnerTubeVideoParser:
                     platform='youtube',
                     scraper=_get_scraper(),
                     api='innertube',
+                    call='player',
                     status_class=status_class,
                     worker_id=get_worker_id(),
                     proxy_file=proxy_file,
@@ -639,7 +642,7 @@ class InnerTubeVideoParser:
                             f'InnerTube PLAYER rate-limited after '
                             f'{max_retries} attempts: {exc}'
                         )
-                    await asyncio.sleep(penalty)
+                    await tracked_sleep(penalty)
                 else:
                     raise RuntimeError(
                         f'InnerTube API call failed: {exc}'
@@ -663,6 +666,7 @@ class InnerTubeVideoParser:
                     platform='youtube',
                     scraper=_get_scraper(),
                     api='innertube',
+                    call='player',
                     status_class='error',
                     worker_id=get_worker_id(),
                     proxy_file=proxy_file,
@@ -756,6 +760,7 @@ class InnerTubeVideoParser:
                         platform='youtube',
                         scraper=_get_scraper(),
                         api='innertube',
+                        call='next',
                         status_class='2xx',
                         worker_id=get_worker_id(),
                         proxy_file=proxy_file,
@@ -785,6 +790,7 @@ class InnerTubeVideoParser:
                         platform='youtube',
                         scraper=_get_scraper(),
                         api='innertube',
+                        call='next',
                         status_class=status_class,
                         worker_id=get_worker_id(),
                         proxy_file=proxy_file,
@@ -824,7 +830,7 @@ class InnerTubeVideoParser:
                             _next_penalty * 2, _PLAYER_PENALTY_MAX
                         )
                         if attempt < max_retries:
-                            await asyncio.sleep(_next_penalty)
+                            await tracked_sleep(_next_penalty)
                     else:
                         break  # non-429 error on NEXT: skip silently
                 except Exception as exc:
@@ -846,6 +852,7 @@ class InnerTubeVideoParser:
                         platform='youtube',
                         scraper=_get_scraper(),
                         api='innertube',
+                        call='next',
                         status_class='error',
                         worker_id=get_worker_id(),
                         proxy_file=proxy_file,
@@ -1047,6 +1054,7 @@ class InnerTubeVideoParser:
                     platform='youtube',
                     scraper=_get_scraper(),
                     api='innertube',
+                    call='get_panel',
                     status_class=status_class,
                     worker_id=get_worker_id(),
                     proxy_file=proxy_file,

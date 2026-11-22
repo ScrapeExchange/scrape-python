@@ -100,6 +100,7 @@ from scrape_exchange.youtube.youtube_client import (
 )
 from scrape_exchange.youtube.youtube_video import YouTubeVideo
 
+from scrape_exchange.wait_tracking import ScrapeTimer
 from scrape_exchange.worker_id import get_worker_id
 from scrape_exchange.watchdog import Watchdog
 from scrape_exchange.youtube.settings import YouTubeScraperSettings
@@ -213,7 +214,6 @@ _RSS_VISITOR_INFO_BY_PROXY: dict[str | None, str] = {}
 from scrape_exchange.scraper_metrics import (
     METRIC_CHANNEL_PRIORITY_WRITES,
     METRIC_SCRAPES_COMPLETED as METRIC_RSS_DOWNLOADED,
-    METRIC_SCRAPE_DURATION,
     METRIC_SCRAPE_FAILURES as METRIC_RSS_FAILURES,
     METRIC_SCRAPE_QUEUE_ENQUEUES,
     METRIC_SCRAPE_QUEUE_SIZE as METRIC_QUEUE_SIZE,
@@ -221,6 +221,7 @@ from scrape_exchange.scraper_metrics import (
     METRIC_RSS_CIRCUIT_WAIT_SECONDS,
     METRIC_RSS_CIRCUIT_STATE,
     METRIC_RSS_CIRCUIT_OPEN_SECONDS,
+    observe_scrape,
 )
 from scrape_exchange.youtube.rss_circuit_breaker import (
     RssCircuitBreaker,
@@ -341,6 +342,7 @@ METRIC_ORPHANS_RECOVERED: Counter = Counter(
 METRIC_RSS_FETCH_DURATION: Histogram = Histogram(
     'rss_feed_fetch_duration_seconds',
     'Duration of a single /feeds/videos.xml HTTP GET, '
+    'not counting the rate-limiter wait, '
     'split by outcome status. The proxy_network label was '
     'dropped to reduce series cardinality; use '
     'scrape_failures_total / proxy_file to recover the '
@@ -857,6 +859,9 @@ async def fetch_rss(
     '''
 
     scrape_start: float = monotonic()
+    # Times the fetch without the rate-limiter wait, for
+    # METRIC_SCRAPE_DURATION and METRIC_RSS_FETCH_DURATION.
+    scrape_timer: ScrapeTimer = ScrapeTimer.start()
     # Tracked for METRIC_RSS_FETCH_DURATION (set in the finally
     # block below). The proxy is acquired inside the outer try
     # so these are initialised conservatively in case acquisition
@@ -1064,37 +1069,32 @@ async def fetch_rss(
                 )
 
         fetch_status = 'success'
-        duration = monotonic() - scrape_start
-        METRIC_SCRAPE_DURATION.labels(
+        observe_scrape(
+            scrape_timer,
             platform='youtube',
             scraper='rss_scraper',
             entity='rss_feed',
             api='rss',
             outcome='success',
-            worker_id=get_worker_id(),
-            innertube_calls='none',
-        ).observe(duration)
+        )
         return videos
     except Exception:
-        duration = monotonic() - scrape_start
-        METRIC_SCRAPE_DURATION.labels(
+        observe_scrape(
+            scrape_timer,
             platform='youtube',
             scraper='rss_scraper',
             entity='rss_feed',
             api='rss',
             outcome='failure',
-            worker_id=get_worker_id(),
-            innertube_calls='none',
-        ).observe(duration)
+        )
         raise
     finally:
-        duration = monotonic() - scrape_start
         METRIC_RSS_FETCH_DURATION.labels(
             platform='youtube',
             scraper='rss_scraper',
             worker_id=get_worker_id(),
             status=fetch_status,
-        ).observe(duration)
+        ).observe(scrape_timer.active())
 
 
 async def check_video_exists(

@@ -1042,7 +1042,7 @@ class TestTypedScrape(
                 'tools.yt_channel_scrape.METRIC_CHANNELS_SCRAPED',
             ) as completed,
             patch(
-                'tools.yt_channel_scrape.METRIC_SCRAPE_DURATION',
+                'tools.yt_channel_scrape.observe_scrape',
             ),
         ):
             await _do_scrape_channel_to_disk_typed(

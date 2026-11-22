@@ -1765,6 +1765,8 @@ class YouTubeChannel:
             await limiter.acquire(
                 YouTubeCallType.BROWSE, proxy=proxy,
             )
+            # Time the request only, not the token wait.
+            start = time.monotonic()
             result: dict = await _resolver_innertube_call(
                 proxy,
                 lambda client: client.adaptor.dispatch(
@@ -1799,6 +1801,7 @@ class YouTubeChannel:
                 METRIC_YT_REQUEST_DURATION.labels(
                     platform='youtube', scraper=scraper,
                     api='innertube_resolver',
+                    call='resolve_url',
                     status_class='2xx', worker_id=worker_id,
                     proxy_file=proxy_file,
                 ).observe(duration)
@@ -1808,6 +1811,7 @@ class YouTubeChannel:
             METRIC_YT_REQUEST_DURATION.labels(
                 platform='youtube', scraper=scraper,
                 api='innertube_resolver',
+                call='resolve_url',
                 status_class='2xx', worker_id=worker_id,
                 proxy_file=proxy_file,
             ).observe(duration)
@@ -1827,6 +1831,7 @@ class YouTubeChannel:
             METRIC_YT_REQUEST_DURATION.labels(
                 platform='youtube', scraper=scraper,
                 api='innertube_resolver',
+                call='resolve_url',
                 status_class='error', worker_id=worker_id,
                 proxy_file=proxy_file,
             ).observe(duration)

@@ -15,7 +15,6 @@ import errno
 import os
 import resource
 import sys
-import time
 import asyncio
 from dataclasses import dataclass
 import logging
@@ -122,10 +121,11 @@ from scrape_exchange.scraper_metrics import (
     METRIC_QUEUE_CONNECTION_ERRORS,
     METRIC_UPLOADS_SKIPPED as METRIC_VIDEOS_ALREADY_UPLOADED,
     METRIC_SCRAPES_COMPLETED,
-    METRIC_SCRAPE_DURATION,
     METRIC_SCRAPE_FAILURES,
     METRIC_UPLOADED_LOOKUPS,
+    observe_scrape,
 )
+from scrape_exchange.wait_tracking import ScrapeTimer
 
 
 # Ordered table of yt-dlp error classifications. Each entry is
@@ -304,11 +304,12 @@ async def _scrape_to_disk(
 
     Each attempt is observed in ``scrape_duration_seconds``, labelled
     with the YouTube calls it sent (see
-    :mod:`scrape_exchange.youtube.innertube_calls`).
+    :mod:`scrape_exchange.youtube.innertube_calls`). Rate-limiter and
+    backoff waits go to ``scrape_wait_seconds`` instead.
     '''
     api: str = 'ytdlp' if settings.video_use_yt_dlp else 'innertube'
     outcome: str = 'failure'
-    start: float = time.monotonic()
+    timer: ScrapeTimer = ScrapeTimer.start()
     with track_calls() as calls:
         try:
             await _scrape_attempt(
@@ -325,15 +326,15 @@ async def _scrape_to_disk(
             )
             outcome = 'success'
         finally:
-            METRIC_SCRAPE_DURATION.labels(
+            observe_scrape(
+                timer,
                 platform='youtube',
                 scraper='video_scraper',
                 entity='video',
                 api=api,
                 outcome=outcome,
-                worker_id=get_worker_id(),
                 innertube_calls=calls_label(calls),
-            ).observe(time.monotonic() - start)
+            )
 
 
 async def _scrape_attempt(

@@ -4,7 +4,9 @@ import unittest
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from scrape_exchange import scraper_metrics
 from scrape_exchange.creator_map import InMemoryCreatorMap
+from scrape_exchange.wait_tracking import tracked_sleep
 from scrape_exchange.youtube.innertube_calls import record_call
 
 
@@ -30,19 +32,26 @@ class TestScrapeDuration(unittest.IsolatedAsyncioTestCase):
     async def _run(
         self, calls: list[str], *, fail: bool = False,
         creator_map: InMemoryCreatorMap | None = None,
+        wait_seconds: float = 0.0,
     ) -> dict[str, Any]:
         from tools import yt_video_scrape
 
+        self.metric: MagicMock = MagicMock()
+        self.wait: MagicMock = MagicMock()
+
         async def fake_scrape(*args: Any, **kwargs: Any) -> MagicMock:
+            if wait_seconds:
+                await tracked_sleep(wait_seconds)
             for call in calls:
                 record_call(call)
             if fail:
                 raise RuntimeError('boom')
             return _video()
 
-        metric: MagicMock = MagicMock()
+        metric: MagicMock = self.metric
         with (
-            patch.object(yt_video_scrape, 'METRIC_SCRAPE_DURATION', metric),
+            patch.object(scraper_metrics, 'METRIC_SCRAPE_DURATION', metric),
+            patch.object(scraper_metrics, 'METRIC_SCRAPE_WAIT', self.wait),
             patch.object(
                 yt_video_scrape.YouTubeVideo, 'scrape',
                 new=AsyncMock(side_effect=fake_scrape),
@@ -89,3 +98,17 @@ class TestScrapeDuration(unittest.IsolatedAsyncioTestCase):
         labels: dict[str, Any] = await self._run(['player'], fail=True)
         self.assertEqual(labels['outcome'], 'failure')
         self.assertEqual(labels['innertube_calls'], 'player')
+
+    async def test_wait_is_left_out_of_duration(self) -> None:
+        await self._run(['player', 'next'], wait_seconds=0.2)
+        active: float = (
+            self.metric.labels.return_value.observe.call_args.args[0]
+        )
+        waited: float = (
+            self.wait.labels.return_value.observe.call_args.args[0]
+        )
+        self.assertLess(active, 0.15)
+        self.assertGreaterEqual(waited, 0.2)
+        wait_labels: dict[str, Any] = self.wait.labels.call_args.kwargs
+        self.assertEqual(wait_labels['scraper'], 'video_scraper')
+        self.assertEqual(wait_labels['outcome'], 'success')
