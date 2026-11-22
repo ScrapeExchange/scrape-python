@@ -1,4 +1,4 @@
-'''_do_scrape_channel_to_disk must emit METRIC_SCRAPE_DURATION
+'''_do_scrape_channel_to_disk must emit scrape duration (observe_scrape)
 observations only on the paths that pair with the success and
 failure counters: success (at the existing
 METRIC_CHANNELS_SCRAPED.inc site) and the early return after
@@ -27,7 +27,7 @@ class TestDoScrapeChannelToDiskLatency(
         '''Drive _do_scrape_channel_to_disk through one of:
             'success', 'try_scrape_failed',
             'no_content', 'persist_failed'.
-        Returns the patched METRIC_SCRAPE_DURATION mock so the
+        Returns the patched observe_scrape mock so the
         caller can assert on it.'''
 
         async def stub_try_scrape(
@@ -70,7 +70,7 @@ class TestDoScrapeChannelToDiskLatency(
             yt_channel_scrape, '_persist_scraped_channel',
             side_effect=stub_persist,
         ), patch.object(
-            yt_channel_scrape, 'METRIC_SCRAPE_DURATION',
+            yt_channel_scrape, 'observe_scrape',
         ) as duration, patch.object(
             yt_channel_scrape, 'METRIC_CHANNELS_SCRAPED',
         ):
@@ -84,31 +84,29 @@ class TestDoScrapeChannelToDiskLatency(
 
     async def test_success_records_one_observation(self) -> None:
         duration: MagicMock = await self._run('success')
-        duration.labels.assert_called_once()
-        kwargs: dict = duration.labels.call_args.kwargs
+        duration.assert_called_once()
+        kwargs: dict = duration.call_args.kwargs
         self.assertEqual(kwargs['outcome'], 'success')
         self.assertEqual(kwargs['scraper'], 'channel_scraper')
         self.assertEqual(kwargs['entity'], 'channel')
         self.assertEqual(kwargs['api'], 'html')
         self.assertEqual(kwargs['platform'], 'youtube')
-        duration.labels.return_value.observe.assert_called_once()
 
     async def test_try_scrape_failed_records_failure(self) -> None:
         duration: MagicMock = await self._run('try_scrape_failed')
-        duration.labels.assert_called_once()
-        kwargs: dict = duration.labels.call_args.kwargs
+        duration.assert_called_once()
+        kwargs: dict = duration.call_args.kwargs
         self.assertEqual(kwargs['outcome'], 'failure')
         self.assertEqual(kwargs['scraper'], 'channel_scraper')
         self.assertEqual(kwargs['api'], 'html')
-        duration.labels.return_value.observe.assert_called_once()
 
     async def test_no_content_does_not_observe(self) -> None:
         duration: MagicMock = await self._run('no_content')
-        duration.labels.assert_not_called()
+        duration.assert_not_called()
 
     async def test_persist_failed_does_not_observe(self) -> None:
         duration: MagicMock = await self._run('persist_failed')
-        duration.labels.assert_not_called()
+        duration.assert_not_called()
 
     async def test_success_enriches_derived_metadata_before_persist(
         self,
@@ -151,7 +149,7 @@ class TestDoScrapeChannelToDiskLatency(
             yt_channel_scrape, 'set_channel_country',
             new=unittest.mock.AsyncMock(),
         ) as set_country, patch.object(
-            yt_channel_scrape, 'METRIC_SCRAPE_DURATION',
+            yt_channel_scrape, 'observe_scrape',
         ), patch.object(
             yt_channel_scrape, 'METRIC_CHANNELS_SCRAPED',
         ):

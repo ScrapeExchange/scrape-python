@@ -302,7 +302,12 @@ class TestSupervisorProxyReload(unittest.TestCase):
         )
         self.assertEqual(first.signals, [])
         self.assertEqual(second.signals, [signal.SIGTERM])
-        self.assertEqual(self.spawned, [(2, {'PROXIES': c})])
+        # c is not in the (empty) test catalog, so its source is
+        # 'none'.
+        self.assertEqual(
+            self.spawned,
+            [(2, {'PROXIES': c, 'PROXY_SOURCES': 'none'})],
+        )
 
     def test_split_pool_child_without_proxies_is_stopped(self) -> None:
         a: str = 'http://slice1.test:1'

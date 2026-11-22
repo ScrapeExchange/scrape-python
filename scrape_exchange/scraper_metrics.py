@@ -26,6 +26,9 @@ passed as ``'none'``.
 
 from prometheus_client import Counter, Gauge, Histogram
 
+from scrape_exchange.wait_tracking import ScrapeTimer
+from scrape_exchange.worker_id import get_worker_id
+
 # ---------------------------------------------------------------------------
 # scrapes_completed_total
 #   Incremented once per successfully scraped entity (video, channel,
@@ -292,13 +295,17 @@ METRIC_WORKER_SLEEP_SECONDS: Gauge = Gauge(
 #   Per-scrape latency histogram. The 'api' label distinguishes yt-dlp,
 #   HTML, InnerTube, and RSS fetches. 'innertube_calls' lists the
 #   YouTube calls a video scrape attempt sent (e.g.
-#   player_next_transcript); 'none' for every other scraper. The 15s
+#   player_next_transcript); 'none' for every other scraper. Waits for
+#   rate-limiter tokens and backoff sleeps are left out (see
+#   scrape_wait_seconds and scrape_exchange.wait_tracking). The 15s
 #   and 20s buckets resolve video scrape attempts, which take 10-30s.
 # ---------------------------------------------------------------------------
 METRIC_SCRAPE_DURATION: Histogram = Histogram(
     'scrape_duration_seconds',
     'Duration of a single scrape call, labelled by api type and '
-    'outcome (success/failure). innertube_calls lists the YouTube '
+    'outcome (success/failure), not counting time spent waiting for '
+    'rate-limiter tokens or in backoff sleeps (see '
+    'scrape_wait_seconds). innertube_calls lists the YouTube '
     'calls made by a video scrape attempt, none for other scrapers.',
     [
         'platform', 'scraper', 'entity', 'api',
@@ -310,6 +317,57 @@ METRIC_SCRAPE_DURATION: Histogram = Histogram(
         900.0, 3600.0
     ),
 )
+
+# ---------------------------------------------------------------------------
+# scrape_wait_seconds
+#   Time a scrape spent waiting for rate-limiter tokens or in retry /
+#   penalty backoff sleeps. scrape_duration_seconds leaves this out;
+#   the two add up to the wall-clock time of the scrape.
+# ---------------------------------------------------------------------------
+METRIC_SCRAPE_WAIT: Histogram = Histogram(
+    'scrape_wait_seconds',
+    'Seconds a single scrape call waited for rate-limiter tokens or '
+    'slept in retry/penalty backoff. Not included in '
+    'scrape_duration_seconds.',
+    ['platform', 'scraper', 'entity', 'outcome', 'worker_id'],
+    buckets=(
+        0.0, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0,
+        300.0, 900.0, 3600.0,
+    ),
+)
+
+
+def observe_scrape(
+    timer: ScrapeTimer,
+    *,
+    platform: str,
+    scraper: str,
+    entity: str,
+    api: str,
+    outcome: str,
+    innertube_calls: str = 'none',
+    worker_id: str | None = None,
+) -> float:
+    '''Record one scrape in ``scrape_duration_seconds`` (active time,
+    without waits) and ``scrape_wait_seconds`` (the waits).
+
+    :param worker_id: label value; defaults to :func:`get_worker_id`.
+    :returns: the active seconds that were observed.
+    '''
+    if worker_id is None:
+        worker_id = get_worker_id()
+    active: float = timer.active()
+    METRIC_SCRAPE_DURATION.labels(
+        platform=platform, scraper=scraper, entity=entity, api=api,
+        outcome=outcome, worker_id=worker_id,
+        innertube_calls=innertube_calls,
+    ).observe(active)
+    METRIC_SCRAPE_WAIT.labels(
+        platform=platform, scraper=scraper, entity=entity,
+        outcome=outcome, worker_id=worker_id,
+    ).observe(timer.waited())
+    return active
+
 
 # ---------------------------------------------------------------------------
 # uploads_failed_total

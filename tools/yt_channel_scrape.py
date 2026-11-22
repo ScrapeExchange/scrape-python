@@ -71,8 +71,8 @@ from scrape_exchange.proxy_loader import proxy_file_label
 from scrape_exchange.redis_claim import RedisClaim
 from scrape_exchange.redis_client import redis_from_url
 from scrape_exchange.scraper_metrics import (
-    METRIC_SCRAPE_DURATION,
     METRIC_SCRAPE_FAILURES,
+    observe_scrape,
 )
 from scrape_exchange.scraper_metrics import (
     METRIC_SCRAPES_COMPLETED as METRIC_CHANNELS_SCRAPED,
@@ -90,6 +90,7 @@ from scrape_exchange.util import (
     extract_proxy_port,
     proxy_network_for,
 )
+from scrape_exchange.wait_tracking import ScrapeTimer
 from scrape_exchange.watchdog import Watchdog
 from scrape_exchange.worker_id import get_worker_id
 from scrape_exchange.youtube.channel_identity import (
@@ -3794,7 +3795,7 @@ async def _do_scrape_channel_to_disk(
     ``/channel/<id>`` URL). A handle, if known, is carried in
     ``extra['channel_handle']`` for the fetch URL preference and
     logging only; it is never required.'''
-    scrape_start: float = time.monotonic()
+    scrape_timer: ScrapeTimer = ScrapeTimer.start()
     logging.debug(
         'Channel not scraped, scraping now', extra=extra,
     )
@@ -3813,15 +3814,15 @@ async def _do_scrape_channel_to_disk(
         channel, settings, fm, channel_id, extra,
     )
     if not ok:
-        METRIC_SCRAPE_DURATION.labels(
+        observe_scrape(
+            scrape_timer,
             platform='youtube',
             scraper='channel_scraper',
             entity='channel',
             api='html',
             outcome='failure',
-            worker_id=get_worker_id(),
             innertube_calls='none',
-        ).observe(time.monotonic() - scrape_start)
+        )
         return False, False, None
 
     scrape_proxy_ip: str = (
@@ -3876,15 +3877,15 @@ async def _do_scrape_channel_to_disk(
         proxy_file=proxy_file_label(scrape_proxy or ''),
         channel_status=extra.get('channel_status', 'unknown'),
     ).inc()
-    METRIC_SCRAPE_DURATION.labels(
+    observe_scrape(
+        scrape_timer,
         platform='youtube',
         scraper='channel_scraper',
         entity='channel',
         api=success_api,
         outcome='success',
-        worker_id=get_worker_id(),
         innertube_calls='none',
-    ).observe(time.monotonic() - scrape_start)
+    )
     logging.info(
         'Downloaded channel',
         extra={
@@ -3949,7 +3950,7 @@ async def _do_scrape_channel_to_disk_typed(
             whether to soft-unavailable or retry.
         Other exceptions: propagated unchanged.
     '''
-    scrape_start: float = time.monotonic()
+    scrape_timer: ScrapeTimer = ScrapeTimer.start()
     channel: YouTubeChannel = YouTubeChannel(
         channel_handle=channel_handle,
         channel_id=extra.get('channel_id'),
@@ -3974,15 +3975,15 @@ async def _do_scrape_channel_to_disk_typed(
             )
         )
     except ChannelNotFoundError:
-        METRIC_SCRAPE_DURATION.labels(
+        observe_scrape(
+            scrape_timer,
             platform='youtube',
             scraper='channel_scraper',
             entity='channel',
             api='html',
             outcome='failure',
-            worker_id=get_worker_id(),
             innertube_calls='none',
-        ).observe(time.monotonic() - scrape_start)
+        )
         raise
 
     scrape_proxy_ip: str = (
@@ -4066,15 +4067,15 @@ async def _do_scrape_channel_to_disk_typed(
         ),
         channel_status=extra.get('channel_status', 'unknown'),
     ).inc()
-    METRIC_SCRAPE_DURATION.labels(
+    observe_scrape(
+        scrape_timer,
         platform='youtube',
         scraper='channel_scraper',
         entity='channel',
         api=success_api,
         outcome='partial' if partial else 'success',
-        worker_id=get_worker_id(),
         innertube_calls='none',
-    ).observe(time.monotonic() - scrape_start)
+    )
     logging.info(
         'Downloaded partial channel' if partial else 'Downloaded channel',
         extra={

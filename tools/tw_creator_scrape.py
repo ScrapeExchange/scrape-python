@@ -22,13 +22,13 @@ from scrape_exchange.creator_queue import (
 from scrape_exchange.file_management import AssetFileManagement
 from scrape_exchange.scraper_metrics import (
     METRIC_CREATOR_SCRAPE_STATE_SIZE,
-    METRIC_SCRAPE_DURATION,
     METRIC_SCRAPE_FAILURES,
     METRIC_SCRAPE_QUEUE_SIZE,
     METRIC_SCRAPE_RECORDS_WRITTEN,
     METRIC_SCRAPE_RETRIES,
     METRIC_SCRAPES_COMPLETED,
     METRIC_WORKER_SLEEP_SECONDS,
+    observe_scrape,
 )
 from scrape_exchange.scraper_runner import ScraperRunContext, ScraperRunner
 from scrape_exchange.scraper_supervisor import distribute_total_concurrency
@@ -50,6 +50,7 @@ from scrape_exchange.twitch.twitch_session_pool import (
     TwitchSessionPool,
 )
 from scrape_exchange.util import extract_proxy_ip, extract_proxy_port
+from scrape_exchange.wait_tracking import ScrapeTimer
 from scrape_exchange.watchdog import Watchdog
 from scrape_exchange.worker_id import get_worker_id
 
@@ -117,7 +118,7 @@ async def process_creator(
     queue: RedisCreatorQueue, fm: AssetFileManagement,
     settings: TwitchScraperSettings, worker_id: str, claim_owner: str,
 ) -> str | None:
-    start: float = time.monotonic()
+    timer: ScrapeTimer = ScrapeTimer.start()
     labels: dict[str, str] = _labels(proxy, worker_id)
     outcome: str = 'failure'
     if not await _owns_claim(queue, username, claim_owner):
@@ -182,11 +183,12 @@ async def process_creator(
         _LOGGER.warning(f'Twitch profile {username}: {reason}')
         return reason
     finally:
-        METRIC_SCRAPE_DURATION.labels(
+        observe_scrape(
+            timer,
             platform=PLATFORM, scraper=SCRAPER, entity='creator',
             api='browser', outcome=outcome, worker_id=worker_id,
             innertube_calls='none',
-        ).observe(time.monotonic() - start)
+        )
 
 
 async def _proxy_task(

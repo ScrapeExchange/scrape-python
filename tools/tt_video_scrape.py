@@ -23,7 +23,6 @@ import os
 import re
 import resource
 import sys
-import time
 from typing import Any, Awaitable, Callable, TypeVar
 
 from pydantic import AliasChoices, Field, field_validator
@@ -33,13 +32,14 @@ from scrape_exchange.file_management import AssetFileManagement
 from scrape_exchange.proxy_loader import proxy_file_label
 from scrape_exchange.redis_client import redis_from_url
 from scrape_exchange.scraper_metrics import (
-    METRIC_SCRAPE_DURATION,
+    observe_scrape,
     METRIC_SCRAPE_FAILURES,
     METRIC_SCRAPE_QUEUE_SIZE,
     METRIC_SCRAPE_RECORDS_WRITTEN,
     METRIC_SCRAPE_RETRIES,
     METRIC_SCRAPES_COMPLETED,
 )
+from scrape_exchange.wait_tracking import ScrapeTimer
 from scrape_exchange.scraper_runner import (
     ScraperRunContext,
     ScraperRunner,
@@ -393,7 +393,7 @@ async def _scrape_one_queued(
     )
     proxy_file: str = _proxy_file_label(proxy)
     while attempts_left > 0:
-        started: float = time.monotonic()
+        timer: ScrapeTimer = ScrapeTimer.start()
         try:
             async with pool.session_for(proxy) as api:
                 await _scrape_to_disk(video_ref, api=api, fm=fm)
@@ -411,7 +411,8 @@ async def _scrape_one_queued(
                 proxy_port=proxy_port,
                 proxy_file=proxy_file,
             ).inc()
-            METRIC_SCRAPE_DURATION.labels(
+            observe_scrape(
+                timer,
                 platform=PLATFORM,
                 scraper=SCRAPER_LABEL,
                 entity=ENTITY,
@@ -419,7 +420,7 @@ async def _scrape_one_queued(
                 outcome='failure',
                 worker_id=worker_id,
                 innertube_calls='none',
-            ).observe(time.monotonic() - started)
+            )
             if reason in _UNAVAILABLE_REASONS:
                 await queue.mark(
                     video_ref,
@@ -464,7 +465,8 @@ async def _scrape_one_queued(
                 proxy_file=proxy_file,
                 channel_status='none',
             ).inc()
-            METRIC_SCRAPE_DURATION.labels(
+            observe_scrape(
+                timer,
                 platform=PLATFORM,
                 scraper=SCRAPER_LABEL,
                 entity=ENTITY,
@@ -472,7 +474,7 @@ async def _scrape_one_queued(
                 outcome='success',
                 worker_id=worker_id,
                 innertube_calls='none',
-            ).observe(time.monotonic() - started)
+            )
             return
     await queue.mark(
         video_ref,

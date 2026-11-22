@@ -35,7 +35,6 @@ from urllib.parse import urlparse
 
 # Stays on httpx (0.23): httpx_curl_cffi's transport is built on it.
 import httpx
-from httpx_curl_cffi import AsyncCurlTransport
 from playwright.async_api import Error as PlaywrightError
 from pydantic import AliasChoices, Field, field_validator
 
@@ -61,9 +60,11 @@ from scrape_exchange.name_map import (
     NameMap,
     RedisNameMap,
 )
+from scrape_exchange.proxy_phase_metrics import (
+    TransferMetricsCurlTransport,
+)
 from scrape_exchange.redis_client import redis_from_url
 from scrape_exchange.scraper_metrics import (
-    METRIC_SCRAPE_DURATION,
     METRIC_SCRAPE_FAILURES,
     METRIC_SCRAPE_LOW_SUBS,
     METRIC_SCRAPE_QUEUE_ENQUEUES,
@@ -72,6 +73,7 @@ from scrape_exchange.scraper_metrics import (
     METRIC_SCRAPE_RETRIES,
     METRIC_SCRAPES_COMPLETED,
     METRIC_TIKTOK_SHORT_URL_RESOLUTIONS,
+    observe_scrape,
 )
 from scrape_exchange.scraper_runner import (
     ScraperRunContext,
@@ -115,6 +117,7 @@ from scrape_exchange.video_scrape_queue import (
     VideoScrapeQueue,
     VideoScrapeQueueSettings,
 )
+from scrape_exchange.wait_tracking import ScrapeTimer
 from scrape_exchange.watchdog import Watchdog
 from scrape_exchange.worker_id import get_worker_id
 
@@ -1296,7 +1299,10 @@ class HttpCreatorFetcher(CreatorFetcher):
         client: httpx.AsyncClient | None = self._clients.get(proxy)
         if client is None:
             client = httpx.AsyncClient(
-                transport=AsyncCurlTransport(
+                transport=TransferMetricsCurlTransport(
+                    platform=PLATFORM,
+                    scraper=SCRAPER_LABEL,
+                    call='profile',
                     impersonate='chrome',
                     default_headers=True,
                     proxy=proxy,
@@ -1412,7 +1418,7 @@ async def _process_creator(
     and the claim is released/removed accordingly — a bad creator never
     kills the worker.
     '''
-    start: float = time.monotonic()
+    timer: ScrapeTimer = ScrapeTimer.start()
     proxy_port: str = extract_proxy_port(proxy)
     try:
         creator: TikTokCreator = await fetcher.scrape(
@@ -1473,11 +1479,12 @@ async def _process_creator(
             proxy_file='',
             channel_status='none',
         ).inc()
-        METRIC_SCRAPE_DURATION.labels(
+        observe_scrape(
+            timer,
             platform=PLATFORM, scraper=SCRAPER_LABEL, entity=ENTITY,
             api=API_LABEL, outcome='success', worker_id=worker_id,
             innertube_calls='none',
-        ).observe(time.monotonic() - start)
+        )
         return None
     except Exception as exc:
         reason: str = await _handle_failure(
@@ -1490,11 +1497,12 @@ async def _process_creator(
             proxy_ip=proxy_ip, proxy_file='',
             proxy_port=proxy_port,
         ).inc()
-        METRIC_SCRAPE_DURATION.labels(
+        observe_scrape(
+            timer,
             platform=PLATFORM, scraper=SCRAPER_LABEL, entity=ENTITY,
             api=API_LABEL, outcome='failure', worker_id=worker_id,
             innertube_calls='none',
-        ).observe(time.monotonic() - start)
+        )
         return reason
 
 

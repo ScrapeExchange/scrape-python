@@ -48,6 +48,10 @@ from scrape_exchange.proxy_health import (
     PUBLISHER_ENV_VAR as PROXY_HEALTH_PUBLISHER_ENV_VAR,
 )
 from scrape_exchange.proxy_health import clear_auth_cooldowns_in_redis
+from scrape_exchange.proxy_loader import (
+    PROXY_SOURCES_ENV_VAR,
+    proxy_sources_env,
+)
 from scrape_exchange.scraper_metrics import METRIC_SUPERVISOR_RESPAWNS
 from scrape_exchange.worker_id import get_worker_id
 
@@ -464,6 +468,7 @@ def spawn_children(
         child_env: dict[str, str] = os.environ.copy()
         child_env[config.num_processes_env_var] = '1'
         child_env['PROXIES'] = ','.join(chunk)
+        child_env[PROXY_SOURCES_ENV_VAR] = proxy_sources_env(chunk)
         child_env[SUPERVISED_CHILD_ENV_VAR] = '1'
         if config.split_proxy_pool:
             # PROXY_FILES takes precedence over PROXIES in the
@@ -790,6 +795,9 @@ def _schedule_proxy_reload(
             # so every running child restarts.
             continue
         slot.spawn_env['PROXIES'] = ','.join(new_slice)
+        slot.spawn_env[PROXY_SOURCES_ENV_VAR] = proxy_sources_env(
+            new_slice,
+        )
         if not new_slice:
             _LOGGER.error(
                 'No proxies left for child; stopping it',

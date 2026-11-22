@@ -52,6 +52,7 @@ from prometheus_client import Counter, Gauge
 
 from scrape_exchange.rate_limiter import RateLimiter, _BucketConfig
 from scrape_exchange.util import extract_proxy_ip, extract_proxy_port
+from scrape_exchange.wait_tracking import tracked_sleep
 from scrape_exchange.youtube.rate_limit_settings import (
     YT_RATE_LIMITS,
 )
@@ -503,7 +504,7 @@ class YouTubeRateLimiter(RateLimiter[YouTubeCallType]):
                         'wait_seconds': wait,
                     },
                 )
-                await asyncio.sleep(wait)
+                await tracked_sleep(wait)
         return await super().acquire(
             call_type, proxy=proxy, max_wait=max_wait,
         )

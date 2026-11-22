@@ -497,7 +497,6 @@ class CamoufoxTikTokApi(TikTokApi):
         endpoint: str = _endpoint_label(url)
         scraper: str = getattr(self, '_scraper_label', 'tiktok')
         worker_id: str = getattr(self, '_worker_id', '0')
-        started: float = time.monotonic()
         if rate_limiter is not None:
             await rate_limiter.acquire(
                 getattr(
@@ -506,6 +505,8 @@ class CamoufoxTikTokApi(TikTokApi):
                 ),
                 proxy=self._rate_limit_proxy,
             )
+        # Time the call only, not the rate-limiter wait.
+        started: float = time.monotonic()
         try:
             _, session = self._get_session(**kwargs)
             page = session.page

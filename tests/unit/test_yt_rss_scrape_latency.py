@@ -12,6 +12,9 @@ from pathlib import Path
 from types import ModuleType
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from scrape_exchange import scraper_metrics
+from scrape_exchange.wait_tracking import tracked_sleep
+
 
 def _load_yt_rss_scrape() -> ModuleType:
     for _key in ('yt_rss_scrape', 'tools.yt_rss_scrape'):
@@ -70,7 +73,7 @@ class TestFetchRssLatency(unittest.IsolatedAsyncioTestCase):
         rate_limiter.report_proxy_result = AsyncMock()
         rate_limiter.report_rss_success = MagicMock()
         with patch.object(
-            yt_rss_scrape, 'METRIC_SCRAPE_DURATION',
+            scraper_metrics, 'METRIC_SCRAPE_DURATION',
         ) as duration, patch.object(
             yt_rss_scrape,
             'borrow_pooled_httpx_client_for_entry',
@@ -94,6 +97,44 @@ class TestFetchRssLatency(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs['api'], 'rss')
         self.assertEqual(kwargs['platform'], 'youtube')
         duration.labels.return_value.observe.assert_called_once()
+
+    async def test_rate_limiter_wait_is_not_counted(self) -> None:
+        async def slow_acquire(*args: object, **kwargs: object) -> None:
+            await tracked_sleep(0.2)
+
+        rate_limiter: MagicMock = MagicMock()
+        rate_limiter.acquire = AsyncMock(side_effect=slow_acquire)
+        rate_limiter.report_proxy_result = AsyncMock()
+        rate_limiter.report_rss_success = MagicMock()
+        with patch.object(
+            scraper_metrics, 'METRIC_SCRAPE_DURATION',
+        ) as duration, patch.object(
+            scraper_metrics, 'METRIC_SCRAPE_WAIT',
+        ) as wait, patch.object(
+            yt_rss_scrape, 'METRIC_RSS_FETCH_DURATION',
+        ) as fetch, patch.object(
+            yt_rss_scrape,
+            'borrow_pooled_httpx_client_for_entry',
+            lambda entry: _StubClient(),
+        ), patch.object(
+            yt_rss_scrape.YouTubeRateLimiter,
+            'get', return_value=rate_limiter,
+        ):
+            await yt_rss_scrape.fetch_rss(
+                rss_url=(
+                    'https://example/feeds/videos.xml?'
+                    'channel_id=UC0'
+                ),
+                channel_handle='Test',
+            )
+        active: float = (
+            duration.labels.return_value.observe.call_args.args[0]
+        )
+        fetched: float = fetch.labels.return_value.observe.call_args.args[0]
+        waited: float = wait.labels.return_value.observe.call_args.args[0]
+        self.assertLess(active, 0.15)
+        self.assertLess(fetched, 0.15)
+        self.assertGreaterEqual(waited, 0.2)
 
     async def test_fetch_rss_sends_browser_headers_and_cookies(self) -> None:
         captured: dict = {}
@@ -143,7 +184,7 @@ class TestFetchRssLatency(unittest.IsolatedAsyncioTestCase):
         rate_limiter.report_proxy_result = AsyncMock()
         rate_limiter.report_rss_success = MagicMock()
         with patch.object(
-            yt_rss_scrape, 'METRIC_SCRAPE_DURATION',
+            scraper_metrics, 'METRIC_SCRAPE_DURATION',
         ) as duration, patch.object(
             yt_rss_scrape,
             'borrow_pooled_httpx_client_for_entry',

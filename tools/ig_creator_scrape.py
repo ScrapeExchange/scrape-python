@@ -58,13 +58,14 @@ from scrape_exchange.scraper_metrics import (
     METRIC_INSTAGRAM_PROFILE_JSON_TIMEOUTS,
     METRIC_INSTAGRAM_PROFILE_TIMEOUT_HTML_BYTES,
     METRIC_CREATOR_SCRAPE_STATE_SIZE,
-    METRIC_SCRAPE_DURATION,
+    observe_scrape,
     METRIC_SCRAPE_FAILURES,
     METRIC_SCRAPE_QUEUE_SIZE,
     METRIC_SCRAPE_RECORDS_WRITTEN,
     METRIC_SCRAPE_RETRIES,
     METRIC_SCRAPES_COMPLETED,
 )
+from scrape_exchange.wait_tracking import ScrapeTimer
 from scrape_exchange.scraper_runner import (
     ScraperRunContext,
     ScraperRunner,
@@ -654,7 +655,7 @@ async def _process_creator(
     worker_id: str,
     proxy_ip: str,
 ) -> str | None:
-    start: float = time.monotonic()
+    timer: ScrapeTimer = ScrapeTimer.start()
     proxy_port: str = extract_proxy_port(proxy)
     evidence: dict | None = None
     await queue.record_scrape_attempt(
@@ -698,7 +699,8 @@ async def _process_creator(
             proxy_file='',
             channel_status='none',
         ).inc()
-        METRIC_SCRAPE_DURATION.labels(
+        observe_scrape(
+            timer,
             platform=PLATFORM,
             scraper=SCRAPER_LABEL,
             entity=ENTITY,
@@ -706,7 +708,7 @@ async def _process_creator(
             outcome='success',
             worker_id=worker_id,
             innertube_calls='none',
-        ).observe(time.monotonic() - start)
+        )
         return None
     except Exception as exc:
         reason: str = await _handle_failure(
@@ -724,7 +726,8 @@ async def _process_creator(
             proxy_port=proxy_port,
             proxy_file='',
         ).inc()
-        METRIC_SCRAPE_DURATION.labels(
+        observe_scrape(
+            timer,
             platform=PLATFORM,
             scraper=SCRAPER_LABEL,
             entity=ENTITY,
@@ -732,7 +735,7 @@ async def _process_creator(
             outcome='failure',
             worker_id=worker_id,
             innertube_calls='none',
-        ).observe(time.monotonic() - start)
+        )
         return reason
 
 

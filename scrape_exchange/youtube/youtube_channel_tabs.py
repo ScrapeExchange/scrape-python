@@ -47,6 +47,7 @@ from .youtube_client import (
     _get_scraper,
     generate_visitor_info,
 )
+from scrape_exchange.wait_tracking import ScrapeTimer
 from scrape_exchange.worker_id import get_worker_id
 from scrape_exchange.proxy_loader import proxy_file_label
 from scrape_exchange.proxy_phase_metrics import (
@@ -70,7 +71,8 @@ _LOGGER: Logger = getLogger(__name__)
 
 CHANNEL_TAB_DURATION: Histogram = Histogram(
     'channel_tab_scrape_duration_seconds',
-    'Duration of one YouTube channel tab scrape.',
+    'Duration of one YouTube channel tab scrape, not counting time '
+    'spent waiting for rate-limiter tokens or in backoff sleeps.',
     [
         'platform', 'scraper', 'entity', 'tab',
         'outcome', 'worker_id',
@@ -562,7 +564,7 @@ class YouTubeChannelTabs:
         set[YouTubeCourse], set[YouTubePost],
         set[YouTubeProduct],
     ]:
-        started_at: float = time.monotonic()
+        tab_timer: ScrapeTimer = ScrapeTimer.start()
         tab_label: str = _tab_metric_label(title)
         metric_base: dict[str, str] = _tab_metric_base(tab_label)
         outcome: str = 'success'
@@ -759,7 +761,7 @@ class YouTubeChannelTabs:
             CHANNEL_TAB_DURATION.labels(
                 **metric_base,
                 outcome=outcome,
-            ).observe(time.monotonic() - started_at)
+            ).observe(tab_timer.active())
 
     def _home_tab_renderer(self) -> dict[str, any] | None:
         '''The Home tab's tabRenderer, already loaded by
@@ -795,7 +797,7 @@ class YouTubeChannelTabs:
         extra: dict[str, str] = {
             'channel_id': self.channel_id, 'tab': HOME_TAB,
         }
-        started_at: float = time.monotonic()
+        tab_timer: ScrapeTimer = ScrapeTimer.start()
         outcome: str = 'success'
         # Keyed by playlist ID: the shelf lockup and the panel's grid
         # item describe the same album with different detail, and the
@@ -832,7 +834,7 @@ class YouTubeChannelTabs:
         finally:
             CHANNEL_TAB_DURATION.labels(
                 **metric_base, outcome=outcome,
-            ).observe(time.monotonic() - started_at)
+            ).observe(tab_timer.active())
 
         CHANNEL_TAB_ITEMS.labels(
             **metric_base, item_type='playlist',
@@ -979,7 +981,7 @@ class YouTubeChannelTabs:
         extra: dict[str, str] = {
             'channel_id': self.channel_id, 'tab': UPLOADS_TAB,
         }
-        started_at: float = time.monotonic()
+        tab_timer: ScrapeTimer = ScrapeTimer.start()
         outcome: str = 'success'
         listing: bool = self.resumable_listing
         video_ids: set[str] = set()
@@ -1048,7 +1050,7 @@ class YouTubeChannelTabs:
         finally:
             CHANNEL_TAB_DURATION.labels(
                 **metric_base, outcome=outcome,
-            ).observe(time.monotonic() - started_at)
+            ).observe(tab_timer.active())
 
         CHANNEL_TAB_ITEMS.labels(
             **metric_base, item_type='video_id',
@@ -1732,6 +1734,7 @@ class YouTubeChannelTabs:
                     platform='youtube',
                     scraper=_get_scraper(),
                     api='innertube',
+                    call='browse',
                     status_class='2xx',
                     worker_id=get_worker_id(),
                     proxy_file=proxy_file,
@@ -1756,6 +1759,7 @@ class YouTubeChannelTabs:
                     platform='youtube',
                     scraper=_get_scraper(),
                     api='innertube',
+                    call='browse',
                     status_class=status_class,
                     worker_id=get_worker_id(),
                     proxy_file=proxy_file,
@@ -1821,6 +1825,7 @@ class YouTubeChannelTabs:
                     platform='youtube',
                     scraper=_get_scraper(),
                     api='innertube',
+                    call='browse',
                     status_class='error',
                     worker_id=get_worker_id(),
                     proxy_file=proxy_file,

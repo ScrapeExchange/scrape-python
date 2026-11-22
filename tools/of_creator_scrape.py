@@ -4,7 +4,6 @@
 import asyncio
 import logging
 import signal
-import time
 from asyncio import sleep
 from contextlib import AsyncExitStack
 from typing import Any
@@ -33,19 +32,20 @@ from scrape_exchange.onlyfans.settings import (
 )
 from scrape_exchange.proxy_loader import proxy_file_label
 from scrape_exchange.scraper_metrics import (
-    METRIC_SCRAPE_DURATION,
     METRIC_SCRAPE_FAILURES,
     METRIC_SCRAPE_QUEUE_SIZE,
     METRIC_SCRAPE_RECORDS_WRITTEN,
     METRIC_SCRAPE_RETRIES,
     METRIC_SCRAPES_COMPLETED,
     METRIC_WORKER_SLEEP_SECONDS,
+    observe_scrape,
 )
 from scrape_exchange.scraper_supervisor import (
     METRIC_CONCURRENCY,
     METRIC_NUM_PROCESSES,
 )
 from scrape_exchange.util import extract_proxy_ip, extract_proxy_port
+from scrape_exchange.wait_tracking import ScrapeTimer
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 PREFIX: str = 'onlyfans-creator-'
@@ -56,7 +56,7 @@ LABELS: dict[str, str] = {
 
 
 def record_outcome(
-    outcome: str, started: float, settings: OnlyFansScraperSettings,
+    outcome: str, timer: ScrapeTimer, settings: OnlyFansScraperSettings,
     proxy: str | None,
 ) -> None:
     labels: dict[str, str] = {
@@ -75,12 +75,13 @@ def record_outcome(
         METRIC_SCRAPE_FAILURES.labels(
             **labels, **proxy_labels, reason=outcome,
         ).inc()
-    METRIC_SCRAPE_DURATION.labels(
+    observe_scrape(
+        timer,
         **labels,
         outcome=('success' if outcome == 'scraped' else
                  'claim_lost' if outcome == 'claim_lost' else 'failure'),
         innertube_calls='none',
-    ).observe(time.monotonic() - started)
+    )
 
 
 async def worker_sleep(
@@ -208,7 +209,7 @@ async def queue_worker(
             username: str = batch[0][0]
             proxy: str | None = proxies[index % len(proxies)]
             index += 1
-            started: float = time.monotonic()
+            timer: ScrapeTimer = ScrapeTimer.start()
             try:
                 if context is None or current_proxy != proxy:
                     async with asyncio.timeout(
@@ -228,7 +229,7 @@ async def queue_worker(
                 outcome = await _retry_creator(
                     username, queue, settings, owner, exc,
                 )
-            record_outcome(outcome, started, settings, proxy)
+            record_outcome(outcome, timer, settings, proxy)
             if outcome in ('failed', 'rate_limit'):
                 await stack.aclose()
                 context = None
@@ -344,7 +345,7 @@ async def scrape_creators(
                 async with anonymous_browser(proxy, settings) as context:
                     username: str
                     for username in batch:
-                        started: float = time.monotonic()
+                        timer: ScrapeTimer = ScrapeTimer.start()
                         outcome: str = 'cancelled'
                         try:
                             creator: OnlyFansCreator = await fetch_profile(
@@ -380,7 +381,7 @@ async def scrape_creators(
                         finally:
                             if outcome != 'cancelled':
                                 record_outcome(
-                                    outcome, started, settings, proxy,
+                                    outcome, timer, settings, proxy,
                                 )
                         completed += 1
             except Exception as exc:  # noqa: BLE001 - redact browser failures

@@ -35,6 +35,7 @@ from scrape_exchange.proxy_health import ProxyHealth
 from scrape_exchange.proxy_health import is_proxy_auth_error
 from scrape_exchange.redis_client import redis_from_url
 from scrape_exchange.util import extract_proxy_ip, extract_proxy_port
+from scrape_exchange.wait_tracking import waiting
 from scrape_exchange.worker_id import get_worker_id
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
@@ -1330,6 +1331,10 @@ class RateLimiter(ABC, Generic[CallTypeT]):
         consume one token from both the per-type and global
         buckets.
 
+        The whole call counts as waiting for
+        :class:`~scrape_exchange.wait_tracking.ScrapeTimer`, so scrape
+        durations leave it out.
+
         :param max_wait: give up instead of sleeping past this many
             seconds in total; None waits as long as it takes.
         :returns: the proxy that was used (useful when
@@ -1337,6 +1342,14 @@ class RateLimiter(ABC, Generic[CallTypeT]):
         :raises RateLimitWaitExceeded: the next sleep would take the
             total wait past *max_wait*.
         '''
+        with waiting():
+            return await self._acquire_tokens(call_type, proxy, max_wait)
+
+    async def _acquire_tokens(
+        self, call_type: CallTypeT, proxy: str | None,
+        max_wait: float | None,
+    ) -> str | None:
+        '''Body of :meth:`acquire`, without the wait recording.'''
         # Cheap timestamp check; reloads fleet-wide proxy health
         # every few seconds for select_proxy() callers.
         await self._health.refresh_if_stale(self._proxies)

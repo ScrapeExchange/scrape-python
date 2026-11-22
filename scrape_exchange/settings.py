@@ -113,6 +113,18 @@ class ScraperSettings(BaseSettings):
             'supervisor child processes after splitting PROXY_FILES.'
         ),
     )
+    proxy_sources_env: str | None = Field(
+        default=None,
+        exclude=True,
+        validation_alias=AliasChoices(
+            'PROXY_SOURCES', 'proxy_sources_env',
+        ),
+        description=(
+            'Comma-separated proxy_file labels, one per PROXIES entry. '
+            'Set by the scraper supervisor so child processes label '
+            'each proxy with the file it came from.'
+        ),
+    )
     proxy_reload_interval: float = Field(
         default=60.0,
         ge=0.0,
@@ -271,7 +283,11 @@ class ScraperSettings(BaseSettings):
                 for entry in self.proxies_env.split(',')
                 if entry.strip()
             ]
-            catalog = load_proxy_entries(entries)
+            labels: list[str] | None = (
+                self.proxy_sources_env.split(',')
+                if self.proxy_sources_env else None
+            )
+            catalog = load_proxy_entries(entries, labels=labels)
         else:
             catalog = load_proxy_catalog([])
         # ClassVar attrs aren't in model_fields; write to instance

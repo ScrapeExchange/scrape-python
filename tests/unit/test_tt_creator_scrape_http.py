@@ -12,9 +12,11 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
-from httpx_curl_cffi import AsyncCurlTransport
 
 from scrape_exchange.file_management import AssetFileManagement
+from scrape_exchange.proxy_phase_metrics import (
+    TransferMetricsCurlTransport,
+)
 from scrape_exchange.tiktok import TikTokCallType, classify_tiktok_error
 from scrape_exchange.tiktok.tiktok_metrics import API_CALL_TOTAL
 from tests.unit.test_tt_creator_scrape import _raw_user, _settings
@@ -168,12 +170,15 @@ class TestHttpCreatorFetcher(unittest.IsolatedAsyncioTestCase):
             MagicMock(), '0',
         )
         with patch.object(
-            tool, 'AsyncCurlTransport', wraps=AsyncCurlTransport,
+            tool, 'TransferMetricsCurlTransport',
+            wraps=TransferMetricsCurlTransport,
         ) as transport_cls:
             client: httpx.AsyncClient = fetcher._client(PROXY)
         try:
             transport_cls.assert_called_once_with(
-                impersonate='chrome', default_headers=True, proxy=PROXY,
+                platform='tiktok', scraper='tiktok_creator',
+                call='profile', impersonate='chrome',
+                default_headers=True, proxy=PROXY,
             )
             self.assertIs(fetcher._client(PROXY), client)
             self.assertEqual(
