@@ -25,6 +25,14 @@ during a network blip costs minutes. A success after the cooldown ends
 resets the backoff. Such a cooldown is flagged so
 :meth:`ProxyHealth.clear_auth_cooldowns` can lift it when the proxy
 files are edited.
+A bot check from YouTube on a proxy puts that proxy in cooldown in
+this process only (:meth:`ProxyHealth.report_bot_detection`), for
+2 min, doubling each time the proxy is challenged again after a
+cooldown ends, up to 30 min; a success of the challenged call after
+the cooldown ends resets it. YouTube challenges the IP together with this process's session
+(cookies, visitor data), so other hosts can keep using the proxy.
+With split proxy pools each proxy has one process per host, so this
+is a per-host cooldown.
 With Redis the state is shared by every process and scraper on every
 host (a ``proxy_health:<hash>`` hash per proxy, updated atomically by a
 Lua script) and each process refreshes its snapshot every few seconds;
@@ -66,6 +74,10 @@ MAX_COOLDOWN_SECONDS: float = 600.0
 # doubling per consecutive 407 cooldown up to the maximum.
 AUTH_BASE_COOLDOWN_SECONDS: float = 300.0
 AUTH_MAX_COOLDOWN_SECONDS: float = 6 * 3600.0
+# Cooldown in this process after a YouTube bot check on a proxy,
+# doubling per consecutive bot cooldown up to the maximum.
+BOT_BASE_COOLDOWN_SECONDS: float = 120.0
+BOT_MAX_COOLDOWN_SECONDS: float = 1800.0
 # How often a process refreshes its view of fleet-wide health.
 REFRESH_INTERVAL_SECONDS: float = 5.0
 # Half-life of the per-process recent-selection load counter.
@@ -92,7 +104,9 @@ METRIC_PROXY_COOLDOWNS: Counter = Counter(
     'transport failures, "proxy_auth" for a 407 from the proxy.',
     ['platform', 'proxy', 'worker_id', 'reason'],
 )
-COOLDOWN_REASONS: tuple[str, ...] = ('failures', 'proxy_auth')
+COOLDOWN_REASONS: tuple[str, ...] = (
+    'failures', 'proxy_auth', 'bot_detection',
+)
 # The per-proxy counter above starts each series at 1, which
 # increase() and rate() cannot see; this one is created at 0 for every
 # proxy file and reason before the first opening, so alerts work.
@@ -100,7 +114,8 @@ METRIC_COOLDOWN_OPENINGS: Counter = Counter(
     'proxy_health_cooldown_openings_total',
     'Times a proxy was put in cooldown, by proxy file and reason: '
     '"failures" for transport failures, "proxy_auth" for a 407 '
-    'from the proxy.',
+    'from the proxy, "bot_detection" for a YouTube bot check (a '
+    'cooldown in this process only).',
     ['platform', 'proxy_file', 'worker_id', 'reason'],
 )
 # The health gauges only carry series for proxies that have been
@@ -336,6 +351,19 @@ def apply_outcome(
     return False
 
 
+@dataclass
+class BotCooldown:
+    '''This process's cooldown of one proxy after YouTube bot
+    checks.'''
+
+    until: float = 0.0
+    # Bot cooldowns opened in a row; sets the next one's length.
+    open_count: int = 0
+    # The call YouTube challenged; only its success resets the
+    # backoff.
+    api: str = ''
+
+
 def _health_key(proxy: str) -> str:
     # Hash the proxy URL so credentials never end up in Redis keys.
     digest: str = hashlib.sha1(proxy.encode('utf-8')).hexdigest()[:16]
@@ -377,6 +405,9 @@ class ProxyHealth:
         # created when a proxy is first seen unhealthy; it cannot be
         # removed again in multiprocess mode, so it then stays.
         self._exported: set[str] = set()
+        # Proxies in this process's bot-check cooldown, or whose
+        # backoff has not been reset by a success yet.
+        self._bot: dict[str, BotCooldown] = {}
         # Proxy files whose cooldown openings series exist.
         self._opening_files: set[str] = set()
         self._opening_list: list[str] | None = None
@@ -389,12 +420,20 @@ class ProxyHealth:
         return state
 
     def available(self, proxy: str, now: float | None = None) -> bool:
-        '''True when *proxy* is not in cooldown.'''
+        '''True when *proxy* is not in cooldown, fleet-wide or
+        in this process after a bot check.'''
+
+        return (now or time.time()) >= self._cooldown_until(proxy)
+
+    def _cooldown_until(self, proxy: str) -> float:
+        '''When *proxy*'s fleet-wide and bot cooldowns end.'''
 
         state: ProxyHealthState | None = self._states.get(proxy)
-        if state is None:
-            return True
-        return (now or time.time()) >= state.cooldown_until
+        bot: BotCooldown | None = self._bot.get(proxy)
+        return max(
+            state.cooldown_until if state is not None else 0.0,
+            bot.until if bot is not None else 0.0,
+        )
 
     def _recent_load(self, proxy: str, now: float) -> float:
         entry: tuple[float, float] | None = self._load.get(proxy)
@@ -431,10 +470,7 @@ class ProxyHealth:
         if not available:
             # Every candidate is cooling down: use the one that
             # recovers first rather than stalling.
-            chosen = min(
-                candidates,
-                key=lambda p: self._state(p).cooldown_until,
-            )
+            chosen = min(candidates, key=self._cooldown_until)
         elif len(available) == 1:
             chosen = available[0]
         else:
@@ -487,10 +523,10 @@ class ProxyHealth:
             return
         self._init_opening_series([proxy])
         auth_failure = auth_failure and not ok
+        now: float = time.time()
         state: ProxyHealthState = self._state(proxy)
         if ok and state.is_clean():
             return
-        now: float = time.time()
         opened: bool
         if self._redis is None:
             opened = apply_outcome(state, ok, now, auth_failure)
@@ -545,6 +581,73 @@ class ProxyHealth:
                 },
             )
         self._publish(proxy, now)
+
+    def report_bot_detection(self, proxy: str | None, api: str) -> bool:
+        '''
+        Put *proxy* in this process's bot-check cooldown: 2 min,
+        doubling per bot check right after a cooldown ends, up to
+        30 min. Checks while the cooldown is open, from requests
+        already in flight, do not extend it. Other processes and
+        hosts are not affected.
+
+        :param proxy: the proxy YouTube challenged; None is ignored
+        :param api: the call that was challenged, e.g. 'player';
+            only :meth:`report_api_success` for this call resets the
+            backoff
+        :returns: True when this check opened a cooldown
+        :raises: (none)
+        '''
+
+        if not proxy:
+            return False
+        self._init_opening_series([proxy])
+        now: float = time.time()
+        bot: BotCooldown = self._bot.setdefault(proxy, BotCooldown())
+        if now < bot.until:
+            return False
+        seconds: float = min(
+            BOT_BASE_COOLDOWN_SECONDS * 2 ** bot.open_count,
+            BOT_MAX_COOLDOWN_SECONDS,
+        )
+        bot.until = now + seconds
+        bot.open_count += 1
+        bot.api = api
+        METRIC_COOLDOWN_OPENINGS.labels(
+            platform=self._platform,
+            proxy_file=proxy_file_label(proxy),
+            worker_id=get_worker_id(), reason='bot_detection',
+        ).inc()
+        _LOGGER.warning(
+            'Proxy put in cooldown on this host after bot detection',
+            extra={
+                'proxy': proxy,
+                'reason': 'bot_detection',
+                'cooldown_seconds': round(seconds),
+                'open_count': bot.open_count,
+                'api': api,
+            },
+        )
+        return True
+
+    def report_api_success(self, proxy: str | None, api: str) -> None:
+        '''
+        Record a successful *api* call through *proxy*. After the
+        proxy's bot-check cooldown has ended, a success of the call
+        that was challenged resets the backoff; successes of other
+        calls, or during the cooldown, do not.
+
+        :param proxy: the proxy the call went through
+        :param api: the call that succeeded, e.g. 'player'
+        :raises: (none)
+        '''
+
+        if not proxy:
+            return
+        bot: BotCooldown | None = self._bot.get(proxy)
+        if bot is None or bot.api != api:
+            return
+        if time.time() >= bot.until:
+            del self._bot[proxy]
 
     async def clear_auth_cooldowns(self, proxies: list[str]) -> int:
         '''

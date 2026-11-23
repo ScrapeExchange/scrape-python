@@ -701,6 +701,13 @@ class InnerTubeVideoParser:
             # as a proxy failure so proxy health moves traffic away
             # from IPs that keep getting challenged.
             await limiter.report_proxy_result(proxy, False)
+            # YouTube challenges the IP together with this host's
+            # session, and other hosts' successes on the IP keep the
+            # fleet-wide health from reacting: stop using the proxy
+            # on this host for a while.
+            limiter.report_bot_detection(
+                proxy, YouTubeCallType.PLAYER,
+            )
             await limiter.penalise(
                 YouTubeCallType.PLAYER,
                 proxy,
@@ -721,6 +728,7 @@ class InnerTubeVideoParser:
                 f'video_id={video.video_id}'
             )
         await limiter.report_proxy_result(proxy, True)
+        limiter.report_api_success(proxy, YouTubeCallType.PLAYER)
         _raise_if_unavailable(video.video_id, player_data)
         InnerTubeVideoParser._apply_player_data(video, player_data)
 
