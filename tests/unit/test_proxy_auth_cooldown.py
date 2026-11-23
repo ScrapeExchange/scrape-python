@@ -12,6 +12,7 @@ import unittest
 
 import fakeredis.aioredis
 import httpx2
+from prometheus_client import REGISTRY
 
 from scrape_exchange import proxy_health as ph
 from scrape_exchange.proxy_health import (
@@ -68,52 +69,84 @@ class TestIsProxyAuthError(unittest.TestCase):
         self.assertFalse(is_proxy_auth_error(exc))
 
 
+BASE: float = ph.AUTH_BASE_COOLDOWN_SECONDS
+
+
 class TestApplyAuthOutcome(unittest.TestCase):
 
-    def test_single_auth_failure_opens_long_cooldown(self) -> None:
+    def test_single_auth_failure_opens_base_cooldown(self) -> None:
         state: ProxyHealthState = ProxyHealthState()
         now: float = 1000.0
         self.assertTrue(apply_outcome(state, False, now, True))
-        self.assertEqual(
-            state.cooldown_until, now + ph.AUTH_COOLDOWN_SECONDS,
-        )
+        self.assertEqual(state.cooldown_until, now + BASE)
         self.assertTrue(state.auth_failed)
+        self.assertEqual(state.auth_open_count, 1)
         self.assertFalse(state.is_clean())
 
     def test_repeat_auth_failure_does_not_reopen(self) -> None:
+        # A burst of 407s from requests already in flight opens one
+        # cooldown and does not extend it.
         state: ProxyHealthState = ProxyHealthState()
         apply_outcome(state, False, 1000.0, True)
         self.assertFalse(apply_outcome(state, False, 1010.0, True))
+        self.assertEqual(state.cooldown_until, 1000.0 + BASE)
+        self.assertEqual(state.auth_open_count, 1)
+
+    def test_407_after_cooldown_doubles(self) -> None:
+        state: ProxyHealthState = ProxyHealthState()
+        now: float = 1000.0
+        expected: list[float] = [BASE, 2 * BASE, 4 * BASE, 8 * BASE]
+        length: float
+        for length in expected:
+            self.assertTrue(apply_outcome(state, False, now, True))
+            self.assertEqual(state.cooldown_until, now + length)
+            now = state.cooldown_until
+
+    def test_backoff_is_capped(self) -> None:
+        state: ProxyHealthState = ProxyHealthState()
+        now: float = 1000.0
+        for _ in range(20):
+            apply_outcome(state, False, now, True)
+            now = state.cooldown_until
+        apply_outcome(state, False, now, True)
         self.assertEqual(
-            state.cooldown_until, 1010.0 + ph.AUTH_COOLDOWN_SECONDS,
+            state.cooldown_until, now + ph.AUTH_MAX_COOLDOWN_SECONDS,
         )
+
+    def test_success_after_cooldown_resets_backoff(self) -> None:
+        state: ProxyHealthState = ProxyHealthState()
+        apply_outcome(state, False, 1000.0, True)
+        apply_outcome(state, False, 1000.0 + BASE, True)
+        self.assertEqual(state.auth_open_count, 2)
+        now: float = state.cooldown_until + 1
+        apply_outcome(state, True, now)
+        self.assertFalse(state.auth_failed)
+        self.assertEqual(state.auth_open_count, 0)
+        apply_outcome(state, False, now + 1, True)
+        self.assertEqual(state.cooldown_until, now + 1 + BASE)
 
     def test_auth_failure_extends_short_cooldown(self) -> None:
         state: ProxyHealthState = ProxyHealthState()
         for _ in range(ph.FAIL_THRESHOLD_CONSECUTIVE):
             apply_outcome(state, False, 1000.0)
-        self.assertLess(state.cooldown_until, 1000.0 + 3600)
+        self.assertLess(state.cooldown_until, 1000.0 + BASE)
         self.assertTrue(apply_outcome(state, False, 1001.0, True))
-        self.assertEqual(
-            state.cooldown_until, 1001.0 + ph.AUTH_COOLDOWN_SECONDS,
-        )
+        self.assertEqual(state.cooldown_until, 1001.0 + BASE)
 
     def test_success_during_cooldown_keeps_it(self) -> None:
         state: ProxyHealthState = ProxyHealthState()
         apply_outcome(state, False, 1000.0, True)
         apply_outcome(state, True, 1001.0)
         self.assertTrue(state.auth_failed)
-        self.assertEqual(
-            state.cooldown_until, 1000.0 + ph.AUTH_COOLDOWN_SECONDS,
-        )
+        self.assertEqual(state.auth_open_count, 1)
+        self.assertEqual(state.cooldown_until, 1000.0 + BASE)
 
     def test_success_after_cooldown_clears_flag(self) -> None:
         state: ProxyHealthState = ProxyHealthState()
         apply_outcome(state, False, 1000.0, True)
-        apply_outcome(
-            state, True, 1000.0 + ph.AUTH_COOLDOWN_SECONDS + 1,
-        )
+        apply_outcome(state, True, 1000.0 + BASE + 1)
         self.assertFalse(state.auth_failed)
+        self.assertEqual(state.auth_open_count, 0)
 
 
 class TestAuthCooldownLocal(unittest.IsolatedAsyncioTestCase):
@@ -160,7 +193,53 @@ class TestAuthCooldownRedis(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(state.auth_failed)
         # Lua's tostring() keeps 14 significant digits.
         self.assertAlmostEqual(
-            state.cooldown_until, before + ph.AUTH_COOLDOWN_SECONDS,
+            state.cooldown_until, before + BASE, delta=1.0,
+        )
+        self.assertEqual(state.auth_open_count, 1)
+
+    async def test_redis_backoff_matches_local(self) -> None:
+        # Drive the Lua script and apply_outcome through the same
+        # sequence and compare: 407, 407 after the cooldown, success
+        # after the cooldown, 407.
+        health: ProxyHealth = ProxyHealth(self.redis, 'youtube')
+        local: ProxyHealthState = ProxyHealthState()
+        key: str = ph._health_key(PROXIES[1])
+        steps: list[tuple[bool, bool]] = [
+            (False, True), (False, True), (True, False), (False, True),
+        ]
+        ok: bool
+        auth: bool
+        for ok, auth in steps:
+            now: float = time.time()
+            await self.redis.hset(key, 'cooldown_until', str(now - 1))
+            local.cooldown_until = now - 1
+            await health.report(PROXIES[1], ok, auth_failure=auth)
+            apply_outcome(local, ok, now, auth)
+            state: ProxyHealthState = health._states[PROXIES[1]]
+            self.assertEqual(
+                state.auth_open_count, local.auth_open_count,
+            )
+            self.assertEqual(state.auth_failed, local.auth_failed)
+            self.assertAlmostEqual(
+                state.cooldown_until, local.cooldown_until, delta=1.0,
+            )
+        self.assertEqual(local.auth_open_count, 1)
+
+    async def test_record_without_auth_open_count(self) -> None:
+        # A record written before auth_open_count existed.
+        key: str = ph._health_key(PROXIES[2])
+        await self.redis.hset(key, mapping={
+            'fail_ewma': '0.2', 'consecutive_failures': '0',
+            'open_count': '0', 'cooldown_until': '0',
+            'auth_failed': '0',
+        })
+        health: ProxyHealth = ProxyHealth(self.redis, 'youtube')
+        await health.refresh_if_stale(PROXIES, force=True)
+        self.assertEqual(health._states[PROXIES[2]].auth_open_count, 0)
+        before: float = time.time()
+        await health.report(PROXIES[2], False, auth_failure=True)
+        self.assertAlmostEqual(
+            health._states[PROXIES[2]].cooldown_until, before + BASE,
             delta=1.0,
         )
 
@@ -173,6 +252,7 @@ class TestAuthCooldownRedis(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await two.clear_auth_cooldowns(PROXIES), 1)
         await one.refresh_if_stale(PROXIES, force=True)
         self.assertTrue(one.available(PROXIES[0]))
+        self.assertEqual(one._states[PROXIES[0]].auth_open_count, 0)
         self.assertFalse(one.available(PROXIES[1]))
         # Clearing again is a no-op.
         self.assertEqual(await two.clear_auth_cooldowns(PROXIES), 0)
@@ -187,6 +267,41 @@ class TestAuthCooldownRedis(unittest.IsolatedAsyncioTestCase):
         await health.report(PROXIES[2], False, auth_failure=True)
         await health.report(PROXIES[2], False, auth_failure=True)
         self.assertEqual(counter._value.get() - start, 1)
+
+
+class TestCooldownOpeningsCounter(unittest.IsolatedAsyncioTestCase):
+    '''The proxy-file counter exists at 0 before the first opening,
+    so increase() sees the opening.'''
+
+    def _value(self, reason: str, platform: str) -> float | None:
+        return REGISTRY.get_sample_value(
+            'proxy_health_cooldown_openings_total', {
+                'platform': platform, 'proxy_file': 'none',
+                'worker_id': ph.get_worker_id(), 'reason': reason,
+            },
+        )
+
+    async def test_series_created_at_zero_then_counted(self) -> None:
+        platform: str = 'openings-test'
+        health: ProxyHealth = ProxyHealth(None, platform)
+        self.assertIsNone(self._value('proxy_auth', platform))
+        await health.refresh_if_stale(list(PROXIES))
+        self.assertEqual(self._value('proxy_auth', platform), 0)
+        self.assertEqual(self._value('failures', platform), 0)
+        await health.report(PROXIES[0], False, auth_failure=True)
+        await health.report(PROXIES[0], False, auth_failure=True)
+        self.assertEqual(self._value('proxy_auth', platform), 1)
+        for _ in range(ph.FAIL_THRESHOLD_CONSECUTIVE):
+            await health.report(PROXIES[1], False)
+        self.assertEqual(self._value('failures', platform), 1)
+
+    async def test_report_creates_series_for_unseen_proxy(
+        self,
+    ) -> None:
+        platform: str = 'openings-report-test'
+        health: ProxyHealth = ProxyHealth(None, platform)
+        await health.report(PROXIES[0], True)
+        self.assertEqual(self._value('proxy_auth', platform), 0)
 
 
 class TestClearAuthCooldownsInRedis(unittest.IsolatedAsyncioTestCase):

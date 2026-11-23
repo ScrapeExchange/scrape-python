@@ -141,32 +141,7 @@
                   },
                   "unit": "ops"
                 },
-                "overrides": [
-                  {
-                    "__systemRef": "hideSeriesFrom",
-                    "matcher": {
-                      "id": "byNames",
-                      "options": {
-                        "mode": "exclude",
-                        "names": [
-                          "rss_feed / not_found"
-                        ],
-                        "prefix": "All except:",
-                        "readOnly": true
-                      }
-                    },
-                    "properties": [
-                      {
-                        "id": "custom.hideFrom",
-                        "value": {
-                          "legend": false,
-                          "tooltip": true,
-                          "viz": true
-                        }
-                      }
-                    ]
-                  }
-                ]
+                "overrides": []
               },
               "options": {
                 "legend": {
@@ -297,126 +272,6 @@
               }
             },
             "version": "12.3.0"
-          }
-        }
-      },
-      "panel-101": {
-        "kind": "Panel",
-        "spec": {
-          "data": {
-            "kind": "QueryGroup",
-            "spec": {
-              "queries": [
-                {
-                  "kind": "PanelQuery",
-                  "spec": {
-                    "hidden": false,
-                    "query": {
-                      "datasource": {
-                        "name": "${datasource}"
-                      },
-                      "group": "prometheus",
-                      "kind": "DataQuery",
-                      "spec": {
-                        "editorMode": "code",
-                        "expr": "sum by (scraper, source) (rate(channel_subscriber_count_parse_total{outcome=\"unparseable\",job=~\"$job\",instance=~\"$instance\"}[5m])) / sum by (scraper, source) (rate(channel_subscriber_count_parse_total{job=~\"$job\",instance=~\"$instance\"}[5m]))",
-                        "legendFormat": "{{scraper}} {{source}}",
-                        "range": true
-                      },
-                      "version": "v0"
-                    },
-                    "refId": "A"
-                  }
-                }
-              ],
-              "queryOptions": {},
-              "transformations": []
-            }
-          },
-          "description": "Fraction (5m) of scraped YouTube channel pages whose subscriber count TEXT was present but could not be parsed (outcome=unparseable). Pages that simply do not show a count are now outcome=absent and are excluded here. source=innertube is the pageHeaderRenderer metadata rows of the InnerTube browse response (channel + RSS scraper); source=about_page is subscriberCountText on the /about HTML page (channel scraper). A jump usually means YouTube changed the page layout.",
-          "id": 101,
-          "links": [],
-          "title": "Subscriber count parse failure ratio by scraper / source",
-          "vizConfig": {
-            "group": "timeseries",
-            "kind": "VizConfig",
-            "spec": {
-              "fieldConfig": {
-                "defaults": {
-                  "color": {
-                    "mode": "palette-classic"
-                  },
-                  "custom": {
-                    "axisBorderShow": false,
-                    "axisCenteredZero": false,
-                    "axisColorMode": "text",
-                    "axisLabel": "",
-                    "axisPlacement": "auto",
-                    "barAlignment": 0,
-                    "barWidthFactor": 0.6,
-                    "drawStyle": "line",
-                    "fillOpacity": 0,
-                    "gradientMode": "none",
-                    "hideFrom": {
-                      "legend": false,
-                      "tooltip": false,
-                      "viz": false
-                    },
-                    "insertNulls": false,
-                    "lineInterpolation": "linear",
-                    "lineWidth": 1,
-                    "pointSize": 5,
-                    "scaleDistribution": {
-                      "type": "linear"
-                    },
-                    "showPoints": "never",
-                    "showValues": false,
-                    "spanNulls": false,
-                    "stacking": {
-                      "group": "A",
-                      "mode": "none"
-                    },
-                    "thresholdsStyle": {
-                      "mode": "off"
-                    }
-                  },
-                  "max": 1,
-                  "min": 0,
-                  "thresholds": {
-                    "mode": "absolute",
-                    "steps": [
-                      {
-                        "color": "green",
-                        "value": 0
-                      },
-                      {
-                        "color": "red",
-                        "value": 0.2
-                      }
-                    ]
-                  },
-                  "unit": "percentunit"
-                },
-                "overrides": []
-              },
-              "options": {
-                "legend": {
-                  "calcs": [
-                    "last",
-                    "max"
-                  ],
-                  "displayMode": "list",
-                  "placement": "bottom",
-                  "showLegend": true
-                },
-                "tooltip": {
-                  "hideZeros": false,
-                  "mode": "multi",
-                  "sort": "desc"
-                }
-              }
-            },
-            "version": "13.3.0"
           }
         }
       },
@@ -1141,7 +996,7 @@
                 }
               }
             },
-            "version": "12.3.0"
+            "version": "13.3.0"
           }
         }
       },
@@ -1255,7 +1110,7 @@
                 }
               }
             },
-            "version": "12.3.0"
+            "version": "13.3.0"
           }
         }
       },
@@ -1390,7 +1245,7 @@
                 }
               }
             },
-            "version": "12.3.0"
+            "version": "13.3.0"
           }
         }
       },
@@ -1525,7 +1380,7 @@
                 }
               }
             },
-            "version": "12.3.0"
+            "version": "13.3.0"
           }
         }
       },
@@ -1640,7 +1495,7 @@
                 }
               }
             },
-            "version": "12.3.0"
+            "version": "13.3.0"
           }
         }
       },
@@ -1756,7 +1611,7 @@
                 }
               }
             },
-            "version": "12.3.0"
+            "version": "13.3.0"
           }
         }
       },
@@ -1892,7 +1747,7 @@
                 }
               }
             },
-            "version": "12.3.0"
+            "version": "13.3.0"
           }
         }
       },
@@ -4977,6 +4832,120 @@
                   "hideZeros": false,
                   "mode": "multi",
                   "sort": "desc"
+                }
+              }
+            },
+            "version": "13.3.0"
+          }
+        }
+      },
+      "panel-169": {
+        "kind": "Panel",
+        "spec": {
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "hidden": false,
+                    "query": {
+                      "datasource": {
+                        "name": "b2ee3b55-9017-40c3-9e1e-e2c68921f97c"
+                      },
+                      "group": "prometheus",
+                      "kind": "DataQuery",
+                      "spec": {
+                        "editorMode": "code",
+                        "expr": "sum by (instance) (rate(scrape_failures_total{reason=\"bot_detection\"}[5m]))",
+                        "legendFormat": "Bot detection: {{scraper}} {{instance}}",
+                        "range": true
+                      },
+                      "version": "v0"
+                    },
+                    "refId": "A"
+                  }
+                }
+              ],
+              "queryOptions": {},
+              "transformations": []
+            }
+          },
+          "description": "",
+          "id": 169,
+          "links": [],
+          "title": "Bot detection",
+          "vizConfig": {
+            "group": "timeseries",
+            "kind": "VizConfig",
+            "spec": {
+              "fieldConfig": {
+                "defaults": {
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "axisBorderShow": false,
+                    "axisCenteredZero": false,
+                    "axisColorMode": "text",
+                    "axisLabel": "",
+                    "axisPlacement": "auto",
+                    "barAlignment": 0,
+                    "barWidthFactor": 0.6,
+                    "drawStyle": "line",
+                    "fillOpacity": 25,
+                    "gradientMode": "none",
+                    "hideFrom": {
+                      "legend": false,
+                      "tooltip": false,
+                      "viz": false
+                    },
+                    "insertNulls": false,
+                    "lineInterpolation": "linear",
+                    "lineWidth": 1,
+                    "pointSize": 5,
+                    "scaleDistribution": {
+                      "type": "linear"
+                    },
+                    "showPoints": "auto",
+                    "showValues": false,
+                    "spanNulls": false,
+                    "stacking": {
+                      "group": "A",
+                      "mode": "normal"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    }
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": 0
+                      },
+                      {
+                        "color": "red",
+                        "value": 80
+                      }
+                    ]
+                  }
+                },
+                "overrides": []
+              },
+              "options": {
+                "legend": {
+                  "calcs": [],
+                  "displayMode": "list",
+                  "placement": "bottom",
+                  "showLegend": true
+                },
+                "tooltip": {
+                  "hideZeros": false,
+                  "mode": "single",
+                  "sort": "none"
                 }
               }
             },
@@ -9965,7 +9934,7 @@
           {
             "kind": "RowsLayoutRow",
             "spec": {
-              "collapse": true,
+              "collapse": false,
               "layout": {
                 "kind": "GridLayout",
                 "spec": {
@@ -9975,9 +9944,9 @@
                       "spec": {
                         "element": {
                           "kind": "ElementReference",
-                          "name": "panel-10"
+                          "name": "panel-169"
                         },
-                        "height": 9,
+                        "height": 8,
                         "width": 12,
                         "x": 0,
                         "y": 0
@@ -10001,25 +9970,12 @@
                       "spec": {
                         "element": {
                           "kind": "ElementReference",
-                          "name": "panel-43"
+                          "name": "panel-10"
                         },
-                        "height": 8,
-                        "width": 24,
-                        "x": 0,
-                        "y": 9
-                      }
-                    },
-                    {
-                      "kind": "GridLayoutItem",
-                      "spec": {
-                        "element": {
-                          "kind": "ElementReference",
-                          "name": "panel-101"
-                        },
-                        "height": 8,
+                        "height": 9,
                         "width": 12,
                         "x": 0,
-                        "y": 17
+                        "y": 8
                       }
                     },
                     {
@@ -10032,6 +9988,19 @@
                         "height": 8,
                         "width": 12,
                         "x": 12,
+                        "y": 9
+                      }
+                    },
+                    {
+                      "kind": "GridLayoutItem",
+                      "spec": {
+                        "element": {
+                          "kind": "ElementReference",
+                          "name": "panel-43"
+                        },
+                        "height": 7,
+                        "width": 12,
+                        "x": 0,
                         "y": 17
                       }
                     }
@@ -11141,7 +11110,7 @@
       "scrape.exchange"
     ],
     "timeSettings": {
-      "autoRefresh": "1m",
+      "autoRefresh": "5m",
       "autoRefreshIntervals": [
         "5s",
         "10s",
@@ -11155,7 +11124,7 @@
         "1d"
       ],
       "fiscalYearStartMonth": 0,
-      "from": "now-12h",
+      "from": "now-24h",
       "hideTimepicker": false,
       "timezone": "browser",
       "to": "now"
