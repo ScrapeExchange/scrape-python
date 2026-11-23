@@ -1284,6 +1284,35 @@ class RateLimiter(ABC, Generic[CallTypeT]):
             proxy, ok, auth_failure=is_proxy_auth_error(exc),
         )
 
+    def report_bot_detection(
+        self, proxy: str | None, call_type: CallTypeT,
+    ) -> None:
+        '''
+        Record that the platform answered a *call_type* request
+        through *proxy* with a bot check: this process stops choosing
+        the proxy for a while (see
+        :meth:`ProxyHealth.report_bot_detection`).
+
+        :param proxy: the proxy the request went through
+        :param call_type: the call that was challenged
+        :raises: (none)
+        '''
+        self._health.report_bot_detection(proxy, call_type.value)
+
+    def report_api_success(
+        self, proxy: str | None, call_type: CallTypeT,
+    ) -> None:
+        '''
+        Record a successful *call_type* request through *proxy*;
+        after a bot-check cooldown ends, a success of the challenged
+        call resets its backoff.
+
+        :param proxy: the proxy the request went through
+        :param call_type: the call that succeeded
+        :raises: (none)
+        '''
+        self._health.report_api_success(proxy, call_type.value)
+
     async def clear_proxy_auth_cooldowns(
         self, proxies: list[str] | None = None,
     ) -> int:

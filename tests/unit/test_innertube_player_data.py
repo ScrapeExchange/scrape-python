@@ -461,6 +461,11 @@ class TestBotDetectionResponseHandling(
             limiter.report_proxy_result.await_args_list,
             [call(proxy, False)],
         )
+        # And this host stops using the proxy for a while.
+        limiter.report_bot_detection.assert_called_once_with(
+            proxy, innertube_mod.YouTubeCallType.PLAYER,
+        )
+        limiter.report_api_success.assert_not_called()
 
 
 class TestUnavailableResponseHandling(
@@ -512,6 +517,11 @@ class TestUnavailableResponseHandling(
         self.assertEqual(
             limiter.report_proxy_result.await_args_list,
             [call(proxy, True)],
+        )
+        # A PLAYER answer that is not a bot check can lift this
+        # host's bot-check backoff.
+        limiter.report_api_success.assert_called_once_with(
+            proxy, innertube_mod.YouTubeCallType.PLAYER,
         )
 
     def test_private_video_without_title_raises(self) -> None:
