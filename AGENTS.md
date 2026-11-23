@@ -1,8 +1,6 @@
 read settings, connectionstrings from LOCAL.md if the file exists.
-for remote shell writes, ask for permission. If permission granted then perform the write
 remember conversations about this code base and repo between sessions
-when creating a new branch, use feature/<feature-name> or bug/<bug-name>
-only use subagents if the user explicitly request them
+only use subagents if the user explicitly request them, unless the subagent is a local agent
 use uv for python package management
 use unittest for testing instead of pytest
 use pydantic-settings for environment variables and command line arguments
@@ -41,6 +39,7 @@ The YouTube channel model is scrape_exchange/youtube/youtube_channel.py, which d
 
 
 ## Performance & scaling notes
+The scrapers will scrape billions of assets, at up to 1000 scrapes per second
 
 ### Video scraper parallelism model
 
