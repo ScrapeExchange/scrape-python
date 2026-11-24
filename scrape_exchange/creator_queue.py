@@ -27,6 +27,7 @@ import logging
 import os
 import random
 import shutil
+import time
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -483,10 +484,26 @@ class CreatorQueue(ABC):
 
         Counts every cid assigned to each tier regardless of
         whether it is currently queued, claimed, no-feeds, or
-        orphan. Cheap by design (single HSCAN traversal, no
-        per-cid pipelined ZSCORE) so it can drive a metric
-        loop on a tight cadence.
+        orphan. One HSCAN traversal, no per-cid pipelined
+        ZSCORE; on a hash of millions of cids that still costs
+        Redis seconds of CPU, so metric loops read
+        :meth:`cached_tier_population` instead.
         '''
+
+    async def refresh_tier_population(
+        self, min_interval_seconds: float,
+    ) -> bool:
+        '''Recompute the cached per-tier population. Backends
+        without a shared cache compute it on every read, so there
+        is nothing to refresh.
+
+        :returns: True when this call ran a scan.
+        '''
+        return False
+
+    async def cached_tier_population(self) -> dict[int, int]:
+        '''Per-tier population for metrics: ``{tier: count}``.'''
+        return await self.tier_population_summary()
 
     @abstractmethod
     async def cleanup_stale_claims(self) -> int:
@@ -1494,6 +1511,14 @@ class RedisCreatorQueue(CreatorQueue):
         self._key_tiers: str = (
             f'{self._key_prefix}:tiers'
         )
+        # Per-tier cid counts from the last full scan of the tiers
+        # hash, and the lock that spaces those scans fleet-wide.
+        self._key_tier_population: str = (
+            f'{self._key_prefix}:tier_population'
+        )
+        self._key_tier_population_lock: str = (
+            f'{self._key_prefix}:tier_population:lock'
+        )
         self._claim_prefix: str = (
             f'{self._key_prefix}:claim:'
         )
@@ -2267,6 +2292,58 @@ class RedisCreatorQueue(CreatorQueue):
                     counts[tier] += 1
             if cursor == 0:
                 break
+        return counts
+
+    async def refresh_tier_population(
+        self, min_interval_seconds: float,
+    ) -> bool:
+        '''Recount the tiers hash and store the counts in the
+        tier-population cache, unless another worker anywhere in
+        the fleet did so in the last *min_interval_seconds*.
+
+        The lock is a ``SET NX EX`` that is left to expire rather
+        than released, so it also spaces the scans: the tiers hash
+        holds millions of cids and one scan costs Redis seconds of
+        CPU.
+
+        :returns: True when this call ran the scan.
+        '''
+        acquired: bool | None = await self._redis.set(
+            self._key_tier_population_lock,
+            self._worker_id,
+            nx=True,
+            ex=max(1, int(min_interval_seconds)),
+        )
+        if not acquired:
+            return False
+        counts: dict[int, int] = await self.tier_population_summary()
+        mapping: dict[str, str] = {
+            str(tier): str(count) for tier, count in counts.items()
+        }
+        mapping['updated_at'] = str(int(time.time()))
+        pipe = self._redis.pipeline(transaction=True)
+        pipe.delete(self._key_tier_population)
+        pipe.hset(self._key_tier_population, mapping=mapping)
+        await pipe.execute()
+        return True
+
+    async def cached_tier_population(self) -> dict[int, int]:
+        '''Per-tier counts stored by the last
+        :meth:`refresh_tier_population`; empty when no scan has
+        stored counts yet.'''
+        raw: dict[str, str] = await self._redis.hgetall(
+            self._key_tier_population,
+        )
+        valid_tiers: set[int] = {tc.tier for tc in self._tiers}
+        counts: dict[int, int] = {}
+        for key, value in raw.items():
+            try:
+                tier: int = int(key)
+                count: int = int(value)
+            except (TypeError, ValueError):
+                continue
+            if tier in valid_tiers:
+                counts[tier] = count
         return counts
 
     async def cleanup_stale_claims(self) -> int:
