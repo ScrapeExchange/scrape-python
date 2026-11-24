@@ -132,15 +132,21 @@ _DEFAULT_CONFIGS: dict[YouTubeCallType, _BucketConfig] = {
         refill_rate=YT_RATE_LIMITS.browse_refill_per_min / 60,
         jitter_min=0.3, jitter_max=1.2,
     ),
+    # PLAYER and NEXT run serially in every video scrape, and the
+    # jitter sleep holds the task after the per-proxy lock is released,
+    # so it does not space out requests per proxy; the bucket does.
+    # 2026-11-24: jitter of 1.0-3.0s (player) + 0.3-1.0s (next) was
+    # ~60% of each video task's time and capped the fleet at
+    # tasks / 4.5s; cut to 0-0.5s and 0-0.3s.
     YouTubeCallType.PLAYER: _BucketConfig(
         burst=2,
         refill_rate=YT_RATE_LIMITS.player_refill_per_min / 60,
-        jitter_min=1.0, jitter_max=3.0,
+        jitter_min=0.0, jitter_max=0.5,
     ),
     YouTubeCallType.NEXT: _BucketConfig(
         burst=20,
         refill_rate=YT_RATE_LIMITS.next_refill_per_min / 60,
-        jitter_min=0.3, jitter_max=1.0,
+        jitter_min=0.0, jitter_max=0.3,
     ),
     # HTML cadence was set to ~9 req/min after the WAF
     # diagnosis: the path was failing at ~99.8% under fleet
