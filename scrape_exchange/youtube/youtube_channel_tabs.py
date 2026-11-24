@@ -2255,6 +2255,15 @@ _TRANSCRIPT_INNERTUBE_POOL: _LazyAsyncPool[
 )
 
 
+def configure_innertube_clients_per_proxy(clients: int) -> None:
+    '''Set how many pooled clients the player, next and transcript
+    pools may hold per proxy. Call at scraper startup.'''
+    slots: int = max(1, clients)
+    _INNERTUBE_POOL.slots = slots
+    _PLAYER_INNERTUBE_POOL.slots = slots
+    _TRANSCRIPT_INNERTUBE_POOL.slots = slots
+
+
 def _make_pooled_localized_innertube_for_key(
     key: tuple[str | None, str, str],
 ) -> InnerTube:

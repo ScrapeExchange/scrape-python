@@ -29,24 +29,51 @@ V = TypeVar('V')
 
 @dataclass
 class _LazyAsyncPool(Generic[K, V]):
-    '''Lazy cache of one client per key.'''
+    '''Lazy cache of up to ``slots`` clients per key.
+
+    :meth:`get` always returns the first client of a key. :meth:`borrow`
+    returns an idle client of the key, creates another one when every
+    existing client is borrowed and the key has fewer than ``slots``
+    clients, and otherwise returns the client with the fewest
+    borrowers. With ``slots=1`` (the default) every key has a single
+    client.
+    '''
 
     factory: Callable[[K], V]
     aclose_attr: str = 'aclose'
-    _cache: dict[K, V] = field(default_factory=dict)
+    slots: int = 1
+    _cache: dict[K, list[V]] = field(default_factory=dict)
     _borrow_counts: dict[int, int] = field(default_factory=dict)
     _retired: dict[int, V] = field(default_factory=dict)
 
     def get(self, key: K) -> V:
-        '''Return the cached client for *key*, constructing one
-        on first use.'''
-        if key not in self._cache:
-            self._cache[key] = self.factory(key)
-        return self._cache[key]
+        '''Return the first cached client for *key*, constructing
+        one on first use.'''
+        clients: list[V] = self._cache.setdefault(key, [])
+        if not clients:
+            clients.append(self.factory(key))
+        return clients[0]
+
+    def _borrowers(self, client: V) -> int:
+        '''Number of callers currently borrowing *client*.'''
+        return self._borrow_counts.get(id(client), 0)
+
+    def _pick(self, key: K) -> V:
+        '''Choose the client of *key* for one borrow.'''
+        clients: list[V] = self._cache.setdefault(key, [])
+        for client in clients:
+            if self._borrowers(client) == 0:
+                return client
+        if len(clients) < max(1, self.slots):
+            client = self.factory(key)
+            clients.append(client)
+            return client
+        return min(clients, key=self._borrowers)
 
     def borrow(self, key: K) -> V:
-        '''Return the active value and protect it from retirement close.'''
-        client: V = self.get(key)
+        '''Return a client for *key* and protect it from retirement
+        close until :meth:`release`.'''
+        client: V = self._pick(key)
         client_id: int = id(client)
         self._borrow_counts[client_id] = (
             self._borrow_counts.get(client_id, 0) + 1
@@ -68,17 +95,21 @@ class _LazyAsyncPool(Generic[K, V]):
     async def retire_key(self, key: K, *, expected: V) -> bool:
         '''Retire ``expected`` only if it is still active for ``key``.
 
-        New lookups immediately construct a replacement. Closing is
-        deferred until all callers that borrowed this generation have
-        released it.
+        Other clients of the key stay active; new borrows construct a
+        replacement when needed. Closing is deferred until all callers
+        that borrowed this generation have released it.
         '''
-        active: V | None = self._cache.get(key)
-        if active is not expected:
+        clients: list[V] = self._cache.get(key, [])
+        index: int | None = next(
+            (i for i, c in enumerate(clients) if c is expected), None,
+        )
+        if index is None:
             return False
-        client: V = self._cache.pop(key)
-        client_id: int = id(client)
-        if self._borrow_counts.get(client_id, 0) > 0:
-            self._retired[client_id] = client
+        client: V = clients.pop(index)
+        if not clients:
+            del self._cache[key]
+        if self._borrowers(client) > 0:
+            self._retired[id(client)] = client
         else:
             await self._aclose_value(client)
         return True
@@ -96,7 +127,7 @@ class _LazyAsyncPool(Generic[K, V]):
             pass
 
     async def aclose_key(self, key: K) -> None:
-        '''Close and remove the cached client for *key*.
+        '''Close and remove the cached clients for *key*.
 
         Other keys remain available. Removing the entry before
         awaiting close ensures a subsequent ``get(key)`` constructs
@@ -104,15 +135,18 @@ class _LazyAsyncPool(Generic[K, V]):
         '''
         if key not in self._cache:
             return
-        client: V = self._cache.pop(key)
-        await self._aclose_value(client)
+        clients: list[V] = self._cache.pop(key)
+        for client in clients:
+            await self._aclose_value(client)
 
     async def aclose_all(self) -> None:
         '''Close every cached client, swallowing per-client
         exceptions, then empty the cache. Best-effort: a failing
         aclose on one client does not block the others.'''
         clients_by_id: dict[int, V] = {
-            id(client): client for client in self._cache.values()
+            id(client): client
+            for clients in self._cache.values()
+            for client in clients
         }
         clients_by_id.update(self._retired)
         self._cache.clear()

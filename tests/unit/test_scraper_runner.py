@@ -36,6 +36,7 @@ def _make_settings_mock(
     s.watchdog_loop_timeout_seconds = 60.0
     s.watchdog_work_timeout_seconds = 180.0
     s.innertube_executor_threads = 16
+    s.innertube_clients_per_proxy = 1
     # No proxy files: the standalone proxy-file watcher stays off.
     s.proxy_reload_interval = 60.0
     s.proxy_file_paths = MagicMock(return_value=[])

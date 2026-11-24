@@ -48,6 +48,7 @@ from scrape_exchange.youtube.youtube_client import (
 )
 from scrape_exchange.youtube.youtube_channel_tabs import (
     aclose_pooled_innertube,
+    configure_innertube_clients_per_proxy,
     configure_innertube_executor,
     shutdown_innertube_executor,
 )
@@ -368,6 +369,9 @@ class ScraperRunner:
 
         configure_innertube_executor(
             self._settings.innertube_executor_threads,
+        )
+        configure_innertube_clients_per_proxy(
+            self._settings.innertube_clients_per_proxy,
         )
 
         heartbeat_task: asyncio.Task[Any] | None = None

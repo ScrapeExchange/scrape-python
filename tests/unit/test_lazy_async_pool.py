@@ -143,5 +143,88 @@ class TestLazyAsyncPool(unittest.IsolatedAsyncioTestCase):
         self.assertIsNot(b, a)
 
 
+class TestLazyAsyncPoolSlots(unittest.IsolatedAsyncioTestCase):
+    '''Several clients per key when ``slots`` > 1.'''
+
+    def _make(self, slots: int) -> _LazyAsyncPool:
+        return _LazyAsyncPool(
+            factory=_FakeClient, aclose_attr='close', slots=slots,
+        )
+
+    async def test_sequential_borrows_reuse_one_client(self) -> None:
+        pool: _LazyAsyncPool = self._make(3)
+        first: _FakeClient = pool.borrow('k1')
+        await pool.release(first)
+        second: _FakeClient = pool.borrow('k1')
+        await pool.release(second)
+        self.assertIs(first, second)
+        self.assertEqual(len(pool._cache['k1']), 1)
+
+    async def test_concurrent_borrows_get_separate_clients(self) -> None:
+        pool: _LazyAsyncPool = self._make(3)
+        clients: list[_FakeClient] = [pool.borrow('k1') for _ in range(3)]
+        self.assertEqual(len({id(c) for c in clients}), 3)
+
+    async def test_borrows_beyond_slots_share_least_busy(self) -> None:
+        pool: _LazyAsyncPool = self._make(2)
+        a: _FakeClient = pool.borrow('k1')
+        b: _FakeClient = pool.borrow('k1')
+        c: _FakeClient = pool.borrow('k1')
+        self.assertIsNot(a, b)
+        self.assertIn(c, (a, b))
+        self.assertEqual(len(pool._cache['k1']), 2)
+        await pool.release(a if c is b else b)
+        d: _FakeClient = pool.borrow('k1')
+        self.assertIsNot(d, c)
+
+    async def test_idle_client_preferred_over_new_one(self) -> None:
+        pool: _LazyAsyncPool = self._make(3)
+        a: _FakeClient = pool.borrow('k1')
+        b: _FakeClient = pool.borrow('k1')
+        await pool.release(a)
+        again: _FakeClient = pool.borrow('k1')
+        self.assertIs(again, a)
+        self.assertEqual(len(pool._cache['k1']), 2)
+        await pool.release(b)
+
+    async def test_keys_have_separate_slots(self) -> None:
+        pool: _LazyAsyncPool = self._make(2)
+        a: _FakeClient = pool.borrow('k1')
+        b: _FakeClient = pool.borrow('k2')
+        self.assertEqual(a.key, 'k1')
+        self.assertEqual(b.key, 'k2')
+
+    async def test_retire_keeps_other_clients_of_key(self) -> None:
+        pool: _LazyAsyncPool = self._make(2)
+        a: _FakeClient = pool.borrow('k1')
+        b: _FakeClient = pool.borrow('k1')
+        retired: bool = await pool.retire_key('k1', expected=a)
+        self.assertTrue(retired)
+        self.assertEqual(pool._cache['k1'], [b])
+        self.assertEqual(a.close_called, 0)
+        await pool.release(a)
+        self.assertEqual(a.close_called, 1)
+        replacement: _FakeClient = pool.borrow('k1')
+        self.assertIsNot(replacement, a)
+        self.assertIsNot(replacement, b)
+
+    async def test_aclose_key_and_all_close_every_slot(self) -> None:
+        pool: _LazyAsyncPool = self._make(2)
+        a: _FakeClient = pool.borrow('k1')
+        b: _FakeClient = pool.borrow('k1')
+        c: _FakeClient = pool.borrow('k2')
+        await pool.aclose_key('k1')
+        self.assertEqual((a.close_called, b.close_called), (1, 1))
+        self.assertEqual(c.close_called, 0)
+        await pool.aclose_all()
+        self.assertEqual(c.close_called, 1)
+
+    def test_get_returns_first_client(self) -> None:
+        pool: _LazyAsyncPool = self._make(2)
+        a: _FakeClient = pool.borrow('k1')
+        pool.borrow('k1')
+        self.assertIs(pool.get('k1'), a)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -217,6 +217,22 @@ class ScraperSettings(BaseSettings):
             'stack; keep well within the 1 GB/tool budget.'
         ),
     )
+    innertube_clients_per_proxy: int = Field(
+        default=3,
+        ge=1,
+        validation_alias=AliasChoices(
+            'INNERTUBE_CLIENTS_PER_PROXY', 'innertube_clients_per_proxy',
+        ),
+        description=(
+            'Maximum number of pooled InnerTube clients per proxy for '
+            'each of the video player, next and transcript calls, per '
+            'process. Calls on one client run one at a time, so this '
+            'caps how many calls of one kind can run at once through '
+            'the same proxy. Extra clients are only created while all '
+            'existing ones are busy. Each client keeps its own '
+            'keep-alive connections to the proxy.'
+        ),
+    )
     worker_id: str = Field(
         default='0',
         validation_alias=AliasChoices(
