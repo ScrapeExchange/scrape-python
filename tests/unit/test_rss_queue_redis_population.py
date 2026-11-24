@@ -1088,7 +1088,7 @@ class TestPublishQueueMetricsLoop(
         queue.queue_sizes_by_tier.return_value = {
             1: 7, 2: 11,
         }
-        queue.tier_population_summary.return_value = {
+        queue.cached_tier_population.return_value = {
             1: 100, 2: 200,
         }
 
@@ -1131,3 +1131,134 @@ class TestPublishQueueMetricsLoop(
             )._value.get()
         )
         self.assertEqual(tp_t1, 100)
+        # The tick reads the cache; it never scans the tiers hash.
+        queue.tier_population_summary.assert_not_called()
+
+
+@unittest.skipUnless(
+    HAS_FAKEREDIS,
+    'fakeredis not installed',
+)
+class TestTierPopulationCache(
+    unittest.IsolatedAsyncioTestCase,
+):
+    '''``refresh_tier_population`` scans the tiers hash at most once
+    per interval fleet-wide and stores the counts;
+    ``cached_tier_population`` reads them back without a scan.'''
+
+    async def _queue(
+        self, redis: object | None = None, worker_id: str = 'w1',
+    ) -> RedisCreatorQueue:
+        q: RedisCreatorQueue = RedisCreatorQueue(
+            redis_dsn='redis://fake',
+            worker_id=worker_id,
+            platform=TEST_PLATFORM,
+        )
+        q._redis = redis or fakeredis.aioredis.FakeRedis(
+            decode_responses=True,
+        )
+        q._tiers = DEFAULT_TIERS
+        q._key_queues = q._build_queue_keys(DEFAULT_TIERS)
+        return q
+
+    async def test_cache_empty_before_first_refresh(self) -> None:
+        q: RedisCreatorQueue = await self._queue()
+        await q._redis.hset(q._key_tiers, 'UC_a', '1')
+        self.assertEqual(await q.cached_tier_population(), {})
+
+    async def test_refresh_stores_counts_for_cache(self) -> None:
+        q: RedisCreatorQueue = await self._queue()
+        await q._redis.hset(q._key_tiers, 'UC_a', '1')
+        await q._redis.hset(q._key_tiers, 'UC_b', '1')
+        await q._redis.hset(q._key_tiers, 'UC_c', '3')
+        self.assertTrue(await q.refresh_tier_population(900))
+        self.assertEqual(
+            await q.cached_tier_population(), {1: 2, 2: 0, 3: 1},
+        )
+        updated_at: str | None = await q._redis.hget(
+            q._key_tier_population, 'updated_at',
+        )
+        self.assertIsNotNone(updated_at)
+
+    async def test_second_refresh_within_interval_skips_scan(
+        self,
+    ) -> None:
+        '''Another worker sharing the Redis does not scan again
+        while the lock from the first scan is alive.'''
+        redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+        first: RedisCreatorQueue = await self._queue(redis, 'w1')
+        second: RedisCreatorQueue = await self._queue(redis, 'w2')
+        await redis.hset(first._key_tiers, 'UC_a', '1')
+        self.assertTrue(await first.refresh_tier_population(900))
+        await redis.hset(first._key_tiers, 'UC_b', '2')
+        with patch.object(
+            second, 'tier_population_summary',
+            wraps=second.tier_population_summary,
+        ) as summary:
+            self.assertFalse(await second.refresh_tier_population(900))
+            summary.assert_not_called()
+        self.assertEqual(
+            await second.cached_tier_population(), {1: 1, 2: 0, 3: 0},
+        )
+        ttl: int = await redis.ttl(first._key_tier_population_lock)
+        self.assertGreater(ttl, 0)
+        self.assertLessEqual(ttl, 900)
+
+    async def test_refresh_after_lock_expiry_replaces_counts(
+        self,
+    ) -> None:
+        q: RedisCreatorQueue = await self._queue()
+        await q._redis.hset(q._key_tiers, 'UC_a', '1')
+        await q.refresh_tier_population(900)
+        await q._redis.delete(q._key_tier_population_lock)
+        await q._redis.hdel(q._key_tiers, 'UC_a')
+        await q._redis.hset(q._key_tiers, 'UC_b', '2')
+        self.assertTrue(await q.refresh_tier_population(900))
+        self.assertEqual(
+            await q.cached_tier_population(), {1: 0, 2: 1, 3: 0},
+        )
+
+    async def test_cache_ignores_unconfigured_and_bad_fields(
+        self,
+    ) -> None:
+        q: RedisCreatorQueue = await self._queue()
+        await q._redis.hset(
+            q._key_tier_population,
+            mapping={'1': '5', '99': '7', '2': 'x', 'updated_at': '1'},
+        )
+        self.assertEqual(await q.cached_tier_population(), {1: 5})
+
+
+class TestRefreshTierPopulationLoop(
+    unittest.IsolatedAsyncioTestCase,
+):
+    '''The refresh loop asks the queue to refresh on every check
+    and keeps running when a refresh fails.'''
+
+    async def test_retries_after_failure(self) -> None:
+        yt_rss_scrape: ModuleType = _load_yt_rss_scrape()
+        queue = AsyncMock()
+        calls: list[float] = []
+
+        async def refresh(interval: float) -> bool:
+            calls.append(interval)
+            if len(calls) == 1:
+                raise RuntimeError('redis down')
+            return False
+
+        queue.refresh_tier_population.side_effect = refresh
+        task = asyncio.create_task(
+            yt_rss_scrape._refresh_tier_population_loop(
+                queue, interval_seconds=900, check_seconds=0.01,
+            ),
+        )
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        self.assertGreaterEqual(
+            queue.refresh_tier_population.await_count, 2,
+        )
+        queue.refresh_tier_population.assert_awaited_with(900)

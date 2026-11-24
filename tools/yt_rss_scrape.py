@@ -619,6 +619,21 @@ class RssSettings(YouTubeScraperSettings):
             'independent.'
         ),
     )
+    rss_tier_population_interval_seconds: float = Field(
+        default=900.0,
+        ge=30.0,
+        validation_alias=AliasChoices(
+            'RSS_TIER_POPULATION_INTERVAL_SECONDS',
+            'rss_tier_population_interval_seconds',
+        ),
+        description=(
+            'Minimum seconds between two counts of channels per '
+            'tier for the channel_tier_population metric. Counting '
+            'scans every channel in the RSS queue in Redis, so only '
+            'one worker in the whole fleet does it per interval and '
+            'every host publishes the stored result.'
+        ),
+    )
     rss_exchange_existence_concurrency: int = Field(
         default=64,
         validation_alias=AliasChoices(
@@ -2316,18 +2331,15 @@ async def _publish_tier_population(
     creator_queue: CreatorQueue,
 ) -> None:
     '''Set the ``channel_tier_population`` gauge to the count of
-    cids per tier from the ``rss:youtube:tiers`` HASH.
+    cids per tier in the ``rss:youtube:tiers`` HASH.
 
-    Uses a cheap HSCAN-and-count (no per-cid pipelined ZSCORE
-    fan-out). The previous implementation invoked
-    ``scan_and_recover_orphans``, which fired ~7 Redis ops per
-    cid in pipelines of 500 — at ~3M ops on the full hash it
-    routinely failed to complete under fleet load and the gauge
-    converged on partial counts. The new code performs a single
-    HSCAN traversal of the tiers hash and counts values.
+    Reads the counts cached by :func:`_refresh_tier_population_loop`
+    (one small HGETALL). Scanning the tiers hash itself on every
+    tick, on every host, kept a full HSCAN of ~9M cids running
+    almost continuously and took ~45% of Redis CPU.
     '''
     counts: dict[int, int] = (
-        await creator_queue.tier_population_summary()
+        await creator_queue.cached_tier_population()
     )
     for tier, count in counts.items():
         METRIC_TIER_POPULATION.labels(
@@ -2342,8 +2354,9 @@ async def _publish_queue_metrics_loop(
     interval_seconds: float = 30.0,
 ) -> None:
     '''Lightweight periodic publisher for the queue-size and
-    tier-population gauges. Cheap (5 ZCARDs + one HSCAN scan
-    per tick); safe to run alongside other workers.
+    tier-population gauges. Cheap (5 ZCARDs + one HGETALL of the
+    cached tier counts per tick); safe to run alongside other
+    workers.
 
     Gating to a single worker per host is the caller's
     responsibility.
@@ -2358,6 +2371,38 @@ async def _publish_queue_metrics_loop(
                 exc_info=True,
             )
         await asyncio.sleep(interval_seconds)
+
+
+async def _refresh_tier_population_loop(
+    creator_queue: CreatorQueue,
+    interval_seconds: float,
+    check_seconds: float = 60.0,
+) -> None:
+    '''Keep the cached tier-population counts fresh.
+
+    Every *check_seconds* this tries to take the fleet-wide lock;
+    only the worker that gets it scans the tiers hash, so the fleet
+    scans it at most once per *interval_seconds* however many hosts
+    run the RSS scraper.
+    '''
+    while True:
+        try:
+            refreshed: bool = (
+                await creator_queue.refresh_tier_population(
+                    interval_seconds,
+                )
+            )
+            if refreshed:
+                logging.info(
+                    'Refreshed tier population counts',
+                    extra={'interval_seconds': interval_seconds},
+                )
+        except Exception:
+            logging.warning(
+                'tier population refresh failed',
+                exc_info=True,
+            )
+        await asyncio.sleep(min(check_seconds, interval_seconds))
 
 
 async def _scan_and_recover_loop(
@@ -2739,6 +2784,12 @@ async def worker_loop(
         ))
         _bg_tasks.append(asyncio.create_task(
             _publish_queue_metrics_loop(creator_queue),
+        ))
+        _bg_tasks.append(asyncio.create_task(
+            _refresh_tier_population_loop(
+                creator_queue,
+                settings.rss_tier_population_interval_seconds,
+            ),
         ))
         _bg_tasks.append(asyncio.create_task(
             _circuit_gauge_reaper(settings),
