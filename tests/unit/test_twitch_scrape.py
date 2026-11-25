@@ -95,7 +95,7 @@ class TestTwitchScrape(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('last_follower_count', state)
 
     async def test_maintenance_recovers_expired_claim(self) -> None:
-        await self.redis.delete(f'{self.queue._claim_prefix}example')
+        await self.redis.hdel(self.queue._key_claims, 'example')
         with patch('tools.tw_creator_scrape.asyncio.sleep',
                    AsyncMock(side_effect=asyncio.CancelledError)), (
             self.assertRaises(asyncio.CancelledError)

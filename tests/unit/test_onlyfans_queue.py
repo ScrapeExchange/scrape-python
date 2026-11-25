@@ -132,10 +132,12 @@ class TestOnlyFansQueue(unittest.IsolatedAsyncioTestCase):
 
     async def test_lost_claim_does_not_write_or_reschedule(self) -> None:
         await self.claim()
-        await self.redis.set('scrape:onlyfans:claim:example', 'another-owner')
+        await self.redis.hset(
+            'scrape:onlyfans:claims', 'example', 'another-owner',
+        )
         self.assertEqual(await self.process(), 'claim_lost')
-        self.assertEqual(await self.redis.get(
-            'scrape:onlyfans:claim:example',
+        self.assertEqual(await self.redis.hget(
+            'scrape:onlyfans:claims', 'example',
         ), 'another-owner')
         self.assertEqual(await self.queue.queue_size(), 0)
         self.assertEqual(list(Path(self.directory.name).glob('*.json.br')), [])
@@ -146,7 +148,9 @@ class TestOnlyFansQueue(unittest.IsolatedAsyncioTestCase):
         await self.claim()
 
         async def fetch(*args: Any) -> Any:
-            await self.redis.set('scrape:onlyfans:claim:example', 'replacement')
+            await self.redis.hset(
+                'scrape:onlyfans:claims', 'example', 'replacement',
+            )
             return extract_profile(public_profile(), 'example')
 
         with patch('tools.of_creator_scrape.fetch_profile', fetch):
@@ -215,7 +219,7 @@ class TestOnlyFansQueue(unittest.IsolatedAsyncioTestCase):
 
     async def test_expired_claim_can_be_recovered(self) -> None:
         await self.claim()
-        await self.redis.delete('scrape:onlyfans:claim:example')
+        await self.redis.hdel('scrape:onlyfans:claims', 'example')
         await self.queue.scan_and_recover_orphans_with_fleet_lock()
         claimed: list[tuple[str, str, float]] = await self.queue.claim_batch(
             1, 'replacement',
@@ -242,12 +246,13 @@ class TestOnlyFansQueue(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await task
         self.assertEqual(
-            await self.redis.get('scrape:onlyfans:claim:example'), self.owner,
+            await self.redis.hget('scrape:onlyfans:claims', 'example'),
+            self.owner,
         )
         self.assertEqual(
             list(Path(self.directory.name).glob('*.json.br')), [],
         )
-        await self.redis.delete('scrape:onlyfans:claim:example')
+        await self.redis.hdel('scrape:onlyfans:claims', 'example')
         await self.queue.scan_and_recover_orphans_with_fleet_lock()
         claimed: list[tuple[str, str, float]] = await self.queue.claim_batch(
             1, 'replacement',

@@ -80,9 +80,7 @@ class TestReleaseIdempotency(
         # membership) and whose tier hash entry is missing —
         # the exact orphan scenario produced by historical
         # schema drift.
-        await q._redis.set(
-            f'{q._claim_prefix}{cid}', 'w1',
-        )
+        await q._redis.hset(q._key_claims, cid, 'w1')
         # _key_tiers has no entry for cid.
 
         await q.release(cid)
@@ -127,9 +125,7 @@ class TestReleaseIdempotency(
         cid: str = 'UCtest1234567890abcdef'
 
         await q._redis.hset(q._key_tiers, cid, '1')
-        await q._redis.set(
-            f'{q._claim_prefix}{cid}', 'w1',
-        )
+        await q._redis.hset(q._key_claims, cid, 'w1')
 
         await q.release(cid)
 
@@ -192,9 +188,7 @@ class TestReleaseRetryInterval(
         q: RedisCreatorQueue = await self._queue()
         cid: str = 'UCtest1234567890abcdef'
         await q._redis.hset(q._key_tiers, cid, '1')
-        await q._redis.set(
-            f'{q._claim_prefix}{cid}', 'w1',
-        )
+        await q._redis.hset(q._key_claims, cid, 'w1')
         score: float
         before: float
         score, before = (
@@ -212,9 +206,7 @@ class TestReleaseRetryInterval(
         q: RedisCreatorQueue = await self._queue()
         cid: str = 'UCtest1234567890abcdef'
         await q._redis.hset(q._key_tiers, cid, '1')
-        await q._redis.set(
-            f'{q._claim_prefix}{cid}', 'w1',
-        )
+        await q._redis.hset(q._key_claims, cid, 'w1')
         score: float
         before: float
         score, before = (
@@ -233,9 +225,7 @@ class TestReleaseRetryInterval(
         q: RedisCreatorQueue = await self._queue()
         cid: str = 'UCtest1234567890abcdef'
         await q._redis.hset(q._key_tiers, cid, '3')
-        await q._redis.set(
-            f'{q._claim_prefix}{cid}', 'w1',
-        )
+        await q._redis.hset(q._key_claims, cid, 'w1')
         score: float
         before: float
         score, before = (

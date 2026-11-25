@@ -97,9 +97,7 @@ async def save_creator(
 async def _owns_claim(
     queue: RedisCreatorQueue, username: str, claim_owner: str,
 ) -> bool:
-    return await queue._redis.get(
-        f'{queue._claim_prefix}{username}',
-    ) == claim_owner
+    return await queue.claim_owner(username) == claim_owner
 
 
 def _labels(proxy: str, worker_id: str) -> dict[str, str]:
