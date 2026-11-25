@@ -11,6 +11,8 @@ from collections.abc import Iterable
 
 import redis.asyncio as aioredis
 
+from scrape_exchange.bloom_filter import bloom_add_many
+
 _KEY: str = 'youtube:exchange_channels_bf'
 
 # ~24 bits per member at a 1e-5 error rate: ~90 MB at capacity,
@@ -39,14 +41,11 @@ class RedisExchangeChannelsSet:
         '''Add zero or more members. The first write creates the
         filter with the configured sizing.'''
         items: list[str] = [h for h in handles if h]
-        if not items:
-            return
-        await self._redis.execute_command(
-            'BF.INSERT', _KEY,
-            'CAPACITY', EXCHANGE_CHANNELS_BF_CAPACITY,
-            'ERROR', f'{EXCHANGE_CHANNELS_BF_ERROR_RATE:f}',
-            'EXPANSION', EXCHANGE_CHANNELS_BF_EXPANSION,
-            'ITEMS', *items,
+        await bloom_add_many(
+            self._redis, _KEY, items,
+            error_rate=EXCHANGE_CHANNELS_BF_ERROR_RATE,
+            capacity=EXCHANGE_CHANNELS_BF_CAPACITY,
+            expansion=EXCHANGE_CHANNELS_BF_EXPANSION,
         )
 
     async def contains_many(
@@ -64,7 +63,3 @@ class RedisExchangeChannelsSet:
             handles[i]: bool(results[i])
             for i in range(len(handles))
         }
-
-    async def size(self) -> int:
-        '''Return the (approximate) number of members.'''
-        return int(await self._redis.execute_command('BF.CARD', _KEY))

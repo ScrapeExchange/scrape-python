@@ -5,6 +5,7 @@ from typing import ClassVar
 
 import redis.asyncio as aioredis
 
+from scrape_exchange.bloom_filter import bloom_add_many
 from scrape_exchange.redis_client import redis_from_url
 
 # Sizing of the Bloom filter. At a 1e-5 false-positive rate a
@@ -68,12 +69,9 @@ class UploadedVideoIds:
         '''Record *video_ids* as uploaded. The first write creates
         the filter with the configured sizing.'''
         ids: list[str] = [v for v in video_ids if v]
-        if not ids:
-            return
-        await self._client.execute_command(
-            'BF.INSERT', self._KEY,
-            'CAPACITY', UPLOADED_BF_CAPACITY,
-            'ERROR', f'{UPLOADED_BF_ERROR_RATE:f}',
-            'EXPANSION', UPLOADED_BF_EXPANSION,
-            'ITEMS', *ids,
+        await bloom_add_many(
+            self._client, self._KEY, ids,
+            error_rate=UPLOADED_BF_ERROR_RATE,
+            capacity=UPLOADED_BF_CAPACITY,
+            expansion=UPLOADED_BF_EXPANSION,
         )

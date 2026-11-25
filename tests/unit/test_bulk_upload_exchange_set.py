@@ -127,7 +127,9 @@ class TestApplyBulkResultsExchangeSet(
             batch_records, results, _StubFM(),
             batch_id='b', job_id='j',
         )
-        self.assertEqual(await self.s.size(), 0)
+        self.assertFalse(
+            await self.redis.exists('youtube:exchange_channels_bf'),
+        )
 
     async def test_id_from_filename_skipped_without_set(
         self,
