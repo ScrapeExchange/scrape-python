@@ -117,9 +117,7 @@ def build_queue(
 async def _owns_claim(
     queue: RedisCreatorQueue, username: str, owner: str,
 ) -> bool:
-    return await queue._redis.get(
-        f'{queue._claim_prefix}{username}',
-    ) == owner
+    return await queue.claim_owner(username) == owner
 
 
 async def _retry_creator(

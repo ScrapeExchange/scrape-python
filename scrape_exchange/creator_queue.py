@@ -1359,21 +1359,27 @@ class FileCreatorQueue(CreatorQueue):
 #
 # KEYS[1..N]   = queue:1..queue:N (tier sorted sets)
 # KEYS[N+1]    = creators hash
+# KEYS[N+2]    = claims hash (creator id -> worker id, each field
+#                expiring after claim_ttl)
 # ARGV[1]      = now (unix timestamp as string)
 # ARGV[2]      = batch_size
 # ARGV[3]      = worker_id
 # ARGV[4]      = claim_ttl (seconds)
-# ARGV[5]      = claim_key prefix
+#
+# Claims live in one hash with a TTL per field, not in a key per
+# creator, so the script only touches keys passed in KEYS (Dragonfly
+# rejects scripts that access undeclared keys).
 
 _LUA_CLAIM_BATCH: str = '''\
-local num_tiers = #KEYS - 1
+local num_tiers = #KEYS - 2
+local claims = KEYS[num_tiers + 2]
 local remaining = tonumber(ARGV[2])
 local out = {}
 for q = 1, num_tiers do
     if remaining <= 0 then break end
     -- Loop fetching candidates until we have ``remaining``
-    -- successful claims or the tier is exhausted. Cids whose
-    -- claim key already exists (stale claim from a worker that
+    -- successful claims or the tier is exhausted. Cids that
+    -- already hold a live claim (stale claim from a worker that
     -- crashed without releasing) are skipped over via an
     -- advancing offset so the returned batch is filled, not
     -- short by the number of stale heads.
@@ -1391,11 +1397,11 @@ for q = 1, num_tiers do
             if remaining <= 0 then break end
             local cid = due[i]
             local score = due[i + 1]
-            local key = ARGV[5] .. cid
-            local ok = redis.call(
-                'SET', key, ARGV[3],
-                'NX', 'EX', tonumber(ARGV[4]))
-            if ok then
+            local ok = redis.call('HSETNX', claims, cid, ARGV[3])
+            if ok == 1 then
+                redis.call(
+                    'HEXPIRE', claims, tonumber(ARGV[4]),
+                    'FIELDS', 1, cid)
                 redis.call('ZREM', KEYS[q], cid)
                 local name = redis.call(
                     'HGET', KEYS[num_tiers + 1],
@@ -1417,19 +1423,22 @@ end
 return out
 '''
 
-# Orphan recovery: scan creators hash; for each
-# creator check whether it is in ANY tier queue or
-# currently claimed.  If neither, re-add to the
-# tier recorded in the tiers hash (or last tier as
-# fallback).
+# Schedule a creator unless it is excluded, claimed or already
+# queued in any tier.
 #
-# KEYS[1]      = creators hash
-# KEYS[2..N+1] = queue:1..queue:N
+# KEYS[1..N]   = queue:1..queue:N
+# KEYS[N+1]    = creators hash
 # KEYS[N+2]    = tiers hash
-# KEYS[N+3]    = excluded set (operator-removed members)
-# ARGV[1]      = now (unix timestamp)
-# ARGV[2]      = claim_key prefix
-# ARGV[3]      = last tier number (string)
+# KEYS[N+3]    = names set
+# KEYS[N+4]    = excluded set (operator-removed members)
+# KEYS[N+5]    = claims hash
+# KEYS[N+6]    = queue of the creator's tier
+# ARGV[1]      = creator id
+# ARGV[2]      = name
+# ARGV[3]      = lower-cased name
+# ARGV[4]      = tier (string)
+# ARGV[5]      = score (now)
+# ARGV[6]      = number of tier queues (N)
 
 _LUA_SCHEDULE_IF_ABSENT: str = '''\
 local num_q = tonumber(ARGV[6])
@@ -1437,7 +1446,7 @@ local cid = ARGV[1]
 if redis.call('SISMEMBER', KEYS[num_q + 4], cid) == 1 then
     return 0
 end
-if redis.call('EXISTS', KEYS[num_q + 5]) == 1 then
+if redis.call('HEXISTS', KEYS[num_q + 5], cid) == 1 then
     return 0
 end
 for i = 1, num_q do
@@ -1519,8 +1528,10 @@ class RedisCreatorQueue(CreatorQueue):
         self._key_tier_population_lock: str = (
             f'{self._key_prefix}:tier_population:lock'
         )
-        self._claim_prefix: str = (
-            f'{self._key_prefix}:claim:'
+        # Live claims: creator id -> worker id, each field expiring
+        # after the claim TTL (HEXPIRE).
+        self._key_claims: str = (
+            f'{self._key_prefix}:claims'
         )
         self._no_feeds_prefix: str = (
             f'{self._key_prefix}:no_feeds:'
@@ -1926,13 +1937,13 @@ class RedisCreatorQueue(CreatorQueue):
                 keys=[
                     *self._key_queues,
                     self._key_creators,
+                    self._key_claims,
                 ],
                 args=[
                     str(ts),
                     str(batch_size),
                     worker_id,
                     str(claim_ttl),
-                    self._claim_prefix,
                 ],
             )
         )
@@ -1980,9 +1991,7 @@ class RedisCreatorQueue(CreatorQueue):
             )
         next_check: float = now + delay_seconds
         pipe = self._redis.pipeline()
-        pipe.delete(
-            f'{self._claim_prefix}{creator_id}',
-        )
+        pipe.hdel(self._key_claims, creator_id)
         pipe.zadd(
             self._queue_key(tier),
             {creator_id: next_check},
@@ -2007,7 +2016,7 @@ class RedisCreatorQueue(CreatorQueue):
         tier: int = await self._member_tier(creator_id)
         now: float = datetime.now(UTC).timestamp()
         pipe = self._redis.pipeline()
-        pipe.delete(f'{self._claim_prefix}{creator_id}')
+        pipe.hdel(self._key_claims, creator_id)
         pipe.zadd(
             self._queue_key(tier),
             {creator_id: now + delay_seconds},
@@ -2025,7 +2034,7 @@ class RedisCreatorQueue(CreatorQueue):
         pipe = self._redis.pipeline()
         for key in self._key_queues:
             pipe.zrem(key, creator_id)
-        pipe.delete(f'{self._claim_prefix}{creator_id}')
+        pipe.hdel(self._key_claims, creator_id)
         pipe.hdel(self._key_tiers, creator_id)
         pipe.hdel(self._key_creators, creator_id)
         pipe.srem(self._key_excluded, creator_id)
@@ -2045,7 +2054,7 @@ class RedisCreatorQueue(CreatorQueue):
                 self._key_tiers,
                 self._key_names,
                 self._key_excluded,
-                f'{self._claim_prefix}{creator_id}',
+                self._key_claims,
                 self._queue_key(tier),
             ],
             args=[
@@ -2205,9 +2214,7 @@ class RedisCreatorQueue(CreatorQueue):
         pipe = self._redis.pipeline()
         for key in self._key_queues:
             pipe.zrem(key, creator_id)
-        pipe.delete(
-            f'{self._claim_prefix}{creator_id}',
-        )
+        pipe.hdel(self._key_claims, creator_id)
         await pipe.execute()
 
     async def park_low_subs(
@@ -2357,10 +2364,11 @@ class RedisCreatorQueue(CreatorQueue):
 
         Python-side HSCAN over ``_key_tiers`` in batches
         of 500. For each batch, one Redis pipeline
-        issues ZSCORE against every tier queue, EXISTS for
-        claim/no_feeds keys, and SISMEMBER for the excluded
-        set. Orphan recovery (if ``recover=True``) runs as a
-        second pipeline on the same batch.
+        issues ZSCORE against every tier queue, HEXISTS on
+        the claims hash, EXISTS for the no_feeds key, and
+        SISMEMBER for the excluded set. Orphan recovery (if
+        ``recover=True``) runs as a second pipeline on the
+        same batch.
 
         Smaller pipelined batches are preferred over a
         single blocking Lua scan because this path can run
@@ -2408,9 +2416,7 @@ class RedisCreatorQueue(CreatorQueue):
                     items.append((cid, tier))
                     for key in self._key_queues:
                         pipe.zscore(key, cid)
-                    pipe.exists(
-                        f'{self._claim_prefix}{cid}',
-                    )
+                    pipe.hexists(self._key_claims, cid)
                     pipe.exists(
                         f'{self._no_feeds_prefix}{cid}',
                     )
@@ -2552,6 +2558,11 @@ class RedisCreatorQueue(CreatorQueue):
                 return score
         return None
 
+    async def claim_owner(self, creator_id: str) -> str | None:
+        '''The worker id holding a live claim on *creator_id*, or
+        None when it is not claimed or the claim expired.'''
+        return await self._redis.hget(self._key_claims, creator_id)
+
     async def _state_of(
         self, creator_id: str,
     ) -> tuple[str, float | None]:
@@ -2560,9 +2571,7 @@ class RedisCreatorQueue(CreatorQueue):
             self._key_excluded, creator_id,
         ):
             return 'removed', None
-        if await self._redis.exists(
-            f'{self._claim_prefix}{creator_id}',
-        ):
+        if await self._redis.hexists(self._key_claims, creator_id):
             return 'claimed', None
         score: float | None = await self._queued_score(creator_id)
         if score is not None:
@@ -2735,7 +2744,7 @@ class RedisCreatorQueue(CreatorQueue):
         pipe = self._redis.pipeline()
         for key in self._key_queues:
             pipe.zrem(key, creator_id)
-        pipe.delete(f'{self._claim_prefix}{creator_id}')
+        pipe.hdel(self._key_claims, creator_id)
         pipe.sadd(self._key_excluded, creator_id)
         await pipe.execute()
 
@@ -2817,16 +2826,7 @@ class RedisCreatorQueue(CreatorQueue):
         for key in self._key_queues:
             queued += await self._redis.zcard(key)
         removed: int = await self._redis.scard(self._key_excluded)
-        claimed: int = 0
-        cursor: int = 0
-        pattern: str = f'{self._claim_prefix}*'
-        while True:
-            cursor, keys = await self._redis.scan(
-                cursor, match=pattern, count=500,
-            )
-            claimed += len(keys)
-            if cursor == 0:
-                break
+        claimed: int = await self._redis.hlen(self._key_claims)
         return {
             'queued': queued,
             'claimed': claimed,

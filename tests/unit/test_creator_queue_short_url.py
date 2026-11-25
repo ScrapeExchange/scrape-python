@@ -42,8 +42,8 @@ class TestRescheduleIn(unittest.IsolatedAsyncioTestCase):
         q = await self._queue()
         # Admit a member into the slowest tier (720h) and claim it.
         await q.add_member('https://vm.tiktok.com/ZG', 'x', 0)
-        await q._redis.set(
-            'scrape:tiktok:claim:https://vm.tiktok.com/ZG', '1',
+        await q._redis.hset(
+            'scrape:tiktok:claims', 'https://vm.tiktok.com/ZG', '1',
         )
         before: float = time.time()
         await q.reschedule_in('https://vm.tiktok.com/ZG', 300)
@@ -55,11 +55,10 @@ class TestRescheduleIn(unittest.IsolatedAsyncioTestCase):
         self.assertLess(abs(score - (before + 300)), 30)
         # Claim cleared.
         self.assertEqual(
-            await q._redis.exists(
-                'scrape:tiktok:claim:'
-                'https://vm.tiktok.com/ZG',
+            await q._redis.hexists(
+                'scrape:tiktok:claims', 'https://vm.tiktok.com/ZG',
             ),
-            0,
+            False,
         )
 
 
@@ -84,7 +83,7 @@ class TestDiscardMember(unittest.IsolatedAsyncioTestCase):
         # Admit a MIXED-CASE short URL (name stored lowercased).
         member: str = 'https://vm.tiktok.com/ZGJEytV2E'
         await q.add_member(member, member, 0)
-        await q._redis.set(f'scrape:tiktok:claim:{member}', '1')
+        await q._redis.hset('scrape:tiktok:claims', member, '1')
         await q.discard_member(member)
         # Gone from every tier ZSET.
         for key in q._key_queues:
@@ -101,10 +100,8 @@ class TestDiscardMember(unittest.IsolatedAsyncioTestCase):
             ),
         )
         self.assertEqual(
-            await q._redis.exists(
-                f'scrape:tiktok:claim:{member}',
-            ),
-            0,
+            await q._redis.hexists('scrape:tiktok:claims', member),
+            False,
         )
         # Names index purged using the LOWERCASED stored name.
         self.assertEqual(
@@ -167,7 +164,7 @@ class TestScheduleIfAbsent(unittest.IsolatedAsyncioTestCase):
 
     async def test_noop_when_claimed(self) -> None:
         q = await self._queue()
-        await q._redis.set('scrape:tiktok:claim:alice', '1')
+        await q._redis.hset('scrape:tiktok:claims', 'alice', '1')
         self.assertFalse(await q.schedule_if_absent('alice', 'alice', 0))
 
     async def test_noop_when_excluded(self) -> None:

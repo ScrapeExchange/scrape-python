@@ -115,9 +115,7 @@ class TestScanAndRecoverOrphans(
         await q._redis.hset(
             q._key_tiers, 'UC_c', '2',
         )
-        await q._redis.set(
-            f'{q._claim_prefix}UC_c', 'w1',
-        )
+        await q._redis.hset(q._key_claims, 'UC_c', 'w1')
 
         # Tier 3, state=no_feeds
         await q._redis.hset(
@@ -177,9 +175,7 @@ class TestScanAndRecoverOrphans(
         await q._redis.hset(
             q._key_tiers, cid, '2',
         )
-        await q._redis.set(
-            f'{q._claim_prefix}{cid}', 'w1',
-        )
+        await q._redis.hset(q._key_claims, cid, 'w1')
         await q._redis.set(
             f'{q._no_feeds_prefix}{cid}',
             'url\tname\t1',
@@ -362,9 +358,7 @@ class TestScanAndRecoverOrphans(
                 await q._redis.hset(
                     q._key_tiers, cid_c, str(tier),
                 )
-                await q._redis.set(
-                    f'{q._claim_prefix}{cid_c}', 'w1',
-                )
+                await q._redis.hset(q._key_claims, cid_c, 'w1')
                 # no_feeds
                 cid_n: str = f'UC_n_{tier}_{suffix}'
                 await q._redis.hset(
@@ -629,10 +623,7 @@ class TestClaimBatchStaleClaims(
         # Pre-set claim keys for the stale cids — simulates a
         # crashed worker that claimed but never released.
         for cid in stale:
-            await q._redis.set(
-                f'{q._claim_prefix}{cid}', 'old_worker',
-                ex=300,
-            )
+            await q._redis.hset(q._key_claims, cid, 'old_worker')
 
         # Request a batch of 5. With the fix, claim_batch must
         # return 5 fresh cids (skipping past the 3 stale ones).
@@ -654,9 +645,7 @@ class TestClaimBatchStaleClaims(
                 if False else None  # noqa - structural placeholder
             self.assertNotIn(cid, cids_returned)
             self.assertEqual(
-                await q._redis.get(
-                    f'{q._claim_prefix}{cid}',
-                ),
+                await q._redis.hget(q._key_claims, cid),
                 'old_worker',
             )
 
@@ -670,10 +659,7 @@ class TestClaimBatchStaleClaims(
         for i, cid in enumerate(cids):
             await self._seed_tier(q, [cid], 1, 100.0 + i)
         for cid in cids:
-            await q._redis.set(
-                f'{q._claim_prefix}{cid}', 'old_worker',
-                ex=300,
-            )
+            await q._redis.hset(q._key_claims, cid, 'old_worker')
         batch: list[tuple[str, str, float]] = (
             await q.claim_batch(5, 'w1')
         )

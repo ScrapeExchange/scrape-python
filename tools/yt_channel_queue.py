@@ -76,21 +76,23 @@ _LUA_BACKFILL_RSS_CREATORS = '''
 -- KEYS[1] = youtube:channel:tiers
 -- KEYS[2..S+1] = youtube:channel:queue:scheduled:<tier>
 -- KEYS[S+2..S+T+1] = terminal-state hashes
+-- KEYS[S+T+2..] = meta hash of each channel, in ARGV pair order
 -- ARGV[1] = scheduled key count (S)
 -- ARGV[2] = terminal hash count (T)
--- ARGV[3] = youtube:channel:meta: prefix
--- ARGV[4] = source
--- ARGV[5] = created_at unix seconds
--- ARGV[6..N] = channel ID, target channel tier pairs
+-- ARGV[3] = source
+-- ARGV[4] = created_at unix seconds
+-- ARGV[5..N] = channel ID, target channel tier pairs
 local added = 0
 local skipped = 0
 local scheduled_count = tonumber(ARGV[1])
 local terminal_count = tonumber(ARGV[2])
 local scheduled_start = 2
 local terminal_start = scheduled_start + scheduled_count
-for i = 6, #ARGV, 2 do
+local meta_start = terminal_start + terminal_count
+for i = 5, #ARGV, 2 do
     local cid = ARGV[i]
     local tier = tonumber(ARGV[i + 1]) or 0
+    local meta_key = KEYS[meta_start + math.floor((i - 5) / 2)]
     local member = 'i:' .. cid
     local exists = false
     for k = scheduled_start, terminal_start - 1 do
@@ -119,12 +121,11 @@ for i = 6, #ARGV, 2 do
         )
         if zadded == 1 then
             redis.call('HSET', KEYS[1], cid, tostring(tier))
-            local meta_key = ARGV[3] .. member
             redis.call(
                 'HSET', meta_key,
                 'channel_id', cid,
-                'source', ARGV[4],
-                'created_at', ARGV[5],
+                'source', ARGV[3],
+                'created_at', ARGV[4],
                 'state', 'scheduled'
             )
             added = added + 1
@@ -1604,15 +1605,19 @@ async def cmd_backfill_rss(
                     added += 1
             batch = []
             return
+        meta_keys: list[str] = [
+            queue._k_meta(f'i:{cid}') for cid in batch
+        ]
         raw: list[int] = await queue._redis.eval(
             _LUA_BACKFILL_RSS_CREATORS,
-            1 + len(scheduled_keys) + len(terminal_keys),
+            1 + len(scheduled_keys) + len(terminal_keys)
+            + len(meta_keys),
             queue._k_tiers(),
             *scheduled_keys,
             *terminal_keys,
+            *meta_keys,
             str(len(scheduled_keys)),
             str(len(terminal_keys)),
-            'youtube:channel:meta:',
             ns.source,
             str(int(time.time())),
             *(

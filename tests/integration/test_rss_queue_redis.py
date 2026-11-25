@@ -64,8 +64,8 @@ def _tiers_key() -> str:
     return f'rss:{TEST_PLATFORM}:tiers'
 
 
-def _claim_key(creator_id: str) -> str:
-    return f'rss:{TEST_PLATFORM}:claim:{creator_id}'
+def _claims_key() -> str:
+    return f'rss:{TEST_PLATFORM}:claims'
 
 
 async def _clean(r: aioredis.Redis) -> None:
@@ -368,11 +368,16 @@ class TestRedisCreatorQueueClaimBatch(
         await self.q.claim_batch(
             10, 'test-worker', claim_ttl=300,
         )
-        ttl: int = await self._redis.ttl(
-            _claim_key('UCaaa'),
+        ttls: list[int] = await self._redis.httl(
+            _claims_key(), 'UCaaa',
         )
-        self.assertGreater(ttl, 0)
-        self.assertLessEqual(ttl, 300)
+        self.assertGreater(ttls[0], 0)
+        # Dragonfly rounds HTTL up, reporting 301 for a 300 s TTL.
+        self.assertLessEqual(ttls[0], 301)
+        self.assertEqual(
+            await self._redis.hget(_claims_key(), 'UCaaa'),
+            'test-worker',
+        )
 
     async def test_claim_batch_empty_when_nothing_due(
         self,
@@ -417,9 +422,10 @@ class TestRedisCreatorQueueClaimBatch(
         )
         # Pre-claim UCaaa; also remove it from the
         # queue (claim implies already popped).
-        await self._redis.set(
-            _claim_key('UCaaa'), 'other-worker', ex=300,
+        await self._redis.hset(
+            _claims_key(), 'UCaaa', 'other-worker',
         )
+        await self._redis.hexpire(_claims_key(), 300, 'UCaaa')
         await self._redis.zrem(_queue_key(1), 'UCaaa')
 
         batch: list[tuple[str, str, float]] = (
@@ -479,11 +485,10 @@ class TestRedisCreatorQueueRelease(
 
         await self.q.release('UCaaa')
 
-        # Claim key must be gone.
-        exists: int = await self._redis.exists(
-            _claim_key('UCaaa'),
+        # Claim must be gone.
+        self.assertFalse(
+            await self._redis.hexists(_claims_key(), 'UCaaa'),
         )
-        self.assertEqual(exists, 0)
 
         # Creator must be back in tier 2 queue.
         score: float | None = (

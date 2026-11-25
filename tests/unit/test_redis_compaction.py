@@ -310,7 +310,12 @@ class TestCopySetToBloom(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             await self.redis.scard(LEGACY_EXCHANGE_CHANNELS_KEY), 3,
         )
-        self.assertEqual(await channels.size(), 2)
+        self.assertEqual(
+            await self.redis.execute_command(
+                'BF.CARD', 'youtube:exchange_channels_bf',
+            ),
+            2,
+        )
 
 
 if __name__ == '__main__':

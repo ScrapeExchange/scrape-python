@@ -8,8 +8,10 @@ from scrape_exchange.youtube._rss_circuit_state import (
     CircuitParams,
 )
 from scrape_exchange.youtube.rss_circuit_breaker import (
+    _LUA_SCRIPT,
     RssCircuitBreaker,
     _InProcessCircuitBackend,
+    _RedisCircuitBackend,
 )
 
 
@@ -194,6 +196,65 @@ class TestInProcessBackend(unittest.TestCase):
             )
         )
         self.assertEqual(backend._wait_jitter_seconds, 42.0)
+
+
+try:
+    import fakeredis.aioredis
+    import lupa  # noqa: F401 -- fakeredis needs it to run Lua
+    HAS_FAKEREDIS_LUA: bool = True
+except ImportError:
+    HAS_FAKEREDIS_LUA = False
+
+
+@unittest.skipUnless(HAS_FAKEREDIS_LUA, 'fakeredis with Lua not installed')
+class TestRedisBackendScript(unittest.IsolatedAsyncioTestCase):
+    '''The Redis backend runs the circuit logic in one Lua script. Every
+    key the script touches is passed in KEYS (Dragonfly rejects
+    undeclared keys), and the window key keeps its name so state
+    written before the change still applies.'''
+
+    def _backend(self) -> _RedisCircuitBackend:
+        backend: _RedisCircuitBackend = _RedisCircuitBackend(
+            _params(), 'redis://fake',
+        )
+        backend._client = fakeredis.aioredis.FakeRedis(
+            decode_responses=True,
+        )
+        return backend
+
+    async def test_trips_after_threshold_and_rolls_back(self) -> None:
+        backend: _RedisCircuitBackend = self._backend()
+        r1 = await backend.record_outcome(
+            channel_id='UC1', was_not_found=True,
+        )
+        self.assertIsNone(r1.transition)
+        await backend.record_outcome(channel_id='UC2', was_not_found=True)
+        r3 = await backend.record_outcome(
+            channel_id='UC3', was_not_found=True,
+        )
+        self.assertIsNotNone(r3.transition)
+        self.assertEqual(r3.transition.to_state, 'open-regular')
+        self.assertTrue(r3.suppress_channel_failure)
+        self.assertEqual(r3.rollback_channel_ids, ['UC1', 'UC2'])
+        state = await backend.read_state()
+        self.assertTrue(state.is_open)
+
+    async def test_window_key_name_unchanged(self) -> None:
+        backend: _RedisCircuitBackend = self._backend()
+        await backend.record_outcome(channel_id='UC1', was_not_found=True)
+        self.assertEqual(
+            _RedisCircuitBackend._WINDOW_KEY,
+            'youtube:rss:circuit:state:window',
+        )
+        window: list[str] = await backend._client.lrange(
+            'youtube:rss:circuit:state:window', 0, -1,
+        )
+        self.assertEqual(len(window), 1)
+
+    async def test_script_declares_every_key(self) -> None:
+        '''No key is built inside the script from another key.'''
+        self.assertNotIn("':window'", _LUA_SCRIPT)
+        self.assertNotIn('replicate_commands', _LUA_SCRIPT)
 
 
 class TestFacadeGet(unittest.TestCase):

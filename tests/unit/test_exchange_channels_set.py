@@ -49,7 +49,9 @@ class TestRedisExchangeChannelsSet(
         self,
     ) -> None:
         await self.s.add_many(set())
-        self.assertEqual(await self.s.size(), 0)
+        self.assertFalse(
+            await self.redis.exists('youtube:exchange_channels_bf'),
+        )
 
     async def test_contains_many_empty_returns_empty(
         self,
@@ -81,7 +83,12 @@ class TestRedisExchangeChannelsSet(
         filter's cardinality.'''
         await self.s.add_many(['alpha', 'bravo'])
         await self.s.add_many(['alpha'])
-        self.assertEqual(await self.s.size(), 2)
+        self.assertEqual(
+            await self.redis.execute_command(
+                'BF.CARD', 'youtube:exchange_channels_bf',
+            ),
+            2,
+        )
 
     async def test_contains_many_with_duplicates(
         self,
