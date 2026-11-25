@@ -258,9 +258,10 @@ class RssCircuitBreaker:
 
 
 _LUA_SCRIPT: str = '''
-redis.replicate_commands()
-
+-- Every key the script touches is passed in KEYS: Dragonfly rejects
+-- scripts that access undeclared keys.
 local key       = KEYS[1]
+local wkey      = KEYS[2]  -- sliding window list of recent outcomes
 local cid       = ARGV[1]
 local was_404   = tonumber(ARGV[2])  -- 0 or 1
 local f_thresh  = tonumber(ARGV[3])
@@ -289,7 +290,7 @@ local cons404    = tonumber(
 local conssucc   = tonumber(
     redis.call('HGET', key, 'cons_succ') or '0'
 )
-local window     = redis.call('LRANGE', key .. ':window', 0, -1)
+local window     = redis.call('LRANGE', wkey, 0, -1)
 
 local function clamp(v, hi)
     if v > hi then return hi else return v end
@@ -317,7 +318,7 @@ if is_open == '1' and now >= open_until then
     open_until = 0
     cons404    = 0
     conssucc   = 0
-    redis.call('DEL', key .. ':window')
+    redis.call('DEL', wkey)
     window           = {}
     transition_from  = before_label
     transition_to    = 'closed-impaired'
@@ -328,9 +329,9 @@ else
     else
         -- Append outcome; trim to T.
         local entry = cjson.encode({cid = cid, f = was_404})
-        redis.call('RPUSH', key .. ':window', entry)
-        redis.call('LTRIM', key .. ':window', -t_size, -1)
-        window = redis.call('LRANGE', key .. ':window', 0, -1)
+        redis.call('RPUSH', wkey, entry)
+        redis.call('LTRIM', wkey, -t_size, -1)
+        window = redis.call('LRANGE', wkey, 0, -1)
 
         if mode == 'regular' then
             local n404 = 0
@@ -350,7 +351,7 @@ else
                 open_until = now + cooldown
                 cons404    = 0
                 conssucc   = 0
-                redis.call('DEL', key .. ':window')
+                redis.call('DEL', wkey)
                 transition_from     = before_label
                 transition_to       = 'open-regular'
                 transition_cooldown = cooldown
@@ -371,7 +372,7 @@ else
                 open_until = now + cooldown
                 cons404    = 0
                 conssucc   = 0
-                redis.call('DEL', key .. ':window')
+                redis.call('DEL', wkey)
                 transition_from     = before_label
                 transition_to       = 'open-impaired'
                 transition_cooldown = cooldown
@@ -381,7 +382,7 @@ else
                 cooldown = s_init
                 cons404  = 0
                 conssucc = 0
-                redis.call('DEL', key .. ':window')
+                redis.call('DEL', wkey)
                 transition_from = before_label
                 transition_to   = 'closed-regular'
                 suppress        = 0
@@ -424,6 +425,7 @@ class _RedisCircuitBackend(_CircuitBackend):
     '''
 
     _STATE_KEY: ClassVar[str] = 'youtube:rss:circuit:state'
+    _WINDOW_KEY: ClassVar[str] = f'{_STATE_KEY}:window'
 
     def __init__(
         self,
@@ -481,13 +483,13 @@ class _RedisCircuitBackend(_CircuitBackend):
         ]
         try:
             raw = await self._client.evalsha(
-                sha, 1, self._STATE_KEY, *args,
+                sha, 2, self._STATE_KEY, self._WINDOW_KEY, *args,
             )
         except NoScriptError:
             self._script_sha = None
             sha = await self._ensure_script()
             raw = await self._client.evalsha(
-                sha, 1, self._STATE_KEY, *args,
+                sha, 2, self._STATE_KEY, self._WINDOW_KEY, *args,
             )
         return _parse_lua_reply(raw)
 

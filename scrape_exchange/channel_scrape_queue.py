@@ -460,6 +460,7 @@ _UNMARK_LUA: str = '''
 -- KEYS[1] = meta hash
 -- KEYS[2] = target queue (unresolved or scheduled:<tier>)
 -- KEYS[3] = tier map
+-- KEYS[4..] = terminal state hashes
 -- ARGV[1] = member
 -- ARGV[2] = target state value
 -- ARGV[3] = target score (as string, will be converted)
@@ -469,17 +470,8 @@ local target_state = ARGV[2]
 local target_score = tonumber(ARGV[3])
 local target_tier = ARGV[4]
 
-local states = {
-    'not_found', 'invalid_handle',
-    'inconsistent_identity', 'terminated',
-    'unresolved', 'removed',
-    'soft_unavailable', 'hard_unavailable',
-    'topic', 'no_videos', 'low_subs', 'moved',
-}
-for _, s in ipairs(states) do
-    redis.call(
-        'HDEL', 'youtube:channel:' .. s, member
-    )
+for i = 4, #KEYS do
+    redis.call('HDEL', KEYS[i], member)
 end
 if target_tier ~= '' then
     redis.call('HSET', KEYS[3], string.sub(member, 3), target_tier)
@@ -496,38 +488,24 @@ return 1
 _MARK_LUA: str = '''
 -- KEYS[1] = meta hash
 -- KEYS[2] = target state hash
+-- KEYS[3] = unresolved queue
+-- KEYS[4..S+3] = scheduled queues
+-- KEYS[S+4..] = terminal state hashes
 -- ARGV[1] = member
 -- ARGV[2] = state value
 -- ARGV[3] = record JSON
--- ARGV[4] = tier count
+-- ARGV[4] = scheduled queue count (S)
 local member = ARGV[1]
 local state = ARGV[2]
 local record = ARGV[3]
-local tier_count = tonumber(ARGV[4])
+local scheduled_count = tonumber(ARGV[4])
+local terminal_start = 4 + scheduled_count
 
-redis.call(
-    'ZREM',
-    'youtube:channel:queue:unresolved',
-    member
-)
-for t = 0, tier_count - 1 do
-    redis.call(
-        'ZREM',
-        'youtube:channel:queue:scheduled:' .. t,
-        member
-    )
+for i = 3, terminal_start - 1 do
+    redis.call('ZREM', KEYS[i], member)
 end
-local states = {
-    'not_found', 'invalid_handle',
-    'inconsistent_identity', 'terminated',
-    'unresolved', 'removed',
-    'soft_unavailable', 'hard_unavailable',
-    'topic', 'no_videos', 'low_subs', 'moved',
-}
-for _, s in ipairs(states) do
-    redis.call(
-        'HDEL', 'youtube:channel:' .. s, member
-    )
+for i = terminal_start, #KEYS do
+    redis.call('HDEL', KEYS[i], member)
 end
 redis.call('HSET', KEYS[2], member, record)
 redis.call('HSET', KEYS[1], 'state', state)
@@ -1108,6 +1086,20 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
 
     def _k_tiers(self) -> str:
         return f'{KEY_PREFIX}:tiers'
+
+    def _k_all_scheduled(self) -> list[str]:
+        '''The scheduled queue of every tier, tier 0 first.'''
+        return [self._k_scheduled(t) for t in range(len(self._tiers))]
+
+    def _k_terminal_states(self) -> list[str]:
+        '''The hash of every terminal state, in a fixed order.'''
+        return [
+            self._k_state(state)
+            for state in sorted(
+                ChannelState.terminal_states(),
+                key=lambda state: state.value,
+            )
+        ]
 
     def _k_listing_counts(self) -> str:
         return f'{KEY_PREFIX}:listing_counts'
@@ -1939,16 +1931,20 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
             record.update(extra)
         meta_key: str = self._k_meta(member)
         state_key: str = self._k_state(state)
-        tier_count: int = len(self._tiers)
+        scheduled_keys: list[str] = self._k_all_scheduled()
+        terminal_keys: list[str] = self._k_terminal_states()
         await self._redis.eval(
             _MARK_LUA,
-            2,
+            3 + len(scheduled_keys) + len(terminal_keys),
             meta_key,
             state_key,
+            self._k_unresolved(),
+            *scheduled_keys,
+            *terminal_keys,
             member,
             state.value,
             json.dumps(record),
-            str(tier_count),
+            str(len(scheduled_keys)),
         )
         await self.recount_listing(member)
 
@@ -1991,12 +1987,14 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
         # spread a large cohort instead of making them all due now.
         if score is not None:
             target_score = score
+        terminal_keys: list[str] = self._k_terminal_states()
         await self._redis.eval(
             _UNMARK_LUA,
-            3,
+            3 + len(terminal_keys),
             self._k_meta(member),
             target_queue,
             self._k_tiers(),
+            *terminal_keys,
             member,
             target_state.value,
             str(target_score),
@@ -2040,17 +2038,8 @@ class RedisChannelScrapeQueue(ChannelScrapeQueue):
                 f'{member!r}'
             )
         forced_at: float = time.time() if now is None else now
-        scheduled_keys: list[str] = [
-            self._k_scheduled(t)
-            for t in range(len(self._tiers))
-        ]
-        terminal_keys: list[str] = [
-            self._k_state(state)
-            for state in sorted(
-                ChannelState.terminal_states(),
-                key=lambda state: state.value,
-            )
-        ]
+        scheduled_keys: list[str] = self._k_all_scheduled()
+        terminal_keys: list[str] = self._k_terminal_states()
         await self._redis.eval(
             _FORCE_RESCRAPE_LUA,
             3 + len(scheduled_keys) + len(terminal_keys),
