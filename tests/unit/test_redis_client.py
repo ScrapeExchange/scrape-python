@@ -15,6 +15,7 @@ from scrape_exchange.redis_client import (
     DEFAULT_MAX_CONNECTIONS,
     BacklogRedisSettings,
     RedisConnectRetrySettings,
+    RedisSlowdownSettings,
     backlog_command_retry,
     backlog_redis_from_url,
     call_with_redis_busy_retry,
@@ -22,7 +23,15 @@ from scrape_exchange.redis_client import (
     is_redis_busy_script_error,
     redis_client_name,
     redis_from_url,
+    redis_slowdown_settings,
 )
+
+
+def _fresh_slowdown_settings(case: unittest.TestCase) -> None:
+    '''redis_slowdown_settings() is cached per process: drop the cache
+    so a test's patched environment is read, and again afterwards.'''
+    redis_slowdown_settings.cache_clear()
+    case.addCleanup(redis_slowdown_settings.cache_clear)
 
 
 class TestRedisClientName(unittest.TestCase):
@@ -148,6 +157,9 @@ class TestRedisFromUrlSocketTimeout(unittest.TestCase):
 
 class TestRedisBusyRetry(unittest.IsolatedAsyncioTestCase):
 
+    def setUp(self) -> None:
+        _fresh_slowdown_settings(self)
+
     async def test_command_recovers_after_dataset_loading(self) -> None:
         from redis.asyncio import Redis
         from redis.exceptions import BusyLoadingError
@@ -177,7 +189,12 @@ class TestRedisBusyRetry(unittest.IsolatedAsyncioTestCase):
             command.await_args_list[0], command.await_args_list[1],
         )
 
-    async def test_dataset_loading_exhausts_bounded_backoff(self) -> None:
+    async def test_dataset_loading_retries_past_busy_retry_count(
+        self,
+    ) -> None:
+        '''A Dragonfly restart answers LOADING for about a minute,
+        longer than the BUSY-script retry count allows; loading is
+        retried until the slowdown limit instead.'''
         from redis.exceptions import BusyLoadingError
 
         attempts: int = 0
@@ -186,23 +203,52 @@ class TestRedisBusyRetry(unittest.IsolatedAsyncioTestCase):
         async def operation() -> str:
             nonlocal attempts
             attempts += 1
-            raise BusyLoadingError('Redis is loading the dataset in memory')
+            if attempts <= 6:
+                raise BusyLoadingError(
+                    'Redis is loading the dataset in memory',
+                )
+            return 'ok'
 
         async def sleep(delay: float) -> None:
             sleeps.append(delay)
 
+        with patch.dict(os.environ, {
+            'REDIS_BUSY_RETRIES': '3',
+            'REDIS_BUSY_RETRY_BASE_SECONDS': '0.25',
+            'REDIS_BUSY_RETRY_MAX_SECONDS': '0.5',
+        }, clear=True):
+            result: str = await call_with_redis_busy_retry(
+                operation, sleep=sleep,
+            )
+
+        self.assertEqual(result, 'ok')
+        self.assertEqual(attempts, 7)
+        self.assertEqual(sleeps, [0.25, 0.5, 0.5, 0.5, 0.5, 0.5])
+
+    async def test_dataset_loading_gives_up_after_slowdown_limit(
+        self,
+    ) -> None:
+        from redis.exceptions import BusyLoadingError
+
+        attempts: int = 0
+
+        async def operation() -> str:
+            nonlocal attempts
+            attempts += 1
+            raise BusyLoadingError('Redis is loading the dataset in memory')
+
+        async def sleep(delay: float) -> None:
+            return None
+
         with (
             patch.dict(os.environ, {
-                'REDIS_BUSY_RETRIES': '3',
-                'REDIS_BUSY_RETRY_BASE_SECONDS': '0.25',
-                'REDIS_BUSY_RETRY_MAX_SECONDS': '0.5',
+                'REDIS_SLOWDOWN_MAX_WAIT_SECONDS': '0',
             }, clear=True),
             self.assertRaises(BusyLoadingError),
         ):
             await call_with_redis_busy_retry(operation, sleep=sleep)
 
-        self.assertEqual(attempts, 4)
-        self.assertEqual(sleeps, [0.25, 0.5, 0.5])
+        self.assertEqual(attempts, 1)
 
     async def test_retries_busy_script_response(
         self,
@@ -323,6 +369,88 @@ class TestRedisBusyRetry(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, ['ok'])
         self.assertEqual(attempts, 2)
+
+    def _pipeline_client(self, from_url: MagicMock) -> Any:
+        from_url.return_value = MagicMock()
+        return redis_from_url(
+            'redis://localhost:6379/0', component='test-component',
+        )
+
+    async def test_pipeline_retries_loading_past_busy_retry_count(
+        self,
+    ) -> None:
+        '''A pipeline waits out a Dragonfly reload like a single
+        command does: LOADING is retried until the slowdown limit,
+        not just REDIS_BUSY_RETRIES times.'''
+        from redis.asyncio.client import Pipeline
+        from redis.exceptions import BusyLoadingError
+
+        attempts: int = 0
+
+        async def execute(
+            pipeline: Pipeline,
+            raise_on_error: bool = True,
+        ) -> list[str]:
+            nonlocal attempts
+            attempts += 1
+            self.assertTrue(pipeline.command_stack)
+            if attempts <= 10:
+                pipeline.command_stack = []
+                raise BusyLoadingError(
+                    'Redis is loading the dataset in memory',
+                )
+            return ['ok']
+
+        with (
+            patch(
+                'redis.asyncio.BlockingConnectionPool.from_url',
+            ) as from_url,
+            patch.object(Pipeline, 'execute', execute),
+            patch.dict(os.environ, {
+                'REDIS_BUSY_RETRIES': '2',
+                'REDIS_BUSY_RETRY_BASE_SECONDS': '0',
+            }, clear=True),
+        ):
+            client: Any = self._pipeline_client(from_url)
+            pipe: Any = client.pipeline(transaction=False)
+            pipe.set('key', 'value')
+            result: list[str] = await pipe.execute()
+
+        self.assertEqual(result, ['ok'])
+        self.assertEqual(attempts, 11)
+
+    async def test_pipeline_loading_gives_up_after_slowdown_limit(
+        self,
+    ) -> None:
+        from redis.asyncio.client import Pipeline
+        from redis.exceptions import BusyLoadingError
+
+        attempts: int = 0
+
+        async def execute(
+            pipeline: Pipeline,
+            raise_on_error: bool = True,
+        ) -> list[str]:
+            nonlocal attempts
+            attempts += 1
+            raise BusyLoadingError('Redis is loading the dataset in memory')
+
+        with (
+            patch(
+                'redis.asyncio.BlockingConnectionPool.from_url',
+            ) as from_url,
+            patch.object(Pipeline, 'execute', execute),
+            patch.dict(os.environ, {
+                'REDIS_SLOWDOWN_MAX_WAIT_SECONDS': '0',
+            }, clear=True),
+            self.assertRaises(BusyLoadingError),
+        ):
+            client: Any = self._pipeline_client(from_url)
+            pipe: Any = client.pipeline(transaction=False)
+            pipe.set('key', 'value')
+            await pipe.execute()
+
+        self.assertEqual(attempts, 1)
 
 
 class TestRedisConnectionRetry(unittest.IsolatedAsyncioTestCase):
@@ -583,6 +711,122 @@ class TestRedisConnectionRetry(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.aclose()
             await client.connection_pool.disconnect()
+
+
+class TestRedisPoolWait(unittest.IsolatedAsyncioTestCase):
+    '''While Dragonfly snapshots, commands take up to ~30 s and every
+    pooled connection is busy. A task that cannot check out a
+    connection within the pool timeout has sent nothing yet, so it
+    keeps waiting (pulsing the watchdog) instead of failing with "No
+    connection available" (yt-channel crashed 377 times on that).'''
+
+    def setUp(self) -> None:
+        _fresh_slowdown_settings(self)
+
+    def _client(self) -> Any:
+        from fakeredis import FakeServer
+        from fakeredis.aioredis import FakeAsyncRedisConnection
+
+        return redis_from_url(
+            'redis://localhost:6379/0', component='test',
+            connection_class=FakeAsyncRedisConnection,
+            server=FakeServer(), max_connections=1, timeout=0.05,
+        )
+
+    async def test_waits_for_busy_pool_instead_of_failing(self) -> None:
+        '''The held connection is released from the watchdog touch
+        after the second pool timeout, not after a fixed sleep, so
+        the waiter has provably timed out twice whatever the
+        scheduler does.'''
+        client: Any = self._client()
+        pool: Any = client.connection_pool
+        touches: list[int] = []
+        releases: list[asyncio.Task] = []
+        try:
+            held: Any = await pool.get_connection()
+            loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+
+            def touch() -> None:
+                touches.append(1)
+                if len(touches) == 2:
+                    releases.append(loop.create_task(pool.release(held)))
+
+            with patch(
+                'scrape_exchange.redis_client._default_touch_work',
+                return_value=touch,
+            ):
+                pong: bool = await asyncio.wait_for(
+                    client.ping(), timeout=30,
+                )
+                await asyncio.gather(*releases)
+            self.assertTrue(pong)
+            self.assertEqual(len(releases), 1)
+            self.assertGreaterEqual(len(touches), 2)
+        finally:
+            await client.aclose()
+            await client.connection_pool.disconnect()
+
+    async def test_gives_up_after_max_wait(self) -> None:
+        from redis.exceptions import ConnectionError as RedisConnectionError
+
+        client: Any = self._client()
+        try:
+            await client.connection_pool.get_connection()
+            with (
+                patch.dict(os.environ, {
+                    'REDIS_SLOWDOWN_MAX_WAIT_SECONDS': '0.1',
+                }),
+                self.assertRaisesRegex(
+                    RedisConnectionError, 'No connection available',
+                ),
+            ):
+                client.connection_pool._slowdown_settings = (
+                    RedisSlowdownSettings()
+                )
+                await client.ping()
+        finally:
+            await client.aclose()
+            await client.connection_pool.disconnect()
+
+
+class TestRedisSlowdownSettings(unittest.TestCase):
+    def setUp(self) -> None:
+        _fresh_slowdown_settings(self)
+
+    def test_settings_are_read_once(self) -> None:
+        with patch.dict(os.environ, {
+            'REDIS_SLOWDOWN_MAX_WAIT_SECONDS': '30',
+        }, clear=True):
+            first: RedisSlowdownSettings = redis_slowdown_settings()
+        with patch.dict(os.environ, {
+            'REDIS_SLOWDOWN_MAX_WAIT_SECONDS': '90',
+        }, clear=True):
+            second: RedisSlowdownSettings = redis_slowdown_settings()
+        self.assertIs(first, second)
+        self.assertEqual(second.max_wait_seconds, 30.0)
+    def test_defaults_to_ten_minutes(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            settings: RedisSlowdownSettings = RedisSlowdownSettings()
+        self.assertEqual(settings.max_wait_seconds, 600.0)
+
+    def test_environment_override_and_validation(self) -> None:
+        from pydantic import ValidationError
+
+        with patch.dict(os.environ, {
+            'REDIS_SLOWDOWN_MAX_WAIT_SECONDS': '30',
+        }, clear=True):
+            self.assertEqual(
+                RedisSlowdownSettings().max_wait_seconds, 30.0,
+            )
+        for value in ('-1', 'nan', 'inf', 'invalid'):
+            with (
+                self.subTest(value=value),
+                patch.dict(os.environ, {
+                    'REDIS_SLOWDOWN_MAX_WAIT_SECONDS': value,
+                }, clear=True),
+                self.assertRaises(ValidationError),
+            ):
+                RedisSlowdownSettings()
 
 
 class TestRedisConnectRetrySettings(unittest.TestCase):

@@ -110,6 +110,11 @@ from scrape_exchange.video_scrape_queue import (
 )
 
 import redis.asyncio as aioredis
+from redis.exceptions import (
+    AuthenticationError as RedisAuthenticationError,
+    ConnectionError as RedisConnectionError,
+    TimeoutError as RedisTimeoutError,
+)
 
 # Prometheus metrics — shared declarations live in scraper_metrics to
 # avoid duplicate-registration errors when multiple tool modules are
@@ -241,6 +246,24 @@ def _is_bind_failure(exc: BaseException) -> bool:
     return False
 
 
+def _is_redis_unreachable(exc: BaseException) -> bool:
+    '''
+    True for a Redis connection failure or timeout (but not a
+    rejected password). These say nothing about the video: they
+    happen while Redis is slow, e.g. during a Dragonfly snapshot,
+    so the video must be retried rather than marked failed.
+
+    Deliberately narrower than
+    :func:`scrape_exchange.redis_client.is_redis_connection_error`,
+    which also matches every ``OSError`` and would turn a failed
+    write to disk into an endless retry.
+    '''
+
+    if isinstance(exc, RedisAuthenticationError):
+        return False
+    return isinstance(exc, (RedisConnectionError, RedisTimeoutError))
+
+
 def _classify_scrape_error(exc: BaseException) -> str:
     '''
     Top-level classifier for video scrape failures. Returns
@@ -261,6 +284,8 @@ def _classify_scrape_error(exc: BaseException) -> str:
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         if isinstance(current, httpx.TransportError):
+            return 'transient'
+        if _is_redis_unreachable(current):
             return 'transient'
         current = current.__cause__ or current.__context__
     return _classify_yt_dlp_error(str(exc))

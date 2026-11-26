@@ -6,9 +6,17 @@ Redis server is required.
 '''
 
 import asyncio
+import os
 import unittest
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
+
+from redis.exceptions import (
+    AuthenticationError as RedisAuthenticationError,
+    ConnectionError as RedisConnectionError,
+    ResponseError as RedisResponseError,
+    TimeoutError as RedisTimeoutError,
+)
 
 try:
     import fakeredis
@@ -17,8 +25,13 @@ try:
 except ImportError:
     HAS_FAKEREDIS = False
 
+from scrape_exchange.redis_client import (
+    RedisSlowdownSettings,
+    redis_slowdown_settings,
+)
 from scrape_exchange.worker_id import get_worker_id
 from scrape_exchange.rate_limiter import (
+    RateLimiterRedisRetrySettings,
     _BucketConfig,
     _RedisBackend,
     _proxy_filename,
@@ -69,6 +82,12 @@ def _make_backend(server=None):
     backend._try_acquire_sha = None
     backend._penalise_sha = None
     backend._scripts_loaded = False
+    # No retry budget: a Redis error raises at once, as before the
+    # retry existed. TestRedisBackendRetry sets its own budget.
+    backend._retry_settings = RateLimiterRedisRetrySettings()
+    backend._slowdown_settings = RedisSlowdownSettings(
+        max_wait_seconds=0.0,
+    )
     # _redis will be set by _wire()
     backend._redis = None
     backend._server = server or fakeredis.FakeServer()
@@ -344,3 +363,168 @@ class TestRedisBackendKeyNaming(unittest.TestCase):
             '.state'
         )
         self.assertEqual(key, f'rl:test:{h}')
+
+
+_OK_RESULT: list[str] = ['0', '9.0', '19.0']
+
+
+class _FakeClock:
+    '''Stands in for time.monotonic(); each sleep advances it.'''
+
+    def __init__(self) -> None:
+        self.now: float = 1000.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    async def sleep(self, delay: float) -> None:
+        self.sleeps.append(delay)
+        self.now += delay
+
+
+class TestRedisBackendRetry(unittest.TestCase):
+    '''try_acquire rides out a slow or unreachable Redis (e.g. a
+    Dragonfly snapshot) instead of failing the scrape at once.'''
+
+    def _backend(
+        self, side_effect: list[object], max_wait: float = 300.0,
+    ) -> _RedisBackend:
+        backend: _RedisBackend = _RedisBackend.__new__(_RedisBackend)
+        backend._default_configs = _TEST_CONFIGS
+        backend._global_config = _TEST_GLOBAL
+        backend._platform = 'test'
+        backend._cache = {}
+        backend._scripts_loaded = True
+        backend._try_acquire_sha = 'sha'
+        backend._penalise_sha = 'sha'
+        backend._retry_settings = RateLimiterRedisRetrySettings(
+            base_seconds=0.5, cap_seconds=10.0,
+        )
+        backend._slowdown_settings = RedisSlowdownSettings(
+            max_wait_seconds=max_wait,
+        )
+        backend._evalsha_with_reload = AsyncMock(
+            side_effect=side_effect,
+        )
+        return backend
+
+    def _acquire(
+        self, backend: _RedisBackend, clock: _FakeClock,
+    ) -> tuple[float, float, float]:
+        with patch(
+            'scrape_exchange.rate_limiter.paced_sleep', clock.sleep,
+        ), patch(
+            'scrape_exchange.rate_limiter.time.monotonic',
+            clock.monotonic,
+        ):
+            return _run(backend.try_acquire(_TEST_CALL_TYPE, None))
+
+    def test_retries_pool_exhaustion_then_succeeds(self) -> None:
+        clock: _FakeClock = _FakeClock()
+        backend: _RedisBackend = self._backend([
+            RedisConnectionError('No connection available.'),
+            RedisTimeoutError('Timeout reading from localhost:6379'),
+            _OK_RESULT,
+        ])
+        wait, bt, gt = self._acquire(backend, clock)
+        self.assertEqual((wait, bt, gt), (0.0, 9.0, 19.0))
+        self.assertEqual(clock.sleeps, [0.5, 1.0])
+        self.assertEqual(backend._evalsha_with_reload.await_count, 3)
+
+    def test_backoff_is_capped(self) -> None:
+        clock: _FakeClock = _FakeClock()
+        errors: list[object] = [
+            RedisTimeoutError('slow') for _ in range(7)
+        ]
+        backend: _RedisBackend = self._backend(errors + [_OK_RESULT])
+        self._acquire(backend, clock)
+        self.assertEqual(
+            clock.sleeps, [0.5, 1.0, 2.0, 4.0, 8.0, 10.0, 10.0],
+        )
+
+    def test_gives_up_after_budget(self) -> None:
+        clock: _FakeClock = _FakeClock()
+        backend: _RedisBackend = self._backend(
+            [RedisTimeoutError('slow') for _ in range(100)],
+            max_wait=30.0,
+        )
+        with self.assertLogs(
+            'scrape_exchange.rate_limiter', level='WARNING',
+        ), self.assertRaises(RedisTimeoutError):
+            self._acquire(backend, clock)
+        # 0.5+1+2+4+8 = 15.5; another 10 fits (25.5); a further 10
+        # would end past 30, so it raises instead of sleeping.
+        self.assertEqual(clock.sleeps, [0.5, 1.0, 2.0, 4.0, 8.0, 10.0])
+
+    def test_does_not_retry_other_errors(self) -> None:
+        for error in (
+            RedisResponseError('WRONGTYPE'),
+            RedisAuthenticationError('invalid password'),
+        ):
+            with self.subTest(error=type(error).__name__):
+                clock: _FakeClock = _FakeClock()
+                backend: _RedisBackend = self._backend([error])
+                with self.assertLogs(
+                    'scrape_exchange.rate_limiter', level='WARNING',
+                ), self.assertRaises(type(error)):
+                    self._acquire(backend, clock)
+                self.assertEqual(clock.sleeps, [])
+
+    def test_each_failed_attempt_counts_as_error(self) -> None:
+        labels: dict[str, str] = {
+            'operation': 'try_acquire',
+            'result': 'error',
+            'platform': 'test',
+            'worker_id': get_worker_id(),
+        }
+        before: float = METRIC_REDIS_OPS.labels(**labels)._value.get()
+        backend: _RedisBackend = self._backend([
+            RedisConnectionError('No connection available.'),
+            RedisConnectionError('No connection available.'),
+            _OK_RESULT,
+        ])
+        self._acquire(backend, _FakeClock())
+        after: float = METRIC_REDIS_OPS.labels(**labels)._value.get()
+        self.assertEqual(after - before, 2.0)
+
+
+class TestRateLimiterRedisRetrySettings(unittest.TestCase):
+
+    def setUp(self) -> None:
+        redis_slowdown_settings.cache_clear()
+        self.addCleanup(redis_slowdown_settings.cache_clear)
+
+    def test_defaults(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            settings: RateLimiterRedisRetrySettings = (
+                RateLimiterRedisRetrySettings()
+            )
+        self.assertEqual(settings.base_seconds, 0.5)
+        self.assertEqual(settings.cap_seconds, 10.0)
+
+    def test_env_override(self) -> None:
+        with patch.dict(os.environ, {
+            'RATE_LIMITER_REDIS_RETRY_CAP_SECONDS': '30',
+        }, clear=True):
+            settings: RateLimiterRedisRetrySettings = (
+                RateLimiterRedisRetrySettings()
+            )
+        self.assertEqual(settings.cap_seconds, 30.0)
+
+    def test_max_wait_is_the_shared_slowdown_setting(self) -> None:
+        '''One knob, REDIS_SLOWDOWN_MAX_WAIT_SECONDS, bounds every
+        wait for a slow Redis, the rate limiter's retries included.'''
+        with patch.dict(os.environ, {
+            'REDIS_SLOWDOWN_MAX_WAIT_SECONDS': '120',
+        }, clear=True):
+            backend: _RedisBackend = _RedisBackend(
+                _TEST_CONFIGS, _TEST_GLOBAL,
+                'redis://localhost:6379/0', 'test',
+            )
+        self.assertEqual(
+            backend._slowdown_settings.max_wait_seconds, 120.0,
+        )
+        self.assertFalse(
+            hasattr(RateLimiterRedisRetrySettings(), 'max_seconds'),
+        )

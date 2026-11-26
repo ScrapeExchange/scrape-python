@@ -12,6 +12,12 @@ messages so that case bug never returns.
 
 import unittest
 
+from redis.exceptions import (
+    AuthenticationError as RedisAuthenticationError,
+    ConnectionError as RedisConnectionError,
+    TimeoutError as RedisTimeoutError,
+)
+
 from scrape_exchange.youtube.youtube_video_innertube import (
     YouTubeBotDetectionError,
     YouTubeVideoUnavailableError,
@@ -307,6 +313,56 @@ class TestTransientClassification(unittest.TestCase):
                 'urllib.error.URLError: unable to connect to proxy',
             ),
             'transient',
+        )
+
+
+class TestRedisErrorClassification(unittest.TestCase):
+    '''A slow or unreachable Redis (e.g. a Dragonfly snapshot) must
+    retry the video, not mark it failed.'''
+
+    def test_pool_exhausted(self) -> None:
+        self.assertEqual(
+            _classify_scrape_error(
+                RedisConnectionError('No connection available.'),
+            ),
+            'transient',
+        )
+
+    def test_read_timeout(self) -> None:
+        self.assertEqual(
+            _classify_scrape_error(
+                RedisTimeoutError(
+                    'Timeout reading from localhost:6379',
+                ),
+            ),
+            'transient',
+        )
+
+    def test_wrapped_redis_error(self) -> None:
+        try:
+            try:
+                raise RedisTimeoutError(
+                    'Timeout reading from localhost:6379',
+                )
+            except RedisTimeoutError as inner:
+                raise RuntimeError('lookup failed') from inner
+        except RuntimeError as outer:
+            self.assertEqual(_classify_scrape_error(outer), 'transient')
+
+    def test_authentication_error_is_not_transient(self) -> None:
+        self.assertEqual(
+            _classify_scrape_error(
+                RedisAuthenticationError('invalid password'),
+            ),
+            'other',
+        )
+
+    def test_plain_os_error_is_not_transient(self) -> None:
+        self.assertEqual(
+            _classify_scrape_error(
+                PermissionError(13, 'Permission denied'),
+            ),
+            'other',
         )
 
 
