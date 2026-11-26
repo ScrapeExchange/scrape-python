@@ -250,6 +250,59 @@ class TestRedisBusyRetry(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(attempts, 1)
 
+    async def test_backlog_busy_retries_past_busy_retry_count(
+        self,
+    ) -> None:
+        '''backlog-server answers "backlog busy, retry" for minutes
+        while it installs a compaction; that is waited out like
+        LOADING, not given up after REDIS_BUSY_RETRIES.'''
+        from redis.exceptions import ResponseError
+
+        attempts: int = 0
+
+        async def operation() -> str:
+            nonlocal attempts
+            attempts += 1
+            if attempts <= 6:
+                raise ResponseError('backlog busy, retry')
+            return 'ok'
+
+        async def sleep(delay: float) -> None:
+            return None
+
+        with patch.dict(os.environ, {
+            'REDIS_BUSY_RETRIES': '2',
+            'REDIS_BUSY_RETRY_BASE_SECONDS': '0',
+        }, clear=True):
+            result: str = await call_with_redis_busy_retry(
+                operation, sleep=sleep,
+            )
+
+        self.assertEqual(result, 'ok')
+        self.assertEqual(attempts, 7)
+
+    async def test_backlog_busy_gives_up_after_slowdown_limit(
+        self,
+    ) -> None:
+        from redis.exceptions import ResponseError
+
+        attempts: int = 0
+
+        async def operation() -> str:
+            nonlocal attempts
+            attempts += 1
+            raise ResponseError('backlog busy, retry')
+
+        with (
+            patch.dict(os.environ, {
+                'REDIS_SLOWDOWN_MAX_WAIT_SECONDS': '0',
+            }, clear=True),
+            self.assertRaisesRegex(ResponseError, 'backlog busy'),
+        ):
+            await call_with_redis_busy_retry(operation)
+
+        self.assertEqual(attempts, 1)
+
     async def test_retries_busy_script_response(
         self,
     ) -> None:
@@ -766,6 +819,46 @@ class TestRedisPoolWait(unittest.IsolatedAsyncioTestCase):
             await client.aclose()
             await client.connection_pool.disconnect()
 
+    async def test_backlog_client_waits_for_busy_pool(self) -> None:
+        '''The backlog-server client keeps its own reconnect policy
+        but waits out a busy pool too: during a compaction install
+        every connection is stuck and the RSS scraper dropped
+        26,831 new videos on "No connection available".
+
+        Checkout is tested on the pool itself with connecting stubbed
+        out (fakeredis stalls in the backlog client's handshake).'''
+        import redis.asyncio as aioredis
+
+        client: Any = backlog_redis_from_url(
+            'redis://localhost:6390/0', component='backlog-test',
+            max_connections=1, timeout=0.05,
+        )
+        pool: Any = client.connection_pool
+        touches: list[int] = []
+        releases: list[asyncio.Task] = []
+        with patch.object(
+            aioredis.BlockingConnectionPool, 'ensure_connection',
+            AsyncMock(return_value=None),
+        ):
+            held: Any = await pool.get_connection()
+            loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+
+            def touch() -> None:
+                touches.append(1)
+                if len(touches) == 2:
+                    releases.append(loop.create_task(pool.release(held)))
+
+            with patch(
+                'scrape_exchange.redis_client._default_touch_work',
+                return_value=touch,
+            ):
+                again: Any = await asyncio.wait_for(
+                    pool.get_connection(), timeout=30,
+                )
+                await asyncio.gather(*releases)
+        self.assertIs(again, held)
+        self.assertGreaterEqual(len(touches), 2)
+
     async def test_gives_up_after_max_wait(self) -> None:
         from redis.exceptions import ConnectionError as RedisConnectionError
 
@@ -1066,8 +1159,16 @@ class TestBacklogRedisFromUrl(unittest.TestCase):
         self.assertEqual(
             type(shared_pool).__name__, 'ConnectRetryPool',
         )
+        # It still waits out a busy pool, but connects with redis-py's
+        # own ensure_connection: no connect retry under the command
+        # retry.
+        self.assertEqual(type(backlog_pool).__name__, 'SlowdownPool')
+        self.assertIsInstance(
+            backlog_pool, aioredis.BlockingConnectionPool,
+        )
         self.assertIs(
-            type(backlog_pool), aioredis.BlockingConnectionPool,
+            type(backlog_pool).ensure_connection,
+            aioredis.BlockingConnectionPool.ensure_connection,
         )
 
     def test_pool_cap_defaults_to_the_shared_client_cap(self) -> None:

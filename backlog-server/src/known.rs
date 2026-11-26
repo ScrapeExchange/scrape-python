@@ -122,9 +122,25 @@ impl KnownSet {
         }
     }
 
-    /// Swap in a generation that already contains the frozen delta,
-    /// and recount from its header plus the active delta.
+    /// Swap in a generation that already contains the frozen delta.
+    ///
+    /// Every ID reads the same before and after (the new base is the
+    /// old one with the frozen delta merged in, and the active delta
+    /// still wins over it), so the counts [`KnownSet::put`] keeps are
+    /// already right and are kept as they are. Recounting here would
+    /// look every active ID up in the new base: on the owner task,
+    /// against a multi-GB generation that compaction wrote around the
+    /// page cache, that is one cold random read per ID and stalled the
+    /// server for minutes.
     pub fn install_base(&mut self, base: Arc<Base>) {
+        self.base = base;
+        self.frozen = None;
+    }
+
+    /// Swap in a generation rewritten from outside input (the offline
+    /// `mark-uploaded` tool), whose states may differ from what the
+    /// counts say, and recount from its header plus the active delta.
+    pub fn install_rewritten_base(&mut self, base: Arc<Base>) {
         let mut counts: [u64; 6] = base.info().state_counts;
         for (id, m) in &self.active {
             if let Some(old) = base.get(*id) {
@@ -270,6 +286,60 @@ mod tests {
         assert_eq!(k.get(130), Some(m(State::Failed)));
         assert_eq!(k.get(60), Some(m(State::Scraped)));
         k.freeze();
+    }
+
+    #[test]
+    fn install_base_reads_nothing_from_the_new_base() {
+        // The counts put() kept are carried over unchanged, and they
+        // match a recount over the installed state.
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let ids: Vec<u64> = (0..50).collect();
+        let initial: BTreeMap<u64, Meta> =
+            ids.iter().map(|id| (*id, m(State::Queued))).collect();
+        let b1: Arc<Base> = base_of(d.path(), 1, &initial);
+        let mut k: KnownSet = KnownSet::new(b1.clone(), HashMap::new());
+        for id in 0..10 {
+            k.put(id, m(State::Scraped), 0);
+        }
+        let frozen: Arc<HashMap<u64, Meta>> = k.freeze();
+        for id in 40..60 {
+            k.put(id, m(State::Failed), 1);
+        }
+        let before: [u64; 6] = k.counts();
+        let mut merged: BTreeMap<u64, Meta> = b1.iter().collect();
+        merged.extend(frozen.iter().map(|(a, b)| (*a, *b)));
+        let b2: Arc<Base> = base_of(d.path(), 2, &merged);
+        k.install_base(b2);
+        assert_eq!(k.counts(), before);
+        assert_eq!(k.counts(), recount(&k, &(0..60).collect::<Vec<u64>>()));
+    }
+
+    #[test]
+    fn install_rewritten_base_recounts_from_the_new_base() {
+        // mark-uploaded rewrites states the counts never saw.
+        let d: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let ids: Vec<u64> = (0..40).collect();
+        let initial: BTreeMap<u64, Meta> =
+            ids.iter().map(|id| (*id, m(State::Scraped))).collect();
+        let b1: Arc<Base> = base_of(d.path(), 1, &initial);
+        let mut k: KnownSet = KnownSet::new(b1, HashMap::new());
+        k.freeze();
+        let rewritten: BTreeMap<u64, Meta> = ids
+            .iter()
+            .map(|id| {
+                let s: State = if id % 2 == 0 {
+                    State::Uploaded
+                } else {
+                    State::Scraped
+                };
+                (*id, m(s))
+            })
+            .collect();
+        let b2: Arc<Base> = base_of(d.path(), 2, &rewritten);
+        k.put(41, m(State::Queued), 2);
+        k.install_rewritten_base(b2);
+        assert_eq!(k.counts(), recount(&k, &(0..42).collect::<Vec<u64>>()));
+        assert_eq!(k.count(State::Uploaded), 20);
     }
 
     #[test]
