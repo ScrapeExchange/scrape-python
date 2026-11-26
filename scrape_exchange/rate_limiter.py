@@ -36,9 +36,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from scrape_exchange.proxy_health import ProxyHealth
 from scrape_exchange.proxy_health import is_proxy_auth_error
 from scrape_exchange.redis_client import (
+    RedisSlowdownSettings,
     is_redis_connection_error,
     paced_sleep,
     redis_from_url,
+    redis_slowdown_settings,
 )
 from scrape_exchange.util import extract_proxy_ip, extract_proxy_port
 from scrape_exchange.wait_tracking import waiting
@@ -714,24 +716,23 @@ METRIC_REDIS_OPS: Counter = Counter(
 
 
 class RateLimiterRedisRetrySettings(BaseSettings):
-    '''How long the Redis backend keeps retrying a token request
-    while Redis is unreachable or too slow to answer.
+    '''Backoff for the Redis backend's token-request retries while
+    Redis is unreachable or too slow to answer.
 
-    A Dragonfly snapshot slows every command for about two minutes,
-    and a restart saves and reloads for several more. Failing the
-    request then fails the scrape that asked for it, so the backend
-    retries with exponential backoff (``base_seconds`` doubling up
-    to ``cap_seconds``) until ``max_seconds`` have passed since the
-    first failure, and only then raises.
+    A Dragonfly snapshot slows every command for minutes, and a
+    restart saves and reloads for several more. Failing the request
+    then fails the scrape that asked for it, so the backend retries
+    with exponential backoff (``base_seconds`` doubling up to
+    ``cap_seconds``). How long it keeps trying is the shared
+    ``REDIS_SLOWDOWN_MAX_WAIT_SECONDS`` (see
+    :class:`scrape_exchange.redis_client.RedisSlowdownSettings`),
+    after which it raises.
     '''
 
     model_config: SettingsConfigDict = SettingsConfigDict(
         env_prefix='RATE_LIMITER_REDIS_RETRY_',
     )
 
-    max_seconds: float = Field(
-        default=600.0, ge=0, allow_inf_nan=False,
-    )
     base_seconds: float = Field(
         default=0.5, gt=0, allow_inf_nan=False,
     )
@@ -902,6 +903,9 @@ class _RedisBackend(_Backend[CallTypeT]):
         self._retry_settings: RateLimiterRedisRetrySettings = (
             RateLimiterRedisRetrySettings()
         )
+        self._slowdown_settings: RedisSlowdownSettings = (
+            redis_slowdown_settings()
+        )
         self._cache: dict[
             str | None,
             dict[str, tuple[float, float]],
@@ -1015,6 +1019,7 @@ class _RedisBackend(_Backend[CallTypeT]):
         )
         gc: _BucketConfig = self._global_config
         retry: RateLimiterRedisRetrySettings = self._retry_settings
+        max_wait: float = self._slowdown_settings.max_wait_seconds
         started: float = time.monotonic()
         delay: float = retry.base_seconds
         while True:
@@ -1046,7 +1051,7 @@ class _RedisBackend(_Backend[CallTypeT]):
                 # sending fewer requests, never more.
                 will_retry: bool = (
                     is_redis_connection_error(e)
-                    and elapsed + delay <= retry.max_seconds
+                    and elapsed + delay <= max_wait
                 )
                 log_extra: dict[str, Any] = {
                     'proxy_ip': (

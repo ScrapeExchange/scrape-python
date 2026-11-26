@@ -1,6 +1,7 @@
 '''Shared Redis client construction helpers.'''
 
 import asyncio
+import functools
 import logging
 import os
 import time
@@ -119,12 +120,13 @@ class RedisConnectRetrySettings(BaseSettings):
 class RedisSlowdownSettings(BaseSettings):
     '''How long to wait out a slow or restarting Redis.
 
-    ``max_wait_seconds`` bounds two waits that send nothing the server
-    could have run: checking a connection out of a pool whose
-    connections are all busy, and retrying a command answered with
-    LOADING. A Dragonfly snapshot slows every command for minutes and
-    a restart reloads the dataset for about one; failing then would
-    crash or fail work that only had to wait.
+    ``max_wait_seconds`` bounds the waits for a slow Redis: checking
+    a connection out of a pool whose connections are all busy,
+    retrying a command or pipeline answered with LOADING, and the
+    rate limiter's retries of a token request that timed out. A
+    Dragonfly snapshot slows every command for minutes and a restart
+    reloads the dataset for about one; failing then would crash or
+    fail work that only had to wait.
     '''
 
     model_config: SettingsConfigDict = SettingsConfigDict(
@@ -135,6 +137,14 @@ class RedisSlowdownSettings(BaseSettings):
         default=DEFAULT_SLOWDOWN_MAX_WAIT_SECONDS,
         ge=0, allow_inf_nan=False,
     )
+
+
+@functools.cache
+def redis_slowdown_settings() -> RedisSlowdownSettings:
+    '''The process-wide :class:`RedisSlowdownSettings`, read from the
+    environment once: the retry paths that consult it run on every
+    failed attempt of every task.'''
+    return RedisSlowdownSettings()
 
 
 class BacklogRedisSettings(BaseSettings):
@@ -343,25 +353,32 @@ async def call_with_redis_busy_retry[T](
         except Exception as exc:
             if not _should_retry_busy(exc, busy_attempt, retries, started):
                 raise
-            # The exponent is capped: the delay reaches max_delay long
-            # before, and 2 ** n overflows a float on a long wait.
-            delay: float = min(
-                max_delay,
-                base_delay * (2 ** min(busy_attempt, 16)),
+            delay: float = _busy_retry_delay(
+                busy_attempt, base_delay, max_delay,
             )
             busy_attempt += 1
             if delay > 0:
                 await sleep(delay)
 
 
+def _busy_retry_delay(
+    attempt: int, base_delay: float, max_delay: float,
+) -> float:
+    '''Backoff before busy/loading retry *attempt* (0-based). The
+    exponent is capped: the delay reaches *max_delay* long before,
+    and 2 ** n overflows a float on a long wait.'''
+    return min(max_delay, base_delay * (2 ** min(attempt, 16)))
+
+
 def _should_retry_busy(
     exc: BaseException, attempt: int, retries: int, started: float,
 ) -> bool:
-    '''Whether :func:`call_with_redis_busy_retry` retries *exc*: a
-    LOADING reply until the slowdown limit has passed since *started*
-    (pulsing the watchdog), a BUSY script reply *retries* times.'''
+    '''Whether a busy/loading retry loop (commands and pipelines)
+    retries *exc*: a LOADING reply until the slowdown limit has
+    passed since *started* (pulsing the watchdog), a BUSY script
+    reply *retries* times.'''
     if _is_redis_loading_error(exc):
-        max_wait: float = RedisSlowdownSettings().max_wait_seconds
+        max_wait: float = redis_slowdown_settings().max_wait_seconds
         if time.monotonic() - started >= max_wait:
             return False
         _default_touch_work()()
@@ -389,7 +406,7 @@ def _retrying_pool_class(aioredis: Any) -> Any:
                 RedisConnectRetrySettings()
             )
             self._slowdown_settings: RedisSlowdownSettings = (
-                RedisSlowdownSettings()
+                redis_slowdown_settings()
             )
 
         async def get_connection(self, *args: Any, **kwargs: Any) -> Any:
@@ -463,6 +480,7 @@ def _retrying_pipeline_class(aioredis: Any):
                 redis_busy_retry_settings()
             )
             busy_attempt: int = 0
+            started: float = time.monotonic()
             while True:
                 command_stack: list[Any] = list(
                     self.command_stack,
@@ -471,19 +489,16 @@ def _retrying_pipeline_class(aioredis: Any):
                 try:
                     return await super().execute(raise_on_error=raise_on_error)
                 except Exception as exc:
-                    if (
-                        is_redis_busy_script_error(exc)
-                        or _is_redis_loading_error(exc)
+                    # Same policy as call_with_redis_busy_retry, so a
+                    # pipeline also waits out a Dragonfly reload.
+                    if not _should_retry_busy(
+                        exc, busy_attempt, retries, started,
                     ):
-                        if busy_attempt >= retries:
-                            raise
-                        delay: float = min(
-                            max_delay,
-                            base_delay * (2 ** busy_attempt),
-                        )
-                        busy_attempt += 1
-                    else:
                         raise
+                    delay: float = _busy_retry_delay(
+                        busy_attempt, base_delay, max_delay,
+                    )
+                    busy_attempt += 1
                     # ``redis-py`` resets pipelines after execute(),
                     # including failures. Restore only for the retry.
                     self.command_stack = command_stack

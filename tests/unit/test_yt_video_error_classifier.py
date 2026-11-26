@@ -331,7 +331,9 @@ class TestRedisErrorClassification(unittest.TestCase):
     def test_read_timeout(self) -> None:
         self.assertEqual(
             _classify_scrape_error(
-                RedisTimeoutError('Timeout reading from hws:6380'),
+                RedisTimeoutError(
+                    'Timeout reading from localhost:6379',
+                ),
             ),
             'transient',
         )
@@ -339,7 +341,9 @@ class TestRedisErrorClassification(unittest.TestCase):
     def test_wrapped_redis_error(self) -> None:
         try:
             try:
-                raise RedisTimeoutError('Timeout reading from hws:6380')
+                raise RedisTimeoutError(
+                    'Timeout reading from localhost:6379',
+                )
             except RedisTimeoutError as inner:
                 raise RuntimeError('lookup failed') from inner
         except RuntimeError as outer:

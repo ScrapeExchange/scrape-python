@@ -23,7 +23,15 @@ from scrape_exchange.redis_client import (
     is_redis_busy_script_error,
     redis_client_name,
     redis_from_url,
+    redis_slowdown_settings,
 )
+
+
+def _fresh_slowdown_settings(case: unittest.TestCase) -> None:
+    '''redis_slowdown_settings() is cached per process: drop the cache
+    so a test's patched environment is read, and again afterwards.'''
+    redis_slowdown_settings.cache_clear()
+    case.addCleanup(redis_slowdown_settings.cache_clear)
 
 
 class TestRedisClientName(unittest.TestCase):
@@ -148,6 +156,9 @@ class TestRedisFromUrlSocketTimeout(unittest.TestCase):
 
 
 class TestRedisBusyRetry(unittest.IsolatedAsyncioTestCase):
+
+    def setUp(self) -> None:
+        _fresh_slowdown_settings(self)
 
     async def test_command_recovers_after_dataset_loading(self) -> None:
         from redis.asyncio import Redis
@@ -358,6 +369,88 @@ class TestRedisBusyRetry(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, ['ok'])
         self.assertEqual(attempts, 2)
+
+    def _pipeline_client(self, from_url: MagicMock) -> Any:
+        from_url.return_value = MagicMock()
+        return redis_from_url(
+            'redis://localhost:6379/0', component='test-component',
+        )
+
+    async def test_pipeline_retries_loading_past_busy_retry_count(
+        self,
+    ) -> None:
+        '''A pipeline waits out a Dragonfly reload like a single
+        command does: LOADING is retried until the slowdown limit,
+        not just REDIS_BUSY_RETRIES times.'''
+        from redis.asyncio.client import Pipeline
+        from redis.exceptions import BusyLoadingError
+
+        attempts: int = 0
+
+        async def execute(
+            pipeline: Pipeline,
+            raise_on_error: bool = True,
+        ) -> list[str]:
+            nonlocal attempts
+            attempts += 1
+            self.assertTrue(pipeline.command_stack)
+            if attempts <= 10:
+                pipeline.command_stack = []
+                raise BusyLoadingError(
+                    'Redis is loading the dataset in memory',
+                )
+            return ['ok']
+
+        with (
+            patch(
+                'redis.asyncio.BlockingConnectionPool.from_url',
+            ) as from_url,
+            patch.object(Pipeline, 'execute', execute),
+            patch.dict(os.environ, {
+                'REDIS_BUSY_RETRIES': '2',
+                'REDIS_BUSY_RETRY_BASE_SECONDS': '0',
+            }, clear=True),
+        ):
+            client: Any = self._pipeline_client(from_url)
+            pipe: Any = client.pipeline(transaction=False)
+            pipe.set('key', 'value')
+            result: list[str] = await pipe.execute()
+
+        self.assertEqual(result, ['ok'])
+        self.assertEqual(attempts, 11)
+
+    async def test_pipeline_loading_gives_up_after_slowdown_limit(
+        self,
+    ) -> None:
+        from redis.asyncio.client import Pipeline
+        from redis.exceptions import BusyLoadingError
+
+        attempts: int = 0
+
+        async def execute(
+            pipeline: Pipeline,
+            raise_on_error: bool = True,
+        ) -> list[str]:
+            nonlocal attempts
+            attempts += 1
+            raise BusyLoadingError('Redis is loading the dataset in memory')
+
+        with (
+            patch(
+                'redis.asyncio.BlockingConnectionPool.from_url',
+            ) as from_url,
+            patch.object(Pipeline, 'execute', execute),
+            patch.dict(os.environ, {
+                'REDIS_SLOWDOWN_MAX_WAIT_SECONDS': '0',
+            }, clear=True),
+            self.assertRaises(BusyLoadingError),
+        ):
+            client: Any = self._pipeline_client(from_url)
+            pipe: Any = client.pipeline(transaction=False)
+            pipe.set('key', 'value')
+            await pipe.execute()
+
+        self.assertEqual(attempts, 1)
 
 
 class TestRedisConnectionRetry(unittest.IsolatedAsyncioTestCase):
@@ -627,6 +720,9 @@ class TestRedisPoolWait(unittest.IsolatedAsyncioTestCase):
     keeps waiting (pulsing the watchdog) instead of failing with "No
     connection available" (yt-channel crashed 377 times on that).'''
 
+    def setUp(self) -> None:
+        _fresh_slowdown_settings(self)
+
     def _client(self) -> Any:
         from fakeredis import FakeServer
         from fakeredis.aioredis import FakeAsyncRedisConnection
@@ -638,24 +734,33 @@ class TestRedisPoolWait(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_waits_for_busy_pool_instead_of_failing(self) -> None:
+        '''The held connection is released from the watchdog touch
+        after the second pool timeout, not after a fixed sleep, so
+        the waiter has provably timed out twice whatever the
+        scheduler does.'''
         client: Any = self._client()
+        pool: Any = client.connection_pool
         touches: list[int] = []
+        releases: list[asyncio.Task] = []
         try:
-            held: Any = await client.connection_pool.get_connection()
+            held: Any = await pool.get_connection()
+            loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
 
-            async def release_later() -> None:
-                await asyncio.sleep(0.2)
-                await client.connection_pool.release(held)
+            def touch() -> None:
+                touches.append(1)
+                if len(touches) == 2:
+                    releases.append(loop.create_task(pool.release(held)))
 
             with patch(
                 'scrape_exchange.redis_client._default_touch_work',
-                return_value=lambda: touches.append(1),
+                return_value=touch,
             ):
-                releaser: asyncio.Task = asyncio.create_task(
-                    release_later(),
+                pong: bool = await asyncio.wait_for(
+                    client.ping(), timeout=30,
                 )
-                self.assertTrue(await client.ping())
-                await releaser
+                await asyncio.gather(*releases)
+            self.assertTrue(pong)
+            self.assertEqual(len(releases), 1)
             self.assertGreaterEqual(len(touches), 2)
         finally:
             await client.aclose()
@@ -685,6 +790,20 @@ class TestRedisPoolWait(unittest.IsolatedAsyncioTestCase):
 
 
 class TestRedisSlowdownSettings(unittest.TestCase):
+    def setUp(self) -> None:
+        _fresh_slowdown_settings(self)
+
+    def test_settings_are_read_once(self) -> None:
+        with patch.dict(os.environ, {
+            'REDIS_SLOWDOWN_MAX_WAIT_SECONDS': '30',
+        }, clear=True):
+            first: RedisSlowdownSettings = redis_slowdown_settings()
+        with patch.dict(os.environ, {
+            'REDIS_SLOWDOWN_MAX_WAIT_SECONDS': '90',
+        }, clear=True):
+            second: RedisSlowdownSettings = redis_slowdown_settings()
+        self.assertIs(first, second)
+        self.assertEqual(second.max_wait_seconds, 30.0)
     def test_defaults_to_ten_minutes(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             settings: RedisSlowdownSettings = RedisSlowdownSettings()
