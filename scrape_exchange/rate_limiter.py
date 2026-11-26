@@ -30,10 +30,16 @@ from typing import Any, ClassVar, Generic, Self, TypeVar
 from dataclasses import dataclass, field
 
 from prometheus_client import Counter, Gauge, Histogram
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from scrape_exchange.proxy_health import ProxyHealth
 from scrape_exchange.proxy_health import is_proxy_auth_error
-from scrape_exchange.redis_client import redis_from_url
+from scrape_exchange.redis_client import (
+    is_redis_connection_error,
+    paced_sleep,
+    redis_from_url,
+)
 from scrape_exchange.util import extract_proxy_ip, extract_proxy_port
 from scrape_exchange.wait_tracking import waiting
 from scrape_exchange.worker_id import get_worker_id
@@ -706,6 +712,34 @@ METRIC_REDIS_OPS: Counter = Counter(
     ['operation', 'result', 'platform', 'worker_id'],
 )
 
+
+class RateLimiterRedisRetrySettings(BaseSettings):
+    '''How long the Redis backend keeps retrying a token request
+    while Redis is unreachable or too slow to answer.
+
+    A Dragonfly snapshot slows every command for about two minutes,
+    and a restart saves and reloads for several more. Failing the
+    request then fails the scrape that asked for it, so the backend
+    retries with exponential backoff (``base_seconds`` doubling up
+    to ``cap_seconds``) until ``max_seconds`` have passed since the
+    first failure, and only then raises.
+    '''
+
+    model_config: SettingsConfigDict = SettingsConfigDict(
+        env_prefix='RATE_LIMITER_REDIS_RETRY_',
+    )
+
+    max_seconds: float = Field(
+        default=600.0, ge=0, allow_inf_nan=False,
+    )
+    base_seconds: float = Field(
+        default=0.5, gt=0, allow_inf_nan=False,
+    )
+    cap_seconds: float = Field(
+        default=10.0, gt=0, allow_inf_nan=False,
+    )
+
+
 # Lua script: atomic refill + conditional consume.
 # Uses redis TIME for server-side clock (avoids cross-host skew).
 # Returns {wait_seconds, bucket_tokens, global_tokens} as strings.
@@ -865,6 +899,9 @@ class _RedisBackend(_Backend[CallTypeT]):
             )
         )
         self._platform: str = platform
+        self._retry_settings: RateLimiterRedisRetrySettings = (
+            RateLimiterRedisRetrySettings()
+        )
         self._cache: dict[
             str | None,
             dict[str, tuple[float, float]],
@@ -977,25 +1014,41 @@ class _RedisBackend(_Backend[CallTypeT]):
             self._default_configs[call_type]
         )
         gc: _BucketConfig = self._global_config
-        try:
-            result: list[str] = (
-                await self._evalsha_with_reload(
-                    self._try_acquire_sha,
-                    _LUA_TRY_ACQUIRE,
-                    1,
-                    self._key(proxy),
-                    call_type.value,
-                    str(cfg.burst),
-                    str(cfg.refill_rate),
-                    str(gc.burst),
-                    str(gc.refill_rate),
-                    str(self._KEY_TTL),
+        retry: RateLimiterRedisRetrySettings = self._retry_settings
+        started: float = time.monotonic()
+        delay: float = retry.base_seconds
+        while True:
+            try:
+                result: list[str] = (
+                    await self._evalsha_with_reload(
+                        self._try_acquire_sha,
+                        _LUA_TRY_ACQUIRE,
+                        1,
+                        self._key(proxy),
+                        call_type.value,
+                        str(cfg.burst),
+                        str(cfg.refill_rate),
+                        str(gc.burst),
+                        str(gc.refill_rate),
+                        str(self._KEY_TTL),
+                    )
                 )
-            )
-        except Exception as e:
-            _LOGGER.warning(
-                'Redis unavailable; blocking request',
-                exc_info=True, extra={
+                break
+            except Exception as e:
+                METRIC_REDIS_OPS.labels(
+                    **self._metric_labels(
+                        'try_acquire', 'error',
+                    )
+                ).inc()
+                elapsed: float = time.monotonic() - started
+                # A timed-out EVALSHA may have run on the server, so
+                # a retry can take a second token. That errs towards
+                # sending fewer requests, never more.
+                will_retry: bool = (
+                    is_redis_connection_error(e)
+                    and elapsed + delay <= retry.max_seconds
+                )
+                log_extra: dict[str, Any] = {
                     'proxy_ip': (
                         extract_proxy_ip(proxy) if proxy else 'none'
                     ),
@@ -1003,15 +1056,21 @@ class _RedisBackend(_Backend[CallTypeT]):
                         extract_proxy_port(proxy) if proxy else 'none'
                     ),
                     'call_type': call_type.value,
-                    'exc': str(e)
-                },
-            )
-            METRIC_REDIS_OPS.labels(
-                **self._metric_labels(
-                    'try_acquire', 'error',
+                    'exc': str(e),
+                    'elapsed_seconds': elapsed,
+                }
+                if not will_retry:
+                    _LOGGER.warning(
+                        'Redis unavailable; blocking request',
+                        exc_info=True, extra=log_extra,
+                    )
+                    raise
+                _LOGGER.info(
+                    'Redis unavailable; retrying rate-limit request',
+                    extra=log_extra | {'retry_in_seconds': delay},
                 )
-            ).inc()
-            raise
+                await paced_sleep(delay)
+                delay = min(delay * 2, retry.cap_seconds)
 
         METRIC_REDIS_OPS.labels(
             **self._metric_labels(

@@ -1,7 +1,9 @@
 '''Shared Redis client construction helpers.'''
 
 import asyncio
+import logging
 import os
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -9,6 +11,8 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from scrape_exchange.worker_id import get_worker_id
+
+_LOGGER: logging.Logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_CONNECTIONS: int = 4
 DEFAULT_BUSY_RETRIES: int = 8
@@ -20,6 +24,11 @@ DEFAULT_BUSY_RETRY_MAX_SECONDS: float = 5.0
 # is retried; commands may have executed before a response is lost.
 DEFAULT_CONNECT_RETRY_BASE_SECONDS: float = 1.0
 DEFAULT_CONNECT_RETRY_MAX_SECONDS: float = 256.0
+# How long a caller waits out a slow or restarting Redis (a pool with
+# every connection busy, a dataset still loading) before the error
+# is raised. A Dragonfly snapshot slowed commands to ~30 s for up to
+# 7 minutes; a restart answers LOADING for about a minute.
+DEFAULT_SLOWDOWN_MAX_WAIT_SECONDS: float = 600.0
 
 # Backlog-server client tuning. backlog-server is one process on one
 # host speaking RESP, reached over the LAN, so a restart, a dropped
@@ -103,6 +112,27 @@ class RedisConnectRetrySettings(BaseSettings):
     )
     max_seconds: float = Field(
         default=DEFAULT_CONNECT_RETRY_MAX_SECONDS,
+        ge=0, allow_inf_nan=False,
+    )
+
+
+class RedisSlowdownSettings(BaseSettings):
+    '''How long to wait out a slow or restarting Redis.
+
+    ``max_wait_seconds`` bounds two waits that send nothing the server
+    could have run: checking a connection out of a pool whose
+    connections are all busy, and retrying a command answered with
+    LOADING. A Dragonfly snapshot slows every command for minutes and
+    a restart reloads the dataset for about one; failing then would
+    crash or fail work that only had to wait.
+    '''
+
+    model_config: SettingsConfigDict = SettingsConfigDict(
+        env_prefix='REDIS_SLOWDOWN_',
+    )
+
+    max_wait_seconds: float = Field(
+        default=DEFAULT_SLOWDOWN_MAX_WAIT_SECONDS,
         ge=0, allow_inf_nan=False,
     )
 
@@ -247,6 +277,21 @@ def _is_redis_loading_error(error: BaseException) -> bool:
     return isinstance(error, BusyLoadingError)
 
 
+def _is_pool_checkout_timeout(error: BaseException) -> bool:
+    '''True for redis-py's "No connection available": every pooled
+    connection stayed busy for the pool timeout. Raised before any
+    command is sent.'''
+    try:
+        from redis.exceptions import ConnectionError as RedisConnectionError
+    except ImportError:
+        return False
+    return (
+        type(error) is RedisConnectionError
+        and isinstance(error.__cause__, TimeoutError)
+        and str(error) == 'No connection available.'
+    )
+
+
 def is_redis_connection_error(error: BaseException) -> bool:
     '''True for connection timeouts/drops: ``redis.exceptions``
     connection/timeout errors, socket-level ``OSError``s, and asyncio
@@ -280,28 +325,50 @@ async def call_with_redis_busy_retry[T](
     *,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> T:
-    '''Retry commands rejected while Redis runs a script or loads data.'''
+    '''Retry commands rejected while Redis runs a script or loads data.
+
+    A BUSY script is retried ``REDIS_BUSY_RETRIES`` times. LOADING
+    (a restart reloading its snapshot, about a minute for Dragonfly)
+    is retried until ``REDIS_SLOWDOWN_MAX_WAIT_SECONDS`` have passed,
+    pulsing the watchdog work signal between attempts. Both back off
+    from ``REDIS_BUSY_RETRY_BASE_SECONDS`` up to
+    ``REDIS_BUSY_RETRY_MAX_SECONDS``.
+    '''
     retries, base_delay, max_delay = redis_busy_retry_settings()
     busy_attempt: int = 0
+    started: float = time.monotonic()
     while True:
         try:
             return await operation()
         except Exception as exc:
-            if (
-                is_redis_busy_script_error(exc)
-                or _is_redis_loading_error(exc)
-            ):
-                if busy_attempt >= retries:
-                    raise
-                delay: float = min(
-                    max_delay,
-                    base_delay * (2 ** busy_attempt),
-                )
-                busy_attempt += 1
-            else:
+            if not _should_retry_busy(exc, busy_attempt, retries, started):
                 raise
+            # The exponent is capped: the delay reaches max_delay long
+            # before, and 2 ** n overflows a float on a long wait.
+            delay: float = min(
+                max_delay,
+                base_delay * (2 ** min(busy_attempt, 16)),
+            )
+            busy_attempt += 1
             if delay > 0:
                 await sleep(delay)
+
+
+def _should_retry_busy(
+    exc: BaseException, attempt: int, retries: int, started: float,
+) -> bool:
+    '''Whether :func:`call_with_redis_busy_retry` retries *exc*: a
+    LOADING reply until the slowdown limit has passed since *started*
+    (pulsing the watchdog), a BUSY script reply *retries* times.'''
+    if _is_redis_loading_error(exc):
+        max_wait: float = RedisSlowdownSettings().max_wait_seconds
+        if time.monotonic() - started >= max_wait:
+            return False
+        _default_touch_work()()
+        return True
+    if is_redis_busy_script_error(exc):
+        return attempt < retries
+    return False
 
 
 def redis_client_name(component: str) -> str:
@@ -321,6 +388,56 @@ def _retrying_pool_class(aioredis: Any) -> Any:
             self._connect_retry_settings: RedisConnectRetrySettings = (
                 RedisConnectRetrySettings()
             )
+            self._slowdown_settings: RedisSlowdownSettings = (
+                RedisSlowdownSettings()
+            )
+
+        async def get_connection(self, *args: Any, **kwargs: Any) -> Any:
+            '''Check out a connection, waiting past the pool timeout
+            while Redis is slow.
+
+            When every connection is busy for longer than the pool
+            ``timeout``, redis-py raises "No connection available".
+            Nothing has been sent at that point, so waiting again is
+            safe for any command; it is bounded by
+            ``REDIS_SLOWDOWN_MAX_WAIT_SECONDS`` and pulses the
+            watchdog work signal between waits.
+            '''
+            started: float = time.monotonic()
+            touch: Callable[[], None] = _default_touch_work()
+            waits: int = 0
+            while True:
+                try:
+                    return await super(
+                        ConnectRetryPool, self,
+                    ).get_connection(*args, **kwargs)
+                except Exception as exc:
+                    if not _is_pool_checkout_timeout(exc):
+                        raise
+                    elapsed: float = time.monotonic() - started
+                    max_wait: float = (
+                        self._slowdown_settings.max_wait_seconds
+                    )
+                    if elapsed >= max_wait:
+                        _LOGGER.warning(
+                            'Redis pool exhausted; giving up',
+                            extra={
+                                'waited_seconds': elapsed,
+                                'max_wait_seconds': max_wait,
+                                'max_connections': self.max_connections,
+                            },
+                        )
+                        raise
+                    waits += 1
+                    if waits == 1:
+                        _LOGGER.info(
+                            'Redis pool exhausted; waiting for a '
+                            'connection',
+                            extra={
+                                'max_connections': self.max_connections,
+                            },
+                        )
+                    touch()
 
         async def ensure_connection(self, connection: Any) -> None:
             async def connect_once() -> None:
