@@ -117,7 +117,7 @@ pub fn run(a: &MarkUploadedArgs) -> Result<MarkUploadedReport> {
     let info: BaseInfo = w.finish()?;
     // Terminal states are kept, so the sidecar is carried over.
     write_terminal_paced(&job.dir, job.generation, &job.terminal, job.pacing)?;
-    if let Some(cleanup) = q.finish_compaction(info)? {
+    if let Some(cleanup) = q.finish_base_rewrite(info)? {
         cleanup.run()?;
     }
     q.sync()?;

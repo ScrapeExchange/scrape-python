@@ -265,6 +265,23 @@ async def paced_sleep(
     await _paced_sleep(delay, sleep or asyncio.sleep, _default_touch_work())
 
 
+# backlog-server's reply when its owner task did not take a command
+# within 30 s (e.g. while it installs a compaction). Every BACKLOG.*
+# command is idempotent (see backlog_command_retry), so it is retried.
+_BACKLOG_BUSY_MESSAGE: str = 'backlog busy, retry'
+
+
+def _is_backlog_busy_error(error: BaseException) -> bool:
+    try:
+        from redis.exceptions import ResponseError
+    except ImportError:
+        return False
+    return (
+        isinstance(error, ResponseError)
+        and str(error) == _BACKLOG_BUSY_MESSAGE
+    )
+
+
 def is_redis_busy_script_error(error: BaseException) -> bool:
     try:
         from redis.exceptions import ResponseError
@@ -339,7 +356,9 @@ async def call_with_redis_busy_retry[T](
 
     A BUSY script is retried ``REDIS_BUSY_RETRIES`` times. LOADING
     (a restart reloading its snapshot, about a minute for Dragonfly)
-    is retried until ``REDIS_SLOWDOWN_MAX_WAIT_SECONDS`` have passed,
+    and backlog-server's "backlog busy, retry" (its owner task stuck,
+    e.g. installing a compaction) are retried until
+    ``REDIS_SLOWDOWN_MAX_WAIT_SECONDS`` have passed,
     pulsing the watchdog work signal between attempts. Both back off
     from ``REDIS_BUSY_RETRY_BASE_SECONDS`` up to
     ``REDIS_BUSY_RETRY_MAX_SECONDS``.
@@ -374,10 +393,10 @@ def _should_retry_busy(
     exc: BaseException, attempt: int, retries: int, started: float,
 ) -> bool:
     '''Whether a busy/loading retry loop (commands and pipelines)
-    retries *exc*: a LOADING reply until the slowdown limit has
-    passed since *started* (pulsing the watchdog), a BUSY script
-    reply *retries* times.'''
-    if _is_redis_loading_error(exc):
+    retries *exc*: a LOADING reply or backlog-server's "backlog busy"
+    until the slowdown limit has passed since *started* (pulsing the
+    watchdog), a BUSY script reply *retries* times.'''
+    if _is_redis_loading_error(exc) or _is_backlog_busy_error(exc):
         max_wait: float = redis_slowdown_settings().max_wait_seconds
         if time.monotonic() - started >= max_wait:
             return False
@@ -398,13 +417,14 @@ def redis_client_name(component: str) -> str:
     )
 
 
-def _retrying_pool_class(aioredis: Any) -> Any:
-    class ConnectRetryPool(aioredis.BlockingConnectionPool):
+def _slowdown_pool_class(aioredis: Any) -> Any:
+    '''A blocking pool that waits out a slow Redis at checkout (see
+    ``get_connection``). Used as is by clients that reconnect through
+    their own ``retry`` policy, such as the backlog-server client.'''
+
+    class SlowdownPool(aioredis.BlockingConnectionPool):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
-            self._connect_retry_settings: RedisConnectRetrySettings = (
-                RedisConnectRetrySettings()
-            )
             self._slowdown_settings: RedisSlowdownSettings = (
                 redis_slowdown_settings()
             )
@@ -426,7 +446,7 @@ def _retrying_pool_class(aioredis: Any) -> Any:
             while True:
                 try:
                     return await super(
-                        ConnectRetryPool, self,
+                        SlowdownPool, self,
                     ).get_connection(*args, **kwargs)
                 except Exception as exc:
                     if not _is_pool_checkout_timeout(exc):
@@ -455,6 +475,20 @@ def _retrying_pool_class(aioredis: Any) -> Any:
                             },
                         )
                     touch()
+
+    return SlowdownPool
+
+
+def _retrying_pool_class(aioredis: Any) -> Any:
+    ''':func:`_slowdown_pool_class` plus the watchdog-aware connect
+    retry.'''
+
+    class ConnectRetryPool(_slowdown_pool_class(aioredis)):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self._connect_retry_settings: RedisConnectRetrySettings = (
+                RedisConnectRetrySettings()
+            )
 
         async def ensure_connection(self, connection: Any) -> None:
             async def connect_once() -> None:
@@ -553,7 +587,9 @@ def redis_from_url(
         watchdog-aware connect retry (1s to 256s). Turn it off only for
         a client whose own ``retry`` policy already reconnects: stacked
         on top of it, every pool connect attempt would run that policy
-        in full (see :func:`backlog_redis_from_url`).
+        in full (see :func:`backlog_redis_from_url`). Either way the
+        pool waits out a checkout while every connection is busy, up
+        to ``REDIS_SLOWDOWN_MAX_WAIT_SECONDS``.
     '''
     import redis.asyncio as aioredis
 
@@ -573,7 +609,7 @@ def redis_from_url(
     kwargs.setdefault('socket_timeout', None)
     pool_cls: Any = (
         _retrying_pool_class(aioredis) if connect_retry
-        else aioredis.BlockingConnectionPool
+        else _slowdown_pool_class(aioredis)
     )
     pool: Any = pool_cls.from_url(
         redis_dsn, **kwargs,

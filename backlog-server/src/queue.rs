@@ -603,6 +603,24 @@ impl Queue {
         &mut self,
         info: BaseInfo,
     ) -> Result<Option<CompactionCleanup>, QueueError> {
+        self.finish_install(info, false)
+    }
+
+    /// [`Queue::finish_compaction`] for a generation from
+    /// [`Queue::start_base_rewrite`] whose states came from outside
+    /// input: the per-state counts are recounted from it.
+    pub fn finish_base_rewrite(
+        &mut self,
+        info: BaseInfo,
+    ) -> Result<Option<CompactionCleanup>, QueueError> {
+        self.finish_install(info, true)
+    }
+
+    fn finish_install(
+        &mut self,
+        info: BaseInfo,
+        recount: bool,
+    ) -> Result<Option<CompactionCleanup>, QueueError> {
         let Some((generation, wal_cut)) = self.compacting else {
             return Ok(None);
         };
@@ -611,7 +629,11 @@ impl Queue {
         let old: u64 = old_base.info().generation;
         let base: Arc<Base> = Arc::new(Base::open(&base_dir, info.generation)?);
         debug_assert_eq!(info.generation, generation);
-        self.known.install_base(base);
+        if recount {
+            self.known.install_rewritten_base(base);
+        } else {
+            self.known.install_base(base);
+        }
         self.compacting = None;
         self.last_compaction = Instant::now();
         self.compaction_failures = 0;
